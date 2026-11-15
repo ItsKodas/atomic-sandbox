@@ -557,3 +557,267 @@ fn the_residual_checks_name_their_true_argmax() {
     s.store.as_mut().unwrap().samples[f_i].energy += 1e-9;
     assert_eq!(s.trust_checks().into_iter().find(|c| c.key == K::ForceResidual).unwrap().worst, None);
 }
+
+/// The ids of stored samples `idx` (the Model tab's checked rows).
+fn ids(s: &SurrogateKs, idx: &[usize]) -> Vec<sim::SampleId> {
+    idx.iter().map(|&i| s.sample_id(i).unwrap()).collect()
+}
+
+/// 2026-11-14, the batched forget: "Forget N selected" applies every sample at once — each code
+/// written, each fencing before any refit, one refit due and one note — and counts them as changes
+/// no fit holds (`user_changes_pending`, the worker's debounce and the banner); the purge waits for
+/// that refit, and so does a lift vote next to the forgotten samples (a refit is due). The refit
+/// fits without them and clears the count; "Restore N selected" is the same in reverse.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn a_batch_forget_applies_every_sample_with_one_refit_due() {
+    let mut s = window();
+    assert_eq!(s.user_changes_pending(), 0);
+    let notes0 = s.user_notes.len();
+    let batch = ids(&s, &[3, 17, 30]);
+    s.forget_samples(&batch).unwrap();
+    for i in [3, 17, 30] {
+        assert_eq!(s.quarantine[i], Q_FORGOTTEN, "#{i} written at once");
+        let pos: Vec<[f64; 3]> = s.store.as_ref().unwrap().samples[i].pos.clone();
+        assert!(s.near_quarantined(&pos, &[1, 1]).contains(&i), "#{i} fences before the refit");
+    }
+    assert_eq!((s.forgotten(), s.forgotten_in_fit(), s.user_changes_pending()), (3, 3, 3));
+    assert!(s.pending_refit(), "one refit due");
+    let added: Vec<&String> = s.user_notes[notes0..].iter().collect();
+    assert_eq!(added.len(), 1, "one note for the batch: {added:?}");
+    assert!(added[0].contains("3 samples forgotten (#3, #17, #30)") && added[0].contains("saved with the model file"), "{added:?}");
+    assert_eq!(s.purge_refusal().as_deref(), Some(super::super::purge::PURGE_WAIT_REFIT));
+    let rep = s.refit().unwrap();
+    assert_eq!(rep.n_samples, 37, "fitted without the three");
+    assert_eq!((s.user_changes_pending(), s.forgotten_in_fit()), (0, 0));
+    s.ensure_loo_ratios();
+    assert_eq!(s.purge_refusal(), None);
+    // Restore two of them: pending again — the purge waits (the fit holds no forgotten sample
+    // now, the changes are still pending)
+    s.restore_samples(&ids(&s, &[3, 30])).unwrap();
+    assert_eq!((s.quarantine[3], s.quarantine[30], s.forgotten(), s.user_changes_pending()), (Q_NONE, Q_NONE, 1, 2));
+    assert!(s.user_notes.last().is_some_and(|n| n.contains("2 samples restored (#3, #30)")), "{:?}", s.user_notes.last());
+    assert_eq!(s.purge_refusal().as_deref(), Some(super::super::purge::PURGE_WAIT_CHANGES));
+    s.refit().unwrap();
+    assert!(s.trusted(), "39 samples: {:?}", s.untrusted_reason());
+    // one more Forget elsewhere, its refit pending: no lift vote next to #17 meanwhile
+    forget(&mut s, 33).unwrap();
+    assert_eq!(s.user_changes_pending(), 1);
+    let sc = {
+        let smp = &s.store.as_ref().unwrap().samples[17];
+        let mut sc = dimer(1.0, [1.0, 0.0, 0.0], [0.0; 3], 1, 1);
+        for (n, p) in sc.nuclei.iter_mut().zip(&smp.pos) {
+            n.pos = *p;
+        }
+        sc
+    };
+    s.discontinuity();
+    let r = s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.contains("no vote toward lifting their fence") && n.contains("a refit is due")), "{:?}", r.stats.notes);
+    s.refit().unwrap();
+    assert_eq!(s.user_changes_pending(), 0);
+}
+
+/// 2026-11-14: a batch is all or nothing — a stale id (the sample list changed), an id twice, or a
+/// sample that cannot be forgotten refuses it whole, nothing changed. The recovery's 10 % cap (40
+/// samples: 4) is not a refusal: a batch past it is applied with the warning a single Forget gets
+/// (the coordinator's ruling: consistent with Forgets one by one); one id is that single Forget.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn a_batch_is_refused_whole() {
+    let mut s = window();
+    let unchanged = |s: &SurrogateKs| s.forgotten() == 0 && s.user_changes_pending() == 0 && !s.pending_refit();
+    let mut stale = ids(&s, &[1, 2]);
+    stale[1].key = s.sample_id(9).unwrap().key;
+    let e = s.forget_samples(&stale).unwrap_err();
+    assert!(e.contains("the sample list changed — pick it again"), "{e}");
+    assert!(unchanged(&s), "a stale id refuses the whole batch");
+    let e = s.forget_samples(&ids(&s, &[1, 2, 1])).unwrap_err();
+    assert!(e.contains("sample #1 is selected twice"), "{e}");
+    s.quarantine.resize(s.samples(), Q_NONE);
+    s.quarantine[2] = Q_HELD;
+    let e = s.forget_samples(&ids(&s, &[1, 2])).unwrap_err();
+    assert!(e.contains("sample #2 is not in the fit"), "{e}");
+    assert!(unchanged(&s) && s.quarantine[1] == Q_NONE);
+    // 1 held + 3 forgotten = 4: within the cap, no warning
+    s.forget_samples(&ids(&s, &[4, 5, 6])).unwrap();
+    assert_eq!((s.forgotten(), s.user_changes_pending()), (3, 3));
+    assert!(s.user_notes.last().is_some_and(|n| n.contains("3 samples forgotten (#4, #5, #6)") && !n.contains("past the 10 %")), "{:?}", s.user_notes.last());
+    // a batch past it (1 + 5 = 6 > 4): applied, with a single Forget's warning
+    s.forget_samples(&ids(&s, &[7, 8])).unwrap();
+    assert!(s.user_notes.last().is_some_and(|n| n.contains("2 samples forgotten (#7, #8)") && n.contains("now 6 of 40 samples, past the 10 %") && n.contains("it holds no more")), "{:?}", s.user_notes.last());
+    assert_eq!((s.forgotten(), s.user_changes_pending()), (5, 5));
+    assert!(s.is_forgotten(7) && s.is_forgotten(8));
+    // a single Forget past it: the same warning; one id is that Forget
+    s.forget_samples(&ids(&s, &[9])).unwrap();
+    assert!(s.user_notes.last().is_some_and(|n| n.contains("sample #9 forgotten") && n.contains("past the 10 %")), "{:?}", s.user_notes.last());
+    assert_eq!((s.forgotten(), s.user_changes_pending()), (6, 6));
+    // Restore: not forgotten, refused whole
+    let e = s.restore_samples(&ids(&s, &[4, 10])).unwrap_err();
+    assert!(e.contains("sample #10 is not forgotten"), "{e}");
+    assert!(s.is_forgotten(4));
+    let e = s.forget_samples(&[]).unwrap_err();
+    assert!(e.contains("no samples selected"), "{e}");
+}
+
+/// 2026-11-14: the pending count follows the refits — a background refit takes the changes made
+/// before it (they are its), the ones made while it runs are the next one's; a discarded refit
+/// gives its changes back.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn the_pending_changes_follow_the_background_refit() {
+    let mut s = window();
+    s.forget_samples(&ids(&s, &[3, 17])).unwrap();
+    assert_eq!(s.user_changes_pending(), 2);
+    assert!(s.begin_background_refit());
+    assert_eq!(s.user_changes_pending(), 0, "the running refit holds them");
+    forget(&mut s, 30).unwrap();
+    assert_eq!(s.user_changes_pending(), 1, "made while it runs: the next refit's");
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Installed(Ok(_))));
+    assert_eq!(s.user_changes_pending(), 1);
+    assert!(s.pending_refit(), "one more refit due");
+    // after a discard they are measured against the fit that stands again
+    assert!(s.begin_background_refit());
+    restore(&mut s, 3).unwrap();
+    s.quarantine[5] = Q_SUPERSEDED;
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Discarded(_)));
+    assert_eq!(s.user_changes_pending(), 2);
+    s.quarantine[5] = Q_NONE;
+    s.refit().unwrap();
+    assert_eq!(s.user_changes_pending(), 0);
+}
+
+/// Review I1 (a), 2026-11-14: a Forget then a Restore of the same sample while a background refit
+/// runs is no change — through the real install the pending count is 0 and no refit is due (a
+/// counted tally said 2 with no refit due: a banner for ever, Refit now a no-op, the purge
+/// refused). The reverse order on a forgotten sample likewise.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn a_forget_and_restore_during_a_background_refit_leave_nothing_pending() {
+    let mut s = window();
+    assert!(s.begin_background_refit());
+    forget(&mut s, 30).unwrap();
+    assert_eq!(s.user_changes_pending(), 1);
+    restore(&mut s, 30).unwrap();
+    assert_eq!(s.user_changes_pending(), 0, "net zero");
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Installed(Ok(_))));
+    assert_eq!((s.user_changes_pending(), s.pending_refit()), (0, false));
+    // a forgotten sample restored and forgotten again during one
+    forget(&mut s, 12).unwrap();
+    s.refit().unwrap();
+    assert!(s.begin_background_refit());
+    restore(&mut s, 12).unwrap();
+    forget(&mut s, 12).unwrap();
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Installed(Ok(_))));
+    assert_eq!((s.user_changes_pending(), s.pending_refit()), (0, false));
+    s.ensure_loo_ratios();
+    assert_eq!(s.purge_refusal(), None, "the purge is not held back by a phantom change");
+}
+
+/// Review I1 (b): a reset while a background refit runs — the model forgotten, or another model
+/// loaded — leaves no stale count when that refit is then discarded (a counted tally gave its
+/// changes back regardless).
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn a_reset_during_a_background_refit_leaves_no_stale_count() {
+    // the model forgotten
+    let mut s = window();
+    forget(&mut s, 3).unwrap();
+    assert!(s.begin_background_refit());
+    forget(&mut s, 30).unwrap();
+    Trainable::forget(&mut s);
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Discarded(_) | BackgroundPoll::Idle));
+    assert_eq!(s.user_changes_pending(), 0);
+    // another model loaded (a file with nothing forgotten)
+    let path = std::env::temp_dir().join(format!("forget-reset-{}.model", std::process::id()));
+    window().save_sidecar(&path).unwrap();
+    let mut s = window();
+    forget(&mut s, 3).unwrap();
+    assert!(s.begin_background_refit());
+    forget(&mut s, 30).unwrap();
+    s.install_sidecar(surrogate::sidecar::read(&path).unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Discarded(_) | BackgroundPoll::Idle));
+    assert_eq!(s.user_changes_pending(), 0, "the loaded file's codes are its fit's");
+    assert_eq!(s.forgotten(), 0);
+}
+
+/// Review I1 (c): a background refit that ends in an error (here asked to stop at its next fit —
+/// it may or may not have finished a first fit) installs nothing new, and whatever the user
+/// changed that the installed fit does not hold is still pending — with a refit due
+/// (`user_changes_pending > 0` ⇒ `pending_refit`); the next refit clears it.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn a_failed_background_refit_keeps_the_changes_due() {
+    let mut s = window();
+    forget(&mut s, 17).unwrap();
+    assert!(s.begin_background_refit());
+    s.background.as_ref().unwrap().cancel_now();
+    forget(&mut s, 30).unwrap();
+    let _ = s.finish_background_refit();
+    let want = if fitted(&s, 17) { 2 } else { 1 };
+    assert_eq!(s.user_changes_pending(), want, "measured against the fit that stands");
+    assert!(s.pending_refit(), "a change no fit holds keeps a refit due");
+    s.refit().unwrap();
+    assert_eq!((s.user_changes_pending(), s.pending_refit()), (0, false));
+    assert!(!fitted(&s, 17) && !fitted(&s, 30));
+}
+
+/// Review I2, 2026-11-14: a model saved between a Forget and its refit (the session's close, or Save
+/// model, during the pending window) holds the forgotten sample in its fit but stores it as
+/// forgotten; loaded, the fit must not keep its contribution — the load rebuilds it, or makes the
+/// rebuild due — and the next refit fits exactly the samples in the fit, never appending to an
+/// accumulator that still holds the forgotten one.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn a_model_saved_before_the_refit_after_a_forget_loads_without_it() {
+    let mut s = window();
+    forget(&mut s, 17).unwrap();
+    let path = std::env::temp_dir().join(format!("forget-pending-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let mut back = SurrogateKs::new(Box::new(MorseDimer::h2()), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    back.install_sidecar(surrogate::sidecar::read(&path).unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(back.is_forgotten(17));
+    let n_acc = back.accumulator.as_ref().unwrap().n_samples;
+    assert!(n_acc == 39 || (back.pending_refit() && back.species_dirty), "the forgotten sample's contribution stays in the loaded fit: {n_acc} accumulated, pending {}", back.pending_refit());
+    back.refit().unwrap();
+    assert_eq!(back.accumulator.as_ref().unwrap().n_samples, 39, "the refit holds exactly the 39 fitted samples");
+    assert_eq!(back.report().unwrap().n_samples, 39);
+    assert!(!fitted(&back, 17));
+    assert_matches_a_rebuild(&mut back);
+    // the same with a sample kept after the fit: the file's prefix walk then reaches its fit's
+    // count by taking that later sample in the forgotten one's place — the label sums tell them
+    // apart, and the fit is rebuilt
+    let mut s = window();
+    forget(&mut s, 17).unwrap();
+    let mut rng = StdRng::seed_from_u64(31);
+    let sc = h2_at(1.47, &mut rng);
+    s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    assert_eq!(s.samples(), 41);
+    s.save_sidecar(&path).unwrap();
+    let mut back = SurrogateKs::new(Box::new(MorseDimer::h2()), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    back.install_sidecar(surrogate::sidecar::read(&path).unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(back.user_notes.iter().any(|n| n.contains("a sample forgotten before its refit")), "{:?}", back.user_notes);
+    back.refit().unwrap();
+    assert_eq!(back.accumulator.as_ref().unwrap().n_samples, 40, "39 fitted + the later one");
+    assert!(!fitted(&back, 17) && fitted(&back, 40));
+    assert_matches_a_rebuild(&mut back);
+}
+
+/// The accumulator's label sums equal those of a fit rebuilt from the stored samples now: no
+/// excluded sample's contribution is left in it.
+fn assert_matches_a_rebuild(s: &mut SurrogateKs) {
+    let sums = |s: &SurrogateKs| {
+        let a = s.accumulator.as_ref().unwrap();
+        (a.n_samples, a.sums().yy_e, a.sums().yy_f)
+    };
+    let before = sums(s);
+    s.species_dirty = true;
+    s.fit_store().unwrap();
+    let after = sums(s);
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * b.abs().max(f64::MIN_POSITIVE);
+    assert!(before.0 == after.0 && close(before.1, after.1) && close(before.2, after.2), "{before:?} vs a rebuild {after:?}");
+}

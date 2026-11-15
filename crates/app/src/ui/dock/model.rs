@@ -9,7 +9,9 @@
 //!    "trusted" and "strict here" paragraphs, the fit's own words) on the "why?" hover; the "N % DFT"
 //!    chip (fallbacks over the last 100 steps). Its second line is the surface chip ([`surface_chip`]:
 //!    "Shared · LSDA · h 0.15 · pseudo"; the old source line, provenance and folder key on hover)
-//!    and the sample count.
+//!    and the sample count. While Forget / Restore changes wait for their refit, the pending-refit
+//!    banner ([`refit_banner`]: "2 changes pending · refit in 8 s" with **Refit now**, or "refitting
+//!    · 1 more pending after this one") sits under the reason (2026-11-14, the batched forget).
 //! 2. **Teach next** (open): what blocks or helps teaching — the refused autoload, the box advice,
 //!    "no model yet" with Retry, Teach around blockers, the running pass's progress, the first-pass
 //!    offer — then the environment keys not learned yet ([`gaps`]: the scene's first, the others
@@ -17,7 +19,8 @@
 //!    with its cost, Cancel while a pass runs; the "Plan settings" fold; the audits line ("audits on
 //!    · every N steps" / "audits off (unsafe)") and the "Audits" fold (cadence, auto, draft mode).
 //! 3. **Health** (open): uncertainty against its bound, the last fit, the last audit — short.
-//! 4. Folds, closed: **Learned (k classes)**, **Worst-fitting samples** (spec 2026-11-12 R2),
+//! 4. Folds, closed: **Learned (k classes)**, **Worst-fitting samples** (spec 2026-11-12 R2; a
+//!    checkbox per row and "Forget N selected" / "Restore N selected", 2026-11-14),
 //!    **Details** (every readout row of the old grid, the provenance, the last pass, "What this
 //!    model is (and is not)") and **Model file** (the shared collection / a model file switch,
 //!    Import, Save a specialised model…, Save / Load / Forget model).
@@ -648,6 +651,10 @@ fn verdict_card(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, m: Option
                 super::super::probed("model-why", ui.label(RichText::new("why?").size(11.5).underline().color(theme::ACCENT_INK))).on_hover_text(&v.tip);
             }
         });
+        // the user's Forget / Restore waiting for their refit (2026-11-14, the batched forget)
+        if let Some(m) = m.filter(|_| st.backend == Backend::Estimated) {
+            refit_banner_row(ui, m, input.sampling(), acts);
+        }
         // the failed residual check's worst sample, with the Worst-fitting rows' Forget
         if let Some(id) = m.filter(|m| m.fitted).and_then(|m| trust(Some(m), input.scene, st).forget) {
             if super::super::probed(&format!("model-trust-forget-{}", id.index), ui.small_button(format!("Forget #{}", id.index)))
@@ -1097,8 +1104,49 @@ pub const SUSPECTS_CAPTION: &str = "Ranked by how badly the fit without each sam
 pub const SUSPECTS_NO_MODEL: &str = "no model yet: the samples are ranked once a fit stands";
 /// The section with a model whose ranking is not computed yet.
 pub const SUSPECTS_NO_RANKING: &str = "no ranking yet: it is computed with the next refit";
+/// The pending-refit banner (2026-11-14, the batched forget): the user's Forget / Restore changes
+/// no fit holds yet (`ModelStatus::user_changes_pending`) and when their refit starts
+/// (`ModelStatus::refit_due`, the worker's debounce) — "2 changes pending · refit in 8 s", "… ·
+/// refit starting", "… · the sampling pass's fit takes them" while a pass runs — or, while a refit
+/// runs, the ones queued after it: "refitting · 1 more pending after this one". `None` with nothing
+/// pending.
+pub fn refit_banner(m: &ModelStatus, sampling: bool, now: std::time::Instant) -> Option<String> {
+    let n = m.user_changes_pending;
+    if n == 0 {
+        return None;
+    }
+    if m.refit_running {
+        return Some(format!("refitting · {n} more pending after this one"));
+    }
+    let changes = if n == 1 { "1 change pending".to_string() } else { format!("{n} changes pending") };
+    Some(match m.refit_due {
+        _ if sampling => format!("{changes} · the sampling pass's fit takes them"),
+        Some(d) => match d.saturating_duration_since(now).as_secs_f64().ceil() as u64 {
+            0 => format!("{changes} · refit starting"),
+            s => format!("{changes} · refit in {s} s"),
+        },
+        None => format!("{changes} · refit due"),
+    })
+}
+
+/// The banner's hover.
+const REFIT_BANNER_TIP: &str = "Forget and Restore apply at once — a forgotten sample's geometries fall back to DFT straight away — but the model keeps its last fit until the refit runs. The refit waits 10 s after your last change (each one restarts the wait), so a run of Forgets refits once; Refit now starts it at once. A change made while a refit runs is applied at once and refitted right after it. Purging waits for the refit";
+
+/// The banner row of the verdict card ([`refit_banner`]) with **Refit now** (`Action::RefitNow`)
+/// while no refit runs; asks for a repaint so the countdown moves.
+fn refit_banner_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Action>) {
+    let Some(text) = refit_banner(m, sampling, std::time::Instant::now()) else { return };
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+    ui.horizontal_wrapped(|ui| {
+        super::super::probed("model-refit-banner", ui.label(RichText::new(&text).size(11.5).color(AMBER))).on_hover_text(REFIT_BANNER_TIP);
+        if !m.refit_running && !sampling && super::super::probed("refit-now", ui.small_button("Refit now")).on_hover_text("start the refit now instead of after the wait").clicked() {
+            acts.push(Action::RefitNow);
+        }
+    });
+}
+
 /// The hover of a row's Forget.
-const FORGET_SAMPLE_TIP: &str = "hold this sample out of the fit until you restore it: geometries near it fall back to DFT, and the trust recovery never releases it (it counts with the quarantined samples against the 10 % the recovery may hold out). Written at once — to the shared collection when it holds the sample — then the model refits without it";
+const FORGET_SAMPLE_TIP: &str = "hold this sample out of the fit until you restore it: geometries near it fall back to DFT, and the trust recovery never releases it (it counts with the quarantined samples against the 10 % the recovery may hold out). Written at once — to the shared collection when it holds the sample — then the model refits without it, 10 s after your last Forget or Restore (Refit now starts it at once). Check several rows to forget them together";
 
 /// "Purge forgotten (N)…"'s inline confirmation (2026-11-14), worded by where the `n` forgotten
 /// samples are: `in_collection` of them in the shared collection (the rest session-only), or — with
@@ -1120,9 +1168,13 @@ pub fn purge_confirm_text(n: usize, in_collection: usize, collection: bool) -> S
 const PURGE_TIP: &str = "delete the forgotten samples for good — from the shared collection's samples file too (its old file is kept as samples.bin.bak), or, with a model file, from the model (Save model then writes it without them). Only the samples you forgot: held, superseded, box-affected and draft samples stay. The fit is unchanged — they are already out of it — and later samples are renumbered. Purged samples no longer fence: geometries near them stop falling back to DFT, and they stop counting against the 10 % the trust recovery may hold out";
 
 /// The "Worst-fitting samples" section's body (spec R2): the fit's worst samples by their
-/// leave-one-out ratio (`ModelStatus::suspects`), each with **Forget** (`Action::ForgetSample`),
-/// the caption, and the forgotten samples, each with **Restore** (`Action::RestoreSample`); with no
-/// model, or no ranking yet, it says why. The forgotten list's header carries **Purge forgotten
+/// leave-one-out ratio (`ModelStatus::suspects`), each with a checkbox and **Forget**
+/// (`Action::ForgetSample`), "Forget N selected" under them while some are checked
+/// (`Action::ForgetSamples`, one batch; 2026-11-14), the caption, and the forgotten samples, each
+/// with a checkbox and **Restore** (`Action::RestoreSample`), "Restore N selected"
+/// (`Action::RestoreSamples`); the selections are kept to the ids the lists show
+/// (`UiState::forget_selection`, `restore_selection`). With no model, or no ranking yet, it says
+/// why. The forgotten list's header carries **Purge forgotten
 /// (N)…** (2026-11-14; hidden with none forgotten, disabled with the reason during a pass or a
 /// refit or when the provider refuses — `ModelStatus::purge_refusal`): it opens an inline
 /// confirmation whose **Purge** emits `Action::PurgeForgotten(n)` (disabled if a refusal appears
@@ -1139,9 +1191,11 @@ pub fn suspects(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling
             ui.weak(SUSPECTS_NO_RANKING);
         }
         Some(m) => {
+            st.forget_selection.retain(|id| m.suspects.iter().any(|s| s.id == *id));
             for s in &m.suspects {
                 // wrapped: a narrow panel puts Forget under the row instead of past the edge
                 ui.horizontal_wrapped(|ui| {
+                    select_box(ui, &mut st.forget_selection, s.id, &format!("select-sample-{}", s.id.index));
                     let worst = s.loo_ratio.is_some_and(|r| !(r <= 1.0));
                     ui.label(RichText::new(suspect_line(s)).monospace().size(11.5).color(if worst { AMBER } else { theme::INK }));
                     if super::super::probed(&format!("forget-sample-{}", s.id.index), ui.small_button("Forget")).on_hover_text(FORGET_SAMPLE_TIP).clicked() {
@@ -1149,13 +1203,24 @@ pub fn suspects(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling
                     }
                 });
             }
+            if !st.forget_selection.is_empty() {
+                let n = st.forget_selection.len();
+                if super::super::probed("forget-selected", ui.button(format!("Forget {n} selected")))
+                    .on_hover_text("forget the checked samples together: applied at once, then one refit — past 10 % of the samples held out (quarantined and forgotten together) the trust recovery holds no more, as with a single Forget")
+                    .clicked()
+                {
+                    acts.push(Action::ForgetSamples(st.forget_selection.clone()));
+                }
+            }
             ui.label(RichText::new(SUSPECTS_CAPTION).size(11.0).color(theme::INK_DIM));
         }
     }
     let Some(m) = m.filter(|m| !m.forgotten_samples.is_empty()) else {
         st.purge_confirm = false;
+        st.restore_selection.clear();
         return;
     };
+    st.restore_selection.retain(|id| m.forgotten_samples.iter().any(|s| s.id == *id));
     let n = m.forgotten_samples.len();
     let why = if sampling { Some("a sampling pass is running — purge once it is done") } else { m.purge_refusal.as_deref() };
     ui.add_space(4.0);
@@ -1201,14 +1266,34 @@ pub fn suspects(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling
     }
     for s in &m.forgotten_samples {
         ui.horizontal_wrapped(|ui| {
+            select_box(ui, &mut st.restore_selection, s.id, &format!("select-forgotten-{}", s.id.index));
             ui.label(RichText::new(suspect_line(s)).monospace().size(11.5).color(theme::INK_DIM));
             if super::super::probed(&format!("restore-sample-{}", s.id.index), ui.small_button("Restore"))
-                .on_hover_text("put this sample back into the fit (written at once; the model refits with it)")
+                .on_hover_text("put this sample back into the fit (written at once; the model refits with it 10 s after your last change, or at Refit now)")
                 .clicked()
             {
                 acts.push(Action::RestoreSample(s.id));
             }
         });
+    }
+    if !st.restore_selection.is_empty() {
+        let n = st.restore_selection.len();
+        if super::super::probed("restore-selected", ui.button(format!("Restore {n} selected"))).on_hover_text("put the checked samples back into the fit together: applied at once, then one refit").clicked() {
+            acts.push(Action::RestoreSamples(st.restore_selection.clone()));
+        }
+    }
+}
+
+/// A row's selection checkbox (probed as `probe`): checked while `sel` holds `id`; a click adds or
+/// removes it.
+fn select_box(ui: &mut Ui, sel: &mut Vec<sim::SampleId>, id: sim::SampleId, probe: &str) {
+    let mut on = sel.contains(&id);
+    if super::super::probed(probe, ui.checkbox(&mut on, "")).on_hover_text("select for the batch Forget / Restore below").changed() {
+        if on {
+            sel.push(id);
+        } else {
+            sel.retain(|x| *x != id);
+        }
     }
 }
 

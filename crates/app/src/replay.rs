@@ -414,6 +414,9 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::SaveSpecialised(_) => "specialised",
         Action::ForgetSample(_) => "forget-sample",
         Action::RestoreSample(_) => "restore-sample",
+        Action::ForgetSamples(_) => "forget-samples",
+        Action::RestoreSamples(_) => "restore-samples",
+        Action::RefitNow => "refit-now",
         Action::PurgeForgotten(_) => "purge-forgotten",
         Action::SampleAfterRefusal => "sample-after-refusal",
         Action::CompareReference { relax: false, .. } => "compare-reference",
@@ -443,8 +446,9 @@ fn harmless(kind: &str) -> bool {
     // nor does setting up PySCF (a replay never installs software: skipped), nor a capture (display only),
     // nor an import of data folders (it copies files into the installed build's root; a replay never does),
     // nor the updater's check, download and restart (a replay never touches the network or installs);
-    // a purge of forgotten samples is not harmless (refused, like Forget and Restore): the purged
-    // samples stop fencing, so the replayed run would diverge
+    // a purge of forgotten samples is not harmless (refused, like Forget and Restore and their
+    // batches): the purged samples stop fencing, so the replayed run would diverge; nor is Refit now
+    // (it moves when the model changes)
     matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup" | "capture" | "import-data" | "update")
 }
 

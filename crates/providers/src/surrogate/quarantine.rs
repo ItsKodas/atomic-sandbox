@@ -1633,24 +1633,7 @@ impl SurrogateKs {
     pub fn forget_sample(&mut self, id: sim::SampleId) -> Result<(), String> {
         let i = self.check_id(id)?;
         let n = self.samples();
-        match self.quarantine.get(i).copied().unwrap_or(Q_NONE) {
-            Q_NONE => {}
-            Q_FORGOTTEN | Q_FORGOTTEN_UNFENCED => return Err(format!("sample #{i} is forgotten already")),
-            q => {
-                return Err(format!(
-                    "sample #{i} is not in the fit ({}): only a sample in the fit can be forgotten",
-                    match q {
-                        Q_HELD => "quarantined by the trust recovery",
-                        Q_SUPERSEDED => "superseded by a fresh answer",
-                        Q_BOX => "box-excluded",
-                        Q_DRAFT => "a draft guess held out of the strict fit",
-                        Q_REF_WAIT => "waiting for its box's isolated-atom reference",
-                        Q_LONE => "lone atoms, held out for good",
-                        _ => "held out of the fit",
-                    }
-                ))
-            }
-        }
+        self.forgettable(i)?;
         let written = self.set_user_code(i, Q_FORGOTTEN);
         let out = (self.quarantined() + self.forgotten()) as f64;
         let cap = if out > QUARANTINE_MAX_FRACTION * n as f64 {
@@ -1664,6 +1647,119 @@ impl SurrogateKs {
         };
         self.user_notes.push(format!(
             "surrogate: sample #{i} forgotten — held out of the fit until Restore, and geometries near it fall back to DFT{written}; the refit decides without it (if it was the only sample of its kind, the trust rule's sample counts may refuse the model until more are sampled){cap}"
+        ));
+        Ok(())
+    }
+
+    /// Whether stored sample `i` may be forgotten: only one whose code is [`Q_NONE`] (fix round 1,
+    /// M3); else the refusal.
+    fn forgettable(&self, i: usize) -> Result<(), String> {
+        match self.quarantine.get(i).copied().unwrap_or(Q_NONE) {
+            Q_NONE => Ok(()),
+            Q_FORGOTTEN | Q_FORGOTTEN_UNFENCED => Err(format!("sample #{i} is forgotten already")),
+            q => Err(format!(
+                "sample #{i} is not in the fit ({}): only a sample in the fit can be forgotten",
+                match q {
+                    Q_HELD => "quarantined by the trust recovery",
+                    Q_SUPERSEDED => "superseded by a fresh answer",
+                    Q_BOX => "box-excluded",
+                    Q_DRAFT => "a draft guess held out of the strict fit",
+                    Q_REF_WAIT => "waiting for its box's isolated-atom reference",
+                    Q_LONE => "lone atoms, held out for good",
+                    _ => "held out of the fit",
+                }
+            )),
+        }
+    }
+
+    /// The batch's store indices (2026-11-14, the batched forget): every id checked
+    /// ([`check_id`](Self::check_id)) and by `ok`, none twice; the first refusal otherwise —
+    /// nothing changed.
+    fn batch_indices(&self, ids: &[sim::SampleId], ok: impl Fn(&Self, usize) -> Result<(), String>) -> Result<Vec<usize>, String> {
+        if ids.is_empty() {
+            return Err("no samples selected".into());
+        }
+        let mut out: Vec<usize> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let i = self.check_id(id)?;
+            if out.contains(&i) {
+                return Err(format!("sample #{i} is selected twice"));
+            }
+            ok(self, i)?;
+            out.push(i);
+        }
+        Ok(out)
+    }
+
+    /// The words on where a batch's statuses were written: each distinct one of
+    /// [`set_user_code`](Self::set_user_code)'s, in order.
+    fn batch_written(written: Vec<String>) -> String {
+        let mut seen: Vec<String> = Vec::new();
+        for w in written {
+            if !seen.contains(&w) {
+                seen.push(w);
+            }
+        }
+        seen.concat()
+    }
+
+    /// "#3, #7, #12" (a batch's note).
+    fn index_list(idx: &[usize]) -> String {
+        idx.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(", ")
+    }
+
+    /// **Forgets** every stored sample `ids` names **as one batch** (2026-11-14; the Model tab's
+    /// "Forget N selected"): all or nothing — every id is checked first ([`check_id`](Self::check_id),
+    /// each must be forgettable as for [`forget_sample`](Self::forget_sample), none twice). A batch
+    /// that takes the held and forgotten samples together past [`QUARANTINE_MAX_FRACTION`] of the
+    /// store is **applied** with the warning a single Forget gets (the coordinator's ruling,
+    /// 2026-11-14: a batch behaves as its Forgets one by one). Each status is written at once, one
+    /// refit is due, and one note says what was forgotten. One id is
+    /// [`forget_sample`](Self::forget_sample). `Err`, nothing changed.
+    pub fn forget_samples(&mut self, ids: &[sim::SampleId]) -> Result<(), String> {
+        if let [id] = ids {
+            return self.forget_sample(*id);
+        }
+        let idx = self.batch_indices(ids, |s, i| s.forgettable(i))?;
+        let n = self.samples();
+        let written: Vec<String> = idx.iter().map(|&i| self.set_user_code(i, Q_FORGOTTEN)).collect();
+        // the cap's warning, as a single Forget's (`forget_sample`)
+        let out = self.quarantined() + self.forgotten();
+        let cap = if out as f64 > QUARANTINE_MAX_FRACTION * n as f64 {
+            format!("; held and forgotten together are now {out} of {n} samples, past the {:.0} % the trust recovery may hold out — it holds no more", 100.0 * QUARANTINE_MAX_FRACTION)
+        } else {
+            String::new()
+        };
+        self.user_notes.push(format!(
+            "surrogate: {} samples forgotten ({}) — held out of the fit until Restore, and geometries near them fall back to DFT{}; the refit decides without them{cap}",
+            idx.len(),
+            Self::index_list(&idx),
+            Self::batch_written(written)
+        ));
+        Ok(())
+    }
+
+    /// Puts every forgotten sample `ids` names back **as one batch** (2026-11-14; "Restore N
+    /// selected"): all or nothing, as [`forget_samples`](Self::forget_samples) — each must be
+    /// forgotten; written at once, one refit due, one note. One id is
+    /// [`restore_sample`](Self::restore_sample). `Err`, nothing changed.
+    pub fn restore_samples(&mut self, ids: &[sim::SampleId]) -> Result<(), String> {
+        if let [id] = ids {
+            return self.restore_sample(*id);
+        }
+        let idx = self.batch_indices(ids, |s, i| if s.is_forgotten(i) { Ok(()) } else { Err(format!("sample #{i} is not forgotten")) })?;
+        let written: Vec<String> = idx
+            .iter()
+            .map(|&i| {
+                let code = self.released_code(i);
+                self.set_user_code(i, code)
+            })
+            .collect();
+        self.user_notes.push(format!(
+            "surrogate: {} samples restored ({}) — back in the fit at the refit{}",
+            idx.len(),
+            Self::index_list(&idx),
+            Self::batch_written(written)
         ));
         Ok(())
     }

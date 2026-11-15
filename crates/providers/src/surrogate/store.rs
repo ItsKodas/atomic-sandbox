@@ -512,8 +512,12 @@ impl SurrogateKs {
         } else if (members, rows) != (want_n, want_rows) || !close(yy_e, acc_ye) || !close(yy_f, acc_yf) {
             self.species_dirty = true;
             self.fit_store().map_err(|e| format!("the file's fit membership ({members} samples, {rows} rows) does not match its report ({want_n}, {want_rows}) and the rebuild failed: {e}"))?;
+            // (review I2, 2026-11-14: the usual cause — a model saved between a Forget and its
+            // refit, whose fit still held the sample its codes call forgotten)
+            let forgot = (0..self.accumulated.max(want_n).min(self.samples())).any(|i| self.is_forgotten(i));
             self.user_notes.push(format!(
-                "surrogate: the file's fit membership ({members} samples, {rows} rows) did not match its report ({want_n}, {want_rows}) or its label sums — the fit was rebuilt from its stored samples (no DFT)"
+                "surrogate: the file's fit membership ({members} samples, {rows} rows) did not match its report ({want_n}, {want_rows}) or its label sums{} — the fit was rebuilt from its stored samples (no DFT)",
+                if forgot { " (it was saved with a sample forgotten before its refit)" } else { "" }
             ));
         }
         if lone_in_fit == 0 {
