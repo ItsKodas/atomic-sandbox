@@ -617,19 +617,22 @@ pub struct ScfStats {
 /// Density on a box face above this (e/Bohr³) triggers the box-size warning.
 const BOUNDARY_DENSITY_WARN: f64 = 1e-5;
 
-/// Relative residual tolerance of the SCF's Poisson solves at any requested tol ≥ 1e-8, and the iteration cap of every
-/// Poisson solve in the SCF. Below tol 1e-8 the tolerance tightens with tol (`poisson_tol`).
+/// Relative residual tolerance of the SCF's Poisson solves at any requested tol ≥ 1e-7, and the iteration cap of every
+/// Poisson solve in the SCF. Below tol 1e-7 the tolerance tightens with tol (`poisson_tol`).
 const POISSON_TOL: f64 = 1e-10;
 const POISSON_MAX_ITER: usize = 5000;
 
-/// The Poisson tolerance of an SCF asked for Δρ < `tol`: `POISSON_TOL` capped at 1e-2·tol, i.e. exactly 1e-10 for every
-/// tol ≥ 1e-8 (those solves are bit-identical to the fixed tolerance) and 1e-11 at tol 1e-9. Why it follows tol: under
-/// `FermiDirac` a partly occupied pair responds to a level shift with ∂f/∂ε = f(1 − f)/kT (≈ 34/Ha at u = Δ/4kT = 0.65,
-/// kT = 5 mHa), which amplifies an inner-solver error into a density floor. Measured on V3's pinned H₄ (`validate`
-/// oracles, plan 2026-11-13 Task 6; 41³ × 0.30, tol 1e-9): at a fixed 1e-10 Δρ wanders between 2e-9 and 2e-7 for 200
-/// steps, whatever eig_tol (1e-9 … 1e-11); at 1e-11, 1e-12 and 1e-13 the cold solve converges in 18–20 steps. Gapped
-/// systems and exactly degenerate shells (f = ½, insensitive) do not amplify it.
-fn poisson_tol(tol: f64) -> f64 { POISSON_TOL.min(1e-2 * tol) }
+/// The Poisson tolerance of an SCF asked for Δρ < `tol`: `POISSON_TOL` capped at 1e-3·tol, i.e. exactly 1e-10 for every
+/// tol ≥ 1e-7 (1e-3·1e-7 == 1e-10 in f64; those solves are bit-identical to the fixed tolerance) and 1e-12 at tol 1e-9.
+/// Why it follows tol: under `FermiDirac` a partly occupied pair responds to a level shift with ∂f/∂ε = f(1 − f)/kT
+/// (≈ 34/Ha at u = Δ/4kT = 0.65, kT = 5 mHa), plus the intra-pair rotation (f₁ − f₂)/Δ (≈ 45/Ha), together ≈ 80–100×,
+/// which amplifies an inner-solver error into a density floor. Measured on V3's pinned H₄ (`validate` oracles, plan
+/// 2026-11-13 Task 6; 41³ × 0.30, tol 1e-9): at a fixed 1e-10 Δρ wanders between 2e-9 and 2e-7 for 200 steps, whatever
+/// eig_tol (1e-9 … 1e-11); at 1e-11, 1e-12 and 1e-13 the cold solve converges in 18–20 steps. The factor is 1e-3, not
+/// 1e-2 (Task 6 review): at 1e-2 the floor (≈ 1e-9) sat at tol and warm solves took 184 and 92 of 200 steps — a dip
+/// below a noise floor rather than a contraction. Gapped systems (≈ 3/Ha) and exactly degenerate shells (f = ½,
+/// insensitive) barely amplify it.
+fn poisson_tol(tol: f64) -> f64 { POISSON_TOL.min(1e-3 * tol) }
 
 /// Worst-case inner-solver diagnostics accumulated over an SCF run (see `ScfStats`).
 struct InnerStats { eigen_residual: f64, poisson_residual: f64, poisson_iterations: usize, poisson_tol: f64, warnings: Vec<String> }
@@ -1154,13 +1157,13 @@ mod tests {
         (stats.energy.total, stats)
     }
 
-    /// The SCF's Poisson tolerance follows the requested tol only below 1e-8 (plan 2026-11-13 Task 6 ruling): every
-    /// tol ≥ 1e-8 keeps `POISSON_TOL` = 1e-10 bit for bit; tol 1e-9 asks 1e-11.
+    /// The SCF's Poisson tolerance follows the requested tol only below 1e-7 (plan 2026-11-13 Task 6 ruling and its fix
+    /// round 1): every tol ≥ 1e-7 keeps `POISSON_TOL` = 1e-10 bit for bit; tol 1e-9 asks 1e-12.
     #[test]
     fn poisson_tol_follows_tight_scf_tol_only() {
         assert_eq!(poisson_tol(1e-6).to_bits(), 1e-10f64.to_bits());
-        assert_eq!(poisson_tol(1e-8).to_bits(), 1e-10f64.to_bits());
-        assert!((poisson_tol(1e-9) - 1e-11).abs() <= 1e-26, "{}", poisson_tol(1e-9));
+        assert_eq!(poisson_tol(1e-7).to_bits(), 1e-10f64.to_bits());
+        assert!((poisson_tol(1e-9) - 1e-12).abs() <= 1e-27, "{}", poisson_tol(1e-9));
     }
 
     #[test]

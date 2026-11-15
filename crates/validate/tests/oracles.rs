@@ -199,7 +199,7 @@ fn h2_force_vanishes_at_equilibrium() {
 
 /// δ of the V3 stencil (Bohr): central differences at δ/2, δ and 2δ (spec §9 V3 "Method").
 const V3_DELTA: f64 = 0.01;
-/// SCF tolerance of the V3 solves (spec §9 V3: CPU f64, tol 1e-9; `qm` then asks its Poisson solves for 1e-11).
+/// SCF tolerance of the V3 solves (spec §9 V3: CPU f64, tol 1e-9; `qm` then asks its Poisson solves for 1e-12).
 const V3_TOL: f64 = 1e-9;
 /// Eigensolver tolerance of the V3 solves (Task 6 ruling, test-local). Near the pinned pair an eigen residual r leaves the
 /// pair's mutual rotation θ ≈ r/Δ unresolved, which moves ρ_out by ≈ (f₁ − f₂)·θ ≈ 1e-8 at r = 1e-9 (Δ = 12.9 mHa,
@@ -252,7 +252,8 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
 }
 
 /// Solves the V3 stencil on `common::v3_h4()` (CPU f64, σ = h, tol `V3_TOL`, eig_tol `V3_EIG_TOL`, `FermiDirac { kt:
-/// ELECTRON_KT }`) and prints its table. Every solve must converge without a warning.
+/// ELECTRON_KT }`) and prints its table. Every solve must converge, with no warning but the box warning: its face density
+/// (≈ 1.7e-5) comes from the same Dirichlet box at every x, which is part of the discrete problem whose F is differentiated.
 fn v3_stencil() -> V3Stencil {
     let (g, sys, atom, axis) = common::v3_h4();
     let mut s = ScfSettings::for_grid(&g);
@@ -301,8 +302,8 @@ fn v3_stencil() -> V3Stencil {
 /// frontier split ≈ 2.6 kT), CPU f64, 41³ × 0.30, σ = h, tol 1e-9, eig_tol 1e-10, `FermiDirac { kt: ELECTRON_KT }`; eight
 /// solves (the centre cold, the six displaced ones warm from it, the centre again warm for the path scatter). The
 /// bounds are the spec's, verbatim: |R_F(δ/2, δ) − R_F(δ, 2δ)| ≤ 2.5e-5 Ha/Bohr (certifies the δ⁴ remainder); the
-/// δ-scaling ratio (FD_F(2δ) − HF)/(FD_F(δ) − HF) ∈ [3, 5] when |FD_F(δ) − HF| ≥ 1e-5 (pre-registered stop: b outside
-/// [−e/2, e/4] is a spec decision); |HF − R_F(δ/2, δ)| ≤ 1e-4 (the "M7 forces" Richardson bound); |HF − R_E(δ/2, δ)|
+/// δ-scaling ratio (FD_F(2δ) − HF)/(FD_F(δ) − HF) ∈ [3, 5] when |FD_F(δ) − HF| ≥ 1e-5 (pre-registered stop: b/e outside
+/// [−½, ¼] is a spec decision); |HF − R_F(δ/2, δ)| ≤ 1e-4 (the "M7 forces" Richardson bound); |HF − R_E(δ/2, δ)|
 /// ≥ 5e-4 (tells F's derivative from E's). Measured numbers: `references.md` "Fermi–Dirac migration", V3.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only oracle; run: cargo test -p validate --release")]

@@ -4773,11 +4773,12 @@ d(TS)/dx = −2.14e-2 … −2.39e-2 Ha/Bohr over the 4δ span (= −u sech²u �
 2.9e-5 Ha/Bohr; HF − R_E(δ/2, δ) = −2.27e-2 Ha/Bohr. The GPU Richardson pair (|R(δ/2, δ) − R(δ, 2δ)| = 2.3e-5) is at the
 f32 floor; the CPU test certifies it. Pre-registered (spec §9 V3): the measured F‴ ≈ 0.58 Ha/Bohr³ puts the plain
 truncation e ≈ 1e-5 at the δ-scaling check's own gate; Task 6 records e and b = HF − R_F separately; if the ratio check
-is asserted and b lies outside [−e/2, e/4], that is a spec decision, never a re-pin.
+is asserted and b lies outside [−e/2, e/4], that is a spec decision, never a re-pin. (Superseded: the stop rule reads
+b/e ∈ [−½, ¼], since the literal interval is empty for e < 0; see "V3 on the CPU" below and spec §9 V3.)
 
 **V3 on the CPU** (plan Task 6, 2026-11-15; `oracles.rs` `fd_forces_are_minus_df_dx_near_a_pinned_pair`, geometry
-`common::v3_h4()`; CPU f64, 41³ × 0.30, σ = h, tol 1e-9 (Poisson 1e-11 by `qm`'s `poisson_tol`), eig_tol 1e-10, FD at
-kT = 5 mHa; release, Ryzen 7 9800X3D, 4 solver threads, 395 s; **passes**). The aspect is confirmed: Δ = 12.93 mHa
+`common::v3_h4()`; CPU f64, 41³ × 0.30, σ = h, tol 1e-9 (Poisson 1e-12 by `qm`'s `poisson_tol`, Task 6 fix round 1), eig_tol
+1e-10, FD at kT = 5 mHa; release, Ryzen 7 9800X3D, 4 solver threads, 394 s; **passes**). The aspect is confirmed: Δ = 12.93 mHa
 (u = 0.646) at the centre, c = dΔ/dx = 0.0498 … 0.0540 Ha/Bohr and d(TS)/dx = −2.14e-2 … −2.39e-2 Ha/Bohr over every
 sub-interval of the 4δ span ((d(TS)/dx)/c = −0.429 … −0.443, against −u sech²u), plain |FD(δ) − FD(2δ)| = 2.96e-5.
 Every solve carries the box warning alone (face density 1.68–1.74e-5, the partly occupied level's tail; the same box
@@ -4786,21 +4787,25 @@ at every x, part of the discrete problem).
 | quantity | value (Ha/Bohr) | bound |
 |---|---|---|
 | HF (atom 0, x) | −0.0464015592 | |
-| FD_F(δ/2), FD_F(δ), FD_F(2δ) | −0.0464042301, −0.0464116125, −0.0464411725 | |
-| R_F(δ/2, δ), R_F(δ, 2δ) | **−0.0464017693, −0.0464017592** | |
-| \|R_F(δ/2, δ) − R_F(δ, 2δ)\| | **1.0e-8** | ≤ 2.5e-5 |
-| e = FD_F(δ) − R_F(δ/2, δ) | −9.84e-6 (F‴ = +0.591 Ha/Bohr³; A1 GPU 0.58) | recorded |
-| b = HF − R_F(δ/2, δ) | **+2.10e-7**; b/e = −0.021 | \|b\| ≤ 1e-4; b/e ∈ [−½, ¼] (pre-registered stop) |
-| FD_F(δ) − HF | −1.005e-5: **0.5 % above the 1e-5 gate**, so the ratio is asserted | asserted iff ≥ 1e-5 |
+| FD_F(δ/2), FD_F(δ), FD_F(2δ) | −0.0464042293, −0.0464116142, −0.0464411711 | |
+| R_F(δ/2, δ), R_F(δ, 2δ) | **−0.0464017677, −0.0464017620** | |
+| \|R_F(δ/2, δ) − R_F(δ, 2δ)\| | **5.7e-9** | ≤ 2.5e-5 |
+| e = FD_F(δ) − R_F(δ/2, δ) | −9.85e-6 (F‴ = +0.591 Ha/Bohr³; A1 GPU 0.58) | recorded |
+| b = HF − R_F(δ/2, δ) | **+2.09e-7**; b/e = −0.021 | \|b\| ≤ 1e-4; b/e ∈ [−½, ¼] (pre-registered stop) |
+| FD_F(δ) − HF | −1.006e-5: **0.6 % above the 1e-5 gate**, so the ratio is asserted | asserted iff ≥ 1e-5 |
 | (FD_F(2δ) − HF)/(FD_F(δ) − HF) | **3.940** | ∈ [3, 5] |
-| R_E(δ/2, δ), R_E(δ, 2δ) | −0.0237560866, −0.0237560625 | |
+| R_E(δ/2, δ), R_E(δ, 2δ) | −0.0237560843, −0.0237560654 | |
 | HF − R_E(δ/2, δ) | **−2.2645e-2** (45× the bound) | \|…\| ≥ 5e-4 |
-| centre warm (from +δ/2) − cold | F −1.6e-10 Ha, E −1.7e-10 Ha | (path scatter) |
+| centre warm (from +δ/2) − cold | F −6.2e-12 Ha, E −7.3e-12 Ha | (path scatter) |
 
 The ratio gate's margin is thin by construction (the pre-registration put e ≈ 1e-5 at the gate); the rule is kept as
-written (Task 6 ruling). Whether the ratio is asserted can flip on a 0.5 % change of FD_F(δ) − HF; when asserted it holds
-with b/e = −0.021, far inside [−½, ¼]. SCF steps per point (the centre cold, the rest warm from it): 23, 184, 28, 17, 92,
-30, 27 at x = −2δ … +2δ; the centre re-solve 18.
+written (Task 6 ruling). Whether the ratio is asserted can flip on a 0.6 % change of FD_F(δ) − HF; when asserted it holds
+with b/e = −0.021, far inside [−½, ¼]. **A run in which the ratio is not asserted (|FD_F(δ) − HF| just under 1e-5,
+printed "not asserted") is expected near this gate and is not a regression**; the check stays conditional as
+pre-registered (the Richardson certification already establishes the expansion regime). SCF steps per point (the centre cold, the rest warm from it): 121, 20, 27, 18, 52,
+29, 19 at x = −2δ … +2δ; the centre re-solve 19 (Poisson 1e-12). At the first ruling's 1e-2·tol (Poisson 1e-11) they
+were 23, 184, 28, 17, 92, 30, 27 and 18, with R_F 1.0e-8 apart and a path scatter of 1.6e-10 Ha; every asserted number
+agreed to its printed digits.
 
 **Why V3 needs tighter inner solvers** (Task 6 diagnosis; the ruling, option A, is in spec §9 V3). Near the pinned pair
 ∂f/∂ε = f(1 − f)/kT ≈ 34/Ha amplifies inner-solver error into a Δρ floor. The V3 centre, cold, tol 1e-9: at the old
@@ -4808,7 +4813,8 @@ fixed Poisson tolerance 1e-10 Δρ wandered between 2e-9 and 2e-7 for 200 steps 
 (F_HF ± 1e-9); at Poisson 1e-11 / 1e-12 / 1e-13 it converged in 20 / 18 / 20 steps. Warm re-solves at eig_tol 1e-9
 then sat at Δρ 1e-8 … 2e-7 (the pair's rotation θ ≈ r/Δ ≈ 8e-8 unresolved, ≈ (f₁ − f₂)θ in ρ): 200 steps without
 convergence at Poisson 1e-12, 196 at 1e-13; at eig_tol 1e-10 the same re-solve took 19. `qm` now asks its Poisson solves
-for min(1e-10, 1e-2·tol) (bit-identical for tol ≥ 1e-8), and V3 sets eig_tol 1e-10.
+for min(1e-10, 1e-3·tol) (bit-identical for tol ≥ 1e-7; Task 6 fix round 1, from 1e-2·tol, whose floor ≈ 1e-9 sat at
+tol), and V3 sets eig_tol 1e-10.
 
 **V5 NVE case: CO₂⁺, not N₃.** Pseudised N₃ (71³ × 0.20) is linear ²Π_g (R_e 2.224 Bohr, TS = 2 kT ln 2 within 1e-9,
 k_β = 0.128 Ha/rad², ω_b 543 cm⁻¹), but its ↓ π split grows only to 39 mHa at a 60° bend, after which the ↑ channel

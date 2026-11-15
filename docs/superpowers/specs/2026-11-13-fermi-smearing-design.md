@@ -1158,8 +1158,9 @@ printed six-decimal E and F, so it carries ±1e-6 of rounding. The two lopsided 
   - **[Task 6] Solver tolerances near a pinned pair.** The FD occupation response ∂f/∂ε = f(1 − f)/kT (≈ 34/Ha here)
     amplifies inner-solver error into a Δρ floor: at the CPU's fixed Poisson tolerance 1e-10 the V3 centre wandered at
     Δρ 2e-9 … 2e-7 for 200 steps whatever eig_tol, and with eig_tol 1e-9 a warm re-solve sat at 1e-8 … 2e-7 (the pair's
-    rotation θ ≈ r/Δ). Ruling (option A): `qm`'s SCF asks its Poisson solves for min(1e-10, 1e-2·tol) (bit-identical for
-    tol ≥ 1e-8; 1e-11 at tol 1e-9), and V3 sets eig_tol 1e-10 in its own settings. Loosening V3's tol was rejected.
+    rotation θ ≈ r/Δ). Ruling (option A, factor amended in Task 6 fix round 1): `qm`'s SCF asks its Poisson solves for
+    min(1e-10, 1e-3·tol) (bit-identical for tol ≥ 1e-7; 1e-12 at tol 1e-9; 1e-2·tol left the floor at tol, with warm
+    solves at 184 and 92 of 200 steps), and V3 sets eig_tol 1e-10 in its own settings. Loosening V3's tol was rejected.
 - **Must show both, on the Richardson value:**
   - |HF_x + dF/dx|_Rich ≤ 1e-4 Ha/Bohr (the "M7 forces" bound, which is defined on Richardson);
   - |HF_x + dE/dx|_Rich ≥ 5e-4 Ha/Bohr, so the test tells F's derivative from E's.
