@@ -735,6 +735,7 @@ impl SurrogateKs {
     /// The class rule's numbers and the readiness readout's worst sample per class (module doc,
     /// "Class-wise trust", "Readiness"): one pass sets `class_loo` and `class_worst`.
     pub(super) fn refresh_class_loo(&mut self) {
+        self.refit_stage(sim::RefitStage::LeaveOneOut);
         let (loo, worst, blockers, ratios) = self.compute_class_loo_full();
         // the per-sample leave-one-out ratios of this fit (spec ruling R1b), keyed to it
         self.loo_ratios = loo.is_some().then(|| LooRatios {
@@ -1249,11 +1250,19 @@ impl SurrogateKs {
                 self.0.end_refit();
             }
         }
+        let (samples, species, t0) = (self.samples(), self.store_species(), std::time::Instant::now());
         let _phase = self.probe.clone().map(|p| {
-            p.begin_refit(self.samples());
+            p.begin_refit(samples, species, false);
             RefitPhase(p)
         });
+        // the stages (`sim::refit_eta`): a background copy's are read at the install
+        self.refit_counts = Some(sim::RefitStages::default());
         let r = self.refit_inner();
+        let counts = if self.refit_fork { self.refit_counts } else { self.refit_counts.take() };
+        // the refit history (a copy's is the live provider's to record, at the install)
+        if let (false, Ok(_), Some(c)) = (self.refit_fork, r.as_ref(), counts) {
+            self.record_refit(t0.elapsed().as_secs_f64(), samples, species, false, c);
+        }
         // the quarantine codes a refit moved, and the history it judged by, go to the shared
         // collection (`shared` module doc) — a background refit's copy writes nothing: the live
         // provider does after the install (`background` module doc)
@@ -1795,6 +1804,7 @@ impl SurrogateKs {
         if store.is_empty() {
             return Err(FitError::NoSamples);
         }
+        self.refit_stage(sim::RefitStage::Fit);
         self.exclude_box_samples();
         let store = self.store.as_ref().expect("checked");
         let provenance = store.provenance.clone();

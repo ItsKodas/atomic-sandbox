@@ -653,7 +653,7 @@ fn verdict_card(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, m: Option
         });
         // the user's Forget / Restore waiting for their refit (2026-11-14, the batched forget)
         if let Some(m) = m.filter(|_| st.backend == Backend::Estimated) {
-            refit_banner_row(ui, m, input.sampling(), acts);
+            refit_banner_row(ui, m, input.sampling(), input.probe.as_ref().and_then(|p| p.refit.as_ref()), acts);
         }
         // the failed residual check's worst sample, with the Worst-fitting rows' Forget
         if let Some(id) = m.filter(|m| m.fitted).and_then(|m| trust(Some(m), input.scene, st).forget) {
@@ -1108,15 +1108,18 @@ pub const SUSPECTS_NO_RANKING: &str = "no ranking yet: it is computed with the n
 /// no fit holds yet (`ModelStatus::user_changes_pending`) and when their refit starts
 /// (`ModelStatus::refit_due`, the worker's debounce) — "2 changes pending · refit in 8 s", "… ·
 /// refit starting", "… · the sampling pass's fit takes them" while a pass runs — or, while a refit
-/// runs, the ones queued after it: "refitting · 1 more pending after this one". `None` with nothing
-/// pending.
-pub fn refit_banner(m: &ModelStatus, sampling: bool, now: std::time::Instant) -> Option<String> {
+/// runs, its time left (`refit`: the probe's, `sim::refit_eta`) and the ones queued after it:
+/// "refitting · about 2:20 left · 1 more pending after this one". A running refit with nothing
+/// queued has the banner from [`REFIT_BANNER_AFTER_S`] on (a refit of milliseconds does not
+/// flash one). `None` otherwise.
+pub fn refit_banner(m: &ModelStatus, sampling: bool, now: std::time::Instant, refit: Option<&sim::RefitView>) -> Option<String> {
     let n = m.user_changes_pending;
+    let left = refit.map(|r| format!(" · {}", crate::ui::activity::words::refit_eta_words(r, false))).unwrap_or_default();
     if n == 0 {
-        return None;
+        return refit.filter(|r| r.elapsed_s >= REFIT_BANNER_AFTER_S).map(|_| format!("refitting{left}"));
     }
-    if m.refit_running {
-        return Some(format!("refitting · {n} more pending after this one"));
+    if m.refit_running || refit.is_some() {
+        return Some(format!("refitting{left} · {n} more pending after this one"));
     }
     let changes = if n == 1 { "1 change pending".to_string() } else { format!("{n} changes pending") };
     Some(match m.refit_due {
@@ -1129,17 +1132,21 @@ pub fn refit_banner(m: &ModelStatus, sampling: bool, now: std::time::Instant) ->
     })
 }
 
+/// A running refit with no change queued after it has the banner from this many seconds on.
+pub const REFIT_BANNER_AFTER_S: f64 = 2.0;
+
 /// The banner's hover.
 const REFIT_BANNER_TIP: &str = "Forget and Restore apply at once — a forgotten sample's geometries fall back to DFT straight away — but the model keeps its last fit until the refit runs. The refit waits 10 s after your last change (each one restarts the wait), so a run of Forgets refits once; Refit now starts it at once. A change made while a refit runs is applied at once and refitted right after it. Purging waits for the refit";
 
 /// The banner row of the verdict card ([`refit_banner`]) with **Refit now** (`Action::RefitNow`)
 /// while no refit runs; asks for a repaint so the countdown moves.
-fn refit_banner_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Action>) {
-    let Some(text) = refit_banner(m, sampling, std::time::Instant::now()) else { return };
+fn refit_banner_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, refit: Option<&sim::RefitView>, acts: &mut Vec<Action>) {
+    let Some(text) = refit_banner(m, sampling, std::time::Instant::now(), refit) else { return };
     ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
     ui.horizontal_wrapped(|ui| {
-        super::super::probed("model-refit-banner", ui.label(RichText::new(&text).size(11.5).color(AMBER))).on_hover_text(REFIT_BANNER_TIP);
-        if !m.refit_running && !sampling && super::super::probed("refit-now", ui.small_button("Refit now")).on_hover_text("start the refit now instead of after the wait").clicked() {
+        let tip = if refit.is_some() { format!("{REFIT_BANNER_TIP}\n\n{}", crate::ui::activity::words::REFIT_ETA_TIP) } else { REFIT_BANNER_TIP.to_string() };
+        super::super::probed("model-refit-banner", ui.label(RichText::new(&text).size(11.5).color(AMBER))).on_hover_text(tip);
+        if !m.refit_running && refit.is_none() && !sampling && super::super::probed("refit-now", ui.small_button("Refit now")).on_hover_text("start the refit now instead of after the wait").clicked() {
             acts.push(Action::RefitNow);
         }
     });
