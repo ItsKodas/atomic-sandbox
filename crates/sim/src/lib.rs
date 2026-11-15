@@ -3,8 +3,10 @@
 //! learns). The providers themselves — Kohn-Sham and surrogate — live in the `providers` crate
 //! (M6, Task 1); `sim` depends on `units` and `gpu` (the display texture handle) only. The bond
 //! detector ([`bonds`]) and the isolated-atom references ([`references`]) it reads the density
-//! against are M6 Task 3.
+//! against are M6 Task 3. The pure part of the viewer's bonds from experience
+//! ([`bond_experience`]) moved here for the validate suite (live orbitals, Task 9).
 pub mod activity;
+pub mod bond_experience;
 pub mod bonds;
 pub mod charges;
 pub mod dynamics;
