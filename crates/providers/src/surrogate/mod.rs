@@ -414,7 +414,7 @@
 //! When the auditor's thread is gone the queued Harris job and the side queue go with it. It is **never** a fallback, an audit, a teacher
 //! solve, a sample or a teach event, and no counter moves (G4,
 //! `harris_job_is_never_a_fallback_or_audit`). `side_job_in_flight` holds while one is queued or
-//! running.
+//! running, and while its payload waits in `side_harris` for the driver (final review M2).
 //!
 //! **The isolated atoms are valence-only.** The auditor solves every `Atom` and `Reference` job
 //! with the display's partial core off, whatever `set_display_partial_core` says: each
@@ -3488,8 +3488,11 @@ impl Trainable for SurrogateKs {
         SurrogateKs::request_display(self, scene)
     }
 
+    /// A Harris payload polled in (`poll_side_jobs`, e.g. by the worker's per-round
+    /// `take_atom_densities`) but not yet taken by the driver is still in flight: else the worker's
+    /// lost-job check would read the job as lost and re-send it (final review M2).
     fn side_job_in_flight(&self) -> bool {
-        self.auditor.as_ref().is_some_and(|a| a.busy.is_some()) || !self.side_queue.is_empty() || self.harris_queued.is_some()
+        self.auditor.as_ref().is_some_and(|a| a.busy.is_some()) || !self.side_queue.is_empty() || self.harris_queued.is_some() || self.side_harris.is_some()
     }
 
     fn request_atom_density(&mut self, z: u8, scene: &Scene) -> bool {

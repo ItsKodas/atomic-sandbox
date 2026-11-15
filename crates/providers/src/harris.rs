@@ -63,9 +63,11 @@
 //! under an ionic setup includes the SCF's pseudo extras, `crate::ks::pseudo_extra_bytes`) and the
 //! orbital view (`crate::ks::orbital_view_footprint_bytes`) of the same n, n_σ and m, counted
 //! from `qm_gpu::harris`'s "Fields and VRAM":
-//! - the block per channel at its growth bound, n_σ + m + G + W vectors (G = `UNOCC_GUARD`; 0 for a
-//!   channel with n_σ + m = 0): the state's own vectors, a block grows behind its Ritz vectors (a
-//!   shared shell or a short window) up to that bound, and the fields it trims stay on the state's
+//! - the block per channel at its growth bound, n_σ + m + G + W + 1 vectors (G = `UNOCC_GUARD`; the
+//!   + 1 the untested buffer column, `qm_gpu::harris`'s `split_bound`; 0 for a channel with n_σ + m
+//!   = 0): the state's own vectors, a block grows behind its Ritz vectors (a shared shell or a short
+//!   window) up to that bound — and an `Aufbau` block whose window's last row and first guard are
+//!   one τ-set runs n_σ + m + G + 1 (final review M1) — and the fields it trims stay on the state's
 //!   free list. W = `MAX_WITNESS_GROWTH` under an ionic setup, 0 without: the occupations are
 //!   `DegenerateShells` exactly when there is a setup (`crate::ks::problem`), and `Aufbau` has no
 //!   window and n_occ = n_σ, so an all-electron block never grows (as `crate::ks::pseudo_extra_bytes`
@@ -73,8 +75,8 @@
 //! - 13 fields: ρ_in↑↓, ρ, V_H, v_nuc, v↑↓, exc, v_xc↑↓, ρ_out↑↓ and one scratch; + 3 under an ionic
 //!   setup (ρ_pc and the two xc inputs ρ_σ + ½ρ_pc);
 //! - the solver's one `LobpcgWork` (8 fields per vector) grown to the largest block, max n_σ + m +
-//!   G + W: the solve's term counts 8·max n_σ, and under a setup its pseudo extras the SCF's own
-//!   witness growth 8W, so what is left is 8(m + G), less the view's own growth of the same work
+//!   G + W + 1: the solve's term counts 8·max n_σ, and under a setup its pseudo extras the SCF's own
+//!   witness growth 8W, so what is left is 8(m + G + 1), less the view's own growth of the same work
 //!   space (`OrbitalView::work_growth_fields(m)` = 8(m + G) for m > 0), which the view's term counts;
 //! - × 1.2, the slack of the other terms (uniforms, readback buffers, allocator slack). The Harris
 //!   state's own `GpuIonic` (local tables, nonlocal point lists: ≈ (4 + 4·rows) bytes per point in
@@ -217,12 +219,13 @@ fn splat(grid: &qm::Grid, pos: [f64; 3], p: &AtomProfile, at: &mut Vec<usize>, v
 pub fn harris_footprint_bytes(n: usize, n_up: usize, n_dn: usize, m: usize, pseudised: bool) -> u64 {
     // the witness growth only under a setup: `DegenerateShells` exactly then (`crate::ks::problem`)
     let (g, w) = (UNOCC_GUARD, if pseudised { MAX_WITNESS_GROWTH } else { 0 });
-    let block = |n_s: usize| if n_s + m > 0 { n_s + m + g + w } else { 0 };
+    // + 1: the untested buffer column above the tested levels (`qm_gpu::harris`'s `split_bound`)
+    let block = |n_s: usize| if n_s + m > 0 { n_s + m + g + w + 1 } else { 0 };
     let vectors = block(n_up) + block(n_dn);
     let fields = if pseudised { 13 + 3 } else { 13 };
     // the one `LobpcgWork` grown to the largest block, less what the solve's term (its 8W witness
     // growth under a setup: `crate::ks::pseudo_extra_bytes`) and the view's term count of it
-    let work = 8 * (m + g) - OrbitalView::work_growth_fields(m);
+    let work = (8 * (m + g + 1)).saturating_sub(OrbitalView::work_growth_fields(m));
     ((vectors + fields + work) as u64 as f64 * field_bytes(n) as f64 * 1.2) as u64
 }
 
@@ -357,8 +360,10 @@ mod tests {
 
     /// Review fix round 2: the profile-count bound is asymmetric. A profile 5 % short of its count
     /// (a diffuse valence atom whose inscribed-sphere profile misses the cell's corners) is not
-    /// named; one 12 % short (a treatment mismatch is ≥ 10 %) is. The H 1s profile's count and its
-    /// values are scaled together, and the S_A bound (10 %) is checked to stay quiet at 5 %.
+    /// named; one 12 % short (a treatment mismatch is ≥ 10 %) is. At 5 % the H 1s profile's count
+    /// and its values are scaled together, and the S_A bound (10 %) is checked to stay quiet. At
+    /// 12 % only the count is scaled (final review M6): ρ is untouched, so S_A stays ≈ 1 and only the
+    /// shortfall bound can name the atom.
     #[test]
     fn a_short_profile_is_named_only_beyond_the_shortfall_bound() {
         let (n, h) = (61usize, 0.2);
@@ -369,24 +374,28 @@ mod tests {
         let r = superposition(&grid, &nuclei, std::slice::from_ref(&scaled(0.95)), &[1.0], 1, 0).expect("built");
         println!("5 % short: S_A {:?}, notes {:?}", r.per_atom, r.notes);
         assert!(r.notes.is_empty(), "{:?}", r.notes);
-        let r = superposition(&grid, &nuclei, std::slice::from_ref(&scaled(0.88)), &[1.0], 1, 0).expect("built");
-        println!("12 % short: S_A {:?}, notes {:?}", r.per_atom, r.notes);
+        let short_count = AtomProfile { electrons: 0.88 * p.electrons, ..p.clone() };
+        let r = superposition(&grid, &nuclei, std::slice::from_ref(&short_count), &[1.0], 1, 0).expect("built");
+        println!("12 % short (count only): S_A {:?}, notes {:?}", r.per_atom, r.notes);
+        assert!((r.per_atom[0] - 1.0).abs() <= ON_GRID_TOLERANCE, "S_A alone would not catch it: {:?}", r.per_atom);
         assert_eq!(r.notes.len(), 1, "{:?}", r.notes);
         assert!(r.notes[0].starts_with("atom 0 (H)") && r.notes[0].contains("0.880 electrons"), "{:?}", r.notes);
     }
 
-    /// The memory term's field count (module doc, "GPU memory"), at the counts it is built from:
-    /// H₂ all-electron, m = 0: blocks 2 × (1 + 2) + 13 + the work's 8·2 = 35 fields; m = 4: blocks
-    /// 2 × 7 + 13 + (8·6 − the view's 8·6) = 27; pseudo-O triplet (n = 4, 2) at m = 2: blocks
-    /// (4 + 2 + 2 + 16) + (2 + 2 + 2 + 16) + 16 + (8·4 − the view's 8·4) = 46 + 16 + 0 = 62 (the
-    /// work's 8W witness growth is the solve's term's, `pseudo_extra_bytes`: Task 4 review M1); at
-    /// m = 0: (4 + 2 + 16) + (2 + 2 + 16) + 16 + 8·2 = 42 + 16 + 16 = 74; an empty channel (H atom
-    /// ↓, m = 0) holds no block.
+    /// The memory term's field count (module doc, "GPU memory"), at the counts it is built from;
+    /// every block and the work include the untested buffer column (+ 1 vector per channel, + 8
+    /// work fields: final review M1 — the solve's `split_bound` is n + m + G + W + 1, was 35 / 27 /
+    /// 62 / 74 / 32 without it). H₂ all-electron, m = 0: blocks 2 × (1 + 2 + 1) + 13 + the work's
+    /// 8·3 = 45 fields; m = 4: blocks 2 × 8 + 13 + (8·7 − the view's 8·6) = 37; pseudo-O triplet
+    /// (n = 4, 2) at m = 2: blocks (4 + 2 + 2 + 16 + 1) + (2 + 2 + 2 + 16 + 1) + 16 + (8·5 − the
+    /// view's 8·4) = 48 + 16 + 8 = 72 (the work's 8W witness growth is the solve's term's,
+    /// `pseudo_extra_bytes`: Task 4 review M1); at m = 0: (4 + 2 + 16 + 1) + (2 + 2 + 16 + 1) + 16 +
+    /// 8·3 = 44 + 16 + 24 = 84; an empty channel (H atom ↓, m = 0) holds no block.
     #[test]
     fn harris_footprint_counts_its_fields() {
         let fields = |b: u64| b as f64 / (field_bytes(33) as f64 * 1.2);
         let at = |n_up, n_dn, m, ps| fields(harris_footprint_bytes(33, n_up, n_dn, m, ps));
-        for (got, want) in [(at(1, 1, 0, false), 35.0), (at(1, 1, 4, false), 27.0), (at(4, 2, 2, true), 62.0), (at(4, 2, 0, true), 74.0), (at(1, 0, 0, false), 3.0 + 13.0 + 16.0)] {
+        for (got, want) in [(at(1, 1, 0, false), 45.0), (at(1, 1, 4, false), 37.0), (at(4, 2, 2, true), 72.0), (at(4, 2, 0, true), 84.0), (at(1, 0, 0, false), 4.0 + 13.0 + 24.0)] {
             assert!((got - want).abs() < 1e-3, "{got} fields, expected {want} (the bytes are truncated to an integer)");
         }
     }

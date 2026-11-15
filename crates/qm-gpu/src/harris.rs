@@ -547,6 +547,12 @@ impl GpuSolver {
                     let (hr, gr) = es.split_residual.expect("a split solve");
                     notes.push(format!("spin {}: the eigensolve ended at its {EIGEN_MAX_ITER}-iteration cap (displayed levels' residual {hr:.1e}, tol {tol:.1e}; guard levels' {gr:.1e}, tol {guard_tol:.0e})", SPIN[ch]));
                 }
+                // what counts as occupied is f > 0, the lowest by rank under both of today's rules. The
+                // match is exhaustive on purpose (final review M7; module doc "Fermi–Dirac"): a new
+                // variant (FD, branch scf-stall) must decide what Harris counts as occupied
+                match settings.occupations {
+                    Occupations::Aufbau | Occupations::DegenerateShells { .. } => {}
+                }
                 // the occupations of this one diagonalisation; the f > 0 levels are the lowest by rank
                 let one = one_shot_occupations(&ev, nc, ch as u8, settings.occupations);
                 let n_occ = one.f.iter().filter(|f| **f > 0.0).count();

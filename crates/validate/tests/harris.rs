@@ -77,7 +77,8 @@
 //! density.** Would bonds and partial charges read from the Harris ρ_out beat the viewer's bond
 //! experience (`sim::bond_experience`) between DFT solves? Three frame sets (`va4_…_h2o`,
 //! `va4_…_h2_scan`, `va4_…_h2_plus_h`; brief, verbatim): (a) a sampling pass on H₂O (97³; 60
-//! perturbations σ 0.15, no burst, no scans; `common::surrogate::student` + `sample_and_fit`), its
+//! perturbations σ 0.15, no burst, no scans; `common::surrogate::student` + `sample_and_fit_with_floor`,
+//! the sampler's time limit off — in one process a solve may wait minutes for the suite's GPU lock), its
 //! samples in store order, the first 40 train experience and the last 20 are held out; (b) H₂ at R =
 //! 0.8, 1.0, …, 6.0 (81³); (c) H₂ + H, the third H at d = 6.0, 5.75, …, 2.0 Bohr from H₂'s centre on
 //! its axis (81³, the chain centred in the box: at d = 6 a third H measured from an H₂ at the origin
@@ -730,7 +731,8 @@ fn h2_plus_h_at(d: f64) -> Scene {
 }
 
 /// V-A4 (record only; module doc), frame set (a): a sampling pass on H₂O (97³, `Accepted`; 60
-/// perturbations, no burst, no scans) through `common::surrogate::student` + `sample_and_fit`; its
+/// perturbations, no burst, no scans) through `common::surrogate::student` + `sample_and_fit_with_floor`
+/// (the sampler's time limit off; every job must solve); its
 /// samples in store order, the first 40 train experience, the last 20 are held out. Measured
 /// (2026-11-16, 997 s; `references.md` "Live orbitals", V-A4): Harris bonded agreement 39/39 near the
 /// bond length, 20/21 stretched (the miss an SCF-side detector miss next to the pseudised O), kinds
@@ -740,12 +742,17 @@ fn h2_plus_h_at(d: f64) -> Scene {
 fn va4_harris_bonds_against_scf_and_experience_h2o() {
     let Some(ctx) = gpu() else { return };
     let t = Instant::now();
-    // the student's teacher takes the GPU lock per evaluation: the pass runs without ours
+    // the student's teacher takes the GPU lock per evaluation: the pass runs without ours. The
+    // other harris tests hold that lock for their whole bodies (75–116 s each), so a solve here
+    // can wait minutes for it; the sampler's time limit would count that wait as a failed solve.
+    // It is off (an infinite floor): it is a viewer-responsiveness device, not part of this
+    // measurement, and a real SCF stall still counts as failed (final review I1).
     let (mut st, _log) = common::surrogate::student(&ctx, 0);
     let plan = sim::SamplingPlan { perturbations: 60, hot_burst_steps: 0, scan_points_per_pair: 0, ..Default::default() };
     let mut out = String::new();
-    common::surrogate::sample_and_fit(&mut st, &h2o(), &plan, &mut out);
+    let (_, _, p) = common::surrogate::sample_and_fit_with_floor(&mut st, &h2o(), &plan, Some(f64::INFINITY), &mut out);
     print!("V-A4 H₂O sampling pass ({:.0} s):\n{out}", t.elapsed().as_secs_f64());
+    assert_eq!((p.failed, p.skipped), (0, 0), "sampling pass: {p:?}");
     let samples: Vec<_> = st.store().expect("samples").samples.iter().filter(|s| s.z.len() == 3).cloned().collect();
     drop(st);
     println!("  {} three-atom samples in store order", samples.len());

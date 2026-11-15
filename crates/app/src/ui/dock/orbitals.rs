@@ -1293,15 +1293,7 @@ fn view_card(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, payload: Opt
         ui.add_space(2.0);
         let short = if st.show == ShowMode::Spin { SPIN_SHORT } else { KS_SHORT };
         // a display solve's orbitals: the hover says what they are too (spec §6)
-        let harris = if payload.is_some_and(is_harris) { format!("
-
-{HARRIS_WHAT}
-
-{HARRIS_EPS_TIP}
-
-{HARRIS_SHAPES}
-
-{HARRIS_DENSITY_NOTE}") } else { String::new() };
+        let harris = if payload.is_some_and(is_harris) { format!("\n\n{HARRIS_WHAT}\n\n{HARRIS_EPS_TIP}\n\n{HARRIS_SHAPES}\n\n{HARRIS_DENSITY_NOTE}") } else { String::new() };
         let r = ui.add(egui::Label::new(RichText::new(short).size(11.0).color(theme::INK_DIM)).truncate()).on_hover_text(format!("{KS_NOTE} {SPIN_NOTE}{harris}"));
         super::super::probe("orbitals-ks-note", &r);
         if let Some(l) = &input.orbital_label {

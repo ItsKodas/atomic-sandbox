@@ -212,6 +212,28 @@ fn a_cancelled_harris_leaves_no_note() {
     assert!(s.pending_notes.is_empty(), "no note: {:?}", s.pending_notes);
 }
 
+/// Final review M2: a Harris payload polled in (the worker's per-round `take_atom_densities`
+/// polls the auditor) but not yet taken by the driver still counts as in flight — the auditor is
+/// idle by then, and the worker's lost-job check would otherwise re-send the same geometry.
+#[test]
+fn a_polled_harris_payload_is_in_flight_until_taken() {
+    let (s, h) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    let (mut s, open, _log) = harris_gated(s, h);
+    let job = queued(&mut s, &h2(1.40), &no_atoms());
+    open.store(true, SeqCst);
+    let t0 = Instant::now();
+    while s.side_harris.is_none() {
+        assert!(s.take_atom_densities().is_empty(), "no atom job was asked for");
+        assert!(t0.elapsed().as_secs_f64() < 2.0, "the Harris payload did not arrive");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(s.auditor_idle() && s.harris_queued.is_none() && s.side_queue.is_empty(), "nothing else in flight");
+    assert!(Trainable::side_job_in_flight(&s), "the payload is not in the driver yet");
+    let d = s.take_side_display().expect("the Harris payload");
+    assert_eq!((d.kind, d.job), (SideKind::Harris, job));
+    assert!(!Trainable::side_job_in_flight(&s), "taken");
+}
+
 /// A gated auditor teacher whose thread dies (it panics) once the gate opens.
 struct Dies {
     open: Arc<AtomicBool>,
