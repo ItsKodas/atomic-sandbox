@@ -138,6 +138,78 @@ pub struct EigenStats {
     pub aborted: bool,
 }
 
+/// The eigen-decomposition of a small symmetric matrix, **checked** (plan 2026-11-13 Task 9b fix round 1, review I1):
+/// `nalgebra::SymmetricEigen`, then every pair's residual ‖A v − λ v‖ against `SYM_EIGEN_CHECK`·(1 + max|λ|); when any
+/// pair fails, the decomposition is refined by cyclic Jacobi on VᵀAV (V nalgebra's eigenvectors, when orthonormal to
+/// 1e-10; from A itself otherwise), which converges in a sweep or two from a nearly diagonal start and is accurate to
+/// rounding. Measured: on LOBPCG's reduced problems nalgebra 0.33.3 often returns pair residuals of 1e-7 … 1e-4 and
+/// sometimes wrong pairings (residual 0.17 … 4.1 Ha; on the 24 × 24 matrix of the GPU pseudo-H₂O display solve the
+/// eigenvalues −0.8687 and +0.7195 carried each other's eigenvectors, so LOBPCG formed the converged 2s column from
+/// the wrong coefficients and lost the level). A decomposition that passes is returned unchanged, bit for bit.
+/// Eigenvalues are in no particular order (as `SymmetricEigen`'s).
+pub fn sym_eigen(a: DMatrix<f64>) -> SymmetricEigen<f64, nalgebra::Dyn> {
+    let e = SymmetricEigen::new(a.clone());
+    let n = e.eigenvalues.len();
+    let scale = 1.0 + e.eigenvalues.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    let bad = (0..n).any(|k| {
+        let v = e.eigenvectors.column(k);
+        !((&a * v - v * e.eigenvalues[k]).norm() <= SYM_EIGEN_CHECK * scale)
+    });
+    if !bad { return e; }
+    let v = e.eigenvectors;
+    let orthonormal = (v.transpose() * &v - DMatrix::<f64>::identity(n, n)).norm() <= 1e-10;
+    if !orthonormal { return jacobi_sym_eigen(a); }
+    let m = v.transpose() * &a * &v;
+    let m = DMatrix::from_fn(n, n, |i, j| 0.5 * (m[(i, j)] + m[(j, i)]));
+    let r = jacobi_sym_eigen(m);
+    SymmetricEigen { eigenvectors: v * r.eigenvectors, eigenvalues: r.eigenvalues }
+}
+
+/// The pair-residual bound of `sym_eigen`, relative to 1 + max|λ|: 10³ × the f64 rounding of an accurate symmetric
+/// eigen-decomposition (≈ 1e-14·‖A‖ per pair).
+pub const SYM_EIGEN_CHECK: f64 = 1e-11;
+
+/// The cyclic Jacobi eigenvalue method (Golub & Van Loan, *Matrix Computations*, §8.5), the fallback of `sym_eigen`:
+/// plane rotations zero each off-diagonal entry in turn until the off-diagonal norm is below 1e-15 × the matrix norm
+/// (or 100 sweeps). Slower than QR but unconditionally robust; eigenvectors are orthonormal to rounding.
+pub fn jacobi_sym_eigen(mut a: DMatrix<f64>) -> SymmetricEigen<f64, nalgebra::Dyn> {
+    let n = a.nrows();
+    let mut v = DMatrix::<f64>::identity(n, n);
+    let norm = a.norm();
+    for _ in 0..100 {
+        let off: f64 = (0..n).flat_map(|i| (0..n).filter(move |&j| j != i).map(move |j| (i, j))).map(|(i, j)| a[(i, j)] * a[(i, j)]).sum::<f64>().sqrt();
+        if !(off > 1e-15 * norm) { break; }
+        for p in 0..n {
+            for q in p + 1..n {
+                let apq = a[(p, q)];
+                if apq == 0.0 { continue; }
+                let theta = (a[(q, q)] - a[(p, p)]) / (2.0 * apq);
+                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                let t = if theta == 0.0 { 1.0 } else { t };
+                let c = 1.0 / (t * t + 1.0).sqrt();
+                let s = t * c;
+                for k in 0..n {
+                    let (akp, akq) = (a[(k, p)], a[(k, q)]);
+                    a[(k, p)] = c * akp - s * akq;
+                    a[(k, q)] = s * akp + c * akq;
+                }
+                for k in 0..n {
+                    let (apk, aqk) = (a[(p, k)], a[(q, k)]);
+                    a[(p, k)] = c * apk - s * aqk;
+                    a[(q, k)] = s * apk + c * aqk;
+                }
+                for k in 0..n {
+                    let (vkp, vkq) = (v[(k, p)], v[(k, q)]);
+                    v[(k, p)] = c * vkp - s * vkq;
+                    v[(k, q)] = s * vkp + c * vkq;
+                }
+            }
+        }
+    }
+    let eigenvalues = nalgebra::DVector::from_fn(n, |i, _| a[(i, i)]);
+    SymmetricEigen { eigenvectors: v, eigenvalues }
+}
+
 /// Number of damped-Jacobi sweeps in `jacobi_precond` (1 = plain diagonal scaling).
 pub const JACOBI_SWEEPS: usize = 4;
 
@@ -269,7 +341,7 @@ fn lobpcg_impl(grid: &Grid, op: &dyn Operator, x: &mut [Vec<f64>], evals: &mut [
             let v = grid.dot(&s[i], &hs[j]);
             a[(i, j)] = v; a[(j, i)] = v;
         }}
-        let eig = SymmetricEigen::new(a);
+        let eig = sym_eigen(a);
         // SymmetricEigen does not sort; take the k lowest Ritz values explicitly.
         let mut order: Vec<usize> = (0..m).collect();
         order.sort_by(|&i, &j| eig.eigenvalues[i].total_cmp(&eig.eigenvalues[j]));
@@ -377,6 +449,29 @@ mod tests {
         assert_eq!(tiered.max_residual, rc.iter().copied().fold(0.0, f64::max));
         assert!(tiered.iterations <= full.iterations);
         assert!((ec[0] - 1.5).abs() < 1e-4, "{ec:?}");
+    }
+
+    /// Plan Task 9b fix round 1 (I1): `sym_eigen` returns correct pairs where they are checked, and the Jacobi fallback
+    /// decomposes a matrix with a near-degenerate cluster and a wide spread to rounding.
+    #[test]
+    fn sym_eigen_pairs_are_checked() {
+        let n = 30;
+        let mut seed = 7u64;
+        let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5 };
+        let q = DMatrix::from_fn(n, n, |_, _| rnd()).qr().q();
+        let lam: Vec<f64> = (0..n).map(|i| if i < 3 { -0.8686 + 1e-12 * i as f64 } else { 70.0 * i as f64 / n as f64 }).collect();
+        let a = &q * DMatrix::from_diagonal(&nalgebra::DVector::from_vec(lam.clone())) * q.transpose();
+        let a = DMatrix::from_fn(n, n, |i, j| 0.5 * (a[(i, j)] + a[(j, i)]));
+        for e in [sym_eigen(a.clone()), jacobi_sym_eigen(a.clone())] {
+            let worst = (0..n).map(|k| { let v = e.eigenvectors.column(k); (&a * v - v * e.eigenvalues[k]).norm() }).fold(0.0, f64::max);
+            let ortho = (e.eigenvectors.transpose() * &e.eigenvectors - DMatrix::<f64>::identity(n, n)).norm();
+            let mut got: Vec<f64> = e.eigenvalues.iter().copied().collect();
+            got.sort_by(f64::total_cmp);
+            let mut want = lam.clone();
+            want.sort_by(f64::total_cmp);
+            let dev = got.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+            assert!(worst < 1e-10 && ortho < 1e-10 && dev < 1e-10, "residual {worst:e}, orthonormality {ortho:e}, eigenvalues {dev:e}");
+        }
     }
 
     #[test]

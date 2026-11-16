@@ -5187,7 +5187,8 @@ split stop, locking, frozen definition, convergence-phase guess band and formati
 `qm_gpu::scf` module docs. In short:
 - a column is **loose** iff the tail sum of upper-bound occupations f̂ = f(θ − r; μ) over it and every column above it
   is below 1e-2·tol (tol = the SCF's Δρ stop); loose columns are held to `WITNESS_GUARD_TOL` = 1e-3 Ha, the rest
-  (tight) to the step's eigen tol; ∫|δρ| from the loose set ≤ (2 + g/kT)·Σ_L f = 2.2e-2·tol;
+  (tight) to the step's eigen tol; ∫|δρ| from the loose set ≤ (2 + 2g/kT)·Σ_L f = 2.4e-2·tol (≲ 2.9e-2·tol with
+  the loose levels' shift of μ; review M1 corrected a first 2.2 that omitted the loose columns' own weight change);
 - the witness reads the lower bound θ_top − r_top (Krylov–Weinstein), never the Ritz value alone;
 - growth doubles the extra block (1, 2, 4, …, the cap) and the overshoot is trimmed above the lowest witness;
 - the cap is min(`MAX_WITNESS_GROWTH` = 32, what the VRAM budget fits) (`providers::ks::witness_cap_for`); the
@@ -5221,10 +5222,15 @@ step, before the convergence-phase rule): 19 steps / 2 resets; off-site Li 33³ 
 the extrapolated H₂ MD path 7.11 steps against 8.00 plain (5.78 before 9b). With the rule: Li 93 / 5, MD path
 6.67 / 8.00, H₃⁺ 13 / 0.
 
-**GPU, the formation check** (`qm_gpu::eigen` "Ritz vectors that do not match their Ritz values"): the pseudo-H₂O
-orbital-display solve (33³, m = 2) lost its converged 2s column in one step at iteration 185 of a 200-iteration grind
-(λ = +0.770 against θ = −0.8687 Ha) and was rejected (|Δε_occ| 0.458 Ha); redoing the step on the MGS basis formed the
-same wrong vector, dropping P (the LOBPCG restart) fixed it: both channels keep the 2s and the solve is accepted.
+**GPU, the lost level — root cause** (task 9b review I1, fix round 1). The pseudo-H₂O orbital-display solve (33³,
+m = 2) lost its converged 2s column at iteration 196 (λ = +0.719 against θ = −0.8687 Ha; rejected, |Δε_occ| 0.458 Ha).
+A formation diagnostic at every step localised it: fused Gram vs f64 dots ≤ 3e-8 relative, GPU lincomb vs f64 S·c
+≤ 8e-8, fresh H·s vs the stored H-products ≤ 5e-12, ghost cells all zero — and the coefficient vector's own Rayleigh
+quotient on the measured A, B was +0.719: `nalgebra::SymmetricEigen` 0.33.3 had paired two eigenvalues of the reduced
+24 × 24 Â with each other's eigenvectors (residual 1.59; every other pair ≤ 2e-13). The dense eigensolves of both
+LOBPCGs now go through `qm::eigen::sym_eigen` (every pair's residual checked, cyclic Jacobi on a failure; bit-neutral
+when the check passes); the dumped matrices are a regression test. The trace-based formation check with the restart
+without P stays as a safety net, counted in `EigenStats::restores` (exhaustion: an error on the SCF path).
 
 **GPU, cost at large blocks.** The fused Gram's greedy planner (`qm_gpu::reduce::plan_gram`) ran on the CPU every
 LOBPCG iteration: 2.65 s per iteration at a 37-column witness block (S of 101 columns) against ≈ 15 ms at 13 columns;

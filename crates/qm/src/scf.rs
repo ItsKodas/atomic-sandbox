@@ -1468,20 +1468,27 @@ mod tests {
 
     // Step 1's output on the code before M7 (86974e3), verbatim. Held: asserted under an explicit `Occupations::Aufbau`
     // (the kT → 0 reference path, unchanged by plan Task 7).
-    const BASE_H2_E: u64 = 0xbfee7a76b2327147;
-    const BASE_H2_FX: u64 = 0x3fc07b1358ca116a; // 10 SCF steps
-    const BASE_LIH_E: u64 = 0xc014e13070f24df5;
-    const BASE_LIH_FX: u64 = 0xbf97397795d2fce0; // 13 SCF steps
+    // Re-pinned in plan 2026-11-13 Task 9b fix round 1 (review I1): LOBPCG's dense eigensolve now goes through the checked
+    // `eigen::sym_eigen`, which refines nalgebra's decomposition by Jacobi when a pair residual exceeds 1e-11·(1 + max|λ|)
+    // (nalgebra 0.33.3 returns 1e-7 … 1e-4 residuals and sometimes wrong pairings on these matrices); the Aufbau energies
+    // move by ≤ 1.4e-11 Ha (pre-fix bits: H₂ 0xbfee7a76b2327147 / 0x3fc07b1358ca116a, LiH 0xc014e13070f24df5 /
+    // 0xbf97397795d2fce0).
+    const BASE_H2_E: u64 = 0xbfee7a76b2327157; // -0.952449176828
+    const BASE_H2_FX: u64 = 0x3fc07b13594a1bbc; // +0.128755968665, 10 SCF steps
+    const BASE_LIH_E: u64 = 0xc014e13070f210ef; // -5.219911350989
+    const BASE_LIH_FX: u64 = 0xbf9739778734cf70; // -0.022680156352, 13 SCF steps
     // Re-pinned (plan Task 7, 2026-11-16; printed by this test): the same scenes under `ScfSettings::for_grid`'s default
     // since Task 7, FermiDirac at kT = 5 mHa — all-electron now solves witness vectors (FD, spec 2026-11-13). The move
     // from the Aufbau bits above and the −TS of each are recorded beside the values.
     // Re-pinned again (plan Task 9b, 2026-11-16): the witness columns at the guard tolerance (`lobpcg_tiers`), the lower-bound
     // witness and the doubled growth change the eigensolves' paths; the moves are inside Δρ < 1e-6 (Task 7's pins: H₂
     // −0.952449176832 / +0.128755999523, LiH −5.219911361078 / −0.022680293939).
-    const FD_H2_E: u64 = 0xbfee7a76b2332abb; // -0.952449176833 (Aufbau −0.952449176828: −5e-12; TS 4.3e-20; 10 steps, 2 / 2 stored)
-    const FD_H2_FX: u64 = 0x3fc07b138b5aa128; // +0.128755991978 (Aufbau +0.128755968432: +2.4e-8)
-    const FD_LIH_E: u64 = 0xc014e130719e4631; // -5.219911361013 (Aufbau −5.219911351003: −1.0e-8 = −TS 1.59e-7 + E − E_A +1.49e-7; 13 steps, 6 / 6 stored)
-    const FD_LIH_FX: u64 = 0xbf97396f611800a0; // -0.022680034925 (Aufbau −0.022680157203: +1.2e-7)
+    // and again in its fix round 1 (the checked dense eigensolve, as the Aufbau pins above): H₂ −0.952449176833 /
+    // +0.128755991978, LiH −5.219911361013 / −0.022680034925 before it.
+    const FD_H2_E: u64 = 0xbfee7a76b2327729; // -0.952449176828 (Aufbau −0.952449176828; TS 4.3e-20; 10 steps, 2 / 2 stored)
+    const FD_H2_FX: u64 = 0x3fc07b135970b544; // +0.128755968735 (Aufbau +0.128755968665)
+    const FD_LIH_E: u64 = 0xc014e130719e4468; // -5.219911361012 (Aufbau −5.219911350989: −1.0e-8 = −TS 1.59e-7 + E − E_A +1.49e-7; 13 steps, 6 / 6 stored)
+    const FD_LIH_FX: u64 = 0xbf97396f60026ec0; // -0.022680034862 (Aufbau −0.022680156352: +1.2e-7)
 
     /// Global constraint: IonicPolicy::None is today's solver, bit for bit (energies and forces) — under `Aufbau`, set
     /// explicitly since plan Task 7 made FermiDirac `for_grid`'s default; the for_grid (FD) solves are pinned beside it.
@@ -1493,13 +1500,16 @@ mod tests {
         let aufbau = ScfSettings { occupations: Occupations::Aufbau, ..fd };
         let scenes = || [("H2", System::new(vec![Nucleus { pos: [0.7, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }], 0, None)),
                          ("LIH", System::new(vec![Nucleus { pos: [-0.8, 0.1, 0.0], z: 3 }, Nucleus { pos: [2.2, 0.0, 0.0], z: 1 }], 0, None))];
-        for ((_, sys), (e_bits, f_bits)) in scenes().into_iter().zip([(BASE_H2_E, BASE_H2_FX), (BASE_LIH_E, BASE_LIH_FX)]) {
+        for ((name, sys), (e_bits, f_bits)) in scenes().into_iter().zip([(BASE_H2_E, BASE_H2_FX), (BASE_LIH_E, BASE_LIH_FX)]) {
             assert!(sys.ionic.is_none());
             let (st, stats) = scf(&g, &sys, &aufbau, None).unwrap();
             let f = crate::forces(&g, &st, &sys.nuclei, aufbau.sigma).unwrap();
+            println!("    const BASE_{name}_E: u64 = 0x{:016x}; // {:+.12}", stats.energy.total.to_bits(), stats.energy.total);
+            println!("    const BASE_{name}_FX: u64 = 0x{:016x}; // {:+.12}", f[0][0].to_bits(), f[0][0]);
+            assert!(stats.core_overlaps.is_empty() && st.ionic.is_none());
+            if std::env::var_os("PIN_PRINT").is_some() { continue; }
             assert_eq!(stats.energy.total.to_bits(), e_bits);
             assert_eq!(f[0][0].to_bits(), f_bits);
-            assert!(stats.core_overlaps.is_empty() && st.ionic.is_none());
         }
         for ((name, sys), (e_bits, f_bits)) in scenes().into_iter().zip([(FD_H2_E, FD_H2_FX), (FD_LIH_E, FD_LIH_FX)]) {
             let (st, stats) = scf(&g, &sys, &fd, None).unwrap();
@@ -1508,6 +1518,7 @@ mod tests {
                       stats.energy.total, stats.energy.ts, stats.energy.internal, stats.iterations, st.orbitals_up.len(), st.orbitals_dn.len(), f[0][0]);
             eprintln!("    const FD_{name}_E: u64 = 0x{:016x}; // {:+.12}", stats.energy.total.to_bits(), stats.energy.total);
             eprintln!("    const FD_{name}_FX: u64 = 0x{:016x}; // {:+.12}", f[0][0].to_bits(), f[0][0]);
+            if std::env::var_os("PIN_PRINT").is_some() { continue; }
             assert_eq!(stats.energy.total.to_bits(), e_bits, "{name} FD energy");
             assert_eq!(f[0][0].to_bits(), f_bits, "{name} FD F_x0");
             assert!(stats.core_overlaps.is_empty() && st.ionic.is_none() && st.occupations == fd.occupations);
@@ -2323,17 +2334,18 @@ mod tests {
     /// nor the forces. CPU f64, FermiDirac at kT = `ELECTRON_KT`, tol = eig_tol = 1e-10, cold; each system solved with
     /// the loose witness columns (production) and with every column held to eig_tol (`scf_all_tight`): |ΔF| ≤ 1e-10 Ha
     /// and |ΔF_I| ≤ 1e-9 Ha/Bohr per component (the brief's bounds; the derivation bounds the rule's own part by
-    /// 2.2e-2·tol in ∫|δρ|). Also: the loose solve's guard columns met the guard tolerance.
+    /// 2.4e-2·tol in ∫|δρ|, ≲ 2.9e-2·tol with the μ shift). Also: the loose solve's guard columns met the guard tolerance.
     ///
     /// The pseudo-O sits on a grid point (the origin of the odd 33³ grid), where the cubic site keeps its 2p set exactly
     /// degenerate, as in V4. Off site the lattice splits the partly filled p set by δ ~ 1e-5 Ha, so its f differ by
     /// f(1 − f)/kT·δ ~ 4e-4 and ρ depends on the rotation inside the set, which an eigensolve to residual r fixes only to
     /// r/δ: at eig_tol = 1e-10 that is a Δρ floor ~ 4e-4·1e-5 ≈ 4e-9, above tol = 1e-10, for both tiers (measured
     /// 2026-11-16: off-site M = 1, loose 200 steps at Δρ ≈ 3e-9, all-tight 86 steps — it crossed 1e-10 on a fluctuation).
-    /// The off-site M = 1 case is therefore a printed record at tol = 1e-8, not a gate: there the two solves differ by the
-    /// stop's own resolution (measured |ΔF| 4.9e-10, |ΔF_I| 1.1e-9 — both tiers stop anywhere inside Δρ < 1e-8, and the
-    /// forces are first order in that), which the brief's bounds do not resolve; its guard columns' f ≤ e^{−36} bound
-    /// the rule's own part by 2.2·e^{−36} in ∫|δρ|.
+    /// The off-site M = 1 case therefore runs at tol = 1e-8 with its own derived bounds (review M5): the split p set's
+    /// occupations differ by Δf over an eigenvalue spread δ, so F is flat along the rotation manifold inside the set to
+    /// ≈ δ·Δf per spin — measured |ΔF| 4.9e-10 against δ·Δf ≈ 4e-9, far above what Δρ < 1e-8 alone would give at second
+    /// order — and the forces are first order in a residual of L1 norm ≤ tol through max|∇V_loc| ≈ 2 Ha/Bohr (spec §5.1):
+    /// |ΔF_I| ≤ 2·tol (measured 1.1e-9). The loose rule's own part stays ≤ 2.4·e^{−36} in ∫|δρ| (its guard columns).
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
     fn fd_guard_tier_matches_all_tight() {
@@ -2366,8 +2378,17 @@ mod tests {
                                     stored ↑ {}/{} ↓ {}/{}; residual tight {:.1e} guard {:.1e} (all-tight run {:.1e})",
                                    l.energy.total, l.energy.ts, l.iterations, a.iterations, sl.orbitals_up.len(), sa.orbitals_up.len(),
                                    sl.orbitals_dn.len(), sa.orbitals_dn.len(), l.max_eigen_residual, l.max_guard_residual, a.max_eigen_residual);
+                // the off-site record's own bounds (review M5): the split p set's rotation manifold is flat to δ·Δf per spin
+                // (δ its eigenvalue spread, Δf its occupation spread), and the forces are first order in a residual of
+                // L1 norm ≤ tol through max|∇V_loc| ≈ 2 Ha/Bohr (pseudo-O, spec §5.1)
+                let flat = [0u8, 1].iter().map(|&sp| {
+                    let p: Vec<&PartialLevel> = l.partial.iter().filter(|q| q.spin == sp).collect();
+                    let spread = |v: &dyn Fn(&PartialLevel) -> f64| p.iter().map(|q| v(q)).fold(f64::NEG_INFINITY, f64::max) - p.iter().map(|q| v(q)).fold(f64::INFINITY, f64::min);
+                    if p.len() > 1 { spread(&|q| q.eps) * spread(&|q| q.f) } else { 0.0 }
+                }).sum::<f64>();
                 let gated = !name.contains("off site");
-                (line, !gated || (de.abs() <= 1e-10 && df <= 1e-9), l.max_guard_residual <= WITNESS_GUARD_TOL && a.max_guard_residual == 0.0)
+                let line = if gated { line } else { format!("{line}; flat-manifold bound δ·Δf {flat:.2e}, force bound 2·tol {:.0e}", 2.0 * s.tol) };
+                (line, if gated { de.abs() <= 1e-10 && df <= 1e-9 } else { de.abs() <= flat && df <= 2.0 * s.tol }, l.max_guard_residual <= WITNESS_GUARD_TOL && a.max_guard_residual == 0.0)
             })).collect();
             for h in handles {
                 let (line, ok, tiers) = h.join().unwrap();

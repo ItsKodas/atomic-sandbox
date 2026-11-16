@@ -212,7 +212,12 @@
 //!   when the previous step's Δρ was already below its stop (the convergence phase the M3 freeze was designed for: "the
 //!   mixing alone finishes the convergence"); before that a guess is kept only when it is already within the step's tol.
 //!   Measured: Li 93 steps / 5 resets, the MD path 6.67 / 8.00, H₃⁺ 13 steps / 0 resets (`Aufbau`: 13). This tightens
-//!   when orbitals may freeze; no tolerance moves. `Aufbau` and `DegenerateShells` keep the band on every step. The f are the step's own and are never mixed; ρ_σ = Σ f ψ² (`mul_add_sq_w`; f = 1.0 by the unweighted
+//!   when orbitals may freeze; no tolerance moves. `Aufbau` and `DegenerateShells` keep the band on every step.
+//!   **In effect there is no hysteresis band under FD** (review M3): a tight step whose Δρ is below its stop ends the
+//!   solve, so "the previous step's Δρ was below its stop" holds only on the one confirmation step after a loosened
+//!   step dipped below tol. FD channels accept a warm guess only within the step's own tol; the band's purpose (no
+//!   rounding-level coin flip between freezing and re-solving) is served by the DIIS-friendly frozen definition
+//!   instead. It only ever tightens freezing and leaves the stop unchanged, so it cannot hide a stall. The f are the step's own and are never mixed; ρ_σ = Σ f ψ² (`mul_add_sq_w`; f = 1.0 by the unweighted
 //!   kernel). The witnesses carry their small f (never clipped), so T_s, E_NL and the forces' weights include them.
 //! - Energy: `internal` = E as above (f-weighted), `ts` = kT·S of the final step's f (S Neumaier over the channels),
 //!   `total` = F = `internal − ts`; the progress energy is F_HF = Σfε + double counting − kT·S of the step's f.
@@ -679,6 +684,13 @@ impl Inner {
     }
 }
 
+/// The SCF's error for an eigensolve whose formation check failed with no restore left (`EigenStats::restores_exhausted`,
+/// `eigen` module doc "Ritz vectors that do not match their Ritz values"): its X may have lost a level, which voids the
+/// "block holds the lowest k" premise of the occupations and the witness (`qm::occupations` module doc).
+fn lost_level(es: &EigenStats) -> QmError {
+    QmError::Numerical(format!("LOBPCG: a Ritz-vector formation failed again after {} restores (the block may have lost a level)", es.restores))
+}
+
 /// Submits everything recorded so far (before handing the queue to a sub-solver with its own batch).
 fn flush(b: &mut Batch) {
     let enc = b.take_encoder();
@@ -758,6 +770,7 @@ impl Channel<'_> {
             .map_err(|e| take_device_error().unwrap_or(e))?;
         if let Some(e) = take_device_error() { return Err(e); }
         inner.eigen(es, t.elapsed());
+        if es.restores_exhausted { return Err(lost_level(&es)); }
         Ok(())
     }
 
@@ -813,6 +826,7 @@ impl Channel<'_> {
             .map_err(|e| take_device_error().unwrap_or(e))?;
         if let Some(e) = take_device_error() { return Err(e); }
         inner.eigen(es, t.elapsed());
+        if es.restores_exhausted { return Err(lost_level(&es)); }
         Ok(es)
     }
 
@@ -1287,6 +1301,7 @@ impl GpuSolver {
                         let h = GpuHamiltonian { v: &v_up, nl };
                         let t = Instant::now();
                         match lobpcg_with_guess_tol(ctx, k, g, r, &h, &mut orb_up, &mut ev_up, work.as_mut().expect("work sized above"), step_tol, EIG_GUESS_FACTOR * step_tol, EIGEN_MAX_ITER, None) {
+                            Ok(es) if es.restores_exhausted => { inner.eigen(es, t.elapsed()); failure = Some(lost_level(&es)); break; }
                             Ok(es) => inner.eigen(es, t.elapsed()),
                             Err(e) => { failure = Some(take_device_error().unwrap_or(e)); break; }
                         }
@@ -1296,6 +1311,7 @@ impl GpuSolver {
                         let h = GpuHamiltonian { v: &v_dn, nl };
                         let t = Instant::now();
                         match lobpcg_with_guess_tol(ctx, k, g, r, &h, &mut orb_dn, &mut ev_dn, work.as_mut().expect("work sized above"), step_tol, EIG_GUESS_FACTOR * step_tol, EIGEN_MAX_ITER, None) {
+                            Ok(es) if es.restores_exhausted => { inner.eigen(es, t.elapsed()); failure = Some(lost_level(&es)); break; }
                             Ok(es) => inner.eigen(es, t.elapsed()),
                             Err(e) => { failure = Some(take_device_error().unwrap_or(e)); break; }
                         }
@@ -1938,7 +1954,7 @@ mod tests {
     fn lobpcg_cap_warns_only_on_the_final_step() {
         let tol = 1e-6;
         let es = |stop: EigenStop, res: f64| EigenStats { iterations: 7, max_residual: res, stop, readbacks: 15, dispatches: 80, fallbacks: 0, alpha_worst: 1.0, split_residual: None,
-                                                          head_kept: false };
+                                                          head_kept: false, restores: 0, restores_exhausted: false };
         let ms = Duration::from_millis(1);
         // early cap hit, final step converged: note, no warning
         let mut a = Inner::new(tol);
@@ -2548,8 +2564,10 @@ mod tests {
     // converged point inside Δρ < 1e-6 (F second order, F_x0 first order in it).
     const GPU_FD_H2_E: u64 = 0xbfee7a7687c9e3a5; // -0.952449097836 (Aufbau −0.952449164522: +6.7e-8; TS 4.3e-20)
     const GPU_FD_H2_FX: u64 = 0x3fc07b1b68c25afc; // +0.128756929542 (Aufbau +0.128753746201: +3.2e-6)
-    const GPU_FD_LIH_E: u64 = 0xc014e1305f4e5c24; // -5.219911088140 (Aufbau −5.219911953896: +8.7e-7, TS 1.59e-7; 14 steps, 4 extras per spin)
-    const GPU_FD_LIH_FX: u64 = 0xbf97390bd4597040; // -0.022678551517 (Aufbau −0.022675900853: −2.7e-6)
+    // fix round 1 of Task 9b (the checked dense eigensolve, `qm::eigen::sym_eigen`; Aufbau and FD H₂ bits unchanged):
+    // LiH was −5.219911088140 / −0.022678551517
+    const GPU_FD_LIH_E: u64 = 0xc014e130581b4ffe; // -5.219910980861 (Aufbau −5.219911953896: +9.7e-7, inside the f32 path scatter; TS 1.59e-7)
+    const GPU_FD_LIH_FX: u64 = 0xbf973912a309b040; // -0.022678652955 (Aufbau −0.022675900853: −2.8e-6)
 
     /// M7 Task 8a: `IonicPolicy::None` (no setup, `Aufbau`) is today's GPU solver bit for bit — the energy and F_x of
     /// nucleus 0 of H₂ and LiH equal the bits measured on the code before the pseudopotential path (driver-specific:

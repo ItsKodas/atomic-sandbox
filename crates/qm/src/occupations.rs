@@ -65,21 +65,24 @@
 //! - **What a loose column can do to Δρ.** Replacing x_j by any unit vector changes ρ_σ by f_j(x_j'² − x_j²), of L1
 //!   norm ≤ 2f_j. Its level shift δθ_j moves μ (Σ_i f_i = N_σ fixed; ∂f_i/∂θ_i = −f_i(1 − f_i)/kT = −∂f_i/∂μ) by
 //!   δμ = Σ_{j∈L} f_j(1 − f_j)δθ_j / Σ_i f_i(1 − f_i), so the tight columns' weights move by
-//!   Σ_{i∈T} |δf_i| ≤ |δμ|·Σ_{i∈T} f_i(1 − f_i)/kT ≤ Σ_{j∈L} f_j |δθ_j| / kT, each |δf_i| moving ∫|δρ| by ≤ |δf_i|.
-//!   A loose column held to r_j ≤ g has |δθ_j| ≤ r_j ≤ g (below), so over the loose set L
+//!   Σ_{i∈T} |δf_i| ≤ |δμ|·Σ_{i∈T} f_i(1 − f_i)/kT ≤ Σ_{j∈L} f_j |δθ_j| / kT, each |δf_i| moving ∫|δρ| by ≤ |δf_i|;
+//!   and the loose columns' own weights move too, Σ_{j∈L} |δf_j| ≤ Σ_{j∈L} f_j |δθ_j − δμ| / kT, by as much again
+//!   (Σ_T δf = −Σ_L δf; plan Task 9b review M1, which corrected a first version that omitted this term). A loose
+//!   column held to r_j ≤ g has |δθ_j| ≤ r_j ≤ g (below), so over the loose set L
 //!   ```text
-//!   ∫|δρ| ≤ (2 + g/kT) · Σ_{j∈L} f_j            (= 2.2 Σ_L f_j at g = 1e-3 Ha, kT = 5 mHa)
+//!   ∫|δρ| ≤ (2 + 2g/kT) · Σ_{j∈L} f_j            (= 2.4 Σ_L f_j at g = 1e-3 Ha, kT = 5 mHa)
 //!   ```
+//!   (the reviewer's random check of 20 000 FD channels: worst 2.44).
 //! - **The rule** (`tight_columns`). L is the set of the highest-ranked columns whose tail sum of the **upper-bound**
 //!   occupations f̂_j = f(θ_j − r_j; μ) ≥ f_j (the level lies above θ_j − r_j) stays below `LOOSE_F_FACTOR`·tol,
-//!   tol the SCF's Δρ stop: ∫|δρ| ≤ 2.2e-2·tol, so no loose column can move Δρ across the stop; f̂ also covers the
-//!   loose levels' own shift of μ (a factor e^{r/kT} ≤ e^{0.2} on f, inside the 1e-2). The threshold comes from the
+//!   tol the SCF's Δρ stop: ∫|δρ| ≤ 2.4e-2·tol, ≲ 2.9e-2·tol with the loose levels' own shift of μ (a factor
+//!   e^{g/kT} ≤ e^{0.2} on f), so no loose column can move Δρ across the stop. The threshold comes from the
 //!   stop, not from a fixed f: H₃⁺ at 1.6 r₀ has its ↑ level 2 at f ≈ 5e-11, and at tol = 1e-6 (threshold 1e-8)
 //!   that level is loose, while a level at 2e-10 would be too (task 9 review C1's caution). Every other column is
 //!   **tight**: held to the SCF's eigen tolerance, as before. Because f falls with θ, L is a top segment of the ranks.
 //! - **The energy and forces.** F is stationary in ψ at fixed f (spec §4.4), so a loose column's error enters F at
-//!   second order, f_j r_j²/δ_j (δ_j its distance to the rest of the spectrum), and through ρ: ≤ (2.2e-2·tol)²-sized.
-//!   The Hellmann–Feynman force moves by ≤ ∫|δρ|·max|∇V_I| ≤ 2.2e-2·tol·max|∇V_I|. Tested on the CPU f64 reference
+//!   second order, f_j r_j²/δ_j (δ_j its distance to the rest of the spectrum), and through ρ: ≤ (2.9e-2·tol)²-sized.
+//!   The Hellmann–Feynman force moves by ≤ ∫|δρ|·max|∇V_I| ≲ 2.9e-2·tol·max|∇V_I|. Tested on the CPU f64 reference
 //!   (`scf` tests, loose against all-tight): |ΔF| ≤ 1e-10 Ha, |ΔF_I| ≤ 1e-9 Ha/Bohr.
 //! - **The guard tolerance** g = `WITNESS_GUARD_TOL` = `WITNESS_GAP`/100 = 1e-3 Ha (the Harris display's `GUARD_TOL`),
 //!   or the step's eigen tol when that is looser (the GPU's Δρ-tied early steps).
@@ -89,8 +92,14 @@
 //!   ```text
 //!   θ_top − r_top ≥ ε_(N_σ) + WITNESS_GAP   and   θ_top − r_top − μ ≥ WITNESS_TAIL_KT · kT
 //!   ```
-//!   (the block holds the lowest k levels, as for every LOBPCG block). At r ≤ g it costs ≤ 1e-3 Ha of the 0.18 Ha
-//!   window; a tight top (r ~ 1e-6) gives the Ritz test to 1e-6. Never the Ritz value alone.
+//!   At r ≤ g it costs ≤ 1e-3 Ha of the 0.18 Ha window; a tight top (r ~ 1e-6) gives the Ritz test to 1e-6. Never the
+//!   Ritz value alone.
+//! - **The premise of both bounds** (review M2): Ritz values bound the levels from above (θ_j ≥ λ_j), but Krylov–Weinstein
+//!   only puts *some* eigenvalue within r of θ. θ_j − r_j is a lower bound on λ_j — for f̂ and for the witness — only if
+//!   the block holds the lowest k levels, i.e. no level below the block's top was missed. That is the assumption every
+//!   LOBPCG block makes, and the GPU solver checks it the way it can: a Rayleigh–Ritz step whose formed vectors do not
+//!   reproduce their Ritz values (a lost column, `qm_gpu::eigen` "Ritz vectors that do not match their Ritz values") is
+//!   undone; one it cannot undo is an error on the SCF path.
 //! - **Growth** (`grown_extras`): when the witness fails the block grows by its current extra count (the extra block
 //!   doubles: 1, 2, 4, 8, 16, 32), clamped to the cap, instead of one vector per re-solve; each grown vector keeps
 //!   its index-seeded guess. Reaching e extras costs ⌈log₂ e⌉ re-solves instead of e − 1.
@@ -118,7 +127,7 @@ pub const PARTIAL_OCCUPATION_MIN: f64 = 1e-6;
 /// 2026-11-14 value). The one definition (preflight F11): `qm-gpu`, the tags and the dimer ledger read it.
 pub const GPU_PARTIAL_TOL: f64 = 1e-5;
 /// A column is loose when the tail sum of the upper-bound occupations over it and every column above it is below this
-/// × the SCF's Δρ tolerance (module doc, "Witness columns at a guard tolerance"): ∫|δρ| ≤ 2.2e-2·tol.
+/// × the SCF's Δρ tolerance (module doc, "Witness columns at a guard tolerance"): ∫|δρ| ≤ 2.4e-2·tol (≲ 2.9e-2·tol).
 pub const LOOSE_F_FACTOR: f64 = 1e-2;
 /// The loose (guard) columns' residual tolerance (Ha): `WITNESS_GAP`/100 = 1e-3, so the witness's lower bound
 /// θ − r loses ≤ 1e-3 Ha of its 0.18 Ha window (module doc). The Harris display's `GUARD_TOL` is the same value.

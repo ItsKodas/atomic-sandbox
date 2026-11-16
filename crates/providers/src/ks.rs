@@ -3916,8 +3916,9 @@ pub(crate) mod tests {
     fn all_electron_h_minus_witness_cap_at_the_largest_box() {
         let Some(ctx) = gpu() else { return };
         let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(mem) = ctx.device_local_memory_bytes() else { return };
-        let budget = mem / 2;
+        // the app's rule (`app::quality::vram_budget`): half the reported memory, else its 12 GB default (review M6: never a
+        // silent pass when the adapter reports none)
+        let budget = ctx.device_local_memory_bytes().map_or(12_000_000_000, |mem| mem / 2);
         let scene = Scene { nuclei: vec![Nucleus::new(1, [0.0; 3])], cell: Cell { n: 201, h: 0.15 }, charge: -1, multiplicity: None, sigma: None,
                             external_field: [0.0; 3], ionic: sim::IonicPolicy::None, train_mask: None };
         let need = gpu_footprint_bytes(&scene);

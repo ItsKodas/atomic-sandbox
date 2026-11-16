@@ -1078,6 +1078,12 @@ impl OrbitalView {
                 Ok(es) => {
                     out.iterations[ch] = es.iterations;
                     out.at_cap[ch] = es.stop == EigenStop::MaxIter;
+                    if es.restores_exhausted {
+                        // `eigen` "Ritz vectors that do not match their Ritz values": a level may be lost — never shown
+                        failure = Some(format!("the display eigensolve's Ritz-vector formation failed after {} restores: unoccupied orbitals not shown", es.restores));
+                        self.pool.extend(x);
+                        break;
+                    }
                 }
                 Err(e) => {
                     failure = Some(format!("the display eigensolve failed: {e}"));

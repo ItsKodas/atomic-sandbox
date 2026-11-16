@@ -217,6 +217,9 @@ pub struct HarrisSolve {
     pub notes: Vec<String>,
     pub iterations: [usize; 2],
     pub at_cap: [bool; 2],
+    /// Per channel: its last LOBPCG solve ended on the f32 floor (`eigen::Stop::Floor`, "as good as f32 allows",
+    /// possibly above tol), not on tol (plan 2026-11-13 Task 9b fix round 1).
+    pub at_floor: [bool; 2],
     pub solves: [usize; 2],
     pub split: [(usize, usize, usize); 2],
     pub cold: bool,
@@ -542,6 +545,7 @@ impl GpuSolver {
         let mut done: [Option<Channel>; 2] = [None, None];
         let (mut cold, mut notes) = (false, Vec::new());
         let mut solves = [0usize; 2];
+        let mut at_floor = [false; 2];
         let mut splits = [(0usize, 0usize, 0usize); 2];
         let mut needs: [Option<Memory>; 2] = [None, None]; // the last occupation pass's split, for `last`
         // Ok(true): aborted
@@ -584,6 +588,10 @@ impl GpuSolver {
                     break 'channels;
                 }
                 info.iterations[ch] += es.iterations;
+                at_floor[ch] = es.stop == EigenStop::Floor;
+                if es.restores_exhausted {
+                    notes.push(format!("spin {}: the eigensolve's Ritz-vector formation failed after {} restores (a level may be missing)", SPIN[ch], es.restores));
+                }
                 if es.stop == EigenStop::MaxIter && !info.at_cap[ch] {
                     info.at_cap[ch] = true;
                     // the tested tiers' residuals (review M2): the buffers' is in `max_residual` only
@@ -702,7 +710,7 @@ impl GpuSolver {
         };
         let ((eu, fu), (ed, fd)) = (level(&up, 0), level(&dn, 1));
         let solve = HarrisSolve { evals: [eu, ed], occ: [fu, fd], n_occ: [up.orbitals.len(), dn.orbitals.len()], notes,
-                                  iterations: info.iterations, at_cap: info.at_cap, solves, split: splits, cold, wall: t0.elapsed() };
+                                  iterations: info.iterations, at_cap: info.at_cap, at_floor, solves, split: splits, cold, wall: t0.elapsed() };
         let Channel { orbitals: orbitals_up, evals: evals_up, occ: occ_up, unocc: unocc_up, spare: spare_up } = up;
         let Channel { orbitals: orbitals_dn, evals: evals_dn, occ: occ_dn, unocc: unocc_dn, spare: spare_dn } = dn;
         *slot = Some(GpuState { grid: grid.clone(), sigma: settings.sigma, orbitals_up, orbitals_dn, evals_up, evals_dn,
@@ -1189,10 +1197,15 @@ mod tests {
         assert_eq!(again.split, out.split, "started at the last call's need");
         // a channel that converged on the first call is converged on entry (before the guard tolerance of
         // task 8b, ↓ ended on the cap here — guard levels near 0.407 Ha at residual 5.7e-4 — and the warm
-        // restart continued it for 54 iterations); a capped one would be continued
+        // restart continued it for 54 iterations); a capped one would be continued. A channel whose last solve ended
+        // on the f32 floor did not converge to tol (plan 2026-11-13 Task 9b fix round 1: ↓'s p triplet floors at
+        // 9.2e-6 against tol 5.4e-6, 2× the model as the eigen module doc measures for rotated degenerate sets), so
+        // its re-measured guess is above tol and is continued — never at the cap
         for ch in 0..2 {
-            if !out.at_cap[ch] { assert_eq!(again.iterations[ch], 0, "spin {ch}: converged on entry"); }
+            if !out.at_cap[ch] && !out.at_floor[ch] { assert_eq!(again.iterations[ch], 0, "spin {ch}: converged on entry"); }
+            assert!(!again.at_cap[ch], "spin {ch}: the warm call ended on the cap");
         }
+        println!("first call at floor {:?}", out.at_floor);
         assert_eq!(out.at_cap, [false, false], "the guard levels meet GUARD_TOL within the cap");
     }
 

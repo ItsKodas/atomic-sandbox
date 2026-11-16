@@ -139,24 +139,28 @@
 //! order in the floor. The solver stops on the floor with `Stop::Floor` (below) instead of
 //! running to `max_iter`.
 //!
-//! # Ritz vectors that do not match their Ritz values (plan 2026-11-13 Task 9b)
-//! In exact arithmetic the stored x_i = S c_i has Rayleigh quotient λ_i = θ_i, the Ritz value the step predicted; in
-//! f32 they differ by the rounding of the `lincomb`, ~2.4e-8·α·‖r_i‖ plus the Gram's ~1e-8·|θ|. The raw [X, W, P]
-//! basis can still form a column that is nothing like its Ritz vector (Hetmaniuk & Lehoucq, J. Comput. Phys. 218 (2006)
-//! 324; the Harris display measured a converged σ_g column replaced by W/P directions, residual 5 Ha). Measured (task
-//! 9b, the pseudo-H₂O orbital-display solve, 33³, iteration 185 of a 200-iteration grind on box states): the converged
-//! 2s column (θ = −0.8687 Ha, residual 2e-5) came out of its `lincomb` with λ = +0.770 and residual 4.5 Ha; the next
-//! Rayleigh–Ritz step dropped the direction and the level never came back. The vector itself was wrong (a fresh
-//! H·x gave the same λ), the measured Gram was well conditioned (σ_min(B̃) 1.6e-2, α 1.01), and redoing the step on
-//! the MGS-orthogonalised basis formed the same wrong vector (λ +0.791 twice on the ↓ channel): the culprit is the P
-//! block, the conjugate directions collapsing toward span(X) over a long grind — the instability LOBPCG's standard
-//! restart answers (drop P, continue from [X, W]). So the readback after every step compares the trace of the moved
-//! columns, Σλ_i = tr(XᵀHX), with Σθ_i: they are equal for B-orthonormal Ritz vectors whatever rotation the f32
-//! `lincomb` makes inside a near-degenerate cluster (a per-column test flagged pseudo-O's p triplet, its λ_i trading
-//! places at 2e-5 Ha), and a wrong column lifts Σλ above Σθ. A rise beyond Σ(`RITZ_FORM_SLACK`·(1 + |θ_i|) +
-//! `RITZ_FORM_RES`·r_i) undoes the step — its X and P are still in the swap slots, its θ was kept, H·X is re-applied —
-//! and redoes it **without P**, at most `MAX_FORM_RESTORES` times per call (measured: both channels then keep the 2s,
-//! −0.86867 Ha, and the display solve is accepted). A step that passes is unchanged, bit for bit.
+//! # Ritz vectors that do not match their Ritz values (plan 2026-11-13 Task 9b, root cause in its fix round 1)
+//! In exact arithmetic the stored x_i = S c_i has Rayleigh quotient λ_i = θ_i, the Ritz value the step predicted. Measured
+//! (the pseudo-H₂O orbital-display solve, 33³, iteration 196 of a 200-iteration grind): the converged 2s column came
+//! out with λ = +0.719 against θ = −0.8687 Ha and the level was lost. **Root cause** (localised by a formation
+//! diagnostic, since removed): the fused Gram matched f64 dots of the downloaded fields (≤ 3e-8 relative), the GPU
+//! `lincomb` matched the f64 S·c (≤ 8e-8), no H-product was stale (≤ 5e-12) and no ghost cell was non-zero — but the
+//! f64 Rayleigh quotient of the coefficient vector c itself, on the measured A and B, was +0.719: the Rayleigh–Ritz
+//! step's dense eigensolve was wrong. `nalgebra::SymmetricEigen` (0.33.3) returned two of the reduced Â's 24 pairs
+//! with residual 1.59, the eigenvalues −0.8687 and +0.7195 each with the other's eigenvector (the dumped matrices are
+//! `testdata/rr_i1_*.txt`, `rayleigh_ritz_pairs_survive_a_bad_symmetric_eigen`). Every dense eigensolve of the LOBPCGs
+//! (this one and `qm::eigen::lobpcg`) now goes through `qm::eigen::sym_eigen`, which checks every pair's residual and
+//! falls back to cyclic Jacobi; a decomposition that passes is unchanged, bit for bit. The first version of this
+//! section blamed a P collapse; the measurements above refute that (task 9b review I1).
+//!
+//! The formation check stays as a safety net: the readback after every step compares the trace of the moved columns,
+//! Σλ_i = tr(XᵀHX), with Σθ_i — equal for B-orthonormal Ritz vectors whatever rotation the f32 `lincomb` makes inside
+//! a near-degenerate cluster (a per-column test flagged pseudo-O's p triplet, its λ_i trading places at 2e-5 Ha) — and
+//! a rise beyond Σ(`RITZ_FORM_SLACK`·(1 + |θ_i|) + `RITZ_FORM_RES`·r_i) undoes the step (its X and P are still in the
+//! swap slots, its θ was kept and becomes the preconditioner shift again, H·X is re-applied) and redoes it without P
+//! (LOBPCG's standard restart), at most `MAX_FORM_RESTORES` times per call. `EigenStats::restores` counts them; a
+//! failure with none left sets `restores_exhausted`: an error on the SCF path (`QmError::Numerical`), a rejected or
+//! noted display on the display paths. A step that passes is unchanged, bit for bit.
 //!
 //! # Guarded columns and locking (plan 2026-11-13 Task 9b; `lobpcg_guarded`)
 //! The SCF's Fermi–Dirac channel solve splits its block (`qm::occupations` "Witness columns at a guard tolerance"): the
@@ -205,7 +209,7 @@ use crate::stencil::{hamiltonian_in, jacobi_step_in};
 use gpu::GpuContext;
 use nalgebra::{DMatrix, SymmetricEigen};
 pub use qm::eigen::JACOBI_SWEEPS;
-use qm::eigen::jacobi_omega;
+use qm::eigen::{jacobi_omega, sym_eigen};
 use qm::stencil::COEFF;
 use qm::QmError;
 
@@ -297,6 +301,11 @@ pub struct EigenStats {
     /// The head columns (all columns without a split) were returned exactly as given: a 0-iteration accept, or
     /// `lobpcg_guarded`'s locked head (module doc, "Guarded columns and locking").
     pub head_kept: bool,
+    /// Steps undone after a Ritz-vector formation check failed (module doc, "Ritz vectors that do not match their Ritz
+    /// values"), and whether one more failed with no restore left (`MAX_FORM_RESTORES`): the returned X may then have
+    /// lost a level — an error on the SCF path, a note on the display paths.
+    pub restores: usize,
+    pub restores_exhausted: bool,
 }
 
 /// Model of the f32 residual floor ‖(H − λ)δx‖ for ‖x‖ = 1 (module doc): the RMS rounding of
@@ -511,7 +520,7 @@ fn rayleigh_ritz(a: &DMatrix<f64>, b: &DMatrix<f64>, nk: usize) -> Result<(Vec<f
     let d: Vec<f64> = (0..m).map(|i| 1.0 / b[(i, i)].sqrt()).collect();
     let scaled = |mat: &DMatrix<f64>| DMatrix::from_fn(m, m, |i, j| mat[(i, j)] * d[i] * d[j]);
     let (an, bn) = (scaled(a), scaled(b));
-    let eb = SymmetricEigen::new(bn);
+    let eb = sym_eigen(bn);
     let smax = eb.eigenvalues.iter().copied().fold(0.0f64, f64::max);
     let keep: Vec<usize> = (0..m).filter(|&i| eb.eigenvalues[i] > RR_DROP * smax).collect();
     if keep.len() < nk {
@@ -520,7 +529,7 @@ fn rayleigh_ritz(a: &DMatrix<f64>, b: &DMatrix<f64>, nk: usize) -> Result<(Vec<f
     let t = DMatrix::from_fn(m, keep.len(), |i, c| eb.eigenvectors[(i, keep[c])] / eb.eigenvalues[keep[c]].sqrt());
     let ah = t.transpose() * &an * &t;
     let ah = DMatrix::from_fn(keep.len(), keep.len(), |i, j| 0.5 * (ah[(i, j)] + ah[(j, i)]));
-    let ea = SymmetricEigen::new(ah);
+    let ea = sym_eigen(ah);
     let mut order: Vec<usize> = (0..keep.len()).collect();
     order.sort_by(|&i, &j| ea.eigenvalues[i].total_cmp(&ea.eigenvalues[j]));
     let theta: Vec<f64> = order.iter().take(nk).map(|&i| ea.eigenvalues[i]).collect();
@@ -691,7 +700,7 @@ fn lobpcg_core(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuH
     // a failed Ritz-vector formation (module doc, "Ritz vectors that do not match their Ritz values"): the previous
     // step's θ while its X and P are still in `xn`/`pn`, and how many steps were restored
     let mut prev: Option<Vec<f64>> = None;
-    let mut restores = 0usize;
+    let (mut restores, mut restores_exhausted) = (0usize, false);
     let mut col_res = vec![0.0f64; nk];
     let trace = std::env::var_os("LOBPCG_TRACE").is_some();
 
@@ -783,6 +792,7 @@ fn lobpcg_core(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuH
             let rise: f64 = (locked..nk).map(|i| lambda[i] - theta[i]).sum();
             let slack: f64 = (locked..nk).map(|i| RITZ_FORM_SLACK * (1.0 + theta[i].abs()) + RITZ_FORM_RES * col_res[i]).sum();
             let bad = !(rise <= slack);
+            if bad && restores >= MAX_FORM_RESTORES { restores_exhausted = true; }
             if bad && restores < MAX_FORM_RESTORES {
                 restores += 1;
                 if trace { eprintln!("lobpcg it {iterations}: a Ritz vector does not match its Ritz value (λ {:?} θ {:?}); the step is redone without P", &lambda[locked..nk], &theta[locked..nk]); }
@@ -792,6 +802,8 @@ fn lobpcg_core(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuH
                     h.apply_in(&mut b, k, g, &x[i], &hx[i]);
                 }
                 theta = prev_theta;
+                // the preconditioner shift back to the restored columns' Ritz values (review M4: not the bad λ)
+                for i in locked..nk { lambda[i] = theta[i]; }
                 np = 0; // the restart: the redone step's S is [X, W] (module doc)
                 continue;
             }
@@ -806,15 +818,19 @@ fn lobpcg_core(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuH
         // the stop test's residual: the true max, or the split one (`tail`), or the active columns' under a lock
         let stop_res = if locked > 0 { lock_res } else if tail.is_some() { split_res } else { max_res };
         if stop_res < 0.5 * best { best = stop_res; best_it = iterations; }
+        // (the f32-floor diagnosis reads the scaled split residual, so a `Floor` exit can leave a loose column above its
+        // own tier — the witness test reads that column's true residual, θ − r, so the bound stays honest; holding the
+        // floor diagnosis until the loose tier is met was tried in task 9b fix round 1 and turned those exits into
+        // 200-iteration grinds on box states)
         if let Some(stop) = classify(stop_res, tol, iterations, max_iter, best_it, floor, guess_tol) {
             stats = EigenStats { iterations, max_residual: max_res, stop, readbacks, dispatches: b.dispatches() + gram_dispatches, fallbacks, alpha_worst, split_residual,
-                                 head_kept: iterations == 0 || locked > 0 };
+                                 head_kept: iterations == 0 || locked > 0, restores, restores_exhausted };
             break;
         }
         if let Some(abort) = should_abort.as_mut() {
             if abort() {
                 stats = EigenStats { iterations, max_residual: max_res, stop: Stop::Aborted, readbacks, dispatches: b.dispatches() + gram_dispatches, fallbacks, alpha_worst, split_residual,
-                                     head_kept: iterations == 0 || locked > 0 };
+                                     head_kept: iterations == 0 || locked > 0, restores, restores_exhausted };
                 break;
             }
         }
@@ -1152,8 +1168,31 @@ mod tests {
         let c = lobpcg_guarded(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, 1.5 * tol, head, guard, 500, &mut res).unwrap();
         println!("(c) {c:?}");
         assert!(c.iterations > 0 && !c.head_kept, "{c:?}");
-        assert!(res[..head].iter().all(|&r| r < tol) && res[4] < guard, "{res:?}");
+        // a `Floor` exit (the scaled split residual stalled in the floor band) may leave the loose column above its tier;
+        // the witness test then reads its true residual
+        assert!(res[..head].iter().all(|&r| r < tol) && (res[4] < guard || c.stop == Stop::Floor), "{c:?} {res:?}");
         assert_eq!(c.split_residual.map(|(a, _)| a < tol), Some(true));
+    }
+
+    /// Plan 2026-11-13 Task 9b fix round 1 (review I1), the root cause of the lost-level failure: the measured 24 × 24
+    /// Rayleigh–Ritz problem (A, B) of the GPU pseudo-H₂O display solve at iteration 196 (`testdata/rr_i1_*.txt`, dumped
+    /// from the failing run). nalgebra's `SymmetricEigen` pairs two eigenvalues of the reduced Â with each other's
+    /// eigenvectors (residual 1.59); the checked `qm::eigen::sym_eigen` falls back to Jacobi and `rayleigh_ritz` returns
+    /// coefficient vectors whose Rayleigh quotients are their Ritz values (the bad pairing gave +0.7195 for θ = −0.8687).
+    #[test]
+    fn rayleigh_ritz_pairs_survive_a_bad_symmetric_eigen() {
+        let load = |text: &str| -> DMatrix<f64> {
+            let rows: Vec<Vec<f64>> = text.lines().map(|l| l.split_whitespace().map(|v| v.parse().unwrap()).collect()).collect();
+            DMatrix::from_fn(rows.len(), rows[0].len(), |i, j| rows[i][j])
+        };
+        let (a, b) = (load(include_str!("../testdata/rr_i1_a.txt")), load(include_str!("../testdata/rr_i1_b.txt")));
+        let (th, c, _) = rayleigh_ritz(&a, &b, 8).unwrap();
+        for k in 0..8 {
+            let ck = c.column(k).into_owned();
+            let ray = (ck.transpose() * &a * &ck)[(0, 0)] / (ck.transpose() * &b * &ck)[(0, 0)];
+            assert!((ray - th[k]).abs() < 1e-9, "column {k}: Rayleigh quotient {ray} vs θ {}", th[k]);
+        }
+        assert!((th[0] + 0.8686699).abs() < 1e-6, "{th:?}");
     }
 
     #[test]
