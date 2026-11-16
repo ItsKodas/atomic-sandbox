@@ -1,0 +1,35 @@
+# DS-era labels for V7 (plan 2026-11-13 Task 10 Step 1, F13), captured on 1d816c4 before DegenerateShells was deleted.
+# Teacher: providers::ks::problem, cold GPU solve, occupations DegenerateShells { tau: 1e-3 }, multiplicity auto,
+# the sample tolerance raised to the GPU floor (effective_gpu_tol), sigma = h; forces from the converged state.
+# Units: Hartree, Bohr, Ha/Bohr. f64 values are Rust's shortest round-trip form. Generator: crates/validate/tests/ds_era_labels.rs (git history).
+policy accepted
+legacy_tag all/30a74d9bda495668/shared1e-3/1e-1/stop2x5e-8
+grid_n 61
+h 0.2
+box 12.0
+tol 1e-6
+case h2
+atom 1 -0.7 0.0 0.0 force -0.011081971665437229 -3.7801042667812256e-10 -4.052312141670508e-9
+atom 1 0.7 0.0 0.0 force 0.011081996876728534 -1.2543749157877962e-9 -1.5927966517455063e-9
+multiplicity 1
+e_ds -1.1359545439214114
+# h2: 10 steps; tol 1e-6, 10 steps, Δρ 5.10e-7, fractional [], released [], partial [], notes []
+case oh
+atom 8 0.0 0.0 0.0 force -0.022901224243955805 1.5880709085124593e-8 -9.447573830896896e-9
+atom 1 1.83 0.0 0.0 force 0.022686864491335834 -1.6481720935412052e-8 -1.8676357198222004e-8
+multiplicity 2
+e_ds -16.777455516610495
+# oh: 17 steps; tol 1e-6, 17 steps, Δρ 2.29e-7, fractional [FractionalShell { spin: 1, first: 2, count: 2, f: 0.5, spread: 1.4055569097504161e-8 }], released [], partial [], notes ["generated the O pseudopotential: f = 1.4, p-local, r_c ≤ 1.22 Bohr, h_req 0.2 Bohr (17.1 s)"]
+case h4
+atom 1 0.9 0.9045 0.0 force 0.04738417913478457 0.05358687926405504 2.556196117835906e-9
+atom 1 -0.9 0.9045 0.0 force -0.04738207669598392 0.05358889402054184 -5.196359531789225e-9
+atom 1 -0.9 -0.9045 0.0 force -0.04738416848195609 -0.05358686328039974 -1.126975886472875e-8
+atom 1 0.9 -0.9045 0.0 force 0.04738208323440458 -0.05358888742193481 1.2398698165637153e-9
+multiplicity 1
+e_ds -2.0289850167853247
+# h4: 50 steps; tol 1e-6, 50 steps, Δρ 2.76e-7, fractional [], released [FractionalShell { spin: 0, first: 1, count: 2, f: 0.5, spread: 0.0023625758211243963 }, FractionalShell { spin: 1, first: 1, count: 2, f: 0.5, spread: 0.002362577518870812 }], partial [], notes ["generated the H pseudopotential: f = 1.2, s-local, r_c ≤ 1.27 Bohr, h_req 0.35 Bohr (64.4 s); dimer gate: pass: PP R_e 1.4340 Bohr, ω 0.018732 a.u. vs AE σ→0 R_e 1.4489 Bohr, ω 0.019402 a.u. (ΔR_e -0.0150 Bohr, ω ratio − 1 -0.0345; bounds 0.02, 0.05) (105 solves)"]
+aspect 1.005
+fd_internal -2.0006504639744724
+fd_ts 0.013835926284125768
+delta_e 0.028334552810852287
+# h4 FD at ELECTRON_KT: 31 steps; tol 1e-6, 31 steps, Δρ 9.26e-6, fractional [], released [], partial [PartialLevel { spin: 0, index: 1, eps: -0.1660917684388686, f: 0.5259828850299116 }, PartialLevel { spin: 0, index: 2, eps: -0.16505151598219517, f: 0.47401711497008836 }, PartialLevel { spin: 1, index: 1, eps: -0.1660917841521423, f: 0.5259836034753012 }, PartialLevel { spin: 1, index: 2, eps: -0.16505150287983622, f: 0.47401639652470023 }], notes []
