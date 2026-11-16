@@ -3546,6 +3546,114 @@ mod orbital_viewer {
         assert_eq!(orbital_view_commands(&outs)[0].what, OrbitalRequest::SpinDensity);
     }
 
+    fn shows(spin: Spin, track: u32) -> OrbitalRequest {
+        OrbitalRequest::Orbital { spin, track, squared: true }
+    }
+
+    /// The mark of the entry for `(spin, track)` in `o`.
+    fn mark_of(o: &OrbitalDisplay, pending: Option<(Spin, u32)>, spin: Spin, track: u32) -> orbitals::RowPick {
+        let (_, es) = orbitals::entries(o);
+        let e = es.iter().find(|e| (e.r.spin, e.r.track) == (spin, track)).expect("an entry");
+        let shown = match o.what {
+            OrbitalRequest::Orbital { spin, track, .. } => Some((spin, track)),
+            _ => None,
+        };
+        orbitals::RowPick::of(e, shown, pending)
+    }
+
+    /// User request 2026-11-16: a picked orbital that is not shown yet is pending — its row marked
+    /// and disabled — until a payload shows it; a newer pick moves the mark.
+    #[test]
+    fn a_pending_orbital_pick_is_marked_until_shown() {
+        use orbitals::{pending_pick, RowPick};
+        let o = payload(h2_rows(), shows(Spin::Up, 1));
+        // nothing picked (the HOMO placeholder), or the pick on screen: nothing pending
+        assert_eq!(pending_pick(ShowMode::Orbitals, None, Some(&o)), None);
+        assert_eq!(pending_pick(ShowMode::Orbitals, Some((Spin::Up, 1)), Some(&o)), None);
+        assert_eq!(mark_of(&o, None, Spin::Up, 1), RowPick::Shown);
+        // a pick pending: its row pending and not clickable, the shown one still marked shown
+        let p = pending_pick(ShowMode::Orbitals, Some((Spin::Down, 2)), Some(&o));
+        assert_eq!(p, Some((Spin::Down, 2)));
+        assert_eq!(mark_of(&o, p, Spin::Down, 2), RowPick::Pending);
+        assert!(!RowPick::Pending.clickable());
+        assert_eq!(mark_of(&o, p, Spin::Up, 1), RowPick::Shown);
+        assert!(mark_of(&o, p, Spin::Up, 3).clickable() && mark_of(&o, p, Spin::Up, 1).clickable());
+        // another pick: the mark moves
+        let p = pending_pick(ShowMode::Orbitals, Some((Spin::Up, 3)), Some(&o));
+        assert_eq!(p, Some((Spin::Up, 3)));
+        assert_eq!((mark_of(&o, p, Spin::Up, 3), mark_of(&o, p, Spin::Down, 2)), (RowPick::Pending, RowPick::None));
+        // the matching payload shown: cleared
+        let o2 = payload(h2_rows(), shows(Spin::Up, 3));
+        assert_eq!(pending_pick(ShowMode::Orbitals, Some((Spin::Up, 3)), Some(&o2)), None);
+        assert_eq!(mark_of(&o2, None, Spin::Up, 3), RowPick::Shown);
+        // only the Orbitals view picks; no payload yet: nothing to mark
+        assert_eq!(pending_pick(ShowMode::Coloured, Some((Spin::Up, 3)), Some(&o)), None);
+        assert_eq!(pending_pick(ShowMode::Orbitals, Some((Spin::Up, 3)), None), None);
+    }
+
+    /// The pending mark clears on an interrupted payload of the pick (its status line says so) and
+    /// on a pick that no longer exists (the producer's fallback, the viewer adopts what it shows);
+    /// an interrupted payload of the earlier pick, made before the worker read the newer request,
+    /// leaves it pending.
+    #[test]
+    fn a_pending_orbital_pick_clears_when_interrupted_or_gone() {
+        use orbitals::pending_pick;
+        let interrupted = Some(UnoccupiedStatus { requested: 4, current: true, interrupted: true, ..Default::default() });
+        let mut o = payload(h2_rows(), shows(Spin::Up, 3));
+        o.unoccupied = interrupted.clone();
+        assert_eq!(pending_pick(ShowMode::Orbitals, Some((Spin::Up, 3)), Some(&o)), None);
+        assert!(orbitals::unoccupied_lines(4, o.unoccupied.as_ref(), false).iter().any(|l| l == "interrupted — recomputed when idle"));
+        // the earlier pick's interrupted payload: still on its way
+        let mut stale = payload(h2_rows(), shows(Spin::Up, 1));
+        stale.unoccupied = interrupted;
+        assert_eq!(pending_pick(ShowMode::Orbitals, Some((Spin::Up, 3)), Some(&stale)), Some((Spin::Up, 3)));
+        // gone: the producer fell back to another orbital and said so
+        let mut gone = payload(h2_rows(), shows(Spin::Up, 1));
+        gone.notes = vec![format!("{} — showing #1 ↑", orbitals::NO_LONGER_EXISTS)];
+        assert_eq!(pending_pick(ShowMode::Orbitals, Some((Spin::Down, 77)), Some(&gone)), None);
+    }
+
+    /// In the tab: the clicked row shows a spinner and is disabled (a second click sends nothing),
+    /// every other row and level stays clickable and moves the spinner; the payload showing the pick
+    /// clears it.
+    #[test]
+    fn a_pending_orbital_row_spins_and_ignores_clicks() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = with_payload(&scene, Backend::Gpu, payload(h2_rows(), shows(Spin::Up, 1)));
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        st.orbital_pick = Some((Spin::Up, 1));
+        alone(&mut st, DockTab::Orbitals);
+        let probed = |k: &str| PROBES.with(|p| p.borrow().contains_key(k));
+        // the probes of one fresh frame
+        let fresh = |ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>| {
+            PROBES.with(|p| p.borrow_mut().clear());
+            frame(ctx, st, inp, 1400.0, vec![]);
+        };
+        fresh(&ctx, &mut st, &inp);
+        assert!(!probed("pending-↓-2") && !probed("pending-↑-3"), "nothing pending");
+        assert_eq!(orbital_view_commands(&click_widget(&ctx, &mut st, &inp, "orbital-↓-2")).len(), 1);
+        fresh(&ctx, &mut st, &inp);
+        assert!(probed("pending-↓-2"), "the spinner on the clicked row");
+        assert!(hover_text(&ctx, &mut st, &inp, "orbital-↓-2").contains(orbitals::PENDING_TIP));
+        assert!(click_widget(&ctx, &mut st, &inp, "orbital-↓-2").iter().all(|o| o.commands.is_empty()), "the pending row is disabled");
+        assert!(click_widget(&ctx, &mut st, &inp, "level-↓-2").iter().all(|o| o.commands.is_empty()), "so is its level");
+        // another row supersedes it
+        assert_eq!(orbital_view_commands(&click_widget(&ctx, &mut st, &inp, "orbital-↑-3")).len(), 1);
+        fresh(&ctx, &mut st, &inp);
+        assert!(probed("pending-↑-3") && !probed("pending-↓-2"), "the spinner moved");
+        // the payload shows it: cleared, and the row clickable again
+        let snap = with_payload(&scene, Backend::Gpu, payload(h2_rows(), shows(Spin::Up, 3)));
+        let inp = input(&scene, Some(&snap), &cam);
+        fresh(&ctx, &mut st, &inp);
+        assert!(!probed("pending-↑-3"));
+        assert_eq!(orbital_view_commands(&click_widget(&ctx, &mut st, &inp, "orbital-↓-2")).len(), 1);
+    }
+
     /// A closed-shell spin readout: ∫|m| inside the solver's noise budget (no net spin).
     fn closed_spin() -> SpinSummary {
         SpinSummary { n_up: 1, n_dn: 1, integral: 0.0, abs_integral: 2e-6, max_abs: 1e-7, rho_max: 0.4, scale: 4e-4, noise: 1.4e-4 }
@@ -4914,6 +5022,8 @@ mod orbital_viewer {
             let inp = input(&scene, Some(&snap), &cam);
             let level = orbital_view_commands(&click_widget(&ctx, &mut st, &inp, &format!("level-{probe}")));
             let pick = st.orbital_pick;
+            // the level's pick is pending now (its row disabled): undo it so the row's click is compared
+            st.orbital_pick = None;
             let row = orbital_view_commands(&click_widget(&ctx, &mut st, &inp, &format!("orbital-{probe}")));
             assert_eq!(level.len(), 1, "{probe}");
             assert_eq!(level, row, "{probe}");
