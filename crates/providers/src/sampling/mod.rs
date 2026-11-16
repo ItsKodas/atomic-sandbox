@@ -1316,6 +1316,7 @@ impl Sampler {
                             ev.n_atoms = job.scene.nuclei.len();
                             ev.solve_ms = r.stats.solve_ms as f64;
                             ev.scf_steps = Some(r.stats.scf_steps);
+                            ev.ts = Some(r.stats.energy.ts);
                             ev.scf_end = converged(r.stats.scf_steps);
                             surrogate.push_event(ev);
                             self.holdouts.push(Holdout { blocker: job.blocker, unfit: r.stats.untrainable().is_some(), face: r.stats.face_density, multiplicity: r.stats.multiplicity, energy: r.energy, forces: r.forces, scene: job.scene });
@@ -1365,6 +1366,7 @@ impl Sampler {
                             ev.n_atoms = sc.nuclei.len();
                             ev.solve_ms = res.stats.solve_ms as f64;
                             ev.scf_steps = Some(res.stats.scf_steps);
+                            ev.ts = Some(res.stats.energy.ts);
                             ev.scf_end = converged(res.stats.scf_steps);
                             surrogate.push_event(ev);
                             self.shell_checks.push(ShellCheck { pair: pair_z, r, r_cut: self.r_cut, unfit: res.stats.untrainable().is_some(), face: res.stats.face_density, energy: res.energy, forces: res.forces, scene: sc });
@@ -1597,6 +1599,7 @@ impl Sampler {
             ev.n_atoms = scene.nuclei.len();
             ev.solve_ms = r.stats.solve_ms as f64;
             ev.scf_steps = Some(r.stats.scf_steps);
+            ev.ts = Some(r.stats.energy.ts);
             ev.scf_end = converged(r.stats.scf_steps);
             ev.burst_t = burst_t;
             ev.detail = note.clone();
@@ -1617,6 +1620,7 @@ impl Sampler {
             ev.n_atoms = scene.nuclei.len();
             ev.solve_ms = r.stats.solve_ms as f64;
             ev.scf_steps = Some(r.stats.scf_steps);
+            ev.ts = Some(r.stats.energy.ts);
             ev.scf_end = converged(r.stats.scf_steps);
             ev.burst_t = burst_t;
             ev.detail = note.clone();
@@ -1625,7 +1629,7 @@ impl Sampler {
             self.mark(GhostOutcome::Skipped, ghost_atoms(scene));
             return;
         }
-        let (solve_ms, scf) = (r.stats.solve_ms as f64, r.stats.scf_steps);
+        let (solve_ms, scf, ts) = (r.stats.solve_ms as f64, r.stats.scf_steps, r.stats.energy.ts);
         let detail = format!("sampling: {} {}/{}", self.progress.stage, self.progress.done + 1, self.progress.total);
         let sample = Sample {
             pos: scene.nuclei.iter().map(|n| n.pos).collect(),
@@ -1660,6 +1664,7 @@ impl Sampler {
         ev.n_atoms = scene.nuclei.len();
         ev.solve_ms = solve_ms;
         ev.scf_steps = Some(scf);
+        ev.ts = Some(ts);
         ev.scf_end = converged(scf);
         ev.burst_t = burst_t;
         ev.detail = detail;

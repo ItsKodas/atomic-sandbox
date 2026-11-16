@@ -234,9 +234,9 @@ pub struct Levels {
     pub lumo_box: bool,
     pub lumo_unconverged: bool,
     pub stale: bool,
-    /// Some orbital is partly occupied (`0 < f < 1`: a degenerate shell shared equally under
-    /// `Occupations::DegenerateShells`, M7 — an open shell of a pseudo-atom): there is no gap between
-    /// partly filled degenerate orbitals, so none is quoted.
+    /// Some orbital is partly occupied (`0 < f < 1` after [`shown_f`]: a level near the Fermi level μ under the
+    /// Fermi–Dirac occupations at T_el — an open shell, nearly degenerate frontier levels; spec 2026-11-13 §6.6): the
+    /// frontier levels share their electrons, so no HOMO–LUMO gap is quoted.
     pub fractional: bool,
     /// The eigenvalues are a Harris display solve's (live-orbitals spec §6): every ε, the HOMO, the
     /// LUMO and the gap print with "≈" and carry [`HARRIS_EPS_TIP`].
@@ -245,11 +245,11 @@ pub struct Levels {
 
 impl Levels {
     pub fn of(rows: &[OrbitalInfo]) -> Levels {
-        let homo = rows.iter().filter(|r| r.occupation > 0.0).map(|r| r.eps_range.1).reduce(f64::max);
-        let lumo = rows.iter().filter(|r| r.occupation == 0.0).map(|r| r.eps_range.0).reduce(f64::min);
-        let at_lumo = |r: &&OrbitalInfo| r.occupation == 0.0 && lumo.is_some_and(|l| r.eps_range.0 <= l + SAME_LEVEL);
+        let homo = rows.iter().filter(|r| shown_f(r) > 0.0).map(|r| r.eps_range.1).reduce(f64::max);
+        let lumo = rows.iter().filter(|r| shown_f(r) == 0.0).map(|r| r.eps_range.0).reduce(f64::min);
+        let at_lumo = |r: &&OrbitalInfo| shown_f(r) == 0.0 && lumo.is_some_and(|l| r.eps_range.0 <= l + SAME_LEVEL);
         let (lumo_box, lumo_unconverged) = (rows.iter().filter(at_lumo).any(|r| r.box_state), rows.iter().filter(at_lumo).any(|r| r.not_converged));
-        let fractional = rows.iter().any(|r| r.occupation > 1e-9 && r.occupation < 1.0 - 1e-9);
+        let fractional = rows.iter().any(|r| shown_f(r) > 1e-9 && shown_f(r) < 1.0 - 1e-9);
         Levels { homo, lumo, inverted: false, lumo_box, lumo_unconverged, stale: false, fractional, approx: false }
     }
 
@@ -298,13 +298,28 @@ impl Levels {
     /// Whether the row's set holds the HOMO: within [`SAME_LEVEL`] of it, so a closed shell's ↑
     /// and ↓ orbitals (equal to the solver's spin noise, ≤ 3e-6 Ha) are both the HOMO.
     fn is_homo(&self, r: &OrbitalInfo) -> bool {
-        r.occupation > 0.0 && self.homo.is_some_and(|h| r.eps_range.1 >= h - SAME_LEVEL)
+        shown_f(r) > 0.0 && self.homo.is_some_and(|h| r.eps_range.1 >= h - SAME_LEVEL)
     }
 
     fn is_lumo(&self, r: &OrbitalInfo) -> bool {
-        r.occupation == 0.0 && self.lumo.is_some_and(|l| r.eps_range.0 <= l + SAME_LEVEL)
+        shown_f(r) == 0.0 && self.lumo.is_some_and(|l| r.eps_range.0 <= l + SAME_LEVEL)
     }
 }
+
+/// A row's occupation as the list shows it (spec 2026-11-13 §6.6): its Fermi–Dirac f per level, a level with
+/// f < 1e-6 (`qm::PARTIAL_OCCUPATION_MIN`: a witness tail) empty and one within it of 1 full —
+/// `qm::orbitals::display_occupation`, which the providers already apply; applied again here so a row can never read
+/// "occupied" on an FD tail.
+pub fn shown_f(r: &OrbitalInfo) -> f64 {
+    qm::orbitals::display_occupation(r.occupation)
+}
+
+/// The occupation badge's hover for a single orbital's fractional f (spec 2026-11-13 §6.6; was the `DegenerateShells`
+/// "shell shared equally" wording).
+pub const OCC_TIP: &str = "occupation: this level's Fermi–Dirac f at the electronic temperature T_el — a level near the Fermi level is partly occupied (an open shell's degenerate levels share their electrons equally, f = 1/3 for one electron in three; nearly degenerate frontier levels split them); f below 1e-6 shows as empty. An ensemble weight of the Kohn–Sham free energy, not a measurable orbital occupation";
+
+/// The occupation badge's hover for a paired ↑↓ row.
+pub const OCC_PAIR_TIP: &str = "occupation of the pair: the sum of its ↑ and its ↓ orbital's Fermi–Dirac f at the electronic temperature T_el (a fraction: partly occupied levels near the Fermi level, summed over both spins; f below 1e-6 shows as empty) — an ensemble weight of the Kohn–Sham free energy, not a measurable orbital occupation";
 
 /// The mark of an approximate (display-solve) energy (live-orbitals spec §6).
 pub const APPROX: &str = "≈";
@@ -316,7 +331,7 @@ pub fn levels_line(l: &Levels) -> Option<String> {
     let at = |e: f64| format!("{a}{} Ha ({a}{} eV)", energy_ha(e), energy_ev(e));
     let line = match (l.homo, l.lumo, l.gap()) {
         (Some(h), Some(u), Some(g)) => format!("HOMO {} · LUMO {} · Kohn–Sham gap {a}{} Ha ({a}{} eV)", at(h), at(u), minus(g, 3), minus(units::hartree_to_ev(g), 2)),
-        (Some(h), _, _) if l.fractional => format!("HOMO {} (partly filled shell: no HOMO–LUMO gap — the orbitals of a shared shell are one level)", at(h)),
+        (Some(h), _, _) if l.fractional => format!("HOMO {} (partly occupied levels: no HOMO–LUMO gap — the frontier levels share their electrons at T_el)", at(h)),
         (Some(h), _, _) => format!("HOMO {}", at(h)),
         _ => return None,
     };
@@ -398,7 +413,7 @@ impl RowView {
         if r.smeared_1s {
             tags.push(tag("smeared nucleus: wider than the physical 1s", SMEARED_TIP, false));
         }
-        if r.touches_box && r.occupation > 0.0 {
+        if r.touches_box && shown_f(r) > 0.0 {
             tags.push(tag(TOUCHES_BOX, TOUCHES_BOX_TIP, true));
         }
         RowView {
@@ -408,8 +423,8 @@ impl RowView {
             label: r.label.to_string(),
             ha: format!("{}{}", levels.mark(), energy_ha(r.energy)),
             ev: format!("{}{}", levels.mark(), energy_ev(r.energy)),
-            occupation: occupation_text(r.occupation),
-            occupied: r.occupation > 0.0,
+            occupation: occupation_text(shown_f(r)),
+            occupied: shown_f(r) > 0.0,
             tags,
             approx: levels.approx,
         }
@@ -429,7 +444,7 @@ impl RowView {
         // the ↑ member's tags in their order, then the warnings only the ↓ member carries
         let mut tags: Vec<Tag> = u.tags.iter().map(|t| if t.warn && !has(&d, t) { marked(t, Spin::Up) } else { t.clone() }).collect();
         tags.extend(d.tags.iter().filter(|t| t.warn && !has(&u, t)).map(|t| marked(t, Spin::Down)));
-        RowView { occupation: occupation_text(up.occupation + dn.occupation), tags, ..u }
+        RowView { occupation: occupation_text(shown_f(up) + shown_f(dn)), tags, ..u }
     }
 
     /// The label's tooltip: what is on screen when this orbital is picked.
@@ -1501,7 +1516,7 @@ impl Entry<'_> {
 
     /// The occupation (a pair's summed).
     pub fn occupation(&self) -> f64 {
-        self.r.occupation + self.partner.map_or(0.0, |d| d.occupation)
+        shown_f(self.r) + self.partner.map_or(0.0, shown_f)
     }
 
     /// A state of the box (either member of a pair).
@@ -2169,11 +2184,7 @@ fn row(ui: &mut Ui, st: &mut UiState, e: Entry<'_>, levels: &Levels, mark: RowPi
         }
         let occ = e.occupation();
         if occ > 1e-9 && (occ - occ.round()).abs() > 1e-9 {
-            let occ_tip = if e.partner.is_some() {
-                "occupation of the pair: the sum of its ↑ and its ↓ orbital's (a fraction is a degenerate shell shared equally, summed over both spins — pseudopotentials: the spherical-atom ensemble, not a measurable orbital occupation)"
-            } else {
-                "occupation: a fraction (1/3, …) is a degenerate shell shared equally (pseudopotentials: the spherical-atom ensemble, not a measurable orbital occupation)"
-            };
+            let occ_tip = if e.partner.is_some() { OCC_PAIR_TIP } else { OCC_TIP };
             badge(ui, &format!("occ {}", fraction_text(occ)), dim).on_hover_text(occ_tip);
         }
         if !notes.is_empty() {

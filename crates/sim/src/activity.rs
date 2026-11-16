@@ -713,6 +713,10 @@ pub struct TeachEvent {
     pub scf_steps: Option<usize>,
     /// How the SCF ended, where known (`None`: no SCF, or a provider that does not say).
     pub scf_end: Option<ScfEnd>,
+    /// The teacher solve's electronic entropy term T_el·S (Ha; `EvalStats::energy.ts`, Fermi–Dirac spec 2026-11-13
+    /// §6.6): the Activity row prints "−TS = −… mHa" when it is ≥ 1e-6. `None` where no solve ran or it did not
+    /// report one (a failure, a reference scan, a row with no solve).
+    pub ts: Option<f64>,
     pub audit: Option<AuditVerdict>,
     /// A background audit: answered steps between its dispatch and its verdict.
     pub audit_lag: Option<usize>,
@@ -739,6 +743,7 @@ impl TeachEvent {
             solve_ms: 0.0,
             scf_steps: None,
             scf_end: None,
+            ts: None,
             audit: None,
             audit_lag: None,
             burst_t: None,

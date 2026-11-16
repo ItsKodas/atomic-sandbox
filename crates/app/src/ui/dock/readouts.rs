@@ -4,7 +4,7 @@
 //! real minimum and maximum, and ΔE = E total minus its value at the window's first point on a real
 //! axis in µHa (mHa above 1000 µHa) with a dashed zero line and labelled ticks, coloured per step by
 //! who answered it ([`delta_axis`]: the old Graph scaled each curve to its own range, which drew
-//! 1e-6 Ha of noise as a full swing) —, the energies (KE, E_KS, E total, E conserved; Ha / eV by the
+//! 1e-6 Ha of noise as a full swing) —, the energies (KE, F — the electronic free energy at T_el —, E total, E conserved; Ha / eV by the
 //! header's switch), one time-and-cost line with the health checks as dots (a check that is not ok
 //! also prints its text), and the folds Work done, Energy breakdown and solver and Compare with
 //! reference (PySCF) ([`Sections`], `UiState::readouts_sections`, the profile's `readouts_sections`).
@@ -109,7 +109,46 @@ fn tile(ui: &mut Ui, key: &str, value: RichText, unit: &str, tip: &str) {
 const STACK_BELOW: f32 = 400.0;
 
 /// The chart card's explanation (the old Graph tab's note), its ⓘ.
-pub const CHART_TIP: &str = "E total = KE + E_KS: it moves when tools or the thermostat act. The drift readout uses E conserved. The lower plot is ΔE, E total minus its value at the first point shown, on a real axis (µHa, or mHa past 1000 µHa) — noise of 1e-6 Ha stays a ripple — coloured by who answered each step; the upper is T in the chosen unit, its real minimum and maximum labelled";
+pub const CHART_TIP: &str = "E total = KE + F: it moves when tools or the thermostat act. The drift readout uses E conserved. The lower plot is ΔE, E total minus its value at the first point shown, on a real axis (µHa, or mHa past 1000 µHa) — noise of 1e-6 Ha stays a ripple — coloured by who answered each step; the upper is T in the chosen unit, its real minimum and maximum labelled";
+
+/// The "E total" row's tooltip (Fermi–Dirac spec 2026-11-13 §6.6): BO-MD on F conserves F + K_nuc (§4.7(f)).
+pub const E_TOTAL_TIP: &str = "KE + F: conserved in NVE without tools";
+
+/// The Energies section's ⓘ: E total is KE + F, and E + KE is not what is conserved where TS varies (spec 2026-11-13
+/// §4.7(f)).
+pub const ENERGIES_INFO: &str = "E total = KE + F: conserved in NVE without tools (the forces are −dF/dR, so KE + E is not conserved where the electronic entropy term TS changes along the path). E conserved = E total + drag spring + field potential + container walls − the work of thermostat, pins, drag damping, COM correction and moving walls (Work done, below).";
+
+/// The F row's tooltip: [`pseudo::ENERGY_TOOLTIP`], with [`pseudo::VALENCE_NOTE`] under a pseudopotential.
+pub fn energy_tip(pseudised: &[sim::PseudoSummary]) -> String {
+    if pseudised.is_empty() {
+        format!("{} At the current positions: electrons + nuclear repulsion.", pseudo::ENERGY_TOOLTIP)
+    } else {
+        format!("{} At the current positions: valence electrons + the ions' repulsion. {}", pseudo::ENERGY_TOOLTIP, pseudo::VALENCE_NOTE)
+    }
+}
+
+/// The Energy breakdown's rows, in order (spec 2026-11-13 §6.6): the electronic kinetic, external, Hartree, xc and
+/// nuclear terms, their sum E (internal), −TS at T_el, and F = E − TS (`EvalStats::energy.total`, the energy the
+/// forces, the dynamics and the model use).
+pub fn breakdown_rows(e: &sim::EnergyBreakdown) -> Vec<(String, f64)> {
+    vec![
+        ("kinetic (electrons)".into(), e.kinetic),
+        ("external".into(), e.external),
+        ("Hartree".into(), e.hartree),
+        ("xc".into(), e.xc),
+        ("nuclear".into(), e.nuclear),
+        ("E (internal)".into(), e.internal),
+        (pseudo::ts_label(), -e.ts),
+        ("F".into(), e.total),
+    ]
+}
+
+/// The evaluation's own health warnings, as the readouts' warning list prints them (amber, one line each): the
+/// solver's warnings, the core-overlap lines and the `branch_jump` guard's formatted text
+/// (`sim::branch_jump_warning`, spec 2026-11-13 §6.3 — the providers push it into `EvalStats::warnings`).
+pub fn eval_warnings(eval: &sim::EvalStats) -> Vec<String> {
+    eval.warnings.clone()
+}
 
 /// The ΔE plot's axis: the unit (`per_ha` units per Hartree: 1e6 µHa, 1e3 mHa), its range and its
 /// labelled ticks, in that unit.
@@ -219,7 +258,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     super::group(ui, st, "d-energies", |ui, st| {
         ui.horizontal(|ui| {
             theme::section(ui, "Energies");
-            theme::info(ui, "E total = KE + E_KS: conserved in NVE without tools. E conserved = E total + drag spring + field potential + container walls − the work of thermostat, pins, drag damping, COM correction and moving walls (Work done, below).");
+            theme::info(ui, ENERGIES_INFO);
         });
         let units = st.energy_units;
         let stacked = ui.available_width() < STACK_BELOW;
@@ -231,14 +270,9 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
                 ui.end_row();
             };
             row("KE (nuclei)", d.kinetic, false, "Σ ½ m v² of the nuclei (lab frame)");
-            let e_ks_label = pseudo::energy_label(&d.eval.pseudised);
-            let e_ks_tip = if d.eval.pseudised.is_empty() {
-                "Kohn-Sham energy at the current positions (electrons + nuclear repulsion)".to_string()
-            } else {
-                format!("Kohn-Sham energy at the current positions (valence electrons + the ions' repulsion). {}", pseudo::VALENCE_NOTE)
-            };
-            row(e_ks_label, d.energy_ks, false, &e_ks_tip);
-            row("E total", d.total, true, "KE + E_KS: conserved in NVE without tools");
+            // the electronic free energy F = E − TS at T_el (spec 2026-11-13 §6.6): `energy_ks` is the provider's total
+            row(&pseudo::energy_label(&d.eval.pseudised), d.energy_ks, false, &energy_tip(&d.eval.pseudised));
+            row("E total", d.total, true, E_TOTAL_TIP);
             row(
                 "E conserved",
                 d.energy_conserved,
@@ -246,7 +280,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
                 "E total + drag spring + field potential + container walls − the work of the thermostat, pins, drag damping, COM correction and moving walls: the invariant the drift is fitted on",
             );
         });
-        // M7 (Task 6 review A.6): a partly filled degenerate shell is shared equally, the spherical-atom ensemble
+        // the partly occupied levels of the final step (Fermi–Dirac, spec 2026-11-13 §6.3), one line each
         for line in pseudo::occupation_lines(&d.eval.partial) {
             theme::note(ui, line);
         }
@@ -442,7 +476,9 @@ fn status_line(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, s: &crate:
                 Some(r) => format!("{} SCF iterations, {r} readbacks", d.eval.scf_steps),
                 None => format!("{} SCF iterations", d.eval.scf_steps),
             };
-            format!("\nper step: {cost} · {} ms", d.eval.solve_ms)
+            // the solve's electronic entropy term when it has one (spec 2026-11-13 §6.6)
+            let ts = crate::ui::activity::log::ts_text(d.eval.energy.ts).map_or(String::new(), |t| format!(" · {t} (electronic entropy at T_el)"));
+            format!("\nper step: {cost} · {} ms{ts}", d.eval.solve_ms)
         }
     };
     if let Some(a) = input.model().and_then(|m| m.last_audit.as_ref()).filter(|a| a.asynchronous) {
@@ -458,8 +494,8 @@ fn status_line(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, s: &crate:
         Some(w) => checks.push((AMBER, w.clone())),
         None => checks.push((GREEN, format!("dt {:.3} fs (the warning starts above {DT_WARN_FS} fs)", d.dt_fs()))),
     }
-    for w in &d.eval.warnings {
-        checks.push((AMBER, w.clone()));
+    for w in eval_warnings(&d.eval) {
+        checks.push((AMBER, w));
     }
     super::group(ui, st, "d-time", |ui, _| {
         ui.horizontal(|ui| {
@@ -550,13 +586,11 @@ fn breakdown(ui: &mut Ui, st: &mut UiState, s: &crate::sim::Snapshot) {
             energy_cells(ui, x, units, false, stacked);
             ui.end_row();
         };
-        row(pseudo::energy_label(&d.eval.pseudised), e.total);
-        row("kinetic (electrons)", e.kinetic);
-        row("external", e.external);
-        row("Hartree", e.hartree);
-        row("xc", e.xc);
-        row("nuclear", e.nuclear);
+        for (name, x) in breakdown_rows(e) {
+            row(&name, x);
+        }
     });
+    ui.weak(format!("F = E − TS: the electronic free energy at T_el = {} K (kT = {} mHa); TS = 0 for a gapped state", pseudo::t_el_kelvin(), qm::ELECTRON_KT * 1e3));
     let sigma = s.scene.sigma.unwrap_or(s.scene.grid_h);
     if d.eval.pseudised.is_empty() {
         ui.weak(format!("smeared nuclei (σ = {sigma} Bohr): absolute energies depend on σ and h"));
@@ -564,11 +598,14 @@ fn breakdown(ui: &mut Ui, st: &mut UiState, s: &crate::sim::Snapshot) {
         ui.weak(format!("{} — all-electron species are smeared nuclei (σ = {sigma} Bohr)", pseudo::VALENCE_NOTE));
     }
     if d.source == Source::Surrogate {
-        ui.weak("surrogate step: only the total is the model's (it has no electrons); the parts above are 0");
+        ui.weak("surrogate step: only F is the model's (it has no electrons); the other rows are 0");
     } else if d.source == Source::Reference {
-        ui.weak("lone atoms, answered from the atom references: only the total is theirs (Σ of the isolated-atom reference energies, no SCF ran); the parts above and the SCF numbers below are 0");
+        ui.weak(format!(
+            "lone atoms, answered from the atom references: only F is theirs (Σ of the isolated-atom reference energies, no SCF ran); the other rows and the SCF numbers below are 0 — {}",
+            pseudo::reference_free_energy_note()
+        ));
     } else if d.source == Source::Fallback {
-        ui.weak("fallback step: the DFT teacher's breakdown (with a trusted model E_KS above is the model's: total − teacher gap)");
+        ui.weak("fallback step: the DFT teacher's breakdown (with a trusted model F above is the model's: total − teacher gap)");
     }
     if s.engine == Backend::Gpu {
         ui.weak("GPU (f32 grid): energies scatter by up to ~1e-5 Ha between solve paths");

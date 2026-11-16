@@ -674,7 +674,7 @@ spin channel, so that k ≥ 2 far-apart copies compose to k·E_ref. It becomes: 
 | "E total" row and the graph | KE + E_KS | KE + F, so "E total" reads "KE + F: conserved in NVE without tools" |
 | Energy breakdown | kinetic … nuclear, total | kinetic, external, Hartree, xc, nuclear, **E (internal)**, **−TS (electronic entropy, T_el 1579 K)**, **F** |
 | Activity iteration energy | E_HF | F_HF (same row, renamed) |
-| Solve log line | — | "−TS = 9.5 mHa", only when TS ≥ 1e-6 Ha |
+| Solve log line | — | "−TS = −9.5 mHa", only when TS ≥ 1e-6 Ha (sign corrected 2026-11-16 at plan Task 12: the value printed is −TS, negative; the earlier string dropped the sign) |
 | Orbital viewer | shared-shell rows | per-level f; a level with f < 1e-6 shows as empty; the `DegenerateShells` wording in `ui/dock/orbitals.rs` is rewritten |
 | Compare with reference (PySCF) | forces, dipole | when TS ≥ 1e-6 Ha: "ours is at T_el = 1579 K with partly occupied levels; PySCF's is integer-occupied", next to the force deviations |
 
@@ -924,7 +924,7 @@ review.
 >   its bound; 6 are kept out, and the model falls back to DFT near them);
 > - 5 not migrated (2 stalled, 3 now box-affected; they remain in the old collection).
 >
-> References re-solved: O −TS = 9.5 mHa (or as measured). The audit history starts empty, so trust is rebuilt from new
+> References re-solved: O −TS = −9.5 mHa (or as measured; sign corrected 2026-11-16 at plan Task 12). The audit history starts empty, so trust is rebuilt from new
 > audits.
 
 The wording says "identical within solver noise", not "identical". It says "kept out", not "discarded". It names the

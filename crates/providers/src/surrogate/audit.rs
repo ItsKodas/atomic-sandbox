@@ -241,13 +241,15 @@ pub(super) struct Solved {
 
 /// The auditor's answer: what the teacher solved, or its error; for a `Reference` job the scan's
 /// outcome is in `reference` (and `result` is unused). `scf_steps`: the solve's SCF steps as its
-/// teacher reported them (`None` for an error or a reference scan).
+/// teacher reported them (`None` for an error or a reference scan); `ts` its electronic entropy term T_el·S
+/// (`EvalStats::energy.ts`, Ha; `None` likewise — the Activity row's "−TS", Fermi–Dirac spec 2026-11-13 §6.6).
 pub(super) struct AuditAnswer {
     pub(super) job: AuditJob,
     pub(super) result: Result<Solved, String>,
     pub(super) reference: Option<Result<AtomReference, ProviderError>>,
     pub(super) ms: f64,
     pub(super) scf_steps: Option<usize>,
+    pub(super) ts: Option<f64>,
 }
 
 /// The background auditor (ruling S14, module doc "Audit"): a second teacher instance on its own
@@ -317,7 +319,7 @@ impl Auditor {
                     teacher.set_share_tables(job.shares.clone());
                     let t = Instant::now();
                     let g = job.generation;
-                    let mut scf_steps = None;
+                    let (mut scf_steps, mut ts) = (None, None);
                     let (result, reference) = match job.kind {
                         // the multiplicity scan (each solve cold, the teacher reset after it)
                         JobKind::Reference(z) => {
@@ -346,7 +348,7 @@ impl Auditor {
                             teacher
                                 .evaluate(&job.scene, &mut || current.load(Ordering::Relaxed) != g)
                                 .map(|r| {
-                                    scf_steps = Some(r.stats.scf_steps);
+                                    (scf_steps, ts) = (Some(r.stats.scf_steps), Some(r.stats.energy.ts));
                                     Solved { energy: r.energy, forces: r.forces, face: r.stats.face_density, multiplicity: r.stats.multiplicity, unfit: r.stats.untrainable(), display: r.display, orbitals: r.orbitals }
                                 })
                                 .map_err(|e| e.to_string()),
@@ -354,7 +356,7 @@ impl Auditor {
                         ),
                     };
                     let ms = t.elapsed().as_secs_f64() * 1e3;
-                    if atx.send(AuditAnswer { job, result, reference, ms, scf_steps }).is_err() {
+                    if atx.send(AuditAnswer { job, result, reference, ms, scf_steps, ts }).is_err() {
                         break;
                     }
                 }
@@ -845,7 +847,7 @@ impl SurrogateKs {
                 if let Some(d) = display {
                     self.side_display = Some(SideDisplay { display: Some(d), orbitals, kind: SideKind::Audit, job: ans.job.id, positions: positions() });
                 }
-                self.judge_audit(ans.job, energy, forces, face, multiplicity, unfit, ans.ms, ans.scf_steps);
+                self.judge_audit(ans.job, energy, forces, face, multiplicity, unfit, ans.ms, ans.scf_steps, ans.ts);
             }
         }
     }
@@ -855,7 +857,7 @@ impl SurrogateKs {
     /// the next evaluation. One activity event either way: judged (the verdict, the admission's
     /// outcome) or discarded (plan review S11).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, multiplicity: Option<u32>, unfit: Option<&str>, ms: f64, scf_steps: Option<usize>) {
+    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, multiplicity: Option<u32>, unfit: Option<&str>, ms: f64, scf_steps: Option<usize>, ts: Option<f64>) {
         let unaudited = self.answered.saturating_sub(job.answered);
         let AuditJob { scene, prov, draft_guess, .. } = job;
         let tag = if draft_guess { SampleTag::DraftAudit } else { SampleTag::Audit };
@@ -879,6 +881,7 @@ impl SurrogateKs {
             ev.n_atoms = pos.len();
             ev.solve_ms = ms;
             ev.scf_steps = scf_steps;
+            ev.ts = ts;
             ev.scf_end = scf_steps.filter(|&n| n > 0).map(|_| sim::ScfEnd::Converged);
             ev.audit_lag = Some(unaudited);
             self.push_event(ev);
@@ -896,6 +899,7 @@ impl SurrogateKs {
             ev.n_atoms = pos.len();
             ev.solve_ms = ms;
             ev.scf_steps = scf_steps;
+            ev.ts = ts;
             ev.scf_end = scf_steps.filter(|&n| n > 0).map(|_| sim::ScfEnd::Converged);
             ev.audit_lag = Some(unaudited);
             self.push_event(ev);
@@ -980,6 +984,7 @@ impl SurrogateKs {
         ev.n_atoms = pos.len();
         ev.solve_ms = ms;
         ev.scf_steps = scf_steps;
+        ev.ts = ts;
         ev.scf_end = scf_steps.filter(|&n| n > 0).map(|_| sim::ScfEnd::Converged);
         ev.audit = Some(verdict);
         ev.audit_lag = Some(unaudited);

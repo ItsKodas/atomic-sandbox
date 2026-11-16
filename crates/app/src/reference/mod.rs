@@ -361,6 +361,12 @@ pub struct Ours {
     /// The provider's raw forces at `positions` (Ha/Bohr).
     pub forces: Vec<[f64; 3]>,
     pub energy: f64,
+    /// Our electronic entropy term T_el·S at `positions` (Ha; `EvalStats::energy.ts`, 0 for a gapped state or a model
+    /// answer): ≥ 1e-6 means partly occupied levels, which the comparison notes (Fermi–Dirac spec 2026-11-13 §6.6).
+    pub ts: f64,
+    /// The surrogate answered this step (`Source::Surrogate`): the comparison's T_el note is the model's
+    /// (`ui::dock::compare::partial_note`), since a model answer has no TS to read.
+    pub model_answer: bool,
     /// The dipole of the density solved at `positions` (`PartialCharges::dipole`), once a snapshot
     /// carries charges measured exactly there.
     pub dipole: Option<[f64; 3]>,

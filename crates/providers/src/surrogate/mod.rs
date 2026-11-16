@@ -1975,7 +1975,7 @@ impl SurrogateKs {
         let raw_energy = r.energy;
         r.energy = self.to_canonical(&h.z, h.prov.grid_n, r.energy);
         // the event's record of the solve (read before `r` and `h` are consumed below)
-        let (teacher_ms, scf) = (r.stats.solve_ms as f64, r.stats.scf_steps);
+        let (teacher_ms, scf, ts) = (r.stats.solve_ms as f64, r.stats.scf_steps, r.stats.energy.ts);
         let (h_audit, rule_code, atom, n_atoms) = (h.audit, h.reason.rule, h.reason.atom, h.pos.len());
         let gap = h.model.as_ref().map(|m| r.energy - m.energy);
         let mut notes = Vec::new();
@@ -2179,6 +2179,7 @@ impl SurrogateKs {
         ev.n_atoms = n_atoms;
         ev.solve_ms = teacher_ms;
         ev.scf_steps = Some(scf);
+        ev.ts = Some(ts);
         ev.audit = if h_audit { self.last_audit.as_ref().map(|a| a.verdict) } else { None };
         self.push_event(ev);
         let surface_forces = surface_forces.unwrap_or_else(|| r.forces.clone());

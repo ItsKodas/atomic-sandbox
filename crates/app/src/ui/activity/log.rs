@@ -38,11 +38,29 @@ pub fn counters(ui: &mut Ui, st: &ActivityState, m: Option<&crate::sim::ModelSta
     // lone-atom steps answered from the references (rule 0b): their own kind — no solve, not a
     // fallback, not a model answer, nothing learned
     if let Some(n) = m.map(|m| m.solves.reference).filter(|&n| n > 0) {
-        tips.push(format!("lone-atom steps from the references: {n} — steps whose atoms had no neighbour within the model's cutoff, answered from the isolated-atom references (E = Σ E_ref, zero forces: the model's own answer there): no DFT solve, not a fallback, not a model answer, nothing learned, never audited. Counted since the solver was built or the model forgotten"));
+        tips.push(lone_atom_tip(n));
     }
     // teaching solves only: a plain DFT step is not one (plan review S16)
     tips.push(format!("teaching solves this session: {} — teacher solves offered to a model since the app started, over every solver switch; plain DFT steps are not counted", st.session_solves));
     super::jobs::two_sides(ui, &left, &right, FontId::monospace(11.0), theme::INK_DIM).on_hover_text(tips.join("\n\n"));
+}
+
+/// The counters' hover line for the lone-atom steps answered from the references (`n` of them): E = Σ E_ref, with the
+/// references' free-energy reading (spec 2026-11-13 §4.7(i), `pseudo::reference_free_energy_note`).
+pub fn lone_atom_tip(n: u64) -> String {
+    format!(
+        "lone-atom steps from the references: {n} — steps whose atoms had no neighbour within the model's cutoff, answered from the isolated-atom references (E = Σ E_ref, zero forces: the model's own answer there): no DFT solve, not a fallback, not a model answer, nothing learned, never audited. Counted since the solver was built or the model forgotten. {}",
+        crate::ui::pseudo::reference_free_energy_note()
+    )
+}
+
+/// A solve's electronic-entropy term as its solve line prints it (spec 2026-11-13 §6.6, its sign corrected at Task 12):
+/// the signed value, "−TS = −9.5 mHa" (µHa below 0.1 mHa), only when TS ≥ 1e-6 Ha — a gapped solve says nothing.
+pub fn ts_text(ts: f64) -> Option<String> {
+    if !(ts >= 1e-6) {
+        return None;
+    }
+    Some(if ts >= 1e-4 { format!("−TS = −{:.1} mHa", ts * 1e3) } else { format!("−TS = −{:.1} µHa", ts * 1e6) })
 }
 
 /// The step cell of a log row and its hover (plan review M6): `pass` for a pass solve, else the
@@ -142,11 +160,20 @@ pub fn gap_cell(e: &sim::TeachEvent) -> (String, Option<String>) {
 
 /// The solve cell: the time (ms, or s above 10 s) and the SCF iterations with how they ended —
 /// "840 ms · 37 it" converged, "6.1 s · 61 stalled" (the stall stop), "9.8 s · 200 cap"; "—" for a
-/// row with no solve.
+/// row with no solve; a solve with TS ≥ 1e-6 Ha ends with its [`ts_text`] ("· −TS = −9.5 mHa").
 pub fn solve_cell(e: &sim::TeachEvent) -> String {
     if !e.is_solve() {
         return "—".into();
     }
+    let cell = solve_cell_time(e);
+    match e.ts.and_then(ts_text) {
+        Some(ts) => format!("{cell} · {ts}"),
+        None => cell,
+    }
+}
+
+/// [`solve_cell`] without the −TS.
+fn solve_cell_time(e: &sim::TeachEvent) -> String {
     let t = if e.solve_ms >= 10_000.0 { format!("{:.1} s", e.solve_ms / 1e3) } else { format!("{:.0} ms", e.solve_ms) };
     match (e.scf_steps.filter(|&n| n > 0), e.scf_end) {
         (Some(n), None | Some(sim::ScfEnd::Converged)) => format!("{t} · {n} it"),
@@ -169,7 +196,8 @@ pub fn solve_hover(e: &sim::TeachEvent) -> Option<String> {
         Some(sim::ScfEnd::NonFinite) => " — stopped: Δρ was not finite",
         Some(sim::ScfEnd::TimeLimit) | None => "",
     };
-    Some(format!("{n} SCF iterations{why}"))
+    let ts = e.ts.and_then(ts_text).map_or(String::new(), |t| format!("; {t} (the electronic entropy term of F at T_el: partly occupied levels)"));
+    Some(format!("{n} SCF iterations{why}{ts}"))
 }
 
 /// One line of the displayed list (oldest-first positions are indices into `rows`).

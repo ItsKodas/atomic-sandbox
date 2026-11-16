@@ -267,7 +267,7 @@ pub fn outcome_sentence(o: K) -> String {
         ),
         K::Thinned => format!("skipped: too similar to a sample already held (one in {THIN_EVERY} such is kept)"),
         K::BoxNotKept => "not kept: it touches the box walls — the box's squeeze, not the molecule".into(),
-        K::UnfitNotKept => "used for this step, not kept: two atoms' cores overlap (the frozen-core approximation fails there) or the shared-shell occupation changed since the last step (the energy jumps)".into(),
+        K::UnfitNotKept => "used for this step, not kept: two atoms' cores overlap (the frozen-core approximation fails there) or F changed by more than the forces' work since the last step (the SCF moved to another stationary state)".into(),
         K::ShellNotKept => "used for this step, not kept and not judged: a pair lies in the cutoff shell a shell check measured — the model's cutoff cannot represent it (a shell fence)".into(),
         K::LoneNotKept => "used for this step, not kept: no atom has a neighbour within the model's cutoff — a lone atom has nothing to learn (the isolated atom is the reference energy)".into(),
         K::FenceDisagrees => "not kept: next to a geometry the model could not learn, and the teacher still disagrees with the model there".into(),

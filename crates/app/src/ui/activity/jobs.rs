@@ -71,14 +71,15 @@ pub struct JobRow {
     pub count: Option<String>,
 }
 
-/// The running solve's line ("Δρ 3.2e-5 → 1e-6 · ΔE −2.1e-4 Ha · 85 ms/iteration") and, once
+/// The running solve's line ("Δρ 3.2e-5 → 1e-6 · ΔF_HF −2.1e-4 Ha · 85 ms/iteration": the change of the iteration's
+/// Harris–Foulkes free energy F_HF, [`ITERATION_ENERGY_TIP`]) and, once
 /// [`STALL_TAG_FROM`] iterations passed without a 2× gain of the best Δρ, the stall tag
 /// ("no 2× gain for 31 / 50": the stall stop ends the solve at 50/50, `qm::scf` "The stall stop").
 pub fn scf_lines(l: &sim::ScfLive) -> (String, Option<String>) {
     let mut parts = vec![format!("Δρ {:.1e} → {:.0e}", l.delta_rho, l.tol)];
     if l.d_energy.is_finite() {
         let sign = if l.d_energy < 0.0 { '−' } else { '+' };
-        parts.push(format!("ΔE {sign}{:.1e} Ha", l.d_energy.abs()));
+        parts.push(format!("ΔF_HF {sign}{:.1e} Ha", l.d_energy.abs()));
     }
     if l.ms_per_iteration.is_finite() {
         parts.push(if l.ms_per_iteration >= 1000.0 { format!("{:.1} s/iteration", l.ms_per_iteration / 1e3) } else { format!("{:.0} ms/iteration", l.ms_per_iteration) });
@@ -87,6 +88,9 @@ pub fn scf_lines(l: &sim::ScfLive) -> (String, Option<String>) {
     let tag = (l.stall_left().is_some() && l.since_gain >= STALL_TAG_FROM).then(|| format!("no 2× gain for {} / {}", l.since_gain, l.window));
     (parts.join(" · "), tag)
 }
+
+/// What the iteration energy is (the hover of the iteration line; Fermi–Dirac spec 2026-11-13 §6.6: E_HF became F_HF).
+pub const ITERATION_ENERGY_TIP: &str = "ΔF_HF is the change between iterations of the Harris–Foulkes free energy F_HF of the iteration's input density: E_HF − T_el·S of that iteration's Fermi–Dirac occupations, which lands on the solve's F as it converges";
 
 /// An orbital display solve's job title (live-orbitals spec §4.3; never "DFT fallback").
 pub const HARRIS_JOB_TITLE: &str = "Orbital display solve";
@@ -547,7 +551,7 @@ pub fn card(ui: &mut Ui, r: &JobRow, tr: &Traces, bars: &[StripBar], acts: &mut 
             let retry = if l.attempt > 1 { " · cold retry" } else { "" };
             let (full, tag) = scf_lines(l);
             two_sides(ui, &format!("iteration {}{each}{retry}", l.iteration), &format!("Δρ {:.1e} → {:.0e}", l.delta_rho, l.tol), egui::FontId::monospace(10.5), theme::INK_DIM)
-                .on_hover_text(format!("{full}\n\nΔρ = ∫|ρ_out − ρ_in| against the target; the time is the mean per iteration. On the GPU a ΔE below ~1e-5 Ha is at the f32 reduction noise of the energy terms"));
+                .on_hover_text(format!("{full}\n\nΔρ = ∫|ρ_out − ρ_in| against the target; the time is the mean per iteration. {ITERATION_ENERGY_TIP}. On the GPU a ΔF_HF below ~1e-5 Ha is at the f32 reduction noise of the energy terms"));
             if let Some(t) = tag {
                 ui.label(RichText::new(t).size(11.0).strong().color(AMBER)).on_hover_text(format!(
                     "the best Δρ ({:.1e}) has not halved for {} iterations and is still above the stall level {:.1e}; at {} the solve stops as stalled (the iteration cap {} is the backstop; below the level a plateau is never stopped)",
