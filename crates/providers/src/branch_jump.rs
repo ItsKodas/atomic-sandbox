@@ -1,7 +1,8 @@
 //! The `branch_jump` work-consistency guard (spec 2026-11-13 §6.3, V7/V8; plan Task 8): it flags a step whose change of
 //! the free energy F disagrees with the work the forces did beyond what noise and the trapezoid's own error allow — the
 //! SCF moved to another stationary state (a branch jump, spec §4.7(g)) — and the surrogate never trains on that step
-//! (`sim::EvalStats::untrainable`). It replaces the `DegenerateShells` occupation-pattern watch (spec §8 item 8).
+//! (`sim::EvalStats::untrainable`). It replaces the shared-shell rule's occupation-pattern watch (spec §8 item 8; that rule was deleted in plan 2026-11-13
+//! Task 10).
 //!
 //! # The check (atomic units: Ha, Bohr, Ha/Bohr)
 //! Two consecutive evaluations of the same provider, at geometries R₀ and R₁ = R₀ + ΔR with energies E₀, E₁ (the

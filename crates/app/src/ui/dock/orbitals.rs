@@ -314,7 +314,7 @@ pub fn shown_f(r: &OrbitalInfo) -> f64 {
     qm::orbitals::display_occupation(r.occupation)
 }
 
-/// The occupation badge's hover for a single orbital's fractional f (spec 2026-11-13 §6.6; was the `DegenerateShells`
+/// The occupation badge's hover for a single orbital's fractional f (spec 2026-11-13 §6.6; was the shared-shell rule's
 /// "shell shared equally" wording).
 pub const OCC_TIP: &str = "occupation: this level's Fermi–Dirac f at the electronic temperature T_el — a level near the Fermi level is partly occupied (an open shell's degenerate levels share their electrons equally, f = 1/3 for one electron in three; nearly degenerate frontier levels split them); f below 1e-6 shows as empty. An ensemble weight of the Kohn–Sham free energy, not a measurable orbital occupation";
 

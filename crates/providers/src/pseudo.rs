@@ -16,7 +16,7 @@
 //!   pseudised `<word>/<surface_hash:016x>/fd5e-3/stop2x5e-8/pin1e-5`, all-electron `none/fd5e-3/pin1e-5`
 //!   ([`all_electron_tag`]: `fd{ELECTRON_KT:e}`, `pin{GPU_PARTIAL_TOL:e}`). Every "is this the all-electron
 //!   surface" test goes through [`is_all_electron_tag`], which also answers for the legacy `"none"`;
-//!   [`legacy_tag_of`] gives the tag the last `DegenerateShells` build computed, to find a predecessor collection.
+//!   [`legacy_tag_of`] gives the tag the last shared-shell build computed, to find a predecessor collection.
 //! - [`gpu_tol_floor`] / [`effective_gpu_tol`]: the floor-aware GPU stop (spec §7 risk 6).
 //! - `Accepted` (M7 Task 11 fix round, the app's default): every species the recipe accepts, H and He included; a refused
 //!   one runs all-electron with a note (`qm::ionic`). In a run without a GPU dimer backend H and He are not generated at
@@ -37,11 +37,17 @@
 //!   the origin): the app's default (Accurate) and the σ → 0 oracle's grid (`validate::oracles` `h2_bond_length`).
 //! - **Geometry.** Two nuclei of charge Z at (∓R/2, 0, 0) — inversion-symmetric on the grid, so F₀ = −F₁ up to f32
 //!   noise; the bond force is F(R) = ½(F₁,x − F₀,x) = −dE/dR (positive = repulsive).
+//! - **Occupations** (both dimers; plan 2026-11-13 Task 10, F8): `DIMER_PROCEDURE.occupations`, Fermi–Dirac at
+//!   kT = `qm::ELECTRON_KT` — every provider solve's rule — and on the GPU the partial-level stop
+//!   `DIMER_PROCEDURE.gpu_partial_tol` = `qm::GPU_PARTIAL_TOL` (the GPU solver's default stop, the same constant). Before
+//!   that task the pseudised dimer ran the shared-shell rule and the all-electron one integer aufbau. H₂ near R_e is
+//!   gapped (σ_g/σ_u ≫ 74 kT), so FD's f there are aufbau's to e^{−36} and R_e, k and ω are unchanged to the solver's
+//!   noise; only the bracket's outer end (a stretched dimer, where FD may partly occupy σ_u) can move, and only its
+//!   sign is read there. The verdicts and R_e/ω must reproduce within the backend margin (`pseudo_oracles`).
 //! - **Pseudised dimer.** The table filtered at h, through `IonicSetup::from_tables` (the candidate has no h_req yet: T8
-//!   runs on the accepted entry), `DegenerateShells` occupations (the providers' choice under a pseudo policy), cold
-//!   solves, tol 1e-6 (GPU: the floor-aware `effective_gpu_tol`), eig_tol 1e-7.
+//!   runs on the accepted entry), cold solves, tol 1e-6 (GPU: the floor-aware `effective_gpu_tol`), eig_tol 1e-7.
 //! - **All-electron dimer.** At each R, F(R; σ) at σ = h·{1.0, 1.2, 1.4, 1.6} (the oracle's ladder, `validate::sigma_ladder`;
-//!   restated, not imported — providers do not depend on validate), cold solves, tol 1e-6, eig_tol 1e-7, integer aufbau,
+//!   restated, not imported — providers do not depend on validate), cold solves, tol 1e-6, eig_tol 1e-7,
 //!   then F₀(R) = `qm::extrapolate_sigma` (the derivative of the energy ansatz a + bσ² + cσ³ + dσ⁴ has the same σ
 //!   dependence; Zσ_max = 0.24 for H is inside its asymptotic regime). The extrapolation weights sum to |w|₁ ≈ 88, so a
 //!   force noise u per solve is ≈ 88u in F₀: the GPU's H₂ force differs from the CPU's by ≤ 3e-6 at tol 1e-6
@@ -59,8 +65,9 @@
 //!   cost only the 15 PP solves) — ≈ 1 min on the RX 7900 XTX; on the CPU fallback (no adapter) ≈ 40 min per element.
 //! - **Backend.** Process-wide ([`set_dimer_backend`]): the app sets the window's GPU, the validate suites theirs; the
 //!   default is the CPU.
-//! - **Procedure constants** (σ ladder, box, h, FD step, bisection width, tolerances, the N/A wall bound) are
-//!   `qm::radial::ledger::DIMER_PROCEDURE`, hashed into `recipe_hash` (Task 11 review SHOULD-2).
+//! - **Procedure constants** (σ ladder, box, h, FD step, bisection width, tolerances, the N/A wall bound, the occupation
+//!   rule and the GPU partial-level stop) are `qm::radial::ledger::DIMER_PROCEDURE`, hashed into `recipe_hash` (Task 11
+//!   review SHOULD-2; the last two since plan 2026-11-13 Task 10, which moved `recipe_hash` for H and He only).
 //! - **Backend margin (Task 11 review Minor-4).** A verdict within ≈ 2e-3 Bohr in R_e or ≈ 0.5 % in ω of its bound is
 //!   backend-dependent: the GPU's AE σ → 0 R_e is 1.4489 against the CPU oracle's 1.4511 (the ×88 extrapolation of a
 //!   3e-6 per-solve force difference). Today's nearest verdict is H f = 1.4 polynomial, +0.0237 Bohr (+0.0216 against the
@@ -305,18 +312,20 @@ pub fn is_all_electron_tag(tag: &str) -> bool {
     tag == "none" || tag.starts_with("none/")
 }
 
-/// `τ` and `τ_c` of the last `DegenerateShells` build's tags (`qm::DEGENERACY_TAU` = 1e-3 Ha and the former
-/// `qm::scf::CANDIDATE_TAU` = `qm::WITNESS_GAP` = 0.1 Ha), frozen here: [`legacy_tag_of`] must keep producing the strings
-/// that build wrote after the scheme and its constants are deleted (plan 2026-11-13 Task 10).
+/// `τ` and `τ_c` of the last shared-shell build's tags (its decision threshold τ = 1e-3 Ha and candidate window
+/// = `qm::WITNESS_GAP` = 0.1 Ha), frozen here: [`legacy_tag_of`] keeps producing the strings that build wrote now the
+/// scheme and its constants are deleted (plan 2026-11-13 Task 10).
 const LEGACY_DS_TAU: f64 = 1e-3;
 const LEGACY_DS_TAU_C: f64 = 0.1;
 
-/// The tag the last `DegenerateShells` build computed for a scene that pseudises something under `policy`, with the
-/// current dimer backend (spec 2026-11-13 §6.2, §7.2): `"<word>/<surface_hash:016x>/shared1e-3/1e-1/stop2x5e-8"`, and
-/// `"none"` for `IonicPolicy::None`. Its only use is to find a predecessor collection; the all-electron predecessor is
-/// `"none"`, which a caller picks through [`is_all_electron_tag`] on the current tag. Pinned against the strings recorded
-/// from the last DS commit (62ae478) for every policy and both backends (`legacy_tag_of_matches_recorded_ds_strings`).
-/// The hash is today's [`surface_hash`]; plan Task 10 freezes it (`DIMER_PROCEDURE_DS`) when the dimer procedure moves.
+/// The tag the last shared-shell build computed for a scene that pseudises something under `policy`, with the current
+/// dimer backend (spec 2026-11-13 §6.2, §7.2): `"<word>/<surface_hash:016x>/shared1e-3/1e-1/stop2x5e-8"`, and `"none"`
+/// for `IonicPolicy::None`. Its only use is to find a predecessor collection; the all-electron predecessor is `"none"`,
+/// which a caller picks through [`is_all_electron_tag`] on the current tag. Pinned against the strings recorded from the
+/// last DS commit (62ae478) for every policy and both backends (`legacy_tag_of_matches_recorded_ds_strings`). The hash
+/// is the surface hash with the gated species' identity frozen at the pre-switch dimer procedure
+/// (`qm::radial::ledger::legacy_recipe_hash`, `DIMER_PROCEDURE_DS`; plan Task 10 moved the live one); the core tables'
+/// identity never moved.
 pub fn legacy_tag_of(policy: IonicPolicy) -> String {
     legacy_tag_gpu(policy, dimer_backend_is_gpu())
 }
@@ -327,8 +336,8 @@ fn legacy_tag_gpu(policy: IonicPolicy, gpu: bool) -> String {
     if policy == IonicPolicy::None {
         return "none".into();
     }
-    format!("{}/{:016x}/shared{:e}/{:e}/stop2x{:e}", surface_word_gpu(policy, gpu), surface_hash_gpu(policy, gpu), LEGACY_DS_TAU, LEGACY_DS_TAU_C,
-            GPU_DRHO_FLOOR_PER_ELECTRON)
+    let hash = if gates_species_gpu(policy, gpu) { qm::radial::ledger::legacy_recipe_hash() } else { qm::radial::ledger::core_recipe_hash() };
+    format!("{}/{:016x}/shared{:e}/{:e}/stop2x{:e}", surface_word_gpu(policy, gpu), hash, LEGACY_DS_TAU, LEGACY_DS_TAU_C, GPU_DRHO_FLOOR_PER_ELECTRON)
 }
 
 /// The charge each nucleus's electrons are counted against under `scene`'s policy (`sim::ForceProvider::valence_charges`,
@@ -843,13 +852,13 @@ impl BondForce {
         BondForce { backend, grid: finest_grid().0, gpu: None, solves: 0, last_sigma: String::new() }
     }
 
+    /// The settings of every gate solve (module doc): the procedure's tolerances and occupation rule (plan 2026-11-13
+    /// Task 10, F8: Fermi–Dirac on both dimers, the `Aufbau` hold and the shared-shell rule gone).
     fn settings(&self) -> qm::ScfSettings {
         let mut s = qm::ScfSettings::for_grid(&self.grid);
         s.tol = DIMER_PROCEDURE.scf_tol;
         s.eig_tol = DIMER_PROCEDURE.eig_tol;
-        // held until plan Task 10 switches it (the dimer procedure moves with its hash there; `for_grid` defaults to
-        // FermiDirac since plan Task 7)
-        s.occupations = qm::Occupations::Aufbau;
+        s.occupations = DIMER_PROCEDURE.occupations;
         s
     }
 
@@ -862,6 +871,8 @@ impl BondForce {
                 qm::forces(grid, &st, &sys.nuclei, settings.sigma).map_err(|e| e.to_string())?
             }
             DimerBackend::Gpu(ctx) => {
+                // the solver's partial-level stop is `qm_gpu::GPU_PARTIAL_TOL`, the constant the procedure records
+                // (`DIMER_PROCEDURE.gpu_partial_tol`; `dimer_procedure_hashes_fd`)
                 let solver = self.gpu.get_or_insert_with(|| qm_gpu::GpuSolver::new(ctx.clone(), grid));
                 let mut s = *settings;
                 if sys.ionic.is_some() {
@@ -878,8 +889,7 @@ impl BondForce {
 
     /// The pseudised dimer's bond force at R (module doc, "Pseudised dimer").
     fn pseudo(&mut self, z: u8, setup: &Arc<IonicSetup>, r: f64) -> Result<f64, String> {
-        let mut s = self.settings();
-        s.occupations = qm::Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU };
+        let s = self.settings();
         self.at(&qm::System::with_ionic(dimer_nuclei(z, r), 0, None, setup.clone()), &s)
     }
 
@@ -1526,7 +1536,7 @@ mod tests {
     }
 
     /// Plan 2026-11-13 Task 9 step 1 (spec §6.2, R15): `legacy_tag_of` reproduces exactly the tags the last
-    /// `DegenerateShells` build (62ae478) computed, for every policy under both dimer backends. The literals were printed
+    /// shared-shell build (62ae478) computed, for every policy under both dimer backends. The literals were printed
     /// from `provenance_tag` (and `tag_of`) on that unmodified tree, with `set_dimer_backend(Cpu)` and `Gpu`; they are the
     /// only source of truth. The backend is passed explicitly here (`legacy_tag_gpu`), so the process-wide backend the
     /// other tests read is never switched.
@@ -1547,6 +1557,44 @@ mod tests {
         }
         assert_eq!(legacy_tag_of(IonicPolicy::All), legacy_tag_gpu(IonicPolicy::All, dimer_backend_is_gpu()), "the current backend");
         assert!(is_all_electron_tag(&legacy_tag_of(IonicPolicy::None)));
+    }
+
+    /// Plan 2026-11-13 Task 10 (spec §6.2, F8, F11): the dimer gate's procedure — every constant of its 3-D computation,
+    /// hashed into `recipe_hash` — names the occupation rule its solves now run (Fermi–Dirac at kT = `qm::ELECTRON_KT` =
+    /// 5e-3 Ha, `Debug` renders it 0.005) and the GPU's partial-level stop `qm::GPU_PARTIAL_TOL` (1e-5; the gate's 3-D
+    /// solves run on the GPU when a GPU backend is set), read from the constants, never a literal. So `recipe_hash` moved
+    /// from the shared-shell build's 0x30a74d9bda495668 (`legacy_tag_of_matches_recorded_ds_strings`), and the frozen
+    /// pre-change procedure (`DIMER_PROCEDURE_DS`) still hashes to it.
+    #[test]
+    fn dimer_procedure_hashes_fd() {
+        let text = format!("{DIMER_PROCEDURE:?}");
+        assert!(text.contains("FermiDirac"), "the occupation rule: {text}");
+        assert_eq!(qm::ELECTRON_KT, 5e-3);
+        assert!(text.contains(&format!("kt: {:?}", qm::ELECTRON_KT)), "kT = 5e-3: {text}");
+        assert_eq!(qm::GPU_PARTIAL_TOL, 1e-5);
+        assert!(text.contains(&format!("gpu_partial_tol: {:?}", qm::GPU_PARTIAL_TOL)), "the GPU partial-level stop 1e-5: {text}");
+        assert_eq!(DIMER_PROCEDURE.occupations, qm::Occupations::FermiDirac { kt: qm::ELECTRON_KT });
+        assert_eq!(DIMER_PROCEDURE.gpu_partial_tol.to_bits(), qm::GPU_PARTIAL_TOL.to_bits());
+        assert_ne!(recipe_hash(), 0x30a7_4d9b_da49_5668, "the gate's procedure moved, so the recipe hash moved");
+        // FNV-1a 64 of the ledger and this procedure's `Debug` text, computed independently (references.md records block)
+        assert_eq!(recipe_hash(), 0xeaf6_3fe2_13a8_4a26);
+        assert_eq!(qm::radial::ledger::legacy_recipe_hash(), 0x30a7_4d9b_da49_5668, "the frozen pre-change procedure keeps the DS-era hash");
+        // the gate's solves read the procedure's rule (F8: no `Aufbau` hold, no shared-shell occupations)
+        assert_eq!(BondForce::new(DimerBackend::Cpu).settings().occupations, DIMER_PROCEDURE.occupations);
+    }
+
+    /// Plan 2026-11-13 Task 10 (spec §6.2): the identity of every table above `dimer_z_max` — the ledger alone — is the
+    /// literal recorded on the tree before this task (the -4 recipe hash, 0xeef0a918057a9fbe), so the `CoresOnly`
+    /// surface hash, its current tag and its legacy tag keep it: only the gated species' identity moved.
+    #[test]
+    fn core_recipe_hash_unchanged() {
+        const CORE: u64 = 0xeef0_a918_057a_9fbe;
+        assert_eq!(qm::radial::ledger::core_recipe_hash(), CORE);
+        for gpu in [false, true] {
+            assert_eq!(surface_hash_gpu(IonicPolicy::CoresOnly, gpu), CORE, "CoresOnly, GPU backend {gpu}");
+            assert!(legacy_tag_gpu(IonicPolicy::CoresOnly, gpu).starts_with("cores/eef0a918057a9fbe/"));
+        }
+        assert!(tag_of(IonicPolicy::CoresOnly).starts_with("cores/eef0a918057a9fbe/"), "{}", tag_of(IonicPolicy::CoresOnly));
     }
 
     /// Plan 2026-11-13 Task 9 (spec §6.2): the one all-electron predicate answers for the legacy `"none"` and the FD tag,

@@ -10,7 +10,10 @@
 //! **The scan (ruling S9).** One nucleus at the origin of the scene's cell, charge 0, solved at
 //! every allowed multiplicity `allowed_multiplicities(Z)` (2S + 1 of the parity of Z, from the
 //! lowest up to 5, 2S ≤ Z), each solve cold (`reset()` before it: another spin state's orbitals
-//! must not steer the SCF); the lowest energy wins and its density is the reference's.
+//! must not steer the SCF); the lowest energy wins and its density is the reference's. The energy is the provider's
+//! reported total, which for a Kohn–Sham provider is the Mermin free energy F = E − TS (Fermi–Dirac occupations, spec
+//! 2026-11-13 §6.5): **the scan keeps the lowest F**. The winning M is unchanged by the switch from the shared-shell rule
+//! where the open shells' TS do not reorder the multiplicities (V0: O keeps M = 3, N M = 4, C M = 3).
 //!
 //! **The retry round** (2026-10-20, the PH₃ session whose P reference did not solve, so its model
 //! never formed; physics review of the fix): a multiplicity whose solve was lost to the **device**
@@ -220,7 +223,8 @@ impl ReferenceKey {
 /// provider without a grid). `fractional`: whether the winning solve's final state has a partly
 /// occupied level (`EvalStats::partial` non-empty — an open shell, or near-degenerate frontier levels,
 /// under Fermi–Dirac occupations; spec 2026-11-13 §6.4), recorded next to the multiplicity (`None` for a
-/// seeded energy).
+/// seeded energy). The name predates Fermi–Dirac (it was "shared a degenerate shell" under the deleted shared-shell
+/// rule); it means "has a partial level", which the lone-atom rule reads (`providers::surrogate`, lone atoms).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AtomReference {
     pub energy: f64,
@@ -339,8 +343,8 @@ pub struct AtomScan {
     sigma: Option<f64>,
     ionic: IonicPolicy,
     remaining: Vec<u32>,
-    /// (multiplicity, energy, its radial density, the solve's face density, whether its final state
-    /// shared a degenerate shell), in the order solved.
+    /// (multiplicity, energy (F), its radial density, the solve's face density, whether its final state has a partly
+    /// occupied level — `EvalStats::partial` non-empty), in the order solved.
     tried: Vec<(u32, f64, RadialDensity, Option<f64>, bool)>,
     failed: Vec<(u32, String)>,
     /// The multiplicities whose first-round solve the device lost (retried once after the first
@@ -465,7 +469,7 @@ impl AtomScan {
         r
     }
 
-    /// The entry: the lowest energy of the solved multiplicities (ruling S9) with its density;
+    /// The entry: the lowest energy (F under Fermi–Dirac) of the solved multiplicities (ruling S9) with its density;
     /// `None` when nothing was solved. `tol` and `provider` are recorded with it.
     pub fn finish(self, tol: f64, provider: &str) -> Option<AtomReference> {
         let best = self.tried.into_iter().min_by(|a, b| a.1.total_cmp(&b.1))?;
@@ -484,7 +488,7 @@ pub fn read_radial(provider: &mut dyn ForceProvider, cell: &Cell) -> RadialDensi
 }
 
 /// One isolated neutral atom of species `z` at the centre of `cell` at `sigma` (`None` = h):
-/// every allowed multiplicity solved cold, the lowest energy kept with its shell-binned density
+/// every allowed multiplicity solved cold, the lowest energy (F) kept with its shell-binned density
 /// (module doc). `provider` is reset before every solve and once after the scan, so its warm
 /// state is never the atom's; `tol` and the name are recorded from it. `Err(Cancelled)` when
 /// `should_abort` ended a solve (the provider is reset); a multiplicity whose solve fails is left

@@ -146,7 +146,7 @@ use crate::scf::ascending;
 /// solver constant for every scene; not per element.
 pub const ELECTRON_KT: f64 = 5e-3;
 /// Witness arm 1 (Ha): the highest solved level lies at least this far above the n-th lowest (spec §4.2; the
-/// value of the former `CANDIDATE_TAU`).
+/// value of the shared-shell rule's candidate window τ_c, deleted in plan 2026-11-13 Task 10).
 pub const WITNESS_GAP: f64 = 0.1;
 /// Witness arm 2: the highest solved level lies at least this many kT above μ (f < 2.4e-16 beyond it).
 pub const WITNESS_TAIL_KT: f64 = 36.0;

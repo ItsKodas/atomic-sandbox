@@ -32,14 +32,14 @@ use crate::common::GPU;
 use qm::ionic::IonicSetup;
 use qm::nonlocal::NonlocalOp;
 use qm::nuclear::{ionic_local_potential, ionic_repulsion, partial_core_field};
-use qm::{Grid, KsState, Nucleus, Occupations, ScfSettings, System, DEGENERACY_TAU};
+use qm::{Grid, KsState, Nucleus, Occupations, ScfSettings, System, ELECTRON_KT, PARTIAL_OCCUPATION_MIN};
 use qm_gpu::GpuSolver;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The cold GPU solves of the probe (`pseudo.rs` `GPU_REPORT_TOL`): tol 1e-6, eig 1e-7 (the GPU raises it to 3× its f32
-/// floor), `DegenerateShells`.
+/// floor), Fermi–Dirac at `ELECTRON_KT` (the providers' occupations; the shared-shell rule before plan 2026-11-13 Task 10).
 pub const GPU_TOL: f64 = 1e-6;
 /// The instrument qualifies when u_I ≤ this (spec §6.6, "Instrument").
 pub const QUALIFY: f64 = 5e-6;
@@ -154,12 +154,13 @@ impl Wall {
     }
 }
 
-/// The highest occupied level of a state (either spin, f > 0), for the wall's decay κ = √(−2ε).
+/// The highest occupied level of a state (either spin, f ≥ `PARTIAL_OCCUPATION_MIN`: every Fermi–Dirac witness has
+/// f > 0, never an occupied level), for the wall's decay κ = √(−2ε).
 pub fn highest_occupied(st: &KsState) -> f64 {
-    st.evals_up.iter().zip(&st.occ_up).chain(st.evals_dn.iter().zip(&st.occ_dn)).filter(|(_, &f)| f > 0.0).map(|(&e, _)| e).fold(f64::MIN, f64::max)
+    st.evals_up.iter().zip(&st.occ_up).chain(st.evals_dn.iter().zip(&st.occ_dn)).filter(|(_, &f)| f >= PARTIAL_OCCUPATION_MIN).map(|(&e, _)| e).fold(f64::MIN, f64::max)
 }
 
-/// One GPU solve (`GPU_TOL`, eig 1e-7, `DegenerateShells`), cold or warm from the solver's last state, under the suite's
+/// One GPU solve (`GPU_TOL`, eig 1e-7, Fermi–Dirac at `ELECTRON_KT`), cold or warm from the solver's last state, under the suite's
 /// GPU lock; the state downloaded as a `KsState`. Panics on a non-converged solve (an unconverged state is never a probe).
 pub fn gpu_solve(solver: &mut GpuSolver, setup: Arc<IonicSetup>, nuclei: Vec<Nucleus>, mult: Option<u32>, warm: bool) -> (f64, KsState, qm::ScfStats, Duration) {
     let _gpu = GPU.lock().unwrap_or_else(|e| e.into_inner());
@@ -169,7 +170,7 @@ pub fn gpu_solve(solver: &mut GpuSolver, setup: Arc<IonicSetup>, nuclei: Vec<Nuc
     let mut s = ScfSettings::for_grid(&g);
     s.eig_tol = 1e-7;
     s.tol = GPU_TOL;
-    s.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
+    s.occupations = Occupations::FermiDirac { kt: ELECTRON_KT };
     let (_, stats) = solver.solve(&sys, &s, warm).unwrap_or_else(|e| panic!("GPU SCF: {e}"));
     let st = solver.ks_state(solver.state().expect("a converged state"));
     (stats.energy.total, st, stats, t0.elapsed())

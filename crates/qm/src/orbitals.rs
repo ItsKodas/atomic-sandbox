@@ -1528,7 +1528,7 @@ pub fn shown_columns(n: usize, occ: &[f64], fermi_dirac: bool) -> Vec<usize> {
 /// The occupation a display row shows for a stored level of occupation `f` (spec 2026-11-13 §6.6, plan Task 9): under
 /// `FermiDirac` every level carries some f, the witness columns ≤ e^−36 and a full level of a narrow gap 1 − tiny, so a
 /// level with f < `PARTIAL_OCCUPATION_MIN` (1e-6) shows as empty (0) and one within it of 1 as full (1); a partly
-/// occupied level (`ScfStats::partial`) keeps its f. Aufbau's 0/1 and `DegenerateShells`' shares are unchanged. The
+/// occupied level (`ScfStats::partial`) keeps its f. Aufbau's 0/1 are unchanged. The
 /// HOMO, the "occupied" selection and the colour view's weights read these rows, so a witness row is never "occupied".
 pub fn display_occupation(f: f64) -> f64 {
     if f < crate::occupations::PARTIAL_OCCUPATION_MIN {

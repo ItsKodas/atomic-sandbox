@@ -1011,7 +1011,7 @@ impl ForceProvider for Recording {
 
 /// Ruling S9 on the real teacher, under the pseudopotentials (M7 Task 10; spec §6.4's O row, Task 6 review A.7): an
 /// isolated O atom solved by the sampling pass's reference scan at multiplicities 1, 3, 5 under `CoresOnly` (pseudo-O,
-/// `DegenerateShells`: both multiplicities are the spherical ensemble), h = O's h_req (0.20), a 14 Bohr box (71³; the
+/// Fermi–Dirac since plan 2026-11-13 Task 9, the shared-shell rule before: both multiplicities are the spherical ensemble), h = O's h_req (0.20), a 14 Bohr box (71³; the
 /// 12 Bohr wall bias of a −0.27 Ha level is 0.3 mHa, Task 6 review V1), the atom at the cell centre (the scan's
 /// placement), GPU, tol 1e-6, each multiplicity cold. Asserted (A.7): M = 1 and M = 3 converged (an unconverged solve is
 /// the scan's failure), every shared cluster's spread < τ/10, each within 2 mHa of the radial KB atom on the same filtered
@@ -1080,7 +1080,7 @@ fn gpu_oxygen_reference_multiplicity() {
                  (e1 - r1) * 1e3, (e3 - r3) * 1e3, (e1 - e3) * 1e3, (r1 - r3) * 1e3, solved(5).map(|x| x.0));
         for (m, st) in [(1, st1), (3, st3)] {
             // the spherical ensemble: each channel's partly occupied levels lie within τ/10 = 1e-4 Ha of each other (the
-            // bound the DS-era test put on a shared cluster's spread; τ = 1e-3 Ha, `DEGENERACY_TAU`)
+            // bound the DS-era test put on a shared cluster's spread; τ = 1e-3 Ha, the shared-shell rule's threshold)
             for spin in 0..2u8 {
                 let eps: Vec<f64> = st.partial.iter().filter(|p| p.spin == spin).map(|p| p.eps).collect();
                 let spread = eps.iter().copied().fold(f64::NEG_INFINITY, f64::max) - eps.iter().copied().fold(f64::INFINITY, f64::min);
@@ -1634,7 +1634,7 @@ fn scf_stall_measurement() {
         let r = solver
             .solve_observed(&system, &settings, warm, &mut || false, Some(&mut |p: &qm::ScfProgress| seen.push(*p)))
             .map(|o| o.expect("never aborted").1);
-        let released = r.as_ref().map(|st| st.released.clone()).unwrap_or_default();
+        let partial = r.as_ref().map(|st| st.partial.clone()).unwrap_or_default();
         let r = r.map(|st| st.iterations);
         let ms = t.elapsed().as_secs_f64() * 1e3;
         let hist = solver.profile().delta_rho_steps.clone();
@@ -1660,8 +1660,8 @@ fn scf_stall_measurement() {
         if !run.converged {
             println!("    {}", run.outcome);
         }
-        if !released.is_empty() {
-            println!("    released (DegenerateShells phase 2): {released:?}");
+        if !partial.is_empty() {
+            println!("    partly occupied levels: {partial:?}");
         }
         runs.push(run);
         converged
@@ -1739,7 +1739,7 @@ fn scf_stall_measurement() {
 
     // 4. review S4: the regimes the first measurement did not cover — the GPU LiH, He and H₃⁺ (equilateral, 1.65 Bohr,
     // charge +1) all-electron presets at 49³ × 0.25; pseudo O–H at 2.5 / 3.5 / 5.0 Bohr (doublet, CoresOnly, 95³ × 0.15:
-    // candidates for a DegenerateShells release — `released` is printed); and, after the GPU runs, the CPU at the
+    // candidates for a partly occupied frontier — the partial levels are printed); and, after the GPU runs, the CPU at the
     // σ → 0 oracles' tight tolerance (H₂ 33³, tol 1e-9, eig_tol 1e-8)
     let mut s = qm_gpu::GpuSolver::new(ctx.clone(), &qm::Grid::cube(49, 0.25));
     let c49 = Cell { n: 49, h: 0.25 };

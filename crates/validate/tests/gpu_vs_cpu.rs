@@ -26,17 +26,20 @@
 //! - `h2_curve_shape_matches`: E(R) for R ∈ {1.0, 1.4, 1.8, 2.4, 3.2}: a constant offset
 //!   between the two solvers is allowed, the shape must match (|ΔE − mean ΔE| ≤ `SHAPE_BOUND` = 5e-6; the brief's was 5e-5), for the
 //!   GPU solved cold at every R and warm along R (the MD path).
-//! - M7 Tasks 8a/8b, the pseudopotential path (`gpu_pseudo_*`, `gpu_mixed_oh_*`): pseudo-O (the `CoresOnly` triplet
-//!   with the shared minority p of spec §5.7) at h_req = 0.20 / 12 Bohr, CH₄ (`CoresOnly`, a mixed scene) at 0.25 /
+//! - M7 Tasks 8a/8b, the pseudopotential path (`gpu_pseudo_*`, `gpu_mixed_oh_*`): pseudo-O (the `CoresOnly` triplet,
+//!   its minority p ⅓ each) at h_req = 0.20 / 12 Bohr, CH₄ (`CoresOnly`, a mixed scene) at 0.25 /
 //!   12 Bohr, H₂O (`All`) at 0.20 / 10 Bohr and OH (`CoresOnly` doublet: σ = h H beside σ_LR = 2h O, review Focus 4) at
-//!   0.20 / 12 Bohr: |ΔE_total|, every eigenvalue (witnesses included) and the occupation patterns, against
+//!   0.20 / 12 Bohr: |ΔF_total|, every eigenvalue both solvers tested (witnesses included, the GPU's buffer column not)
+//!   and the occupations (|Δf| ≤ `EPS_BOUND_PSEUDO`/(2kT), the same partial levels), against
 //!   `E_BOUND_PSEUDO`/`EPS_BOUND_PSEUDO`; the Hellmann–Feynman forces GPU vs CPU, each solver on its own cold state
 //!   (`F_BOUND_PSEUDO`), and per term (ion–ion, LR, SR, NL, ρ_pc) on the same GPU state against
 //!   `qm::forces::pseudo_force_terms` on the downloaded state (`F_TERM_BOUND_PSEUDO`; the lone O's ρ_pc term is the
 //!   NLCC ruling's Ruling 6 check); and the warm guard across ionic setups.
 //! - Since plan 2026-11-13 Task 7 every all-electron case above runs `ScfSettings::for_grid`'s default, Fermi–Dirac at
-//!   kT = `ELECTRON_KT` = 5 mHa (the witness vectors solved; the gapped cases' TS ≤ 2e-7, so the bounds stand), and the
-//!   pseudo cases keep `DegenerateShells` explicitly until plan Task 10. **V4** (spec 2026-11-13 §9; `gpu_fd_*`): the
+//!   kT = `ELECTRON_KT` = 5 mHa (the witness vectors solved; the gapped cases' TS ≤ 2e-7, so the bounds stand), and
+//!   since plan Task 10 (F12) the pseudo cases too (they ran the shared-shell rule before; its exactly degenerate
+//!   ensembles — the lone O's ⅓ p, OH's ½ π — are FD's, so E is unchanged and F = E − TS on both solvers alike, and the
+//!   GPU-vs-CPU bounds compare F with F; the GPU stops a partly occupied step at `GPU_PARTIAL_TOL`, spec §5.1). **V4** (spec 2026-11-13 §9; `gpu_fd_*`): the
 //!   H₄ square (two half-filled degenerate pairs) and a lone pseudo-O at M = 3 and M = 1 at 49³ × 0.25, the GPU at its
 //!   partial-level stop (1e-5, spec §5.1) and the CPU at 1e-6: F and TS within the suite's energy bounds, μ_σ within
 //!   `EPS_BOUND_PSEUDO`, every f within `EPS_BOUND_PSEUDO`/(2kT), Σf over each degenerate cluster within 1e-9, the same
@@ -58,7 +61,7 @@ use gpu::GpuContext;
 use qm::ionic::{Ionic, IonicPolicy, IonicSetup};
 use qm::radial::filter::{filtered, FilteredTable};
 use qm::radial::{generate, has_core, PseudoTable};
-use qm::{Energy, Grid, Nucleus, Occupations, ScfSettings, ScfStats, System, DEGENERACY_TAU, ELECTRON_KT, GPU_PARTIAL_TOL};
+use qm::{Energy, Grid, Nucleus, Occupations, ScfSettings, ScfStats, System, ELECTRON_KT, GPU_PARTIAL_TOL, PARTIAL_OCCUPATION_MIN};
 use qm_gpu::{GpuSolver, SolveProfile};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -420,10 +423,11 @@ fn pseudo_h_req(z: u8) -> f64 { table(z).record.h_req.unwrap_or_else(|| panic!("
 /// The odd n giving a box of ≈ `box_bohr` at spacing h (a grid point at the origin; `pseudo.rs`).
 fn n_for(box_bohr: f64, h: f64) -> usize { 2 * (box_bohr / (2.0 * h)).round() as usize + 1 }
 
-/// `ScfSettings::for_grid` with the pseudo policies' occupations (spec §5.7: `DegenerateShells`, τ = `DEGENERACY_TAU`).
+/// `ScfSettings::for_grid`: the providers' occupations under every policy, Fermi–Dirac at `ELECTRON_KT` (plan 2026-11-13
+/// Task 10, F12: the shared-shell rule of pseudopotential spec §5.7 before).
 fn pseudo_settings(grid: &Grid) -> ScfSettings {
-    let mut s = ScfSettings::for_grid(grid);
-    s.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
+    let s = ScfSettings::for_grid(grid);
+    assert_eq!(s.occupations, Occupations::FermiDirac { kt: ELECTRON_KT });
     s
 }
 
@@ -438,7 +442,9 @@ fn pseudo_settings(grid: &Grid) -> ScfSettings {
 /// The components differ by up to 3.9e-5 (CH₄ external) and cancel to second order in the variational total, as in the
 /// all-electron H₂O case. Never loosened from here (rule 6).
 const E_BOUND_PSEUDO: f64 = 6e-6;
-/// max |Δε| bound (Ha) over every stored level (witnesses included): 3 × the largest achieved |Δε| (pseudo-O 2.2e-6,
+/// max |Δε| bound (Ha) over every stored level both solvers tested (witnesses included; since plan 2026-11-13 Task 10
+/// the GPU's untested FD buffer column is left out and the CPU's lowest as many are compared, `pseudo_case`):
+/// 3 × the largest achieved |Δε| (pseudo-O 2.2e-6,
 /// CH₄ 3.1e-6, H₂O (All) 4.3e-7) = 9.3e-6 → 1e-5. This bound has **no path-scatter input** (review SHOULD-3). The scatter
 /// measured since (`pseudo_path_scatter_report`) is pseudo-O 6.9e-6 (its degenerate shared 2p cluster), CH₄ 2.3e-6,
 /// H₂O (All) 5.1e-7. Applying the rule to it would give 3e-5. That is not done here: the bound is held at 1e-5 and
@@ -477,8 +483,9 @@ struct PseudoRow { de: f64, deps: f64, df: f64, kernel: f64, state: f64, dterm: 
 
 const TERMS: [&str; 5] = ["ion–ion", "LR", "SR", "NL", "ρ_pc"];
 
-/// CPU then GPU (cold, under the lock) on one discrete problem: energies, components, eigenvalues (sorted per spin,
-/// witnesses included), the occupation patterns (identical shared clusters and releases) and the warnings.
+/// CPU then GPU (cold, under the lock) on one discrete problem: energies, components, the tested eigenvalues (sorted per
+/// spin, witnesses included), the occupations (every f by rank within `df_bound()`, the same partial levels per spin)
+/// and the warnings.
 fn pseudo_case(ctx: &GpuContext, name: &str, grid: &Grid, sys: &System, settings: &ScfSettings) -> PseudoRow {
     let (cpu_state, cpu, cpu_t) = cpu_solve(grid, sys, settings, name);
     let mut s = GpuSolver::new(ctx.clone(), grid);
@@ -503,14 +510,29 @@ fn pseudo_case(ctx: &GpuContext, name: &str, grid: &Grid, sys: &System, settings
     let (kernel, state) = (maxd(&f_gpu, &f_cpu_sg), maxd(&f_cpu_sg, &f_cpu));
     let sorted = |e: &[f64]| -> Vec<f64> { let mut v = e.to_vec(); v.sort_by(f64::total_cmp); v };
     let (gu, gd, cu, cd) = (sorted(&st.evals_up), sorted(&st.evals_dn), sorted(&cpu_state.evals_up), sorted(&cpu_state.evals_dn));
-    assert_eq!((gu.len(), gd.len()), (cu.len(), cd.len()), "{name}: stored orbital counts (witnesses included)");
+    // the occupations by rank (Fermi–Dirac f, each solver's own levels; a stored level the other solver does not hold — the
+    // GPU's buffer column, a witness grown on one side only — compares with f = 0): V4's `df_bound()`
     let by_rank = |e: &[f64], f: &[f64]| -> Vec<f64> { let mut o: Vec<usize> = (0..e.len()).collect(); o.sort_by(|&a, &b| e[a].total_cmp(&e[b])); o.iter().map(|&i| f[i]).collect() };
-    assert_eq!((by_rank(&st.evals_up, &st.occ_up), by_rank(&st.evals_dn, &st.occ_dn)), (by_rank(&cpu_state.evals_up, &cpu_state.occ_up), by_rank(&cpu_state.evals_dn, &cpu_state.occ_dn)),
-               "{name}: occupations by level");
-    assert_eq!(gpu.fractional.len(), cpu.fractional.len(), "{name}: shared clusters");
-    assert_eq!(gpu.released.len(), cpu.released.len(), "{name}: releases");
+    for (spin, (g, c)) in [(by_rank(&st.evals_up, &st.occ_up), by_rank(&cpu_state.evals_up, &cpu_state.occ_up)),
+                           (by_rank(&st.evals_dn, &st.occ_dn), by_rank(&cpu_state.evals_dn, &cpu_state.occ_dn))].into_iter().enumerate() {
+        for i in 0..g.len().max(c.len()) {
+            let d = (g.get(i).copied().unwrap_or(0.0) - c.get(i).copied().unwrap_or(0.0)).abs();
+            assert!(d <= df_bound(), "{name}: spin {spin} level {i}: |Δf| = {d:.3e} > {:.0e} (gpu {g:?}, cpu {c:?})", df_bound());
+        }
+    }
+    let spins = |p: &[qm::PartialLevel]| p.iter().map(|l| l.spin).collect::<Vec<_>>();
+    assert_eq!(spins(&gpu.partial), spins(&cpu.partial), "{name}: the same partial levels (gpu {:?}, cpu {:?})", gpu.partial, cpu.partial);
     assert_eq!(gpu.warnings.iter().filter(|w| !w.contains("LOBPCG")).count(), cpu.warnings.len(), "{name}: warnings gpu {:?} cpu {:?}", gpu.warnings, cpu.warnings);
-    let deps = gu.iter().zip(&cu).chain(gd.iter().zip(&cd)).map(|(g, c)| (g - c).abs()).fold(0.0, f64::max);
+    // the levels compared (plan 2026-11-13 Task 10): the GPU's tested levels — all but its untested buffer, the highest
+    // (Task 9c (c): its Ritz value decides nothing) — against the CPU's lowest as many; the two FD witness blocks need not
+    // be the same size (each solver grows and trims its own), so the counts are not pinned equal, but the compared levels
+    // must cover every CPU-occupied level (f ≥ PARTIAL_OCCUPATION_MIN) and a witness above them
+    let buffer = |n: usize| usize::from(n > 0);
+    let (tu, td) = (gu.len() - buffer(sys.n_up), gd.len() - buffer(sys.n_dn));
+    let occupied = |f: &[f64]| f.iter().filter(|&&x| x >= PARTIAL_OCCUPATION_MIN).count();
+    let (nu, nd) = (occupied(&cpu_state.occ_up), occupied(&cpu_state.occ_dn));
+    assert!(tu.min(cu.len()) > nu && td.min(cd.len()) > nd, "{name}: the compared levels cover the occupied ones and a witness ({tu}/{} ↑ vs {nu}, {td}/{} ↓ vs {nd})", cu.len(), cd.len());
+    let deps = gu[..tu].iter().zip(&cu).chain(gd[..td].iter().zip(&cd)).map(|(g, c)| (g - c).abs()).fold(0.0, f64::max);
     let d = gpu.energy.total - cpu.energy.total;
     let (wc, wd) = worst_component(&gpu.energy, &cpu.energy);
     let row = format!("| {name} | {}³ × {} | {:+.9} | {:+.9} | {d:+.2e} | {wc} {wd:.1e} | {deps:.1e} | {} / {} | {:.0} / {:.0} |",
@@ -520,8 +542,8 @@ fn pseudo_case(ctx: &GpuContext, name: &str, grid: &Grid, sys: &System, settings
                        grid.n[0], grid.h, dterm[0], dterm[1], dterm[2], dterm[3], dterm[4]);
     let mut diag = diagnostics(name, &gpu, &prof, &cpu);
     for ((n, g), (_, c)) in components(&gpu.energy).iter().zip(components(&cpu.energy).iter()) { let _ = writeln!(diag, "    {n:>8}: gpu {g:+.9} cpu {c:+.9} Δ {:+.2e}", g - c); }
-    let _ = writeln!(diag, "    ε↑ gpu {gu:.7?}\n    ε↑ cpu {cu:.7?}\n    ε↓ gpu {gd:.7?}\n    ε↓ cpu {cd:.7?}\n    occ ↑ {:?} ↓ {:?}; shared gpu {:?} cpu {:?}",
-                     st.occ_up, st.occ_dn, gpu.fractional.iter().map(|c| (c.spin, c.count, c.f, c.spread)).collect::<Vec<_>>(), cpu.fractional.iter().map(|c| (c.spin, c.count, c.f, c.spread)).collect::<Vec<_>>());
+    let _ = writeln!(diag, "    ε↑ gpu {gu:.7?}\n    ε↑ cpu {cu:.7?}\n    ε↓ gpu {gd:.7?}\n    ε↓ cpu {cd:.7?}\n    occ ↑ {:?} ↓ {:?}; TS gpu {:.6e} cpu {:.6e}; tol_used gpu {:e} cpu {:e}; partial gpu {:?} cpu {:?}",
+                     st.occ_up, st.occ_dn, gpu.energy.ts, cpu.energy.ts, gpu.tol_used, cpu.tol_used, gpu.partial, cpu.partial);
     let _ = writeln!(diag, "    forces (Ha/Bohr), GPU vs CPU each on its own state, then the terms on the GPU state (GPU / CPU f64 on the downloaded state):");
     for (i, n) in sys.nuclei.iter().enumerate() {
         let _ = writeln!(diag, "      nucleus {i} (Z = {}): F gpu [{:+.8}, {:+.8}, {:+.8}] cpu [{:+.8}, {:+.8}, {:+.8}]", n.z, f_gpu[i][0], f_gpu[i][1], f_gpu[i][2], f_cpu[i][0], f_cpu[i][1], f_cpu[i][2]);
@@ -547,7 +569,7 @@ const PSEUDO_HEADER: &str = "| system | grid | E_cpu | E_gpu | ΔE (gpu − cpu)
 /// comparison on one discrete problem.
 fn pseudo_cases(dx: f64) -> Vec<(&'static str, Grid, System)> {
     // (OH, M7 Task 8b: review Focus 4 on the GPU — the σ = h all-electron H beside the σ_LR = 2h pseudo-O, a doublet
-    // whose π pair is shared ½–½ under `DegenerateShells`, at O's h_req in a 12 Bohr box)
+    // whose minority π pair holds ½–½ (Fermi–Dirac; the shared-shell rule gave the same), at O's h_req in a 12 Bohr box)
     let shift = |n: Vec<Nucleus>| n.into_iter().map(|m| Nucleus { pos: [m.pos[0] + dx, m.pos[1], m.pos[2]], ..m }).collect::<Vec<_>>();
     let h_o = 0.25f64.min(pseudo_h_req(8));
     let o = System::with_ionic(shift(vec![Nucleus { pos: [0.07, -0.03, 0.02], z: 8 }]), 0, Some(3), pseudo_setup(IonicPolicy::CoresOnly, h_o, &[8]));

@@ -3692,7 +3692,7 @@ pub(crate) mod tests {
     /// cases, cold GPU solves at the default settings (stop on): stretched spin-symmetric H₂ at 65³ × 0.25, R = 6.0 and
     /// 107³ × 0.15, R = 5.75 — under aufbau plateaus of 152 and 118 iterations at a best Δρ ≤ 9.6e-5, below L = 2e-3 —
     /// converge, the stop leaving them bitwise as with it off; water's O–H at 1.8 r₀ (95³ × 0.15, `CoresOnly`, the sampling
-    /// pass's failing point, Δρ oscillating at 0.3–1.5 under `DegenerateShells`, L = 8e-3) stalled early.
+    /// pass's failing point, Δρ oscillating at 0.3–1.5 under the shared-shell rule, L = 8e-3) stalled early.
     ///
     /// **Re-pinned in plan 2026-11-13 Task 9** (the scenes are Fermi–Dirac now; all-electron now solves witness vectors):
     /// the stretched H₂ converged in **14** and **13** iterations (plan Task 9b: 17 and the count printed, compared with
@@ -3772,14 +3772,15 @@ pub(crate) mod tests {
         println!("pseudo OH 3.5 Bohr M = 2 95³: {} steps, F {:+.10}, F_HF(last) {:+.10} (Δ {:.2e}), TS {:.3e}, partial {:?}; no-gain counter {:?}",
                  a.iterations, a.energy.total, last.energy, last.energy - a.energy.total, a.energy.ts, a.partial, seen.iter().map(|p| p.since_gain).collect::<Vec<_>>());
         // re-pinned in plan 2026-11-13 Task 9 (was `!released.is_empty()`): the scene is FD now, which has no shell release
-        // (the stall watch's restart path went with `DegenerateShells`'s phase 2); the stop on and off still give the same
-        // bits on this slow, partly occupied solve, and the last Harris–Foulkes F lands on the reported F
-        assert!(a.released.is_empty() && !a.partial.is_empty(), "FD: nothing released, a partly occupied level: {:?}", a.partial);
+        // (the stall watch's restart went with the shared-shell rule's phase 2, deleted in Task 10 with `ScfStats.released`);
+        // the stop on and off still give the same bits on this slow, partly occupied solve, and the last Harris–Foulkes F
+        // lands on the reported F
+        assert!(!a.partial.is_empty(), "FD: a partly occupied level: {:?}", a.partial);
         assert!((last.energy - a.energy.total).abs() < 1e-5, "Harris–Foulkes {} vs F {}", last.energy, a.energy.total);
     }
 
     /// Task 6 review A.6 and the orbital viewer (task-9 carry item 6), re-pinned for Fermi–Dirac in plan 2026-11-13 Task 9
-    /// (was the `DegenerateShells` shared cluster): a lone pseudo-O (triplet, 2p^4: three p electrons up full, one p
+    /// (was the shared-shell rule's cluster): a lone pseudo-O (triplet, 2p^4: three p electrons up full, one p
     /// electron down over the three p levels, exactly degenerate at a grid point so f = 1/3 each) — the CPU solve reports
     /// the three partly occupied ↓ levels, TS = 3 kT s(1/3), the pseudised species and its h_req, and the orbital rows
     /// carry the state's occupations (1, 1/3, ≈ 0 for the stored witnesses) with the electron counts n_up = 4, n_dn = 2.
@@ -3821,7 +3822,8 @@ pub(crate) mod tests {
     }
 
     /// Task 6 review A.6 (the atom-reference scan under the pseudo policies): every candidate multiplicity of a
-    /// lone atom converges under `DegenerateShells`, and the scan keeps O at M = 3, N at M = 4 and C at M = 3 —
+    /// lone atom converges (under Fermi–Dirac since plan 2026-11-13 Task 9; the shared-shell rule before), and the scan
+    /// keeps O at M = 3, N at M = 4 and C at M = 3 —
     /// Hund's rule, from the energies alone (`sim::references::solve_atom`, ruling S9). GPU, 61³ × 0.20.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only (generates C, N, O); cargo test -p providers --release")]

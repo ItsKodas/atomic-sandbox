@@ -38,6 +38,26 @@ test pass (CLAUDE.md rule 6) — a miss is investigated and reported.
   h = 0.10 (+12.3 mHa; +45.9 at h = 0.15); Li is a known limitation (below).
   At finite σ the smearing is also repulsive in the bond coordinate (2πσ² Σ_I ρ(R_I) grows as the
   bond shortens), so H₂'s R_e and the force at R_e are extrapolated in σ as well.
+- **Fermi–Dirac occupations** (spec `2026-11-13-fermi-smearing-design.md` §4.3, §4.7; every solve since plan Task 9,
+  the dimer gate since Task 10): the reported energy is the Mermin free energy **F = E − TS at T_el = 1 579 K
+  (kT = 5 mHa)**, not the T = 0 Kohn–Sham energy. TS = 0 (≤ 1e-14 Ha) on systems gapped by ≥ 74 kT; below that a gap Δ
+  with μ at mid-gap carries TS ≈ 2kT(1 + y)e^{−y} per channel, y = Δ/(2kT) (4e-10 Ha at Δ = 0.2 Ha, 5e-6 Ha at 0.1 Ha).
+  Exactly degenerate open shells carry the closed forms (spec §4.3): H₄ square 4 kT ln 2 = 1.38629e-2 Ha; linear OH
+  and the H₅ ring 2 kT ln 2 = 6.9315e-3 Ha; one open p channel (O, S, C, Si at M = 3; B at M = 2 and 4; F, Cl at
+  M = 2 and 4) 3 kT s(⅓) = 9.5477e-3 Ha; two open p channels (O, S, C, Si at M = 1; N, P at M = 2) 1.90954e-2 Ha.
+  Smearing converges to the nearest stationary state, not the lowest: the restricted (spin-symmetric) H₄ lies
+  12–24 mHa (pseudo) and 12.4 mHa (all-electron) above its broken-symmetry state (spec §4.7(e)). **F, not E, is what
+  MD conserves** (the forces are −dF/dR).
+- S is the entropy of the Kohn–Sham occupations with ground-state LSDA xc, not the molecule's physical electronic
+  entropy (spec §4.7, SHOULD-4).
+- Separated fragments share one μ_σ per spin over the whole box, so fragments whose frontier levels align share charge
+  or spin across any distance (LSDA delocalisation, spec §4.7(h), SHOULD-10).
+- Atomisation and binding energies against free-atom references shift by +TS_atom per open-shell atom (a lone O at
+  M = 3 carries −TS = −9.55 mHa; spec §4.7(i), NOTE-4).
+- The lone-atom rule's Z = 1 branch composes k far-apart H as k·E_ref(M = 2) at aligned spin; a DFT solve of an even
+  number of far-apart H at auto is the restricted ½/½ ensemble, tens of mHa above that sum (4.6e-2 Ha at 6.4 Bohr), and
+  FD lowers that DFT side by a further 2 kT ln 2 per pair. "Compose to k·E_ref" is the rule's answer, not a claim that
+  DFT gives it (spec §6.4, NOTE-9).
 
 ## Oracle designs (σ → 0 extrapolation) and measured values (Task 11, 2026-10-13, release)
 
@@ -1068,7 +1088,7 @@ units. "Why" is the one-line justification; the module docs carry the derivation
 | `energy_std_per_atom` | 1e-3 Ha | the spec's energy tier per atom; the trust rule's training-residual bound and the audit's verdict use the same number |
 | `max_descriptor_distance` | 3.0 training spreads | the envelope (rule 5c): what the variance cannot see (all body-2 features vanish as a pair separates) |
 | rule 0: the cell check under the surrogate (M6 Task 11) | `Scene::check_inside_cell`, 3h from every face | the teacher's own R12 check, same error and message, before any rule (draft mode too): a model answer is a function of the positions alone and carried a dissociated pair to \|x\| = 287 Bohr (diagnosis 2026-10-15 §3); the store, envelope and audits are of in-cell geometries |
-| rule 0b: lone atoms answered from the references (user request 2026-11-12, fix round 1; `providers::surrogate::lone`) | strict mode, no atom with a neighbour within the model's r_cut (6 Bohr; one source for the rule and the audit skip) → E = Σ_i E_ref(Z_i), every F = 0, `Source::Reference` (on the model's surface), no teacher call, no audit, no sample; the references are the model's own `ref_energy` when a model on this surface covers the species (bitwise `Model::predict`; it moves only with a refit, booked), else the provider's (per scene the store's surface: grid, h, σ, tol, teacher, ionic tag equal; in collection mode the canonical ones, the box's own reference solved). Declines — the **teacher** answers (rules 1–4, else rule 5a's refusal `IsolatedAtom` before any model answer, readiness the same; never the model's one-atom answer) — for charge ≠ 0, a missing or unsolved reference, ≥ 2 lone atoms of mixed species, a pair under a shell-check fence, ≥ 2 atoms not known to end at a gap (Z = 1, or on a pseudised surface a scan with `AtomReference::fractional == Some(false)`; any Z ≥ 2 on the all-electron surface or unrecorded → declined), and a multiplicity ≠ 1 + Σ_i (m_i − 1) (m_i the scan's recorded choice, else the only one the scan can solve — H's 2 — else unknown → declined); draft mode answers with the model, the same number; the relax verification is skipped after a reference step | exact for the model by construction (empty descriptors, mean 0, no intercept: `surrogate::fit` "Isolated-atom limit"; bitwise test). For the scenes it answers, DFT differs only by finite-box artefacts, **measured for a lone H** against the same atom at the cell centre (`diag_lone_h_wobble`, GPU, tol 1e-6, all-electron; the app's `Accepted` pseudo-H not measured): default box 81³ × 0.15 — a sub-grid shift **+8.7e-7 Ha**, (2, 1, 0.5) Bohr (4 Bohr from the nearest face, face density 7.3e-6 at the box rule's 7.2e-6) **+1.82e-3 Ha** with F_x −2.6e-3 Ha/Bohr toward the centre, 2 Bohr from a face **+3.47e-2 Ha** (F −5.2e-2); 49³ × 0.25 the same box: +2.7e-6, +1.95e-3 (face 2.0e-5 at the rule's 2e-5), +3.29e-2. The grid's ripple is µHa; the rest is the grid box's confinement (its Dirichlet boundary, ψ = 0 at the faces — not the app's container walls, which `sim` applies on top and books), which the free-atom reference leaves out (the more physical answer; it also made the user's 202 lone-H samples spread by 1.3 mHa). Open shells: under `DegenerateShells` a shared cluster is released once its spread reaches τ = `DEGENERACY_TAU` = 1e-3 Ha (not τ_c = 0.1), which box confinement exceeds between copies, and `released_occupations` fills one copy first (two O at M = 5 → O⁻ + O⁺, hundreds of mHa: derived from the occupation rule, not measured); integer aufbau hides open shells — hence the ≥ 2 rule; one open-shell atom alone is answered, its in-box release into the integer symmetry-broken state (≤ ≈ 12 mHa for O) being one more box artefact. Multiplicity: two H at M = 1 (also "automatic") are the restricted singlet, +4.6e-2 Ha above 2 E_ref at 6.4 Bohr (rule 5a's measurement; R → ∞: 2 E_LDA(H) ≈ +66 mHa above 2 E_LSD). Mixed species: aligned spins can move charge to another species' partly empty shell at any separation. Why: the user's untrusted collection (1805 samples) sent a single H to DFT on every step. Tests: `surrogate::tests::lone` (13) |
+| rule 0b: lone atoms answered from the references (user request 2026-11-12, fix round 1; `providers::surrogate::lone`) | strict mode, no atom with a neighbour within the model's r_cut (6 Bohr; one source for the rule and the audit skip) → E = Σ_i E_ref(Z_i), every F = 0, `Source::Reference` (on the model's surface), no teacher call, no audit, no sample; the references are the model's own `ref_energy` when a model on this surface covers the species (bitwise `Model::predict`; it moves only with a refit, booked), else the provider's (per scene the store's surface: grid, h, σ, tol, teacher, ionic tag equal; in collection mode the canonical ones, the box's own reference solved). Declines — the **teacher** answers (rules 1–4, else rule 5a's refusal `IsolatedAtom` before any model answer, readiness the same; never the model's one-atom answer) — for charge ≠ 0, a missing or unsolved reference, ≥ 2 lone atoms of mixed species, a pair under a shell-check fence, ≥ 2 atoms not known to end at a gap (since plan 2026-11-13 Task 10, spec §6.4: Z = 1, or a scan whose winning solve had no partial level, `AtomReference::fractional == Some(false)` — a ≥ 27.6 kT = 138 mHa gap around μ — on either surface; a partial level or unrecorded → declined; before it, any Z ≥ 2 on the all-electron surface declined), and a multiplicity ≠ 1 + Σ_i (m_i − 1) (m_i the scan's recorded choice, else the only one the scan can solve — H's 2 — else unknown → declined); draft mode answers with the model, the same number; the relax verification is skipped after a reference step | exact for the model by construction (empty descriptors, mean 0, no intercept: `surrogate::fit` "Isolated-atom limit"; bitwise test). For the scenes it answers, DFT differs only by finite-box artefacts, **measured for a lone H** against the same atom at the cell centre (`diag_lone_h_wobble`, GPU, tol 1e-6, all-electron; the app's `Accepted` pseudo-H not measured): default box 81³ × 0.15 — a sub-grid shift **+8.7e-7 Ha**, (2, 1, 0.5) Bohr (4 Bohr from the nearest face, face density 7.3e-6 at the box rule's 7.2e-6) **+1.82e-3 Ha** with F_x −2.6e-3 Ha/Bohr toward the centre, 2 Bohr from a face **+3.47e-2 Ha** (F −5.2e-2); 49³ × 0.25 the same box: +2.7e-6, +1.95e-3 (face 2.0e-5 at the rule's 2e-5), +3.29e-2. The grid's ripple is µHa; the rest is the grid box's confinement (its Dirichlet boundary, ψ = 0 at the faces — not the app's container walls, which `sim` applies on top and books), which the free-atom reference leaves out (the more physical answer; it also made the user's 202 lone-H samples spread by 1.3 mHa). Open shells: one μ_σ spans the box, so copies whose levels the box splits (≤ 1.8 mHa measured) can fill one copy's partly filled shell first (two O at M = 5 → charge moved between them, far from 2 E_ref: derived from the occupation rule, not measured); a reference with no partial level has a ≥ 138 mHa gap at μ, above the O self-polarisation gap (11.6–11.8 mHa) plus that splitting — hence the ≥ 2 rule (before Task 10 the shared-shell rule's release did the same with τ = 1e-3 Ha, and integer aufbau hid all-electron open shells); one open-shell atom alone is answered. Multiplicity: two H at M = 1 (also "automatic") are the restricted singlet, +4.6e-2 Ha above 2 E_ref at 6.4 Bohr (rule 5a's measurement; R → ∞: 2 E_LDA(H) ≈ +66 mHa above 2 E_LSD). Mixed species: aligned spins can move charge to another species' partly empty shell at any separation. Why: the user's untrusted collection (1805 samples) sent a single H to DFT on every step. Tests: `surrogate::tests::lone` (13) |
 | rule 5a: an isolated atom in a scene of ≥ 2 atoms (M6 Task 11) | no neighbour within r_cut = 6 Bohr → fallback | the model's free-atom limit is Σ E_ref with F = 0 (ruling S5), not the teacher's dissociated state at the scene's spin (restricted H₂ singlet +4.6e-2 Ha above 2 E_ref at r = 6.4, measured); a one-atom scene is exempt (its answer is E_ref, the teacher's own atom, S9). Not an envelope limit: on even with `max_descriptor_distance` = ∞ |
 | `COORDINATION_RATIO` (rule 5b, M6 Task 11) | 3 | the vanishing direction judged relatively: an atom whose coordination C_t = Σ_{j∈t} f_c(r_ij) is > 3× below the training minimum of its species is outside. One kept stretched-pair sample (r = 5.125, f_c 0.05) put C = 0 at 0.51 spreads (old rule never fired; now: fires at C < 0.0172, r > 5.50 Bohr for one H neighbour, and at C = 0). Factor = the spread limit's "3× beyond what was seen", multiplicatively — no new tuning; where the old premise held nothing changes (the spread rule fires first iff u < 2m/9: H₂ pass m 0.531, u 0.078 = 0.15 m → spread fires at r > 3.8, ratio would at r > 4.34). Only the n = 0 channels (the n ≥ 1 and l ≥ 1 features vanish inside full neighbourhoods by symmetry). Derivation: `surrogate::envelope` module doc |
 | rule 6: the force std compared (M6 Task 11) | epistemic only: force_std_epistemic/√3 | the posterior's force variance splits exactly, force_std² = 3σ_f² + Σ_a g̃ᵀΣg̃ (accumulated separately in `Model::predictive_std`; test 1e-14); σ_f is label noise a fallback cannot reduce — as rule 7 already excludes the energy floor. With σ_f in it, a fit with σ_f ≳ 2e-3 fell back on every pass through equilibrium (absolute bound) and answered near the turning points: the user's cycle |
@@ -2118,10 +2138,12 @@ generated without the gate (CPU, `generate`), so H and He read "provisional (dim
 (`IonicError::Provisional`); the gated H (f = 1.2, s-local, h_req 0.35) and He (not applicable, f = 1.6) the providers use
 are recorded in "M7 `All` (Task 11)". The hash line is `recipe_hash` = ledger + `DIMER_PROCEDURE` (the "two identities" of
 `qm::radial::ledger`; `LEDGER.version` did not move): regenerated at Task 11 with every row's values unchanged (only the
-hash line and the new column differ).
+hash line and the new column differ). **Plan 2026-11-13 Task 10:** the dimer procedure gained the occupation rule (Fermi–Dirac
+at kT = 5e-3) and the GPU partial-level stop (1e-5) among its hashed fields, so the hash line moved from 0x30a74d9bda495668
+(now `legacy_recipe_hash`, the shared-shell era's) to 0xeaf63fe213a84a26 with every row unchanged.
 
 <!-- m7-generation-records:begin -->
-recipe_hash = 0x30a74d9bda495668 (m7-tm-kb-nlcc-4 + dimer-gate-1)
+recipe_hash = 0xeaf63fe213a84a26 (m7-tm-kb-nlcc-4 + dimer-gate-1)
 
 | Z | el | f | local | r_c (Bohr) | Z_v | E_KB (Ha) | GSS (Ha) | r_nlc | r_core | h_req | h_eb | dimer |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -5346,6 +5368,85 @@ the free-atom H), the water point's count.
   default 128 MiB, 161³ passes); the old LOBPCG work is released before the grown one is allocated.
 - *Minors.* M4: the cold guess is per centre (`qm::nuclear::cold_guess`: free atoms at all-electron centres, Z_v blobs
   for pseudised). M6: `SolveProfile::eigen_restores` — 0 in every solve printed (97³ H₂O, the provider test).
+
+### Task 10: the shared-shell rule deleted, the dimer gate on Fermi–Dirac (plan 2026-11-13 Task 10, 2026-11-17, release, RX 7900 XTX)
+
+`Occupations::DegenerateShells` and everything that served it (`degenerate_shell_occupations`, `released_occupations`,
+`decide`, `shared_runs`, `FractionalShell`, `DEGENERACY_TAU`, `ScfStats.{fractional, released}`, the phase-2 release
+with its pattern frozen by rank and its DIIS/stall-watch restart, `StallWatch::restart`, in both solvers) are gone.
+The Rust sources hold none of those identifiers (`rg` over `crates`); docs cite them as history.
+
+**The dimer gate's identity** (spec §6.2). `DIMER_PROCEDURE` gained `occupations: FermiDirac { kt: ELECTRON_KT }` and
+`gpu_partial_tol: GPU_PARTIAL_TOL`, read from the constants (F11); both dimers' 3-D solves run it (the `Aufbau` hold
+and the shared-shell rule are gone, F8). `recipe_hash` moved 0x30a74d9bda495668 → **0xeaf63fe213a84a26** (FNV-1a 64
+of the ledger and the new `Debug` text, computed independently and pinned in `dimer_procedure_hashes_fd`);
+`core_recipe_hash` = 0xeef0a918057a9fbe and the `CoresOnly` surface hash are unchanged (`core_recipe_hash_unchanged`).
+`legacy_recipe_hash()` hashes the frozen `ledger::ds_era::DIMER_PROCEDURE_DS` — a struct of its own named
+`DimerProcedure`, so its derived `Debug` text is byte for byte the old one — and reproduces 0x30a74d9bda495668, so
+`legacy_tag_of` still returns the recorded `all/30a74d9bda495668/shared1e-3/1e-1/stop2x5e-8` and
+`cores/eef0a918057a9fbe/…` (`legacy_tag_of_matches_recorded_ds_strings`, unchanged). The generation records block
+moved its hash line only (`generation_record_table_matches_references_md` passes with every row bitwise the same; `pseudo_gen` 6/6, 273 s).
+
+**The DS-era V7 labels** (`tests/fixtures/ds_era_labels.txt`, Step 1, F13; captured on 1d816c4 before the deletion):
+`Accepted` (H and O pseudised with the GPU gate), 61³ × 0.20 (12 Bohr), σ = h, tol 1e-6 raised to the GPU floor,
+cold, multiplicity auto. H₂ R = 1.4: E_DS −1.1359545439214114 (10 steps, gapped). Linear OH, O–H 1.83 Bohr along x
+(O on a grid point): E_DS −16.777455516610495, the ↓ π pair shared ½–½ (spread 1.4e-8; 17 steps) — FD's ensemble is the
+same, so V7 expects class T with ΔF = −2 kT ln 2 = −6.9315e-3 Ha. H₄ 1.8 × 1.809 Bohr (aspect 1.005): E_DS
+−2.0289850167853247 (50 steps: the shared-shell rule **released** the e pair, spread 2.36 mHa ≥ τ, into the integer
+state), FD at ELECTRON_KT E −2.0006504639744724, F −2.0144863903, TS 1.3836e-2 (31 steps, f 0.526 / 0.474 per spin):
+**E_FD − E_DS = +2.83e-2 Ha** (≥ 3ε_E = 3e-5 by a factor of 940; class S). The other aspects scanned, all released
+under DS: 1.01 +2.82e-2, 1.02 +2.76e-2, 1.04 +2.52e-2, 1.083 +4.27e-3 (E_FD − E_DS). The DS label is the lower-F state
+(F_FD − E_DS = +1.45e-2 at 1.005): the shared-shell release found the broken-symmetry integer state FD does not reach
+from its cold start (spec §4.7(e), the restricted-vs-broken-symmetry H₄ gap).
+
+**Moved references** (each converted test compares F with F on both sides, so no bound moved by −TS):
+
+| test | case | DS era | FD (this task) | TS (closed form) |
+|---|---|---|---|---|
+| `qm` `fd_h4_square_closed_form` | H₄ square 41³ × 0.30, tol 1e-9 | E_DS run in the test | E_DS the literal −1.621874087546 (1d816c4; Task 5 printed −1.621874088905 before Task 6's Poisson-tolerance change, 1.36e-9 apart); E − E_DS −5.3e-12 | 1.386294e-2 = 4 kT ln 2 (+7.3e-14) |
+| `qm` `ion_on_a_grid_point_is_finite` | pseudo-O M = 3 on a grid point, tol 1e-9 | one shared cluster, f = ⅓, spread < τ/10 | three ↓ partial levels f = ⅓ within 1e-6, TS within 1e-6 relative of the closed form | 9.5477e-3 = 3 kT s(⅓) |
+| `qm` / `qm-gpu` `the_stall_stop_and_the_observer_leave_a_pseudo_solve_bitwise` | pseudo-O M = 3 33³ | shared ⅓ cluster | bitwise stop on/off/observed; F_HF(last) − F −1.2e-7 (GPU) | 9.547611e-3 (GPU) |
+| `qm-gpu` `pseudo_o_triplet_matches_cpu` | pseudo-O M = 3 33³ × 0.25 (8 Bohr, off-site) | \|ΔE\| 7.8e-7 | \|ΔF\| 8.05e-7 (bound 3e-6), components 5.0e-6 (1e-4), \|Δε\| 6.1e-7 over the tested levels (1e-5), forces 4.19e-6 = kernels 7.9e-8 + state 4.27e-6; GPU stop 1e-5, CPU 1e-6 | GPU and CPU 9.547611e-3 (the closed form 9.547712e-3: the off-site p levels split 8.8e-5 Ha, f 0.335 / 0.334 / 0.331) |
+| `gpu_vs_cpu` `gpu_pseudo_o_*` | pseudo-O M = 3 61³ × 0.20 | \|ΔE\| 4.99e-7 | \|ΔF\| 2.70e-7, \|Δε\| 3.4e-6, ΔF_I 5.05e-7 | 9.547712e-3 both |
+| `gpu_vs_cpu` `gpu_mixed_oh_*` | OH M = 2 61³ × 0.20 | \|ΔF_I\| 4.31e-5 | \|ΔF\| 5.58e-7, \|Δε\| 1.5e-6, **ΔF_I 5.56e-6** (8× below the shared-shell era's; its state part was the shared π cluster) | 6.931472e-3 = 2 kT ln 2 both |
+| `gpu_vs_cpu` `gpu_pseudo_c_*`, `gpu_pseudo_h2o_all_*` | CH₄, H₂O (All) | | \|ΔF\| 2.32e-7, 1.32e-6; ΔF_I 1.71e-6, 3.24e-6 | 5e-16, 3e-14 (gapped) |
+
+`pseudo_case` (validate) and `pseudo_vs_cpu` (qm-gpu) compare the GPU's **tested** levels (its untested FD buffer, the
+highest, left out — Task 9c (c): its Ritz value decides nothing) with the CPU's lowest as many, and no longer pin the
+two block sizes equal: under FD each solver grows and trims its own witness block (pseudo-O 33³ ↓: CPU 6 tested, GPU 5
+tested + buffer, the buffer 6.0e-5 Ha from the CPU's 6th level). The compared levels must cover every CPU-occupied
+level and a witness; the ε bound (1e-5) is unchanged.
+
+The validate `pseudo` suite runs Fermi–Dirac (`solve_with`, the GPU probe, `eggbox`): 9/9 gates pass (2281 s).
+- `pseudo_o_triplet_below_singlet` (compares E = `energy.internal` with the radial atom): M = 1 −16.050054 vs radial
+  −16.049325 (Δ −0.73 mHa), M = 3 −16.106124 vs −16.105387 (Δ −0.74 mHa), splitting 56.069 mHa (radial 56.062); TS at
+  the closed forms, 1.909543e-2 (M = 1) and 9.547713e-3 (M = 3).
+- `lone_o_and_n_scan_picks_hund` (lowest F): O F(1) −16.068941, **F(3) −16.115461**, F(5) −15.739613 → M = 3;
+  N F(2) −9.872353, **F(4) −9.955924** (no partial level) → M = 4. The winners are unchanged.
+- `eggbox_passes_at_0_15`: O₂ G 6.752e-6 Ha/Bohr, u_I 9.39e-8; H₂O G 4.142e-6, u_I 6.32e-7 (gapped: F = E); PASSES.
+- The repurposed `degenerate_spread_at_low_symmetry_sites` (V0's site study under FD; 20 CPU solves at h_req, 12 Bohr,
+  four low-symmetry sites): every case the symmetric ensemble at every site, TS against the closed form within
+  1.5e-6 relative (worst: C M = 3 at the tetragonal sites, −1.45e-6; O M = 3 at (0, h/2, h/2) −1.0e-7; the rest ≤ 2.3e-9),
+  each channel's partial levels within 3.1e-5 Ha of each other (C M = 3; O M = 3 8.1e-6; F 1.9e-7). Site spread of F
+  over the four sites (reported): O M = 1 5.47e-6, O M = 3 5.50e-6, C M = 3 1.99e-5, N M = 2 9.20e-6, F M = 2 3.91e-7 Ha.
+
+`pseudo_oracles` (the dimer gate's H and He regenerated once under the moved hash; 11/11 gates, 4062 s): pseudo-H₂ R_e
+**1.4340 Bohr** (the shared-shell era's 1.4340; this run's AE σ→0 1.4488, the DS-era gate's 1.4489), the gate's
+same-procedure ω ratio −3.43 % (DS era −3.45 %; bound 5 %), bias-free −3.72 % — the verdict (pass, f = 1.2, s-local,
+h_req 0.35) reproduces within the backend margin (2e-3 Bohr, 0.5 %). H₂O (All) ∠HOH 104.811°, NH₃ 107.47°, CH₄
+tetrahedral, the egg-box records, the H₂O preset NVE (E spread 8.02e-6 Ha), the pseudo-O₂ NVE drift −9.85e-7 Ha/ps
+(bound 2e-4) and the CH₄ CSVR ⟨T⟩ 315.0 K (+5.0 %) all pass.
+
+**Open (not re-pinned; a ruling is needed):** `qm-gpu` `harris::tests::harris_block_follows_a_shared_shell` fails its
+`out.at_cap == [false, false]` assertion under Fermi–Dirac (the fixture `solved_pseudo_o` ran the shared-shell rule
+before). Measured (a temporary per-solve trace, removed): ↓'s second Harris solve, split (8, 6, 7), ran to the
+200-iteration cap with its displayed tier at 2.33e-5 (tol 5.4e-6) and its guard tier at 6.9e-6 (GUARD_TOL 1e-3); the
+head's sixth level 0.406862 Ha is one of a box pair 9.2e-6 Ha apart (0.406862 / 0.406871) straddling the head boundary,
+its partner in the guard tier; the next solve raised the head over the shown pair and ended on the f32 floor in 13
+iterations. The splits and solve counts are the shared-shell era's ([2, 3], (9, 7, 8)); only the first call's cap
+moved. FD's ↓ density (f 0.335 / 0.334 / 0.331, the off-site p set split 8.8e-5 Ha) is what splits that box pair
+differently; the head boundary splitting a near-degenerate pair before the post-solve raise is a pre-existing Harris
+behaviour.
 
 ## Live orbitals (Harris display; spec 2026-11-14)
 

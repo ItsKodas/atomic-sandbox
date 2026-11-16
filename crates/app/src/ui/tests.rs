@@ -3608,7 +3608,7 @@ mod orbital_viewer {
     }
 
     /// Plan 2026-11-13 Task 12 (spec §6.6): the rows show each level's Fermi–Dirac f — f = ⅓ shows its f (and its
-    /// "occ 1/3" badge's tip is the per-level wording, not the `DegenerateShells` "shared equally" one); a level with
+    /// "occ 1/3" badge's tip is the per-level wording, not the shared-shell rule's "shared equally" one); a level with
     /// f < 1e-6 (a witness tail) shows as empty: not occupied, not the HOMO, and the LUMO when it is the lowest empty
     /// level; one within 1e-6 of 1 shows as full.
     #[test]
@@ -3634,7 +3634,7 @@ mod orbital_viewer {
         assert_eq!(orbitals::shown_f(&rows[3]), 0.0);
         for tip in [orbitals::OCC_TIP, orbitals::OCC_PAIR_TIP] {
             assert!(tip.contains("Fermi–Dirac f") && tip.contains("T_el") && tip.contains("f below 1e-6 shows as empty"), "{tip}");
-            assert!(!tip.contains("spherical-atom ensemble"), "the DegenerateShells wording is gone: {tip}");
+            assert!(!tip.contains("spherical-atom ensemble"), "the shared-shell wording is gone: {tip}");
         }
     }
 

@@ -142,14 +142,13 @@
 //! clamp engages, are counted and warned about (T8(c) certifies the domain radially; this makes the
 //! "never engages" claim checkable in 3-D, Task 6 review S3).
 //!
-//! # Occupations (spec 2026-11-13 §4–5; `DegenerateShells`: pseudopotential spec §5.7, M7 Task 6 review, ruling A)
-//! `ScfSettings.occupations` picks how each spin channel σ (N_σ electrons) fills its levels. Three schemes:
+//! # Occupations (spec 2026-11-13 §4–5)
+//! `ScfSettings.occupations` picks how each spin channel σ (N_σ electrons) fills its levels. Two schemes:
 //! - **`Aufbau`** (the default of `for_grid` until plan Task 7 flipped it to `FermiDirac`; the providers' choice under
-//!   `IonicPolicy::None` until plan Task 9 switches it; afterwards only the kT → 0 reference) is everything above: each
-//!   spin fills its N_σ lowest levels, k_σ = N_σ vectors are solved, not one operation differs from the solver before
-//!   M7.
-//! - **`FermiDirac { kt }`** (spec 2026-11-13; the default of `for_grid` since plan Task 7, at the production kT =
-//!   `ELECTRON_KT` = 5 mHa, T_el = kT/k_B ≈ 1 579 K): the
+//!   `IonicPolicy::None` until plan Task 9 switched it; now only the kT → 0 reference) is everything above: each spin
+//!   fills its N_σ lowest levels, k_σ = N_σ vectors are solved, not one operation differs from the solver before M7.
+//! - **`FermiDirac { kt }`** (spec 2026-11-13; the default of `for_grid` since plan Task 7 and every provider's scheme
+//!   since plan Task 9, at the production kT = `ELECTRON_KT` = 5 mHa, T_el = kT/k_B ≈ 1 579 K): the
 //!   Mermin–Kohn–Sham ensemble at fixed N_σ per spin (the fixed-spin-moment ensemble, so a forced or "auto"
 //!   multiplicity keeps its meaning), with ground-state LSDA xc. All of it is in atomic units (ε, μ, kT in Ha, k_B = 1).
 //!   - *The rule* (`occupations::fermi_dirac`, its module doc has the derivation): on every SCF step, from that step's
@@ -166,8 +165,9 @@
 //!     negligible against the Δρ stop are held to `WITNESS_GUARD_TOL` instead of eig_tol (`tight_columns`), the extra
 //!     block doubles per growth (`grown_extras`) and its overshoot is trimmed once the witness passes (`witness_keep`).
 //!     At most `MAX_WITNESS_GROWTH` extra vectors, else `QmError::Numerical`. A cold start solves N_σ + 1; a warm
-//!     start keeps its block; growth uses `DegenerateShells`' seeds. Under `Aufbau` an all-electron scene solved
-//!     exactly N_σ vectors, so FD costs it at least one extra vector per occupied channel.
+//!     start keeps its block; a grown vector is seeded by `initial_orbitals` at seed 1000 + 2·(its index) + σ (the
+//!     seeds of the former shared-shell growth, so the bits of every grown block are unchanged). Under `Aufbau` an
+//!     all-electron scene solved exactly N_σ vectors, so FD costs it at least one extra vector per occupied channel.
 //!   - *The energies* (spec §4.3): E (`Energy::internal`) = T_s + E_ext (incl. E_NL) + E_H + E_xc + E_nn as above with
 //!     T_s = Σ f⟨ψ|−½∇²|ψ⟩ and E_NL = Σ f Σ E_KB c², all from the output orbitals and ρ_out of the final step;
 //!       S = Σ_σ Σ_i s(f_iσ),   s(f) = −[f ln f + (1 − f) ln(1 − f)] ≥ 0,
@@ -180,89 +180,41 @@
 //!     condition, μ_σ the multiplier of Σ_i f_iσ = N_σ. So dF/dR = ∂F/∂R|_{ψ,f}: S has no explicit R, and the force is
 //!     the Hellmann–Feynman force of the f-weighted density and projector sums `forces` already computes — −dF/dR,
 //!     not −dE/dR (they differ by d(TS)/dR: 0 when gapped, up to a few mHa/Bohr where a level crosses μ).
-//!   - *Why it replaces `DegenerateShells`*: integer aufbau has no well-posed fixed point for a partly filled
-//!     degenerate shell (below), and the two-phase equal-share rule that answered it decides by thresholds on a
-//!     converged spread (τ, τ_c), so it needs a second convergence and a release that restarts the mixer and the
-//!     stall watch. FD's f are a continuous function of the levels: there is no decision to depend on the path, the
-//!     solve converges to a stationary point of F, and an exactly degenerate partly filled shell gets the same
-//!     equal-weight ensemble (so the same E), now with −TS (4 kT ln 2 for the H₄ square). Plan Task 10 deletes the
-//!     two phases.
+//!   - *Why it replaced the shared-shell rule* (history: the former DS scheme, pseudopotential spec §5.7, the providers'
+//!     scheme for pseudised scenes until plan 2026-11-13 Task 9, deleted in Task 10). Integer aufbau has no well-posed
+//!     fixed point for a partly filled degenerate shell: for pseudo-O at h = 0.20, M = 1 (two of three p per spin) has
+//!     no aufbau-consistent state (the empty p falls below an occupied one in their own potential: Δρ 1.2–2.7 for 60
+//!     steps), and M = 3's one minority p is aufbau-consistent but its orientation is a zero mode of the fixed-point set
+//!     (|p_n̂|² has angular content l = 0, 2 only, the lattice's anisotropy starts at l = 4; measured contraction 0.9991
+//!     per step, Δρ stalled at 7e-5). The shared-shell rule answered that with an equal share of a straddling cluster
+//!     within τ_c = 0.1 Ha of ε_F, decided by a threshold τ = 1e-3 Ha on the cluster's converged spread: it needed a
+//!     second convergence, a release into integer occupations frozen by rank, and a restart of the mixer and the stall
+//!     watch, and its outcome hung on thresholds. FD's f are a continuous function of the levels: there is no decision to
+//!     depend on the path, the solve converges to a stationary point of F, and an exactly degenerate partly filled
+//!     shell gets the same equal-weight ensemble (so the same E the shared-shell rule gave), now with −TS (4 kT ln 2 for
+//!     the H₄ square, `fd_h4_square_closed_form`).
 //!   - *What the state is* (rule 7, spec §4.7). Gapped (≥ 74 kT around μ): every f is 1.0 or ≤ e^{−36}, S ≤ 1e-14,
 //!     F = E. A smaller frontier gap Δ with μ at mid-gap carries TS ≈ 2kT(1 + y)e^{−y}, y = Δ/(2kT), per channel
 //!     (4e-10 Ha at 0.2 Ha, 5e-6 Ha at 0.1 Ha). Near-degenerate frontier ("pinned") levels put F below E by
-//!     O(kT) per pinned level. S is the entropy of the KS occupations, not the molecule's physical electronic entropy.
-//!     Smearing converges to the nearest stationary state, not the lowest (a spin-symmetric state can lie above a
-//!     broken-symmetry one: spec §4.7(e)); one μ_σ spans the box, so separated fragments with aligned frontier levels
-//!     share charge or spin (LSDA delocalisation, §4.7(h)).
+//!     O(kT) per pinned level. An exactly degenerate open shell is the equal-weight ensemble — for an atom the
+//!     spherical atom, the object the radial generator builds (spec §4.1) and every T3 gate compares; LSDA lowers the
+//!     non-spherical integer state by a few mHa (O: 11.6–11.8 mHa of self-polarisation; the symmetry dilemma of
+//!     approximate functionals), measured and reported, never hidden. S is the entropy of the KS occupations, not the
+//!     molecule's physical electronic entropy. Smearing converges to the nearest stationary state, not the lowest (a
+//!     spin-symmetric state can lie above a broken-symmetry one: spec §4.7(e)); one μ_σ spans the box, so separated
+//!     fragments with aligned frontier levels share charge or spin (LSDA delocalisation, §4.7(h)).
 //!   - *Diagnostics*: `ScfStats.entropy` (S), `mu` (μ_σ), `partial` (min(f, 1 − f) ≥ `PARTIAL_OCCUPATION_MIN`, i.e.
 //!     |ε − μ| ≲ 13.8 kT).
 //!   - *Warm start* (spec §5): `KsState.occupations` records the scheme with its kT and the guard compares it with
 //!     `==`, so a state converged at another kT or under another scheme never seeds the solve (the cold path runs).
-//! - **`DegenerateShells { tau }`** (the providers' choice under `CoresOnly` and `All` until plan Task 9; removed in
-//!   plan Task 10), τ = `DEGENERACY_TAU`:
-//!   - Why: with integer aufbau a partly filled degenerate shell has no well-posed fixed point. For
-//!     pseudo-O at h = 0.20, M = 1 (two of three p per spin) has no aufbau-consistent state (the empty
-//!     p falls below an occupied one in their own potential: Δρ 1.2–2.7 for 60 steps), and M = 3's one
-//!     minority p is aufbau-consistent but its orientation is a zero mode of the fixed-point set in the
-//!     continuum and nearly so on the grid (|p_n̂|² has angular content l = 0, 2 only, the lattice's
-//!     anisotropy starts at l = 4; measured contraction 0.9991 per step, Δρ stalled at 7e-5). No mixer
-//!     or eigensolver setting removes a zero mode.
-//!   - Rule (state-defined; Task 6 re-review, ruling 1): a level set at ε_F,σ is shared iff, in the
-//!     self-consistent state in which it is shared, its eigenvalue spread is < τ. Two phases; every
-//!     solve, cold or warm, starts in the first, so the outcome is a property of the converged state,
-//!     not of the SCF path:
-//!     1. Candidates. For each spin with N_σ > 0 LOBPCG solves k_σ = N_σ + g_σ states, g_σ grown one
-//!        at a time (`MAX_WITNESS_GROWTH`) until the gap witness satisfies ε_{k_σ} ≥ ε_F,σ + τ_c,
-//!        ε_F,σ the N_σ-th lowest level; all k_σ are converged to eig_tol (a witness stopped at the
-//!        LOBPCG cap shows in `max_eigen_residual`). The levels within τ_c of ε_F,σ form the cluster
-//!        C_σ; if it straddles ε_F,σ (reaches rank N_σ) it is shared equally, f = (N_σ − n_below)/|C_σ|
-//!        (`degenerate_shell_occupations`), else the f are aufbau's. The SCF runs to `tol`.
-//!     2. Decision. A shared cluster whose spread is ≥ τ is released: its levels are split wherever a
-//!        neighbour gap is ≥ τ and filled by aufbau over the groups (`released_occupations`). The
-//!        pattern (f by rank) is then frozen for the rest of the solve — no re-sharing, so no
-//!        oscillation — and the SCF runs to `tol` again. Releases are reported (`ScfStats.released`).
-//!
-//!     A closed shell's cluster ends at N_σ and is never shared; a second convergence happens only when
-//!     ε_F lies within τ_c of a genuinely split set. Then ρ_σ = Σ f_i ψ_i², T_s = Σ f_i⟨ψ_i|−½∇²|ψ_i⟩,
-//!     E_NL = Σ f_iσ Σ E_KB c_lm². The f are constants of the state (fixed by the rule, not varied), and E is
-//!     stationary in ψ at those fixed f, so the energy above and the forces hold with the weights f_iσ
-//!     (`KsState.occ_up/occ_dn`).
-//!   - Why two phases: a one-shot test on each step's levels is path-dependent. At a low-symmetry site
-//!     the cold-guess orbitals (compact, ε ≈ −1.05 Ha for O 2p) are split by the lattice beyond 1e-4 at
-//!     step 1 (1.5e-4 at (0, h/2, h/2), h = 0.20), and an integer occupation then self-polarises
-//!     (11.6–11.8 mHa): the round-1 one-shot rule left a lone O 4.1 mHa lower at that site than at the
-//!     cubic ones, while the same site's shared state has a spread of only 5.3e-5.
-//!   - What it is (rule 7): the equal-weight ensemble of the degenerate shell, for an atom the
-//!     spherical atom — the object the radial generator builds (spec §4.1) and every T3 gate compares.
-//!     LSDA lowers the non-spherical integer state by a few mHa (the symmetry dilemma of approximate
-//!     functionals); that gap is measured and reported (spec §6.3), never hidden.
-//!   - τ = `DEGENERACY_TAU` = 1e-3 Ha: 10× the largest converged lattice spread of a symmetry-degenerate
-//!     shared level at any site and certified h (measured 5.3e-5 Ha for O 2p at the tetragonal site,
-//!     h = 0.20; validated per species at h_req by `validate`'s `degenerate_spread_at_low_symmetry_sites`),
-//!     and below k_B·300 K ≈ 0.95 mHa (levels this close are thermally co-occupied at the sandbox's
-//!     temperatures; sharing a genuinely split pair with δ < τ moves E by ≤ δ/2 at first order).
-//!     τ_c = `WITNESS_GAP` = 0.1 Ha (the value of the former `CANDIDATE_TAU`) exceeds the splitting that integer
-//!     occupation induces in a partly filled set (O: 11.6–11.8 mHa), so neither a transient nor a warm state can
-//!     decide the pattern. Solver constants; they change no table.
-//!   - Molecules: closed shells and integer-per-spin open shells (H₂O, CH₄, the O₂ triplet) get aufbau's
-//!     f; symmetry-enforced degenerate partly filled sets get the ensemble. A set whose converged spread
-//!     crosses τ during dynamics switches between shared and integer occupation (`ScfStats.fractional`
-//!     reports every shared cluster of the final state, `ScfStats.released` every release).
-//!   - The warm-start guard also requires the same scheme (`KsState.occupations`), so an integer,
-//!     broken-symmetry state never seeds a shared solve.
 //! - **One shot** (`one_shot_occupations`, live-orbitals spec §4.1): a single diagonalisation with no SCF loop (the
 //!   Harris display solve of the estimated mode) applies the scheme once to its levels. `Aufbau` fills the N_σ
 //!   lowest. `FermiDirac { kt }` (the scf-stall ← main merge ruling, 2026-11-16): `occupations::fermi_dirac` at the
 //!   same kT on the computed levels, per spin at its N_σ — the rule every SCF step applies on that surface; the window
-//!   is short (`OneShot.window_short`) iff `witness_reached` fails on them, and the caller grows its block one level at
-//!   a time up to `MAX_WITNESS_GROWTH`, as the SCF does. A window still short at that bound gives approximate
-//!   occupations — a display note, never an error. `shared`/`released` are `DegenerateShells`' (`None`/false under
-//!   FD; its partly occupied levels are `partial_levels` of the f). `DegenerateShells` runs phase 1 with τ_c on the
-//!   computed levels, then phase 2's decision (`decide`) once on those same levels — there is no second convergence,
-//!   so "the converged spread" is the one-shot spread. There is no witness growth either: when the top computed level
-//!   lies within τ_c of ε_F (`degenerate_shell_occupations` returns `None`), every computed level within τ_c of ε_F
-//!   is the cluster — it always straddles ε_F, so it is shared, then decided — and `OneShot.window_short` reports
-//!   that the window was cut by the block size. The result is a display occupation, never a Kohn–Sham fixed point's.
+//!   is short (`OneShot.window_short`) iff `witness_reached` fails on them, and the caller grows its block up to
+//!   `MAX_WITNESS_GROWTH`, as the SCF does. A window still short at that bound gives approximate occupations — a
+//!   display note, never an error. Its partly occupied levels are `partial_levels` of the f. The result is a display
+//!   occupation, never a Kohn–Sham fixed point's.
 //!
 //! # The stall stop (`StallWatch`, `ScfSettings::stall_window`)
 //! A solve that cannot converge used to run to `max_iter` (200) before failing, and the providers'
@@ -286,9 +238,9 @@
 //! another. A non-finite Δρ is not a stall: it ends the solve at once as `ScfNotConverged`. In words: the best Δρ (the anchor is always the best Δρ at
 //! the time of the last 2× gain) has not improved by a factor ≥ 2 within the last W iterations.
 //! Slow but steady progress never stops: any rate faster than 2× per W iterations re-anchors.
-//! At the `DegenerateShells` release (phase 2 restarts the convergence with Δρ = ∞) the watch
-//! restarts too. W = `SCF_STALL_WINDOW`; its measurement is cited there and in `validate`'s
-//! `references.md` ("SCF stall stop").
+//! W = `SCF_STALL_WINDOW`; its measurement is cited there and in `validate`'s `references.md` ("SCF stall stop").
+//! A solve has one convergence phase, so the watch never restarts (the shared-shell rule's phase-2 release restarted
+//! it mid-solve; that rule was deleted in plan 2026-11-13 Task 10).
 //!
 //! # Progress (`scf_observed`)
 //! An observer gets one `ScfProgress` per iteration, after Δρ and before the convergence test: the
@@ -321,13 +273,9 @@ pub use crate::occupations::*;
 
 /// How each spin's electrons fill its Kohn–Sham levels (module doc, "Occupations"). `PartialEq` compares kT, so the
 /// warm-start guard (`KsState.occupations == settings.occupations`) refuses a state converged at another kT.
-/// `DegenerateShells` is removed in plan Task 10.
+/// (The shared-shell scheme, pseudopotential spec §5.7, was deleted in plan 2026-11-13 Task 10.)
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Occupations { Aufbau, DegenerateShells { tau: f64 }, FermiDirac { kt: f64 } }
-
-/// τ of `Occupations::DegenerateShells` (Ha; module doc, "Occupations"): the decision threshold on a shared
-/// cluster's converged spread. A solver constant.
-pub const DEGENERACY_TAU: f64 = 1e-3;
+pub enum Occupations { Aufbau, FermiDirac { kt: f64 } }
 
 /// The most extra vectors a spin channel may grow to find the gap witness: the ceiling of the cap (a method literal and
 /// a cost cap only: the largest symmetry degeneracy of a Z ≤ 18 open shell is 3, plus box continuum states above it;
@@ -346,117 +294,33 @@ pub const DEGENERACY_TAU: f64 = 1e-3;
 /// same rule.
 pub const MAX_WITNESS_GROWTH: usize = 32;
 
-/// A shared (fractionally occupied) cluster of one spin channel: spin (0 ↑, 1 ↓), the index of its first
-/// level in ascending order, its size, the occupation f of each level and its eigenvalue spread (Ha).
-#[derive(Clone, Debug, PartialEq)]
-pub struct FractionalShell { pub spin: u8, pub first: usize, pub count: usize, pub f: f64, pub spread: f64 }
-
-/// Spec §5.7's phase-1 (candidate) occupations of `evals` (any order; f is returned in the same order) for `n`
-/// electrons with the window `tau` (τ_c in the solver): `None` if the gap witness (the highest level) lies within
-/// `tau` of ε_F (the n-th lowest) — solve another vector. The levels within `tau` of ε_F form the cluster; it is
-/// shared equally iff it straddles ε_F (reaches rank n). The second value is the shared cluster (first, count, f,
-/// spread), `None` when the f are aufbau's.
-pub fn degenerate_shell_occupations(evals: &[f64], n: usize, tau: f64) -> Option<(Vec<f64>, Option<(usize, usize, f64, f64)>)> {
-    if n == 0 { return Some((vec![0.0; evals.len()], None)); }
-    let k = evals.len();
-    assert!(k > n, "the rule needs at least one vector above the {n} electrons ({k} given)");
-    let mut order: Vec<usize> = (0..k).collect();
-    order.sort_by(|&a, &b| evals[a].total_cmp(&evals[b]));
-    let e_f = evals[order[n - 1]];
-    if evals[order[k - 1]] - e_f < tau { return None; }
-    let first = order.iter().position(|&i| (evals[i] - e_f).abs() < tau).expect("ε_F is in its own cluster");
-    let count = order[first..].iter().take_while(|&&i| (evals[i] - e_f).abs() < tau).count();
-    let fc = (n - first) as f64 / count as f64;
-    let mut f = vec![0.0; k];
-    for (rank, &i) in order.iter().enumerate() {
-        f[i] = if rank < first { 1.0 } else if rank < first + count { fc } else { 0.0 };
-    }
-    let shell = (first + count != n).then(|| {
-        let c = &order[first..first + count];
-        let spread = c.iter().map(|&i| evals[i]).fold(f64::MIN, f64::max) - c.iter().map(|&i| evals[i]).fold(f64::MAX, f64::min);
-        (first, count, fc, spread)
-    });
-    Some((f, shell))
-}
-
-/// Spec §5.7's phase-2 release of a shared cluster: its levels `sorted` (ascending) are split wherever a neighbour
-/// gap is ≥ `tau`, and `electrons` are filled by aufbau over the groups, shared equally within a partly filled group.
-/// Returns f per level (same order).
-pub fn released_occupations(sorted: &[f64], electrons: f64, tau: f64) -> Vec<f64> {
-    debug_assert!(sorted.windows(2).all(|w| w[0] <= w[1]), "levels must be ascending");
-    let mut groups: Vec<(usize, usize)> = Vec::new();
-    let mut start = 0;
-    for i in 1..=sorted.len() {
-        if i == sorted.len() || sorted[i] - sorted[i - 1] >= tau { groups.push((start, i)); start = i; }
-    }
-    let (mut f, mut left) = (vec![0.0; sorted.len()], electrons);
-    for (a, b) in groups {
-        let size = (b - a) as f64;
-        let take = left.min(size);
-        for x in &mut f[a..b] { *x = take / size; }
-        left -= take;
-    }
-    f
-}
-
 /// The occupations of one spin channel after a single diagonalisation (`one_shot_occupations`; module doc,
-/// "Occupations", one-shot paragraph): `f` in the order of the given `evals`, Σf = n; `shared` the cluster shared in
-/// the final `f` (`None` when every f is 0 or 1; `first` is a rank in ascending order); `released` iff phase 2 split
-/// the candidate cluster; `window_short` iff the top computed level lay within τ_c of ε_F (no gap witness; under
-/// `FermiDirac`: iff `witness_reached` fails on the computed levels, so the f may miss weight above them).
+/// "Occupations", one-shot paragraph): `f` in the order of the given `evals`, Σf = n; `window_short` iff, under
+/// `FermiDirac`, `witness_reached` fails on the computed levels (so the f may miss weight above them); never under
+/// `Aufbau`.
 #[derive(Clone, Debug, PartialEq)]
-pub struct OneShot { pub f: Vec<f64>, pub shared: Option<FractionalShell>, pub released: bool, pub window_short: bool }
+pub struct OneShot { pub f: Vec<f64>, pub window_short: bool }
 
 /// Applies `rule` once to the levels `evals` (any order) of spin `spin` holding `n` electrons (module doc,
-/// "Occupations", one-shot paragraph). `Aufbau`: 1 on the n lowest by rank. `DegenerateShells { tau }`: phase 1 with
-/// τ_c (`degenerate_shell_occupations`; without a gap witness every computed level within τ_c of ε_F is shared and
-/// `window_short` is set), then phase 2 once (`decide`: a shared cluster of spread ≥ `tau` is released).
-/// `FermiDirac { kt }` (the scf-stall ← main merge ruling): `fermi_dirac(evals, n, kt)`, the rule of every SCF step on
-/// that surface, with `window_short` = !`witness_reached` (the caller grows its block up to `MAX_WITNESS_GROWTH`, as
-/// the SCF does); `shared` `None`, `released` false. Errors: `fermi_dirac`'s (fewer than n + 1 levels, a non-finite ε
-/// or kT). Panics if n > 0 and `evals.len() < n` (`Aufbau`) or `evals.len() <= n` (`DegenerateShells`).
-pub fn one_shot_occupations(evals: &[f64], n: usize, spin: u8, rule: Occupations) -> Result<OneShot, QmError> {
-    let none = |f| OneShot { f, shared: None, released: false, window_short: false };
+/// "Occupations", one-shot paragraph). `Aufbau`: 1 on the n lowest by rank. `FermiDirac { kt }` (the scf-stall ← main
+/// merge ruling): `fermi_dirac(evals, n, kt)`, the rule of every SCF step on that surface, with `window_short` =
+/// !`witness_reached` (the caller grows its block up to `MAX_WITNESS_GROWTH`, as the SCF does). `spin` names the
+/// channel in the caller's notes only. Errors: `fermi_dirac`'s (fewer than n + 1 levels, a non-finite ε or kT).
+/// Panics if n > 0 and `evals.len() < n` (`Aufbau`).
+pub fn one_shot_occupations(evals: &[f64], n: usize, _spin: u8, rule: Occupations) -> Result<OneShot, QmError> {
+    let none = |f| OneShot { f, window_short: false };
     if n == 0 { return Ok(none(vec![0.0; evals.len()])); }
-    let order = ascending(evals);
     match rule {
         Occupations::Aufbau => {
             assert!(evals.len() >= n, "aufbau needs {n} levels ({} given)", evals.len());
             let mut f = vec![0.0; evals.len()];
-            for &i in &order[..n] { f[i] = 1.0; }
+            for &i in &ascending(evals)[..n] { f[i] = 1.0; }
             Ok(none(f))
         }
         Occupations::FermiDirac { kt } => {
             let fd = fermi_dirac(evals, n, kt)?;
             let mu = fd.mu.expect("a channel with electrons has μ");
-            Ok(OneShot { f: fd.f, shared: None, released: false, window_short: !witness_reached(evals, n, mu, kt) })
-        }
-        Occupations::DegenerateShells { tau } => {
-            let k = evals.len();
-            assert!(k > n, "the rule needs at least one level above the {n} electrons ({k} given)");
-            let (f, shell, window_short) = match degenerate_shell_occupations(evals, n, WITNESS_GAP) {
-                Some((f, shell)) => (f, shell, false),
-                None => {
-                    // no gap witness: the cluster |ε − ε_F| < τ_c is a contiguous run of ranks containing ε_F (rank
-                    // n − 1) and the top level (rank k − 1 ≥ n), so it always straddles ε_F and is shared
-                    let e_f = evals[order[n - 1]];
-                    let first = order.iter().position(|&i| (evals[i] - e_f).abs() < WITNESS_GAP).expect("ε_F is in its own cluster");
-                    let count = k - first;
-                    let fc = (n - first) as f64 / count as f64;
-                    let mut f = vec![0.0; k];
-                    for (rank, &i) in order.iter().enumerate() { f[i] = if rank < first { 1.0 } else { fc }; }
-                    let spread = evals[order[k - 1]] - evals[order[first]];
-                    (f, Some((first, count, fc, spread)), true)
-                }
-            };
-            let shells: Vec<FractionalShell> = shell.map(|(first, count, f, spread)| FractionalShell { spin, first, count, f, spread }).into_iter().collect();
-            let mut released = Vec::new();
-            let by_rank = decide(evals, &f, &shells, tau, &mut released);
-            let mut f = vec![0.0; k];
-            for (rank, &i) in order.iter().enumerate() { f[i] = by_rank[rank]; }
-            let runs = shared_runs(evals, &order, &by_rank, spin);
-            debug_assert!(runs.len() <= 1, "one cluster, at most one partly filled group: {runs:?}");
-            Ok(OneShot { f, shared: runs.into_iter().next(), released: !released.is_empty(), window_short })
+            Ok(OneShot { f: fd.f, window_short: !witness_reached(evals, n, mu, kt) })
         }
     }
 }
@@ -602,13 +466,10 @@ impl StallWatch {
     /// still at or above the level.
     pub fn stalled(&self, since_gain: usize) -> bool { self.window > 0 && since_gain >= self.window && self.best >= self.level }
 
-    /// A new convergence phase starts after iteration `i` (the `DegenerateShells` release).
-    pub fn restart(&mut self, i: usize) { *self = StallWatch { anchor_at: i, ..StallWatch::new(self.window, self.level) }; }
-
     /// L, the stall level (e).
     pub fn level(&self) -> f64 { self.level }
 
-    /// The lowest Δρ observed (since the last restart).
+    /// The lowest Δρ observed.
     pub fn best(&self) -> f64 { self.best }
 
     pub fn window(&self) -> usize { self.window }
@@ -644,8 +505,7 @@ pub struct ScfProgress {
 /// asserts the grid and σ match its arguments. `v_nuc` is the local ionic potential V_loc (today's
 /// V_nuc when `ionic` is `None`); `rho_up`/`rho_dn` are the (valence) electron densities, without ρ_pc.
 /// `occ_up`/`occ_dn` hold one occupation per stored orbital (all 1 under `Aufbau`, where exactly N_σ
-/// orbitals are stored; under `DegenerateShells` the stored orbitals include the gap witnesses, f = 0; under
-/// `FermiDirac` they are the final step's Fermi–Dirac f over the grown block, the witnesses included with their small
+/// orbitals are stored; under `FermiDirac` they are the final step's Fermi–Dirac f over the grown block, the witnesses included with their small
 /// but nonzero f — never clipped to 0 — so Σf = N_σ to ≈ 1e-13), and `occupations` the scheme the state was converged
 /// under, kT included (the warm-start guard compares it with `==`). `rho_up`/`rho_dn` are Σ f ψ² of those f.
 pub struct KsState {
@@ -665,7 +525,7 @@ impl KsState {
 
 /// Energy components (Hartree). `internal` = E = kinetic + external + hartree + xc + nuclear (that left-to-right
 /// sum), the Kohn–Sham energy with the f-weights; `ts` = kT·S ≥ 0, the electronic entropy term of the final step's
-/// occupations (0.0 under `Aufbau` and `DegenerateShells`); `total` = F = `internal − ts`, bitwise — the Mermin free
+/// occupations (0.0 under `Aufbau`); `total` = F = `internal − ts`, bitwise — the Mermin free
 /// energy under `FermiDirac` (module doc, "Occupations"), E itself otherwise. Every consumer of `total` gets F. Under an
 /// ionic setup (module doc, "Ionic species (M7)"): `external` = ∫ρ V_loc + E_NL, the whole
 /// ion–electron energy; `xc` = E_xc[ρ↑ + ½ρ_pc, ρ↓ + ½ρ_pc]; `nuclear` = E_ii with valence charges Z_v
@@ -683,21 +543,18 @@ pub struct Energy { pub kinetic: f64, pub external: f64, pub hartree: f64, pub x
 /// LOBPCG stopped at its iteration cap at least once (see `InnerStats::eigen` for why that is
 /// not a warning); a Poisson solve that stops at its cap above its tolerance (`poisson_tol`) adds a warning.
 /// `core_overlaps`: the pairs (I, J, R_IJ) whose core radii overlap (spec §5.6; empty without an
-/// ionic setup), each also a warning starting with `ionic::CORE_OVERLAP_WARNING`. `fractional`: the
-/// shared clusters of the final step under `DegenerateShells` (pseudopotential spec §5.7; empty under `Aufbau`,
-/// `FermiDirac` and for integer patterns); `released`: the phase-1 clusters whose converged spread was ≥ τ, as they
-/// were when released (both go with `DegenerateShells` in plan Task 10). Under `FermiDirac` (module doc,
+/// ionic setup), each also a warning starting with `ionic::CORE_OVERLAP_WARNING`. Under `FermiDirac` (module doc,
 /// "Occupations"), of the final step's occupations: `entropy` = S = Σ_σ Σ_i s(f_iσ) (dimensionless, k_B = 1;
 /// `energy.ts` = kT·S); `mu` = μ_σ per spin [↑, ↓] (`None` for an empty channel; a physical number only where the
 /// channel has a partial level, spec §4.1); `partial` = every level with min(f, 1 − f) ≥ `PARTIAL_OCCUPATION_MIN`, in
-/// ascending ε per spin, ↑ first. Under the other schemes S = 0, μ = [None, None] and `partial` is empty.
+/// ascending ε per spin, ↑ first. Under `Aufbau` S = 0, μ = [None, None] and `partial` is empty.
 /// `tol_used`: the Δρ tolerance the converged step was tested against — always `settings.tol` on the CPU (f64 has no
 /// occupation-noise floor); on the GPU max(`settings.tol`, `GPU_PARTIAL_TOL`) when that step's occupations have a
 /// partial level (spec §5.1, `qm_gpu::scf` "Fermi–Dirac occupations"), else `settings.tol`.
 /// Under `FermiDirac` the eigen residuals are split (plan 2026-11-13 Task 9b; `occupations` module doc, "Witness
 /// columns at a guard tolerance"): `max_eigen_residual` is the worst of the **tight** columns (the ones the density
 /// rests on, held to eig_tol), `max_guard_residual` the worst of the loose witness columns (held to
-/// `WITNESS_GUARD_TOL`, f negligible against the stop); 0 under the other schemes, where every column is tight.
+/// `WITNESS_GUARD_TOL`, f negligible against the stop); 0 under `Aufbau`, where every column is tight.
 #[derive(Debug, Clone)]
 pub struct ScfStats {
     pub iterations: usize, pub delta_rho: f64, pub energy: Energy, pub boundary_density: f64,
@@ -706,8 +563,6 @@ pub struct ScfStats {
     pub poisson_residual: f64, pub poisson_iterations: usize,
     pub warnings: Vec<String>,
     pub core_overlaps: Vec<(usize, usize, f64)>,
-    pub fractional: Vec<FractionalShell>,
-    pub released: Vec<FractionalShell>,
     pub entropy: f64,
     pub mu: [Option<f64>; 2],
     pub partial: Vec<PartialLevel>,
@@ -928,33 +783,6 @@ fn solve_channel(grid: &Grid, v_eff: &[f64], nl: Option<&NonlocalOp>, orbitals: 
     })
 }
 
-/// One spin channel under `DegenerateShells` (module doc, "Occupations"). Phase 1 (`frozen` = None): solve, grow
-/// the block by one vector until the gap witness clears τ_c, share a straddling cluster. Phase 2: the frozen
-/// occupations by rank (no growth). Returns the occupations and the shared clusters (f not 0 or 1).
-#[allow(clippy::too_many_arguments)]
-fn solve_shared(grid: &Grid, v_eff: &[f64], nl: Option<&NonlocalOp>, orbitals: &mut Vec<Vec<f64>>, evals: &mut Vec<f64>, n: usize,
-                frozen: Option<&[f64]>, eig_tol: f64, nuclei: &[Nucleus], spin: u8, inner: &mut InnerStats) -> Result<(Vec<f64>, Vec<FractionalShell>), QmError> {
-    if n == 0 { return Ok((vec![0.0; orbitals.len()], Vec::new())); }
-    if let Some(by_rank) = frozen {
-        inner.eigen(solve_channel(grid, v_eff, nl, orbitals, evals, eig_tol));
-        let order = ascending(evals);
-        let mut f = vec![0.0; evals.len()];
-        for (r, &i) in order.iter().enumerate() { f[i] = by_rank[r]; }
-        return Ok((f, shared_runs(evals, &order, by_rank, spin)));
-    }
-    loop {
-        inner.eigen(solve_channel(grid, v_eff, nl, orbitals, evals, eig_tol));
-        if let Some((f, shell)) = degenerate_shell_occupations(evals, n, WITNESS_GAP) {
-            return Ok((f, shell.map(|(first, count, f, spread)| FractionalShell { spin, first, count, f, spread }).into_iter().collect()));
-        }
-        if orbitals.len() >= n + MAX_WITNESS_GROWTH {
-            return Err(QmError::Numerical(format!("no gap witness within {MAX_WITNESS_GROWTH} extra levels of spin {spin} (τ_c = {WITNESS_GAP} Ha)")));
-        }
-        orbitals.extend(initial_orbitals(grid, nuclei, 1, 1000 + 2 * orbitals.len() as u64 + spin as u64));
-        evals.push(*evals.last().expect("n > 0 vectors"));
-    }
-}
-
 /// `solve_channel` with the split stop of `lobpcg_tiers` (the lowest `head` columns to `eig_tol`, the rest to
 /// `guard_tol`); `residuals` receives every column's exit residual.
 #[allow(clippy::too_many_arguments)]
@@ -981,7 +809,7 @@ enum Tiers { Loose { tol: f64 }, #[cfg(test)] AllTight }
 /// - if a column held loose has an upper-bound occupation that needs it tight (`tight_columns`), raise `*tight` over it
 ///   and re-solve (a column changing class; `*tight` keeps the step's need for the next step);
 /// - while the highest level's lower bound θ − r is no witness (`witness_bound_reached`), grow the extra block
-///   (`grown_extras`: it doubles, at most `cap` extra vectors; the grown vectors' seeds are `solve_shared`'s) and
+///   (`grown_extras`: it doubles, at most `cap` extra vectors; a grown vector's seed is 1000 + 2·(its index) + spin) and
 ///   re-solve every level; once it is, trim the overshoot above the lowest witness (`witness_keep`) and return the
 ///   occupations of what is kept.
 /// Errors: the witness still missing at `cap` extra vectors, and `fermi_dirac`'s refusals (a non-finite level). An
@@ -1043,38 +871,6 @@ pub fn ascending(evals: &[f64]) -> Vec<usize> {
     order
 }
 
-/// The maximal runs of equal fractional f (0 < f < 1) in a by-rank pattern, as shells with their spread (`pub` for
-/// `qm-gpu::scf`).
-pub fn shared_runs(evals: &[f64], order: &[usize], by_rank: &[f64], spin: u8) -> Vec<FractionalShell> {
-    let mut out = Vec::new();
-    let mut r = 0;
-    while r < by_rank.len() {
-        let f = by_rank[r];
-        let mut e = r + 1;
-        while e < by_rank.len() && by_rank[e] == f { e += 1; }
-        if f > 0.0 && f < 1.0 {
-            let lv: Vec<f64> = order[r..e].iter().map(|&i| evals[i]).collect();
-            out.push(FractionalShell { spin, first: r, count: e - r, f, spread: lv.iter().cloned().fold(f64::MIN, f64::max) - lv.iter().cloned().fold(f64::MAX, f64::min) });
-        }
-        r = e;
-    }
-    out
-}
-
-/// Phase 2's decision (module doc): the occupations by rank of one spin, with every shared cluster of spread ≥ τ
-/// released (`released_occupations`); the released clusters are appended to `released`. `pub` for `qm-gpu::scf`.
-pub fn decide(evals: &[f64], f: &[f64], shells: &[FractionalShell], tau: f64, released: &mut Vec<FractionalShell>) -> Vec<f64> {
-    let order = ascending(evals);
-    let mut by_rank: Vec<f64> = order.iter().map(|&i| f[i]).collect();
-    for c in shells.iter().filter(|c| c.spread >= tau) {
-        let sorted: Vec<f64> = order[c.first..c.first + c.count].iter().map(|&i| evals[i]).collect();
-        let fr = released_occupations(&sorted, (c.f * c.count as f64).round(), tau);
-        by_rank[c.first..c.first + c.count].copy_from_slice(&fr);
-        released.push(c.clone());
-    }
-    by_rank
-}
-
 /// Runs the SCF loop (module doc). `warm` reuses a previous state's orbitals, densities and
 /// V_H as the starting point when it was converged on the same grid, under the same ionic
 /// physics (module doc, "Ionic species (M7)"), and its orbital counts match `system`; otherwise
@@ -1123,14 +919,14 @@ fn scf_tiered(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option
             let total = (system.n_up + system.n_dn) as f64;
             // broad atomic-like blobs (σ = 1 Bohr) carrying each centre's charge (Z, or Z_v when pseudised)
             // the cold guess (`qm::nuclear::cold_guess`): free atoms for all-electron centres under FermiDirac (plan 2026-11-13
-            // Task 9c (a), review M4), σ = 1 blobs of the centre's charge otherwise (pseudised centres; Aufbau and
-            // DegenerateShells keep their bits)
+            // Task 9c (a), review M4), σ = 1 blobs of the centre's charge otherwise (pseudised centres; Aufbau keeps its
+            // bits)
             let (z_tot, guess) = cold_guess(grid, &system.nuclei, system.ionic.as_deref(), settings.sigma,
                                             matches!(settings.occupations, Occupations::FermiDirac { .. }));
             let scale = if z_tot > 0.0 { total / z_tot } else { 0.0 };
             let fu = if total > 0.0 { system.n_up as f64 / total } else { 0.0 };
             let fd = if total > 0.0 { system.n_dn as f64 / total } else { 0.0 };
-            // one gap witness per occupied spin channel under DegenerateShells (module doc, "Occupations")
+            // one witness per occupied spin channel under FermiDirac (module doc, "Occupations")
             let extra = |n: usize| usize::from(n > 0 && settings.occupations != Occupations::Aufbau);
             let (ku, kd) = (system.n_up + extra(system.n_up), system.n_dn + extra(system.n_dn));
             (initial_orbitals(grid, &system.nuclei, ku, 1), initial_orbitals(grid, &system.nuclei, kd, 2),
@@ -1145,12 +941,8 @@ fn scf_tiered(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option
     let (mut rho_out_up, mut rho_out_dn) = (rho_in_up.clone(), rho_in_dn.clone());
     let mut hist: Vec<DiisEntry> = Vec::new();
     let (mut occ_up, mut occ_dn) = (vec![1.0; orb_up.len()], vec![1.0; orb_dn.len()]);
-    let mut fractional: Vec<FractionalShell> = Vec::new();
     // `FermiDirac` (module doc, "Occupations"): S and μ_σ of the latest step's f, its partial levels (empty otherwise)
     let (mut entropy, mut mu, mut partial): (f64, [Option<f64>; 2], Vec<PartialLevel>) = (0.0, [None, None], Vec::new());
-    // spec §5.7: phase 1 (None) until the first convergence, then the frozen pattern by rank per spin
-    let mut frozen: Option<(Vec<f64>, Vec<f64>)> = None;
-    let mut released: Vec<FractionalShell> = Vec::new();
     let mut watch = StallWatch::for_solve(settings, system);
     let mut stalled = false;
     while iterations < settings.max_iter {
@@ -1172,15 +964,6 @@ fn scf_tiered(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option
                 inner.eigen(solve_channel(grid, &v_dn, terms.nl.as_ref(), &mut orb_dn, &mut ev_dn, settings.eig_tol));
                 rho_out_up = density_from(grid, &orb_up);
                 rho_out_dn = density_from(grid, &orb_dn);
-            }
-            Occupations::DegenerateShells { .. } => {
-                let (fzu, fzd) = match &frozen { Some((u, d)) => (Some(u.as_slice()), Some(d.as_slice())), None => (None, None) };
-                let (fu, su) = solve_shared(grid, &v_up, terms.nl.as_ref(), &mut orb_up, &mut ev_up, system.n_up, fzu, settings.eig_tol, &system.nuclei, 0, &mut inner)?;
-                let (fd, sd) = solve_shared(grid, &v_dn, terms.nl.as_ref(), &mut orb_dn, &mut ev_dn, system.n_dn, fzd, settings.eig_tol, &system.nuclei, 1, &mut inner)?;
-                rho_out_up = weighted_density(grid, &orb_up, &fu);
-                rho_out_dn = weighted_density(grid, &orb_dn, &fd);
-                (occ_up, occ_dn) = (fu, fd);
-                fractional = su.into_iter().chain(sd).collect();
             }
             Occupations::FermiDirac { kt } => {
                 // the step's own levels decide the f (never mixed; spec 2026-11-13 §5 "Unchanged")
@@ -1212,20 +995,7 @@ fn scf_tiered(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option
         let next = after_delta_rho(delta_rho, settings.tol, watch.stalled(since_gain));
         if next == AfterDeltaRho::Abort { break; }
         if next == AfterDeltaRho::Converged {
-            // spec §5.7 phase 2: at the first convergence, release every shared cluster whose spread is ≥ τ, freeze
-            // the pattern and converge again; without a release the phase-1 state is the answer
-            match (settings.occupations, &frozen) {
-                (Occupations::DegenerateShells { tau }, None) if fractional.iter().any(|c| c.spread >= tau) => {
-                    let (su, sd): (Vec<FractionalShell>, Vec<FractionalShell>) = fractional.iter().cloned().partition(|c| c.spin == 0);
-                    let up = decide(&ev_up, &occ_up, &su, tau, &mut released);
-                    let dn = decide(&ev_dn, &occ_dn, &sd, tau, &mut released);
-                    frozen = Some((up, dn));
-                    hist.clear();
-                    delta_rho = f64::INFINITY;
-                    watch.restart(iterations); // a new convergence phase (module doc, "The stall stop")
-                }
-                _ => break,
-            }
+            break;
         } else if next == AfterDeltaRho::Stall {
             // never on a Δρ below tol (`after_delta_rho`); the GPU mirrors it, where a Δρ below tol on a loosened eigen
             // step takes one more step and must never be called stalled (review S1)
@@ -1255,7 +1025,7 @@ fn scf_tiered(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option
     let mut kinetic_e = 0.0;
     match settings.occupations {
         Occupations::Aufbau => for psi in orb_up.iter().chain(orb_dn.iter()) { kinetic(grid, psi, &mut t); kinetic_e += grid.dot(psi, &t); },
-        Occupations::DegenerateShells { .. } | Occupations::FermiDirac { .. } => for (psi, &f) in orb_up.iter().zip(&occ_up).chain(orb_dn.iter().zip(&occ_dn)) {
+        Occupations::FermiDirac { .. } => for (psi, &f) in orb_up.iter().zip(&occ_up).chain(orb_dn.iter().zip(&occ_dn)) {
             if f == 0.0 { continue; }
             kinetic(grid, psi, &mut t);
             kinetic_e += f * grid.dot(psi, &t);
@@ -1270,12 +1040,12 @@ fn scf_tiered(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option
             None => grid.dot(&rho, v_nuc),
             Some(nl) => grid.dot(&rho, v_nuc) + match settings.occupations {
                 Occupations::Aufbau => nl.energy(&orb_up) + nl.energy(&orb_dn),
-                Occupations::DegenerateShells { .. } | Occupations::FermiDirac { .. } => nl.energy_weighted(&orb_up, &occ_up) + nl.energy_weighted(&orb_dn, &occ_dn),
+                Occupations::FermiDirac { .. } => nl.energy_weighted(&orb_up, &occ_up) + nl.energy_weighted(&orb_dn, &occ_dn),
             },
         };
         let hartree = hartree_energy(grid, &rho, &v_h);
         let xc_e = grid.integrate(&xc.energy_density);
-        // E as before (the same left-to-right sum: `Aufbau` and `DegenerateShells` keep their bits, ts = 0.0 there), and
+        // E as before (the same left-to-right sum: `Aufbau` keeps its bits, ts = 0.0 there), and
         // F = E − kT·S of the final step's f (module doc, "Occupations")
         let internal = kinetic_e + external + hartree + xc_e + e_nn;
         let ts = kt_of(settings.occupations) * entropy;
@@ -1294,22 +1064,22 @@ fn scf_tiered(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option
                   ionic: system.ionic.clone(), occ_up, occ_dn, occupations: settings.occupations },
         ScfStats { iterations, delta_rho, energy, boundary_density,
                    max_eigen_residual: inner.eigen_residual, max_guard_residual: inner.guard_residual, poisson_residual: inner.poisson_residual,
-                   poisson_iterations: inner.poisson_iterations, warnings, core_overlaps: overlaps, fractional, released,
+                   poisson_iterations: inner.poisson_iterations, warnings, core_overlaps: overlaps,
                    entropy, mu, partial, tol_used: settings.tol }))
 }
 
-/// kT of a scheme (Ha): the `FermiDirac` temperature, 0 for `Aufbau` and `DegenerateShells` (whose S is 0).
+/// kT of a scheme (Ha): the `FermiDirac` temperature, 0 for `Aufbau` (whose S is 0).
 fn kt_of(occ: Occupations) -> f64 {
-    match occ { Occupations::FermiDirac { kt } => kt, Occupations::Aufbau | Occupations::DegenerateShells { .. } => 0.0 }
+    match occ { Occupations::FermiDirac { kt } => kt, Occupations::Aufbau => 0.0 }
 }
 
 /// Whether a warm state's orbitals fit `system` under `occ`: exactly N_σ per spin under `Aufbau` (today's
-/// test), the same electron count Σf with at least one witness per occupied spin under `DegenerateShells` and
-/// `FermiDirac`. The scheme itself, kT included, is the caller's separate `==` guard.
+/// test), the same electron count Σf with at least one witness per occupied spin under `FermiDirac`. The scheme
+/// itself, kT included, is the caller's separate `==` guard.
 fn counts_match(w: &KsState, system: &System, occ: Occupations) -> bool {
     match occ {
         Occupations::Aufbau => w.orbitals_up.len() == system.n_up && w.orbitals_dn.len() == system.n_dn,
-        Occupations::DegenerateShells { .. } | Occupations::FermiDirac { .. } => {
+        Occupations::FermiDirac { .. } => {
             let fits = |orbs: &[Vec<f64>], f: &[f64], n: usize| orbs.len() == f.len() && (f.iter().sum::<f64>() - n as f64).abs() < 1e-9
                 && (if n == 0 { orbs.is_empty() } else { orbs.len() > n });
             fits(&w.orbitals_up, &w.occ_up, system.n_up) && fits(&w.orbitals_dn, &w.occ_dn, system.n_dn)
@@ -1558,9 +1328,11 @@ mod tests {
     /// Review Focus 3: an ion exactly on a grid point gives finite fields and a converged SCF. Solved at
     /// tol = eig_tol = 1e-9 (plan review S6), because Task 7 extends this test with the force, whose
     /// zero by inversion symmetry holds only to the eigensolver residual.
-    /// The open-shell O triplet is solved with `DegenerateShells` (spec §5.7, the providers' choice under the
-    /// pseudo policies): under integer aufbau it does not converge (Task 6 report: Δρ 5e-4–1e-2 after 46
-    /// steps here). The minority 2p cluster must come out shared (1/3 each) and tight (spread < τ/10).
+    /// The open-shell O triplet is solved under `FermiDirac` at `ELECTRON_KT` (`for_grid`'s default and the providers'
+    /// scheme; plan 2026-11-13 Task 10 converted it from the deleted shared-shell rule): under integer aufbau it does
+    /// not converge (Task 6 report: Δρ 5e-4–1e-2 after 46 steps here). The minority 2p must come out as the
+    /// equal-weight ensemble, f = ⅓ each (it was the shared ⅓ cluster before; the ensemble is the same, so E is
+    /// unchanged and F = E − 3 kT s(⅓), spec §4.3 table).
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
     fn ion_on_a_grid_point_is_finite() {
@@ -1577,14 +1349,17 @@ mod tests {
         let sys = System::with_ionic(nuc, 0, Some(3), setup);
         let mut s = ScfSettings::for_grid(&g);
         (s.tol, s.eig_tol) = (1e-9, 1e-9);
-        s.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
+        assert_eq!(s.occupations, Occupations::FermiDirac { kt: ELECTRON_KT });
         let (st, stats) = scf(&g, &sys, &s, None).expect("converges");
-        eprintln!("pseudo-O triplet on a grid point, h = {h}, {n}³: E {:.8} in {} SCF steps, max eigen residual {:.2e}, shared {:?}, occ ↑ {:?} ↓ {:?}, warnings {:?}",
-                  stats.energy.total, stats.iterations, stats.max_eigen_residual, stats.fractional, st.occ_up, st.occ_dn, stats.warnings);
+        // s(⅓) = −[⅓ ln ⅓ + ⅔ ln ⅔] = 0.636514 (spec §4.3 table)
+        let closed = -3.0 * ELECTRON_KT * ((1.0f64 / 3.0) * (1.0f64 / 3.0).ln() + (2.0f64 / 3.0) * (2.0f64 / 3.0).ln());
+        eprintln!("pseudo-O triplet on a grid point, h = {h}, {n}³: F {:.8} (E {:.8}, TS {:.6e} vs 3 kT s(⅓) {closed:.6e}) in {} SCF steps, max eigen residual {:.2e}, partial {:?}, occ ↑ {:?} ↓ {:?}, warnings {:?}",
+                  stats.energy.total, stats.energy.internal, stats.energy.ts, stats.iterations, stats.max_eigen_residual, stats.partial, st.occ_up, st.occ_dn, stats.warnings);
         assert!(stats.energy.total.is_finite() && sys.n_up == 4 && sys.n_dn == 2);
-        assert_eq!(stats.fractional.len(), 1, "one shared cluster: the minority 2p");
-        let c = &stats.fractional[0];
-        assert!(c.spin == 1 && c.first == 1 && c.count == 3 && (c.f - 1.0 / 3.0).abs() < 1e-15 && c.spread < DEGENERACY_TAU / 10.0, "{c:?}");
+        // the minority 2p: three partial levels of ↓ at ⅓ each (the ensemble the shared-shell rule gave), nothing else partial
+        let dn: Vec<&PartialLevel> = stats.partial.iter().filter(|p| p.spin == 1).collect();
+        assert!(dn.len() == 3 && stats.partial.len() == 3 && dn.iter().all(|p| (p.f - 1.0 / 3.0).abs() < 1e-6), "{:?}", stats.partial);
+        assert!((stats.energy.ts - closed).abs() < 1e-6 * closed, "TS {} vs 3 kT s(⅓) = {closed}", stats.energy.ts);
         // M7 Task 7 (plan review S6): every force integrand is odd about R, so the force vanishes for a parity-pure
         // state; the iterative eigenvectors carry a parity admixture of first order in the eigensolver residual, so
         // |F| ~ residual·|∇V|, bounded by 1e-6 at tol = eig_tol = 1e-9
@@ -1668,54 +1443,6 @@ mod tests {
         }
     }
 
-    /// Spec §5.7's rule on synthetic levels (any order in, the same order out): a three-fold cluster with one
-    /// electron is shared 1/3 each; a full cluster is integer; a degenerate pair across ε_F shares the
-    /// remainder; a cluster that reaches the last vector asks for another vector; n = 0 is empty.
-    #[test]
-    fn degenerate_shell_occupations_on_levels() {
-        let tau = DEGENERACY_TAU;
-        // O-triplet minority: s, then p ×3 within 1e-7, then a witness 0.3 Ha up; listed out of order
-        let (f, c) = degenerate_shell_occupations(&[-0.27, -0.79, 0.07, -0.27 + 1e-7, -0.27 - 5e-8], 2, tau).unwrap();
-        assert_eq!(f[1], 1.0);
-        for i in [0, 3, 4] { assert!((f[i] - 1.0 / 3.0).abs() < 1e-15, "{f:?}"); }
-        assert_eq!(f[2], 0.0);
-        let (first, count, fc, spread) = c.unwrap();
-        assert_eq!((first, count), (1, 3));
-        assert!((fc - 1.0 / 3.0).abs() < 1e-15 && (spread - 1.5e-7).abs() < 1e-15);
-        // a full cluster (Ne p⁶ per spin: 1 + 3 electrons) is aufbau's
-        let (f, c) = degenerate_shell_occupations(&[-1.3, -0.5, -0.5, -0.5, 0.05], 4, tau).unwrap();
-        assert_eq!((f, c), (vec![1.0, 1.0, 1.0, 1.0, 0.0], None));
-        // two of three shared: 2/3 each
-        let (f, _) = degenerate_shell_occupations(&[-0.9, -0.34, -0.34, -0.34, 0.04], 3, tau).unwrap();
-        assert!(f[1..4].iter().all(|x| (x - 2.0 / 3.0).abs() < 1e-15) && f[0] == 1.0 && f[4] == 0.0);
-        // levels farther apart than τ are aufbau's even when close (2τ)
-        let (f, c) = degenerate_shell_occupations(&[-0.5, -0.5 + 2.0 * tau, 0.1], 1, tau).unwrap();
-        assert_eq!((f, c), (vec![1.0, 0.0, 0.0], None));
-        // the witness inside the cluster: ask for another vector
-        assert!(degenerate_shell_occupations(&[-0.79, -0.27, -0.27], 2, tau).is_none());
-        assert!(degenerate_shell_occupations(&[-0.79, -0.27, -0.27 + 0.5 * tau], 2, tau).is_none());
-        assert_eq!(degenerate_shell_occupations(&[], 0, tau), Some((vec![], None)));
-        // phase 1 uses the candidate window τ_c = 0.1: an O-like minority p set split by 5 mHa is still one candidate
-        let (f, c) = degenerate_shell_occupations(&[-0.80, -0.275, -0.27, -0.27, 0.07], 2, WITNESS_GAP).unwrap();
-        assert!(f[1..4].iter().all(|x| (x - 1.0 / 3.0).abs() < 1e-15) && (c.unwrap().3 - 0.005).abs() < 1e-12);
-        // phase 2 releases (spec §5.7): split at neighbour gaps ≥ τ, aufbau over the groups
-        assert_eq!(released_occupations(&[-0.30, -0.30 + 0.2 * tau, -0.30 + 3.0 * tau], 1.0, tau), vec![0.5, 0.5, 0.0]);
-        assert_eq!(released_occupations(&[-0.30, -0.30 + 3.0 * tau, -0.30 + 6.0 * tau], 2.0, tau), vec![1.0, 1.0, 0.0]);
-        assert_eq!(released_occupations(&[-0.30, -0.30 + 3.0 * tau, -0.30 + 6.0 * tau], 1.0, tau), vec![1.0, 0.0, 0.0]);
-        let f = released_occupations(&[-0.30, -0.30 + 0.5 * tau, -0.30 + 0.9 * tau], 1.0, tau);
-        assert!(f.iter().all(|x| (x - 1.0 / 3.0).abs() < 1e-15), "gaps < τ: one group, shared: {f:?}");
-        // decide: a shared cluster of spread ≥ τ is released, one below τ is kept
-        let evals = [-0.80, -0.27, -0.27 + 5.0 * tau, -0.27 + 5.0 * tau, 0.07];
-        let shell = FractionalShell { spin: 1, first: 1, count: 3, f: 1.0 / 3.0, spread: 5.0 * tau };
-        let mut rel = Vec::new();
-        let by_rank = decide(&evals, &[1.0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 0.0], &[shell.clone()], tau, &mut rel);
-        assert_eq!((by_rank, rel), (vec![1.0, 1.0, 0.0, 0.0, 0.0], vec![shell]));
-        let kept = FractionalShell { spin: 1, first: 1, count: 3, f: 1.0 / 3.0, spread: 0.05 * tau };
-        let mut rel = Vec::new();
-        let by_rank = decide(&[-0.80, -0.27, -0.27, -0.27, 0.07], &[1.0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 0.0], &[kept], tau, &mut rel);
-        assert!(rel.is_empty() && (by_rank[1] - 1.0 / 3.0).abs() < 1e-15);
-    }
-
     /// One-shot `Aufbau` (module doc, "Occupations", one-shot paragraph): 1 on the n lowest by rank, in the order of
     /// `evals`; n = 0 is all zeros under either rule.
     #[test]
@@ -1724,58 +1451,11 @@ mod tests {
         let o = one_shot_occupations(&evals, 2, 0, Occupations::Aufbau).expect("one shot");
         assert_eq!(o.f, vec![0.0, 0.0, 1.0, 1.0]);
         assert_eq!(o.f.iter().sum::<f64>(), 2.0);
-        assert!(o.shared.is_none() && !o.released && !o.window_short, "{o:?}");
-        for rule in [Occupations::Aufbau, Occupations::DegenerateShells { tau: DEGENERACY_TAU }, Occupations::FermiDirac { kt: ELECTRON_KT }] {
+        assert!(!o.window_short, "{o:?}");
+        for rule in [Occupations::Aufbau, Occupations::FermiDirac { kt: ELECTRON_KT }] {
             let o = one_shot_occupations(&evals, 0, 1, rule).expect("one shot");
-            assert_eq!((o.f, o.shared, o.released, o.window_short), (vec![0.0; 4], None, false, false));
+            assert_eq!((o.f, o.window_short), (vec![0.0; 4], false));
         }
-    }
-
-    /// One-shot `DegenerateShells`: a p set split by 6e-5 < τ across ε_F (two of three electrons) is shared 2/3 each
-    /// and kept (spread < τ).
-    #[test]
-    fn one_shot_shares_a_degenerate_p_shell() {
-        let o = one_shot_occupations(&[-1.0, -0.40000, -0.40004, -0.39998, 0.2], 3, 1, Occupations::DegenerateShells { tau: DEGENERACY_TAU }).expect("one shot");
-        assert_eq!(o.f[0], 1.0);
-        for i in 1..4 { assert!((o.f[i] - 2.0 / 3.0).abs() < 1e-15, "{o:?}"); }
-        assert_eq!(o.f[4], 0.0);
-        assert!((o.f.iter().sum::<f64>() - 3.0).abs() < 1e-12);
-        let c = o.shared.as_ref().expect("a shared shell");
-        assert!(c.spin == 1 && c.first == 1 && c.count == 3 && (c.f - 2.0 / 3.0).abs() < 1e-15 && (c.spread - 6e-5).abs() < 1e-12, "{c:?}");
-        assert!(!o.released && !o.window_short, "{o:?}");
-    }
-
-    /// One-shot `DegenerateShells`: the candidate cluster (−0.402, −0.400, −0.395; one electron) has spread 7e-3 ≥ τ,
-    /// so phase 2 releases it once — f is `released_occupations` of the cluster.
-    #[test]
-    fn one_shot_releases_a_split_cluster() {
-        let evals = [-1.0, -0.402, -0.400, -0.395, 0.2];
-        let o = one_shot_occupations(&evals, 2, 0, Occupations::DegenerateShells { tau: DEGENERACY_TAU }).expect("one shot");
-        assert!(o.released && !o.window_short, "{o:?}");
-        assert_eq!(o.f[0], 1.0);
-        assert_eq!(o.f[1..4].to_vec(), released_occupations(&evals[1..4], 1.0, DEGENERACY_TAU));
-        assert_eq!(o.f[4], 0.0);
-        assert!((o.f.iter().sum::<f64>() - 2.0).abs() < 1e-12);
-        assert!(o.shared.is_none(), "the release leaves every level integer: {o:?}");
-    }
-
-    /// One-shot `DegenerateShells` with the top computed level within τ_c of ε_F (no gap witness): the cluster is every
-    /// computed level within τ_c, `window_short` is set, and — its spread 0.05 being ≥ τ (ruling R1 of the Phase A
-    /// plan: the brief's "share the remaining electron" holds for phase 1 only) — phase 2 releases it.
-    #[test]
-    fn one_shot_marks_a_short_window() {
-        let evals = [-1.0, -0.40, -0.39, -0.35];
-        let o = one_shot_occupations(&evals, 2, 0, Occupations::DegenerateShells { tau: DEGENERACY_TAU }).expect("one shot");
-        assert!(o.window_short && o.released, "{o:?}");
-        assert_eq!(o.f[0], 1.0);
-        assert_eq!(o.f[1..4].to_vec(), released_occupations(&evals[1..4], 1.0, DEGENERACY_TAU));
-        assert!((o.f.iter().sum::<f64>() - 2.0).abs() < 1e-12);
-        // a short window whose cluster is tight (spread < τ) stays shared: the remaining electron over all three
-        let o = one_shot_occupations(&[-1.0, -0.40, -0.4002, -0.3996], 2, 0, Occupations::DegenerateShells { tau: DEGENERACY_TAU }).expect("one shot");
-        assert!(o.window_short && !o.released, "{o:?}");
-        for i in 1..4 { assert!((o.f[i] - 1.0 / 3.0).abs() < 1e-15, "{o:?}"); }
-        let c = o.shared.expect("a shared shell");
-        assert!(c.first == 1 && c.count == 3, "{c:?}");
     }
 
     /// One-shot `FermiDirac` (the scf-stall ← main merge ruling): the f are `fermi_dirac`'s at the same kT, in the order
@@ -1788,7 +1468,7 @@ mod tests {
         let evals = [-0.1, 0.4, -0.6, -0.2];
         let o = one_shot_occupations(&evals, 2, 0, fd).expect("one shot");
         assert_eq!(o.f, fermi_dirac(&evals, 2, ELECTRON_KT).unwrap().f);
-        assert!(o.shared.is_none() && !o.released && !o.window_short, "{o:?}");
+        assert!(!o.window_short, "{o:?}");
         assert!((o.f[2] - 1.0).abs() < 1e-12 && (o.f[3] - 1.0).abs() < 1e-4 && o.f[0] < 1e-4 && o.f[1] < 1e-16, "{o:?}");
         let p = [-1.0, -0.40, -0.40, -0.40, 0.2];
         let o = one_shot_occupations(&p, 2, 1, fd).expect("one shot");
@@ -1798,43 +1478,6 @@ mod tests {
         let o = one_shot_occupations(&[-1.0, -0.40, -0.35], 2, 0, fd).expect("one shot");
         assert!(o.window_short, "{o:?}");
         assert!(one_shot_occupations(&[-1.0, -0.4], 2, 0, fd).is_err(), "fewer than n + 1 levels");
-    }
-
-    /// Spec §5.7: the rule is inert on closed shells. H₂ and LiH (as in `none_policy_is_bitwise_today`) under
-    /// `DegenerateShells` get integer occupations (zero-weight witnesses above τ_c) and the `Aufbau` energy
-    /// to 1e-9 Ha: the two runs converge the same discrete problem to Δρ < 1e-6 along different LOBPCG
-    /// paths, and E is second order in that residual. A warm state converged under the other scheme is
-    /// ignored (the same bits as a cold solve).
-    #[test]
-    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
-    fn closed_shells_are_aufbau_under_the_rule() {
-        let g = Grid::cube(33, 0.25);
-        // `Aufbau` explicitly: `for_grid` defaults to FermiDirac since plan Task 7 (this test is DS against aufbau)
-        let aufbau = ScfSettings { occupations: Occupations::Aufbau, ..ScfSettings::for_grid(&g) };
-        let mut shared = ScfSettings::for_grid(&g);
-        shared.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
-        for nuc in [vec![Nucleus { pos: [0.7, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }],
-                    vec![Nucleus { pos: [-0.8, 0.1, 0.0], z: 3 }, Nucleus { pos: [2.2, 0.0, 0.0], z: 1 }]] {
-            let sys = System::new(nuc, 0, None);
-            let (sa, a) = scf(&g, &sys, &aufbau, None).unwrap();
-            let (st, b) = scf(&g, &sys, &shared, None).unwrap();
-            eprintln!("closed shell under the rule: E {:.12} vs aufbau {:.12} (Δ {:+.1e}), {} vs {} steps, occ ↑ {:?} ↓ {:?}",
-                      b.energy.total, a.energy.total, b.energy.total - a.energy.total, b.iterations, a.iterations, st.occ_up, st.occ_dn);
-            assert!(b.fractional.is_empty());
-            for (occ, n) in [(&st.occ_up, sys.n_up), (&st.occ_dn, sys.n_dn)] {
-                assert!(occ.len() > n, "at least one witness: {occ:?}");
-                assert!(occ[..n].iter().all(|&f| f == 1.0) && occ[n..].iter().all(|&f| f == 0.0), "{occ:?}");
-            }
-            assert!(b.released.is_empty(), "{:?}", b.released);
-            assert!((b.energy.total - a.energy.total).abs() < 1e-9);
-            assert_eq!((sa.occ_up.len(), sa.occupations), (sys.n_up, Occupations::Aufbau));
-            // the scheme guard, both ways
-            let cold_b = b.energy.total;
-            let (_, from_a) = scf(&g, &sys, &shared, Some(&sa)).unwrap();
-            assert_eq!(from_a.energy.total.to_bits(), cold_b.to_bits());
-            let (_, from_b) = scf(&g, &sys, &aufbau, Some(&st)).unwrap();
-            assert_eq!(from_b.energy.total.to_bits(), a.energy.total.to_bits());
-        }
     }
 
     /// N = Σ q_I − charge (spec §5.2): Z_v for pseudised species, Z for all-electron ones; `System::new` is
@@ -2036,12 +1679,11 @@ mod tests {
         // a level exactly at the best still stalls (≥)
         let mut s = StallWatch::new(w, 2e-4);
         assert_eq!((1..=400).find(|&i| { let k = s.observe(i, seq(i)); s.stalled(k) }), Some(3 + w));
-        // a restart opens a fresh window; W = 0 never stalls
+        // a non-finite Δρ is no gain, the first finite one anchors; W = 0 never stalls (the restart of the deleted
+        // shared-shell release went with it, plan 2026-11-13 Task 10)
         let mut s = StallWatch::new(5, 0.0);
-        for i in 1..=4 { s.observe(i, 1e-3); }
-        s.restart(4);
-        assert_eq!(s.observe(5, f64::INFINITY), 1, "∞ (the release's reset Δρ) is no gain");
-        assert_eq!(s.observe(6, 0.4), 0, "the first finite Δρ after a restart anchors");
+        assert_eq!(s.observe(1, f64::INFINITY), 1, "∞ is no gain");
+        assert_eq!(s.observe(2, 0.4), 0, "the first finite Δρ anchors");
         let off = StallWatch::new(0, 0.0);
         assert!(!off.stalled(10_000));
         // the error carries what the message needs
@@ -2126,10 +1768,11 @@ mod tests {
         assert!((last.energy - a.energy.total).abs() < 1e-5, "Harris–Foulkes {} vs E {}", last.energy, a.energy.total);
     }
 
-    /// Review S3. The bitwise and Harris–Foulkes claims on the pseudo path — pseudo-O M = 3 (`CoresOnly`,
-    /// `DegenerateShells`: NLCC, E_NL, the shared minority p with f = 1/3 in the band sum), 33³, h = σ = 0.25: the
-    /// stall stop off, at its default W, and observed give the same bits, and the last Harris–Foulkes energy lands on
-    /// the reported one.
+    /// Review S3. The bitwise and Harris–Foulkes claims on the pseudo path — pseudo-O M = 3 (`CoresOnly`, `FermiDirac`
+    /// at `ELECTRON_KT`, `for_grid`'s default: NLCC, E_NL, the minority p ensemble with f = ⅓ in the band sum and −kT·S
+    /// in F_HF; plan 2026-11-13 Task 10 converted it from the deleted shared-shell rule), 33³, h = σ = 0.25: the stall
+    /// stop off, at its default W, and observed give the same bits, and the last Harris–Foulkes F lands on the reported
+    /// F (unchanged bound: both sides carry the same −TS).
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
     fn the_stall_stop_and_the_observer_leave_a_pseudo_solve_bitwise() {
@@ -2139,8 +1782,8 @@ mod tests {
         let g = Grid::cube(33, h);
         let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([(8, Ionic::Pseudo(filtered_at(8, h)))])));
         let sys = System::with_ionic(vec![Nucleus { pos: [0.07, -0.03, 0.02], z: 8 }], 0, Some(3), setup);
-        let mut on = ScfSettings::for_grid(&g);
-        on.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
+        let on = ScfSettings::for_grid(&g);
+        assert_eq!(on.occupations, Occupations::FermiDirac { kt: ELECTRON_KT });
         let off = ScfSettings { stall_window: 0, ..on };
         let (_, a) = scf(&g, &sys, &on, None).unwrap();
         let (_, b) = scf(&g, &sys, &off, None).unwrap();
@@ -2153,10 +1796,10 @@ mod tests {
         }
         assert_eq!(seen.len(), a.iterations);
         let last = seen.last().unwrap();
-        println!("pseudo-O M=3 33³ (CPU): {} iterations, E {:+.10}, E_HF(last) {:+.10} (Δ {:.2e}); shared {:?}; released {:?}; longest no-gain run {}",
-                 a.iterations, a.energy.total, last.energy, last.energy - a.energy.total, a.fractional, a.released, seen.iter().map(|p| p.since_gain).max().unwrap_or(0));
-        assert!(!a.fractional.is_empty(), "the minority p is shared: the fractional band sum is exercised");
-        assert!((last.energy - a.energy.total).abs() < 1e-5, "Harris–Foulkes {} vs E {}", last.energy, a.energy.total);
+        println!("pseudo-O M=3 33³ (CPU): {} iterations, F {:+.10}, F_HF(last) {:+.10} (Δ {:.2e}), TS {:.6e}; partial {:?}; longest no-gain run {}",
+                 a.iterations, a.energy.total, last.energy, last.energy - a.energy.total, a.energy.ts, a.partial, seen.iter().map(|p| p.since_gain).max().unwrap_or(0));
+        assert!(!a.partial.is_empty(), "the minority p is partly occupied: the fractional band sum is exercised");
+        assert!((last.energy - a.energy.total).abs() < 1e-5, "Harris–Foulkes {} vs F {}", last.energy, a.energy.total);
     }
 
     // ---- Fermi–Dirac occupations (spec 2026-11-13 §4–5; plan Task 5). All-electron, σ = h (ruling R3). ----
@@ -2205,8 +1848,14 @@ mod tests {
 
     /// [SHOULD-6] The H₄ square (a = 1.8, axes-aligned and centred: the x ↔ y swap is exact on the grid, so the e pair is
     /// degenerate to the eigensolver): each spin holds 1 electron in the pair, f = ½ each, so TS = 4 kT ln 2 exactly
-    /// (spec §4.3 table), and E is the equal-share ensemble's, i.e. `DegenerateShells`' (spec §4.7(b)). The last
-    /// iteration's Harris–Foulkes energy is F_HF and lands on F (it would miss by TS = 1.4e-2 without −kT·S).
+    /// (spec §4.3 table), and E is the equal-share ensemble's, i.e. the deleted shared-shell rule's (spec §4.7(b)). The
+    /// last iteration's Harris–Foulkes energy is F_HF and lands on F (it would miss by TS = 1.4e-2 without −kT·S).
+    ///
+    /// `E_DS` is a literal since plan 2026-11-13 Task 10 (the shared-shell scheme it was solved under is deleted): the
+    /// same solve (41³ × 0.30, tol = eig_tol = 1e-9) under the shared-shell rule (τ = 1e-3) on the last tree that had it
+    /// (1d816c4, 14 steps, the e pair shared ½–½ in each spin with spread ≤ 1.4e-16): −1.621874087546 Ha. (Task 5
+    /// printed −1.621874088905, 1.36e-9 lower, before Task 6 tied the Poisson tolerance to tol — 1e-12 at tol 1e-9,
+    /// `poisson_tol`; both are inside the 1e-8 bound. The FD solve on 1d816c4 gave E − E_DS = −5.3e-12.)
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
     fn fd_h4_square_closed_form() {
@@ -2217,12 +1866,9 @@ mod tests {
         (s.tol, s.eig_tol, s.occupations) = (1e-9, 1e-9, fd(ELECTRON_KT));
         let mut seen = Vec::new();
         let (st, f) = scf_observed(&g, &sys, &s, None, Some(&mut |p: &ScfProgress| seen.push(*p))).unwrap();
-        let ds = ScfSettings { occupations: Occupations::DegenerateShells { tau: DEGENERACY_TAU }, ..s };
-        let (_, d) = scf(&g, &sys, &ds, None).unwrap();
-        let e_ds = d.energy.total;
+        let e_ds = -1.621874087546; // the shared-shell rule's E on 1d816c4 (doc above)
         let closed = 4.0 * ELECTRON_KT * std::f64::consts::LN_2;
         let last = seen.last().unwrap();
-        eprintln!("H₄ square 41³ × 0.30: E_DS = {e_ds:.12} (Task 10's literal; {} steps, shared {:?})", d.iterations, d.fractional);
         eprintln!("  FD: F {:.12}, E {:.12} (E − E_DS {:+.2e}), TS {:.12e} (− 4kT ln 2 {:+.2e}), μ {:?}, partial {:?}, {} steps, \
                    F_HF(last) − F {:+.2e}, stored ↑ {} ↓ {}",
                   f.energy.total, f.energy.internal, f.energy.internal - e_ds, f.energy.ts, f.energy.ts - closed, f.mu, f.partial,
@@ -2233,7 +1879,6 @@ mod tests {
         assert_eq!(f.partial.len(), 4, "the e pair in each spin: {:?}", f.partial);
         assert!(f.partial.iter().all(|p| (p.f - 0.5).abs() < 1e-6), "{:?}", f.partial);
         assert!(f.mu[0].is_some() && f.mu[1].is_some());
-        assert!(f.fractional.is_empty() && f.released.is_empty(), "no DegenerateShells bookkeeping under FD");
         assert!((last.energy - f.energy.total).abs() < 1e-6, "F_HF {} vs F {}", last.energy, f.energy.total);
     }
 
@@ -2472,10 +2117,10 @@ mod tests {
     }
 
     /// Review Focus 1 / spec §5 "Warm start": `KsState.occupations` carries kT and the guard compares it with `==`, so a
-    /// state converged at another kT, under `DegenerateShells` or under `Aufbau`, never seeds an FD solve — the result is
-    /// the cold solve's bits. The other-kT and `DegenerateShells` states fit FD's counts (N_σ in Σf, a witness above), so
-    /// they reach the `==` guard itself (Task 5 review); the `Aufbau` one (exactly N_σ orbitals) is refused by
-    /// `counts_match` first.
+    /// state converged at another kT or under `Aufbau` never seeds an FD solve — the result is the cold solve's bits. The
+    /// other-kT state fits FD's counts (N_σ in Σf, a witness above), so it reaches the `==` guard itself (Task 5 review);
+    /// the `Aufbau` one (exactly N_σ orbitals) is refused by `counts_match` first. (The shared-shell leg went with that
+    /// scheme in plan 2026-11-13 Task 10.)
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
     fn fd_warm_state_from_other_scheme_is_cold() {
@@ -2485,12 +2130,10 @@ mod tests {
         let target = ScfSettings { occupations: fd(ELECTRON_KT), ..base };
         let (_, cold) = scf(&g, &sys, &target, None).unwrap();
         let (other_kt, _) = scf(&g, &sys, &ScfSettings { occupations: fd(2e-3), ..base }, None).unwrap();
-        let (shells, _) = scf(&g, &sys, &ScfSettings { occupations: Occupations::DegenerateShells { tau: DEGENERACY_TAU }, ..base }, None).unwrap();
         let (aufbau, _) = scf(&g, &sys, &ScfSettings { occupations: Occupations::Aufbau, ..base }, None).unwrap();
-        assert!(counts_match(&other_kt, &sys, target.occupations) && counts_match(&shells, &sys, target.occupations),
-                "the other-kT and DegenerateShells legs must reach the == guard");
+        assert!(counts_match(&other_kt, &sys, target.occupations), "the other-kT leg must reach the == guard");
         assert!(!counts_match(&aufbau, &sys, target.occupations), "the Aufbau leg is refused by counts_match");
-        for (name, w) in [("FD kT 2e-3", &other_kt), ("DegenerateShells", &shells), ("Aufbau", &aufbau)] {
+        for (name, w) in [("FD kT 2e-3", &other_kt), ("Aufbau", &aufbau)] {
             let (_, warm) = scf(&g, &sys, &target, Some(w)).unwrap();
             assert_eq!(warm.energy.total.to_bits(), cold.energy.total.to_bits(), "{name}");
             assert_eq!(warm.energy.ts.to_bits(), cold.energy.ts.to_bits(), "{name}");

@@ -173,16 +173,14 @@
 //!   E_NL = Σ f E_KB c² (one more readback, f64 finish), E_nn is `ionic_repulsion`, the core overlaps and the LSDA-domain
 //!   count (max(−n_σ) in the energy readback; the points counted on the CPU only when there are any) are warnings as on
 //!   the CPU. The `GpuIonic` is kept by the solver and updated per geometry (no allocation per step or per MD step).
-//! - `Occupations::DegenerateShells`: the CPU's two-phase rule step for step, with its helpers
-//!   (`qm::scf::{degenerate_shell_occupations, decide, ascending, shared_runs}`, τ_c, the growth cap and the seeds of the
-//!   grown witnesses): one witness per occupied spin on a cold start, growth until the gap witness clears τ_c (the LOBPCG
-//!   work space grows with it), the weighted density (`mul_add_sq_w`), the weighted kinetic energy and E_NL (f = 0
-//!   skipped), and at the first convergence the release/freeze and a DIIS restart. `GpuState` records the setup, the
-//!   occupations and the scheme; the warm guard requires the same grid, counts, scheme and ionic physics.
-//! - Measured (references.md "GPU vs CPU: pseudopotentials (M7 Task 8)"): |ΔE| ≤ 6.1e-7 Ha and |Δε| ≤ 3.1e-6 Ha against
-//!   the CPU on pseudo-O (CoresOnly triplet, shared), CH₄ (CoresOnly) and H₂O (All). A degenerate shared p cluster
-//!   floors ~2× above LOBPCG's model floor (`eigen` "The f32 residual floor": the cluster is rotated every call), so the
-//!   orbitals freeze late and the pseudo-O 61³ solve takes 24 steps against the CPU's 13 (3.2 s).
+//! - The occupation schemes are `Aufbau` and `FermiDirac` ("Fermi–Dirac occupations" below). `GpuState` records the
+//!   setup, the occupations and the scheme; the warm guard requires the same grid, counts, scheme and ionic physics.
+//!   (The shared-shell scheme of pseudopotential spec §5.7 — the CPU's two-phase rule step for step, with its release,
+//!   pattern frozen by rank and DIIS/stall-watch restart — was deleted in plan 2026-11-13 Task 10.)
+//! - Measured under the shared-shell rule (references.md "GPU vs CPU: pseudopotentials (M7 Task 8)"): |ΔE| ≤ 6.1e-7 Ha
+//!   and |Δε| ≤ 3.1e-6 Ha against the CPU on pseudo-O (CoresOnly triplet, shared), CH₄ (CoresOnly) and H₂O (All); the
+//!   Fermi–Dirac re-measure is `pseudo_o_triplet_matches_cpu` and `validate`'s gpu_vs_cpu. A degenerate partly filled p
+//!   set floors ~2× above LOBPCG's model floor (`eigen` "The f32 residual floor": the set is rotated every call).
 //!
 //! # Fermi–Dirac occupations (spec 2026-11-13 §4–5, §5.1; plan Task 7)
 //! `Occupations::FermiDirac { kt }` (the default of `ScfSettings::for_grid`, kT = `qm::ELECTRON_KT`) is `qm::scf`'s rule
@@ -238,8 +236,7 @@
 //!   stretched-H₂ gate's 65³ R 6 / 107³ R 5.75, ≤ 30; with the review-I1 buffer rule): none 10 > 9 (11 / 18); a full
 //!   restart at every freeze 6 (55 before I1); keep only the newest entry at every freeze 6 ≤ 10, but 11 / 39 — it
 //!   lets the density converge onto the stale frozen output of a high-response pair and the unfreeze jumps Δρ 10–100×;
-//!   the stall rule 7 ≤ 9, 11 / 18 (it never fires there). `Aufbau` and `DegenerateShells` keep their history (their
-//!   bits are pinned).
+//!   the stall rule 7 ≤ 9, 11 / 18 (it never fires there). `Aufbau` keeps its history (its bits are pinned).
 //! - **The guess band only in the convergence phase** (FD channels; plan 2026-11-13 Task 9b). With the witness out of the
 //!   decision, FD solves would freeze as often as `Aufbau` ones do — and before 9b they practically never froze early,
 //!   because the diffuse witness held the block-wide residual above the band. A tight head that hovers at the band edge
@@ -250,7 +247,7 @@
 //!   when the previous step's Δρ was already below its stop (the convergence phase the M3 freeze was designed for: "the
 //!   mixing alone finishes the convergence"); before that a guess is kept only when it is already within the step's tol.
 //!   Measured: Li 93 steps / 5 resets, the MD path 6.67 / 8.00, H₃⁺ 13 steps / 0 resets (`Aufbau`: 13). This tightens
-//!   when orbitals may freeze; no tolerance moves. `Aufbau` and `DegenerateShells` keep the band on every step.
+//!   when orbitals may freeze; no tolerance moves. `Aufbau` keeps the band on every step.
 //!   **In effect there is no hysteresis band under FD** (review M3): a tight step whose Δρ is below its stop ends the
 //!   solve, so "the previous step's Δρ was below its stop" holds only on the one confirmation step after a loosened
 //!   step dipped below tol. FD channels accept a warm guess only within the step's own tol; the band's purpose (no
@@ -268,7 +265,7 @@
 //!   before the rule. It is evaluated on the occupations of the step being tested (a cold solve stays
 //!   bit-reproducible); the "a Δρ below tol buys a tight eigen step" rule reads the previous step's tested tolerance;
 //!   the stall watch and the cap are unchanged. `ScfStats::tol_used` is the tolerance the converged step was tested
-//!   against (`settings.tol` under `Aufbau`, `DegenerateShells` and on a gapped FD step). What stopping at 1e-5
+//!   against (`settings.tol` under `Aufbau` and on a gapped FD step). What stopping at 1e-5
 //!   costs (V0, measured): |ΔF| ≤ 1.7 µHa and ≤ 3.2e-6 Ha/Bohr per force component on the pseudo surface, ≤ 2.9 µHa
 //!   and 2.1e-6 Ha/Bohr on all-electron O — F is second order in the residual, the forces first order.
 //!
@@ -326,7 +323,7 @@ use gpu::{GpuContext, Volume3D};
 use nalgebra::{DMatrix, DVector};
 use qm::ionic::{core_overlaps, IonicSetup, CORE_OVERLAP_WARNING};
 use qm::nuclear::{cold_guess, ionic_repulsion, nuclear_repulsion};
-use qm::scf::{ascending, decide, degenerate_shell_occupations, initial_orbitals, shared_runs, FractionalShell, MAX_WITNESS_GROWTH};
+use qm::scf::{ascending, initial_orbitals, MAX_WITNESS_GROWTH};
 use qm::{fermi_dirac, grown_extras, partial_levels, step_tail_kt, tight_columns, tight_start, witness_bound_reached_tail, witness_keep_tail, FdOccupations, PartialLevel, WITNESS_GAP,
          WITNESS_GUARD_TOL, WITNESS_TAIL_KT};
 use qm::{Energy, Occupations, QmError, ScfProgress, ScfSettings, ScfStats, StallWatch, System};
@@ -396,7 +393,7 @@ const DIIS_REG: f64 = 1e-12;
 ///
 /// M7 Task 8a (`qm::KsState`'s fields of the same names): `ionic` the setup the state was converged under (`None`:
 /// all-electron; `v_nuc` is then today's V_nuc, else the local ionic potential V_loc), `occ_up`/`occ_dn` one occupation
-/// per stored orbital (all 1 under `Aufbau`; under `DegenerateShells` the orbitals include the gap witnesses, f = 0) and
+/// per stored orbital (all 1 under `Aufbau`; under `FermiDirac` the final step's f, the witnesses included) and
 /// `occupations` the scheme. A warm start requires the same scheme and the same ionic physics (`qm::scf`'s guard).
 pub struct GpuState {
     pub grid: qm::Grid, pub sigma: f64,
@@ -572,8 +569,8 @@ impl Diis {
 
     fn clear(&mut self, pool: &mut Pool) { while !self.entries.is_empty() { self.drop_oldest(pool); } }
 
-    /// The history restart after the map ρ_in ↦ ρ_out changed (module doc: a frozen orbital set re-solved, or the
-    /// `DegenerateShells` release): every old entry's residual was measured on the old map, so all are dropped, and
+    /// The history restart after the map ρ_in ↦ ρ_out changed (module doc: a frozen orbital set re-solved, or a witness
+    /// window that widened and grew the block): every old entry's residual was measured on the old map, so all are dropped, and
     /// `e` — measured on the new map — is pushed alone, its Gram row `row` (computed against the old entries, ending
     /// with ⟨r_e, r_e⟩) reduced to that self-dot. The next `mix` is then plain α-mixing of `e`'s residual: no weight on
     /// any old-map entry (spec 2026-11-13 §5; `diis_reset_mixes_only_new_map_residuals`).
@@ -793,12 +790,12 @@ pub(crate) fn accumulate_density(b: &mut Batch, k: &Kernels, g: &GpuGrid, rho: &
 }
 
 /// `qm::scf::counts_match` on a GPU state: exactly N_σ orbitals per spin under `Aufbau` (today's test); under
-/// `DegenerateShells` and `FermiDirac` the same electron count Σf with at least one witness per occupied spin (the scheme
+/// `FermiDirac` the same electron count Σf with at least one witness per occupied spin (the scheme
 /// itself, kT included, is the caller's separate `==` guard).
 fn counts_match(s: &GpuState, n_up: usize, n_dn: usize, occ: Occupations) -> bool {
     match occ {
         Occupations::Aufbau => s.orbitals_up.len() == n_up && s.orbitals_dn.len() == n_dn,
-        Occupations::DegenerateShells { .. } | Occupations::FermiDirac { .. } => {
+        Occupations::FermiDirac { .. } => {
             let fits = |len: usize, f: &[f64], n: usize| len == f.len() && (f.iter().sum::<f64>() - n as f64).abs() < 1e-9
                 && (if n == 0 { len == 0 } else { len > n });
             fits(s.orbitals_up.len(), &s.occ_up, n_up) && fits(s.orbitals_dn.len(), &s.occ_dn, n_dn)
@@ -811,8 +808,7 @@ fn same_ionic(a: Option<&IonicSetup>, b: Option<&IonicSetup>) -> bool {
     match (a, b) { (None, None) => true, (Some(x), Some(y)) => x.same_physics(y), _ => false }
 }
 
-/// One spin channel's eigenproblem under `DegenerateShells` (`qm::scf::solve_shared`) or `FermiDirac`
-/// (`qm::scf::solve_fd`).
+/// One spin channel's eigenproblem under `FermiDirac` (`qm::scf::solve_fd`).
 struct Channel<'a> {
     ctx: &'a GpuContext, k: &'a Kernels, g: &'a GpuGrid, r: &'a Reducer, grid: &'a qm::Grid, nuclei: &'a [qm::Nucleus],
     h: GpuHamiltonian<'a>, n: usize, spin: u8, step_tol: f64,
@@ -827,54 +823,8 @@ struct Channel<'a> {
 }
 
 impl Channel<'_> {
-    /// One LOBPCG call on all of `orbs` (the work space grown to their count first). A latched readback failure
-    /// (`grid::take_readback_fault`) is `QmError::Device`, winning over whatever the zeros it returned caused —
-    /// before the occupations rule reads the eigenvalues.
-    fn solve(&self, orbs: &mut [Field], evals: &mut [f64], work: &mut Option<LobpcgWork>, work_k: &mut usize, inner: &mut Inner) -> Result<(), QmError> {
-        if work.is_none() || *work_k < orbs.len() {
-            *work = None; // the old work is released before the grown one is allocated (task 9d review m6)
-            *work = Some(LobpcgWork::new(self.ctx, self.g, orbs.len()));
-            *work_k = orbs.len();
-        }
-        let t = Instant::now();
-        let es = lobpcg_with_guess_tol(self.ctx, self.k, self.g, self.r, &self.h, orbs, evals, work.as_mut().expect("work sized above"),
-                                       self.step_tol, EIG_GUESS_FACTOR * self.step_tol, EIGEN_MAX_ITER, None)
-            .map_err(|e| take_device_error().unwrap_or(e))?;
-        if let Some(e) = take_device_error() { return Err(e); }
-        inner.eigen(es, t.elapsed());
-        if es.restores_exhausted { return Err(lost_level(&es)); }
-        Ok(())
-    }
-
-    /// Phase 1 (`by_rank` None): solve, grow the block by one vector until the gap witness clears τ_c, share a
-    /// straddling cluster. Phase 2: the frozen occupations by rank. Returns the occupations and the shared clusters.
-    /// The CPU's rule step for step (`qm::scf::solve_shared`; the same seeds for the grown vectors).
-    #[allow(clippy::too_many_arguments)]
-    fn solve_shared(&self, orbs: &mut Vec<Field>, evals: &mut Vec<f64>, by_rank: Option<&[f64]>, work: &mut Option<LobpcgWork>, work_k: &mut usize,
-                    pool: &mut Pool, inner: &mut Inner) -> Result<(Vec<f64>, Vec<FractionalShell>), QmError> {
-        if self.n == 0 { return Ok((vec![0.0; orbs.len()], Vec::new())); }
-        if let Some(by_rank) = by_rank {
-            self.solve(orbs, evals, work, work_k, inner)?;
-            let order = ascending(evals);
-            let mut f = vec![0.0; evals.len()];
-            for (r, &i) in order.iter().enumerate() { f[i] = by_rank[r]; }
-            return Ok((f, shared_runs(evals, &order, by_rank, self.spin)));
-        }
-        loop {
-            self.solve(orbs, evals, work, work_k, inner)?;
-            if let Some((f, shell)) = degenerate_shell_occupations(evals, self.n, WITNESS_GAP) {
-                let spin = self.spin;
-                return Ok((f, shell.map(|(first, count, f, spread)| FractionalShell { spin, first, count, f, spread }).into_iter().collect()));
-            }
-            if orbs.len() >= self.n + MAX_WITNESS_GROWTH {
-                return Err(QmError::Numerical(format!("no gap witness within {MAX_WITNESS_GROWTH} extra levels of spin {} (τ_c = {WITNESS_GAP} Ha)", self.spin)));
-            }
-            self.grow(orbs, evals, pool);
-        }
-    }
-
-    /// One more vector for the block: the CPU's seeded guess for its index (`qm::scf::solve_shared`/`solve_fd`), its
-    /// eigenvalue placeholder the current highest.
+    /// One more vector for the block: the CPU's seeded guess for its index (`qm::scf::solve_fd`), its eigenvalue
+    /// placeholder the current highest.
     fn grow(&self, orbs: &mut Vec<Field>, evals: &mut Vec<f64>, pool: &mut Pool) {
         let seed = 1000 + 2 * orbs.len() as u64 + self.spin as u64;
         let f = pool.take(self.ctx, self.g);
@@ -1257,15 +1207,13 @@ impl GpuSolver {
            mut inner_abort: Option<&mut (dyn FnMut() -> bool + '_)>, mut observe: Option<&mut dyn FnMut(&ScfProgress)>) -> Result<Option<ScfStats>, QmError> {
         let t0 = Instant::now();
         clear_readback_fault(); // a fault latched by an earlier, unrelated readback is not this solve's
-        // spec §5.7 (module doc "Ionic species and occupations (M7)"): τ of DegenerateShells; kT of FermiDirac (module
-        // doc "Fermi–Dirac occupations"); both None under Aufbau. `weighted_occ`: the f-weighted density and energy with
-        // gap witnesses (both schemes other than Aufbau)
-        let (shared_tau, fd_kt) = match settings.occupations {
-            Occupations::Aufbau => (None, None),
-            Occupations::DegenerateShells { tau } => (Some(tau), None),
-            Occupations::FermiDirac { kt } => (None, Some(kt)),
+        // kT of FermiDirac (module doc "Fermi–Dirac occupations"); None under Aufbau. `weighted_occ`: the f-weighted
+        // density and energy with witnesses (FermiDirac)
+        let fd_kt = match settings.occupations {
+            Occupations::Aufbau => None,
+            Occupations::FermiDirac { kt } => Some(kt),
         };
-        let weighted_occ = shared_tau.is_some() || fd_kt.is_some();
+        let weighted_occ = fd_kt.is_some();
         let prev_converged = self.converged; // the warm start is a converged state (not a parked one)
         self.converged = false;
         // E_nn (valence charges under a setup) and the core overlaps, before anything is touched (coincident nuclei)
@@ -1348,8 +1296,8 @@ impl GpuSolver {
                 let total = (n_up + n_dn) as f64;
                 // broad atomic-like blobs (σ = 1 Bohr) carrying each centre's charge (Z, or Z_v when pseudised)
                 // the cold guess (`qm::nuclear::cold_guess`): free atoms for all-electron centres under FermiDirac (plan 2026-11-13
-                // Task 9c (a), review M4), σ = 1 blobs of the centre's charge otherwise (pseudised centres; Aufbau and
-                // DegenerateShells keep their bits)
+                // Task 9c (a), review M4), σ = 1 blobs of the centre's charge otherwise (pseudised centres; Aufbau keeps
+                // its bits)
                 let (z_tot, guess) = cold_guess(grid, &system.nuclei, system.ionic.as_deref(), settings.sigma,
                                                 matches!(settings.occupations, Occupations::FermiDirac { .. }));
                 let scale = if z_tot > 0.0 { total / z_tot } else { 0.0 };
@@ -1359,7 +1307,7 @@ impl GpuSolver {
                 let orbitals = |pool: &mut Pool, count: usize, seed: u64| -> Vec<Field> {
                     initial_orbitals(grid, &system.nuclei, count, seed).iter().map(|d| upload(pool, d)).collect()
                 };
-                // one gap witness per occupied spin channel under DegenerateShells and FermiDirac (`qm::scf` "Occupations")
+                // one witness per occupied spin channel under FermiDirac (`qm::scf` "Occupations")
                 let extra = |n: usize| usize::from(n > 0 && weighted_occ);
                 let (ku, kd) = (n_up + extra(n_up), n_dn + extra(n_dn));
                 let orb_up = orbitals(pool, ku, 1);
@@ -1393,12 +1341,8 @@ impl GpuSolver {
         let mut prev_tail = f64::INFINITY; // the previous step's widest witness tail (kT; Task 9c (b))
         // `FermiDirac`: this step's calls all returned their tight columns bitwise (module doc, "Fermi–Dirac occupations")
         let mut step_kept = false;
-        // spec §5.7: the occupations (all 1 under Aufbau), the shared clusters of the last step, phase 2's frozen
-        // pattern by rank per spin (None = phase 1) and the released clusters
+        // the occupations (all 1 under Aufbau; the latest step's f under FermiDirac)
         let (mut occ_up, mut occ_dn) = (vec![1.0; orb_up.len()], vec![1.0; orb_dn.len()]);
-        let mut fractional: Vec<FractionalShell> = Vec::new();
-        let mut pattern: Option<(Vec<f64>, Vec<f64>)> = None;
-        let mut released: Vec<FractionalShell> = Vec::new();
         // FermiDirac (module doc, "Fermi–Dirac occupations"): S and μ_σ of the latest step's f and its partial levels
         // (empty otherwise), and the Δρ tolerance that step is tested against (spec §5.1; `settings.tol` unless the step
         // has a partial level) — a converged solve's is `ScfStats::tol_used`
@@ -1444,8 +1388,8 @@ impl GpuSolver {
             lincomb_in(&mut batch, k, g, &v_up, &[(1.0, &v_nuc), (1.0, &v_h), (1.0, &xc_up)]);
             lincomb_in(&mut batch, k, g, &v_dn, &[(1.0, &v_nuc), (1.0, &v_h), (1.0, &xc_dn)]);
             flush(&mut batch);
-            match (shared_tau, fd_kt) {
-                (None, Some(kt)) => {
+            match fd_kt {
+                Some(kt) => {
                     // the step's own levels decide the f (never mixed; spec 2026-11-13 §5 "Unchanged")
                     let mut occ: [Option<FdOccupations>; 2] = [None, None];
                     let mut err = None;
@@ -1484,7 +1428,7 @@ impl GpuSolver {
                     partial = partial_levels(&ev_up, &ou.f, 0).into_iter().chain(partial_levels(&ev_dn, &od.f, 1)).collect();
                     (occ_up, occ_dn) = (ou.f, od.f);
                 }
-                (None, None) => {
+                None => {
                     if n_up > 0 {
                         let h = GpuHamiltonian { v: &v_up, nl };
                         let t = Instant::now();
@@ -1505,22 +1449,6 @@ impl GpuSolver {
                         }
                         device_fault!();
                     }
-                }
-                (Some(_), _) => {
-                    let mut shells = Vec::new();
-                    let mut err = None;
-                    for (spin, n, v, orbs, evals) in [(0u8, n_up, &v_up, &mut orb_up, &mut ev_up), (1, n_dn, &v_dn, &mut orb_dn, &mut ev_dn)] {
-                        let by_rank = pattern.as_ref().map(|(u, d)| if spin == 0 { u.as_slice() } else { d.as_slice() });
-                        let ch = Channel { ctx, k, g, r, grid, nuclei: &system.nuclei, h: GpuHamiltonian { v, nl }, n, spin, step_tol,
-                                           scf_tol: settings.tol, cap: MAX_WITNESS_GROWTH, cap_note: None, guess_band: true, loosened_delta: None };
-                        match ch.solve_shared(orbs, evals, by_rank, work, work_k, pool, &mut inner) {
-                            Ok((f, s)) => { if spin == 0 { occ_up = f } else { occ_dn = f } shells.extend(s); }
-                            Err(e) => { err = Some(e); break; }
-                        }
-                    }
-                    if let Some(e) = err { failure = Some(take_device_error().unwrap_or(e)); break; }
-                    device_fault!();
-                    fractional = shells;
                 }
             }
             accumulate_density(&mut batch, k, g, &rho_out_up, &orb_up, weighted_occ.then_some(occ_up.as_slice()));
@@ -1547,8 +1475,7 @@ impl GpuSolver {
                 delta_rho = vals[0] + vals[1];
                 inner.profile.delta_rho_steps.push(delta_rho);
                 if trace { eprintln!("scf step {iterations}: Δρ {delta_rho:.3e} (↑ {:.2e} ↓ {:.2e}), DIIS history {}, eig tol {step_tol:.2e}, eigen last-step residual {:.2e}, eigen it this step {}{}", vals[0], vals[1], hist.entries.len(), inner.step_residual, inner.profile.eigen_iterations - eig_it_before,
-                                     if shared_tau.is_some() { format!(", shared {:?}", fractional.iter().map(|c| (c.spin, c.count, c.f, c.spread)).collect::<Vec<_>>()) }
-                                     else if fd_kt.is_some() { format!(", μ {mu:?}, S {entropy:.3e}, partial {:?}, block {}/{} tight {tight:?} kept {step_kept}, guard residual {:.1e}",
+                                     if fd_kt.is_some() { format!(", μ {mu:?}, S {entropy:.3e}, partial {:?}, block {}/{} tight {tight:?} kept {step_kept}, guard residual {:.1e}",
                                                                        partial.iter().map(|p| (p.spin, p.index, p.f)).collect::<Vec<_>>(), orb_up.len(), orb_dn.len(), inner.guard_residual) }
                                      else { String::new() }); }
                 let hf_dc = (vals.len() > row_end).then(|| neumaier([-0.5 * vals[row_end], -vals[row_end + 1], -vals[row_end + 2], vals[row_end + 3], e_nn].into_iter()));
@@ -1570,23 +1497,9 @@ impl GpuSolver {
             // converged only on a step whose eigensolves ran at the tight (M3) tol: the energy and
             // forces are evaluated from these orbitals, so a Δρ that dropped below tol on a
             // loosened step takes one more step (forced tight at the top of the loop)
-            let mut released_now = false;
             if !delta_rho.is_finite() || (delta_rho < test_tol && step_tol <= eig_tol) {
-                // spec §5.7 phase 2 (`qm::scf`): at the first convergence, release every shared cluster whose spread is
-                // ≥ τ, freeze the pattern and converge again; without a release the phase-1 state is the answer
-                match (shared_tau, &pattern) {
-                    (Some(tau), None) if delta_rho.is_finite() && fractional.iter().any(|c| c.spread >= tau) => {
-                        let (su, sd): (Vec<FractionalShell>, Vec<FractionalShell>) = fractional.iter().cloned().partition(|c| c.spin == 0);
-                        let up = decide(&ev_up, &occ_up, &su, tau, &mut released);
-                        let dn = decide(&ev_dn, &occ_dn, &sd, tau, &mut released);
-                        pattern = Some((up, dn));
-                        hist.clear(pool);
-                        delta_rho = f64::INFINITY;
-                        released_now = true;
-                        watch.restart(iterations); // a new convergence phase (`qm::scf`, "The stall stop")
-                    }
-                    _ => { pool.give(r_up); pool.give(r_dn); break; }
-                }
+                pool.give(r_up); pool.give(r_dn);
+                break;
             } else if !(delta_rho < test_tol) && watch.stalled(since_gain) {
                 // the stall stop: only ever ends a solve that would have gone on (module doc) — never a step whose
                 // Δρ is already below tol on a loosened eigen step (it takes one tight step and converges, review S1)
@@ -1618,7 +1531,7 @@ impl GpuSolver {
             if step_frozen && fd_kt.is_some() { inner.profile.frozen_steps += 1; }
             frozen = step_frozen;
             let entry = DiisEntry { rho_up: rho_in_up, rho_dn: rho_in_dn, r_up, r_dn };
-            if released_now || map_changed { hist.push_reset(entry, &row, pool); }
+            if map_changed { hist.push_reset(entry, &row, pool); }
             else if freeze_trim { hist.push_keep(entry, &row, consistent - 1, pool); }
             else { hist.push(entry, row, pool); }
             rho_in_up = pool.take(ctx, g);
@@ -1723,7 +1636,7 @@ impl GpuSolver {
             if let Some(e) = take_device_error() { fail!(e, iterations); }
             let (external, hartree, xc, boundary) = (vals[0] + e_nl, 0.5 * vals[1], vals[2], vals[3]);
             let negative = core.is_some() && (vals[4 + nk] > 0.0 || vals[5 + nk] > 0.0);
-            // E as before (the same left-to-right sum: `Aufbau` and `DegenerateShells` keep their bits, ts = 0.0 there),
+            // E as before (the same left-to-right sum: `Aufbau` keeps its bits, ts = 0.0 there),
             // and F = E − kT·S of the final step's f (module doc, "Fermi–Dirac occupations"; `qm::scf`'s expression)
             let internal = kinetic + external + hartree + xc + e_nn;
             let ts = fd_kt.unwrap_or(0.0) * entropy;
@@ -1757,7 +1670,7 @@ impl GpuSolver {
                                 ionic: system.ionic.clone(), occ_up, occ_dn, occupations: settings.occupations });
         *converged = true;
         Ok(Some(ScfStats { iterations, delta_rho, energy, boundary_density, max_eigen_residual, max_guard_residual, poisson_residual, poisson_iterations, warnings,
-                           core_overlaps: overlaps, fractional, released, entropy, mu, partial, tol_used: test_tol }))
+                           core_overlaps: overlaps, entropy, mu, partial, tol_used: test_tol }))
     }
 
     /// The LOBPCG tol the SCF converges its final step to (module doc, "Display access"); a Harris
@@ -2836,7 +2749,7 @@ mod tests {
             assert_eq!(stats.energy.total.to_bits(), e_bits, "{name} energy");
             assert_eq!(f[0][0].to_bits(), f_bits, "{name} F_x0");
             let st = s.state().unwrap();
-            assert!(st.ionic.is_none() && st.occupations == Occupations::Aufbau && stats.core_overlaps.is_empty() && stats.fractional.is_empty());
+            assert!(st.ionic.is_none() && st.occupations == Occupations::Aufbau && stats.core_overlaps.is_empty() && stats.partial.is_empty());
             assert!(st.occ_up.iter().chain(&st.occ_dn).all(|&f| f == 1.0));
             assert_eq!((stats.energy.ts, stats.tol_used), (0.0, aufbau.tol));
         }
@@ -2859,7 +2772,7 @@ mod tests {
 
     /// Spec 2026-11-13 §5: no code path clears the DIIS history and then pushes an entry measured on the old map. The
     /// history is filled with three entries of "map A", the frozen-orbital reset (`Diis::push_reset`, the path `run`
-    /// takes when a frozen set is re-solved and at the `DegenerateShells` release) pushes one entry measured on "map B",
+    /// takes when a frozen set is re-solved or a widened witness window grew the block) pushes one entry measured on "map B",
     /// and the next mix must be plain α-mixing of B's residual, ρ_B + α r_B (clamped at 0): zero weight on any A entry.
     /// The control: the same B pushed without the reset does put weight on the A entries.
     #[test]
@@ -2908,7 +2821,8 @@ mod tests {
     }
 
     /// Review Focus 1 on the GPU (the CPU's `fd_warm_state_from_other_scheme_is_cold`): a parked state converged at
-    /// another kT, under `Aufbau` or under `DegenerateShells` is no warm start for a FermiDirac solve at `ELECTRON_KT` —
+    /// another kT or under `Aufbau` is no warm start for a FermiDirac solve at `ELECTRON_KT` (the shared-shell leg went
+    /// with that scheme, plan 2026-11-13 Task 10) —
     /// the warm solve equals the cold one bit for bit (F, TS, Δρ, steps) — while a state of the same scheme is reused.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm-gpu --release")]
@@ -2917,10 +2831,10 @@ mod tests {
         let sys = h2(0.0);
         let target = ScfSettings { occupations: Occupations::FermiDirac { kt: qm::ELECTRON_KT }, ..base };
         let cold = s.solve(&sys, &target, false).unwrap().1;
-        for other in [Occupations::FermiDirac { kt: 2e-3 }, Occupations::Aufbau, Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU }] {
+        for other in [Occupations::FermiDirac { kt: 2e-3 }, Occupations::Aufbau] {
             s.solve(&sys, &ScfSettings { occupations: other, ..base }, false).unwrap();
-            // the guard reached (review M2, the CPU twin's check): the other-kT and DS states fit FD's orbital counts,
-            // so only the `==` scheme guard refuses them; the Aufbau state (exactly N_σ vectors) fails `counts_match`
+            // the guard reached (review M2, the CPU twin's check): the other-kT state fits FD's orbital counts, so only
+            // the `==` scheme guard refuses it; the Aufbau state (exactly N_σ vectors) fails `counts_match`
             let fits = counts_match(s.state().expect("converged"), sys.n_up, sys.n_dn, target.occupations);
             assert_eq!(fits, other != Occupations::Aufbau, "{other:?}: counts_match {fits}");
             let warm = s.solve(&sys, &target, true).unwrap().1;
@@ -3001,19 +2915,29 @@ mod tests {
         let dc = comps.iter().fold(0.0f64, |m, d| m.max(d.abs()));
         let sorted = |e: &[f64]| -> Vec<f64> { let mut v = e.to_vec(); v.sort_by(f64::total_cmp); v };
         let (gu, gd, cu, cd) = (sorted(&st.evals_up), sorted(&st.evals_dn), sorted(&cpu_state.evals_up), sorted(&cpu_state.evals_dn));
-        // Task 9c (c): an FD channel's GPU block carries one untested buffer above the CPU's levels (the highest; the zip
-        // below compares the CPU's levels with the GPU's lowest as many)
+        // Task 9c (c): an FD channel's GPU block carries one untested buffer, its highest level, whose Ritz value decides
+        // nothing; the levels compared are the GPU's tested ones against the CPU's lowest as many. Plan 2026-11-13 Task 10:
+        // the two witness blocks need not have the same size under FD (pseudo-O ↓: the CPU's grown-and-trimmed block kept
+        // 6 levels, the GPU 5 tested + the buffer, which sat 6.0e-5 Ha from the CPU's 6th tested level), so the counts
+        // are no longer pinned equal; the compared levels must still cover every CPU-occupied level and a witness above.
         let buffer = |n: usize| usize::from(matches!(settings.occupations, Occupations::FermiDirac { .. }) && n > 0);
-        assert_eq!((gu.len(), gd.len()), (cu.len() + buffer(sys.n_up), cd.len() + buffer(sys.n_dn)), "{name}: stored orbital counts (witnesses included)");
-        let deps = gu.iter().zip(&cu).chain(gd.iter().zip(&cd)).map(|(g, c)| (g - c).abs()).fold(0.0, f64::max);
+        let (tu, td) = (gu.len() - buffer(sys.n_up), gd.len() - buffer(sys.n_dn));
+        let deps = gu[..tu].iter().zip(&cu).chain(gd[..td].iter().zip(&cd)).map(|(g, c)| (g - c).abs()).fold(0.0, f64::max);
+        println!("{name}: stored counts gpu ({}, {}) cpu ({}, {}) buffer ({}, {})", gu.len(), gd.len(), cu.len(), cd.len(), buffer(sys.n_up), buffer(sys.n_dn));
         println!("{name}: GPU {} steps {gpu_s:.2} s ({:?}), CPU {} steps {cpu_s:.1} s; E gpu {:+.9} cpu {:+.9} Δ {:+.2e}; components Δ [T {:+.1e}, ext {:+.1e}, H {:+.1e}, xc {:+.1e}, nn {:+.1e}]; max |Δε| {deps:.2e}",
                  stats.iterations, s.profile().notes, cpu_stats.iterations, a.total, b.total, a.total - b.total, comps[0], comps[1], comps[2], comps[3], comps[4]);
         println!("  ε↑ gpu {gu:.6?} cpu {cu:.6?}; ε↓ gpu {gd:.6?} cpu {cd:.6?}");
-        println!("  occ ↑ gpu {:?} cpu {:?}; occ ↓ gpu {:?} cpu {:?}; shared gpu {:?} cpu {:?}; warnings gpu {:?} cpu {:?}",
-                 st.occ_up, cpu_state.occ_up, st.occ_dn, cpu_state.occ_dn, stats.fractional, cpu_stats.fractional, stats.warnings, cpu_stats.warnings);
+        println!("  occ ↑ gpu {:?} cpu {:?}; occ ↓ gpu {:?} cpu {:?}; partial gpu {:?} cpu {:?}; F gpu {:+.9} cpu {:+.9}, TS gpu {:.6e} cpu {:.6e}, tol_used gpu {:e} cpu {:e}; warnings gpu {:?} cpu {:?}",
+                 st.occ_up, cpu_state.occ_up, st.occ_dn, cpu_state.occ_dn, stats.partial, cpu_stats.partial, a.total, b.total, a.ts, b.ts, stats.tol_used, cpu_stats.tol_used,
+                 stats.warnings, cpu_stats.warnings);
+        let occupied = |f: &[f64]| f.iter().filter(|&&x| x >= qm::PARTIAL_OCCUPATION_MIN).count();
+        let (ou, od) = (occupied(&cpu_state.occ_up), occupied(&cpu_state.occ_dn));
+        assert!(tu.min(cu.len()) > ou && td.min(cd.len()) > od, "{name}: the compared levels cover the occupied ones and a witness ({tu}/{} ↑ vs {ou}, {td}/{} ↓ vs {od})", cu.len(), cd.len());
         assert!((st.occ_up.iter().sum::<f64>() - sys.n_up as f64).abs() < 1e-12 && (st.occ_dn.iter().sum::<f64>() - sys.n_dn as f64).abs() < 1e-12);
-        assert_eq!(stats.fractional.len(), cpu_stats.fractional.len(), "{name}: the same shared clusters");
-        assert_eq!(stats.released.len(), cpu_stats.released.len(), "{name}: the same releases");
+        // the same partly occupied levels (spin and rank; the shared clusters of the deleted shared-shell rule before plan
+        // 2026-11-13 Task 10)
+        let ranks = |p: &[qm::PartialLevel]| p.iter().map(|l| l.spin).collect::<Vec<_>>();
+        assert_eq!(ranks(&stats.partial), ranks(&cpu_stats.partial), "{name}: the same partial levels");
         assert_eq!(stats.core_overlaps.len(), cpu_stats.core_overlaps.len());
         // M7 Task 8b: forces, each solver on its own state, and per term on the same state
         let f_gpu = s.forces(st, &sys.nuclei, settings.sigma).unwrap();
@@ -3040,9 +2964,13 @@ mod tests {
         }
     }
 
-    /// Pseudo-O (`CoresOnly`, triplet, `DegenerateShells`: the spec §5.7 shared minority p) on the GPU vs the CPU at 33³,
-    /// h = σ = 0.25 (an 8 Bohr box; uncertified `from_tables`: a solver comparison on one discrete problem). Bounds by the
-    /// suite's 3× rule: measured |ΔE| 7.8e-7 (GPU path scatter 5.2e-7, `validate`) → 3e-6; components 3.3e-5 → 1e-4;
+    /// Pseudo-O (`CoresOnly`, triplet) on the GPU vs the CPU at 33³, h = σ = 0.25 (an 8 Bohr box; uncertified
+    /// `from_tables`: a solver comparison on one discrete problem), under `FermiDirac` at `ELECTRON_KT` (`for_grid`'s; the
+    /// minority p ⅓ each, F = E − 3 kT s(⅓), 3 kT s(⅓) = 9.5477e-3 Ha, spec §4.3 table). Plan 2026-11-13 Task 10 (F12)
+    /// converted it from the deleted shared-shell rule (the same ⅓ ensemble, so the same E): both sides carry the same
+    /// −TS, so the GPU-vs-CPU bounds compare F with F and do not move by it. The GPU stops at the partial-level stop
+    /// `GPU_PARTIAL_TOL` = 1e-5 (spec §5.1), the CPU at tol 1e-6. Bounds by the suite's 3× rule, set under the
+    /// shared-shell rule: measured |ΔE| 7.8e-7 (GPU path scatter 5.2e-7, `validate`) → 3e-6; components 3.3e-5 → 1e-4;
     /// eigenvalues 3.0e-6 → 1e-5 Ha.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm-gpu --release")]
@@ -3054,8 +2982,8 @@ mod tests {
         let grid = Grid::cube(33, h);
         let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([(8, Ionic::Pseudo(filtered_at(8, h)))])));
         let sys = System::with_ionic(vec![Nucleus { pos: [0.07, -0.03, 0.02], z: 8 }], 0, Some(3), setup);
-        let mut settings = ScfSettings::for_grid(&grid);
-        settings.occupations = Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU };
+        let settings = ScfSettings::for_grid(&grid);
+        assert_eq!(settings.occupations, Occupations::FermiDirac { kt: qm::ELECTRON_KT });
         let (de, dc, deps, kernel, dt) = pseudo_vs_cpu("pseudo-O M=3 33³", &grid, &sys, &settings);
         assert!(de < 3e-6 && dc < 1e-4 && deps < 1e-5, "|ΔE| {de:.2e}, component {dc:.2e}, ε {deps:.2e}");
         // Task 8b (forces, review round 1): the f32 evaluation on one GPU state, pinned by the 3× rule from the measured
@@ -3089,8 +3017,8 @@ mod tests {
     }
 
     /// `a_failed_readback_is_a_device_error_wherever_it_strikes` on the M7 path (the main merge of 2026-10-17): pseudo-O
-    /// (`CoresOnly`: V_NL and the partial core) as a triplet under `DegenerateShells` (the shared-occupation channel solves,
-    /// the witness growth), 33³, h = 0.25. A readback that fails anywhere — a phase-1 eigensolve whose zero eigenvalues
+    /// (`CoresOnly`: V_NL and the partial core) as a triplet under `FermiDirac` (`for_grid`'s: the FD channel solves with
+    /// a partly filled ↓ p, the witness growth; the shared-shell rule's before plan 2026-11-13 Task 10), 33³, h = 0.25. A readback that fails anywhere — a phase-1 eigensolve whose zero eigenvalues
     /// would feed the occupation rule, Δρ, the final reduction, the E_NL readback — is `Err(QmError::Device)`, leaves no
     /// state and is consumed; the next cold solve is bit-identical to the first. `forces` / `force_terms` (one readback
     /// for the four electronic terms) report it too.
@@ -3104,8 +3032,7 @@ mod tests {
         let grid = Grid::cube(33, h);
         let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([(8, Ionic::Pseudo(filtered_at(8, h)))])));
         let sys = System::with_ionic(vec![Nucleus { pos: [0.07, -0.03, 0.02], z: 8 }], 0, Some(3), setup);
-        let mut settings = ScfSettings::for_grid(&grid);
-        settings.occupations = Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU };
+        let settings = ScfSettings::for_grid(&grid);
         let mut s = GpuSolver::new(ctx, &grid);
         let before = crate::grid::readbacks_on_this_thread();
         let reference = s.solve(&sys, &settings, false).unwrap().1;
@@ -3151,8 +3078,7 @@ mod tests {
         let grid = Grid::cube(33, h);
         let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([(8, Ionic::Pseudo(filtered_at(8, h)))])));
         let sys = System::with_ionic(vec![Nucleus { pos: [0.07, -0.03, 0.02], z: 8 }], 0, Some(3), setup.clone());
-        let mut settings = ScfSettings::for_grid(&grid);
-        settings.occupations = Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU };
+        let settings = ScfSettings::for_grid(&grid);
         let mut s = GpuSolver::new(ctx.clone(), &grid);
         let (_, stats) = s.solve(&sys, &settings, false).unwrap();
         let state = s.state().expect("converged");
@@ -3175,7 +3101,7 @@ mod tests {
         assert_eq!(s2.copy_density_with_core_to_volume(st2, &volume), s2.density_max(st2));
     }
 
-    /// Diagnostic (M7 Task 8a): a GPU pseudo-O triplet solve (`CoresOnly`, `DegenerateShells`) at h = 0.20 in a 12 Bohr
+    /// Diagnostic (M7 Task 8a): a GPU pseudo-O triplet solve (`CoresOnly`, `FermiDirac`) at h = 0.20 in a 12 Bohr
     /// box (61³), cold, with the per-step trace: `SCF_TRACE=1 cargo test -p qm-gpu --release -- --ignored --nocapture
     /// diag_pseudo_o`. `DIAG_N` overrides n.
     #[test]
@@ -3189,20 +3115,19 @@ mod tests {
         let grid = Grid::cube(n, h);
         let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([(8, Ionic::Pseudo(filtered_at(8, h)))])));
         let sys = System::with_ionic(vec![Nucleus { pos: [0.07, -0.03, 0.02], z: 8 }], 0, Some(3), setup);
-        let mut settings = ScfSettings::for_grid(&grid);
-        settings.occupations = Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU };
+        let settings = ScfSettings::for_grid(&grid);
         let mut s = GpuSolver::new(ctx, &grid);
         let (_, st) = s.solve(&sys, &settings, false).unwrap();
         let p = s.profile();
-        println!("pseudo-O {n}³ cold: {} steps, {:.0} ms (Poisson {:.0}, LOBPCG {:.0}), E {:+.9}, Δρ {:.2e}, eigen it {}, DIIS resets {}, shared {:?}, released {:?}, notes {:?}",
-                 st.iterations, p.wall.as_secs_f64() * 1e3, p.poisson_wall.as_secs_f64() * 1e3, p.eigen_wall.as_secs_f64() * 1e3, st.energy.total, st.delta_rho,
-                 p.eigen_iterations, p.diis_resets, st.fractional, st.released, p.notes);
+        println!("pseudo-O {n}³ cold: {} steps, {:.0} ms (Poisson {:.0}, LOBPCG {:.0}), F {:+.9}, TS {:.6e}, Δρ {:.2e}, eigen it {}, DIIS resets {}, partial {:?}, notes {:?}",
+                 st.iterations, p.wall.as_secs_f64() * 1e3, p.poisson_wall.as_secs_f64() * 1e3, p.eigen_wall.as_secs_f64() * 1e3, st.energy.total, st.energy.ts, st.delta_rho,
+                 p.eigen_iterations, p.diis_resets, st.partial, p.notes);
         // the all-electron O on the same grid (σ = h, the same occupation rule) for the cost comparison
         let ae = System::new(vec![Nucleus { pos: [0.07, -0.03, 0.02], z: 8 }], 0, Some(3));
         let (_, st) = s.solve(&ae, &settings, false).unwrap();
         let p = s.profile();
-        println!("all-electron O {n}³ (σ = h) cold: {} steps, {:.0} ms (Poisson {:.0}, LOBPCG {:.0}), E {:+.9}, eigen it {}, shared {:?}",
-                 st.iterations, p.wall.as_secs_f64() * 1e3, p.poisson_wall.as_secs_f64() * 1e3, p.eigen_wall.as_secs_f64() * 1e3, st.energy.total, p.eigen_iterations, st.fractional);
+        println!("all-electron O {n}³ (σ = h) cold: {} steps, {:.0} ms (Poisson {:.0}, LOBPCG {:.0}), F {:+.9}, eigen it {}, partial {:?}",
+                 st.iterations, p.wall.as_secs_f64() * 1e3, p.poisson_wall.as_secs_f64() * 1e3, p.eigen_wall.as_secs_f64() * 1e3, st.energy.total, p.eigen_iterations, st.partial);
     }
 
     /// Step 1 printer (M7 Task 8a): run on the code before the pseudopotential path to print the `GPU_BASE_…` pins of
@@ -3271,10 +3196,11 @@ mod tests {
         }
     }
 
-    /// Review S3: the bitwise and Harris–Foulkes claims on the pseudo path — pseudo-O M = 3 (`CoresOnly`,
-    /// `DegenerateShells`: NLCC, E_NL, the shared minority p with f = 1/3 in the band sum), 33³, h = σ = 0.25 (as
-    /// `pseudo_o_triplet_matches_cpu`): the stall stop off, at its default W, and observed give the same bits, and
-    /// the last iteration's Harris–Foulkes energy lands on the reported one.
+    /// Review S3: the bitwise and Harris–Foulkes claims on the pseudo path — pseudo-O M = 3 (`CoresOnly`, `FermiDirac`
+    /// at `ELECTRON_KT`: NLCC, E_NL, the minority p ensemble with f = ⅓ in the band sum and −kT·S in F_HF; the shared-shell
+    /// rule's ⅓ before plan 2026-11-13 Task 10), 33³, h = σ = 0.25 (as `pseudo_o_triplet_matches_cpu`): the stall stop
+    /// off, at its default W, and observed give the same bits, and the last iteration's Harris–Foulkes F lands on the
+    /// reported F (the bound is unchanged: both sides carry the same −TS).
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm-gpu --release")]
     fn the_stall_stop_and_the_observer_leave_a_pseudo_solve_bitwise() {
@@ -3285,8 +3211,7 @@ mod tests {
         let grid = Grid::cube(33, h);
         let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([(8, Ionic::Pseudo(filtered_at(8, h)))])));
         let sys = System::with_ionic(vec![Nucleus { pos: [0.07, -0.03, 0.02], z: 8 }], 0, Some(3), setup);
-        let mut on = ScfSettings::for_grid(&grid);
-        on.occupations = Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU };
+        let on = ScfSettings::for_grid(&grid);
         let off = ScfSettings { stall_window: 0, ..on };
         let mut s = GpuSolver::new(ctx, &grid);
         let a = s.solve(&sys, &on, false).unwrap().1;
@@ -3300,11 +3225,9 @@ mod tests {
         }
         assert_eq!(seen.len(), a.iterations);
         let last = seen.last().unwrap();
-        println!("pseudo-O M=3 33³ (GPU): {} steps, E {:+.10}, E_HF(last) {:+.10} (Δ {:.2e}); shared {:?}; released {:?}; longest no-gain run {}",
-                 a.iterations, a.energy.total, last.energy, last.energy - a.energy.total, a.fractional, a.released, seen.iter().map(|p| p.since_gain).max().unwrap_or(0));
-        assert!(!a.fractional.is_empty(), "the minority p is shared: the fractional band sum is exercised");
-        assert!((last.energy - a.energy.total).abs() < 1e-5, "Harris–Foulkes {} vs E {}", last.energy, a.energy.total);
-        // the shell-release path (the watch's restart) is pinned on the providers' real setup: `ks` tests,
-        // `the_stall_stop_leaves_a_released_pseudo_solve_bitwise`
+        println!("pseudo-O M=3 33³ (GPU): {} steps, F {:+.10}, F_HF(last) {:+.10} (Δ {:.2e}), TS {:.6e}; partial {:?}; longest no-gain run {}",
+                 a.iterations, a.energy.total, last.energy, last.energy - a.energy.total, a.energy.ts, a.partial, seen.iter().map(|p| p.since_gain).max().unwrap_or(0));
+        assert!(!a.partial.is_empty(), "the minority p is partly occupied: the fractional band sum is exercised");
+        assert!((last.energy - a.energy.total).abs() < 1e-5, "Harris–Foulkes {} vs F {}", last.energy, a.energy.total);
     }
 }

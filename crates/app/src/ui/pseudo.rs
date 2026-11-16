@@ -141,7 +141,7 @@ pub fn reference_free_energy_note() -> String {
 /// One line per partly occupied level of the final step (`EvalStats::partial`, Fermi–Dirac occupations at T_el; spec
 /// 2026-11-13 §6.3, §6.6): "partly occupied: level k (↑/↓), ε = −0.3123 Ha, f = 0.333" — ε with the orbital list's
 /// true minus sign (`dock::orbitals::minus`), f without trailing zeros; none for a gapped state. It replaced the
-/// `DegenerateShells` shared-shell line (plan 2026-11-13 Tasks 9 and 12).
+/// shared-shell rule's line (plan 2026-11-13 Tasks 9 and 12).
 pub fn occupation_lines(levels: &[sim::PartialLevel]) -> Vec<String> {
     levels
         .iter()

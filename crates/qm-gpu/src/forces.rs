@@ -92,8 +92,8 @@
 //! the Hellmann–Feynman force of the f-weighted density (and, under a setup, of the f-weighted projector sums with the
 //! state's `occ_*`, witnesses included) that this module computes, unchanged: **the force is −dF/dR of the Mermin
 //! functional, not −dE/dR**. They differ by d(kT·S)/dR — 0 in a gapped system, up to a few mHa/Bohr where a level crosses
-//! μ — so the force pairs with `Energy::total` (= F), not `Energy::internal` (= E). Under `Aufbau` and
-//! `DegenerateShells` S = 0 and the f are fixed, so the same expression is −dE/dR. The floors are the ones above: the
+//! μ — so the force pairs with `Energy::total` (= F), not `Energy::internal` (= E). Under `Aufbau` S = 0 and the f are
+//! fixed, so the same expression is −dE/dR. The floors are the ones above: the
 //! SCF residual (on a solve with a partial level the GPU stops at Δρ < 1e-5, spec §5.1: V0 measured ≤ 3.2e-6 Ha/Bohr per
 //! component against a tighter re-solve), the LOBPCG residual and the f32 partial sums.
 //!

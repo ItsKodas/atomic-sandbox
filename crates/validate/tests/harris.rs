@@ -20,10 +20,11 @@
 //! once, with no SCF loop. The SCF's converged state (ψ^S, ε^S, f^S, ρ_SCF) is a fixed point of the
 //! same map: ρ_SCF = ρ_out[V[ρ_SCF]] to its tolerance.
 //!
-//! **The subspace overlap** (`overlap`), per spin channel σ, over the occupied levels — f > 0 under `Aufbau` and
-//! `DegenerateShells`, f ≥ `qm::PARTIAL_OCCUPATION_MIN` (1e-6) under `FermiDirac` (the scf-stall ← main merge: every
-//! scene's occupations; plan 2026-11-13 Task 9's display rule — the SCF state's witness columns carry f ≤ e^−36 > 0 and
-//! are never occupied; the threshold is the same set as f > 0 under the integer and shared rules, whose f are 0 or a share ≥ 1/k of the k computed levels):
+//! **The subspace overlap** (`overlap`), per spin channel σ, over the occupied levels — f > 0 under `Aufbau`,
+//! f ≥ `qm::PARTIAL_OCCUPATION_MIN` (1e-6) under `FermiDirac` (the scf-stall ← main merge: every scene's occupations;
+//! plan 2026-11-13 Task 9's display rule — the SCF state's witness columns carry f ≤ e^−36 > 0 and are never occupied;
+//! the threshold is the same set as f > 0 under the integer rule and under the deleted shared-shell rule, whose f were 0
+//! or a share ≥ 1/k of the k computed levels):
 //!
 //! ```text
 //!   C_ij = h³ Σ_r ψ^H_i(r) ψ^S_j(r)                 (i ∈ occ_H, j ∈ occ_S; f64, Neumaier)
@@ -35,7 +36,8 @@
 //! the rotation between them. The brief writes the normaliser as n_σ (the electrons of the
 //! channel): that is the same number whenever the f > 0 levels are n_σ whole orbitals (every case
 //! here but pseudo-O). Pseudo-O's auto multiplicity is the singlet (Z_v = 6, n↑ = n↓ = 3) and
-//! `DegenerateShells` shares the 2p shell, f = 1, ⅔, ⅔, ⅔: four f > 0 levels for n_σ = 3. Dividing
+//! Fermi–Dirac fills the 2p shell ⅔ each (as the deleted shared-shell rule did), f = 1, ⅔, ⅔, ⅔: four occupied levels
+//! for n_σ = 3. Dividing
 //! by n_σ = 3 would make the identity read 4/3 and let a 25 % mismatch pass; max(n_occ^H, n_occ^S)
 //! is the strict normaliser (a count mismatch alone keeps O < 1).
 //!
@@ -137,12 +139,12 @@ const H: f64 = 0.15;
 const IDENTITY_EPS: f64 = 1e-5;
 const IDENTITY_OVERLAP: f64 = 1.0 - 1e-6;
 /// V-A1: the one-shot occupations equal the SCF's (the same rule on ε equal to ~1e-7 Ha; exact fractions) — for
-/// every level under `Aufbau`/`DegenerateShells`, and under `FermiDirac` for a level within `PARTIAL_OCCUPATION_MIN`
+/// every level under `Aufbau`, and under `FermiDirac` for a level within `PARTIAL_OCCUPATION_MIN`
 /// of 0 or 1. A partly filled FD level is gated by `fd_occ_gate` instead.
 const OCC_EPS: f64 = 1e-12;
 
 /// V-A1's f gate for a partly filled `FermiDirac` level (1e-6 < f < 1 − 1e-6; controller ruling (1) on the scf-stall
-/// ← main merge, 2026-11-16). The 1e-12 gate presumed `DegenerateShells`' exact fractions (f = (N − n_below)/|C|, a
+/// ← main merge, 2026-11-16). The 1e-12 gate presumed the shared-shell rule's exact fractions (f = (N − n_below)/|C|, a
 /// constant of the level count). Under FD, f = 1/(1 + e^{(ε − μ)/kT}) is a smooth function of ε with
 ///   ∂f/∂ε = −f(1 − f)/kT,
 /// so an ε that passes the ε gate (|Δε| ≤ `IDENTITY_EPS`) moves f by at most f(1 − f)/kT · `IDENTITY_EPS` to first

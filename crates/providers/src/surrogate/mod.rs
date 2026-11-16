@@ -67,7 +67,7 @@
 //!    the all-electron tag `none/fd5e-3/pin1e-5` whenever nothing is pseudised (H₂ under `CoresOnly` *is* the
 //!    all-electron surface; `crate::pseudo::is_all_electron_tag` also answers for the legacy `"none"`), else
 //!    `"<policy>/<surface hash>/fd5e-3/stop2x<floor>/pin1e-5"` (Fermi–Dirac at kT = 5 mHa and the GPU stop rules, plan
-//!    2026-11-13 Task 9; the `DegenerateShells`-era `…/shared1e-3/1e-1/stop2x5e-8` is the legacy tag); the surfaces differ by tens of Ha per pseudised
+//!    2026-11-13 Task 9; the shared-shell-era `…/shared1e-3/1e-1/stop2x5e-8` is the legacy tag); the surfaces differ by tens of Ha per pseudised
 //!    atom and in bond angles, so a model taught on one is never consulted on another. **With a
 //!    shared collection attached** (M8a Task 4a, `shared` module doc) the comparison is the
 //!    collection's surface-key check instead: any box, neutral, automatic multiplicity, the same

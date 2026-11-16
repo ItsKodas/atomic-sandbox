@@ -35,9 +35,10 @@
 //! self-consistent (ρ, f) by first order in the SCF residual, as the orbitals do. The floors are therefore today's:
 //! the SCF and eigensolver residuals (first order) and the discrete Hartree map's asymmetry (≲ 1e-5 Ha/Bohr,
 //! "Expected size of the egg-box force" below).
-//! Under `Aufbau` (f = 1: the kT → 0 limit) and `DegenerateShells` (f fixed by its rule, constant in R within a
-//! pattern; removed in plan Task 10) S = 0 and the f do not vary, so the same expression is −dE_h/dR. No force code
-//! depends on the scheme: the all-electron path reads the weighted ρ, the pseudised one ρ and `occ_*`.
+//! Under `Aufbau` (f = 1: the kT → 0 limit) S = 0 and the f do not vary, so the same expression is −dE_h/dR. No force
+//! code depends on the scheme: the all-electron path reads the weighted ρ, the pseudised one ρ and `occ_*`. (The
+//! "Janak at fixed occupations" grounding of the shared-shell rule, deleted in plan 2026-11-13 Task 10, is gone with
+//! it: every provider solve is Fermi–Dirac, stationary in f.)
 //!
 //! # Sign chain
 //! V_I depends on r and R_I only through u = r − R_I, so ∂V_I/∂R_I = −∇_u V_I = −∇_r V_I and

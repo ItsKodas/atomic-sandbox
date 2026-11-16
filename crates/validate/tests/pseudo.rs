@@ -11,8 +11,10 @@
 //!   never a pass.
 //! - Boxes are ≈ 12 Bohr cubes with a grid point at the origin (`n_for`), except where a test says otherwise (the O
 //!   Hund gate: 14 Bohr, spec §6.3).
-//! - Occupations: `DegenerateShells` (τ = `DEGENERACY_TAU`), the providers' choice under the pseudo policies (spec
-//!   §5.7; Task 6 review ruling A); closed shells come out aufbau's.
+//! - Occupations: Fermi–Dirac at kT = `ELECTRON_KT` (`for_grid`'s default and the providers' choice under every policy;
+//!   plan 2026-11-13 Task 10 moved this suite off the deleted shared-shell rule of spec §5.7 / Task 6 review ruling A,
+//!   whose exactly degenerate ensembles FD reproduces: the same E, and F = E − TS). Closed shells come out aufbau's.
+//!   `Energy::total` is F; a comparison with a radial atom's E reads `Energy::internal`.
 //! - Every rigid-shift egg-box probe has the Dirichlet-wall term removed (spec §6.6; Task 6 review ruling C, `Wall`).
 //! - Forces on pseudised states: `qm::forces` since M7 Task 7 (local LR + SR, nonlocal, partial core, ion–ion;
 //!   `qm::forces` module doc "Pseudised ions (M7)"), checked here against finite differences of the SCF energy
@@ -33,7 +35,7 @@ use qm::nonlocal::NonlocalOp;
 use qm::nuclear::{centres, has_partial_core, ionic_local_potential, ionic_repulsion, partial_core_field, smeared_potential};
 use qm::radial::{filter::filtered, generate, has_core, PseudoTable};
 use qm::radial::{ground_state, transfer_configs, SpinMode};
-use qm::{scf, Grid, KsState, Nucleus, Occupations, ScfSettings, System, DEGENERACY_TAU};
+use qm::{scf, Grid, KsState, Nucleus, Occupations, ScfSettings, System, ELECTRON_KT, PARTIAL_OCCUPATION_MIN};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -68,11 +70,23 @@ fn solve_with(h: f64, box_bohr: f64, setup: Arc<IonicSetup>, nuclei: Vec<Nucleus
     let sys = System::with_ionic(nuclei, 0, mult, setup);
     let mut s = ScfSettings::for_grid(&g);
     s.eig_tol = 1e-7;
-    s.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
+    assert_eq!(s.occupations, Occupations::FermiDirac { kt: ELECTRON_KT });
     if let Some(t) = tol { (s.tol, s.eig_tol) = (t, t); }
     let (st, stats) = scf(&g, &sys, &s, None).expect("SCF converges");
     (stats.energy.total, st, stats)
 }
+
+/// The widest eigenvalue spread of a channel's partly occupied levels (Ha; 0 with fewer than two): the FD twin of the
+/// shared-shell rule's converged cluster spread.
+fn partial_spread(stats: &qm::ScfStats) -> f64 {
+    (0..2u8).map(|spin| {
+        let eps: Vec<f64> = stats.partial.iter().filter(|p| p.spin == spin).map(|p| p.eps).collect();
+        if eps.len() < 2 { 0.0 } else { eps.iter().copied().fold(f64::MIN, f64::max) - eps.iter().copied().fold(f64::MAX, f64::min) }
+    }).fold(0.0, f64::max)
+}
+
+/// s(f) = −[f ln f + (1 − f) ln(1 − f)], one level's entropy (the closed forms of spec §4.3).
+fn level_entropy(f: f64) -> f64 { -(f * f.ln() + (1.0 - f) * (1.0 - f).ln()) }
 
 /// At most this many SCF solves run at once in one test (each holds ≈ 170 MB at 61³: LOBPCG's 3k-block workspace and
 /// the DIIS history; the machine is shared).
@@ -94,9 +108,10 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
     out.into_iter().map(|m| m.into_inner().unwrap().expect("every item ran")).collect()
 }
 
-/// The highest occupied level of a state (either spin, f > 0), for the wall's decay κ = √(−2ε).
+/// The highest occupied level of a state (either spin, f ≥ `PARTIAL_OCCUPATION_MIN`: a Fermi–Dirac witness has f > 0
+/// and is never occupied), for the wall's decay κ = √(−2ε).
 fn highest_occupied(st: &KsState) -> f64 {
-    st.evals_up.iter().zip(&st.occ_up).chain(st.evals_dn.iter().zip(&st.occ_dn)).filter(|(_, &f)| f > 0.0).map(|(&e, _)| e).fold(f64::MIN, f64::max)
+    st.evals_up.iter().zip(&st.occ_up).chain(st.evals_dn.iter().zip(&st.occ_dn)).filter(|(_, &f)| f >= PARTIAL_OCCUPATION_MIN).map(|(&e, _)| e).fold(f64::MIN, f64::max)
 }
 
 /// The box-wall term of a rigid-shift probe (Task 6 review, ruling C; spec §6.6). The egg-box is periodic in each
@@ -200,7 +215,9 @@ fn pseudo_ne_3d_matches_radial() {
 /// unconverged solve is an error.
 /// - Gated: each of M = 1 and M = 3 within 2 mHa of the radial KB atom on the same filtered table (M = 1: the
 ///   spin-restricted reference configuration; M = 3: T3's Hund configuration), and E(3) < E(1) − 20 mHa.
-/// - Asserted: every shared cluster's spread < τ/10.
+/// - Asserted: each channel's partly occupied levels lie within 1e-4 Ha of each other (τ/10 of the deleted shared-shell
+///   rule, the bound its clusters were held to). The radial comparisons and the splitting read E (`Energy::internal`):
+///   FD's symmetric ensemble is the same state, F = E − TS (plan 2026-11-13 Task 10).
 /// - Reported: the splitting against the radial one and the all-electron spherical 54.14 mHa (references.md "M7 radial
 ///   atom": E(M=1) − E(M=3) = −74.470692 + 74.524830). LSDA's integer lowering is `pseudo_o_integer_triplet_report`.
 #[test]
@@ -217,12 +234,13 @@ fn pseudo_o_triplet_below_singlet() {
     let r3 = qm::radial::kb::solve_kb_atom(&ft.grid, &ft.input(), &hund.pp, SpinMode::Polarised).unwrap().energy;
     let o = || vec![Nucleus { pos: [0.013, -0.0091, 0.0052], z: 8 }];
     let mut both = par_map(&[1u32, 3], |&m| { let t0 = Instant::now(); let (e, st, stats) = solve_with(h, 14.0, s.clone(), o(), Some(m), None); (e, st, stats, t0.elapsed().as_secs_f64()) });
-    let (e3, st3, s3, t3) = both.pop().unwrap();
-    let (e1, st1, s1, t1) = both.pop().unwrap();
+    let (_, st3, s3, t3) = both.pop().unwrap();
+    let (_, st1, s1, t1) = both.pop().unwrap();
+    let (e1, e3) = (s1.energy.internal, s3.energy.internal);
     for (m, st, stats) in [(1, &st1, &s1), (3, &st3, &s3)] {
-        eprintln!("pseudo-O M = {m}: occ ↑ {:?} ε ↑ {:.6?}; occ ↓ {:?} ε ↓ {:.6?}; shared {:?}; max eigen residual {:.1e}; face {:.1e}; warnings {:?}",
-                  st.occ_up, st.evals_up, st.occ_dn, st.evals_dn, stats.fractional, stats.max_eigen_residual, stats.boundary_density, stats.warnings);
-        for c in &stats.fractional { assert!(c.spread < DEGENERACY_TAU / 10.0, "M = {m}: cluster {c:?}"); }
+        eprintln!("pseudo-O M = {m}: occ ↑ {:?} ε ↑ {:.6?}; occ ↓ {:?} ε ↓ {:.6?}; F {:.6} TS {:.6e}; partial {:?}; max eigen residual {:.1e}; face {:.1e}; warnings {:?}",
+                  st.occ_up, st.evals_up, st.occ_dn, st.evals_dn, stats.energy.total, stats.energy.ts, stats.partial, stats.max_eigen_residual, stats.boundary_density, stats.warnings);
+        assert!(partial_spread(stats) < 1e-4, "M = {m}: partly occupied levels {:?}", stats.partial);
     }
     eprintln!("pseudo-O at h = {h}, 14 Bohr ({}³): M = 1 {e1:.6} vs radial {r1:.6} (Δ {:+.2} mHa; {} steps, {t1:.0} s); M = 3 {e3:.6} vs radial {r3:.6} (Δ {:+.2} mHa; {} steps, {t3:.0} s); \
                splitting E(1) − E(3) = {:.3} mHa (radial {:.3}, all-electron spherical 54.138)",
@@ -237,18 +255,19 @@ fn pseudo_o_triplet_below_singlet() {
 /// Hund gate. E_int: integer aufbau (`Occupations::Aufbau`), linear mixing α = 0.3 driven one SCF step at a time
 /// (each `scf` call converges trivially at tol = ∞ and returns E[ψ_out]; the next input is ρ_in + α(ρ_out − ρ_in)),
 /// stopped when |E_k − E_{k−20}| < 1e-7 Ha (E is stationary, so its error is second order in the residual), recorded
-/// with its Δρ. E_sph: `DegenerateShells`, as in the gate.
+/// with its Δρ. E_sph: the gate's solve, the Fermi–Dirac symmetric ensemble's E (`Energy::internal`; the shared-shell
+/// rule's before plan 2026-11-13 Task 10, the same state).
 #[test]
 #[ignore = "report: cargo test -p validate --release --test pseudo -- --ignored --nocapture pseudo_o_integer_triplet_report"]
 fn pseudo_o_integer_triplet_report() {
     let h = 0.20;
     let s = setup(IonicPolicy::CoresOnly, h, &[8]);
     let o = || vec![Nucleus { pos: [0.013, -0.0091, 0.0052], z: 8 }];
-    let (e_sph, _, _) = solve_with(h, 14.0, s.clone(), o(), Some(3), None);
+    let e_sph = solve_with(h, 14.0, s.clone(), o(), Some(3), None).2.energy.internal;
     let g = Grid::cube(n_for(14.0, h), h);
     let sys = System::with_ionic(o(), 0, Some(3), s);
     let mut set = ScfSettings::for_grid(&g);
-    (set.tol, set.max_iter, set.eig_tol) = (f64::INFINITY, 1, 1e-7);
+    (set.tol, set.max_iter, set.eig_tol, set.occupations) = (f64::INFINITY, 1, 1e-7, Occupations::Aufbau);
     let (mut st, mut stats) = scf(&g, &sys, &set, None).unwrap();
     let (mut rho_up, mut rho_dn) = (st.rho_up.clone(), st.rho_dn.clone());
     let mut es = vec![stats.energy.total];
@@ -265,7 +284,8 @@ fn pseudo_o_integer_triplet_report() {
 }
 
 /// Spec §5.7 / review A.6: a lone pseudised O or N converges at every allowed multiplicity (the spherical ensemble), and
-/// the lowest is Hund's: O M = 3, N M = 4. At each species' h_req, 12 Bohr, CoresOnly.
+/// the lowest F (the scan's rule, spec 2026-11-13 §6.5) is Hund's: O M = 3, N M = 4. At each species' h_req, 12 Bohr,
+/// CoresOnly.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
 fn lone_o_and_n_scan_picks_hund() {
@@ -274,9 +294,9 @@ fn lone_o_and_n_scan_picks_hund() {
         let s = setup(IonicPolicy::CoresOnly, h, &[z]);
         let es: Vec<(u32, f64, usize, usize)> = par_map(&ms, |&m| {
             let (e, _, stats) = solve_with(h, 12.0, s.clone(), vec![Nucleus { pos: [0.011, -0.007, 0.004], z }], Some(m), None);
-            (m, e, stats.iterations, stats.fractional.len())
+            (m, e, stats.iterations, stats.partial.len())
         });
-        eprintln!("Z = {z} at h = {h}: (M, E, SCF steps, shared clusters) {es:.6?}");
+        eprintln!("Z = {z} at h = {h}: (M, F, SCF steps, partly occupied levels) {es:.6?}");
         let best = es.iter().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0;
         assert_eq!(best, hund, "Z = {z}: the scan picks M = {best}");
     }
@@ -306,22 +326,25 @@ fn eggbox_floor(z: u8, mult: Option<u32>, policy: IonicPolicy) {
     let t0 = Instant::now();
     // 8 force probes, 8 ripple shifts, 3 lattice translates, MAX_PARALLEL_SOLVES at a time (each solve is single-threaded);
     // a job returns only its numbers — the state (≈ 30 MB at 61³) is dropped inside it
-    // (force, δ = 2e-3 force, SCF steps, every partly filled set shared: a fractional cluster and no release)
-    let forces: Vec<([f64; 3], [f64; 3], usize, bool)> = par_map(&probes, |&p| {
+    // (force, δ = 2e-3 force, SCF steps, TS: the state the site reached)
+    let forces: Vec<([f64; 3], [f64; 3], usize, f64)> = par_map(&probes, |&p| {
         let nuc = vec![Nucleus { pos: p, z }];
         let (_, st, stats) = solve_with(h, 12.0, s.clone(), nuc.clone(), mult, Some(1e-9));
         let (f, wide) = frozen_force(&g, &st, &s, &nuc, 0);
-        (f, wide, stats.iterations, stats.released.is_empty())
+        (f, wide, stats.iterations, stats.energy.ts)
     });
     let shifts: Vec<[f64; 3]> = ripple.iter().chain(&translates).copied().collect();
-    // each shift's occupation pattern is printed: spec §5.7's rule decides shared vs integer per site (Task 6 round 1)
-    let energies: Vec<(f64, f64, String, bool)> = par_map(&shifts, |&p| {
+    // each shift's occupations are printed: under Fermi–Dirac the reached state shows in TS (Task 6 round 1 found the
+    // first shared-shell rule switching state per site)
+    let energies: Vec<(f64, f64, String, f64)> = par_map(&shifts, |&p| {
         let (e, st, stats) = solve_with(h, 12.0, s.clone(), vec![Nucleus { pos: p, z }], mult, Some(1e-9));
-        (e, highest_occupied(&st), format!("shared {:?}; released {}; f↓ {:?}", stats.fractional.iter().map(|c| (c.spin, c.count, c.f, c.spread)).collect::<Vec<_>>(),
-                                           stats.released.len(), st.occ_dn), stats.released.is_empty())
+        (e, highest_occupied(&st), format!("TS {:.9e}; partial {:?}; f↓ {:?}", stats.energy.ts, stats.partial.iter().map(|l| (l.spin, l.f)).collect::<Vec<_>>(), st.occ_dn),
+         stats.energy.ts)
     });
-    for (p, (e, _, pattern, _)) in shifts.iter().zip(&energies) { eprintln!("  Z = {z}, shift ({:.3}, {:.3}, {:.3}): E {e:.9}; {pattern}", p[0], p[1], p[2]); }
-    let all_shared = forces.iter().all(|f| f.3) && energies.iter().all(|e| e.3);
+    for (p, (e, _, pattern, _)) in shifts.iter().zip(&energies) { eprintln!("  Z = {z}, shift ({:.3}, {:.3}, {:.3}): F {e:.9}; {pattern}", p[0], p[1], p[2]); }
+    // one state at every site: TS within 1e-6 Ha of the first site's (a state switch moves it by O(kT), 5e-3 Ha)
+    let ts0 = energies[0].3;
+    let all_shared = forces.iter().all(|f| (f.3 - ts0).abs() <= 1e-6) && energies.iter().all(|e| (e.3 - ts0).abs() <= 1e-6);
     let e0 = energies[0].0;
     let kappa = (-2.0 * energies[0].1).sqrt();
     let e_plus = [energies[8].0, energies[9].0, energies[10].0];
@@ -345,9 +368,9 @@ fn eggbox_floor(z: u8, mult: Option<u32>, policy: IonicPolicy) {
               (egg - f_atom).max(0.0), e_plus[0] - e0, e_plus[1] - e0, e_plus[2] - e0, spread(&es), spread(&corrected), t0.elapsed().as_secs_f64());
     assert!(wall_max <= 3e-4, "the wall term {wall_max:.2e} exceeds 10× the gate: enlarge the box (spec §6.6)");
     assert!(egg.is_finite() && spread(&corrected).is_finite());
-    // Task 6 re-review R5: no partly filled set released at any of the 19 sites, and the wall-subtracted ripple is the
-    // egg-box (expected ~3e-6 Ha for O), not occupation switching (round 1's rule gave 4.11e-3)
-    assert!(all_shared, "a partly filled set was released at some site (spec §5.7)");
+    // Task 6 re-review R5: one state at all 19 sites, and the wall-subtracted ripple is the egg-box (expected ~3e-6 Ha
+    // for O), not occupation switching (round 1's rule gave 4.11e-3)
+    assert!(all_shared, "the reached state (TS) differs between sites");
     assert!(spread(&corrected) < 1e-5, "wall-subtracted {{0, h/2}}³ spread {:.3e} Ha", spread(&corrected));
 }
 
@@ -432,44 +455,50 @@ fn h_floor_hf_matches_energy_differences() {
 }
 
 
-/// Task 6 re-review R5 (spec §5.7, τ's lower bound): at low-symmetry lattice sites every partly filled set of C, N, O
-/// and F is shared in its converged state with spread ≤ τ/10. Each species at its h_req (capped where none), a 12 Bohr
-/// box, sites (0, h/2, h/2), (h/2, 0, 0), (h/2, h/2, h/2), (h/4, h/4, h/4); cases O M = 1, 3, C M = 3, N M = 2 and F M = 2,
-/// each at its record h_req. Reported: the step-1 spread (a one-step solve at tol = ∞),
-/// which round 1's one-shot rule let decide. The box must not confine (no box-size warning is asserted): the review's 8 Bohr
-/// box gave C (diffuse 2p, h = 0.30) a face density of 1.4e-4 and a spread of 1.21e-4 at (0, h/2, h/2), against 3.6e-5 at
-/// 12 Bohr and 4.2e-5 at 16 Bohr (`c_spread_box_report`): the box's anisotropy, not the lattice's (Task 6 round 2).
+/// V0's site study under Fermi–Dirac (plan 2026-11-13 Task 10, repurposing Task 6 re-review R5's
+/// `degenerate_spread_at_low_symmetry_sites`, which held the deleted shared-shell rule's clusters to spread ≤ τ/10): at
+/// low-symmetry lattice sites every partly filled p set of C, N, O and F reaches the **symmetric** ensemble at
+/// kT = `ELECTRON_KT`. Each species at its h_req, a 12 Bohr box, sites (0, h/2, h/2), (h/2, 0, 0), (h/2, h/2, h/2),
+/// (h/4, h/4, h/4); cases O M = 1, 3, C M = 3, N M = 2 and F M = 2 (CoresOnly, CPU, tol 1e-6). Per site, asserted:
+/// - the state class (V4's rule R9, `gpu_vs_cpu::state_class`): |TS − TS_cf| ≤ 5 % of TS_cf, TS_cf the closed form of
+///   the case's equal-weight ensemble (spec §4.3 table): O M = 1 and N M = 2, two open p channels, 6 kT s(⅓) =
+///   1.90954e-2 Ha; O M = 3, C M = 3 and F M = 2, one open p channel, 3 kT s(⅓) = 9.5477e-3 Ha (V0 measured TS at the
+///   closed form to ≤ 1e-6 relative at every site; a polarised state sits near TS ≈ 0);
+/// - each channel's partly occupied levels within 1e-4 Ha of each other (`partial_spread`; τ/10, the shared-shell
+///   rule's bound, kept);
+/// - no box-size warning (the review's 8 Bohr box confined C; Task 6 round 2: `c_spread_box_report`).
+/// Reported: F and its site spread per case (V0's site-spread rule compared it with the shared-shell E spread; that rule
+/// is gone, so the spread is printed for references.md, not gated).
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
 fn degenerate_spread_at_low_symmetry_sites() {
     // each species at its h_req (Task 6: O 0.20, C 0.30, N 0.30 at -3; N 0.20 at -4, c = ¼; F 0.15)
     let at = |z: u8| table(z).record.h_req.expect("an M7 species has h_req");
-    let cases: [(u8, u32, f64); 5] = [(8, 1, at(8)), (8, 3, at(8)), (6, 3, at(6)), (7, 2, at(7)), (9, 2, at(9))];
-    let jobs: Vec<(u8, u32, f64, [f64; 3])> = cases.iter().flat_map(|&(z, m, h)| {
-        [[0.0, h / 2.0, h / 2.0], [h / 2.0, 0.0, 0.0], [h / 2.0, h / 2.0, h / 2.0], [h / 4.0, h / 4.0, h / 4.0]].map(move |p| (z, m, h, p))
+    let (one, two) = (3.0 * ELECTRON_KT * level_entropy(1.0 / 3.0), 6.0 * ELECTRON_KT * level_entropy(1.0 / 3.0));
+    let cases: [(u8, u32, f64, f64); 5] = [(8, 1, at(8), two), (8, 3, at(8), one), (6, 3, at(6), one), (7, 2, at(7), two), (9, 2, at(9), one)];
+    let jobs: Vec<(u8, u32, f64, f64, [f64; 3])> = cases.iter().flat_map(|&(z, m, h, ts_cf)| {
+        [[0.0, h / 2.0, h / 2.0], [h / 2.0, 0.0, 0.0], [h / 2.0, h / 2.0, h / 2.0], [h / 4.0, h / 4.0, h / 4.0]].map(move |p| (z, m, h, ts_cf, p))
     }).collect();
-    let setups: HashMap<(u8, u64), Arc<IonicSetup>> = cases.iter().map(|&(z, _, h)| ((z, h.to_bits()), setup(IonicPolicy::CoresOnly, h, &[z]))).collect();
-    let rows = par_map(&jobs, |&(z, m, h, p)| {
+    let setups: HashMap<(u8, u64), Arc<IonicSetup>> = cases.iter().map(|&(z, _, h, _)| ((z, h.to_bits()), setup(IonicPolicy::CoresOnly, h, &[z]))).collect();
+    let rows = par_map(&jobs, |&(z, m, h, ts_cf, p)| {
         let s = setups[&(z, h.to_bits())].clone();
-        let g = Grid::cube(n_for(12.0, h), h);
-        let nuc = vec![Nucleus { pos: p, z }];
-        let sys = System::with_ionic(nuc.clone(), 0, Some(m), s.clone());
-        let mut one = ScfSettings::for_grid(&g);
-        (one.tol, one.max_iter, one.eig_tol) = (f64::INFINITY, 1, 1e-7);
-        one.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
-        let (_, first) = scf(&g, &sys, &one, None).unwrap();
-        let (_, _, stats) = solve_with(h, 12.0, s, nuc, Some(m), None);
-        (z, m, h, p, first.fractional.iter().map(|c| c.spread).fold(0.0f64, f64::max), stats)
+        let (f, _, stats) = solve_with(h, 12.0, s, vec![Nucleus { pos: p, z }], Some(m), None);
+        (z, m, h, ts_cf, p, f, stats)
     });
     let mut bad = Vec::new();
-    for (z, m, h, p, step1, stats) in &rows {
-        let worst = stats.fractional.iter().map(|c| c.spread).fold(0.0f64, f64::max);
-        eprintln!("Z = {z} M = {m} h = {h} at ({:.3}, {:.3}, {:.3}): step-1 spread {step1:.2e}; converged shared {:?}, released {:?}; worst spread {worst:.2e} ({} steps)",
-                  p[0], p[1], p[2], stats.fractional.iter().map(|c| (c.spin, c.count, c.f)).collect::<Vec<_>>(), stats.released, stats.iterations);
+    for (z, m, h, ts_cf, p, f, stats) in &rows {
+        let spread = partial_spread(stats);
+        let symmetric = (stats.energy.ts - ts_cf).abs() <= 0.05 * ts_cf;
+        eprintln!("Z = {z} M = {m} h = {h} at ({:.3}, {:.3}, {:.3}): F {f:.9} TS {:.9e} (closed form {ts_cf:.9e}, relative {:+.2e}); partial {:?}; spread {spread:.2e} ({} steps)",
+                  p[0], p[1], p[2], stats.energy.ts, (stats.energy.ts - ts_cf) / ts_cf, stats.partial.iter().map(|l| (l.spin, l.f)).collect::<Vec<_>>(), stats.iterations);
         let confined = stats.warnings.iter().any(|w| w.contains("box too small"));
-        if stats.fractional.is_empty() || !stats.released.is_empty() || worst > DEGENERACY_TAU / 10.0 || confined { bad.push((*z, *m, *p)); }
+        if !symmetric || spread > 1e-4 || confined { bad.push((*z, *m, *p)); }
     }
-    assert!(bad.is_empty(), "not shared with spread ≤ τ/10 at: {bad:?} (Task 6 re-review R1-M2: back to physics review, never a larger τ)");
+    for &(z, m, _, _) in &cases {
+        let fs: Vec<f64> = rows.iter().filter(|r| r.0 == z && r.1 == m).map(|r| r.5).collect();
+        eprintln!("Z = {z} M = {m}: site spread of F over the four sites {:.2e} Ha", fs.iter().copied().fold(f64::MIN, f64::max) - fs.iter().copied().fold(f64::MAX, f64::min));
+    }
+    assert!(bad.is_empty(), "not the symmetric ensemble with spread ≤ 1e-4 at: {bad:?} (back to physics review, never a looser bound)");
 }
 
 // ---- M7 Task 7: forces under pseudopotentials ----
@@ -491,8 +520,9 @@ fn assert_box_warning_only(label: &str, warnings: &[String], box_expected: Optio
 /// energy; `qm::forces` derives the HF − FD(0.01) floor at ≈ 2–3e-5 (FD truncation) and the Richardson floor below
 /// 2e-5; 1e-4 is 5× that floor — a spec revision, §6.6).
 /// Common fixture: h = min(0.25, h_req,O) = 0.20 — the coarsest grid the O table is certified at, so the smallest grid
-/// the physics allows — in a 10 Bohr box (51³); `DegenerateShells` (the providers' choice under the pseudo policies,
-/// spec §5.7); tol = eig_tol = 1e-9; CPU, because the check needs f64 energies to 1e-9 (a GPU f32 energy's noise is
+/// the physics allows — in a 10 Bohr box (51³); Fermi–Dirac at `ELECTRON_KT` (the providers' choice; the shared-shell
+/// rule of spec §5.7 before plan 2026-11-13 Task 10 — HF is −dF/dR under FD, −dE/dR at its fixed f before, and FD
+/// differentiates F); tol = eig_tol = 1e-9; CPU, because the check needs f64 energies to 1e-9 (a GPU f32 energy's noise is
 /// ~1e-6 Ha, and HF on an f32-converged state carries the 1e-5-class first-order SCF error: Task 7 review ruling 3).
 /// The 10 Bohr box keeps every H ≥ 3.1 Bohr from a face; HF-vs-FD is an identity of the discrete problem in any box,
 /// but a smaller box would press the H density into the Dirichlet wall (face density far above the 1e-5 warning) and
@@ -507,14 +537,13 @@ fn hf_vs_fd(name: &str, base: &[Nucleus], mult: Option<u32>, moves: &[(usize, us
     let g = Grid::cube(n_for(box_bohr, h), h);
     let mut set = ScfSettings::for_grid(&g);
     (set.tol, set.eig_tol) = (1e-9, 1e-9);
-    set.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
     let t0 = Instant::now();
     let sys0 = System::with_ionic(base.to_vec(), 0, mult, s.clone());
     let (st, stats) = scf(&g, &sys0, &set, None).expect("SCF converges");
     let hf = qm::forces(&g, &st, &sys0.nuclei, set.sigma).unwrap();
-    eprintln!("{name} (CoresOnly) at h = {h}, {}³ ({box_bohr} Bohr): E {:.10} in {} steps ({:.0} s), face density {:.2e}, shared {:?}, warnings {:?}; HF {:?}; ΣF {:?}",
-              g.n[0], stats.energy.total, stats.iterations, t0.elapsed().as_secs_f64(), stats.boundary_density,
-              stats.fractional.iter().map(|c| (c.spin, c.count, c.f, c.spread)).collect::<Vec<_>>(), stats.warnings,
+    eprintln!("{name} (CoresOnly) at h = {h}, {}³ ({box_bohr} Bohr): F {:.10} (TS {:.6e}) in {} steps ({:.0} s), face density {:.2e}, partial {:?}, warnings {:?}; HF {:?}; ΣF {:?}",
+              g.n[0], stats.energy.total, stats.energy.ts, stats.iterations, t0.elapsed().as_secs_f64(), stats.boundary_density,
+              stats.partial.iter().map(|l| (l.spin, l.f)).collect::<Vec<_>>(), stats.warnings,
               hf.iter().map(|f| f.map(|x| format!("{x:+.7}"))).collect::<Vec<_>>(),
               [0, 1, 2].map(|a| format!("{:+.2e}", hf.iter().map(|f| f[a]).sum::<f64>())));
     assert_box_warning_only(&format!("{name} unshifted"), &stats.warnings, box_expected);
@@ -523,7 +552,7 @@ fn hf_vs_fd(name: &str, base: &[Nucleus], mult: Option<u32>, moves: &[(usize, us
         let mut nuc = base.to_vec();
         nuc[i].pos[a] += d;
         let (_, stats) = scf(&g, &System::with_ionic(nuc, 0, mult, s.clone()), &set, Some(&st)).expect("SCF converges");
-        (stats.energy.total, stats.iterations, stats.fractional.len(), stats.warnings)
+        (stats.energy.total, stats.iterations, stats.partial.len(), stats.warnings)
     });
     for ((i, a, d), r) in jobs.iter().zip(&es) { assert_box_warning_only(&format!("{name} nucleus {i} axis {a} δ {d:+}"), &r.3, None); }
     let e = |i: usize, a: usize, d: f64| es[jobs.iter().position(|&(ji, ja, jd)| (ji, ja, jd) == (i, a, d)).unwrap()].0;
@@ -536,13 +565,14 @@ fn hf_vs_fd(name: &str, base: &[Nucleus], mult: Option<u32>, moves: &[(usize, us
         assert!((hf[i][a] - d1).abs() < 2e-3, "{name} nucleus {i} axis {a}: HF {} vs FD {d1}", hf[i][a]);
         assert!((hf[i][a] - rich).abs() < 1e-4, "{name} nucleus {i} axis {a}: HF {} vs Richardson {rich} (plan review S2)", hf[i][a]);
     }
-    eprintln!("{name} displaced solves (warm): steps {:?}, shared clusters {:?}; total {:.0} s", es.iter().map(|x| x.1).collect::<Vec<_>>(),
+    eprintln!("{name} displaced solves (warm): steps {:?}, partly occupied levels {:?}; total {:.0} s", es.iter().map(|x| x.1).collect::<Vec<_>>(),
               es.iter().map(|x| x.2).collect::<Vec<_>>(), t0.elapsed().as_secs_f64());
 }
 
 /// Spec §8 row 7 first failing test, on OH (`hf_vs_fd`): FD along x (near the bond axis) on both nuclei. OH is a
-/// doublet, 1π³: the minority π pair is shared ½–½ under `DegenerateShells` (spec §5.7; an integer hole's orientation
-/// is the near-zero mode of Task 6's O triplet), so this exercises fractional f. Its face density, 1.6e-5, raises the
+/// doublet, 1π³: the minority π pair holds one electron, f ≈ ½ each under Fermi–Dirac (the shared-shell rule's ½–½ before
+/// plan 2026-11-13 Task 10; an integer hole's orientation is the near-zero mode of Task 6's O triplet), so this exercises
+/// fractional f and −d(TS)/dR. Its face density, 1.6e-5, raises the
 /// box warning (asserted present, and alone). 760 s (2026-10-17).
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test pseudo")]
@@ -619,9 +649,9 @@ fn o_floor_attribution_report() {
         let nuc = vec![Nucleus { pos: [h / 4.0; 3], z: 8 }];
         let t0 = Instant::now();
         let (e, st, stats) = solve_with(h, 16.0, s.clone(), nuc.clone(), Some(3), Some(1e-9));
-        eprintln!("pseudo-O triplet at (h/4)³, h = {h}, 16 Bohr ({}³), CPU tol 1e-9: {}; E {e:.9}, {} steps, shared {:?}, released {}, face {:.1e}; {:.0} s",
-                  g.n[0], attribution_line(&g, &st, &s, &nuc), stats.iterations, stats.fractional.iter().map(|c| (c.spin, c.count, c.spread)).collect::<Vec<_>>(),
-                  stats.released.len(), stats.boundary_density, t0.elapsed().as_secs_f64());
+        eprintln!("pseudo-O triplet at (h/4)³, h = {h}, 16 Bohr ({}³), CPU tol 1e-9: {}; F {e:.9}, {} steps, partial {:?}, face {:.1e}; {:.0} s",
+                  g.n[0], attribution_line(&g, &st, &s, &nuc), stats.iterations, stats.partial.iter().map(|l| (l.spin, l.f)).collect::<Vec<_>>(),
+                  stats.boundary_density, t0.elapsed().as_secs_f64());
     }
 }
 
@@ -694,7 +724,7 @@ fn o2_shifts(h: f64) -> (Vec<[f64; 3]>, Vec<[f64; 3]>) {
 }
 
 /// The O₂ probe's analysis (`o2_eggbox_gate_early_run`'s doc), shared by the CPU and GPU runs: `forces[i]` = (ΣF, SCF
-/// steps, shared + released clusters) at `probes[i]`, `energies[j]` = (E, ε_max) at `o2_shifts`'s j-th energy shift.
+/// steps, partly occupied levels) at `probes[i]`, `energies[j]` = (E, ε_max) at `o2_shifts`'s j-th energy shift.
 /// Prints the per-shift lines and the verdict line; returns the wall-subtracted max |ΣF| and the wall maximum.
 fn o2_summary(label: &str, h: f64, forces: &[([f64; 3], usize, usize)], energies: &[(f64, f64)], secs: f64) -> (f64, f64) {
     let (probes, shifts) = o2_shifts(h);
@@ -708,7 +738,7 @@ fn o2_summary(label: &str, h: f64, forces: &[([f64; 3], usize, usize)], energies
     for (p, &(f, steps, shared)) in probes.iter().zip(forces) {
         let fw = wall.force(*p);
         let fc = [f[0] - fw[0], f[1] - fw[1], f[2] - fw[2]];
-        eprintln!("  O₂ [{label}] shift ({:+.3}, {:+.3}, {:+.3}): ΣF ({:+.3e}, {:+.3e}, {:+.3e}), wall ({:+.3e}, {:+.3e}, {:+.3e}), corrected ({:+.3e}, {:+.3e}, {:+.3e}) |{:.3e}|; {steps} steps; shared/released clusters {shared}",
+        eprintln!("  O₂ [{label}] shift ({:+.3}, {:+.3}, {:+.3}): ΣF ({:+.3e}, {:+.3e}, {:+.3e}), wall ({:+.3e}, {:+.3e}, {:+.3e}), corrected ({:+.3e}, {:+.3e}, {:+.3e}) |{:.3e}|; {steps} steps; partly occupied levels {shared}",
                   p[0], p[1], p[2], f[0], f[1], f[2], fw[0], fw[1], fw[2], fc[0], fc[1], fc[2], norm(fc));
         raw = raw.max(norm(f));
         wall_max = wall_max.max(norm(fw));
@@ -744,7 +774,7 @@ fn o2_eggbox_gate_early_run() {
     let forces: Vec<([f64; 3], usize, usize)> = par_map(&probes, |&p| {
         let nuc = o2_at(p);
         let (_, st, stats) = solve_with(h, 14.0, s.clone(), nuc.clone(), Some(3), Some(1e-9));
-        (frozen_sum_force(&g, &st, &s, &nuc), stats.iterations, stats.fractional.len() + stats.released.len())
+        (frozen_sum_force(&g, &st, &s, &nuc), stats.iterations, stats.partial.len())
     });
     let energies: Vec<(f64, f64)> = par_map(&shifts, |&p| { let (e, st, _) = solve_with(h, 14.0, s.clone(), o2_at(p), Some(3), Some(1e-9)); (e, highest_occupied(&st)) });
     let (_, wall_max) = o2_summary("CPU, tol 1e-9", h, &forces, &energies, t0.elapsed().as_secs_f64());
@@ -769,7 +799,7 @@ const GPU_REPORT_TOL: f64 = 1e-6;
 fn vram_mb(ctx: &gpu::GpuContext) -> f64 { ctx.device.generate_allocator_report().map_or(f64::NAN, |r| r.total_allocated_bytes as f64 / 1e6) }
 
 /// `solve_with` on the GPU: the same settings (`for_grid`, eig_tol 1e-7 — the GPU raises it to 3× its f32 floor —,
-/// `DegenerateShells`), tol `GPU_REPORT_TOL`, cold; the state downloaded as a `KsState` for the f64 frozen probes.
+/// Fermi–Dirac at `ELECTRON_KT`), tol `GPU_REPORT_TOL`, cold; the state downloaded as a `KsState` for the f64 frozen probes.
 fn gpu_solve_with(solver: &mut GpuSolver, setup: Arc<IonicSetup>, nuclei: Vec<Nucleus>, mult: Option<u32>) -> (f64, KsState, qm::ScfStats) {
     gpu_solve_from(solver, setup, nuclei, mult, false)
 }
@@ -781,7 +811,6 @@ fn gpu_solve_from(solver: &mut GpuSolver, setup: Arc<IonicSetup>, nuclei: Vec<Nu
     let mut s = ScfSettings::for_grid(&g);
     s.eig_tol = 1e-7;
     s.tol = GPU_REPORT_TOL;
-    s.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
     let (_, stats) = solver.solve(&sys, &s, warm).unwrap_or_else(|e| panic!("GPU SCF: {e}"));
     let st = solver.ks_state(solver.state().expect("a converged state"));
     (stats.energy.total, st, stats)
@@ -804,9 +833,9 @@ fn o_floor_attribution_gpu() {
         let (e, st, stats) = gpu_solve_with(&mut solver, s.clone(), nuc.clone(), Some(3));
         let t_solve = t0.elapsed().as_secs_f64();
         let line = attribution_line(&g, &st, &s, &nuc);
-        eprintln!("pseudo-O triplet at (h/4)³, h = {h}, 16 Bohr ({}³), GPU tol {GPU_REPORT_TOL:.0e} (Δρ {:.2e}): {line}; E {e:.9}, {} steps, shared {:?}, released {}, face {:.1e}; GPU solve {t_solve:.1} s, total {:.0} s; VRAM allocated {:.0} MB",
-                  g.n[0], stats.delta_rho, stats.iterations, stats.fractional.iter().map(|c| (c.spin, c.count, c.spread)).collect::<Vec<_>>(),
-                  stats.released.len(), stats.boundary_density, t0.elapsed().as_secs_f64(), vram_mb(&ctx));
+        eprintln!("pseudo-O triplet at (h/4)³, h = {h}, 16 Bohr ({}³), GPU tol {GPU_REPORT_TOL:.0e} (Δρ {:.2e}): {line}; F {e:.9}, {} steps, partial {:?}, face {:.1e}; GPU solve {t_solve:.1} s, total {:.0} s; VRAM allocated {:.0} MB",
+                  g.n[0], stats.delta_rho, stats.iterations, stats.partial.iter().map(|l| (l.spin, l.f)).collect::<Vec<_>>(),
+                  stats.boundary_density, t0.elapsed().as_secs_f64(), vram_mb(&ctx));
     }
 }
 
@@ -965,7 +994,6 @@ fn o2_gpu_protocol_report() {
         let sys = System::with_ionic(nuc.clone(), 0, Some(3), s.clone());
         let mut set = ScfSettings::for_grid(&g);
         (set.eig_tol, set.tol) = (1e-7, GPU_REPORT_TOL);
-        set.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
         let (_, stats_b) = solver.solve(&sys, &set, true).expect("GPU warm converges");
         let st_b = solver.ks_state(solver.state().unwrap());
         let f_b = frozen_sum_force(&g, &st_b, &s, &nuc);
@@ -992,8 +1020,8 @@ fn c_spread_box_report() {
     let s = setup(IonicPolicy::CoresOnly, h, &[6]);
     for b in [8.0, 12.0, 16.0] {
         let (e, _, stats) = solve_with(h, b, s.clone(), vec![Nucleus { pos: [0.0, h / 2.0, h / 2.0], z: 6 }], Some(3), None);
-        eprintln!("C M = 3 at (0, h/2, h/2), h = {h}, {b} Bohr: E {e:.9}; shared {:?}; released {}; face {:.1e}",
-                  stats.fractional.iter().map(|c| (c.spin, c.count, c.spread)).collect::<Vec<_>>(), stats.released.len(), stats.boundary_density);
+        eprintln!("C M = 3 at (0, h/2, h/2), h = {h}, {b} Bohr: F {e:.9}; partial {:?}; partly occupied spread {:.2e}; face {:.1e}",
+                  stats.partial.iter().map(|l| (l.spin, l.f)).collect::<Vec<_>>(), partial_spread(&stats), stats.boundary_density);
     }
 }
 
@@ -1505,7 +1533,6 @@ fn o2_cpu_probe_polish_report() {
         let sys = System::with_ionic(nuc.clone(), 0, Some(3), s.clone());
         let mut set = ScfSettings::for_grid(&g);
         (set.tol, set.eig_tol) = (1e-9, 1e-9);
-        set.occupations = Occupations::DegenerateShells { tau: DEGENERACY_TAU };
         let (st_c, stats_c) = scf(&g, &sys, &set, Some(&st_a)).expect("the CPU polish converges");
         let f_c = frozen_sum_force(&g, &st_c, &s, &nuc);
         let (ef_c, _) = ks_energy_f64(&g, &occupied(&g, &st_c), &st_c.v_h, &s, &nuc, &mut poisson);
@@ -1847,9 +1874,9 @@ fn o_floor_attribution_h_scan_gpu() {
         let (e, st, stats) = gpu_solve_with(&mut solver, s.clone(), nuc.clone(), Some(3));
         let line = attribution_line(&g, &st, &s, &nuc);
         let c = &ft.check;
-        eprintln!("pseudo-O triplet at (h/4)³, h = {h}{}, 16 Bohr ({}³), GPU tol {GPU_REPORT_TOL:.0e}: {line}; E {e:.9}, {} steps, Δρ {:.1e}, shared {:?}; {}; T8 row: ΔE {:+.3} mHa, Δε {:.3} mHa, T3 {:.3} mHa, clamp {}, F_table [{}]; {:.0} s, VRAM {:.0} MB",
+        eprintln!("pseudo-O triplet at (h/4)³, h = {h}{}, 16 Bohr ({}³), GPU tol {GPU_REPORT_TOL:.0e}: {line}; E {e:.9}, {} steps, Δρ {:.1e}, partial {:?}; {}; T8 row: ΔE {:+.3} mHa, Δε {:.3} mHa, T3 {:.3} mHa, clamp {}, F_table [{}]; {:.0} s, VRAM {:.0} MB",
                   pc_from.map_or(String::new(), |hp| format!(" (ρ_pc filtered at {hp})")), g.n[0], stats.iterations, stats.delta_rho,
-                  stats.fractional.iter().map(|x| (x.spin, x.count, x.spread)).collect::<Vec<_>>(), pc_diagnostics(&ft),
+                  stats.partial.iter().map(|x| (x.spin, x.f)).collect::<Vec<_>>(), pc_diagnostics(&ft),
                   c.de * 1e3, c.max_eig * 1e3, c.t3_max * 1e3, c.clamped, sci(&c.f_table), t0.elapsed().as_secs_f64(), vram_mb(&ctx));
     }
 }

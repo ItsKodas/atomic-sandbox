@@ -189,7 +189,7 @@ pub fn free_atom_density(grid: &Grid, nuclei: &[Nucleus], sigma: f64) -> Option<
 /// The SCF's cold density guess and the charge it carries, per centre (plan 2026-11-13 Task 9c (a); task 9c review M4):
 /// under `free_atoms` (the `FermiDirac` solves) an all-electron centre starts from its σ-smeared free atom
 /// (`free_atom_density` at the centre's own σ — `sigma` without a setup) and a pseudised one from a σ = 1 Bohr blob of
-/// its valence charge Z_v; otherwise (`Aufbau`, `DegenerateShells`: their pinned bits) every centre is the σ = 1 blob of
+/// its valence charge Z_v; otherwise (`Aufbau`: its pinned bits) every centre is the σ = 1 blob of
 /// its charge (Z, or Z_v when pseudised), as before Task 9c. A free atom that does not solve falls back to its blob.
 /// Returns (Σ charges, the unnormalised density); the caller scales it to the electron count.
 pub fn cold_guess(grid: &Grid, nuclei: &[Nucleus], setup: Option<&IonicSetup>, sigma: f64, free_atoms: bool) -> (f64, Vec<f64>) {
@@ -422,7 +422,7 @@ mod tests {
     }
 
     /// Task 9c review M4: the cold guess per centre. Without a setup and under FermiDirac it is `free_atom_density`
-    /// bit for bit; without free atoms it is the σ = 1 blobs bit for bit (the Aufbau / DegenerateShells pins); with a
+    /// bit for bit; without free atoms it is the σ = 1 blobs bit for bit (the Aufbau pins); with a
     /// CoresOnly setup (pseudo-O, all-electron H) the H is its free atom and the O a blob of Z_v, each centre carrying its
     /// charge on the grid.
     #[test]
