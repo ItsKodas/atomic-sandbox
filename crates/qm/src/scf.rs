@@ -308,8 +308,8 @@ use crate::error::QmError;
 use crate::grid::{neumaier, Grid};
 use crate::ionic::{core_overlaps, IonicSetup, CORE_OVERLAP_WARNING};
 use crate::nonlocal::{NonlocalOp, PseudoHamiltonian};
-use crate::nuclear::{centres, deposit_centres, has_partial_core, ionic_local_potential, ionic_repulsion, partial_core_field, Centre};
-use crate::nuclear::{deposit_charge, free_atom_density, nuclear_potential, nuclear_repulsion, Nucleus};
+use crate::nuclear::{has_partial_core, ionic_local_potential, ionic_repulsion, partial_core_field};
+use crate::nuclear::{cold_guess, nuclear_potential, nuclear_repulsion, Nucleus};
 use crate::poisson::{hartree_energy, PoissonSolver, PoissonStats};
 use crate::stencil::kinetic;
 use crate::xc::{lsda_pw92, XcResult};
@@ -1122,18 +1122,11 @@ fn scf_tiered(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option
         _ => {
             let total = (system.n_up + system.n_dn) as f64;
             // broad atomic-like blobs (σ = 1 Bohr) carrying each centre's charge (Z, or Z_v when pseudised)
-            let (z_tot, guess) = match system.ionic.as_deref() {
-                // FermiDirac starts from the free atoms' densities (plan 2026-11-13 Task 9c (a), `qm::nuclear::free_atom_density`);
-                // Aufbau and DegenerateShells keep the sigma = 1 blobs (their bits)
-                None => (system.nuclei.iter().map(|q| q.z as f64).sum::<f64>(), match settings.occupations {
-                    Occupations::FermiDirac { .. } => free_atom_density(grid, &system.nuclei, settings.sigma).unwrap_or_else(|| deposit_charge(grid, &system.nuclei, 1.0)),
-                    Occupations::Aufbau | Occupations::DegenerateShells { .. } => deposit_charge(grid, &system.nuclei, 1.0),
-                }),
-                Some(s) => {
-                    let c: Vec<Centre> = centres(&system.nuclei, s).into_iter().map(|c| Centre { sigma: 1.0, ..c }).collect();
-                    (c.iter().map(|c| c.charge).sum::<f64>(), deposit_centres(grid, &c))
-                }
-            };
+            // the cold guess (`qm::nuclear::cold_guess`): free atoms for all-electron centres under FermiDirac (plan 2026-11-13
+            // Task 9c (a), review M4), σ = 1 blobs of the centre's charge otherwise (pseudised centres; Aufbau and
+            // DegenerateShells keep their bits)
+            let (z_tot, guess) = cold_guess(grid, &system.nuclei, system.ionic.as_deref(), settings.sigma,
+                                            matches!(settings.occupations, Occupations::FermiDirac { .. }));
             let scale = if z_tot > 0.0 { total / z_tot } else { 0.0 };
             let fu = if total > 0.0 { system.n_up as f64 / total } else { 0.0 };
             let fd = if total > 0.0 { system.n_dn as f64 / total } else { 0.0 };

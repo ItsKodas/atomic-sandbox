@@ -2,7 +2,8 @@
 //! the total-energy functional and why it is evaluated from the *output* density with a fresh
 //! Poisson solve, the Pulay/DIIS derivation with the two spin channels stacked and the
 //! charge-conservation argument, the electron-count/multiplicity rules, the warm-start rules
-//! and the box-size warning). The algorithm is step for step the CPU's:
+//! and the box-size warning). The algorithm is the CPU's (under `FermiDirac` the GPU adds the buffer column, the
+//! step-accuracy tail and the DIIS rule at a stalled freeze, plan 2026-11-13 Tasks 9c–9d; the CPU has none of them):
 //!   V_eff,σ = V_nuc + V_H[ρ_in] + v_xc,σ[ρ_in↑, ρ_in↓]  →  lowest n_σ eigenpairs of H_σ per spin
 //!   →  ρ_out,σ = Σ_i ψ_{iσ}²,  Δρ = ∫(|ρ_out↑ − ρ_in↑| + |ρ_out↓ − ρ_in↓|)  →  DIIS mix,
 //! and the energy E = T_s + E_ext + E_H + E_xc + E_nn from ρ_out and the orbitals. This doc
@@ -188,7 +189,8 @@
 //! ("Occupations" there is the physics: the Mermin free energy F = E − kT·S at fixed N_σ, its stationarity, the
 //! witness), run on the host on the GPU's eigenvalues — the same f64 functions after the same f64 Rayleigh–Ritz, so CPU
 //! and GPU share every operation after the eigenvalues (G4):
-//! - per spin and step (`Channel::solve_fd`, `qm::scf::solve_fd` step for step, the same seeds for the grown vectors):
+//! - per spin and step (`Channel::solve_fd`: `qm::scf::solve_fd`'s rule with the same seeds for the grown vectors, plus
+//!   the GPU's buffer column and step-accuracy tail, "The cold-start window" below):
 //!   solve the block with its tight columns at the step's eigen tol and its loose (witness) columns at the guard
 //!   tolerance (`eigen::lobpcg_guarded`; `qm::occupations` "Witness columns at a guard tolerance": loose iff the
 //!   upper-bound f tail stays below 1e-2·tol), `qm::fermi_dirac` on its levels, re-solve when a column needs to change
@@ -198,16 +200,18 @@
 //!   budget); a cold start solves N_σ + 1 per occupied spin, a warm one keeps its block.
 //! - **The cold-start window** (plan 2026-11-13 Task 9c; measured on all-electron H₂O 97³ × 0.25, the task 9b review's
 //!   regression case: 22 steps, 123 s, a peak block of 22 vectors per spin). (a) Under `FermiDirac` the cold density is
-//!   the superposition of the free atoms (`qm::nuclear::free_atom_density`, Z only), each convolved with the nuclear
+//!   the superposition of the free atoms at the all-electron centres (`qm::nuclear::cold_guess`; pseudised centres are
+//!   σ = 1 blobs of Z_v; `free_atom_density`, Z only), each convolved with the nuclear
 //!   Gaussian σ so that the core screens the smeared nucleus as the grid sees it; the σ = 1 blobs put the first steps'
 //!   μ in the box continuum (−0.003 Ha with the unsmeared free atoms, whose 1s sits inside σ = h: every level of the
 //!   first potential then lay above −0.04 Ha). (b) A loosened step's witness tail is tied to its accuracy
 //!   (`qm::step_tail_kt`). (c) The block's top column is an untested buffer (`Channel::solve_fd`), which decides the
-//!   witness itself when its own lower bound passes (one vector is then added as the next buffer, instead of doubling
-//!   the extras: without that the buffer cost the 97³ solve a 13 → 21 doubling). (d), a loose stop at the per-column
+//!   witness itself when its own θ − r passes at r ≤ g (premise M2, task 9c review I1: an unconverged buffer can hide
+//!   weight below θ − r; one vector is then added as the next buffer; at r > g the block grows by one, where doubling
+//!   the extras cost the 97³ solve a 13 → 21 doubling). (d), a loose stop at the per-column
 //!   density bound, was measured and not adopted (`qm::occupations` "No loose stop"). Measured: 11 steps, 11 s, peak
-//!   block 14 (9 extra vectors per spin, the buffer included; the step-1 36 kT window); the 14 Bohr box of the app's
-//!   177³ VRAM case (run at 167³ × 0.0848): 14 steps, 36 s, peak block 8 (3 extra vectors per spin), no growth.
+//!   block 14 (9 extra vectors per spin, the buffer included; the step-1 36 kT window); the app's 177³ × 0.08 VRAM case
+//!   (14 Bohr): 13 steps, 41 s, peak block 8 (3 extra vectors per spin), no growth — `providers::ks::WITNESS_GROWTH_COUNTED`.
 //! - **Pause and cancel inside an eigensolve** (Task 9c): `solve_polled`'s second poll reaches the FD channels' LOBPCG
 //!   (once per iteration; `solve_with`/`solve_observed` keep their one poll per step, which callers count as steps —
 //!   the Activity probe); an aborted eigensolve abandons the solve like an abort before a step, parking the iterate as
@@ -218,6 +222,20 @@
 //!   iterated) is frozen: the DIIS restart below fires only when a frozen step is followed by one whose tight columns
 //!   moved. Before 9b one block-wide max residual, the witness's included, drove both decisions, and H₃⁺ at 1.6 r₀
 //!   alternated 0 / ≈ 25 iterations with a DIIS reset every other step (no convergence in 200).
+//! - **The DIIS history at a freeze** (FD channels; plan 2026-11-13 Task 9d). A frozen step's output density is the one
+//!   the last unfrozen step's orbitals gave, so of the history only that step's entry and the frozen steps' own were
+//!   measured on the frozen map ρ_in ↦ ρ_out = const — affine, on which the Pulay mix contracts the residual by at least
+//!   1 − α per step (the last entry alone already does). Older entries keep their weight and can pin the
+//!   extrapolation: measured on the extrapolated H₂ 33³ warm path (`providers::gpu_provider_matches_cpu_provider_at_fixed_sigma`),
+//!   two pre-freeze entries held coefficients −2.3 / +3.3 and their clamped combination sat at Δρ 7.0–7.2e-6 for five
+//!   frozen steps until they aged out (10 steps against a cold 9). So a frozen step that follows a frozen step and
+//!   fails that contraction (Δρ > (1 − α)·Δρ_prev) drops every entry older than the freeze (`Diis::push_keep`;
+//!   `SolveProfile::diis_freeze_trims`): 7 steps there. Rules measured (that test's extrapolated / cold steps; the
+//!   stretched-H₂ gate's 65³ R 6 / 107³ R 5.75, ≤ 30; with the review-I1 buffer rule): none 10 > 9 (11 / 18); a full
+//!   restart at every freeze 6 (55 before I1); keep only the newest entry at every freeze 6 ≤ 10, but 11 / 39 — it
+//!   lets the density converge onto the stale frozen output of a high-response pair and the unfreeze jumps Δρ 10–100×;
+//!   the stall rule 7 ≤ 9, 11 / 18 (it never fires there). `Aufbau` and `DegenerateShells` keep their history (their
+//!   bits are pinned).
 //! - **The guess band only in the convergence phase** (FD channels; plan 2026-11-13 Task 9b). With the witness out of the
 //!   decision, FD solves would freeze as often as `Aufbau` ones do — and before 9b they practically never froze early,
 //!   because the diffuse witness held the block-wide residual above the band. A tight head that hovers at the band edge
@@ -303,7 +321,7 @@ use crate::stencil::kinetic_in;
 use gpu::{GpuContext, Volume3D};
 use nalgebra::{DMatrix, DVector};
 use qm::ionic::{core_overlaps, IonicSetup, CORE_OVERLAP_WARNING};
-use qm::nuclear::{centres, deposit_centres, deposit_charge, free_atom_density, ionic_repulsion, nuclear_repulsion, Centre};
+use qm::nuclear::{cold_guess, ionic_repulsion, nuclear_repulsion};
 use qm::scf::{ascending, decide, degenerate_shell_occupations, initial_orbitals, shared_runs, FractionalShell, MAX_WITNESS_GROWTH};
 use qm::{fermi_dirac, grown_extras, partial_levels, step_tail_kt, tight_columns, tight_start, witness_bound_reached_tail, witness_keep_tail, FdOccupations, PartialLevel, WITNESS_GAP,
          WITNESS_GUARD_TOL, WITNESS_TAIL_KT};
@@ -458,6 +476,14 @@ pub struct SolveProfile {
     /// `FermiDirac`: the channel solves decided by the buffer's own lower bound (`Channel::solve_fd`; each then adds one
     /// vector, the next buffer).
     pub buffer_witnesses: usize,
+    /// `FermiDirac`: the steps whose buffer passed both witness arms at a residual above the guard tolerance and grew
+    /// the block by one instead (task 9c review I1).
+    pub buffer_growths: usize,
+    /// `FermiDirac`: the frozen steps that stalled and dropped the DIIS entries older than the freeze (Task 9d).
+    pub diis_freeze_trims: usize,
+    /// The LOBPCG steps redone without P after a failed Ritz-vector formation (`EigenStats::restores`, summed over the
+    /// solve; task 9b fix round 1's safety net — 0 expected since the checked dense eigensolve, task 9c review M6).
+    pub eigen_restores: usize,
     /// Δρ of every step in order (the convergence history; `eig_tol_steps` is its partner).
     pub delta_rho_steps: Vec<f64>,
     /// The warm start's input density was extrapolated, ρ_in = 2ρ_t − ρ_{t−1}
@@ -549,6 +575,15 @@ impl Diis {
         self.push(e, vec![*row.last().expect("the row ends with ⟨r, r⟩")], pool);
     }
 
+    /// Keeps the newest `keep` entries, drops the rest, pushes `e`, its Gram row `row` (against all the old entries, ending
+    /// with ⟨r_e, r_e⟩) reduced to the kept ones and its self-dot (plan 2026-11-13 Task 9d, a stalled frozen phase).
+    fn push_keep(&mut self, e: DiisEntry, row: &[f64], keep: usize, pool: &mut Pool) {
+        let m = self.entries.len();
+        let keep = keep.min(m);
+        while self.entries.len() > keep { self.drop_oldest(pool); }
+        self.push(e, row[m - keep..].to_vec(), pool);
+    }
+
     /// Pulay coefficients (`qm::scf::diis_coefficients`): bordered system on the Gram matrix
     /// scaled by its largest diagonal, +1e-12 relative on the diagonal, LU. `None` on failure.
     fn coefficients(&self) -> Option<Vec<f64>> {
@@ -636,6 +671,7 @@ impl Inner {
 
     fn eigen(&mut self, s: EigenStats, wall: Duration) {
         self.eigen_calls += 1;
+        self.profile.eigen_restores += s.restores;
         // the residual of the columns the density rests on: all of them, or under a split stop (`lobpcg_guarded`, plan
         // 2026-11-13 Task 9b) the tight head; the loose witness columns go to `guard_residual`
         let (tight, guard) = s.split_residual.unwrap_or((s.max_residual, 0.0));
@@ -861,16 +897,18 @@ impl Channel<'_> {
         Ok((es.stop != EigenStop::Aborted).then_some(es))
     }
 
-    /// `FermiDirac { kt }` (module doc, "Fermi–Dirac occupations"; `qm::scf::solve_fd` step for step): solve the block
-    /// with its lowest `*tight` columns at the step's tol, the rest but the top at the guard tolerance and the top an
-    /// untested **buffer** (Task 9c (c), as the Harris solve: it speeds up the column below it, whose rate is set by the
-    /// gap to the first level outside the tested set, and decides nothing — f = 0, outside the witness test), take
+    /// `FermiDirac { kt }` (module doc, "Fermi–Dirac occupations"; `qm::scf::solve_fd`'s rule, plus the GPU's buffer and
+    /// step-accuracy tail — the CPU has neither): solve the block with its lowest `*tight` columns at the step's tol, the
+    /// rest but the top at the guard tolerance and the top an untested **buffer** (Task 9c (c), as the Harris solve: it
+    /// speeds up the column below it, whose rate is set by the gap to the first level outside the tested set; it is
+    /// outside the occupations, f = 0, and is a witness only once its own residual meets the guard tolerance), take
     /// `fermi_dirac`'s occupations of the tested levels; re-solve when a loose column needs the tol (`tight_columns` at
     /// the SCF's tol; `*tight` keeps the step's need); while the top tested level's lower bound is no witness
     /// (`witness_bound_reached`) double the extra block (`grown_extras`, at most `self.cap`) and re-solve. At the cap no
     /// buffer fits and every column is tested. The buffer is the block's highest Ritz value (moved to the last position
-    /// when a lock left it elsewhere), so every level below the witness is tested (`qm::occupations` "Witness columns at
-    /// a guard tolerance", premise M2). Returns the occupations (the buffer's f = 0) and whether every call kept the
+    /// when a lock or a 0-iteration accept left it elsewhere; the untested column that swap moves into the tested range is
+    /// re-solved until it meets the guard tolerance), so every level below the witness is a tested column at r ≤ g
+    /// (`qm::occupations` "Witness columns at a guard tolerance", premise M2). Returns the occupations (the buffer's f = 0) and whether every call kept the
     /// tight columns bitwise (the step's "frozen", module doc); `None` when `should_abort` stopped an eigensolve (the
     /// SCF's pause/cancel, Task 9c). Errors: the witness still missing at the cap (naming the VRAM budget when the cap
     /// came from one), `fermi_dirac`'s refusals (a non-finite level). An empty channel is not solved: f = [], μ = None,
@@ -885,6 +923,7 @@ impl Channel<'_> {
         // the buffer fits below the cap: a block of n + 1 (a cold start, or a state from before the buffer) gets one
         let buffered = |len: usize| len >= self.n + 2 && len - self.n < self.cap;
         if orbs.len() == self.n + 1 && self.cap >= 2 { self.grow(orbs, evals, pool); }
+        let mut swap_retries = 0;
         loop {
             let checked = if buffered(orbs.len()) { orbs.len() - 1 } else { orbs.len() };
             let head = (*tight).min(checked);
@@ -894,7 +933,13 @@ impl Channel<'_> {
             let tail_kt = self.loosened_delta.map_or(WITNESS_TAIL_KT, |d| step_tail_kt(orbs.len(), d));
             let Some(es) = self.solve_guarded(orbs, evals, head, checked, guard_tol, &mut residuals, work, work_k, inner, should_abort.as_deref_mut())?
             else { return Ok(None) };
-            if checked < orbs.len() { buffer_last(orbs, evals, &mut residuals); }
+            if checked < orbs.len() {
+                // the swap edge (task 9c review I1): an untested column moved into the tested range is no witness until
+                // it meets the guard tolerance — re-solve (it is tested now), at most twice
+                if let Some(moved) = buffer_last(orbs, evals, &mut residuals) {
+                    if residuals[moved] > guard_tol && swap_retries < 2 { swap_retries += 1; continue; }
+                }
+            }
             if std::env::var_os("SCF_TRACE").is_some() {
                 eprintln!("  spin {} block {} head {head} tested {checked}: {} it ({:?}, head kept {}, {} readbacks, {} fallbacks, α {:.1}) in {:.2} s, residual tight / guard {:?}, top tested θ {:.4}",
                           self.spin, orbs.len(), es.iterations, es.stop, es.head_kept, es.readbacks, es.fallbacks,
@@ -923,7 +968,8 @@ impl Channel<'_> {
                     dropped.sort_unstable_by(|a, b| b.cmp(a));
                     for i in dropped { pool.give(orbs.remove(i)); evals.remove(i); residuals.remove(i); }
                     inner.profile.witness_trims += 1;
-                    let checked = if buffered(len) { buffer_last(orbs, evals, &mut residuals); len - 1 } else { len };
+                    // (the kept columns are the lowest `len` by value: the highest of them is already the top, tested or not)
+                    let checked = if buffered(len) { let _ = buffer_last(orbs, evals, &mut residuals); len - 1 } else { len };
                     (fermi_dirac(&evals[..checked], self.n, kt)?, checked)
                 } else { (occ, checked) };
                 occ.f.resize(orbs.len(), 0.0); // the buffer decides nothing and holds no charge
@@ -939,16 +985,25 @@ impl Channel<'_> {
                 }
                 return Ok(Some((occ, kept)));
             }
-            // the buffer as the witness (Task 9c (c)): its lower bound θ − r is a bound at any residual, so when it passes
-            // both arms the step is decided (its f = 0 < e^{−36}, as every level above a witness) and one fresh vector
-            // becomes the next step's buffer — one vector more, where doubling the extras for a tested witness would
-            // overshoot (measured on the cold all-electron H₂O 97³: a block of 13 doubled to 21 for this)
+            // the buffer as the witness (Task 9c (c); task 9c review I1, ruling (a)): θ − r bounds the buffer's level only
+            // when its spectral weight below θ − r is negligible (premise M2: ≤ r²/D², D the distance to the next level),
+            // so the buffer decides the step only at r ≤ g = WITNESS_GUARD_TOL, as a tested witness column; one fresh
+            // vector then becomes the next step's buffer. A buffer that passes both arms at r > g grows the block by one
+            // (it is tested on the re-solve) — one vector more, where doubling the extras would overshoot (measured on
+            // the cold all-electron H₂O 97³: a block of 13 doubled to 21)
             if checked < orbs.len() && witness_bound_reached_tail(evals, &residuals, self.n, mu, kt, tail_kt) {
-                let mut occ = occ;
-                occ.f.resize(orbs.len(), 0.0);
-                inner.profile.buffer_witnesses += 1;
-                if orbs.len() - self.n < self.cap { self.grow(orbs, evals, pool); occ.f.push(0.0); }
-                return Ok(Some((occ, kept)));
+                if residuals[orbs.len() - 1] <= WITNESS_GUARD_TOL {
+                    let mut occ = occ;
+                    occ.f.resize(orbs.len(), 0.0);
+                    inner.profile.buffer_witnesses += 1;
+                    if orbs.len() - self.n < self.cap { self.grow(orbs, evals, pool); occ.f.push(0.0); }
+                    return Ok(Some((occ, kept)));
+                }
+                if orbs.len() - self.n < self.cap {
+                    inner.profile.buffer_growths += 1;
+                    self.grow(orbs, evals, pool);
+                    continue;
+                }
             }
             if std::env::var_os("SCF_TRACE").is_some() {
                 let order = ascending(&evals[..checked]);
@@ -968,12 +1023,15 @@ impl Channel<'_> {
     }
 }
 
-/// Moves the block's highest Ritz value to the last position — the buffer's (`Channel::solve_fd`) — when a lock left it
-/// elsewhere (the Rayleigh–Ritz returns the unlocked columns ascending, after the locked head).
-fn buffer_last(orbs: &mut [Field], evals: &mut [f64], residuals: &mut [f64]) {
+/// Moves the block's highest Ritz value to the last position — the buffer's (`Channel::solve_fd`) — when a lock or a
+/// 0-iteration accept left it elsewhere (the Rayleigh–Ritz returns the unlocked columns ascending, after the locked head).
+/// Returns the position the former last (untested) column moved to, if any.
+fn buffer_last(orbs: &mut [Field], evals: &mut [f64], residuals: &mut [f64]) -> Option<usize> {
     let last = evals.len() - 1;
     let top = (0..evals.len()).fold(last, |b, i| if evals[i] > evals[b] { i } else { b });
-    if top != last { orbs.swap(top, last); evals.swap(top, last); residuals.swap(top, last); }
+    if top == last { return None; }
+    orbs.swap(top, last); evals.swap(top, last); residuals.swap(top, last);
+    Some(top)
 }
 
 /// The Kohn-Sham solver for one grid: kernels, reducer, Poisson solver, LOBPCG work space, a
@@ -1265,18 +1323,11 @@ impl GpuSolver {
                 if let Some((pu, pd)) = prev_rho.take() { pool.give(pu); pool.give(pd); }
                 let total = (n_up + n_dn) as f64;
                 // broad atomic-like blobs (σ = 1 Bohr) carrying each centre's charge (Z, or Z_v when pseudised)
-                let (z_tot, guess) = match system.ionic.as_deref() {
-                    // FermiDirac starts from the free atoms' densities (plan 2026-11-13 Task 9c (a), `qm::nuclear::free_atom_density`);
-                    // Aufbau and DegenerateShells keep the sigma = 1 blobs (their bits)
-                    None => (system.nuclei.iter().map(|q| q.z as f64).sum::<f64>(), match settings.occupations {
-                        Occupations::FermiDirac { .. } => free_atom_density(grid, &system.nuclei, settings.sigma).unwrap_or_else(|| deposit_charge(grid, &system.nuclei, 1.0)),
-                        Occupations::Aufbau | Occupations::DegenerateShells { .. } => deposit_charge(grid, &system.nuclei, 1.0),
-                    }),
-                    Some(s) => {
-                        let c: Vec<Centre> = centres(&system.nuclei, s).into_iter().map(|c| Centre { sigma: 1.0, ..c }).collect();
-                        (c.iter().map(|c| c.charge).sum::<f64>(), deposit_centres(grid, &c))
-                    }
-                };
+                // the cold guess (`qm::nuclear::cold_guess`): free atoms for all-electron centres under FermiDirac (plan 2026-11-13
+                // Task 9c (a), review M4), σ = 1 blobs of the centre's charge otherwise (pseudised centres; Aufbau and
+                // DegenerateShells keep their bits)
+                let (z_tot, guess) = cold_guess(grid, &system.nuclei, system.ionic.as_deref(), settings.sigma,
+                                                matches!(settings.occupations, Occupations::FermiDirac { .. }));
                 let scale = if z_tot > 0.0 { total / z_tot } else { 0.0 };
                 let fu = if total > 0.0 { n_up as f64 / total } else { 0.0 };
                 let fd = if total > 0.0 { n_dn as f64 / total } else { 0.0 };
@@ -1314,6 +1365,7 @@ impl GpuSolver {
         let (v_up, v_dn, exc, xc_up, xc_dn) = (pool.take(ctx, g), pool.take(ctx, g), pool.take(ctx, g), pool.take(ctx, g), pool.take(ctx, g));
         let mut hist = Diis::new(settings.diis_history);
         let mut frozen = false; // the last step's eigensolves took 0 iterations (module doc)
+        let mut consistent = 0usize; // DIIS entries measured on the current frozen orbitals' output (Task 9d)
         let mut prev_tail = f64::INFINITY; // the previous step's widest witness tail (kT; Task 9c (b))
         // `FermiDirac`: this step's calls all returned their tight columns bitwise (module doc, "Fermi–Dirac occupations")
         let mut step_kept = false;
@@ -1529,10 +1581,20 @@ impl GpuSolver {
             prev_tail = inner.step_tail;
             let map_changed = ((frozen && !step_frozen) || widened) && !hist.entries.is_empty();
             if map_changed { inner.profile.diis_resets += 1; }
+            // a frozen phase that stalls (`FermiDirac`; Task 9d, module doc "The DIIS history at a freeze"): the entries
+            // measured on the frozen orbitals' output density are the last unfrozen step's and every frozen one's; on them
+            // the map is affine and the mix contracts the residual by ≥ 1 − α a step, so a second frozen step that does not
+            // proves older entries are pinning the extrapolation — they are dropped
+            consistent = if step_frozen && fd_kt.is_some() { if frozen { consistent + 1 } else { 2 } } else { 0 };
+            let freeze_trim = fd_kt.is_some() && frozen && step_frozen && !map_changed && delta_rho > (1.0 - settings.mixing) * delta_rho_prev
+                && hist.entries.len() + 1 > consistent;
+            if freeze_trim { inner.profile.diis_freeze_trims += 1; }
             if step_frozen && fd_kt.is_some() { inner.profile.frozen_steps += 1; }
             frozen = step_frozen;
             let entry = DiisEntry { rho_up: rho_in_up, rho_dn: rho_in_dn, r_up, r_dn };
-            if released_now || map_changed { hist.push_reset(entry, &row, pool); } else { hist.push(entry, row, pool); }
+            if released_now || map_changed { hist.push_reset(entry, &row, pool); }
+            else if freeze_trim { hist.push_keep(entry, &row, consistent - 1, pool); }
+            else { hist.push(entry, row, pool); }
             rho_in_up = pool.take(ctx, g);
             rho_in_dn = pool.take(ctx, g);
             hist.mix(&mut batch, k, g, settings.mixing, &rho_in_up, &rho_in_dn, pool);
@@ -1830,6 +1892,28 @@ mod tests {
         Some((GpuSolver::new(ctx, &grid), grid, settings))
     }
 
+    /// Plan 2026-11-13 Task 9c fix round 2: the app's finest Custom box (177³ × 0.08, its 14 Bohr H₂O case) allocates and
+    /// runs. Its Poisson boundary table is 147 MB, bound whole by `ghost_fill`: over wgpu's default 128 MiB storage binding,
+    /// so before `gpu::GpuContext` asked for the adapter's own limits the first dispatch failed validation. H₂ at the app's
+    /// FermiDirac default, cold, abandoned after its first SCF step (every solve buffer — fields, LOBPCG work, the boundary
+    /// table — is allocated and used by then).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only (GPU, 177³); cargo test -p qm-gpu --release")]
+    fn a_177_cube_solve_allocates_and_runs() {
+        let Some(ctx) = GpuContext::new_headless() else { return };
+        let limits = ctx.device.limits();
+        println!("device limits: max_storage_buffer_binding_size {} B, max_buffer_size {} B", limits.max_storage_buffer_binding_size, limits.max_buffer_size);
+        let grid = Grid::cube(177, 0.08);
+        let settings = ScfSettings::for_grid(&grid);
+        let mut s = GpuSolver::new(ctx, &grid);
+        let table = s.poisson.ghost_table_bytes();
+        assert!(table > 128 << 20 && table <= limits.max_storage_buffer_binding_size as u64, "the boundary table ({table} B) is past the default binding and inside the device's");
+        let mut asked = 0;
+        let out = s.solve_with(&h2(0.0), &settings, false, &mut || { asked += 1; asked == 2 }).unwrap();
+        assert!(out.is_none() && s.profile().steps == 1, "one SCF step at 177³: {:?}", s.profile().notes);
+        println!("177³ × 0.08 H₂: one step in {:.1} s ({} LOBPCG iterations), boundary table {:.0} MB", s.profile().wall.as_secs_f64(), s.profile().eigen_iterations, table as f64 / 1e6);
+    }
+
     fn cpu(grid: &Grid, system: &System, settings: &ScfSettings) -> (qm::KsState, ScfStats, f64) {
         let t = Instant::now();
         let (state, stats) = qm::scf(grid, system, settings, None).expect("cpu reference converges");
@@ -1953,7 +2037,8 @@ mod tests {
     /// FD at tol 1e-6, cold. Before 9b one block-wide LOBPCG residual — the diffuse witness column's included — drove both
     /// the tol stop and the 1.5·tol guess accept, the steps alternated 0 / ≈ 25 iterations with a DIIS reset every other
     /// step, and the solve cycled at Δρ 4e-5…3e-4 to the 200-step cap (Aufbau: 13 steps). Now it converges in ≤ 20 steps
-    /// with ≤ 1 DIIS reset (measured 13 / 0), and a second cold solve gives the same bits.
+    /// with ≤ 1 DIIS reset (measured 13 / 0 in 9b; 14 / 1 with 9c's buffer witness at any residual; 12 / 0 since 9c fix
+    /// round 2), and a second cold solve gives the same bits.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm-gpu --release")]
     fn gpu_fd_stretched_h3plus_converges_cold() {
@@ -1972,8 +2057,8 @@ mod tests {
         println!("H₃⁺ 1.6 r₀ 49³ FD cold: {} steps ({wall:.1} s), F {:+.10}, TS {:.2e}, tol_used {:e}; DIIS resets {}, frozen steps {}, locked calls {},                   class raises {}, witness growths {}; blocks {}/{}; residual tight {:.2e} guard {:.2e}; Δρ {:?}",
                  a.iterations, a.energy.total, a.energy.ts, a.tol_used, p.diis_resets, p.frozen_steps, p.locked_calls, p.class_raises,
                  p.witness_growths, state.orbitals_up.len(), state.orbitals_dn.len(), a.max_eigen_residual, a.max_guard_residual, p.delta_rho_steps.iter().map(|d| format!("{d:.1e}")).collect::<Vec<_>>());
-        assert!(a.iterations <= 20, "{} steps (measured 13; Aufbau converges in 13)", a.iterations);
-        assert!(p.diis_resets <= 1, "{} DIIS resets (measured 0)", p.diis_resets);
+        assert!(a.iterations <= 20, "{} steps (measured 12 since 9c fix round 2, 13 in 9b; Aufbau converges in 13)", a.iterations);
+        assert!(p.diis_resets <= 1, "{} DIIS resets (measured 0 since 9c fix round 2; 1 in 9c)", p.diis_resets);
         assert!(a.max_guard_residual <= EIG_GUESS_FACTOR * WITNESS_GUARD_TOL, "the witness columns at the guard tier (a guess accepted within its 1.5× band): {:.2e}", a.max_guard_residual);
         let (_, b) = s.solve(&sys, &settings, false).unwrap();
         assert_eq!((a.energy.total.to_bits(), a.delta_rho.to_bits(), a.iterations), (b.energy.total.to_bits(), b.delta_rho.to_bits(), b.iterations),
@@ -2398,6 +2483,8 @@ mod tests {
         assert!(s.profile().notes.iter().any(|n| n.contains("abandoned in SCF step 1's eigensolve")), "{:?}", s.profile().notes);
         assert!(s.state().is_none());
         let (_, resumed) = s.solve(&sys, &settings, true).unwrap();
+        // the same bound as the step-boundary resume above (1e-5 Ha): two f32 paths to Δρ < tol scatter the energy by
+        // ≲ 1e-7 (H₂ 33³; the GPU FD pins' moves between solver variants, `GPU_FD_H2_E`, are 2.6e-8–7.4e-8)
         assert!((resumed.energy.total - cold.energy.total).abs() < 1e-5, "{} vs {}", resumed.energy.total, cold.energy.total);
     }
 

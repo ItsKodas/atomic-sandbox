@@ -159,6 +159,10 @@ fn classify(t: f64, rec: f64, last: f64) -> Option<Stop> {
 }
 
 impl GpuPoisson {
+    /// The boundary table's size (bytes): one storage binding of `ghost_fill`, 147 MB at 177³ (the device must offer a
+    /// binding that large; `gpu::GpuContext` asks for the adapter's own limit).
+    pub fn ghost_table_bytes(&self) -> u64 { self.ghost_table.size() }
+
     /// Samples R_lm on the grid and tabulates the ghost shell (both f64 → f32), uploads once.
     pub fn new(ctx: &GpuContext, _k: &Kernels, g: &GpuGrid) -> GpuPoisson {
         let (n, p) = (g.n, g.p);

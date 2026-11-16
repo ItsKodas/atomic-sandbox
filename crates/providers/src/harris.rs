@@ -69,7 +69,8 @@
 //!   window) up to that bound — and an `Aufbau` block whose window's last row and first guard are
 //!   one τ-set runs n_σ + m + G + 1 (final review M1) — and the fields it trims stay on the state's
 //!   free list. W = the solver's witness cap for every scene (`crate::ks::witness_cap_for` under a budget: the counted
-//!   16 up to `qm::scf::MAX_WITNESS_GROWTH` = 32, plan 2026-11-13 Task 9b): `crate::ks::problem` poses every scene under
+//!   start, `crate::ks::WITNESS_GROWTH_COUNTED` = 3, up to `qm::scf::MAX_WITNESS_GROWTH` = 32, plan 2026-11-13 Task 9b and
+//!   Task 9c fix round 2): `crate::ks::problem` poses every scene under
 //!   `FermiDirac` (smearing plan Task 9), whose Harris block grows to the SCF's witness
 //!   (`qm_gpu::harris` "Fermi–Dirac"; the scf-stall ← main merge) — all-electron too, where main's
 //!   `Aufbau` block never grew (W was 0 without a setup until that merge). The SCF's own growth is
@@ -399,7 +400,9 @@ mod tests {
     #[test]
     fn harris_footprint_counts_its_fields() {
         let fields = |b: u64| b as f64 / (field_bytes(33) as f64 * 1.2);
-        let at = |n_up, n_dn, m, ps| fields(harris_footprint_bytes(33, n_up, n_dn, m, ps, crate::ks::WITNESS_GROWTH_COUNTED));
+        // the formula at W = 16 (the count before plan 2026-11-13 Task 9c fix round 2; the term is linear in W, so the
+        // pinned counts stay the formula's check whatever `crate::ks::WITNESS_GROWTH_COUNTED` is)
+        let at = |n_up, n_dn, m, ps| fields(harris_footprint_bytes(33, n_up, n_dn, m, ps, 16));
         for (got, want) in [(at(1, 1, 0, false), 77.0), (at(1, 1, 4, false), 69.0), (at(4, 2, 2, true), 72.0), (at(4, 2, 0, true), 84.0), (at(1, 0, 0, false), 20.0 + 13.0 + 24.0)] {
             assert!((got - want).abs() < 1e-3, "{got} fields, expected {want} (the bytes are truncated to an integer)");
         }

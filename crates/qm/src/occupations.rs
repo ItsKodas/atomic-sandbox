@@ -72,7 +72,11 @@
 //!   ```text
 //!   ∫|δρ| ≤ (2 + 2g/kT) · Σ_{j∈L} f_j            (= 2.4 Σ_L f_j at g = 1e-3 Ha, kT = 5 mHa)
 //!   ```
-//!   (the reviewer's random check of 20 000 FD channels: worst 2.44).
+//!   (2.4 is the first-order constant; the reviewer's random check of 20 000 FD channels gave a worst 2.44, the
+//!   e^{g/kT} nonlinearity of f, inside the ≲ 2.9 below — not a violated bound). It assumes r_j ≤ g: a loose column
+//!   that leaves LOBPCG on a floor exit above g (`qm_gpu::eigen`, the f32-floor diagnosis reads the scaled split
+//!   residual) is bounded by its own per-column term (2 + 2r_j/kT)·f̂_j instead, and the 2.4e-2·tol figure does not
+//!   apply to it.
 //! - **The rule** (`tight_columns`). L is the set of the highest-ranked columns whose tail sum of the **upper-bound**
 //!   occupations f̂_j = f(θ_j − r_j; μ) ≥ f_j (the level lies above θ_j − r_j) stays below `LOOSE_F_FACTOR`·tol,
 //!   tol the SCF's Δρ stop: ∫|δρ| ≤ 2.4e-2·tol, ≲ 2.9e-2·tol with the loose levels' own shift of μ (a factor
@@ -94,23 +98,32 @@
 //!   ```
 //!   At r ≤ g it costs ≤ 1e-3 Ha of the 0.18 Ha window; a tight top (r ~ 1e-6) gives the Ritz test to 1e-6. Never the
 //!   Ritz value alone.
-//! - **The premise of both bounds** (review M2): Ritz values bound the levels from above (θ_j ≥ λ_j), but Krylov–Weinstein
-//!   only puts *some* eigenvalue within r of θ. θ_j − r_j is a lower bound on λ_j — for f̂ and for the witness — only if
-//!   the block holds the lowest k levels, i.e. no level below the block's top was missed. That is the assumption every
-//!   LOBPCG block makes, and the GPU solver checks it the way it can: a Rayleigh–Ritz step whose formed vectors do not
-//!   reproduce their Ritz values (a lost column, `qm_gpu::eigen` "Ritz vectors that do not match their Ritz values") is
-//!   undone; one it cannot undo is an error on the SCF path.
+//! - **The premise of both bounds** (review M2, restated by the task 9c review I1): Ritz values bound the levels from
+//!   above (θ_j ≥ λ_j), but Krylov–Weinstein only puts *some* eigenvalue within r of θ — it does not bound a column's
+//!   lowest spectral component: the weight a unit x with residual r carries below θ − D is ≤ r²/D² (Chebyshev), and up
+//!   to half of it can lie just below θ − r. So θ_j − r_j is used as a lower bound on λ_j — for f̂ and for the witness —
+//!   under the premise that the spectral weight below θ_j − r_j is negligible (≤ r_j²/D²), i.e. the block holds the
+//!   lowest k levels and no level below the block's top was missed. That holds for columns converged to r ≤ g (hidden
+//!   weight ≲ 3e-5 at g = 1e-3 against the window's D ≈ 0.18 Ha), which is why an untested column (the GPU's buffer)
+//!   is a witness only at r ≤ g. The GPU solver checks the rest the way it can: a Rayleigh–Ritz step whose formed
+//!   vectors do not reproduce their Ritz values (a lost column, `qm_gpu::eigen` "Ritz vectors that do not match their
+//!   Ritz values") is undone; one it cannot undo is an error on the SCF path.
 //! - **Growth** (`grown_extras`): when the witness fails the block grows by its current extra count (the extra block
 //!   doubles: 1, 2, 4, 8, 16, 32), clamped to the cap, instead of one vector per re-solve; each grown vector keeps
 //!   its index-seeded guess. Reaching e extras costs ⌈log₂ e⌉ re-solves instead of e − 1.
 //! - **The step-accuracy tail** (plan 2026-11-13 Task 9c (b), `step_tail_kt`; the task 9b review's lever). On a
 //!   *loosened* GPU step (its eigen tol above the tight one, i.e. far from convergence) the tail arm is
-//!   X = ln(n_w/(c·Δρ_prev)) clamped to [6, 36] kT, c = `STEP_TAIL_C` = 1e-3, n_w the block's levels: the levels it
-//!   leaves out hold f ≤ e^{−X} each, n_w of them at most c·Δρ_prev of charge — the same error class as the Δρ-tied
-//!   eigen tol, a thousandth of the step's own error. The gap arm and the lower bound stay. A tight step (the only kind
-//!   that can converge) runs the full 36 kT window, so a level that crosses into the window can never be missed at
-//!   convergence; a descending level enters on a transient step once its f exceeds c·Δρ, at the cost of one growth.
-//!   A step whose window widened and grew the block resets the DIIS history (the map changed, like an unfreeze).
+//!   X = ln(n_w/(c·Δρ_prev)) clamped to [6, 36] kT, c = `STEP_TAIL_C` = 1e-3, n_w the block's levels. The levels it
+//!   leaves out are all those above μ + X·kT; with g the density of states there (levels per Ha), their charge is
+//!   Σf ≲ ∫ g e^{−(ε−μ)/kT} dε = g·kT·e^{−X} (spec 2026-11-13 §4.2 (c); task 9c review M1), which is ≤ n_w·e^{−X} =
+//!   c·Δρ_prev — the same error class as the Δρ-tied eigen tol, a thousandth of the step's own error — while
+//!   n_w ≥ g·kT. That holds in the boxes measured: g·kT ≈ 0.3 at 14 Bohr, ≈ 1.6 at 24.5, ≈ 3 at 30 (Weyl), against
+//!   n_w ≥ n_σ + 2. The gap arm and the lower bound stay. The tail cannot change a converged answer (review M2): a
+//!   solve converges only on a tight step (step tol = eig tol), which runs the full 36 kT window, so a level that
+//!   crosses into the window can never be missed at convergence; a descending level enters on a transient step once
+//!   its f exceeds c·Δρ, at the cost of one growth. The [6, 36] clamp binds only for Δρ_prev ≳ 0.4·n_w (the floor) or
+//!   tiny Δρ_prev (36 kT). A step whose window widened and grew the block resets the DIIS history (the map changed, like
+//!   an unfreeze; by the bound above the change is ≤ c·Δρ — measured, removing the reset changed neither gate case).
 //! - **No loose stop** (plan 2026-11-13 Task 9c (d), measured and not adopted). The bound above holds per column,
 //!   ∫|δρ| ≤ Σ_L (2 + 2r_j/kT)·f̂_j at any r_j, so a GPU eigensolve could end once that sum is below 1e-2·tol and the
 //!   witness passes, the loose columns wherever they are. Tried on every step, on loosened steps and the first one, and
@@ -285,7 +298,8 @@ pub fn witness_bound_reached_tail(evals: &[f64], residuals: &[f64], n: usize, mu
 }
 
 /// The witness tail of a loosened SCF step (plan 2026-11-13 Task 9c (b); module doc, "The step-accuracy tail"):
-/// X = ln(n_w / (`STEP_TAIL_C`·Δρ_prev)) clamped to [`STEP_TAIL_MIN_KT`, `WITNESS_TAIL_KT`], n_w the block's levels.
+/// X = ln(n_w / (`STEP_TAIL_C`·Δρ_prev)) clamped to [`STEP_TAIL_MIN_KT`, `WITNESS_TAIL_KT`], n_w the block's levels
+/// (a bound on the omitted charge while n_w ≥ g·kT, g the density of states above μ + X·kT: module doc).
 /// A non-finite or non-positive Δρ_prev gives the full `WITNESS_TAIL_KT`.
 pub fn step_tail_kt(n_w: usize, delta_rho_prev: f64) -> f64 {
     if !(delta_rho_prev.is_finite() && delta_rho_prev > 0.0) { return WITNESS_TAIL_KT; }

@@ -344,13 +344,16 @@ pub fn footprint_bytes_in(cache: &std::sync::Mutex<crate::pseudo::PseudoCache>, 
     }
 }
 
-/// The witness growth the scene guard counts (plan 2026-11-13 Task 9b ruling: the cap is min(32, what fits)): a scene
-/// is refused unless its solve fits with this many extra vectors per spin — the acceptance every estimate before 9b
-/// used, so the app's quality pickers and the estimated mode's auditor share (Precise 141³ in half the budget) keep
-/// their answers. The solver's cap is then raised toward `qm::scf::MAX_WITNESS_GROWTH` as far as the budget allows
-/// (`witness_cap_for`): a scene too large for 16 is refused up front (with its size and the budget) rather than solved
-/// for minutes toward a cap error, and one with room solves with up to 32.
-pub const WITNESS_GROWTH_COUNTED: usize = 16;
+/// The witness vectors the scene guard counts per spin: what the solver allocates at the start — the measured peak of
+/// tested witness levels, 2, plus the buffer column (`qm_gpu::scf` "The cold-start window"; plan 2026-11-13 fix round 2,
+/// Decision 1). Measured with the 9c cold start at the app's 14 Bohr all-electron H₂O box (167³ × 0.0848, the 177³
+/// case's box): a peak block of n_σ + 3, no growth. A scene is refused unless its solve fits with this many; the
+/// solver's cap is then raised toward `qm::scf::MAX_WITNESS_GROWTH` as far as the remaining budget allows
+/// (`witness_cap_for`), and a solve that needs more than its cap ends with the cap error naming the budget — never an
+/// out-of-memory. (Task 9b counted 16, a worst-case guess from the blob start's transient windows of 16–20; 9c measured
+/// the start-window cause away. Fewer fields per vector — 12 now, 0.73 GB per vector at 177³ in estimated mode — is a
+/// later optimisation.)
+pub const WITNESS_GROWTH_COUNTED: usize = 3;
 
 /// The witness growth's fields at `w` extra vectors per spin: the one `LobpcgWork` (sized for the larger spin) grows by
 /// 8 fields a vector, and each spin stores that many more orbitals and kinetic scratch fields: (8 + 2 + 2)·w fields (a
@@ -363,15 +366,16 @@ pub fn witness_bytes(n: usize, w: usize) -> u64 {
     (witness_growth_fields(w) as f64 * field_bytes(n) as f64 * 1.2) as u64
 }
 
-/// The witness growth of an all-electron solve under `FermiDirac` at the counted `WITNESS_GROWTH_COUNTED` (192 fields):
-/// the scene guard's term (plan 2026-11-13 Task 7 fix rounds 1–2; Task 9b keeps 16 as the acceptance count).
+/// The witness growth of an all-electron solve under `FermiDirac` at the counted `WITNESS_GROWTH_COUNTED` (36 fields):
+/// the scene guard's term (plan 2026-11-13 Task 7 fix rounds 1–2; the count since fix round 2 of Task 9c).
 pub fn witness_extra_bytes(n: usize) -> u64 { witness_bytes(n, WITNESS_GROWTH_COUNTED) }
 
 /// The `FermiDirac` witness cap a VRAM `budget` leaves `scene` (plan 2026-11-13 Task 9b ruling: min(32, what fits)): the
 /// largest w ≤ `qm::scf::MAX_WITNESS_GROWTH` for which the scene's solve with w extra vectors per spin **plus** the
 /// orbital view and the Harris display at their largest request (`UNOCCUPIED_MAX` rows, the colour textures, the
-/// Harris block at w) fit, so every display guard at any request passes whenever the cap is above the counted 16; never
-/// below `WITNESS_GROWTH_COUNTED` (the scene guard has accepted that much, and the display guards count it as before).
+/// Harris block at w) fit, so every display guard at any request passes whenever the cap is above the counted start;
+/// never below `WITNESS_GROWTH_COUNTED` (the scene guard has accepted that much, and the display guards count it as
+/// before). Growth past the cap is the solver's named cap error (`GpuSolver::set_witness_cap`), never an allocation.
 pub fn witness_cap_for(scene: &Scene, budget: u64) -> usize {
     let n = scene.cell.n;
     let fp = crate::pseudo::footprint_inputs(scene);
@@ -398,10 +402,10 @@ pub fn solve_footprint_bytes(n: usize, n_el: u64, k_max: u64) -> u64 {
 /// orbitals, for the pseudised ions given as (r, rows) — the radius of the ion's projector/partial-core ball in
 /// Bohr and its number of projector rows Σ(2l + 1) — with the 1.2 slack of [`solve_footprint_bytes`] applied:
 /// - ρ_pc and the two XC input fields ρ_σ + ½ρ_pc (Task 8a review SHOULD-5): 3 fields;
-/// - the witness growth at the counted `WITNESS_GROWTH_COUNTED` = 16 extra vectors per spin (plan 2026-11-13 Task 9b: the
-///   acceptance count; the solver's cap above it comes from the budget, `witness_cap_for`): the one `LobpcgWork` (sized
-///   for the larger spin) grows by 8 fields a vector, and each spin stores that many more orbitals and kinetic scratch
-///   fields: (8 + 2 + 2)·16 fields (`witness_growth_fields`; a bound — a typical shell needs a few);
+/// - the witness vectors at the counted `WITNESS_GROWTH_COUNTED` = 3 per spin (the solver's start allocation; its cap
+///   above it comes from the budget, `witness_cap_for`): the one `LobpcgWork` (sized for the larger spin) grows by 8
+///   fields a vector, and each spin stores that many more orbitals and kinetic scratch fields: (8 + 2 + 2)·3 fields
+///   (`witness_growth_fields`);
 /// - the v̄ scratch of the force path (Task 8b ruling (c)): 6 fields;
 /// - the display copy of ρ + ρ_pc (`GpuSolver::copy_density_with_core_to_volume`): 1 field;
 /// - the force weights, Σ_rows n_pts × 20 B with n_pts = (4π/3)(r/h)³ points in the ball (Task 8b ruling (c));
@@ -1042,7 +1046,7 @@ impl GpuKs {
         if let Some(budget) = *vram_budget {
             // the scene guard's all-electron witness bound too (`witness_extra_bytes`, plan 2026-11-13 Task 7 fix round 1),
             // so a budget the scene passes is judged on the same base
-            // (at the solver's witness cap, plan 2026-11-13 Task 9b: above the counted 16 only when the budget has room
+            // (at the solver's witness cap, plan 2026-11-13 Task 9b: above the counted start (`WITNESS_GROWTH_COUNTED`) only when the budget has room
             // for the largest view, `witness_cap_for`)
             let base = solve_footprint_bytes(n, (n_up + n_dn) as u64, n_up.max(n_dn) as u64) + if all_electron { witness_bytes(n, solver.witness_cap()) } else { 0 };
             let need = |m: usize| base + orbital_view_footprint_bytes(n, n_up, n_dn, m, orb.texture());
@@ -1345,7 +1349,7 @@ impl GpuKs {
         let mut guard = Vec::new();
         if let Some(budget) = self.vram_budget {
             // the solve and the Harris block at the cap `check_vram` derived (`witness_cap_for`: when it is above the counted
-            // 16 every request here fits by construction; at 16 this is the guard as before)
+            // start every request here fits by construction; at the count this is the guard as before)
             let w = self.witness_cap;
             let base = gpu_footprint_bytes(scene) - witness_extra_bytes(n) + witness_bytes(n, w);
             let texture = self.orb.texture();
@@ -1946,7 +1950,7 @@ pub(crate) mod tests {
         assert!(gpu_footprint_bytes(&h2o(49)) > small, "more orbitals");
         // H₂O at 97³ (K = 10): within 2× of `qm_gpu::scf`'s ~700 MB at 97³ with K = 8
         // re-pinned (plan 2026-11-13 Task 7 fix rounds 1–2): the estimate now adds the all-electron FD witness growth
-        // (`witness_extra_bytes`, a bound at the cap of 16: 192 fields); the solve part keeps its window
+        // (`witness_extra_bytes`: the counted start since Task 9c fix round 2, 36 fields); the solve part keeps its window
         let w = solve_footprint_bytes(97, 10, 5) as f64 / 1e6;
         assert!((600.0..1400.0).contains(&w), "{w} MB");
         assert_eq!(gpu_footprint_bytes(&h2o(97)), solve_footprint_bytes(97, 10, 5) + witness_extra_bytes(97));
@@ -2063,6 +2067,10 @@ pub(crate) mod tests {
             println!("H₂ R = {r} 33³: E_gpu {:+.9} E_cpu {:+.9} |ΔE| {de:.2e}, max|ΔF| {df:.2e}; GPU {} steps / {:?} readbacks / eig tol {:?} / {} ms, CPU {} steps / {} ms; GPU notes {:?} warnings {:?}",
                      rg.energy, rc.energy, rg.stats.scf_steps, rg.stats.readbacks, rg.stats.eig_tol_used, rg.stats.solve_ms,
                      rc.stats.scf_steps, rc.stats.solve_ms, rg.stats.notes, rg.stats.warnings);
+            if let Some(p) = g.solver.as_ref().map(|s| s.profile()) {
+                println!("  GPU profile: witness growths {}, trims {}, buffer witnesses {}, buffer growths {}, DIIS resets {}, freeze trims {}, frozen steps {}, restores {}",
+                         p.witness_growths, p.witness_trims, p.buffer_witnesses, p.buffer_growths, p.diis_resets, p.diis_freeze_trims, p.frozen_steps, p.eigen_restores);
+            }
             assert!(de < 2e-6, "R = {r}: |ΔE| = {de:.3e}");
             assert!(df < 5e-6, "R = {r}: max |ΔF| = {df:.3e}");
             assert!(rg.stats.readbacks.is_some_and(|n| n > 0));
@@ -3055,7 +3063,7 @@ pub(crate) mod tests {
     #[cfg_attr(debug_assertions, ignore)]
     fn the_orbital_view_is_charged_to_the_vram_budget() {
         let s = h2(49, 1.4);
-        // + the all-electron FD witness growth at the cap of 16 (plan 2026-11-13 Task 7 fix rounds 1–2)
+        // + the all-electron FD witness vectors at the count (plan 2026-11-13 Task 7 fix rounds 1–2; 3 since Task 9c fix round 2)
         assert_eq!(solve_footprint_bytes(49, 2, 1) + witness_extra_bytes(49), gpu_footprint_bytes(&s), "one formula");
         let fb = field_bytes(49) as f64;
         let fields = |m: usize| (orbital_view_footprint_bytes(49, 1, 1, m, TextureKind::None) as f64 / (1.2 * fb)).round() as usize;
@@ -3569,7 +3577,7 @@ pub(crate) mod tests {
         let warm = std::sync::Mutex::new(PseudoCache::default());
         warm.lock().unwrap().table(8).expect("O is accepted");
         // None: the all-electron formula, 8 electrons (triplet: k_max = 5), whatever the cache holds, plus the
-        // all-electron FD witness growth at the cap of 16 (plan 2026-11-13 Task 7 fix rounds 1–2)
+        // all-electron FD witness vectors at the count (plan 2026-11-13 Task 7 fix rounds 1–2; 3 since Task 9c fix round 2)
         assert_eq!(footprint_bytes_in(&warm, &none), solve_footprint_bytes(none.cell.n, 8, 5) + witness_extra_bytes(none.cell.n));
         // pseudo: 6 valence electrons (k_max = 4) plus the extras
         let fp = footprint_in(&warm, &pseudo);
@@ -3588,7 +3596,7 @@ pub(crate) mod tests {
         // H2 under CoresOnly pseudises nothing: counted as today
         let h2c = Scene { ionic: sim::IonicPolicy::CoresOnly, ..h2(33, 1.4) };
         assert_eq!(footprint_bytes_in(&warm, &h2c), footprint_bytes_in(&warm, &h2(33, 1.4)));
-        // plan 2026-11-13 Task 7 fix round 2: with the witness term at the cap of 16 (192 fields), the Precise H₂O preset
+        // plan 2026-11-13 Task 7 fix round 2: with the witness term counted (16 then, 3 since Task 9c fix round 2), the Precise H₂O preset
         // (141³ × 0.10, the 14 Bohr box) fits the estimated mode's auditor share again — half of the 12.9 GB adapter
         // budget of the RX 7900 XTX, 6.45 GB — both all-electron and pseudised under `Accepted` (counted at the bound
         // by a cache that holds no table: the conservative estimate)
@@ -3602,10 +3610,11 @@ pub(crate) mod tests {
     }
 
     /// Plan 2026-11-13 Task 9b ruling: the witness cap is min(32, what fits). `witness_cap_for` raises it from the counted
-    /// 16 only as far as the solve at the cap plus the largest orbital view and Harris display fit the budget, so every
-    /// display guard passes at any request whenever the cap is above 16; it never drops below 16 (what the scene guard
-    /// counted). The app's 12.9 GB at the Accurate H₂O preset (95³ × 0.15) fits 32; the auditor's half of it at Precise
-    /// (141³ × 0.10) does not fit the largest displays above 16; a budget just over the cap-16 scene keeps 16.
+    /// start (`WITNESS_GROWTH_COUNTED`) only as far as the solve at the cap plus the largest orbital view and Harris
+    /// display fit the budget, so every display guard passes at any request whenever the cap is above the count; it never
+    /// drops below the count (what the scene guard accepted). The app's 12.9 GB at the Accurate H₂O preset (95³ × 0.15)
+    /// fits 32; the auditor's half of it at Precise (141³ × 0.10) fits a cap between the count and 32; a budget just over
+    /// the counted scene keeps the count.
     #[test]
     fn the_witness_cap_is_what_the_budget_fits() {
         let accurate = Scene { cell: Cell { n: 95, h: 0.15 }, ..h2o(95) };
@@ -3613,11 +3622,11 @@ pub(crate) mod tests {
         let precise = Scene { cell: Cell { n: 141, h: 0.10 }, ..h2o(141) };
         let auditor = witness_cap_for(&precise, 6_450_000_000);
         let tight = witness_cap_for(&accurate, gpu_footprint_bytes(&accurate) + 1);
-        println!("witness cap: Accurate H₂O 12.9 GB {}, Precise H₂O 6.45 GB {auditor}, Accurate at its cap-16 footprint + 1 B {tight}",
+        println!("witness cap: Accurate H₂O 12.9 GB {}, Precise H₂O 6.45 GB {auditor}, Accurate at its counted footprint + 1 B {tight}",
                  witness_cap_for(&accurate, 12_900_000_000));
         assert_eq!(tight, WITNESS_GROWTH_COUNTED);
         assert!((WITNESS_GROWTH_COUNTED..=qm::scf::MAX_WITNESS_GROWTH).contains(&auditor));
-        // by construction: a cap above 16 leaves room for the largest view and Harris display at that cap
+        // by construction: a cap above the count leaves room for the largest view and Harris display at that cap
         let m = UNOCCUPIED_MAX as usize;
         for (scene, budget) in [(&accurate, 12_900_000_000u64), (&precise, 6_450_000_000), (&precise, 12_900_000_000)] {
             let w = witness_cap_for(scene, budget);
@@ -3708,8 +3717,10 @@ pub(crate) mod tests {
         let r = s.solve(&system, &settings, false).map(|(_, st)| st.iterations);
         println!("water O–H 1.8 r₀ (stop on): {r:?} after {:.1} s", t.elapsed().as_secs_f64());
         // re-pinned in plan 2026-11-13 Task 9 (was an early `ScfStalled`): under FD the point converges
-        // re-pinned in plan 2026-11-13 Task 9c (the GPU's buffer column changes the path; 16 before)
-        assert_eq!(r.ok(), Some(17), "the water point converges under Fermi–Dirac");
+        // re-pinned in plan 2026-11-13 Task 9c (the GPU's buffer column changes the path; 16 before), and in its fix round
+        // 2 to 18: the all-electron H of this CoresOnly scene now starts from its free atom (review M4; 16 with the buffer
+        // rule of review I1 alone)
+        assert_eq!(r.ok(), Some(18), "the water point converges under Fermi–Dirac");
     }
 
     /// Physics review S3 (stall stop): the shell-release path. The OH radical at 3.5 Bohr (`CoresOnly`: pseudo-O, an
@@ -3905,40 +3916,61 @@ pub(crate) mod tests {
         assert!(homo > 0.0, "LSDA's H⁻ HOMO is unbound (held by the box): ε = {homo}");
     }
 
-    /// Spec 2026-11-13 NOTE-6 / V8 at the app's **largest** box (review I1), re-ruled by plan Task 9b's cap decision:
-    /// all-electron H⁻ at 201³ × 0.15 (`MAX_GRID_N`, 30 Bohr), at the app's interactive 1e-5, through `GpuKs` with the
-    /// app's budget (half the adapter's device-local memory, `app::quality::vram_budget`'s rule; 12.9 GB on the RX 7900
-    /// XTX). Weyl's estimate gives ≈ 79 box states below ≈ 0.21 Ha at L = 30 (≈ 7.5 in the 14 Bohr box, where 10–11
-    /// witness vectors were measured): no cap a 24 GB card can hold reaches them (each extra vector per spin costs 12
-    /// fields, 0.53 GB at 201³). The outcome is the memory guard's: the scene needs ≈ 13.4 GB with the counted 16 extra
-    /// vectors (5.0 GB without them) — over the budget, so it is refused before any allocation, naming the budget (the
-    /// cap ruling: min(32, what fits), never a solve that runs for minutes into the cap error). Without the guard the
-    /// solve would end on the cap error naming the cap (`within {cap} extra levels`); not run (≈ 22 GB at cap 32).
+    /// Spec 2026-11-13 NOTE-6 / V8 at the app's **largest** box (review I1), re-ruled by plan Task 9c fix round 2 (Decision
+    /// 1): all-electron H⁻ at 201³ × 0.15 (`MAX_GRID_N`, 30 Bohr) under the app's budget (half the adapter's device-local
+    /// memory, `app::quality::vram_budget`'s rule; 12.9 GB on the RX 7900 XTX). Weyl's estimate gives ≈ 79 box states
+    /// below ≈ 0.21 Ha at L = 30 (10–11 witness vectors were measured in the 14 Bohr box): no cap a 24 GB card can hold
+    /// reaches them. The guard now counts the start allocation (`WITNESS_GROWTH_COUNTED`), so the scene is accepted, with
+    /// a cap of what the budget leaves (`witness_cap_for`) — well below 79, so its solve ends on the cap error naming the
+    /// budget, never an allocation past it (that path is solved in `a_growth_over_the_budget_is_the_named_cap_error`; this
+    /// 201³ solve is not run: minutes of grinding toward the same error). Guard-level only: no GPU work.
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "release-only (GPU); cargo test -p providers --release")]
     fn all_electron_h_minus_witness_cap_at_the_largest_box() {
-        let Some(ctx) = gpu() else { return };
-        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
-        // the app's rule (`app::quality::vram_budget`): half the reported memory, else its 12 GB default (review M6: never a
-        // silent pass when the adapter reports none)
-        let budget = ctx.device_local_memory_bytes().map_or(12_000_000_000, |mem| mem / 2);
+        let budget = 12_880_000_000u64; // half of the RX 7900 XTX's 25.76 GB (the app's rule)
         let scene = Scene { nuclei: vec![Nucleus::new(1, [0.0; 3])], cell: Cell { n: 201, h: 0.15 }, charge: -1, multiplicity: None, sigma: None,
                             external_field: [0.0; 3], ionic: sim::IonicPolicy::None, train_mask: None };
         let need = gpu_footprint_bytes(&scene);
-        let without = need - witness_extra_bytes(201);
-        println!("H⁻ 201³ × 0.15: needs {:.2} GB with the counted {WITNESS_GROWTH_COUNTED} extra vectors ({:.2} GB without), budget {:.2} GB; one extra vector per spin {:.2} GB",
-                 need as f64 / 1e9, without as f64 / 1e9, budget as f64 / 1e9, witness_bytes(201, 1) as f64 / 1e9);
+        let cap = witness_cap_for(&scene, budget);
+        println!("H⁻ 201³ × 0.15: needs {:.2} GB with the counted {WITNESS_GROWTH_COUNTED} witness vectors per spin, budget {:.2} GB; cap {cap}; one vector per spin {:.2} GB",
+                 need as f64 / 1e9, budget as f64 / 1e9, witness_bytes(201, 1) as f64 / 1e9);
+        assert!(need <= budget, "the counted start fits");
+        assert!((WITNESS_GROWTH_COUNTED..79).contains(&cap), "a cap below Weyl's ≈ 79 box states: the solve ends on the cap error ({cap})");
+        // the cap is what the budget leaves: one more vector per spin, with the largest displays, does not fit
+        let (m, n) = (UNOCCUPIED_MAX as usize, 201);
+        let at = |w: usize| need - witness_extra_bytes(n) + witness_bytes(n, w) + orbital_view_footprint_bytes(n, 1, 1, m, TextureKind::Colour)
+            + harris_footprint_bytes(n, 1, 1, m, false, w);
+        assert!(cap == qm::scf::MAX_WITNESS_GROWTH || at(cap + 1) > budget, "cap {cap}: one more vector still fits");
+    }
+
+    /// Plan 2026-11-13 Task 9c fix round 2 (Decision 1): a solve whose witness growth would pass what the budget leaves
+    /// ends with the solver's cap error naming the budget — never an allocation past it. All-electron H⁻ at 95³ × 0.15
+    /// (the 14 Bohr V8 box: 8 witness vectors per spin measured) under a budget that fits the counted start plus one
+    /// vector per spin with the largest displays (cap = count + 1 = 4): the cold solve stops at the cap with
+    /// `QmError::Numerical` "no gap witness within 4 extra levels … the most the … budget fits".
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only (GPU); cargo test -p providers --release")]
+    fn a_growth_over_the_budget_is_the_named_cap_error() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let scene = Scene { nuclei: vec![Nucleus::new(1, [0.0; 3])], cell: Cell { n: 95, h: 0.15 }, charge: -1, multiplicity: None, sigma: None,
+                            external_field: [0.0; 3], ionic: sim::IonicPolicy::None, train_mask: None };
+        let (n, m, w) = (95, UNOCCUPIED_MAX as usize, WITNESS_GROWTH_COUNTED + 1);
+        let budget = gpu_footprint_bytes(&scene) - witness_extra_bytes(n) + witness_bytes(n, w) + orbital_view_footprint_bytes(n, 1, 1, m, TextureKind::Colour)
+            + harris_footprint_bytes(n, 1, 1, m, false, w);
+        assert_eq!(witness_cap_for(&scene, budget), w, "the budget leaves one vector per spin past the count");
         let mut g = GpuKs::new(ctx, 1e-5).with_vram_budget(budget);
-        match g.evaluate(&scene, &mut never()) {
-            Err(ProviderError::Invalid(m)) => {
-                assert!(m.contains("GPU memory") && m.contains("budget") && m.contains("201³"), "the refusal names the budget: {m}");
-                assert!(g.solver.is_none(), "refused before the solver was built");
-                println!("refused: {m}");
+        let t = Instant::now();
+        let r = g.evaluate(&scene, &mut never());
+        println!("H⁻ 95³ × 0.15 under {:.3} GB (cap {w}): {:?} after {:.1} s", budget as f64 / 1e9, r.as_ref().map(|r| r.stats.scf_steps), t.elapsed().as_secs_f64());
+        match r {
+            Err(ProviderError::Solver(SolverError::Numerical(m))) => {
+                assert!(m.contains(&format!("within {w} extra levels")) && m.contains("budget"), "the cap error names the cap and the budget: {m}");
             }
-            Err(e) => panic!("expected the memory guard's refusal at the largest box, got {e}"),
-            Ok(r) => panic!("expected the memory guard's refusal at the largest box, got a result ({:?})", r.stats.source),
+            Err(e) => panic!("expected the named cap error, got {e}"),
+            Ok(r) => panic!("expected the named cap error, got a result ({} steps)", r.stats.scf_steps),
         }
-        assert!(need > budget && without < budget, "the witness growth is what does not fit");
+        let peak = g.solver.as_ref().map(|s| s.profile().peak_block);
+        assert!(peak.is_some_and(|p| p <= 1 + w), "the block never passed the cap: peak {peak:?}");
     }
 
     /// Review I4: the cold all-electron H₂O at 97³ × 0.25 (24 Bohr) — `unoccupied_budget_in_play`'s former leg and
@@ -3958,9 +3990,9 @@ pub(crate) mod tests {
         let r = s.solve(&system, &settings, false).map(|(_, st)| st);
         let wall = t.elapsed().as_secs_f64();
         let p = s.profile().clone();
-        println!("H₂O 97³ × 0.25 all-electron, cold: {:?} after {wall:.1} s; peak block {}, witness growths {}, class raises {}, locked calls {}, frozen steps {}, DIIS resets {}",
+        println!("H₂O 97³ × 0.25 all-electron, cold: {:?} after {wall:.1} s; peak block {}, witness growths {}, buffer witnesses {} / growths {}, class raises {}, locked calls {}, frozen steps {}, DIIS resets {}, freeze trims {}, restores {}",
                  r.as_ref().map(|st| (st.iterations, st.energy.total, st.energy.ts, st.max_eigen_residual, st.max_guard_residual)),
-                 p.peak_block, p.witness_growths, p.class_raises, p.locked_calls, p.frozen_steps, p.diis_resets);
+                 p.peak_block, p.witness_growths, p.buffer_witnesses, p.buffer_growths, p.class_raises, p.locked_calls, p.frozen_steps, p.diis_resets, p.diis_freeze_trims, p.eigen_restores);
         let st = r.unwrap_or_else(|e| panic!("H₂O 97³ × 0.25 cold: {e}"));
         let state = s.state().expect("converged");
         println!("  stored ↑ {} ↓ {} (n {} / {}), ε↑ {:?}", state.orbitals_up.len(), state.orbitals_dn.len(), system.n_up, system.n_dn, state.evals_up);
@@ -3970,28 +4002,27 @@ pub(crate) mod tests {
     /// Plan 2026-11-13 Task 9c, the VRAM measurement: the cold all-electron H₂O of the app's
     /// `a_change_over_the_vram_budget_is_refused` (177³ × 0.08, 14.08 Bohr) under FermiDirac at the app's 1e-5 — the
     /// solve's peak witness allocation (`SolveProfile::peak_block` − n_σ extra vectors per spin), against which the
-    /// footprint's counted growth is set. Run at 167³ × 0.0848 (the same 14.08 Bohr box): 177³ does not run on a
-    /// default-limits device — the Poisson boundary table (`ghost_fill`'s binding 3, 147 MB at 177³) is over wgpu's
-    /// 128 MiB `max_storage_buffer_binding_size`, which `gpu::GpuContext` keeps at its default. A measurement:
+    /// footprint's count (`WITNESS_GROWTH_COUNTED`) is set. (Until fix round 2 it ran at 167³ × 0.0848, the same box:
+    /// 177³'s Poisson boundary table was over wgpu's default 128 MiB storage binding.) A measurement:
     /// `cargo test -p providers --release --lib -- --ignored --nocapture cold_all_electron_h2o_at_177_peak`.
     #[test]
-    #[ignore = "measurement (GPU, 167³ all-electron, minutes)"]
+    #[ignore = "measurement (GPU, 177³ all-electron, about a minute)"]
     fn cold_all_electron_h2o_at_177_peak() {
         let Some(ctx) = gpu() else { return };
         let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
-        let mut sc = h2o(167);
-        sc.cell.h = 14.08 / 166.0;
-        let (grid, system, settings) = problem(&sc, 1e-5, &mut Vec::new()).expect("H₂O 167³ × 0.0848 is posed");
+        let mut sc = h2o(177);
+        sc.cell.h = 0.08;
+        let (grid, system, settings) = problem(&sc, 1e-5, &mut Vec::new()).expect("H₂O 177³ × 0.08 is posed");
         assert!(system.ionic.is_none());
         let mut s = qm_gpu::GpuSolver::new(ctx, &grid);
         let t = Instant::now();
         let r = s.solve(&system, &settings, false).map(|(_, st)| st);
         let wall = t.elapsed().as_secs_f64();
         let p = s.profile().clone();
-        println!("H₂O 167³ × 0.0848 (14.08 Bohr) all-electron, cold: {:?} after {wall:.1} s; peak block {} (n↑ {}, n↓ {}), witness growths {}, trims {}, class raises {}, locked calls {}, DIIS resets {}",
+        println!("H₂O 177³ × 0.08 (14.08 Bohr) all-electron, cold: {:?} after {wall:.1} s; peak block {} (n↑ {}, n↓ {}), witness growths {}, trims {}, class raises {}, locked calls {}, DIIS resets {}",
                  r.as_ref().map(|st| (st.iterations, st.energy.total, st.max_eigen_residual)), p.peak_block, system.n_up, system.n_dn,
                  p.witness_growths, p.witness_trims, p.class_raises, p.locked_calls, p.diis_resets);
-        r.unwrap_or_else(|e| panic!("H₂O 167³ cold: {e}"));
+        r.unwrap_or_else(|e| panic!("H₂O 177³ cold: {e}"));
     }
 
     // ---- the Harris display (module doc, "Harris display"; live-orbitals Task 4) ----

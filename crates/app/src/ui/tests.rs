@@ -2956,12 +2956,15 @@ fn superscripts_are_drawn_raised() {
 /// before anything is sent (wgpu would otherwise panic on the allocation): 8 Ne in a 16 Bohr box at
 /// Custom 0.08 (201³, 80 electrons, ≈ 25.5 GB) on the GPU backend — and the refused value does not
 /// stay on the Custom slider. H₂O at Custom 0.08 on the estimated solver (177³ for its own 14 Bohr
-/// box, two GPU solvers — teacher and auditor — ≈ 9.9 GB) is under the 12 GB default and goes
-/// through — on the estimated solver's own box since 2026-11-14 (`ui::estimated_box`): H₂O's span
-/// 2.86 Bohr + 2 × (the provisional 5.98 Bohr cloud at h = 0.08 + 2 Bohr) = 18.8 Bohr asks for the
-/// largest grid (201³), over the budget, so it falls back to the largest grid the guard passes
-/// (189³ under the 12 GB default). (The action path reads `ATOMIC_SANDBOX_VRAM_GB`, unset here,
-/// and the card's memory when a viewer test reported it: the expected grid is the guard's own.)
+/// box, two GPU solvers — teacher and auditor — ≈ 12.10 GB with the counted witness vectors, plan
+/// 2026-11-13 Task 9c fix round 2) is over the 12 GB default (a card that reports no memory) and is
+/// refused there; on this card's 12.88 GB it goes through on the estimated solver's own box
+/// (`ui::estimated_box`, since 2026-11-14): H₂O's span 2.86 Bohr + 2 × (the provisional 5.98 Bohr
+/// cloud at h = 0.08 + 2 Bohr) = 18.8 Bohr asks for the largest grid (201³), over the budget, so it
+/// falls back to the largest grid the guard passes (179³; 189³ under the 12 GB default before plan
+/// Task 7 counted witness vectors). (The action path reads `ATOMIC_SANDBOX_VRAM_GB`, unset here, and
+/// the card's memory when a viewer test reported it: its refusal is asserted only when that budget
+/// is under the need.)
 #[test]
 fn a_change_over_the_vram_budget_is_refused() {
     use crate::quality::{gpu_solvers, vram_check, VramBudget, VRAM_BUDGET_GB};
@@ -2991,24 +2994,34 @@ fn a_change_over_the_vram_budget_is_refused() {
     assert_eq!(w8.grid_n, 177);
     let need = 2 * providers::gpu_footprint_bytes(&w8.to_sim().unwrap());
     eprintln!("H₂O at 0.08 (177³), estimated mode: ≈ {:.2} GB", need as f64 / 1e9);
-    assert!((9.5e9..10.3e9).contains(&(need as f64)), "{need}");
-    assert!(vram_check(&w8, gpu_solvers(Backend::Estimated, true), budget).is_ok());
-    let mut st = UiState::new("h2o", &w);
-    (st.backend, st.gpu_available) = (Backend::Estimated, true);
-    let out = act(&mut st, &input(&w, None, &cam), Action::Quality(0.08));
-    assert!(out.error.is_none(), "{:?}", out.error);
+    // re-pinned (plan 2026-11-13 Task 9c fix round 2, Decision 1): the guard counts the solver's start allocation, 3
+    // witness vectors per spin (`providers::ks::WITNESS_GROWTH_COUNTED`: the measured peak of 2 at this 14 Bohr box plus
+    // the buffer column), 12 fields each at 177³ in two solvers: 9.91 GB before any witness term + 2.19 GB = 12.10 GB
+    // (9.5–10.3 before plan Task 7 counted witnesses; 21.6 GB at Task 9b's count of 16)
+    assert!((12.0e9..12.2e9).contains(&(need as f64)), "{need}");
     let solvers = gpu_solvers(Backend::Estimated, true);
     let w8r = &w8;
     let fits = |b: VramBudget| move |n: usize| vram_check(&Scene { grid_n: n, ..w8r.clone() }, solvers, b).is_ok();
+    // over the 12 GB default (a card that reports no memory) the change is refused like the Ne one: no box from the
+    // base 177³ up passes, so the estimated box is the base's own and the guard refuses it, nothing changed
+    assert!(vram_check(&w8, solvers, budget).is_err());
     let default = crate::quality::estimated_box(&w8, 14.0, 0.08, &[], fits(budget));
-    assert_eq!((default.want_n, default.n, default.capped), (201, 189, true), "under the 12 GB default");
-    let n = crate::quality::estimated_box(&w8, 14.0, 0.08, &[], fits(crate::quality::vram_budget())).n;
-    assert!((177..201).contains(&n), "{n}");
-    assert!(
-        matches!(out.commands.as_slice(), [Command::SetGrid { n: g, h }, Command::Dyn(DynCommand::SetWalls(Some(_)))] if *h == 0.08 && *g == n),
-        "{:?}",
-        out.commands
-    );
+    assert_eq!((default.want_n, default.n, default.capped), (201, 177, true), "under the 12 GB default: the base box, refused");
+    let mut st = UiState::new("h2o", &w);
+    (st.backend, st.gpu_available) = (Backend::Estimated, true);
+    let before = (st.grid_n, st.quality_h);
+    let out = act(&mut st, &input(&w, None, &cam), Action::Quality(0.08));
+    if crate::quality::vram_budget().bytes < need {
+        assert!(out.commands.is_empty() && out.error.as_deref().is_some_and(|e| e.contains("GPU memory")), "{:?}", out.error);
+        assert_eq!((st.grid_n, st.quality_h), before, "nothing changed");
+    }
+    // on this card's budget (half of the RX 7900 XTX's 25.76 GB) it goes through, on the estimated solver's own box: the
+    // largest grid the guard passes below the wanted 201³
+    let card = VramBudget::fixed(12_880_000_000);
+    assert!(vram_check(&w8, solvers, card).is_ok());
+    let on_card = crate::quality::estimated_box(&w8, 14.0, 0.08, &[], fits(card));
+    eprintln!("estimated box: 12 GB default {:?}, 12.88 GB card {:?}", default, on_card);
+    assert_eq!((on_card.want_n, on_card.n, on_card.capped), (201, 179, true), "under this card's 12.88 GB");
 }
 
 // ---- temperature units (user request 2026-10-14: K / °C / °F, display only) ----

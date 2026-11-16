@@ -66,7 +66,14 @@ impl GpuContext {
         // partials buffer in one dispatch; WebGPU's default is 8 storage buffers per stage. Ask
         // for what the adapter offers up to 16, never below the default (the kernel adapts).
         let mut limits = wgpu::Limits::default();
-        limits.max_storage_buffers_per_shader_stage = adapter.limits().max_storage_buffers_per_shader_stage.clamp(8, 16);
+        let offered = adapter.limits();
+        limits.max_storage_buffers_per_shader_stage = offered.max_storage_buffers_per_shader_stage.clamp(8, 16);
+        // The largest buffer and storage binding the adapter offers, never below wgpu's defaults (plan 2026-11-13
+        // fix round 2): at the default 128 MiB binding the Poisson boundary table of a 177³ grid (147 MB, bound whole
+        // by `ghost_fill`) cannot be bound, so the app's finest Custom qualities failed at the first dispatch. The RX
+        // 7900 XTX (Vulkan) offers 2 GiB − 4 B for the binding and 2 GiB for a buffer.
+        limits.max_storage_buffer_binding_size = offered.max_storage_buffer_binding_size.max(limits.max_storage_buffer_binding_size);
+        limits.max_buffer_size = offered.max_buffer_size.max(limits.max_buffer_size);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("atomic-sandbox"),
             required_features: optional,
