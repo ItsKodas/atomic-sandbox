@@ -55,8 +55,8 @@
 //!
 //! # The knowledge map (M8a Task 9)
 //! `sim::KnowledgeMap` is built whenever the model is fitted and what it shows may have changed
-//! ([`KnowledgeKey`]: the model generation, the trust rule, the exclusions and every per-key class
-//! verdict — not the store's size, since samples kept since the last refit are not in the fit the
+//! ([`KnowledgeKey`]: the model generation, the trust rule, the exclusions — the forgotten count
+//! included — and every per-key class verdict — not the store's size, since samples kept since the last refit are not in the fit the
 //! map counts), whether or not the views are on: one pass over the fitted samples, no prediction
 //! (milliseconds for thousands of samples), in `activity_ms`. Shipped like the views:
 //! `ActivityDelta::knowledge`, `None` = no new build.
@@ -143,6 +143,8 @@ pub(super) struct KnowledgeKey {
     model_gen: u64,
     trusted: bool,
     quarantined: usize,
+    /// A Forget or Restore moves the molecules' counts and the fitted set at once (2026-11-16).
+    forgotten: usize,
     superseded: usize,
     box_excluded: usize,
     verdicts: Vec<bool>,
@@ -154,6 +156,7 @@ impl KnowledgeKey {
             model_gen: m.model_gen,
             trusted: m.trusted,
             quarantined: m.quarantined,
+            forgotten: m.forgotten,
             superseded: m.superseded,
             box_excluded: m.box_excluded,
             verdicts: m.class_loo.iter().flat_map(|c| std::iter::once(c.trusted).chain(c.species.iter().map(|s| s.trusted))).collect(),

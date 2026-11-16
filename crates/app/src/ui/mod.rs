@@ -751,6 +751,9 @@ pub struct UiState {
     /// "Restore N selected" (2026-11-14, the batched forget). Kept to the ids the lists show.
     pub forget_selection: Vec<sim::SampleId>,
     pub restore_selection: Vec<sim::SampleId>,
+    /// "Forget samples…" and "Forget all above x×" (2026-11-16): their filter and inline
+    /// confirmations (display state until **Forget** emits `Action::ForgetByRule`).
+    pub forget_rule: dock::model::ForgetTool,
     /// The number of the last purge outcome put on the status line (`ModelStatus::last_purge`).
     pub purge_seen: u64,
     /// The first click on a sampling button whose pass would take longer than
@@ -1050,6 +1053,7 @@ impl UiState {
             purge_confirm: false,
             forget_selection: Vec::new(),
             restore_selection: Vec::new(),
+            forget_rule: dock::model::ForgetTool::default(),
             purge_seen: 0,
             start_armed: None,
             audit_every: providers::FallbackPolicy::default().audit_every,

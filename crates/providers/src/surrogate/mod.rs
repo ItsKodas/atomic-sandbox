@@ -3436,6 +3436,10 @@ impl Trainable for SurrogateKs {
         SurrogateKs::user_changes_pending(self)
     }
 
+    fn forget_by_rule(&mut self, rule: &sim::knowledge::ForgetRule, expected: usize) -> Result<usize, String> {
+        SurrogateKs::forget_by_rule(self, rule, expected)
+    }
+
     fn sample_suspects(&self) -> Vec<sim::SampleSuspect> {
         SurrogateKs::sample_suspects(self)
     }

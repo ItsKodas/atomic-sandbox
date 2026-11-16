@@ -93,6 +93,12 @@ pub enum Command {
     /// Estimated solver: "Restore N selected" (`Trainable::restore_samples`), as one batch. Never an
     /// edit, never aborts.
     RestoreSamples(Vec<sim::SampleId>),
+    /// Estimated solver: the Model tab's "Forget samples…" / "Forget all above x×" after its
+    /// confirmation (2026-11-16): every stored sample in the fit's codes that the rule matches,
+    /// resolved by the provider now (`Trainable::forget_by_rule`) and forgotten as one batch, then
+    /// one debounced refit as for [`Command::ForgetSamples`]. `expected` is the count the user
+    /// confirmed: refused when another count matches now. Never an edit, never aborts.
+    ForgetByRule { rule: sim::knowledge::ForgetRule, expected: usize },
     /// Estimated solver: the Model tab's "Refit now": the pending refit after the user's Forget /
     /// Restore starts at once instead of after its delay (after a running refit lands). Never an
     /// edit, never aborts.
@@ -211,6 +217,7 @@ impl Command {
             | Command::RestoreSample(_)
             | Command::ForgetSamples(_)
             | Command::RestoreSamples(_)
+            | Command::ForgetByRule { .. }
             | Command::RefitNow
             | Command::PurgeForgotten(_)
             | Command::SaveSpecialised { .. }
@@ -252,6 +259,7 @@ impl Command {
             | Command::RestoreSample(_)
             | Command::ForgetSamples(_)
             | Command::RestoreSamples(_)
+            | Command::ForgetByRule { .. }
             | Command::RefitNow
             | Command::PurgeForgotten(_)
             | Command::SaveSpecialised { .. }
@@ -299,6 +307,7 @@ impl Command {
                 | Command::RestoreSample(_)
                 | Command::ForgetSamples(_)
                 | Command::RestoreSamples(_)
+                | Command::ForgetByRule { .. }
                 | Command::RefitNow
                 | Command::PurgeForgotten(_)
                 | Command::SaveSpecialised { .. }
@@ -349,6 +358,7 @@ impl Command {
             | Command::RestoreSample(_)
             | Command::ForgetSamples(_)
             | Command::RestoreSamples(_)
+            | Command::ForgetByRule { .. }
             | Command::RefitNow
             | Command::PurgeForgotten(_)
             | Command::SaveSpecialised { .. }
@@ -461,6 +471,7 @@ impl Worker {
             Command::RestoreSample(i) => self.user_samples(&[i], false),
             Command::ForgetSamples(ids) => self.user_samples(&ids, true),
             Command::RestoreSamples(ids) => self.user_samples(&ids, false),
+            Command::ForgetByRule { rule, expected } => self.forget_by_rule(&rule, expected),
             Command::RefitNow => self.refit_now(),
             Command::PurgeForgotten(n) => self.purge_forgotten(n),
             Command::SaveSpecialised { path, species } => self.save_specialised(&path, &species),

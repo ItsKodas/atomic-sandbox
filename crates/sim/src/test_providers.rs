@@ -447,6 +447,10 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         self.lock().user_changes_pending()
     }
 
+    fn forget_by_rule(&mut self, rule: &crate::knowledge::ForgetRule, expected: usize) -> Result<usize, String> {
+        self.lock().forget_by_rule(rule, expected)
+    }
+
     fn sample_suspects(&self) -> Vec<crate::provider::SampleSuspect> {
         self.lock().sample_suspects()
     }

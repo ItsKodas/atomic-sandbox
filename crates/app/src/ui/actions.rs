@@ -141,6 +141,12 @@ pub enum Action {
     /// "Restore N selected": the checked forgotten rows, restored as one batch
     /// (`Command::RestoreSamples`). Recorded, not replayable.
     RestoreSamples(Vec<sim::SampleId>),
+    /// "Forget samples…" › **Forget** and "Forget all above x×" › **Forget** (2026-11-16, after the
+    /// inline confirmation): every stored sample in the fit's codes the rule matches, with the count
+    /// the user confirmed (`Command::ForgetByRule`: the worker resolves the rule and refuses another
+    /// count). Recorded, not replayable (`# not replayable: forget-by-rule`, refused like a Forget
+    /// batch: it writes the shared collection's status records).
+    ForgetByRule(sim::knowledge::ForgetRule, usize),
     /// The pending-refit banner's "Refit now" (and the Activity job row's): the refit after the
     /// user's Forget / Restore starts at once instead of after its delay (`Command::RefitNow`).
     /// Recorded, not replayable (it only exists after a Forget or Restore, which a replay refuses).
@@ -704,6 +710,12 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             st.set_status(format!("restoring {} samples; the refit follows in {} s (Refit now starts it)", ids.len(), crate::sim::FORGET_REFIT_DELAY.as_secs()));
             out.commands.push(Command::RestoreSamples(ids));
         }
+        Action::ForgetByRule(rule, n) => {
+            st.forget_rule.confirm = false;
+            st.forget_rule.above_confirm = false;
+            st.set_status(format!("forgetting {n} sample{}: held out of the fit until Restore; the refit follows in {} s (Refit now starts it)", if n == 1 { "" } else { "s" }, crate::sim::FORGET_REFIT_DELAY.as_secs()));
+            out.commands.push(Command::ForgetByRule { rule, expected: n });
+        }
         Action::RefitNow => {
             st.set_status("refitting now");
             out.commands.push(Command::RefitNow);
@@ -1241,7 +1253,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | ForgetSample(_) | RestoreSample(_) | ForgetSamples(_) | RestoreSamples(_) | RefitNow | PurgeForgotten(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) | ImportData(_) | CheckUpdates | InstallVersion(_) | RestartToUpdate | CancelUpdateDownload => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | ForgetSample(_) | RestoreSample(_) | ForgetSamples(_) | RestoreSamples(_) | ForgetByRule(..) | RefitNow | PurgeForgotten(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) | ImportData(_) | CheckUpdates | InstallVersion(_) | RestartToUpdate | CancelUpdateDownload => return None,
         })
     }
 
