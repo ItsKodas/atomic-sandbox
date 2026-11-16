@@ -166,12 +166,15 @@ pub fn tridiagonal_qtc(a: &[f64], n: usize, c: &mut [f64]) -> (Vec<f64>, Vec<f64
 /// deflates only relative to the neighbouring diagonal and did not converge on a strongly graded
 /// 37×37 block (entries 1e5 down to 5e-11) of the user's collection (2026-11-17).
 ///
+/// `Err` when the QL iteration does not converge on a block (never seen on symmetric input; the
+/// active set then falls back on Jacobi, `grade`).
+///
 /// # Panics
-/// If `a.len() != n * n`, or (never seen on symmetric input) the QL iteration does not converge.
-pub fn symmetric_eigen(a: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
+/// If `a.len() != n * n`.
+pub fn symmetric_eigen(a: &[f64], n: usize) -> Result<(Vec<f64>, Vec<f64>), LinalgError> {
     assert_eq!(a.len(), n * n, "dense::symmetric_eigen: slice is not n×n");
     if n == 0 {
-        return (Vec::new(), Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     install(|| {
         let mut m = lower_to_mat(a, n);
@@ -211,8 +214,7 @@ pub fn symmetric_eigen(a: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
                     ri[k] = c * x - s * y;
                     rj[k] = s * x + c * y;
                 }
-            })
-            .expect("dense::symmetric_eigen: QL did not converge");
+            })?;
             for i in 0..b {
                 ev[lo + i] = db[i];
                 for k in 0..b {
@@ -240,7 +242,7 @@ pub fn symmetric_eigen(a: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
                 v[k * n + col] = ut[(k, i)];
             }
         }
-        (order.iter().map(|&i| ev[i]).collect(), v)
+        Ok((order.iter().map(|&i| ev[i]).collect(), v))
     })
 }
 
@@ -317,7 +319,7 @@ mod tests {
                 assert!((w.1 - g.1).abs() < 1e-9 * (1.0 + w.1), "n {n}: ĉ² {} vs {}", w.1, g.1);
             }
             // eigenpairs
-            let (ev, v) = symmetric_eigen(&a, n);
+            let (ev, v) = symmetric_eigen(&a, n).unwrap();
             assert!(ev.windows(2).all(|w| w[0] <= w[1]), "nondecreasing");
             for i in 0..n {
                 for k in 0..n {
@@ -353,7 +355,7 @@ mod tests {
             }
         }
         let tr: f64 = (0..n).map(|i| g[i * n + i]).sum();
-        let (ev, _) = symmetric_eigen(&g, n);
+        let (ev, _) = symmetric_eigen(&g, n).unwrap();
         let mut sorted = ev.clone();
         sorted.sort_by(|a, b| a.abs().total_cmp(&b.abs()));
         let null_max = sorted[n - r - 1].abs() / tr;
@@ -391,7 +393,7 @@ mod tests {
                     a[j * n + i] += x;
                 }
             }
-            let (ev, v) = symmetric_eigen(&a, n);
+            let (ev, v) = symmetric_eigen(&a, n).unwrap();
             assert!(ev.iter().all(|x| x.is_finite()), "n {n}");
             let (mut eb, _) = linalg::symmetric_eigen(&big, r);
             eb.sort_by(f64::total_cmp);
@@ -429,7 +431,7 @@ mod tests {
         for i in d.len()..n {
             a[i * n + i] = 1e-300 * i as f64;
         }
-        let (ev, v) = symmetric_eigen(&a, n);
+        let (ev, v) = symmetric_eigen(&a, n).unwrap();
         let (mut want, _) = linalg::symmetric_eigen_householder(&a, n);
         want.sort_by(f64::total_cmp);
         let norm = want.iter().fold(0.0f64, |m, x| m.max(x.abs()));
@@ -458,7 +460,7 @@ mod tests {
                 let inv = spd_inverse(&l, n);
                 let mut c = c0.clone();
                 let (d, e) = tridiagonal_qtc(&a, n, &mut c);
-                let (ev, v) = symmetric_eigen(&a, n);
+                let (ev, v) = symmetric_eigen(&a, n).unwrap();
                 let bits = |x: &[f64]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
                 (bits(&l), bits(&inv), bits(&d), bits(&e), bits(&c), bits(&ev), bits(&v))
             })

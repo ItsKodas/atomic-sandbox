@@ -138,6 +138,23 @@ impl SpeciesActive {
 /// in it. `large`: faer's eigensolver with the rounding band at τ counted null (module doc, "The
 /// large basis"; a body-4 basis); otherwise Jacobi and the bare comparison, bit for bit.
 fn species_active(xs: &[Vec<f64>], p: usize, large: bool, max_swaps: usize) -> SpeciesActive {
+    species_active_with(xs, p, large, max_swaps, crate::dense::symmetric_eigen)
+}
+
+/// The large path's eigensolver result: `solver`'s (faer's in a build), or Jacobi's when its QL
+/// does not converge (`dense::symmetric_eigen`'s `Err`, never seen) — the active set is then
+/// built as before the speed-up, slower, instead of the refit panicking. The band rule applies to
+/// either spectrum.
+type EigenResult = Result<(Vec<f64>, Vec<f64>), crate::linalg::LinalgError>;
+fn large_span_eigen(g: &[f64], p: usize, solver: impl Fn(&[f64], usize) -> EigenResult) -> (Vec<f64>, Vec<f64>) {
+    solver(g, p).unwrap_or_else(|_| {
+        crate::prof::count("active set: QL did not converge, Jacobi instead", 1);
+        symmetric_eigen(g, p)
+    })
+}
+
+/// [`species_active`] with the large path's eigensolver given (the fallback test).
+fn species_active_with(xs: &[Vec<f64>], p: usize, large: bool, max_swaps: usize, solver: impl Fn(&[f64], usize) -> EigenResult) -> SpeciesActive {
     crate::prof::count("active set: species blocks", 1);
     crate::prof::count("active set: features p (summed over species)", p as u64);
     crate::prof::count("active set: atoms (rows)", xs.len() as u64);
@@ -148,7 +165,7 @@ fn species_active(xs: &[Vec<f64>], p: usize, large: bool, max_swaps: usize) -> S
     drop(_pg);
     let _pe = crate::prof::span("grade: active set eigen (faer for body-4, else Jacobi)");
     let (v, (keep, n_null)) = if large {
-        let (ev, v) = crate::dense::symmetric_eigen(&g, p);
+        let (ev, v) = large_span_eigen(&g, p, solver);
         (v, span_split(&ev, tau))
     } else {
         let (ev, v) = symmetric_eigen(&g, p);
@@ -388,7 +405,7 @@ impl ActiveSet {
                 let g = gram(&xs, p);
                 let tau = p as f64 * f64::EPSILON * (0..p).map(|i| g[i * p + i]).sum::<f64>();
                 let (mut ej, _) = symmetric_eigen(&g, p);
-                let (mut ef, _) = crate::dense::symmetric_eigen(&g, p);
+                let (mut ef, _) = crate::dense::symmetric_eigen(&g, p).expect("measurement: faer's QL did not converge");
                 ej.sort_by(f64::total_cmp);
                 ef.sort_by(f64::total_cmp);
                 Some((ej, ef, tau))
@@ -548,6 +565,24 @@ mod tests {
             let (gj, gf) = (jac.grade(0, x), fae.grade(0, x));
             assert!((gj - gf).abs() <= 1e-9 * gj.abs().max(1.0), "{gj} vs {gf}");
         }
+    }
+
+    /// A QL that does not converge on the large path (`dense::symmetric_eigen`'s `Err`) falls back on
+    /// Jacobi: no panic, and the same span and active rows as Jacobi's path (the band rule moves
+    /// nothing on these rows), to rounding in the grade.
+    #[test]
+    fn a_failed_ql_falls_back_on_jacobi() {
+        let (n, p, r) = (400, 40, 17);
+        let xs = rank_deficient_rows(13, n, p, r);
+        let g = gram(&xs, p);
+        let failing = |_: &[f64], _: usize| -> EigenResult { Err(crate::linalg::LinalgError::NotPositiveDefinite(0)) };
+        let (ev, v) = large_span_eigen(&g, p, failing);
+        let (ej, vj) = symmetric_eigen(&g, p);
+        assert_eq!((ev, v), (ej, vj), "the fallback is Jacobi's decomposition, bit for bit");
+        let fell_back = species_active_with(&xs, p, true, MAXVOL_MAX_SWAPS, failing);
+        let jacobi = species_active(&xs, p, false, MAXVOL_MAX_SWAPS);
+        assert_eq!((fell_back.u.len(), &fell_back.active, fell_back.converged), (r, &jacobi.active, true));
+        assert_eq!(fell_back.null_threshold, jacobi.null_threshold);
     }
 
     /// The band rule (module doc): an eigenvalue within δ = √P·ε·max|λ| above τ is null, one above
