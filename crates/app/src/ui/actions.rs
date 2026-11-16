@@ -774,9 +774,14 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
                 st.set_status(super::RELAX_REFUSED_SAMPLING);
             } else {
                 out.commands.push(dyn_(DynCommand::Relax));
+                // the button shows Stop at once, spinning until the worker answers
+                st.relax_pending = Some(super::RelaxPending::new(false, input.relaxing(), Instant::now()));
             }
         }
-        Action::StopRelax => out.commands.push(dyn_(DynCommand::StopRelax)),
+        Action::StopRelax => {
+            out.commands.push(dyn_(DynCommand::StopRelax));
+            st.relax_pending = Some(super::RelaxPending::new(true, input.relaxing(), Instant::now()));
+        }
         Action::CompareReference { method, relax } => compare_reference(st, input, method, relax, out),
         Action::CancelCompare => st.compare.cancel(),
         Action::SetupPyscf => st.compare.setup_pressed(),

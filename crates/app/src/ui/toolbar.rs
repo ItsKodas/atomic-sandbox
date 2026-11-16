@@ -405,7 +405,7 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     group(ui, st, "tb-time", "Time", None, w.time, |ui, st| {
         row(ui, |ui| {
             time_buttons(ui, st, input, sampling, false, acts);
-            super::relax_toggle(ui, input, Vec2::new(RELAX_W, 28.0), ("relax", "relax"), acts);
+            super::relax_toggle(ui, input, st.relax_pending.as_ref(), Vec2::new(RELAX_W, 28.0), ("relax", "relax"), acts);
         });
         ui.horizontal(|ui| match d.and_then(|d| d.relax.as_ref()).filter(|r| r.converged.is_none()) {
             Some(r) => {
