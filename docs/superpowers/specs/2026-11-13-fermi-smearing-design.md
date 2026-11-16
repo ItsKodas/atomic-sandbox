@@ -193,6 +193,15 @@ Here ε_{N_σ,σ} is the N_σ-th lowest level [MUST-1].
     g·kT·e^{−X} for a level density g (≈ 60 per Ha above μ in the 14 Bohr box: 15 levels over 0.26 Ha for S at
     M = 5), so X = 25 leaves ≈ 4e-12 electrons and kT·that ≈ 2e-14 Ha in F, five orders below the 1e-6 Δρ stop and the
     µHa energy scatter. (c) shrinks the window from 0.18 to 0.125 Ha. This spec keeps 36 kT and 16 (ruling 43).
+  - **Amended by plan Task 9c (2026-11-16/17), the cold-start window.** Tight steps (the step that can converge)
+    keep the full 36 kT window, so the converged answer and every convergence criterion are unchanged. On
+    loosened steps only, the window is a step-accuracy tail X = ln(n_w/(c·Δρ_prev)), c = 1e-3, clamped to
+    [6, 36] kT. The bound is Σf ≲ g·kT·e^{−X}, conservative while n_w ≥ g·kT. Cold FD solves start from free-atom
+    densities (qm::radial, Z only) for all-electron centres and Z_v blobs for pseudised ones. The GPU block carries a
+    buffer column, which counts as the witness only when its residual is ≤ the guard tolerance. The VRAM guard
+    counts the measured start allocation (3 per spin), and growth past it is capped by the remaining budget with a
+    named error. A loose-column stop was measured and dropped (stretched-H₂ 43–102 steps > 30). Measurements:
+    `crates/validate/references.md`; rulings: the SDD ledger.
 - Growth is one vector at a time, re-testing both arms on the re-solved levels. Growing the block re-solves every
   level, so no monotonicity is claimed. The loop is bounded by the cap.
 - The cap stays: `MAX_WITNESS_GROWTH` = 16, with the same error when it is exceeded.

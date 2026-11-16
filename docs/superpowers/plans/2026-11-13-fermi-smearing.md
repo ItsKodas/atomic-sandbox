@@ -606,6 +606,28 @@ Runs after the preview build that follows Task 9, before Task 10. Witness column
 - **Harris witness cost** (merge of main into scf-stall, ruling 2026-11-16): under FD the live-orbitals Harris display solve grows witness columns too, and V-A3's warm refresh rose 1.5–2.7× (H₂ 0.115→0.172 s, H₂ + H 0.147→0.402 s, above the 0.3 s target, H₂O 0.46→0.79 s). Apply the same per-column guard tolerance to the Harris block, re-measure V-A3, and restore the 0.3 s target or record why not.
 - Physics review before commit.
 
+### Task 9c: The cold-start window — **physics** (added 2026-11-16 after the app gate; done in 0264c55, 2f62211, 69e90fb)
+
+- **Why:** the app gate on a8d69b2 had 5 failures that share one cause. The blob start puts μ ≈ −0.06 Ha, so the 36 kT witness window covers many box states:
+  - VRAM 21.6 GB (against 9.9 GB) at all-electron H₂O 177³;
+  - a cold 97³ solve at 114.5 s (against 1.8 s);
+  - Pause at 2.48 s;
+  - warm slower than cold.
+- **What it does:** the design in spec §4.2's Task 9c amendment.
+  - (a) Free-atom start.
+  - (b) Step-accuracy tail, on loosened steps only.
+  - (c) Buffer column, accepted as the witness only when r ≤ g.
+  - (d) Loose stop: measured and dropped.
+  - (e) Chunked tail: not needed.
+  - Pause and Cancel reach the eigensolve.
+- **Acceptance:** the four worker tests (`frames_keep_flowing_while_a_gpu_solve_runs`, `pause_and_cancel_abort_a_sampling_solve_promptly`, `forget_and_restore_a_sample_refit_the_model`, `moving_a_nucleus_warm_starts`) and `ui::tests::a_change_over_the_vram_budget_is_refused` pass with no bound loosened.
+
+### Task 9d: The DIIS stall at the orbital freeze — **physics** (69e90fb)
+
+- **Problem:** `providers::gpu_provider_matches_cpu_provider_at_fixed_sigma` ran warm 10 steps against cold 9.
+- **Rule:** drop the DIIS entries older than the freeze when a frozen step that follows another frozen step fails to contract the residual by 1 − α.
+- **Constraints:** a full reset at the freeze, and keeping only the newest entry, both fail the stretched-H₂ gate (≤ 30 steps). That gate is unchanged.
+
 ---
 
 ### Task 10: The dimer procedure, deleting `DegenerateShells`, the lone-atom rule, the reference scan — **physics**
