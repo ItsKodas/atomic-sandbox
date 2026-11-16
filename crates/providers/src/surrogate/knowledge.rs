@@ -17,6 +17,13 @@
 //! counted when its forces are fitted, a pair when at least one of its two atoms is (that atom's
 //! neighbourhood is the source scene's, so the pair is real); a cap or an edge atom adds nothing.
 //!
+//! **The pending samples** (2026-11-16, the live knowledge graph; `sim::knowledge`, "New samples,
+//! waiting for the refit"): the store's tail past the accumulated prefix without a quarantine code
+//! ([`SurrogateKs::pending_samples`]) — a forgotten, held, superseded, box-excluded, draft, lone
+//! or reference-waiting sample is never pending. Their atom pairs are binned by the fitted
+//! samples' rule ([`each_pair`]) into each pair's `pending`, among the fitted species only; they
+//! enter no other count, so no class, confidence or first shell moves until the refit.
+//!
 //! **r_cut** is the model's cutoff ([`SurrogateKs::cutoff`]: its basis's — a shared collection's
 //! reach or a per-scene basis's), the cutoff the verdict's keys are formed with.
 //!
@@ -26,11 +33,28 @@
 //! recomputes no rule (the controller's ruling on Task 9, which supersedes the plan's "≥ Q′").
 //!
 //! Cost: two passes over the fitted samples, O(Σ N²) distances and O(Σ N·k²) angles (k the shell
-//! neighbours), plus one verdict lookup per key. No prediction, no teacher.
+//! neighbours), plus one verdict lookup per key, and one distance pass over the pending samples.
+//! No prediction, no teacher.
 use super::*;
 use sim::knowledge::{angle_bin, first_shell, molecules, Composition, ElementKnowledge, KnowledgeMap, PairHistogram, PairKnowledge, RowStatus, SampleRow, StoredSample, ANGLE_BINS, BIN};
 use sim::Confidence;
 use std::collections::BTreeSet;
+
+/// Every atom pair (a, b), a < b, of sample `s` that the map counts: closer than r_cut (`rc2` its
+/// square) and at least one of the two atoms trained (module doc, "Capped segments"), with its
+/// species pair (min Z, max Z) and its squared distance.
+fn each_pair(s: &Sample, rc2: f64, mut f: impl FnMut(usize, usize, (u8, u8), f64)) {
+    let n = s.pos.len();
+    for a in 0..n {
+        for b in a + 1..n {
+            let r2: f64 = (0..3).map(|k| (s.pos[a][k] - s.pos[b][k]).powi(2)).sum();
+            if r2 >= rc2 || !(s.trains_atom(a) || s.trains_atom(b)) {
+                continue;
+            }
+            f(a, b, (s.z[a].min(s.z[b]), s.z[a].max(s.z[b])), r2);
+        }
+    }
+}
 
 impl SurrogateKs {
     /// The knowledge map of the fit that stands (module doc); `None` without a model or a store.
@@ -55,20 +79,13 @@ impl SurrogateKs {
             let n = s.pos.len();
             let mut coord = vec![0usize; n];
             let mut seen: BTreeSet<(u8, u8)> = BTreeSet::new();
-            for a in 0..n {
-                for b in a + 1..n {
-                    let r2 = d2(s.pos[a], s.pos[b]);
-                    if r2 >= rc2 || !(s.trains_atom(a) || s.trains_atom(b)) {
-                        continue;
-                    }
-                    coord[a] += 1;
-                    coord[b] += 1;
-                    let key = (s.z[a].min(s.z[b]), s.z[a].max(s.z[b]));
-                    seen.insert(key);
-                    let h = &mut pairs.entry(key).or_insert_with(|| (0, vec![0; n_bins])).1;
-                    h[((r2.sqrt() / BIN) as usize).min(n_bins - 1)] += 1;
-                }
-            }
+            each_pair(s, rc2, |a, b, key, r2| {
+                coord[a] += 1;
+                coord[b] += 1;
+                seen.insert(key);
+                let h = &mut pairs.entry(key).or_insert_with(|| (0, vec![0; n_bins])).1;
+                h[((r2.sqrt() / BIN) as usize).min(n_bins - 1)] += 1;
+            });
             for key in seen {
                 pairs.get_mut(&key).expect("a seen pair has a histogram").0 += 1;
             }
@@ -118,6 +135,23 @@ impl SurrogateKs {
             }
         }
 
+        // the pending samples: their atom pairs in the same bins, apart from every fitted count
+        let fitted_to = self.accumulated.min(store.len());
+        let pending: Vec<&Sample> =
+            store.samples[fitted_to..].iter().enumerate().filter(|(k, s)| !self.excluded(fitted_to + k) && s.z.len() == s.pos.len()).map(|(_, s)| s).collect();
+        let mut pending_pairs: BTreeMap<(u8, u8), (usize, Vec<u32>)> = BTreeMap::new();
+        for s in &pending {
+            let mut seen: BTreeSet<(u8, u8)> = BTreeSet::new();
+            each_pair(s, rc2, |_, _, key, r2| {
+                seen.insert(key);
+                let h = &mut pending_pairs.entry(key).or_insert_with(|| (0, vec![0; n_bins])).1;
+                h[((r2.sqrt() / BIN) as usize).min(n_bins - 1)] += 1;
+            });
+            for key in seen {
+                pending_pairs.get_mut(&key).expect("a seen pair has a histogram").0 += 1;
+            }
+        }
+
         // the confidence: the model's trust rule, then every key the pair is met in (module doc)
         let model_trusted = self.trusted();
         let key_trusted = |k: &surrogate::EnvKey| self.class_untrusted(&[Some(k.clone())]).is_none();
@@ -134,7 +168,8 @@ impl SurrogateKs {
                 } else {
                     Confidence::Thin
                 };
-                pair_list.push(PairKnowledge { z, samples, hist: PairHistogram { z, bin: BIN, counts }, confidence });
+                let (pending_samples, pending) = pending_pairs.remove(&z).unwrap_or_else(|| (0, vec![0; n_bins]));
+                pair_list.push(PairKnowledge { z, samples, hist: PairHistogram { z, bin: BIN, counts }, confidence, pending, pending_samples });
             }
         }
         // the molecules: every stored sample by composition (`sim::knowledge`, "Molecules")
@@ -157,14 +192,23 @@ impl SurrogateKs {
             samples: fitted.len(),
             r_cut,
             molecules,
+            pending: pending.len(),
         })
+    }
+
+    /// The stored samples kept since the last refit and in the next fit's codes (module doc, "The
+    /// pending samples"): of [`unfitted`](Self::unfitted), those with no quarantine code.
+    pub fn pending_samples(&self) -> usize {
+        let n = self.samples();
+        (self.accumulated.min(n)..n).filter(|&i| !self.excluded(i)).count()
     }
 
     /// Every stored sample as the molecules and a Forget rule see it (`sim::knowledge`,
     /// "Molecules"), in store order: its composition, its scene (the shared
     /// collection's record; empty for a session-only sample or a model file's), its status — fitted
     /// as the map counts it (the accumulated prefix in the fit's codes, not in the misfit set),
-    /// waiting (in the fit's codes otherwise), forgotten, or held — and its leave-one-out ratio from
+    /// pending (in the fit's codes past that prefix: kept since the last refit), waiting (in the
+    /// fit's codes otherwise: the misfit set), forgotten, or held — and its leave-one-out ratio from
     /// the standing fit's cache when it is in the fit's codes (as `sample_suspects` reads it).
     pub(super) fn sample_rows(&self) -> Vec<SampleRow> {
         let Some(store) = self.store.as_ref() else { return Vec::new() };
@@ -179,7 +223,9 @@ impl SurrogateKs {
                     RowStatus::Forgotten
                 } else if self.excluded(i) {
                     RowStatus::Held
-                } else if i < fitted_to && !self.in_misfit(i) {
+                } else if i >= fitted_to {
+                    RowStatus::Pending
+                } else if !self.in_misfit(i) {
                     RowStatus::Fitted
                 } else {
                     RowStatus::Waiting

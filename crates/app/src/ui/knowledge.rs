@@ -15,6 +15,13 @@
 //!   with [`bar_colours`] and a "now 1.45" marker at the open scene's distances, Teach this — the
 //!   Model tab's Sample more —, and the "Why thin?" fold, [`Sections`]) or element (its neighbour
 //!   counts and bond angles) or composition;
+//! - **live during training** (2026-11-16, the live knowledge graph): the samples kept since the
+//!   last refit (`sim::knowledge`, "New samples, waiting for the refit") stack on each bin of the
+//!   pair card's histogram as an outlined, unfilled segment ([`NEW_INK`], the legend's
+//!   [`NEW_WORDS`]), the card's sentence adds "+k new since the last refit", the summary "+k new"
+//!   and a composition "+k new"; colours, the verdict and "Still missing" stay the fitted
+//!   samples' — the refit turns the outline into solid bar. The worker rebuilds the map for them at
+//!   most every 2 s (`worker::activity`, "The live graph");
 //! - **"Molecules trained"** (2026-11-16, user request: H₃ was nowhere to be seen): every
 //!   composition of the stored samples (`sim::KnowledgeMap::molecules`, the multiset of Z as a
 //!   formula), its fitted count, the held-out, forgotten and not-yet-fitted ones as a faint suffix
@@ -54,6 +61,17 @@ use std::collections::BTreeMap;
 
 /// The occupancy (1 − e^(−n/`COVERAGE_COUNT`), the overlay's) at which a distance reads taught.
 pub const TAUGHT: f64 = 0.9;
+
+/// The outline of a bin's "new, waiting for refit" segment (module doc, "live during training").
+pub const NEW_INK: Color32 = theme::INK;
+
+/// The histogram legend's words for that segment.
+pub const NEW_WORDS: &str = "new (waiting for refit)";
+
+/// " · +k new since the last refit" for `k` > 0, else empty.
+fn new_since(k: usize) -> String {
+    if k > 0 { format!(" · +{k} new since the last refit") } else { String::new() }
+}
 
 /// What the detail shows: a pair, an element, or (nothing picked) the weakest pair the scene asks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -400,7 +418,13 @@ fn summary(ui: &mut Ui, map: &KnowledgeMap) {
         ui.spacing_mut().item_spacing.x = 6.0;
         let c = super::dock::model::chip(ui, &chip_text, theme::ACCENT_INK).on_hover_text(&tip);
         super::probe("knowledge-chip", &c);
-        let s = ui.label(mono(&format!("{} samples", map.samples), theme::INK_DIM));
+        let new = if map.pending > 0 { format!(" · +{} new", map.pending) } else { String::new() };
+        let s = ui.label(mono(&format!("{} samples{new}", map.samples), theme::INK_DIM));
+        let s = if map.pending > 0 {
+            s.on_hover_text(format!("{} fitted samples; {} kept since the last refit, waiting for it — outlined on the pair card's bars until the refit takes them in", map.samples, map.pending))
+        } else {
+            s
+        };
         super::probe("knowledge-samples", &s);
         theme::info(ui, LEGEND_TIP);
         rest = ui.available_width();
@@ -798,18 +822,23 @@ pub fn molecule_probe(c: &sim::knowledge::Composition) -> String {
     format!("knowledge-molecule-{}", c.0.iter().map(u8::to_string).collect::<Vec<_>>().join("-"))
 }
 
-/// A composition's faint suffix: what of it is out of the fit — "3 held out · 9 forgotten · 2 not
-/// fitted yet" — empty when every sample is fitted.
+/// A composition's faint suffix: what of it is out of the fit — "+4 new · 3 held out · 9 forgotten
+/// · 2 not fitted yet" (new: kept since the last refit; not fitted yet: in the fit, not reproduced)
+/// — empty when every sample is fitted.
 pub fn molecule_suffix(m: &sim::knowledge::MoleculeKnowledge) -> String {
     let mut w = Vec::new();
+    if m.pending > 0 {
+        w.push(format!("+{} new", m.pending));
+    }
     if m.held > 0 {
         w.push(format!("{} held out", m.held));
     }
     if m.forgotten > 0 {
         w.push(format!("{} forgotten", m.forgotten));
     }
-    if m.waiting > 0 {
-        w.push(format!("{} not fitted yet", m.waiting));
+    let misfit = m.waiting.saturating_sub(m.pending);
+    if misfit > 0 {
+        w.push(format!("{misfit} not fitted yet"));
     }
     w.join(" · ")
 }
@@ -893,7 +922,7 @@ fn molecule_detail(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, m: &sim::k
             let colour_of = |k: usize| -> Option<Color32> { h.get(k).filter(|&&n| n > 0).map(|&n| Taught::of(n).colour()) };
             let labels: Vec<(f64, String)> = (0..=6).map(|k| (k as f64 * 30.0, (k * 30).to_string())).collect();
             let w = ui.available_width().clamp(200.0, 640.0);
-            let r = histogram(ui, h, ANGLE_BIN_DEG, ANGLE_BINS as f64 * ANGLE_BIN_DEG, &colour_of, &[], &|a| format!("{a:.0}°"), &labels, ("", "bond angle, degrees"), vec2(w, if w > 400.0 { 110.0 } else { 86.0 }), None);
+            let r = histogram(ui, h, &[], ANGLE_BIN_DEG, ANGLE_BINS as f64 * ANGLE_BIN_DEG, &colour_of, &[], &|a| format!("{a:.0}°"), &labels, ("", "bond angle, degrees"), vec2(w, if w > 400.0 { 110.0 } else { 86.0 }), None);
             super::probe(&format!("knowledge-molecule-angles-{z}"), &r);
         }
         if m.angles.iter().all(|(_, h)| h.iter().all(|&n| n == 0)) {
@@ -986,9 +1015,17 @@ fn taught_range(p: &PairKnowledge) -> Option<(f64, f64)> {
 /// The pair card's one plain sentence, from the verdict, the taught range and the keys behind it:
 /// "Taught 0.8–5.7 Bohr (1467 samples). Still missing: three-or-more-atom arrangements around H,
 /// with H and N, 3 of 92 samples." / "… Trusted everywhere this pair was met." / "Never seen — …".
+/// Samples kept since the last refit add " · +k new since the last refit" after the taught range
+/// (module doc, "live during training"); the rest stays the fitted samples'.
 pub fn pair_sentence(map: &KnowledgeMap, p: &PairKnowledge, keys: &[(&str, &sim::SpeciesVerdict)]) -> String {
-    let taught = taught_range(p).map_or(String::new(), |(lo, hi)| format!("Taught {lo:.1}–{hi:.1} Bohr ({} samples). ", p.samples));
+    let new = new_since(p.pending_samples);
+    let taught = match taught_range(p) {
+        Some((lo, hi)) => format!("Taught {lo:.1}–{hi:.1} Bohr ({} samples){new}. ", p.samples),
+        None if !new.is_empty() => format!("{}. ", new.trim_start_matches(" · ")),
+        None => String::new(),
+    };
     match p.confidence {
+        Confidence::Unseen if p.pending_samples > 0 => format!("Never seen — no fitted sample has these two within {:.1} Bohr{new}: they count once the model is refitted.", map.r_cut),
         Confidence::Unseen => format!("Never seen — no fitted sample has these two within {:.1} Bohr. Train a scene that has it.", map.r_cut),
         Confidence::Trusted => format!("{taught}Trusted everywhere this pair was met."),
         Confidence::Thin => {
@@ -1052,6 +1089,7 @@ fn pair_detail(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, p: &PairKnowle
     let r = histogram(
         ui,
         &p.hist.counts,
+        &p.pending,
         p.hist.bin,
         x_max,
         &colour_of,
@@ -1060,10 +1098,13 @@ fn pair_detail(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, p: &PairKnowle
         &labels,
         ("compressed ←", &format!("→ stretched · Bohr · r_cut {:.1}", map.r_cut)),
         vec2(w, if w > 400.0 { 140.0 } else { 96.0 }),
-        (total == 0).then_some("nothing taught"),
+        (total == 0 && p.pending_samples == 0).then_some("nothing taught"),
     );
     super::probe("knowledge-histogram", &r);
-    r.on_hover_text(format!("distances taught, log scale, per {:.2} Bohr bin: green where at least 10 like it were taught, amber where fewer (the knowledge overlay's rule). {asked_tip}", p.hist.bin));
+    r.on_hover_text(format!(
+        "distances taught, log scale, per {:.2} Bohr bin: green where at least 10 like it were taught, amber where fewer (the knowledge overlay's rule); outlined on top, the distances of the samples kept since the last refit — new, waiting for it, they colour nothing until the refit takes them in. {asked_tip}",
+        p.hist.bin
+    ));
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         for (colour, word) in [(GREEN, "taught"), (AMBER, "thin")] {
@@ -1072,6 +1113,10 @@ fn pair_detail(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, p: &PairKnowle
             ui.label(RichText::new(word).size(10.5).color(theme::INK_DIM));
             ui.add_space(4.0);
         }
+        let (sq, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+        ui.painter().rect_stroke(sq, 1.0, Stroke::new(1.0, NEW_INK), egui::StrokeKind::Inside);
+        let l = ui.label(RichText::new(NEW_WORDS).size(10.5).color(theme::INK_DIM)).on_hover_text("samples kept since the last refit (a pass or a teach scan running): drawn as an outline on top of each bar; the refit makes them part of the solid bar and its colour");
+        super::probe("knowledge-legend-new", &l);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| teach_button(ui, st, input, p.z, !ds.is_empty(), acts));
     });
     // why: the detail lines of the verdict, folded
@@ -1225,6 +1270,7 @@ fn element_detail(ui: &mut Ui, map: &KnowledgeMap, e: &ElementKnowledge, input: 
     histogram(
         ui,
         &e.angles,
+        &[],
         ANGLE_BIN_DEG,
         ANGLE_BINS as f64 * ANGLE_BIN_DEG,
         &colour_of,
@@ -1255,13 +1301,15 @@ fn element_detail(ui: &mut Ui, map: &KnowledgeMap, e: &ElementKnowledge, input: 
 }
 
 /// A log-scale histogram: `counts` in bins of `bin` x-units from 0 to `x_max`, each bar coloured
-/// by `colour_of` (`None`: empty, drawn as a grey baseline), the open scene's values at `ticks` as
-/// white dashed lines, the shortest labelled by `now` ("now 1.45"), axis tick labels and the two
-/// end captions. Returns the plot's hover response.
+/// by `colour_of` (`None`: empty, drawn as a grey baseline), `pending` (empty: none) stacked on
+/// each bar as an unfilled [`NEW_INK`] outline (module doc, "live during training"), the open
+/// scene's values at `ticks` as white dashed lines, the shortest labelled by `now` ("now 1.45"),
+/// axis tick labels and the two end captions. Returns the plot's hover response.
 #[allow(clippy::too_many_arguments)]
 fn histogram(
     ui: &mut Ui,
     counts: &[u32],
+    pending: &[u32],
     bin: f64,
     x_max: f64,
     colour_of: &dyn Fn(usize) -> Option<Color32>,
@@ -1277,21 +1325,30 @@ fn histogram(
     let plot = Rect::from_min_max(rect.min + vec2(26.0, 18.0), rect.max - vec2(8.0, 30.0));
     p.rect_filled(plot, 0.0, Color32::from_black_alpha(64));
     let x_of = |x: f64| plot.left() + (x / x_max.max(1e-9)) as f32 * plot.width();
-    let top = counts.iter().copied().max().unwrap_or(0) as f32;
+    let new = |k: usize| pending.get(k).copied().unwrap_or(0);
+    // the scale holds the fitted and the new counts stacked
+    let top = counts.iter().enumerate().map(|(k, &n)| n + new(k)).max().unwrap_or(0) as f32;
+    let height = |n: u32| (1.0 + n as f32).ln() / (1.0 + top).ln() * plot.height();
     let small = FontId::monospace(8.5);
     for (k, &n) in counts.iter().enumerate() {
         let (x0, x1) = (x_of(k as f64 * bin) + 0.5, x_of((k + 1) as f64 * bin) - 0.5);
         if x0 >= plot.right() {
             break;
         }
+        let x1 = x1.min(plot.right());
         match colour_of(k) {
             Some(c) if n > 0 => {
-                let h = (1.0 + n as f32).ln() / (1.0 + top).ln() * plot.height();
-                p.rect_filled(Rect::from_min_max(pos2(x0, plot.bottom() - h), pos2(x1.min(plot.right()), plot.bottom())), 0.0, c.gamma_multiply(0.85));
+                p.rect_filled(Rect::from_min_max(pos2(x0, plot.bottom() - height(n)), pos2(x1, plot.bottom())), 0.0, c.gamma_multiply(0.85));
             }
             _ => {
-                p.line_segment([pos2(x0, plot.bottom()), pos2(x1.min(plot.right()), plot.bottom())], Stroke::new(2.0, theme::INK_FAINT));
+                p.line_segment([pos2(x0, plot.bottom()), pos2(x1, plot.bottom())], Stroke::new(2.0, theme::INK_FAINT));
             }
+        }
+        // new, waiting for the refit: an outline from the fitted bar's top to the stacked count's
+        if new(k) > 0 {
+            let lo = if n > 0 { height(n) } else { 0.0 };
+            let seg = Rect::from_min_max(pos2(x0, plot.bottom() - height(n + new(k))), pos2(x1, plot.bottom() - lo));
+            p.rect_stroke(seg, 0.0, Stroke::new(1.0, NEW_INK.gamma_multiply(0.9)), egui::StrokeKind::Inside);
         }
     }
     for (x, t) in labels {
@@ -1385,7 +1442,7 @@ pub(crate) fn fixture_map() -> KnowledgeMap {
         }
         PairHistogram { z, bin: BIN, counts }
     };
-    let pk = |z, samples, peaks: &[(usize, u32)], confidence| PairKnowledge { z, samples, hist: hist(z, peaks), confidence };
+    let pk = |z, samples, peaks: &[(usize, u32)], confidence| PairKnowledge { z, samples, hist: hist(z, peaks), confidence, pending: vec![0; 60], pending_samples: 0 };
     let mut angles = vec![0u32; ANGLE_BINS];
     angles[20] = 40;
     angles[21] = 300;
@@ -1405,5 +1462,6 @@ pub(crate) fn fixture_map() -> KnowledgeMap {
         samples: 2140,
         r_cut: 6.0,
         molecules: Vec::new(),
+        pending: 0,
     }
 }

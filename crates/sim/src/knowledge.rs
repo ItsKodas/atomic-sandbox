@@ -74,6 +74,21 @@
 //! [`select`] resolves it per sample (the worker's side) and [`ForgetPreview::of`] counts it from
 //! the molecules (the confirmation's side) — the same rule over the same rows, so the two agree
 //! while the map is current. Only a sample in the fit's codes (fitted or waiting) can be forgotten.
+//!
+//! # New samples, waiting for the refit (2026-11-16: the live knowledge graph)
+//!
+//! A sample kept since the last refit and in the next fit's codes ([`RowStatus::Pending`]: past
+//! the fitted prefix, no quarantine code — so never a forgotten, held, superseded, box-excluded,
+//! draft, lone or reference-waiting one) is **pending**: [`KnowledgeMap::pending`] counts them,
+//! [`PairKnowledge::pending`] bins their atom pairs exactly as `hist` bins the fitted ones (the
+//! same geometry rule: within r_cut, a pair counted when one of its atoms is trained) and
+//! [`PairKnowledge::pending_samples`] counts the pending samples holding the pair. Their energies
+//! and forces are never read. **Pending samples decide nothing:** a pair's confidence, its sample
+//! count, its histogram (and so a bin's taught/thin class), the elements, the first shells and the
+//! molecules' geometry statistics stay the fitted samples' alone; the UI draws the pending counts
+//! as a separate "new, waiting for refit" segment, which the refit turns into fitted counts. Only
+//! the pairs of the fitted species carry them (a species no fitted sample holds has no node or
+//! pair yet; its samples show in the molecules' counts until the refit).
 
 /// Pair-distance histogram bin (Bohr): the training views' (`TrainingViews::pairs`).
 pub const BIN: f64 = 0.1;
@@ -106,6 +121,9 @@ pub struct KnowledgeMap {
     pub r_cut: f64,
     /// Every composition of the stored samples (module doc, "Molecules"), most fitted first.
     pub molecules: Vec<MoleculeKnowledge>,
+    /// The stored samples kept since the last refit and in the next fit's codes (module doc, "New
+    /// samples, waiting for the refit"); not in `samples`.
+    pub pending: usize,
 }
 
 /// One element's coverage (module doc).
@@ -130,6 +148,11 @@ pub struct PairKnowledge {
     /// Its atom-pair distances < r_cut, bins of [`BIN`] Bohr from 0.
     pub hist: PairHistogram,
     pub confidence: Confidence,
+    /// The pending samples' atom-pair distances, `hist`'s bins (module doc, "New samples, waiting
+    /// for the refit"): never in `hist`, the confidence or a bin's class.
+    pub pending: Vec<u32>,
+    /// The pending samples holding the pair within r_cut.
+    pub pending_samples: usize,
 }
 
 /// Whether the model answers a pair's environments (module doc, "Confidence").
@@ -197,9 +220,12 @@ fn d2(a: [f64; 3], b: [f64; 3]) -> f64 {
 pub enum RowStatus {
     /// A member of the fit that stands.
     Fitted,
-    /// In the fit's codes (it may be forgotten) but not fitted: kept since the last refit, or in
-    /// the fit and not reproduced (the misfit set, out of the class counts).
+    /// In the fit's codes (it may be forgotten) but not fitted: in the fit and not reproduced (the
+    /// misfit set, out of the class counts).
     Waiting,
+    /// In the fit's codes, kept since the last refit: new, waiting for the refit (module doc, "New
+    /// samples, waiting for the refit").
+    Pending,
     /// Held out of the fit: by the trust recovery, superseded, box-affected, a draft guess, waiting
     /// for its box's reference, lone atoms.
     Held,
@@ -210,7 +236,7 @@ pub enum RowStatus {
 impl RowStatus {
     /// In the fit's codes: what a Forget can take.
     pub fn open(self) -> bool {
-        matches!(self, RowStatus::Fitted | RowStatus::Waiting)
+        matches!(self, RowStatus::Fitted | RowStatus::Waiting | RowStatus::Pending)
     }
 }
 
@@ -262,8 +288,10 @@ pub struct MoleculeKnowledge {
     pub composition: Composition,
     /// Members of the fit that stands.
     pub fitted: usize,
-    /// In the fit's codes, not fitted ([`RowStatus::Waiting`]).
+    /// In the fit's codes, not fitted ([`RowStatus::Waiting`] and [`RowStatus::Pending`]).
     pub waiting: usize,
+    /// Of `waiting`, the samples kept since the last refit ([`RowStatus::Pending`]): "+k new".
+    pub pending: usize,
     /// Held out ([`RowStatus::Held`]).
     pub held: usize,
     pub forgotten: usize,
@@ -306,6 +334,7 @@ pub fn molecules(samples: &[StoredSample<'_>], shells: &BTreeMap<(u8, u8), f64>,
             composition: c.clone(),
             fitted: 0,
             waiting: 0,
+            pending: 0,
             held: 0,
             forgotten: 0,
             scenes: Vec::new(),
@@ -328,6 +357,11 @@ pub fn molecules(samples: &[StoredSample<'_>], shells: &BTreeMap<(u8, u8), f64>,
             }
             RowStatus::Waiting => {
                 m.waiting += 1;
+                sc.open += 1;
+            }
+            RowStatus::Pending => {
+                m.waiting += 1;
+                m.pending += 1;
                 sc.open += 1;
             }
             RowStatus::Held => {
@@ -437,7 +471,7 @@ pub fn select(rows: &[SampleRow], rule: &ForgetRule) -> Selection {
     let mut out = Selection::default();
     for r in rows.iter().filter(|r| rule.matches(&r.composition, &r.scene, r.ratio)) {
         match r.status {
-            RowStatus::Fitted | RowStatus::Waiting => out.chosen.push(r.index),
+            RowStatus::Fitted | RowStatus::Waiting | RowStatus::Pending => out.chosen.push(r.index),
             RowStatus::Held => out.held += 1,
             RowStatus::Forgotten => out.forgotten += 1,
         }
@@ -588,14 +622,15 @@ mod tests {
         KnowledgeMap {
             elements: vec![el(1), el(6)],
             pairs: vec![
-                PairKnowledge { z: (1, 1), samples: 100, hist: hist((1, 1), hh), confidence: Confidence::Trusted },
-                PairKnowledge { z: (1, 6), samples: 50, hist: hist((1, 6), ch), confidence: Confidence::Trusted },
-                PairKnowledge { z: (6, 6), samples: 0, hist: hist((6, 6), vec![0; 60]), confidence: Confidence::Unseen },
+                PairKnowledge { z: (1, 1), samples: 100, hist: hist((1, 1), hh), confidence: Confidence::Trusted, pending: vec![0; 60], pending_samples: 0 },
+                PairKnowledge { z: (1, 6), samples: 50, hist: hist((1, 6), ch), confidence: Confidence::Trusted, pending: vec![0; 60], pending_samples: 0 },
+                PairKnowledge { z: (6, 6), samples: 0, hist: hist((6, 6), vec![0; 60]), confidence: Confidence::Unseen, pending: vec![0; 60], pending_samples: 0 },
             ],
             slug: String::new(),
             samples: 150,
             r_cut: 6.0,
             molecules: Vec::new(),
+            pending: 0,
         }
     }
 
@@ -642,8 +677,9 @@ mod tests {
         assert_eq!(Composition::of(&[8, 1, 1]), Composition::of(&[1, 8, 1]));
     }
 
-    /// The rule per kind: only samples in the fit's codes are chosen (fitted or waiting); the
-    /// held and forgotten ones it matched are counted, not chosen; an empty match chooses nothing.
+    /// The rule per kind: only samples in the fit's codes are chosen (fitted, waiting or pending —
+    /// kept since the last refit); the held and forgotten ones it matched are counted, not chosen;
+    /// an empty match chooses nothing.
     #[test]
     fn a_rule_selects_only_samples_in_the_fit() {
         let rows = vec![
@@ -654,13 +690,15 @@ mod tests {
             row(4, &[15, 1, 1, 1], "ph3", RowStatus::Forgotten, None),
             row(5, &[1, 1], "h2", RowStatus::Fitted, Some(f64::INFINITY)),
             row(6, &[1, 1], "", RowStatus::Fitted, Some(0.4)),
+            row(7, &[15, 1, 1, 1], "ph3", RowStatus::Pending, None),
         ];
         let s = select(&rows, &ForgetRule::Element(15));
-        assert_eq!((s.chosen, s.held, s.forgotten), (vec![0, 1, 2], 1, 1));
+        assert_eq!((s.chosen, s.held, s.forgotten), (vec![0, 1, 2, 7], 1, 1));
         let s = select(&rows, &ForgetRule::Composition(Composition::of(&[15, 1, 1, 1])));
-        assert_eq!((s.chosen, s.held, s.forgotten), (vec![0, 1], 1, 1), "exact: not the PH₅ sample (PH₃ beside an H₂)");
+        assert_eq!((s.chosen, s.held, s.forgotten), (vec![0, 1, 7], 1, 1), "exact: not the PH₅ sample (PH₃ beside an H₂)");
         let s = select(&rows, &ForgetRule::Scene("ph3".into()));
-        assert_eq!((s.chosen, s.held, s.forgotten), (vec![0, 1], 1, 1));
+        assert_eq!((s.chosen, s.held, s.forgotten), (vec![0, 1, 7], 1, 1));
+        assert!(RowStatus::Pending.open(), "a pending sample can be forgotten");
         assert_eq!(select(&rows, &ForgetRule::Scene(String::new())).chosen, vec![6], "no scene recorded is a scene of its own");
         let s = select(&rows, &ForgetRule::Above(5.0));
         assert_eq!(s.chosen, vec![2, 5], "7.5 and ∞ are above 5; 1.2 and 0.4 are not; no ratio is never above");
@@ -693,11 +731,18 @@ mod tests {
         st.push(one(4, zp, ph3, "ph3", RowStatus::Held, None));
         st.push(one(5, zp, ph3, "", RowStatus::Forgotten, None));
         st.push(one(6, zm, mix, "mix", RowStatus::Waiting, None));
+        st.push(one(7, zp, ph3, "ph3", RowStatus::Pending, None));
+        st.push(one(8, zp, ph3, "ph3", RowStatus::Pending, None));
         let ms = molecules(&st, &sh, 6.0);
-        let names: Vec<(Vec<u8>, usize, usize, usize, usize)> = ms.iter().map(|m| (m.composition.0.clone(), m.fitted, m.waiting, m.held, m.forgotten)).collect();
-        assert_eq!(names, vec![(vec![1, 1], 3, 0, 0, 0), (vec![1, 1, 1, 15], 1, 0, 1, 1), (vec![1, 1, 1, 1, 1, 15], 0, 1, 0, 0)]);
+        let names: Vec<(Vec<u8>, usize, usize, usize, usize, usize)> = ms.iter().map(|m| (m.composition.0.clone(), m.fitted, m.waiting, m.pending, m.held, m.forgotten)).collect();
+        assert_eq!(
+            names,
+            vec![(vec![1, 1], 3, 0, 0, 0, 0), (vec![1, 1, 1, 15], 1, 2, 2, 1, 1), (vec![1, 1, 1, 1, 1, 15], 0, 1, 0, 0, 0)],
+            "a pending sample is waiting and counted as new; a misfit one only waiting"
+        );
         let p = &ms[1];
-        assert_eq!(p.scenes, vec![SceneCount { name: String::new(), open: 0, held: 0, forgotten: 1 }, SceneCount { name: "ph3".into(), open: 1, held: 1, forgotten: 0 }]);
+        assert_eq!(p.scenes, vec![SceneCount { name: String::new(), open: 0, held: 0, forgotten: 1 }, SceneCount { name: "ph3".into(), open: 3, held: 1, forgotten: 0 }]);
+        assert!(p.pairs.iter().all(|r| r.count == 3), "the pending PH₃ add nothing to the fitted ranges: {:?}", p.pairs);
         assert_eq!(p.ratios, vec![6.0]);
         assert_eq!(ms[0].ratios, vec![1.0, 2.0, 3.0]);
         assert!(ms[2].pairs.is_empty() && ms[2].angles.is_empty(), "nothing fitted: no geometry statistics");
@@ -708,7 +753,7 @@ mod tests {
             assert_eq!((v.total, v.held, v.forgotten), (s.chosen.len(), s.held, s.forgotten), "{rule:?}");
         }
         let v = ForgetPreview::of(&ms, &ForgetRule::Element(15));
-        assert_eq!(v.groups, vec![(Composition::of(&[15, 1, 1, 1, 1, 1]), 1), (Composition::of(&[15, 1, 1, 1]), 1)], "equal counts in composition order");
+        assert_eq!(v.groups, vec![(Composition::of(&[15, 1, 1, 1]), 3), (Composition::of(&[15, 1, 1, 1, 1, 1]), 1)], "most first, the pending ones included");
         assert_eq!(v.emptied, vec![15], "every P sample in the fit goes");
         assert!(ForgetPreview::of(&ms, &ForgetRule::Composition(p.composition.clone())).emptied.is_empty(), "the PH₅ sample keeps P");
         let v = ForgetPreview::of(&ms, &ForgetRule::Above(2.5));
