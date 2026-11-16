@@ -127,6 +127,7 @@ impl SurrogateKs {
         self.report = None;
         self.envelope = None;
         self.null_space = None;
+        self.null_space_pending = false;
         self.active_set = None;
         self.audit_force = None;
         self.training_residuals = None;
@@ -414,6 +415,7 @@ impl SurrogateKs {
         self.pending_refit = store.len() > self.accumulated;
         self.envelope = Some(accumulator.envelope.clone());
         self.null_space = Some(NullSpace::of(&accumulator, &model.scale));
+        self.null_space_pending = false;
         self.accumulator = Some(accumulator);
         self.face = if face_density.is_empty() { vec![f64::NAN; store.len()] } else { face_density };
         self.store = Some(store);

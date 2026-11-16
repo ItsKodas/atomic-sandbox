@@ -447,6 +447,7 @@ pub(super) struct FitState {
     pub(super) report: Option<FitReport>,
     pub(super) envelope: Option<Envelope>,
     pub(super) null_space: Option<NullSpace>,
+    pub(super) null_space_pending: bool,
     pub(super) active_set: Option<ActiveSet>,
     pub(super) training_residuals: Option<TrainingResiduals>,
     pub(super) misfit: Option<Misfit>,
@@ -1356,10 +1357,25 @@ impl SurrogateKs {
         false
     }
 
-    /// The class-wise leave-one-out and the active set of the fit that stands, when a deferred fit
-    /// left them for later (`deferred_trust`); a no-op otherwise.
+    /// The null space (rule 5d) of the fit that stands, when a deferred fit left it for later
+    /// (`null_space_pending`): `NullSpace::of` the accumulator and the model it was fitted from,
+    /// the numbers the fit itself would have computed, bit for bit. A no-op otherwise.
+    pub(super) fn ensure_null_space(&mut self) {
+        if !std::mem::take(&mut self.null_space_pending) {
+            return;
+        }
+        let _prof = surrogate::prof::span("P2 ensure_null_space (standing fit)");
+        if let (Some(acc), Some(model)) = (self.accumulator.as_ref(), self.model.as_ref()) {
+            self.null_space = Some(NullSpace::of(acc, &model.scale));
+        }
+    }
+
+    /// The null space, the class-wise leave-one-out and the active set of the fit that stands,
+    /// when a deferred fit left them for later (`null_space_pending`, `deferred_trust`); a no-op
+    /// otherwise.
     pub(super) fn ensure_trust_passes(&mut self) {
         let _prof = surrogate::prof::span("P1 ensure_trust_passes (standing fit)");
+        self.ensure_null_space();
         if self.deferred_trust.is_some() {
             self.refresh_class_loo();
             self.rebuild_active_set();
@@ -1745,6 +1761,7 @@ impl SurrogateKs {
             report: self.report.clone(),
             envelope: self.envelope.clone(),
             null_space: self.null_space.clone(),
+            null_space_pending: self.null_space_pending,
             active_set: self.active_set.clone(),
             training_residuals: self.training_residuals,
             misfit: self.misfit.clone(),
@@ -1770,6 +1787,7 @@ impl SurrogateKs {
         self.report = s.report;
         self.envelope = s.envelope;
         self.null_space = s.null_space;
+        self.null_space_pending = s.null_space_pending;
         self.active_set = s.active_set;
         self.training_residuals = s.training_residuals;
         self.misfit = s.misfit;
@@ -1797,11 +1815,13 @@ impl SurrogateKs {
     }
 
     /// [`fit_store`](Self::fit_store) inside a refit: the training residuals and the sample floor's
-    /// column count only; the class-wise leave-one-out and the active set — O(P · m · Q′²) and
-    /// O(atoms · p²), the refit's cost at scale — are left to
+    /// column count only; the class-wise leave-one-out, the active set and the null space —
+    /// O(P · m · Q′²), O(atoms · p²) and O(Q′³), the refit's cost at scale — are left to
     /// [`ensure_trust_passes`](Self::ensure_trust_passes) for the fit that stands. Until then
     /// `class_loo`, `class_judge`, `class_worst`, `class_blockers` and `active_set` are an earlier
-    /// fit's and nothing may read them (the refit's own decisions do not: `refit_fits`).
+    /// fit's, `null_space` is `None` (`null_space_pending`), and nothing may read them (the
+    /// refit's own decisions do not: `refit_fits`; `judge_held_out`, whose `geometry_refusal`
+    /// reads rules 5d and 5e, runs `ensure_trust_passes` first).
     pub(super) fn fit_store_deferred(&mut self) -> Result<FitReport, FitError> {
         // the equivalence tests' reference: every fit with its passes, as before the deferral
         #[cfg(test)]
@@ -1853,6 +1873,12 @@ impl SurrogateKs {
         };
         // the references first: an error here changes nothing
         let refs = self.reference_vector(&basis)?;
+        // the incremental path adds to the standing fit's accumulator: its deferred null space is
+        // taken first, while the accumulator is still the one that fit was built from (a failed
+        // solve below leaves that fit standing, with the accumulator grown)
+        if !rebuild {
+            self.ensure_null_space();
+        }
         let (mut acc, mut accumulated) = if rebuild {
             (Accumulator::new(&basis), 0)
         } else {
@@ -1887,7 +1913,15 @@ impl SurrogateKs {
             }
         };
         self.envelope = Some(acc.envelope.clone());
-        self.null_space = Some(NullSpace::of(&acc, &model.scale));
+        // the null space with the trust passes: now, or once for the fit that stands
+        // (`ensure_null_space`; the accumulator and the model below are what it is built from)
+        if trust_passes {
+            self.null_space = Some(NullSpace::of(&acc, &model.scale));
+            self.null_space_pending = false;
+        } else {
+            self.null_space = None;
+            self.null_space_pending = true;
+        }
         self.accumulator = Some(acc);
         self.accumulated = accumulated;
         self.species_dirty = false;
