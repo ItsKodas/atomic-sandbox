@@ -1,6 +1,6 @@
 # Three-atom coverage map: where the model's three-atom arrangements are taught, and Teach a cell (2026-11-17)
 
-Status: design for a user-approved feature (the user's idea, 2026-11-16/17). Branch `triple-map` off `main` 5613bdc.
+Status: approved by the user 2026-11-17; plan after targeted teach. Branch `triple-map` off `main` 5613bdc.
 No product code. Lands **after targeted teach** (§11). Atomic units throughout (Bohr, Hartree); angles are shown in
 degrees and binned in cos θ (§5.2).
 
@@ -94,8 +94,9 @@ The user wants:
   arrangements and that this map does not show them (§6.7).
 - Arrangements beyond r_cut. Body-3 does not see them, and long reach's beyond-reach band is pair-only.
 - A triple-aware 3D-overlay tint (`sim::atom_coverage` is unchanged).
-- Fill gaps for a whole triple map, which would be hundreds to thousands of solves (but see open question 3).
-- Adding atoms to the scene to make a triple it lacks (open question 2 asks whether to).
+- Fill gaps for a whole triple map, which would be hundreds to thousands of solves, or for one slice (§11.3: a
+  possible later addition).
+- Adding atoms to the scene to make a triple it lacks (§11.2).
 
 **Anti-goals.**
 - No per-element or per-pair bins, ranges or bond lengths (rule 1). Every range comes from the grid constants, r_cut,
@@ -157,8 +158,8 @@ windows. Revisit only if a measured frame cost says so.
   The j–k distance may be anything, including beyond r_cut: body-3 sums every neighbour pair of the centre. Each
   unordered {j, k} is counted once. The j = k terms are not arrangements and are not counted.
 - **The neighbour set is every neighbour within r_cut**, as body-3 sums. It is not the element card's first shell.
-  That card stays as it is (a chemistry-like bond-angle view, documented as first-shell). The two differ on purpose.
-  Open question 1 asks the user to confirm this.
+  That card stays as it is (a chemistry-like bond-angle view, documented as first-shell). The two differ on purpose
+  (the user's decision, §11.1).
 - **Axes.**
   - For a ≠ b: r₁ = r_ij to the species-a neighbour and r₂ = r_ik to the species-b one.
   - For a = b the triple is symmetric and is **folded**: r₁ = min, r₂ = max, and only cells with k₁ ≤ k₂ are stored.
@@ -367,7 +368,7 @@ green.
   3. else the scene instance nearest the selection, in cell steps (ties to the lowest indices).
 
   With no instance, Teach is disabled. The tip names the stored compositions that hold the type:
-  "the open scene has no H–O–H within the cutoff — H₂O (610 samples) has it" (open question 2).
+  "the open scene has no H–O–H within the cutoff — H₂O (610 samples) has it" (§11.2).
 - **The planner.** `sim::sampling::plan_cells(scene, &req, triples: &TripleKnowledge, grid, r_cut, r_core, refuse) ->
   CellPlan`. It is pure and deterministic, has no physics, and is shared by the UI's estimate and the provider's start,
   as `plan_range` is.
@@ -575,19 +576,13 @@ Decided here, within the user's brief:
 - The farthest-point slot order's tie detail, provided the order is deterministic (C9) and pinned by a test.
 - Whether the 3D default rotation is fixed or remembered per type in `KnowledgeView`.
 
-## 11. Open questions for the user
+## 11. Decisions recorded (the user, 2026-11-17; formerly the open questions)
 
-1. **Which neighbours make a triple?**
-   - (a) Every pair of neighbours within r_cut, exactly what the model's three-atom terms sum. The map then also shows
-     far arrangements, such as an H₂ 5 Bohr from an O.
-   - (b) Only first-shell neighbours, like the element card's bond angles: closer to chemistry, but it hides what the
-     model learns from and moves with the measured first shell at every refit.
-
-   **Recommended: (a)**, with the reach keeping the drawn gaps to distances the pair graphs have taught.
-2. **When the open scene lacks the picked triple**, should Teach add an atom to make it (a "place a third atom" mode:
-   it changes the molecule, its electron count and spin), or stay disabled with a tip naming the stored molecules that
-   have it? **Recommended: disabled in this feature.** Adding atoms is a different, physics-heavier design, and the
-   builder already makes the scene.
-3. **A "Fill gaps on this slice (k)" button** in 2D, the pair graph's Fill gaps limited to one r₂ slice? A slice can
-   hold dozens of gap cells, about 10 solves each. **Recommended: not in this feature.** Drag-select covers it at a
-   cost the user sees, and it is a small addition later if wanted.
+1. **A triple is every pair of neighbours within r_cut**, exactly what the model's three-atom terms sum (§6.1). It is
+   not the first shell. The element card's first-shell bond angles stay as they are. The reach keeps the drawn gaps to
+   distances the pair graphs have taught (§6.3).
+2. **When the open scene lacks the picked triple, Teach is disabled.** The tip names the stored molecules that have it
+   (`TripleKnowledge::compositions`, §6.1, §6.6). No atom is added. A "place a third atom" mode is a separate, later
+   design.
+3. **No "Fill gaps on this slice" in this feature.** Drag-select covers it, at a cost the user sees. A slice-only Fill
+   gaps (the pair graph's, limited to one r₂ slice) is a possible later addition.
