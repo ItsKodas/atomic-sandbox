@@ -603,6 +603,7 @@ Runs after the preview build that follows Task 9, before Task 10. Witness column
 - **The loose threshold comes from the stop**, not a fixed 1e-10: H₃⁺'s ↑ level 2 sits at f ≈ 5e-11, so a neighbour at 2e-10 would stay tight and could cycle. Use f < 1e-2·tol, justified by f·κ·r ≪ tol and dμ/dε ∝ f(1−f), or verify every point of an H₃⁺ scan.
 - **The RED tests Task 9 left** become green or are re-ruled here: the 201³ × 0.15 all-electron H⁻ leg (V8 at the app's largest box) and the cold all-electron H₂O at 97³ × 0.25 (both `#[ignore = "plan Task 9b: witness cap"]`), plus `the_stuck_escape_repro_is_answered_honestly` if Task 9 could not run it inside a batch.
 - **Task 9 is complete only when `h3plus_tier` passes** (it closes here).
+- **Harris witness cost** (merge of main into scf-stall, ruling 2026-11-16): under FD the live-orbitals Harris display solve grows witness columns too, and V-A3's warm refresh rose 1.5–2.7× (H₂ 0.115→0.172 s, H₂ + H 0.147→0.402 s, above the 0.3 s target, H₂O 0.46→0.79 s). Apply the same per-column guard tolerance to the Harris block, re-measure V-A3, and restore the 0.3 s target or record why not.
 - Physics review before commit.
 
 ---
