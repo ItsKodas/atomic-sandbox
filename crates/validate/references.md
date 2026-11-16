@@ -5306,14 +5306,39 @@ M = 3 −1.1e-11 Ha (all |ΔF_I| ≤ 1.1e-10); the off-site record −5.4e-10 / 
 pins of `none_policy` (Aufbau bits unchanged), the frozen-density stall test's anchor (the frozen first Δρ, 0.077 from
 the free-atom H), the water point's count.
 
-**Open after 9c: `providers` `gpu_provider_matches_cpu_provider_at_fixed_sigma` fails "warm 10 > cold 9 steps"** (H₂
-33³, the third, extrapolated solve; 9b: cold 11, extrapolated 7). Measured cause (DIIS trace): after two unfrozen
-steps the orbitals freeze (0-iteration accepts, the head just under the f32-floor tol 5.42e-6) and the DIIS keeps the
-two pre-freeze entries at coefficients ≈ −2.3 / +3.3; their extrapolation, clamped at 0, is a fixed point the frozen
-map cannot leave, so Δρ sits at 7.0–7.2e-6 for five steps until the old entries age out of the 6-entry history. 9b's
-trace shows the same plateau (7.3, 7.4, 5.6, 3.9e-6), shorter; the free-atom start took the cold solve from 11 to 9
-steps. A DIIS reset on entering a frozen step fixes this case (6 steps) but sends the stretched H₂ to 55 (gate ≤ 30):
-the frozen/unfrozen alternation of a head at the floor. Not fixed; needs its own task (the freeze rule at the f32 floor).
+**Fix round 2 and Task 9d (2026-11-17; rulings in the ledger; review `task-9c-review.md`).**
+- *VRAM (Decision 1).* The guard counts the solver's start allocation: `WITNESS_GROWTH_COUNTED` = 3 per spin (the
+  measured peak of 2 tested witness vectors at the app's 14 Bohr box plus the buffer). Measured at the real
+  177³ × 0.08 once the binding limit was raised: 13 steps, 37 s, peak block n_σ + 3, no growth. Growth past the
+  start is clamped by the remaining budget (`witness_cap_for`) and ends with the named cap error:
+  `a_growth_over_the_budget_is_the_named_cap_error` (H⁻ 95³ × 0.15 under a budget leaving cap 4: "no gap witness
+  within 4 extra levels … 4 is the most the 2.0 GB budget fits", 1.6 s, the block never past n + 4). The app's
+  estimated-mode H₂O at 177³ now reads 12.10 GB (9.91 + 2.19): refused under the 12 GB default, accepted on this card's
+  12.88 GB at the estimated box 179³; the 8-Ne 201³ refusal is unchanged. H⁻ at 201³ × 0.15 is accepted (6.62 GB)
+  with cap 3 — below Weyl's ≈ 79 box states, so its solve would end on the cap error (guard-level test). Fewer fields
+  per vector (12; 0.73 GB per vector at 177³ in estimated mode) is a later optimisation.
+- *Binding limits.* `gpu::GpuContext` requests the adapter's `max_storage_buffer_binding_size` and `max_buffer_size`
+  (wgpu's defaults as the floor; the RX 7900 XTX offers 2 GiB − 4 B and 2 GiB). `qm-gpu`
+  `a_177_cube_solve_allocates_and_runs`: the 147 MB boundary table binds, one H₂ step at 177³ × 0.08 in 5.4 s.
+- *Review I1 (ruling (a)).* The buffer decides the witness only at r ≤ g = `WITNESS_GUARD_TOL` (its spectral weight
+  below θ − r is ≤ r²/D²; at larger r an unconverged buffer can hide an occupied-weight level); at r > g the block
+  grows by one. `buffer_last`'s swap edge re-solves until the moved column meets g. H₃⁺ 1.6 r₀: 12 steps, 0 resets.
+- *Review I2 / Task 9d.* On the failing test's warm solves the counters were witness growths 0, trims 0, buffer
+  witnesses 0, DIIS resets 0 — the trim is not involved there; trimming at 36 kT and removing the widen + grow reset
+  changed neither gate case (identical numbers), so both are kept. The plateau is the freeze (DIIS trace in the
+  `qm_gpu::scf` module doc, "The DIIS history at a freeze"). Adopted: a frozen step that follows a frozen step and
+  fails the Pulay contraction 1 − α drops the entries older than the freeze. Measured (provider test extrapolated /
+  cold steps; stretched H₂ 65³ R 6 / 107³ R 5.75, gate ≤ 30): no rule 10 > 9 (11 / 18); full restart at a freeze 6
+  (55 before I1); keep only the newest entry at every freeze 6, but 11 / 39; **the stall rule 7 ≤ 9, 11 / 18**.
+  Water O–H 1.8 r₀ (CoresOnly) 18 steps (the AE H's free-atom start, review M4).
+- *The stuck-escape repro now passes* (`validate --test surrogate the_stuck_escape_repro_is_answered_honestly`, with
+  `h3plus_tier`, 805 s for both; it failed in 9b): hot run 219 model answers, 116 judged, worst |ΔE|/N 5.23e-4 Ha
+  (tier 1e-3), worst force residual / bound 1.91 (gate 3×), 0 beyond; 103 box-affected and not judged (worst 2.01e-3
+  there). No trust rule changed — the teacher's path did. `h3plus_tier` passes (975 teacher solves, 6.8 steps each).
+- *Gates.* qm 253, qm-gpu 146, providers 461 (with the water re-pin), app `worker:: ui::` 471, gpu_vs_cpu 12
+  (timing_table H₂O 97³ cold 10.1 s / 12 steps, warm 13 steps).
+- *Minors.* M4: the cold guess is per centre (`qm::nuclear::cold_guess`: free atoms at all-electron centres, Z_v blobs
+  for pseudised). M6: `SolveProfile::eigen_restores` — 0 in every solve printed (97³ H₂O, the provider test).
 
 ## Live orbitals (Harris display; spec 2026-11-14)
 

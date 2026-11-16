@@ -211,7 +211,7 @@
 //!   the extras cost the 97³ solve a 13 → 21 doubling). (d), a loose stop at the per-column
 //!   density bound, was measured and not adopted (`qm::occupations` "No loose stop"). Measured: 11 steps, 11 s, peak
 //!   block 14 (9 extra vectors per spin, the buffer included; the step-1 36 kT window); the app's 177³ × 0.08 VRAM case
-//!   (14 Bohr): 13 steps, 41 s, peak block 8 (3 extra vectors per spin), no growth — `providers::ks::WITNESS_GROWTH_COUNTED`.
+//!   (14 Bohr): 13 steps, 37 s, peak block 8 (3 extra vectors per spin), no growth — `providers::ks::WITNESS_GROWTH_COUNTED`.
 //! - **Pause and cancel inside an eigensolve** (Task 9c): `solve_polled`'s second poll reaches the FD channels' LOBPCG
 //!   (once per iteration; `solve_with`/`solve_observed` keep their one poll per step, which callers count as steps —
 //!   the Activity probe); an aborted eigensolve abandons the solve like an abort before a step, parking the iterate as
