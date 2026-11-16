@@ -5441,7 +5441,7 @@ h_req 0.35) reproduces within the backend margin (2e-3 Bohr, 0.5 %). H₂O (All)
 tetrahedral, the egg-box records, the H₂O preset NVE (E spread 8.02e-6 Ha), the pseudo-O₂ NVE drift −9.85e-7 Ha/ps
 (bound 2e-4) and the CH₄ CSVR ⟨T⟩ 315.0 K (+5.0 %) all pass.
 
-**Resolved in fix round 1 (below the measurement):** `qm-gpu` `harris::tests::harris_block_follows_a_shared_shell` (renamed `harris_block_follows_a_partly_filled_shell` in fix round 1) fails its
+**Resolved in fix rounds 1–2 (below the measurement):** `qm-gpu` `harris::tests::harris_block_follows_a_shared_shell` (renamed `harris_block_follows_a_partly_filled_shell` in fix round 1) fails its
 `out.at_cap == [false, false]` assertion under Fermi–Dirac (the fixture `solved_pseudo_o` ran the shared-shell rule
 before). Measured (a temporary per-solve trace, removed): ↓'s second Harris solve, split (8, 6, 7), ran to the
 200-iteration cap with its displayed tier at 2.33e-5 (tol 5.4e-6) and its guard tier at 6.9e-6 (GUARD_TOL 1e-3); the
@@ -5450,17 +5450,18 @@ its partner in the guard tier; the next solve raised the head over the shown pai
 iterations. The splits and solve counts are the shared-shell era's ([2, 3], (9, 7, 8)); only the first call's cap
 moved. FD's ↓ density (f 0.335 / 0.334 / 0.331, the off-site p set split 8.8e-5 Ha) is what splits that box pair
 differently; the head boundary splitting a near-degenerate pair before the post-solve raise is a pre-existing Harris
-behaviour. **Fix round 1** (review I1), assertions unchanged:
-- the head is closed inside `eigen::lobpcg_split` after every Rayleigh–Ritz step: from the given head, while
-  θ_head − θ_{head−1} ≤ τ_scf + r_{head−1} + r_head (τ_scf = `qm::orbitals::tau(tol)`, 1e-4 at tol 1e-6; r the true
-  residuals), the head takes the next column, up to `checked`; `EigenStats::split_head` returns it and Harris records it
-  in `splits` (`the_split_head_closes_over_a_near_degenerate_pair`). Alone it did **not** clear the cap: the closed
-  7-column head of split (8, 6, 7) stalled at 2.3e-5 (the guard tier empty) for 200 iterations;
-- so the reviewer's minimal rule is applied as well: a pass that grows the block holds the head inside the old block,
-  at most cur.len − 1. ↓ now runs (6, 4, 5) → (8, 5, 7) → (9, 7, 8): 224 iterations in 3 solves, no cap, no floor exit
+behaviour. **Fix rounds 1–2** (review I1), assertions unchanged:
+- fix round 1 tried closing the head inside `eigen::lobpcg_split` after every Rayleigh–Ritz step (while
+  θ_head − θ_{head−1} ≤ τ_scf + r_{head−1} + r_head). Alone it did **not** clear the cap — it pushed the head to `checked`,
+  emptying the guard tier and leaving the top head column under the untested buffer, and the 7-column head stalled at
+  2.3e-5 — and it can close and reopen across iterations; fix round 2 removed it;
+- the rule kept: a pass that grows the block holds the head inside the old block, at most cur.len − 1 (`next_split`,
+  `a_growing_pass_holds_the_head_inside_the_old_block`). ↓ now runs (6, 4, 5) → (8, 5, 7) → (9, 7, 8): 224 iterations in 3 solves, no cap, no floor exit
   (265 with one capped solve before); ↑ is unchanged (153 in 2); the warm second call takes 0 iterations on both spins;
   splits and solve counts are the shared-shell era's ([2, 3], (9, 7, 8)). The test is renamed
-  `harris_block_follows_a_partly_filled_shell` (review M5). Every other qm-gpu test passes unchanged.
+  `harris_block_follows_a_partly_filled_shell` (review M5). Every other qm-gpu test passes unchanged. Accepted and
+  pre-existing: a warm call whose head boundary newly cuts a τ-set (no growth) can still spend one capped solve before
+  the post-solve raise.
 
 ## Live orbitals (Harris display; spec 2026-11-14)
 
