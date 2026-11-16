@@ -52,6 +52,19 @@ pub struct DisplayRow {
     pub solve: sim::DisplaySolve,
 }
 
+/// A sampling pass paused or resumed by the user (user request 2026-11-16): a row of its own in
+/// the solve log, not a teaching solve (counted nowhere), seen as the snapshot's
+/// `SamplingProgress::paused` changes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PassMark {
+    /// Session time the change was seen.
+    pub at: Duration,
+    pub paused: bool,
+    /// The pass's jobs done and total then.
+    pub done: usize,
+    pub total: usize,
+}
+
 /// One mark of the timeline (spec §3.3.6).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mark {
@@ -112,6 +125,8 @@ pub struct ActivityState {
     pub rows: VecDeque<LogRow>,
     /// The display eigensolves, oldest first (at most [`LOG_ROWS`]).
     pub display_rows: VecDeque<DisplayRow>,
+    /// The passes paused and resumed, oldest first (at most [`LOG_ROWS`]).
+    pub pass_marks: VecDeque<PassMark>,
     pub session_solves: u64,
     /// Events absorbed over the session, kept or dropped from the ring (a replay's `solve-log`
     /// baseline: the ring's length stops growing at [`LOG_ROWS`]).
@@ -148,6 +163,8 @@ pub struct ActivityState {
     pub runs: Vec<Duration>,
     last_quarantined: Option<usize>,
     pass_running: bool,
+    /// The running pass was paused in the last snapshot.
+    pass_paused: bool,
     pub headline: headline::Throttled<Option<headline::Headline>>,
     /// The convergence plot's traces (`jobs::Traces`).
     pub conv: jobs::Traces,
@@ -169,6 +186,7 @@ impl ActivityState {
             start: Instant::now(),
             rows: VecDeque::new(),
             display_rows: VecDeque::new(),
+            pass_marks: VecDeque::new(),
             session_solves: 0,
             rows_seen: 0,
             fit_points: Vec::new(),
@@ -187,6 +205,7 @@ impl ActivityState {
             runs: Vec::new(),
             last_quarantined: None,
             pass_running: false,
+            pass_paused: false,
             headline: headline::Throttled::new(None),
             conv: jobs::Traces::default(),
             log_view: log::LogView::All,
@@ -286,6 +305,16 @@ impl ActivityState {
             }
         }
         self.pass_running = running;
+        // the user's Pause and Resume of the pass, one log row each
+        let p = s.dynamics.sampling.as_ref().filter(|_| running);
+        let paused = p.is_some_and(|p| p.paused);
+        if let Some(p) = p.filter(|_| paused != self.pass_paused) {
+            self.pass_marks.push_back(PassMark { at: now, paused, done: p.done, total: p.total });
+            if self.pass_marks.len() > LOG_ROWS {
+                self.pass_marks.pop_front();
+            }
+        }
+        self.pass_paused = paused;
         // the timeline is a view: bounded like the log
         if self.timeline.len() > 4 * LOG_ROWS {
             self.timeline.drain(..self.timeline.len() - 4 * LOG_ROWS);
@@ -316,6 +345,7 @@ impl ActivityState {
             }
         }
         self.pass_running = false;
+        self.pass_paused = false;
         self.last_quarantined = None;
     }
 

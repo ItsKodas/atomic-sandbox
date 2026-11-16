@@ -130,6 +130,10 @@ pub fn headline(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Optio
     let last = (d.eval.scf_steps > 0).then_some(d.eval.scf_steps as u32);
     let primary: Option<(String, BarMode)> = if let Some(s) = d.sampling.as_ref().filter(|_| input.sampling()) {
         let frac = BarMode::Fraction(if s.total > 0 { s.done as f32 / s.total as f32 } else { 0.0 });
+        if s.paused {
+            // paused by the user (2026-11-16): no stage, iteration or time left — nothing runs
+            return Some(Headline { text: format!("training paused · {}", sample_text(s.done, s.total).to_lowercase()), audit, orbitals, bar: frac });
+        }
         // the stage of the job being solved now (the ghost's), not the last finished one's; a
         // teach-around pass names its blocker
         let stage = super::words::pass_stage_of(s, d.ghost.as_ref());

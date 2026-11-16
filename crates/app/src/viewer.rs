@@ -1679,7 +1679,7 @@ impl Viewer {
                 if s.dynamics.drag.is_none() && !self.tool.dragging {
                     self.drag_target = None;
                 }
-                let ghost = s.dynamics.ghost.as_ref().filter(|_| crate::sim::sampling_active(&s.dynamics));
+                let ghost = s.dynamics.ghost.as_ref().filter(|_| crate::sim::sampling_active(&s.dynamics) && !crate::sim::pass_paused(&s.dynamics));
                 self.ghost.follow(ghost, Instant::now());
                 // bonds from experience: a fresh graph is recorded, a stale one guessed over
                 // (only drawn, so only computed, when wanted: `guess_wanted`)
@@ -1688,7 +1688,14 @@ impl Viewer {
                 if let Some(note) = self.bond_exp.note.take() {
                     self.ui.log.push(ui::logbook::LogKind::Warning, note);
                 }
+                // a pass ended: whatever the folder holds now is offered — a paused pass ended by a new
+                // scene left its checkpoint as an interrupted pass; a finished or cancelled one
+                // removed its files (no offer)
+                let pass_ended = self.snapshot.as_ref().is_some_and(|p| crate::sim::sampling_active(&p.dynamics)) && !crate::sim::sampling_active(&s.dynamics);
                 self.snapshot = Some(*s);
+                if pass_ended {
+                    self.refresh_resume_offer();
+                }
                 self.record_trails();
             }
             SimEvent::Error(message) => {
@@ -2018,9 +2025,14 @@ impl Viewer {
             let wanted = self.ui.orbital_pick.unwrap_or((sim::Spin::Up, ui::HOMO_TRACK));
             let exists = o.rows.iter().any(|r| (r.spin, r.track) == wanted);
             if !exists && self.ui.orbital_pick != Some((*spin, *track)) {
-                // adopting the HOMO the producer showed for the placeholder — or again after its
-                // tracks restarted (an isolated-atom job of the estimated solver renumbers them) —
-                // is no selection of the user's; replacing a pick the user made is, and keeps its note
+                // the producer resolved a track it no longer has (`providers::orbitals`, "The
+                // selection fallback"): renumbered — a rebuilt producer after an isolated-atom job,
+                // or unoccupied tracks retired across an audit's payload without unoccupied rows —
+                // to the same orbital under its new track, with no note; genuinely vanished to the
+                // HOMO, with its note. A payload that left the pick unresolved names the pick
+                // itself, so it is never adopted from. Adopting the HOMO the producer showed for
+                // the placeholder is no selection of the user's; replacing a pick the user made is,
+                // and keeps any note
                 self.ui.orbital_pick_adopted = self.ui.orbital_pick.is_none() || self.ui.orbital_pick_adopted;
                 self.ui.orbital_pick = Some((*spin, *track));
                 resend = true;
@@ -2384,9 +2396,10 @@ impl Viewer {
 
     /// What the running sampling pass is solving, to be drawn instead of the scene (View ▸ Display
     /// aids ▸ show what training is solving; `crate::ghost`): `None` when the toggle is off, no pass
-    /// runs (it ended, was cancelled or failed) or the snapshot carries none.
+    /// runs (it ended, was cancelled or failed), the pass is paused (it solves nothing: the scene is
+    /// shown) or the snapshot carries none.
     pub fn ghost_now(&self) -> Option<&sim::PassGhost> {
-        let s = self.snapshot.as_ref().filter(|s| self.ui.show_ghost && crate::sim::sampling_active(&s.dynamics))?;
+        let s = self.snapshot.as_ref().filter(|s| self.ui.show_ghost && crate::sim::sampling_active(&s.dynamics) && !crate::sim::pass_paused(&s.dynamics))?;
         s.dynamics.ghost.as_ref()
     }
 
@@ -4302,6 +4315,81 @@ nucleus 1 {a} {} {}
         assert_eq!(crate::ui::orbital_tab::visible_notes(d2.orbitals.as_ref().unwrap(), v.ui.orbital_pick_adopted).len(), 1);
     }
 
+    /// The user report (2026-11-16, estimated mode with live orbitals): a picked orbital switched
+    /// to another about every 30 s. End to end through the producer's view state
+    /// (`providers::orbitals::ViewState`, fed the viewer's own requests) and the driver's test
+    /// (`answered_by`): Harris payloads with unoccupied rows, an audit's converged payload without
+    /// them, then Harris payloads whose unoccupied tracks the tracker numbered afresh, then a
+    /// rebuilt producer (an isolated-atom job). The user's ↑ LUMO stays picked throughout — the
+    /// same orbital under its new track, no note, no spinner — and an orbital that genuinely
+    /// vanished still falls back to the HOMO with its note.
+    #[test]
+    fn a_picked_orbital_survives_renumbered_tracks() {
+        use providers::orbitals::ViewState;
+        use qm::orbitals as qo;
+        use sim::Spin;
+        let row = |spin, index, track, energy: f64, unocc: bool| qo::Row {
+            spin, index, track, slot: 0, energy, eps_range: (energy, energy), occupation: if unocc { 0.0 } else { 1.0 },
+            label: qo::Label::Index(index + 1), cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false,
+            residual: unocc.then_some(1e-6), not_converged: false, l: None,
+        };
+        let out = |rows| qo::UpdateOutput { rotations: [Vec::new(), Vec::new()], rows, scale: [Vec::new(), Vec::new()], hidden_unoccupied: [0; 2], lone_atom: qo::LoneAtom::NotLoneAtom };
+        let harris = |up_lumo: u32, dn_lumo: u32| out(vec![
+            row(qo::Spin::Up, 0, 0, -0.6, false), row(qo::Spin::Up, 1, up_lumo, 0.1, true), row(qo::Spin::Down, 0, 2, -0.6, false), row(qo::Spin::Down, 1, dn_lumo, 0.1, true),
+        ]);
+        let audit = out(vec![row(qo::Spin::Up, 0, 0, -0.61, false), row(qo::Spin::Down, 0, 2, -0.61, false)]);
+        let mut v = pinned("h2");
+        let mut producer = ViewState::default();
+        let mut d = sim::DynSnapshot::default();
+        // one update: the producer takes the viewer's current request, the driver shows the
+        // payload if it answers the view, then the viewer reads the snapshot
+        let step = |v: &mut Viewer, producer: &mut ViewState, d: &mut sim::DynSnapshot, o: &qo::UpdateOutput| {
+            let req = v.ui.orbital_request();
+            producer.set(req.clone());
+            let spin = qo::SpinSummary { n_up: 1, n_dn: 1, integral: 0.0, abs_integral: 0.0, max_abs: 0.0, rho_max: 1.0 };
+            let p = producer.pick(o);
+            let unocc = (req.unoccupied > 0).then(|| sim::UnoccupiedStatus { requested: req.unoccupied, ..Default::default() });
+            let payload = producer.display(sim::Cell { n: 9, h: 0.5 }, [0.0; 3], Vec::new(), o, &spin, 0.0, p, None, unocc);
+            let shown = req.answered_by(&payload);
+            if shown {
+                d.orbitals = Some(payload);
+            }
+            v.drive_orbital_view(d);
+            shown
+        };
+        let visible = |v: &Viewer, d: &sim::DynSnapshot| crate::ui::orbital_tab::visible_notes(d.orbitals.as_ref().unwrap(), v.ui.orbital_pick_adopted).len();
+        let pending = |v: &Viewer, d: &sim::DynSnapshot| crate::ui::orbital_tab::pending_pick(v.ui.show, v.ui.orbital_pick, d.orbitals.as_ref());
+        v.apply(ui::Action::Show(ui::ShowMode::Orbitals));
+        step(&mut v, &mut producer, &mut d, &harris(1, 3));
+        assert_eq!(v.ui.orbital_pick, Some((Spin::Up, 0)), "the HOMO placeholder, adopted");
+        // the user picks the ↑ LUMO; a Harris payload shows it
+        v.apply(ui::Action::PickOrbital { spin: Spin::Up, track: 1 });
+        assert_eq!(pending(&v, &d), Some((Spin::Up, 1)), "loading");
+        step(&mut v, &mut producer, &mut d, &harris(1, 3));
+        assert_eq!((v.ui.orbital_pick, pending(&v, &d)), (Some((Spin::Up, 1)), None));
+        // the audit's converged payload without unoccupied rows: not shown, the pick unchanged
+        assert!(!step(&mut v, &mut producer, &mut d, &audit), "it does not answer the view");
+        assert_eq!(v.ui.orbital_pick, Some((Spin::Up, 1)));
+        // the next Harris payloads: the ↑ LUMO under a new track, the user's pick still
+        assert!(step(&mut v, &mut producer, &mut d, &harris(4, 5)));
+        assert_eq!(v.ui.orbital_pick, Some((Spin::Up, 4)), "the same orbital, renumbered");
+        assert!(!v.ui.orbital_pick_adopted, "still the user's pick");
+        assert_eq!((visible(&v, &d), pending(&v, &d)), (0, None), "no note, no spinner");
+        step(&mut v, &mut producer, &mut d, &harris(4, 5));
+        assert_eq!(v.ui.orbital_pick, Some((Spin::Up, 4)));
+        // an isolated-atom job rebuilds the producer: raw ids restart, the pick follows
+        producer.rebuilt();
+        step(&mut v, &mut producer, &mut d, &harris(1, 3));
+        assert_eq!(v.ui.orbital_pick, Some((Spin::Up, 6 + 1)), "base 6 + raw 1");
+        assert_eq!((visible(&v, &d), pending(&v, &d)), (0, None));
+        // genuinely vanished (an electron more: ↑ rank 1 is occupied now): the HOMO, with its note
+        let more = out(vec![row(qo::Spin::Up, 0, 0, -0.6, false), row(qo::Spin::Up, 1, 9, -0.2, false), row(qo::Spin::Up, 2, 10, 0.2, true), row(qo::Spin::Down, 0, 2, -0.6, false)]);
+        step(&mut v, &mut producer, &mut d, &more);
+        assert_eq!(v.ui.orbital_pick, Some((Spin::Up, 6 + 9)), "the HOMO");
+        assert!(!v.ui.orbital_pick_adopted);
+        assert_eq!((visible(&v, &d), pending(&v, &d)), (1, None), "the note is shown");
+    }
+
     /// A solver switch starts a new worker whose provider numbers its tracks afresh: the pick and
     /// the include set must not carry over (final review I5) and its first view holds back the
     /// unoccupied orbitals (minor 1: `run_settings` is built after the deferral is set). Through
@@ -4459,7 +4547,7 @@ nucleus 1 {a} {} {}
     }
 
     fn pass_progress(done: usize, finished: bool, cancelled: bool) -> sim::SamplingProgress {
-        sim::SamplingProgress { done, total: 20, stage: "scans", last_energy: -1.1, cancelled, skipped: 0, failed: 0, finished, target: None }
+        sim::SamplingProgress { done, total: 20, stage: "scans", last_energy: -1.1, cancelled, skipped: 0, failed: 0, finished, target: None, paused: false }
     }
 
     fn ghost_snapshot(v: &Viewer, sampling: Option<sim::SamplingProgress>, ghost: Option<sim::PassGhost>) -> Snapshot {

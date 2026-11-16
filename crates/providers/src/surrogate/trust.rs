@@ -447,6 +447,7 @@ pub(super) struct FitState {
     pub(super) report: Option<FitReport>,
     pub(super) envelope: Option<Envelope>,
     pub(super) null_space: Option<NullSpace>,
+    pub(super) null_space_pending: bool,
     pub(super) active_set: Option<ActiveSet>,
     pub(super) training_residuals: Option<TrainingResiduals>,
     pub(super) misfit: Option<Misfit>,
@@ -571,6 +572,7 @@ impl SurrogateKs {
     /// |∪_k S_k| of the current fit's members ([`key_column_counts`]; the class judgement's
     /// `fit_columns`, computed alone for a deferred fit). 0 without a model or a store.
     fn fit_column_union(&self) -> usize {
+        let _prof = surrogate::prof::span("P3 fit_column_union (floor columns)");
         let (Some(model), Some(store)) = (self.model.as_ref(), self.store.as_ref()) else { return 0 };
         key_column_counts(&model.basis, store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s)).union
     }
@@ -690,6 +692,7 @@ impl SurrogateKs {
     /// residual over its bound: in M when it is finite and above 1; a NaN stays outside M, where
     /// the residual rows fail on it.
     pub(super) fn compute_residuals(&self) -> Option<(TrainingResiduals, Misfit)> {
+        let _prof = surrogate::prof::span("P3 compute_residuals (training residuals + M)");
         let (model, store) = (self.model.as_ref()?, self.store.as_ref()?);
         let (mut all, mut m) = (Running::ZERO, Misfit { samples: Vec::new(), atoms: Vec::new(), outside: Running::ZERO.worst, fitted: 0, worst: None });
         let mut outside = Running::ZERO;
@@ -735,6 +738,7 @@ impl SurrogateKs {
     /// The class rule's numbers and the readiness readout's worst sample per class (module doc,
     /// "Class-wise trust", "Readiness"): one pass sets `class_loo` and `class_worst`.
     pub(super) fn refresh_class_loo(&mut self) {
+        let _prof = surrogate::prof::span("P2 refresh_class_loo");
         self.refit_stage(sim::RefitStage::LeaveOneOut);
         let (loo, worst, blockers, ratios) = self.compute_class_loo_full();
         // the per-sample leave-one-out ratios of this fit (spec ruling R1b), keyed to it
@@ -915,6 +919,7 @@ impl SurrogateKs {
     /// from the same leave-one-out.
     #[allow(clippy::type_complexity)]
     pub(super) fn compute_class_loo_full(&self) -> (Option<(Vec<ClassLoo>, ClassJudge)>, Vec<Option<(usize, f64)>>, Vec<Vec<(usize, f64)>>, Vec<(usize, f64, f64, Channel)>) {
+        let _prof = surrogate::prof::span("P3 compute_class_loo_full");
         let (Some(model), Some(store), Some(report)) = (self.model.as_ref(), self.store.as_ref(), self.report.as_ref()) else {
             return (None, Vec::new(), Vec::new(), Vec::new());
         };
@@ -942,10 +947,13 @@ impl SurrogateKs {
         // union — stay over every fitted sample, M included: M is in the fit, so a column only M
         // touches is set by data the fit cannot reproduce, and leaving M out of q_k would lower the
         // floor it is held to (the union is `fit_column_union`'s, the sample floor)
+        let _prof_kc = surrogate::prof::span("P4 class pass: key_column_counts (serial, x1-2)");
         let counts = key_column_counts(&model.basis, fitted.iter().filter(|(i, _)| !self.in_misfit(*i)).map(|&(_, s)| s));
         let all_fitted = self.misfit.as_ref().is_some_and(|m| !m.samples.is_empty()).then(|| key_column_counts(&model.basis, fitted.iter().map(|&(_, s)| s)));
         let columns = all_fitted.as_ref().unwrap_or(&counts);
+        drop(_prof_kc);
         let loos = surrogate::loo::leave_one_out_many(model, &fitted.iter().map(|&(_, s)| s).collect::<Vec<_>>());
+        let _prof_agg = surrogate::prof::span("P4 class pass: serial per-sample aggregation (energy_and_forces, env keys)");
         // every fitted sample's leave-one-out ratios, M's included (the recovery ranks every
         // fitted sample, spec 2026-11-12 R1b; `fresh_loo_ratios` matches them to the fit's members)
         let mut sample_ratios: Vec<(usize, f64, f64, Channel)> = Vec::with_capacity(fitted.len());
@@ -1029,6 +1037,8 @@ impl SurrogateKs {
                 }
             }
         }
+        drop(_prof_agg);
+        let _prof_cal = surrogate::prof::span("P4 class pass: calibrate + judge");
         // the audit calibration per class (M8a Task 2) — the verdict's evidence
         // ā_c = min(σ_F, the class's training force-residual rms) (fix round 1, the review's I2)
         let aleatoric: [f64; 2] = std::array::from_fn(|c| {
@@ -1090,6 +1100,7 @@ impl SurrogateKs {
     /// (`class_memory`; M8a Task 2): called once a refit, an install or a policy change is done,
     /// never by the intermediate fits inside one of them.
     pub(super) fn commit_class_memory(&mut self) {
+        let _prof = surrogate::prof::span("P1 commit_class_memory");
         self.class_memory = self
             .class_loo
             .iter()
@@ -1243,6 +1254,7 @@ impl SurrogateKs {
     /// envelope stay in place. With a probe attached ([`with_probe`](SurrogateKs::with_probe)) the
     /// refit's phase is reported on it for its duration (spec A1), cleared on every exit.
     pub fn refit(&mut self) -> Result<FitReport, FitError> {
+        let _prof = surrogate::prof::span("P0 refit() whole");
         /// Ends the probe's refit phase when dropped (an error or a panic clears it too).
         struct RefitPhase(Arc<sim::ActivityProbe>);
         impl Drop for RefitPhase {
@@ -1301,6 +1313,7 @@ impl SurrogateKs {
     /// The fits of a refit ([`refit_inner`](Self::refit_inner)): the fit, the fence votes, the
     /// release, the trust recovery, the held-out guesses — each fit deferred (`fit_store_deferred`).
     fn refit_fits(&mut self) -> Result<FitReport, FitError> {
+        let _prof = surrogate::prof::span("P1 refit_fits (fits, votes, release, recovery, held-out)");
         let mut report = self.fit_store_deferred()?;
         self.recovery = None;
         // fence votes (`surrogate` module doc, "Fence voting"): a voted sample the new model cannot
@@ -1344,9 +1357,25 @@ impl SurrogateKs {
         false
     }
 
-    /// The class-wise leave-one-out and the active set of the fit that stands, when a deferred fit
-    /// left them for later (`deferred_trust`); a no-op otherwise.
+    /// The null space (rule 5d) of the fit that stands, when a deferred fit left it for later
+    /// (`null_space_pending`): `NullSpace::of` the accumulator and the model it was fitted from,
+    /// the numbers the fit itself would have computed, bit for bit. A no-op otherwise.
+    pub(super) fn ensure_null_space(&mut self) {
+        if !std::mem::take(&mut self.null_space_pending) {
+            return;
+        }
+        let _prof = surrogate::prof::span("P2 ensure_null_space (standing fit)");
+        if let (Some(acc), Some(model)) = (self.accumulator.as_ref(), self.model.as_ref()) {
+            self.null_space = Some(NullSpace::of(acc, &model.scale));
+        }
+    }
+
+    /// The null space, the class-wise leave-one-out and the active set of the fit that stands,
+    /// when a deferred fit left them for later (`null_space_pending`, `deferred_trust`); a no-op
+    /// otherwise.
     pub(super) fn ensure_trust_passes(&mut self) {
+        let _prof = surrogate::prof::span("P1 ensure_trust_passes (standing fit)");
+        self.ensure_null_space();
         if self.deferred_trust.is_some() {
             self.refresh_class_loo();
             self.rebuild_active_set();
@@ -1424,6 +1453,7 @@ impl SurrogateKs {
     /// the band it fences (the fit can lean on a nearby row and pass there while f_c → 0 beyond
     /// it); it stands until a later pass's shell check for the pair measures the shell again.
     pub(super) fn rejudge_failed_audits(&mut self, count: bool) {
+        let _prof = surrogate::prof::span("P1 rejudge_failed_audits");
         if self.audit_failed.is_some() && self.failed_audits.is_empty() {
             self.audit_failed = None;
             self.audit_force = None;
@@ -1657,6 +1687,7 @@ impl SurrogateKs {
     /// audit's own criteria, and promoted into the fit (`Q_NONE`); a failure becomes a failed audit
     /// (rule 8: it untrusts until re-earned). How many were promoted (the caller refits then).
     pub(super) fn judge_held_out(&mut self) -> usize {
+        let _prof = surrogate::prof::span("P2 judge_held_out");
         let held: Vec<usize> = (0..self.quarantine.len()).filter(|&i| self.quarantine[i] == Q_DRAFT).collect();
         if held.is_empty() || self.model.is_none() {
             return 0;
@@ -1722,6 +1753,7 @@ impl SurrogateKs {
     }
 
     pub(super) fn save_state(&self) -> FitState {
+        let _prof = surrogate::prof::span("P4 save_state (clone)");
         FitState {
             accumulator: self.accumulator.clone(),
             accumulated: self.accumulated,
@@ -1729,6 +1761,7 @@ impl SurrogateKs {
             report: self.report.clone(),
             envelope: self.envelope.clone(),
             null_space: self.null_space.clone(),
+            null_space_pending: self.null_space_pending,
             active_set: self.active_set.clone(),
             training_residuals: self.training_residuals,
             misfit: self.misfit.clone(),
@@ -1747,12 +1780,14 @@ impl SurrogateKs {
     }
 
     pub(super) fn restore_state(&mut self, s: FitState) {
+        let _prof = surrogate::prof::span("P4 restore_state");
         self.accumulator = s.accumulator;
         self.accumulated = s.accumulated;
         self.model = s.model;
         self.report = s.report;
         self.envelope = s.envelope;
         self.null_space = s.null_space;
+        self.null_space_pending = s.null_space_pending;
         self.active_set = s.active_set;
         self.training_residuals = s.training_residuals;
         self.misfit = s.misfit;
@@ -1780,11 +1815,13 @@ impl SurrogateKs {
     }
 
     /// [`fit_store`](Self::fit_store) inside a refit: the training residuals and the sample floor's
-    /// column count only; the class-wise leave-one-out and the active set — O(P · m · Q′²) and
-    /// O(atoms · p²), the refit's cost at scale — are left to
+    /// column count only; the class-wise leave-one-out, the active set and the null space —
+    /// O(P · m · Q′²), O(atoms · p²) and O(Q′³), the refit's cost at scale — are left to
     /// [`ensure_trust_passes`](Self::ensure_trust_passes) for the fit that stands. Until then
     /// `class_loo`, `class_judge`, `class_worst`, `class_blockers` and `active_set` are an earlier
-    /// fit's and nothing may read them (the refit's own decisions do not: `refit_fits`).
+    /// fit's, `null_space` is `None` (`null_space_pending`), and nothing may read them (the
+    /// refit's own decisions do not: `refit_fits`; `judge_held_out`, whose `geometry_refusal`
+    /// reads rules 5d and 5e, runs `ensure_trust_passes` first).
     pub(super) fn fit_store_deferred(&mut self) -> Result<FitReport, FitError> {
         // the equivalence tests' reference: every fit with its passes, as before the deferral
         #[cfg(test)]
@@ -1795,6 +1832,7 @@ impl SurrogateKs {
     }
 
     fn fit_store_with(&mut self, trust_passes: bool) -> Result<FitReport, FitError> {
+        let _prof = surrogate::prof::span("P2 fit_store_with (one fit)");
         // a background refit's copy whose provider let it go stops here (`background`); its result
         // is never installed, so the error's kind is never shown
         if self.refit_cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
@@ -1835,6 +1873,12 @@ impl SurrogateKs {
         };
         // the references first: an error here changes nothing
         let refs = self.reference_vector(&basis)?;
+        // the incremental path adds to the standing fit's accumulator: its deferred null space is
+        // taken first, while the accumulator is still the one that fit was built from (a failed
+        // solve below leaves that fit standing, with the accumulator grown)
+        if !rebuild {
+            self.ensure_null_space();
+        }
         let (mut acc, mut accumulated) = if rebuild {
             (Accumulator::new(&basis), 0)
         } else {
@@ -1869,7 +1913,15 @@ impl SurrogateKs {
             }
         };
         self.envelope = Some(acc.envelope.clone());
-        self.null_space = Some(NullSpace::of(&acc, &model.scale));
+        // the null space with the trust passes: now, or once for the fit that stands
+        // (`ensure_null_space`; the accumulator and the model below are what it is built from)
+        if trust_passes {
+            self.null_space = Some(NullSpace::of(&acc, &model.scale));
+            self.null_space_pending = false;
+        } else {
+            self.null_space = None;
+            self.null_space_pending = true;
+        }
         self.accumulator = Some(acc);
         self.accumulated = accumulated;
         self.species_dirty = false;
@@ -1906,6 +1958,7 @@ impl SurrogateKs {
     /// trusted — or, in draft mode, whenever rules 1–3 pass (the `match`): an untrusted refit
     /// under draft mode moves the surface the atoms are on, and its jump must be booked too.
     pub(super) fn surface_moved(&mut self, was_trusted: bool, was_model: bool) -> Result<(), surrogate::DescribeError> {
+        let _prof = surrogate::prof::span("P1 surface_moved");
         let model = self.model.as_ref().expect("a model was just installed");
         // a lone-atom reference answer (rule 0b) is the model's own whatever the trust: the next one
         // at these positions moves with the refit, so its jump is booked untrusted too (review M1)

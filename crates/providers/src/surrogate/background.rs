@@ -175,6 +175,7 @@ impl SurrogateKs {
         f.report = self.report.clone();
         f.envelope = self.envelope.clone();
         f.null_space = self.null_space.clone();
+        f.null_space_pending = self.null_space_pending;
         f.active_set = self.active_set.clone();
         f.training_residuals = self.training_residuals;
         f.misfit = self.misfit.clone();
@@ -413,6 +414,7 @@ impl SurrogateKs {
         self.report = f.report.take();
         self.envelope = f.envelope.take();
         self.null_space = f.null_space.take();
+        self.null_space_pending = f.null_space_pending;
         self.active_set = f.active_set.take();
         self.training_residuals = f.training_residuals;
         self.misfit = f.misfit.take();

@@ -9,7 +9,7 @@
 //! (`overlay.rs`).
 use super::dock;
 use super::activity;
-use super::{source_colour, source_label, theme, Action, PanelInput, UiState, GREEN, RED, SPARK_E};
+use super::{keyed, source_colour, source_label, theme, Action, PanelInput, UiState, GREEN, RED, SPARK_E};
 use crate::sim::Backend;
 use egui::{pos2, Align2, Color32, Id, Order, Pos2, Rect, RichText, Stroke, Vec2};
 
@@ -437,6 +437,16 @@ fn segment_card(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInpu
         });
 }
 
+/// A pass's Pause, or Resume while it is paused (user request 2026-11-16), probed as
+/// `<probe>-pause` / `<probe>-resume`.
+pub fn pause_button(ui: &mut egui::Ui, paused: bool, probe: &str, acts: &mut Vec<Action>) {
+    let (label, action) = crate::ui::activity::jobs::pause_control(paused);
+    let tip = if paused { crate::ui::activity::jobs::RESUME_PASS_TIP } else { crate::ui::activity::jobs::PAUSE_PASS_TIP };
+    if super::probed(&format!("{probe}-{}", label.to_lowercase()), ui.button(label)).on_hover_text(tip).clicked() {
+        acts.push(action);
+    }
+}
+
 /// Returns the card's top edge when it is shown.
 fn sampling_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInput<'_>, acts: &mut Vec<Action>) -> Option<f32> {
     let p = input.snapshot.and_then(|s| s.dynamics.sampling.as_ref()).filter(|_| input.sampling())?;
@@ -449,11 +459,12 @@ fn sampling_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInpu
             theme::card().show(ui, |ui| {
                 ui.set_width(520.0f32.min(view.width() - 40.0));
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Sampling pass").strong());
+                    ui.label(RichText::new(if p.paused { "Sampling pass · paused" } else { "Sampling pass" }).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Cancel").on_hover_text("end the pass now: what it sampled is kept; it is refitted only once there are enough samples to fit (Q′, the model's number of directions), else the Log says so and Sample more adds to them").clicked() {
                             acts.push(Action::CancelSampling);
                         }
+                        pause_button(ui, p.paused, "sampling-card", acts);
                     });
                 });
                 dock::progress(ui, p, input.model());
@@ -549,22 +560,22 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelI
                         ui.horizontal(|ui| {
                             ui.spacing_mut().slider_width = 90.0;
                             ui.label("density");
-                            ui.add(egui::Slider::new(&mut st.dots_amount, 0.5..=6.0).show_value(false)).on_hover_text("how many dots: more fill the same space more densely");
+                            keyed(ui, "ov-dots-amount", |ui| ui.add(egui::Slider::new(&mut st.dots_amount, 0.5..=6.0).show_value(false))).on_hover_text("how many dots: more fill the same space more densely");
                             ui.label(format!("{:.1}×", st.dots_amount));
                             ui.add_space(8.0);
                             ui.label("drift");
-                            ui.add_enabled(st.dots_float, egui::Slider::new(&mut st.dots_drift, 0.002..=1.5).logarithmic(true).show_value(false))
+                            keyed(ui, "ov-dots-drift", |ui| ui.add_enabled(st.dots_float, egui::Slider::new(&mut st.dots_drift, 0.002..=1.5).logarithmic(true).show_value(false)))
                                 .on_hover_text("how fast the dots drift (View ▸ How it looks ▸ floating)");
                             ui.add_space(8.0);
                             ui.label("feather");
-                            ui.add(egui::Slider::new(&mut st.dots_feather, 0.0..=0.8).show_value(false))
+                            keyed(ui, "ov-dots-feather", |ui| ui.add(egui::Slider::new(&mut st.dots_feather, 0.0..=0.8).show_value(false)))
                                 .on_hover_text("fade out the faint outskirts: the dots where the field is low disappear softly, leaving the main lobes (0 = every dot)");
                             ui.add_space(8.0);
                             ui.label("size");
-                            ui.add(egui::Slider::new(&mut st.dots_size, 0.05..=3.0).logarithmic(true).show_value(false)).on_hover_text("the dots' size");
+                            keyed(ui, "ov-dots-size", |ui| ui.add(egui::Slider::new(&mut st.dots_size, 0.05..=3.0).logarithmic(true).show_value(false))).on_hover_text("the dots' size");
                             ui.add_space(8.0);
                             ui.label("blur");
-                            ui.add(egui::Slider::new(&mut st.dots_blur, 0.0..=1.0).show_value(false)).on_hover_text("how soft each dot's edge is: left crisp, right blurry (the middle is the default look)");
+                            keyed(ui, "ov-dots-blur", |ui| ui.add(egui::Slider::new(&mut st.dots_blur, 0.0..=1.0).show_value(false))).on_hover_text("how soft each dot's edge is: left crisp, right blurry (the middle is the default look)");
                         });
                     });
                 }
@@ -573,16 +584,16 @@ fn view_switch(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelI
                         ui.horizontal(|ui| {
                             ui.spacing_mut().slider_width = 110.0;
                             ui.label("shutter");
-                            ui.add(egui::Slider::new(&mut st.shutter, 0.0..=1.0).show_value(false))
+                            keyed(ui, "ov-shutter", |ui| ui.add(egui::Slider::new(&mut st.shutter, 0.0..=1.0).show_value(false)))
                                 .on_hover_text("how much of the motion between frames one picture collects: longer streaks to the right, a sharp still at 0");
                             ui.label(format!("{:.0} %", st.shutter * 100.0));
                             ui.add_space(8.0);
                             ui.label("exposure");
-                            ui.add(egui::Slider::new(&mut st.exposure_ev, -3.0..=3.0).step_by(0.1).show_value(false)).on_hover_text("brightness of the glow, in stops (EV)");
+                            keyed(ui, "ov-exposure", |ui| ui.add(egui::Slider::new(&mut st.exposure_ev, -3.0..=3.0).step_by(0.1).show_value(false))).on_hover_text("brightness of the glow, in stops (EV)");
                             ui.label(format!("{:+.1} EV", st.exposure_ev));
                             ui.add_space(8.0);
                             ui.label("smooth");
-                            ui.add(egui::Slider::new(&mut st.camera_smooth, 0.0..=2.0).show_value(false))
+                            keyed(ui, "ov-camera-smooth", |ui| ui.add(egui::Slider::new(&mut st.camera_smooth, 0.0..=2.0).show_value(false)))
                                 .on_hover_text("with any solidity: one smooth surface — neighbouring atoms flow into each other through a soft neck (0 = separate balls)");
                         });
                     });

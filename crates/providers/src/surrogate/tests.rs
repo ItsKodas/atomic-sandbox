@@ -7945,7 +7945,7 @@ fn a_round_that_leaves_its_class_short_is_not_accepted() {
     s.class_loo = s.judge_classes(&j);
     s.class_judge = Some(j);
     assert!(matches!(s.class_loo()[0].refusal, Some((sim::ClassKey::Samples, ..))), "{:?}", s.class_loo()[0]);
-    let progress = sim::SamplingProgress { done: 9, total: 9, stage: "done", last_energy: 0.0, cancelled: false, skipped: 0, failed: 0, finished: true, target: None };
+    let progress = sim::SamplingProgress { done: 9, total: 9, stage: "done", last_energy: 0.0, cancelled: false, skipped: 0, failed: 0, finished: true, target: None, paused: false };
     let held = s.store().unwrap().samples.last().unwrap().clone();
     let scene = Scene { nuclei: held.pos.iter().map(|p| Nucleus::new(1, *p)).collect(), ..in_big_cell(h2(1.6)) };
     let holdout = crate::sampling::Holdout { blocker: 60, scene, energy: held.energy, forces: held.forces.clone(), face: None, multiplicity: None, unfit: false };
@@ -8666,7 +8666,7 @@ fn every_blocker_needs_a_judged_check() {
     s.start_teach(&in_big_cell(h2(1.6))).unwrap();
     while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
     assert!(s.user_notes.iter().any(|n| n.starts_with("teaching around #60: accepted")), "premise");
-    let progress = sim::SamplingProgress { done: 9, total: 9, stage: "done", last_energy: 0.0, cancelled: false, skipped: 0, failed: 0, finished: true, target: None };
+    let progress = sim::SamplingProgress { done: 9, total: 9, stage: "done", last_energy: 0.0, cancelled: false, skipped: 0, failed: 0, finished: true, target: None, paused: false };
     let held = s.store().unwrap().samples[30].clone();
     let scene = Scene { nuclei: held.pos.iter().map(|p| Nucleus::new(1, *p)).collect(), ..in_big_cell(h2(1.6)) };
     let near_60 = crate::sampling::Holdout { blocker: 60, scene, energy: held.energy, forces: held.forces.clone(), face: None, multiplicity: None, unfit: false };
@@ -11357,6 +11357,8 @@ fn a_pass_bringing_a_new_species_into_a_large_store_refits() {
 /// M8a Task 9: the knowledge map's builder (`knowledge.rs`), on this module's fixtures.
 mod knowledge;
 mod refit_cost;
+mod refit_profile;
+mod refit_golden;
 mod residual_diag;
 
 /// Rule 0b: lone atoms answered from the isolated-atom references (`lone.rs`).

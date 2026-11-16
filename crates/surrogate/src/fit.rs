@@ -190,12 +190,14 @@
 //!
 //! i.e. the whole evidence (the formula above, with the nominal λ in (Q′/2) ln λ and λ‖m‖²) in O(Q′)
 //! per evaluation. No eigenvectors are formed: H_ρ is reduced to tridiagonal form by Householder
-//! reflections (`linalg::Tridiagonal`, 2Q′³) and diagonalised by implicit QL, the reflections and
-//! rotations applied to b̃_F + ρ b̃_E alone. Per outer round: the λ search (the same grid and
+//! reflections (faer's blocked, threaded reduction, `dense::tridiagonal_qtc`, ≈ 4Q′³/3) and
+//! diagonalised by implicit QL (`linalg::tridiagonal_ql`, O(Q′²)), the reflections and rotations
+//! applied to b̃_F + ρ b̃_E alone. Per outer round: the λ search (the same grid and
 //! golden section, now O(Q′) per point) and — with neither noise level pinned — the common scale t
 //! by MacKay's β update at fixed ρ, t = ρRSS_E + RSS_F over n_E + n_F − γ (stationarity in t:
 //! d ln p/dt = [−(n_E + n_F) + γ]/(2t) + (ρRSS_E + RSS_F)/(2t²)), alternated to 1e-6; then one
-//! exact factorisation and inverse at (λ, s_E², s_F²) (the vectorised kernels, ≈ Q′³) gives
+//! exact factorisation and inverse at (λ, s_E², s_F²) (faer's blocked, threaded Cholesky and SPD
+//! inverse, `dense`, ≈ Q′³) gives
 //! RSS_κ and γ_κ per kind and the per-kind fixed points s_κ² = RSS_κ/(n_κ − γ_κ) the next ρ, as a
 //! step in ln ρ whose multiplier halves each time the step reverses direction (the bare fixed point
 //! cycled — ρ 460 → 2.1e4 → 1.4e3 → 460 — on a near-noise-free collection fixture; an evidence
@@ -207,7 +209,13 @@
 //! falls back to the reference search. Measured on a Q′ 250 body-4 fixture
 //! (`large_basis_search_finds_the_reference_search_optimum`): λ equal to 5 digits, σ_E within
 //! 0.05 %, ln p equal to 7 digits, 49 ms against 4 007 ms; at Q′ 2 688 and 10 000 samples a search
-//! takes 27.8 s (6 rounds; `references.md` "M8a body-4").
+//! takes 27.8 s (6 rounds; `references.md` "M8a body-4"). Since 2026-11-17 the O(Q′³) kernels are
+//! faer's (`dense`: blocked, threaded on the fit's CPU share, the same numbers on any thread
+//! count) instead of `linalg`'s single-threaded loops — the same algorithms and backward errors;
+//! the solution differs by up to κ(A)·ε (3e-3 at κ 1e13: the old kernels differ from themselves
+//! that much under a reordering, faer's forward error measured ~2× theirs on a synthetic κ 1e13),
+//! and every verdict and every prediction within 1 % of the tiers is unchanged on the user's
+//! collection (`references.md`, "Refit speed-up").
 //!
 //! **Warm refit.** Between searches the hyperparameters and the standardisation D stand (the
 //! search's, frozen), and a new sample only adds rows: A ← A + U Uᵀ with U the sample's k = 3N + 1
@@ -310,8 +318,7 @@
 use crate::descriptor::{describe, Basis, DescribeError};
 use crate::envelope::Envelope;
 use crate::linalg::{
-    cholesky_in_place, cholesky_in_place_fast, cholesky_inverse, cholesky_logdet, cholesky_solve, cholesky_update_upper, dot,
-    inverse_from_lower_inverse, lower_inverse_transposed, mat_vec, mat_vec_fast, tridiagonal_ql, upper_solve, Tridiagonal,
+    cholesky_in_place, cholesky_inverse, cholesky_logdet, cholesky_solve, cholesky_update_upper, dot, mat_vec, mat_vec_fast, tridiagonal_ql, upper_solve,
 };
 use crate::model::{energy_and_forces, Model, Provenance};
 use std::fmt;
@@ -786,6 +793,7 @@ impl Accumulator {
     /// # Panics
     /// As [`add`](Self::add).
     pub fn add_many(&mut self, samples: &[&Sample], basis: &Basis, ref_energy: &[f64], opts: &FitOptions) -> Result<(), DescribeError> {
+        let _prof = crate::prof::span("fit: Accumulator::add_many");
         if samples.is_empty() {
             return Ok(());
         }
@@ -1075,6 +1083,7 @@ impl Accumulator {
         provenance: &Provenance,
         ref_energy: &[f64],
     ) -> Result<(Model, FitReport), FitError> {
+        let _prof = crate::prof::span("fit:   Accumulator::solve (reference search)");
         let opts = &self.effective_options(opts);
         let (scale, d, problem) = self.prepare(ref_energy, None)?;
         let (hyper, sol) = problem.estimate(opts)?;
@@ -1097,6 +1106,7 @@ impl Accumulator {
     /// The standardisation (from the energy rows, or `frozen` = a warm state's (scale, d)) and the
     /// standardised two-noise problem (module doc). Refuses an empty or non-finite accumulator.
     fn prepare(&self, ref_energy: &[f64], frozen: Option<(&[f64], &[f64])>) -> Result<(Vec<f64>, Vec<f64>, TwoNoise), FitError> {
+        let _prof = crate::prof::span("fit:     prepare (standardise)");
         if self.n_samples == 0 || self.n_scale == 0 {
             return Err(FitError::NoSamples);
         }
@@ -1172,6 +1182,7 @@ impl Accumulator {
         log_evidence: f64,
         condition: f64,
     ) -> Result<(Model, FitReport), FitError> {
+        let _prof = crate::prof::span("fit:     assemble (model)");
         let basis = &self.basis;
         let p = basis.n_features();
         let n_s = basis.n_species();
@@ -1309,6 +1320,7 @@ impl Accumulator {
     /// valid (the same options, the store grown by less than [`WARM_GROWTH`] since the last search,
     /// at most [`WARM_MAX_PENDING`] samples since the last refit), else the spectral search.
     pub fn refit(&mut self, opts: &FitOptions, provenance: &Provenance, ref_energy: &[f64]) -> Result<(Model, FitReport), FitError> {
+        let _prof = crate::prof::span("fit: Accumulator::refit");
         let opts = &self.effective_options(opts);
         if !self.basis.body4 {
             self.warm = None;
@@ -1348,6 +1360,7 @@ impl Accumulator {
     /// reopened collection's first fit equals the session's last search, bit for bit); leaves a
     /// warm state for the next refit.
     fn solve_spectral(&mut self, opts: &FitOptions, provenance: &Provenance, ref_energy: &[f64]) -> Result<(Model, FitReport), FitError> {
+        let _prof = crate::prof::span("fit:   solve_spectral (search)");
         let start = None;
         self.warm = None;
         self.pending.clear();
@@ -1386,6 +1399,7 @@ impl Accumulator {
     /// tr Σ and tr(Σ G̃_E) carried by Woodbury, the mean solved with the updated factor. On any
     /// failure the warm state is dropped (the caller searches).
     fn solve_warm(&mut self, opts: &FitOptions, provenance: &Provenance, ref_energy: &[f64]) -> Result<(Model, FitReport), FitError> {
+        let _prof = crate::prof::span("fit:   solve_warm");
         let mut w = self.warm.take().expect("refit checked the warm state");
         let pending = std::mem::take(&mut self.pending);
         let (_, _, problem) = self.prepare(ref_energy, Some((&w.scale, &w.d)))?;
@@ -1757,6 +1771,7 @@ const NOISE_TOL: f64 = 1e-6;
 
 impl TwoNoise {
     fn solve(&self, lambda: f64, s_e2: f64, s_f2: f64) -> Result<Solved, FitError> {
+        let _prof = crate::prof::span("fit:     TwoNoise::solve (reference chol+inv)");
         let q = self.q;
         let (ie, i_f) = (1.0 / s_e2, 1.0 / s_f2);
         let mut a = vec![0.0; q * q];
@@ -2013,9 +2028,11 @@ impl Spectrum {
 }
 
 impl TwoNoise {
-    /// The spectrum at ratio ρ: one Householder tridiagonalisation of H_ρ and an implicit QL
-    /// iteration that carries Qᵀc along (no eigenvectors are formed).
+    /// The spectrum at ratio ρ: one Householder tridiagonalisation of H_ρ with Qᵀc (faer's
+    /// blocked, threaded reduction: `dense::tridiagonal_qtc`) and an implicit QL iteration that
+    /// carries Qᵀc along (no eigenvectors are formed).
     fn spectrum(&self, rho: f64) -> Result<Spectrum, FitError> {
+        let _prof = crate::prof::span("fit:     spectrum (tridiag+QL, Q'^3)");
         let q = self.q;
         let mut h = vec![0.0; q * q];
         let mut max_diag = 0.0f64;
@@ -2025,10 +2042,8 @@ impl TwoNoise {
             }
             max_diag = max_diag.max(h[i * q + i]);
         }
-        let tri = Tridiagonal::of(&h, q);
         let mut c: Vec<f64> = (0..q).map(|i| self.b_f[i] + rho * self.b_e[i]).collect();
-        tri.apply_qt(&mut c);
-        let (mut d, mut e) = (tri.d.clone(), tri.e.clone());
+        let (mut d, mut e) = crate::dense::tridiagonal_qtc(&h, q, &mut c);
         tridiagonal_ql(&mut d, &mut e, |i, cc, ss| {
             let (x, y) = (c[i], c[i + 1]);
             c[i] = cc * x - ss * y;
@@ -2038,9 +2053,10 @@ impl TwoNoise {
         Ok(Spectrum { rho, h: d, c, mu_floor: 4.0 * q.max(1) as f64 * f64::EPSILON * max_diag })
     }
 
-    /// [`TwoNoise::solve`] with the large-basis kernels (the vectorised Cholesky and the
-    /// triangular inverse: ≈ Q′³ flops instead of ≈ 2.3 Q′³), plus tr Σ and tr(Σ G̃_E).
+    /// [`TwoNoise::solve`] with the large-basis kernels (faer's blocked, threaded Cholesky and SPD
+    /// inverse, `dense`: ≈ Q′³ flops instead of ≈ 2.3 Q′³), plus tr Σ and tr(Σ G̃_E).
     fn solve_large(&self, lambda: f64, s_e2: f64, s_f2: f64) -> Result<(Solved, LargeExtra), FitError> {
+        let _prof = crate::prof::span("fit:     solve_large (chol+inverse, Q'^3)");
         let q = self.q;
         let (ie, i_f) = (1.0 / s_e2, 1.0 / s_f2);
         let mut a = vec![0.0; q * q];
@@ -2055,13 +2071,12 @@ impl TwoNoise {
         for i in 0..q {
             a[i * q + i] += lambda_eff;
         }
-        let mut chol = a.clone();
-        cholesky_in_place_fast(&mut chol, q).map_err(|_| FitError::Singular)?;
+        let chol = crate::dense::cholesky_lower(&a, q).map_err(|_| FitError::Singular)?;
         let mut m: Vec<f64> = (0..q).map(|i| self.b_e[i] * ie + self.b_f[i] * i_f).collect();
         cholesky_solve(&chol, q, &mut m);
         let rss_e = residual_ss(&self.g_e, &self.b_e, self.yy_e, q, &m);
         let rss_f = residual_ss(&self.g_f, &self.b_f, self.yy_f, q, &m);
-        let inv = inverse_from_lower_inverse(&lower_inverse_transposed(&chol, q), q);
+        let inv = crate::dense::spd_inverse(&chol, q);
         let tr_sigma_ge = trace_product(&inv, &self.g_e, q);
         let gamma_e = tr_sigma_ge * ie;
         let gamma_f = trace_product(&inv, &self.g_f, q) * i_f;
@@ -2296,6 +2311,7 @@ fn rel_change(a: f64, b: f64) -> f64 {
 /// κ₂(A) by power iteration (largest eigenvalue) and inverse iteration through the Cholesky
 /// factor (smallest), 40 steps each from a fixed start vector.
 fn condition_estimate(a: &[f64], chol: &[f64], q: usize) -> f64 {
+    let _prof = crate::prof::span("fit:     condition_estimate");
     if q == 0 {
         return 1.0;
     }
@@ -3603,7 +3619,7 @@ mod tests {
         let (model, report) = acc.refit(&opts, &provenance(), &refs).unwrap();
         let q = report.q_prime;
         let l = model.sigma_inv_chol.as_ref().unwrap();
-        let sigma = inverse_from_lower_inverse(&lower_inverse_transposed(l, q), q);
+        let sigma = crate::linalg::inverse_from_lower_inverse(&crate::linalg::lower_inverse_transposed(l, q), q);
         let (s, u) = crate::linalg::symmetric_eigen_householder(&sigma, q);
         let mut order: Vec<usize> = (0..q).collect();
         order.sort_by(|&a, &b| s[b].total_cmp(&s[a]));

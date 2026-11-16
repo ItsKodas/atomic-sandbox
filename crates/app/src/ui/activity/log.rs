@@ -206,6 +206,8 @@ pub enum Item {
     Row(usize),
     /// A display eigensolve: an index into `display_rows`.
     Display(usize),
+    /// A pass paused or resumed by the user: an index into `pass_marks`.
+    PassMark(usize),
     /// A new run began between the neighbouring rows: steps restart at 0.
     Divider,
     /// A run of identical rows (same step, origin, rule and outcome; [`collapsible`]): the oldest
@@ -248,8 +250,9 @@ pub fn group_text(rows: &[&sim::TeachEvent]) -> String {
 pub fn items(st: &ActivityState) -> Vec<Item> {
     let teach = st.rows.iter().enumerate().filter(|(_, r)| admits(&st.filter, &r.event) && in_view(st.log_view, &r.event)).map(|(i, r)| (r.at, Item::Row(i)));
     let display = st.display_rows.iter().enumerate().filter(|_| st.filter.orbitals && st.log_view == LogView::All).map(|(i, r)| (r.at, Item::Display(i)));
-    // both are oldest first: a stable sort by time keeps each one's order
-    let mut merged: Vec<(std::time::Duration, Item)> = teach.chain(display).collect();
+    let marks = st.pass_marks.iter().enumerate().filter(|_| st.filter.pass && st.log_view == LogView::All).map(|(i, m)| (m.at, Item::PassMark(i)));
+    // all are oldest first: a stable sort by time keeps each one's order
+    let mut merged: Vec<(std::time::Duration, Item)> = teach.chain(display).chain(marks).collect();
     merged.sort_by_key(|&(at, _)| at);
     let mut v = Vec::new();
     let mut prev: Option<std::time::Duration> = None;
@@ -368,7 +371,7 @@ pub fn show_log(ui: &mut Ui, st: &mut ActivityState, estimated: bool) {
             }
         });
     });
-    if st.rows.is_empty() && st.display_rows.is_empty() {
+    if st.rows.is_empty() && st.display_rows.is_empty() && st.pass_marks.is_empty() {
         theme::note(
             ui,
             if estimated {
@@ -461,6 +464,11 @@ pub fn show_log(ui: &mut Ui, st: &mut ActivityState, estimated: bool) {
                     let id = ui.id().with(("display-row", i));
                     display_row(ui, id, rect, &st.display_rows[i], &widths, &mono, &prop);
                 }
+                Item::PassMark(i) => {
+                    let id = ui.id().with(("pass-mark-row", i));
+                    pass_mark_row(ui, id, rect, &st.pass_marks[i], &widths, &mono, &prop);
+                    crate::ui::probe_rect(&format!("log-pass-mark-{i}"), rect);
+                }
             }
         }
         });
@@ -517,6 +525,45 @@ fn display_row(ui: &mut Ui, id: egui::Id, rect: Rect, r: &DisplayRow, widths: &[
     col(ui, 4, outcome, prop, colour, Some(why.into()));
     col(ui, 5, "—", mono, theme::INK_DIM, None);
     col(ui, 6, &display_solve_cell(d), mono, theme::INK_DIM, Some(format!("{:.0} ms of wall time", d.ms)));
+}
+
+/// A paused or resumed pass's row words: the rule cell and the outcome cell ("paused at sample
+/// 41 of 273", "paused").
+pub fn pass_mark_words(m: &super::PassMark) -> (String, &'static str) {
+    let at = format!("sample {} of {}", (m.done + 1).min(m.total.max(1)), m.total);
+    if m.paused {
+        (format!("paused at {at}"), "paused")
+    } else {
+        (format!("resumed at {at}"), "resumed")
+    }
+}
+
+/// A pass paused or resumed by the user (`ActivityState::pass_marks`): "pass" in the origin
+/// column, the sample it stood at, "paused" / "resumed"; no step, |ΔE| or solve (not a solve).
+fn pass_mark_row(ui: &mut Ui, id: egui::Id, rect: Rect, m: &super::PassMark, widths: &[f32; 7], mono: &FontId, prop: &FontId) {
+    let mut x = rect.left();
+    let mut col = |ui: &mut Ui, k: usize, text: &str, font: &FontId, colour: Color32, hover: Option<&str>| {
+        let cr = Rect::from_min_size(pos2(x, rect.top()), vec2(widths[k], ROW_H));
+        x += widths[k];
+        cell(ui, cr, text, font.clone(), colour);
+        if let Some(h) = hover {
+            ui.interact(cr, id.with(k), Sense::hover()).on_hover_text(h);
+        }
+    };
+    let (what, outcome) = pass_mark_words(m);
+    let why = if m.paused {
+        "the pass card's Pause: the solve in progress was dropped (it is solved again on Resume), nothing more is solved, and the pass's place is kept (and written to disk)"
+    } else {
+        "the pass card's Resume: the pass goes on from its queue"
+    };
+    let (origin, colour) = origin_style(TeachOrigin::Pass);
+    col(ui, 0, &clock(m.at), mono, theme::INK_DIM, None);
+    col(ui, 1, "—", mono, theme::INK_DIM, None);
+    col(ui, 2, origin, prop, colour, None);
+    col(ui, 3, &what, prop, theme::INK, Some(why));
+    col(ui, 4, outcome, prop, AMBER, Some(why));
+    col(ui, 5, "—", mono, theme::INK_DIM, None);
+    col(ui, 6, "—", mono, theme::INK_DIM, None);
 }
 
 fn row(ui: &mut Ui, id: egui::Id, rect: Rect, r: &LogRow, widths: &[f32; 7], mono: &FontId, prop: &FontId) {

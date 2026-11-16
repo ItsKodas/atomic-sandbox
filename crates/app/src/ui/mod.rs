@@ -1586,6 +1586,31 @@ fn probed(name: &str, r: egui::Response) -> egui::Response {
     r
 }
 
+/// Draws `add` (one slider or drag value) under ids of its own — `ui.id()` with `key` — instead of
+/// egui's next auto id. Every slider and drag value goes through it.
+///
+/// egui numbers a ui's widgets in the order they are added, and a child ui's widgets carry the
+/// number the child got in its parent, so a widget that appears or disappears anywhere above a
+/// slider renumbers it. Mid-drag that hands the drag to whichever widget now has the dragged id:
+/// the first change of the LOOK card's brightness turns the look "custom", that label appears above
+/// the sliders, and the drag went on with the amount slider above (user report 2026-11-16). `key`
+/// must be unique among the widgets sharing `ui.id()` (sibling uis share it): the probe name where
+/// there is one. (`ui.push_id` does not help: egui 0.36 salts the child's ids with the parent's
+/// counter too.) In a wrapping row the scope cannot wrap itself: it breaks the row first when its
+/// last width no longer fits, as the row would have.
+fn keyed<R>(ui: &mut egui::Ui, key: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let id = ui.id().with(("keyed", key));
+    let wraps = ui.layout().main_wrap && ui.layout().main_dir == egui::Direction::LeftToRight;
+    if wraps && ui.cursor().min.x > ui.max_rect().min.x + 0.5 && ui.data(|d| d.get_temp::<f32>(id)).is_some_and(|w| w > ui.available_size_before_wrap().x) {
+        ui.end_row();
+    }
+    let r = ui.scope_builder(egui::UiBuilder::new().id(id), add);
+    if wraps {
+        ui.data_mut(|d| d.insert_temp(id, r.response.rect.width()));
+    }
+    r.inner
+}
+
 /// The status line when Relax is pressed during a sampling pass (the driver refuses it too).
 pub const RELAX_REFUSED_SAMPLING: &str = "relax: a sampling pass is running — let it finish (or Cancel it) first";
 

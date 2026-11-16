@@ -446,10 +446,13 @@
 //! densities"). An isolated-atom job runs with the view off (its teacher is reset around it
 //! anyway: that is a new scene for the tracker). So **the tracks restart after an atom or
 //! reference job** (Task 3 review M3): the view's producer is dropped with the view off, and the
-//! next audit or refresh hands out fresh tracks (never a reused id, `crate::orbitals`), so a
-//! selected orbital falls back — "selected orbital no longer exists — showing …" — even though
-//! the same orbital is still there. Rare (one reference per species, mostly early in a session);
-//! Task 7's tab shows that note as it stands. The stepping teacher never gets the request:
+//! next audit or refresh hands out fresh tracks (never a reused id, `crate::orbitals`); a
+//! selected orbital is then found again under its new track by its channel and rank, with no note
+//! (`crate::orbitals`, "The selection fallback"). The unoccupied tracks also restart after every
+//! audit in play that follows a Harris payload (its converged payload carries no unoccupied rows:
+//! `crate::ks`, "Harris display"); a picked unoccupied orbital is left unresolved by that payload,
+//! which the driver does not show, and found again in the next Harris one (user report
+//! 2026-11-16: it used to switch to the HOMO about every 30 s). The stepping teacher never gets the request:
 //! a fallback step carries no orbitals, and a model step has no electrons. So
 //! `orbital_display_now` is `None` here; the caller asks for a display refresh instead
 //! (`request_display`, which is also how "refresh every N s" updates the orbitals). Without an
@@ -533,9 +536,9 @@
 //!   **Once per refit, for the fit that stands** (2026-11-12, `references.md` "Refit cost at
 //!   scale"): the fits inside one refit — the fence votes', the release's, the trust recovery's
 //!   cap retries and quarantine rounds — decide on the training residuals, the force noise and the
-//!   sample floor only, so they leave this pass and the active set (rule 5e) to the fit that
-//!   stands (`fit_store_deferred`, `ensure_trust_passes`; before the held-out guesses are judged,
-//!   which read rule 5e). The verdicts are bit for bit those of a pass after every fit
+//!   sample floor only, so they leave this pass, the active set (rule 5e) and the null space (rule
+//!   5d) to the fit that stands (`fit_store_deferred`, `ensure_trust_passes`; before the held-out
+//!   guesses are judged, which read rules 5d and 5e). The verdicts are bit for bit those of a pass after every fit
 //!   (`a_deferred_refit_leaves_the_eager_refits_state`); only a teach-around round count now
 //!   restarts by the standing fit's class verdict, not by an intermediate fit's that the recovery
 //!   replaced. The samples' leave-one-out runs on `surrogate::threads::worker_threads` threads
@@ -1340,6 +1343,11 @@ pub struct SurrogateKs {
     envelope: Option<Envelope>,
     /// The fit's unspanned directions (rule 5d, `surrogate::novelty`).
     null_space: Option<NullSpace>,
+    /// Inside a refit (`fit_store_deferred`): `null_space` is not yet the current fit's — computed
+    /// once for the fit that stands (`ensure_trust_passes`, or before the accumulator it is built
+    /// from takes new rows), like the class pass and the active set (2026-11-17: an O(Q′³)
+    /// eigendecomposition per intermediate fit, 3.6 s at Q′ 2 460). Nothing reads it meanwhile.
+    null_space_pending: bool,
     /// The extrapolation grade's MaxVol active sets (rule 5e, `surrogate::grade`).
     active_set: Option<ActiveSet>,
     training_residuals: Option<TrainingResiduals>,
@@ -1729,6 +1737,7 @@ impl SurrogateKs {
             report: None,
             envelope: None,
             null_space: None,
+            null_space_pending: false,
             active_set: None,
             training_residuals: None,
             misfit: None,
@@ -2919,6 +2928,7 @@ impl SurrogateKs {
     /// appended samples touch new columns and raise the floor above the count. Without the body-4
     /// block (per scene) the start, which such a basis carries unused.
     pub(super) fn grown_body4_degree(&self, species: &[u8]) -> usize {
+        let _prof = surrogate::prof::span("P3 grown_body4_degree");
         let start = surrogate::BODY4_DEGREE_START;
         let basis = self.fit_basis(species);
         if !basis.body4 {
@@ -2952,6 +2962,7 @@ impl SurrogateKs {
     /// attached (M8a Task 5: the collection's capacity; a per-scene model keeps its basis bit for
     /// bit, `surrogate::descriptor` "Body-4 features").
     pub(super) fn fit_basis(&self, species: &[u8]) -> Basis {
+        let _prof = surrogate::prof::span("P3 fit_basis");
         let mut b = self.default_basis(species);
         if let Some(d) = self.degree_cap.filter(|_| b.body3) {
             b.degree_cap = d;
@@ -3384,6 +3395,7 @@ impl Trainable for SurrogateKs {
             box_affected: self.box_affected(),
             trust_floor: self.trust_floor(),
             unfitted: self.unfitted(),
+            pending: self.pending_samples(),
             recovery: self.recovery_note().map(str::to_string),
             audits_background: self.audits_asynchronous(),
             audit_in_flight: self.audit_in_flight(),

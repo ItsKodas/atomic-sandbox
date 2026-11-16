@@ -1,6 +1,7 @@
 //! Dense f64 linear algebra for the fit: Cholesky factorisation, the triangular solves the ridge
-//! system and the predictive variance need, log-determinant, inverse. Hand-written (CLAUDE.md
-//! rule 2: crates for plumbing only). All matrices are square, row-major (`a[i * n + j]`), and a
+//! system and the predictive variance need, log-determinant, inverse. Hand-written; the
+//! large-basis fit's O(n³) factorisations, inverse and spectra run on faer instead (`dense`,
+//! CLAUDE.md rule 2 as of 2026-11-16: a library where it beats ours). All matrices are square, row-major (`a[i * n + j]`), and a
 //! Cholesky factor L is lower triangular with the strict upper triangle zeroed, so A = L Lᵀ.
 //!
 //! The factorisation is the unpivoted Cholesky–Banachiewicz loop: for j = 0..n,

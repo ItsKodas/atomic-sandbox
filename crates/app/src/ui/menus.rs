@@ -5,7 +5,7 @@
 //! Also the Help windows ("Physics, honestly").
 use super::search;
 use super::workspace::presets::Preset;
-use super::{gravity_au, icons, probe, probed, theme, Action, DockTab, HelpTopic, PanelInput, UiState};
+use super::{gravity_au, icons, keyed, probe, probed, theme, Action, DockTab, HelpTopic, PanelInput, UiState};
 use crate::scene::{model_path, Scene};
 use crate::sim::{Backend, DEFAULT_DT_FS};
 use egui::{Button, Frame, Margin, Popup, PopupCloseBehavior, PopupKind, RichText, Stroke, Ui, Vec2};
@@ -464,7 +464,7 @@ fn scene_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
             ui.label("charge");
             let mut c = scene.charge;
             // at least one electron must remain; anions down to −4
-            if ui.add(egui::DragValue::new(&mut c).range(-4..=(protons - 1).max(0)).speed(0.05)).changed() {
+            if keyed(ui, "charge", |ui| ui.add(egui::DragValue::new(&mut c).range(-4..=(protons - 1).max(0)).speed(0.05))).changed() {
                 acts.push(Action::SetCharge(c));
             }
             ui.end_row();
@@ -473,7 +473,7 @@ fn scene_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
                 let mut auto = scene.multiplicity.is_none();
                 let mut m = scene.multiplicity.unwrap_or(1 + (electrons as u32 % 2));
                 let toggled = ui.checkbox(&mut auto, "auto").changed();
-                let edited = ui.add_enabled(!auto, egui::DragValue::new(&mut m).range(1..=11).speed(0.05)).changed();
+                let edited = keyed(ui, "multiplicity", |ui| ui.add_enabled(!auto, egui::DragValue::new(&mut m).range(1..=11).speed(0.05))).changed();
                 if toggled || edited {
                     acts.push(Action::SetMultiplicity(if auto { None } else { Some(m) }));
                 }
@@ -484,8 +484,7 @@ fn scene_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
                 let mut auto = scene.sigma.is_none();
                 let mut s = scene.sigma.unwrap_or(scene.grid_h);
                 let toggled = ui.checkbox(&mut auto, "auto = h").changed();
-                let edited = ui
-                    .add_enabled(!auto, egui::DragValue::new(&mut s).range(0.05..=1.0).speed(0.005).suffix(" Bohr"))
+                let edited = keyed(ui, "sigma", |ui| ui.add_enabled(!auto, egui::DragValue::new(&mut s).range(0.05..=1.0).speed(0.005).suffix(" Bohr")))
                     .changed();
                 if toggled || edited {
                     acts.push(Action::SetSigma(if auto { None } else { Some(s) }));
@@ -503,16 +502,16 @@ fn scene_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
             ui.label("n");
             // n must be odd: edit k with n = 2k + 1, shown and typed as n
             let mut k = (st.grid_n.max(1) - 1) / 2;
-            ui.add(
+            keyed(ui, "grid-n", |ui| ui.add(
                 egui::DragValue::new(&mut k)
                     .range(8..=(crate::scene::MAX_GRID_N - 1) / 2)
                     .speed(0.1)
                     .custom_formatter(|v, _| format!("{}", 2 * v as usize + 1))
                     .custom_parser(|s| s.trim().parse::<f64>().ok().map(|n| ((n - 1.0) / 2.0).round())),
-            );
+            ));
             st.grid_n = 2 * k + 1;
             ui.label("h");
-            ui.add(egui::DragValue::new(&mut st.grid_h).range(crate::quality::H_MIN..=0.5).speed(0.002).fixed_decimals(3).suffix(" Bohr"));
+            keyed(ui, "grid-h", |ui| ui.add(egui::DragValue::new(&mut st.grid_h).range(crate::quality::H_MIN..=0.5).speed(0.002).fixed_decimals(3).suffix(" Bohr")));
             let pending = st.grid_n != scene.grid_n || st.grid_h != scene.grid_h;
             if probed("apply-grid", ui.add_enabled(pending, Button::new("Apply grid"))).clicked() {
                 acts.push(Action::ApplyGrid);
@@ -583,7 +582,7 @@ fn quality_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts:
         ui.label("custom h");
         let r = probed(
             "quality-custom",
-            ui.add(egui::Slider::new(&mut st.quality_slider, H_MIN..=H_MAX).step_by(0.001).fixed_decimals(3).suffix(" Bohr")),
+            keyed(ui, "quality-custom", |ui| ui.add(egui::Slider::new(&mut st.quality_slider, H_MIN..=H_MAX).step_by(0.001).fixed_decimals(3).suffix(" Bohr"))),
         )
         .on_hover_text("any spacing in 0.08–0.35 Bohr (snapped to 3 decimals); applied when you let go. Smaller is slower and closer to the σ → 0 answer");
         if r.drag_stopped() || (r.changed() && !r.dragged()) {
@@ -637,8 +636,7 @@ fn walls_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &
                 sim::dynamics::WALL_LAYER
             ))
             .changed();
-        let slider = ui
-            .add_enabled(on, egui::Slider::new(&mut half, min..=max.max(min)).suffix(" Bohr").fixed_decimals(2))
+        let slider = keyed(ui, "wall-half", |ui| ui.add_enabled(on, egui::Slider::new(&mut half, min..=max.max(min)).suffix(" Bohr").fixed_decimals(2)))
             .on_hover_text("half-width of the container (the DFT cell is the limit: grow the grid to go further). Shrinking it while playing is a piston: it squeezes the atoms, and its work is booked");
         send |= slider.changed();
     });
@@ -753,7 +751,7 @@ pub fn dt_field(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) -> egui::Resp
             ui.visuals_mut().override_text_color = Some(super::AMBER);
             ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::new(1.0, super::AMBER);
         }
-        ui.add(egui::DragValue::new(&mut dt).range(0.01..=2.0).speed(0.005).fixed_decimals(3).suffix(" fs"))
+        keyed(ui, "dt", |ui| ui.add(egui::DragValue::new(&mut dt).range(0.01..=2.0).speed(0.005).fixed_decimals(3).suffix(" fs")))
     });
     let r = r.inner.on_hover_text(format!(
         "time step; the default {DEFAULT_DT_FS} fs resolves the ~10 fs H–X stretch, above {DT_WARN_FS} fs it is under-resolved. Changing dt restarts the drift history."
@@ -824,15 +822,14 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
             let mut shown = tu.from_k(t);
             let tc = probed(
                 "thermostat-t",
-                ui.add(egui::DragValue::new(&mut shown).range(tu.range(0.0, f64::INFINITY)).speed(1.0).max_decimals(2).suffix(tu.suffix())),
+                keyed(ui, "thermostat-t", |ui| ui.add(egui::DragValue::new(&mut shown).range(tu.range(0.0, f64::INFINITY)).speed(1.0).max_decimals(2).suffix(tu.suffix()))),
             )
             .on_hover_text("target temperature (absolute zero is 0 K = −273.15 °C = −459.67 °F)")
             .changed();
             if tc {
                 t = tu.to_k(shown);
             }
-            let tauc = ui
-                .add(egui::DragValue::new(&mut tau).range(1.0..=1000.0).speed(0.2).prefix("τ ").suffix(" fs"))
+            let tauc = keyed(ui, "thermostat-tau", |ui| ui.add(egui::DragValue::new(&mut tau).range(1.0..=1000.0).speed(0.2).prefix("τ ").suffix(" fs")))
                 .on_hover_text("coupling time: smaller = tighter control, more disturbed dynamics")
                 .changed();
             if toggled || tc || tauc {
@@ -966,7 +963,7 @@ fn drag_controls(ui: &mut Ui, st: &UiState, acts: &mut Vec<Action>) {
             .custom_formatter(|v, _| super::sig3(v))
             .custom_parser(|t| t.trim().parse().ok())
             .suffix(" Ha/Bohr");
-        if probed("drag-pull", ui.add(slider))
+        if probed("drag-pull", keyed(ui, "drag-pull", |ui| ui.add(slider)))
             .on_hover_text(DRAG_TIP)
             .changed()
         {

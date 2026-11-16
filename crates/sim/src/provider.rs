@@ -187,7 +187,12 @@ impl OrbitalViewRequest {
     /// may differ only by the selection fallback: the payload shows another track only when the
     /// requested one is not among its rows. The driver's side-payload precedence and the app's
     /// Harris schedule share it: a payload that does not answer the view shown now neither blocks
-    /// a newer one nor counts as covering its geometry.
+    /// a newer one nor counts as covering its geometry. A payload that names the selected orbital
+    /// but has rows without it answers nothing: the producer left the pick unresolved because the
+    /// update computed no unoccupied orbitals of its channel (`providers::orbitals`, "The
+    /// selection fallback"; a converged audit in play after a Harris payload), so it shows no
+    /// orbital and must not replace one that does. One without any rows (a refused view, no
+    /// electrons) still answers: it says why nothing is shown.
     pub fn answered_by(&self, o: &OrbitalDisplay) -> bool {
         use OrbitalRequest as R;
         if o.unoccupied.as_ref().map_or(0, |u| u.requested) != self.unoccupied {
@@ -196,7 +201,8 @@ impl OrbitalViewRequest {
         match (&self.what, &o.what) {
             (R::List, R::List) | (R::SpinDensity, R::SpinDensity) => true,
             (R::Orbital { spin, track, squared }, R::Orbital { spin: s2, track: t2, squared: q2 }) => {
-                squared == q2 && ((spin, track) == (s2, t2) || !o.rows.iter().any(|r| r.spin == *spin && r.track == *track))
+                let has = o.rows.iter().any(|r| r.spin == *spin && r.track == *track);
+                squared == q2 && if (spin, track) == (s2, t2) { has || o.rows.is_empty() } else { !has }
             }
             (R::AllColoured { physical, look, .. }, R::AllColoured { physical: p2, look: l2, .. }) => physical == p2 && look == l2,
             _ => false,
@@ -1455,6 +1461,10 @@ pub struct TrainableStatus {
     /// `samples` = fit samples + `quarantined` + `superseded` + `forgotten` + `box_excluded` + `held_out` + `lone` + `unfitted`
     /// exactly (M6 Task 11: the panel's "fit vs held" reconciliation).
     pub unfitted: usize,
+    /// Of `unfitted`, the samples in the next fit's codes (no quarantine code: not forgotten, held,
+    /// superseded, box-excluded, a draft, lone atoms or waiting for a reference): the knowledge
+    /// map's "new, waiting for refit" (`knowledge` module doc), what the app's map key watches.
+    pub pending: usize,
     /// What the last refit's trust recovery did.
     pub recovery: Option<String>,
     /// The audits run on a background teacher.

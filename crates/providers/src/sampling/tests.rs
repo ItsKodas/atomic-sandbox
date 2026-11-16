@@ -33,12 +33,17 @@ struct PairMorse {
     /// `usize::MAX` never succeeds.
     atom_failures: usize,
     atom_device: bool,
+    /// The user's Pause pressed during these solves (0-based counts of solves made, `solves`): the
+    /// flag the test's `should_abort` reads is raised mid-solve and the teacher polls it again, as
+    /// the GPU teacher does every SCF iteration — the solve is abandoned (`Cancelled`) and counted
+    /// nowhere.
+    pause_at: Option<(Vec<usize>, Arc<std::sync::atomic::AtomicBool>)>,
 }
 
 impl PairMorse {
     fn h2() -> PairMorse {
         let m = MorseDimer::h2();
-        PairMorse { d: m.d, a: m.a, r_e: m.r_e, e_atom: m.e_atom, seen: Vec::new(), solves: Arc::new(AtomicUsize::new(0)), resets: 0, discontinuities: 0, atom_energy: Vec::new(), confine: None, atom_failures: 0, atom_device: false }
+        PairMorse { d: m.d, a: m.a, r_e: m.r_e, e_atom: m.e_atom, seen: Vec::new(), solves: Arc::new(AtomicUsize::new(0)), resets: 0, discontinuities: 0, atom_energy: Vec::new(), confine: None, atom_failures: 0, atom_device: false, pause_at: None }
     }
 
     /// Whether the scripted box confines this geometry.
@@ -74,6 +79,15 @@ impl ForceProvider for PairMorse {
         }
         if !inside_cell(scene) {
             return Err(ProviderError::Invalid("pair morse: nucleus outside the cell margin".into()));
+        }
+        if let Some((at, flag)) = &mut self.pause_at {
+            if let Some(k) = at.iter().position(|&n| n == self.solves.load(Ordering::SeqCst)) {
+                at.remove(k);
+                flag.store(true, Ordering::SeqCst);
+            }
+            if should_abort() {
+                return Err(ProviderError::Cancelled);
+            }
         }
         self.seen.push(scene.clone());
         self.solves.fetch_add(1, Ordering::SeqCst);
@@ -2491,4 +2505,142 @@ fn pass_events_carry_their_solves_ts() {
     // a solve's event always carries it; an event without a solve never does
     assert!(events.iter().filter(|e| e.scf_steps.is_some()).all(|e| e.ts == Some(4.2e-3)), "{events:?}");
     assert!(events.iter().filter(|e| !e.is_solve()).all(|e| e.ts.is_none()), "{events:?}");
+}
+
+// ---- pausing a pass (user request 2026-11-16; `sim::dynamics`, "Pausing a pass") ----
+
+/// What [`paused_pass`] returns: the samples the pass added (tag, positions, energy), its final
+/// progress, the teacher solves it made, and the driver's notes.
+type PassRun = (Vec<(SampleTag, Vec<[f64; 3]>, f64)>, SamplingProgress, usize, Vec<String>);
+
+/// One pass through a `Dynamics` at one solve per tick, with the user's Pause pressed during the
+/// teacher solves numbered in `pauses` (counted from the pass's start). The worker's part is
+/// played here: the raised flag is its `should_abort` while the Pause is queued (the solve in
+/// flight is abandoned), then `PauseSampling` is applied, `idle` ticks run while paused (each
+/// checked to solve nothing), and `ContinueSampling` goes on.
+fn paused_pass(plan: &SamplingPlan, pauses: &[usize], idle: usize) -> PassRun {
+    use std::sync::atomic::AtomicBool;
+    let flag = Arc::new(AtomicBool::new(false));
+    let teacher = Shared::new(PairMorse::h2());
+    let h = teacher.handle();
+    let solves = h.lock().unwrap().solves.clone();
+    let (p, sh) = driven(surrogate_over(&teacher));
+    let mut d = Dynamics::new(pair(1, 1, 1.45, cell(41)), p, 0.25, 1);
+    let n0 = surrogate_of(&sh).samples();
+    let s0 = solves.load(Ordering::SeqCst);
+    h.lock().unwrap().pause_at = Some((pauses.iter().map(|k| s0 + k).collect(), flag.clone()));
+    d.apply(DynCommand::StartSampling(plan.clone()));
+    let mut ticks = 0;
+    let fin = loop {
+        let raised = flag.clone();
+        let snap = d.tick(0.0, &mut || raised.load(Ordering::SeqCst));
+        let p = snap.sampling.clone().expect("progress");
+        assert!(!p.paused);
+        if p.finished {
+            break p;
+        }
+        if flag.swap(false, Ordering::SeqCst) {
+            // the Pause the flag stood for, applied once the aborted tick has returned
+            let solved = solves.load(Ordering::SeqCst);
+            d.apply(DynCommand::PauseSampling);
+            let snap = d.snapshot();
+            assert_eq!(snap.last_rejection, None);
+            let q = snap.sampling.clone().unwrap();
+            assert!(q.paused && !q.finished && !q.cancelled, "{q:?}");
+            assert_eq!((q.done, q.total), (p.done, p.total), "the abandoned solve is not counted");
+            let note = snap.notes.last().cloned().unwrap_or_default();
+            assert!(note.contains(&format!("sampling pass paused at sample {} of {}", p.done + 1, p.total)), "{note}");
+            // a paused pass is still a pass: the dynamics stay paused
+            d.apply(DynCommand::Play);
+            let rej = d.snapshot().last_rejection.expect("Play is refused while a pass is paused");
+            assert!(rej.contains("paused"), "{rej}");
+            d.apply(DynCommand::StartSampling(plan.clone()));
+            let rej = d.snapshot().last_rejection.expect("one pass at a time, paused or not");
+            assert!(rej.contains("a pass is paused (resume or cancel it first)"), "{rej}");
+            d.apply(DynCommand::LoadModel(tmp("never-read.model")));
+            let rej = d.snapshot().last_rejection.expect("no load while a pass is paused");
+            assert!(rej.contains("cancel the paused sampling pass first"), "{rej}");
+            for _ in 0..idle {
+                let s = d.tick(f64::INFINITY, &mut never());
+                let q = s.sampling.unwrap();
+                assert!(q.paused && q.done == p.done, "{q:?}");
+                assert!(s.paused, "the dynamics stay paused");
+            }
+            assert_eq!(solves.load(Ordering::SeqCst), solved, "no teacher solve while paused");
+            d.apply(DynCommand::PauseSampling);
+            assert_eq!(d.snapshot().last_rejection, None, "a second Pause is a no-op");
+            d.apply(DynCommand::ContinueSampling);
+            let snap = d.snapshot();
+            assert!(!snap.sampling.as_ref().unwrap().paused);
+            assert!(snap.notes.last().is_some_and(|n| n.contains("going on at sample")), "{:?}", snap.notes.last());
+        }
+        ticks += 1;
+        assert!(ticks < 1000);
+    };
+    assert!(h.lock().unwrap().pause_at.as_ref().is_some_and(|(left, _)| left.is_empty()), "every Pause landed in a solve");
+    let added = surrogate_of(&sh).store().expect("samples").samples[n0..].iter().map(|x| (x.tag, x.pos.clone(), x.energy)).collect();
+    let notes = d.snapshot().notes;
+    (added, fin, solves.load(Ordering::SeqCst) - s0, notes)
+}
+
+/// The pass card's Pause (user request 2026-11-16): the solve in flight is abandoned and its job
+/// re-queued, nothing is solved while paused (ticks run, the teacher is never asked), and Resume
+/// goes on from the queue to the same end as an unpaused pass with the same seed: the same total,
+/// every job done once, the same samples in the same order. Each Pause cost the abandoned solve
+/// and nothing else.
+#[test]
+fn a_paused_pass_solves_nothing_and_resumes_to_the_unpaused_samples() {
+    let plan = SamplingPlan { perturbations: 10, hot_burst_steps: 8, scan_points_per_pair: 6, seed: 11, ..SamplingPlan::default() };
+    let (plain, p_plain, n_plain, _) = paused_pass(&plan, &[], 0);
+    // paused in the perturbations, in the scan and in the hot burst
+    let (paused, p_paused, n_paused, notes) = paused_pass(&plan, &[3, 13, 19], 5);
+    println!("unpaused {p_plain:?} ({n_plain} solves); paused 3x {p_paused:?} ({n_paused} solves)");
+    assert!(p_plain.finished && !p_plain.cancelled && p_plain.done == p_plain.total);
+    assert_eq!((p_paused.done, p_paused.total, p_paused.failed, p_paused.skipped), (p_plain.done, p_plain.total, p_plain.failed, p_plain.skipped));
+    assert!(p_paused.finished && !p_paused.cancelled && !p_paused.paused);
+    assert_eq!(n_paused, n_plain, "an abandoned solve is no solve: each job solved once");
+    assert!(!plain.is_empty());
+    assert_eq!(paused.len(), plain.len());
+    assert_eq!(paused, plain, "the same samples, bit for bit, in the same order");
+    assert_eq!(notes.iter().filter(|n| n.contains("sampling pass paused at sample")).count(), 3);
+}
+
+/// Cancel while paused ends the pass as Cancel does (cancelled, the samples so far kept) and
+/// clears the pause; Pause and Resume without a pass are no-ops, not refusals.
+#[test]
+fn cancelling_a_paused_pass_ends_it() {
+    let teacher = Shared::new(PairMorse::h2());
+    let h = teacher.handle();
+    let (p, sh) = driven(surrogate_over(&teacher));
+    let mut d = Dynamics::new(pair(1, 1, 1.45, cell(41)), p, 0.25, 1);
+    d.apply(DynCommand::PauseSampling);
+    d.apply(DynCommand::ContinueSampling);
+    assert_eq!(d.snapshot().last_rejection, None, "no pass: nothing to pause or resume");
+    assert_eq!(d.snapshot().sampling, None);
+    let n0 = surrogate_of(&sh).samples();
+    d.apply(DynCommand::StartSampling(SamplingPlan { perturbations: 10, hot_burst_steps: 0, scan_points_per_pair: 0, seed: 3, ..SamplingPlan::default() }));
+    for _ in 0..4 {
+        d.tick(0.0, &mut never());
+    }
+    d.apply(DynCommand::PauseSampling);
+    let done = d.snapshot().sampling.unwrap().done;
+    let seen = h.lock().unwrap().seen.len();
+    d.tick(f64::INFINITY, &mut never());
+    assert_eq!(h.lock().unwrap().seen.len(), seen);
+    d.apply(DynCommand::CancelSampling);
+    let snap = d.snapshot();
+    let p = snap.sampling.clone().unwrap();
+    assert!(p.cancelled && p.finished && !p.paused, "{p:?}");
+    assert_eq!(p.done, done);
+    assert!(snap.notes.iter().any(|n| n.contains("sampling pass cancelled")), "{:?}", snap.notes);
+    assert!(surrogate_of(&sh).samples() > n0, "the samples so far are kept");
+    // the pause went with the pass: Play is accepted, and a new pass runs at once
+    d.apply(DynCommand::Play);
+    assert_eq!(d.snapshot().last_rejection, None);
+    d.apply(DynCommand::Pause);
+    d.apply(DynCommand::StartSampling(SamplingPlan { perturbations: 2, hot_burst_steps: 0, scan_points_per_pair: 0, seed: 4, ..SamplingPlan::default() }));
+    let s = d.tick(0.0, &mut never());
+    let p = s.sampling.unwrap();
+    // (the cached reference counts at once, then one solve)
+    assert!(!p.paused && p.done >= 1, "{p:?}");
 }

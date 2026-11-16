@@ -35,6 +35,8 @@
 //!   their median wall time (never below what trust needs; M6 Task 9: [`pass_resize`],
 //!   `Trainable::rescale_pass`), or — when even that floor exceeds the target at the scene's cold
 //!   evaluation — nothing and a [`PassOffer`] for the panel's "Start anyway" ([`first_pass`]).
+//!   No automatic pass starts while an interrupted (or paused) pass is on disk in the checkpoint
+//!   folder: it would replace those files; the Model tab offers to resume or discard them.
 //!   While a pass runs, [`ModelStatus::pass_eta_s`] is its time
 //!   left at its measured rate. A refused autoload (another provenance) starts nothing: the
 //!   panel offers to forget it. Playing while no model exists (an offer waiting, a refused
@@ -157,9 +159,12 @@
 //! raises it **only** while a command that makes the running step pointless is queued
 //! ([`Command::aborts`]): Pause, the scene edits (teleport, add, remove, a replaced scene,
 //! charge / multiplicity / grid / σ — those become `ReplaceScene`), the model commands that end or
-//! replace what a sampling solve is for (StartSampling, CancelSampling, ForgetModel, LoadModel,
-//! EnsureModel; not SaveModel, a file write) and Shutdown. A Pause during a pass abandons the
-//! sampling solve in flight; the job stays queued and the pass resumes on the next tick. Drag moves,
+//! replace what a sampling solve is for (StartSampling, CancelSampling, PauseSampling, ForgetModel,
+//! LoadModel, EnsureModel; not SaveModel, a file write) and Shutdown. A Pause during a pass abandons the
+//! sampling solve in flight; the job stays queued and the pass resumes on the next tick. The pass
+//! card's Pause (`PauseSampling`) abandons it the same way and then holds the pass: nothing more is
+//! solved until `ContinueSampling` (the card's Resume), the worker is idle meanwhile ([`has_work`]),
+//! and the pass is checkpointed at the pause (`checkpoint` module doc, "Paused passes"). Drag moves,
 //! the drag pull (the wheel), speed, pins, rewind, thermostat, field, dt and the COM toggle never abort: they only change
 //! the state the next step starts from, and a drag move arrives every frame — aborting on it
 //! would cancel every DFT step while the user drags. The construction of the driver
@@ -571,7 +576,8 @@ impl Inbox {
 /// Whether the driver has something to do without a new command (`Snapshot::working`): playing
 /// (with nuclei to move: an empty scene that plays has nothing to tick — module doc, "The empty
 /// scene"), queued steps, a stale-force evaluation, a relax running (its FIRE steps advance one tick at a
-/// time like play's; M6 Task 8, found by the `relax_h2` replay), or a sampling pass in progress.
+/// time like play's; M6 Task 8, found by the `relax_h2` replay), or a sampling pass in progress
+/// that is not paused (a paused pass solves nothing: the worker sleeps until a command).
 /// A stale evaluation that failed is not retried until Play, Step or an edit (they clear
 /// `last_error`). A bond
 /// reference solving off the stepping path is **not** work (M6 Task 3 fix round 2): it is
@@ -582,7 +588,7 @@ fn has_work(s: &DynSnapshot) -> bool {
         || s.pending_steps > 0
         || (s.forces_stale && s.last_error.is_none())
         || s.relax.as_ref().is_some_and(|r| r.converged.is_none())
-        || sampling_active(s)
+        || (sampling_active(s) && !pass_paused(s))
 }
 
 /// The shortest wall time between two side densities partitioned into charges
@@ -670,6 +676,8 @@ struct Worker {
     /// The running pass: when its current timing segment started, its `done` count then, and
     /// whether that segment is the reference stage (timed apart: `track_cost`).
     pass_clock: Option<(Instant, usize, bool)>,
+    /// When the running pass was paused (`track_cost`: the paused time is left out of its rate).
+    pass_pause: Option<Instant>,
     /// The pass's remaining time (s), from its measured rate.
     pass_eta_s: Option<f64>,
     pass_offer: Option<PassOffer>,
@@ -893,6 +901,7 @@ fn worker(
         solve_s: None,
         solve_s_measured: false,
         pass_clock: None,
+        pass_pause: None,
         pass_eta_s: None,
         pass_offer: None,
         sizing: None,
@@ -1006,11 +1015,16 @@ impl Worker {
         // a background refit in flight is work: the view shows it until the new model stands
         self.set_busy(will_work || self.refit_started.is_some());
         let t0 = Instant::now();
-        let mut snap = self
-            .dy
-            .tick(TICK_BUDGET_MS, &mut || inbox.abort_pending());
+        // whether a queued command cut the tick short (a Pause, PauseSampling, an edit …)
+        let mut aborted = false;
+        let mut snap = self.dy.tick(TICK_BUDGET_MS, &mut || {
+            let a = inbox.abort_pending();
+            aborted |= a;
+            a
+        });
         let tick_s = t0.elapsed().as_secs_f64();
-        self.size_pass(&mut snap, done_before, tick_s, pass_only);
+        // a tick cut short by an abort times an abandoned solve too: it does not size the pass
+        self.size_pass(&mut snap, done_before, tick_s, pass_only && !aborted);
         // pacing (module doc): a playing tick that ran all its steps early waits out the budget.
         // The deadlines follow a fixed 16 ms schedule rather than "start + 16 ms": a sleep that
         // overshoots (Windows timers tick at ~15.6 ms) is made up by not waiting next time, so the
