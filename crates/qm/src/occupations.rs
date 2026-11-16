@@ -121,7 +121,7 @@
 //!   n_w ≥ n_σ + 2. The gap arm and the lower bound stay. The tail cannot change a converged answer (review M2): a
 //!   solve converges only on a tight step (step tol = eig tol), which runs the full 36 kT window, so a level that
 //!   crosses into the window can never be missed at convergence; a descending level enters on a transient step once
-//!   its f exceeds c·Δρ, at the cost of one growth. The [6, 36] clamp binds only for Δρ_prev ≳ 0.4·n_w (the floor) or
+//!   its f exceeds c·Δρ, at the cost of one growth. The [6, 36] clamp binds only for Δρ_prev ≳ n_w/(c·e⁶) ≈ 2.5·n_w (the floor) or
 //!   tiny Δρ_prev (36 kT). A step whose window widened and grew the block resets the DIIS history (the map changed, like
 //!   an unfreeze; by the bound above the change is ≤ c·Δρ — measured, removing the reset changed neither gate case).
 //! - **No loose stop** (plan 2026-11-13 Task 9c (d), measured and not adopted). The bound above holds per column,

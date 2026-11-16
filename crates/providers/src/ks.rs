@@ -392,6 +392,17 @@ pub fn witness_cap_for(scene: &Scene, budget: u64) -> usize {
     (WITNESS_GROWTH_COUNTED + 1..=qm::scf::MAX_WITNESS_GROWTH).take_while(|&w| fits(w)).last().unwrap_or(WITNESS_GROWTH_COUNTED)
 }
 
+/// The device-limit refusal of an n³ solve (`GpuKs::check_vram`), or `None` when it fits: its largest single storage
+/// binding — one padded field, or the Poisson boundary table (`qm_gpu::poisson::ghost_table_bytes_for`, 4704·n² B, the
+/// larger from n ≈ 169 at wgpu's default 128 MiB; task 9d review m5) — against the device's binding and buffer limits.
+pub fn binding_refusal(n: usize, max_binding: u64, max_buffer: u64) -> Option<String> {
+    let limit = max_binding.min(max_buffer);
+    let (field, table) = (field_bytes(n), qm_gpu::poisson::ghost_table_bytes_for(n));
+    let (what, bytes) = if table > field { ("its Poisson boundary table", table) } else { ("one field", field) };
+    (bytes > limit).then(|| format!("{n}³: {what} is {:.0} MB, over this GPU's {:.0} MB buffer limit: choose a coarser quality (Scene ▸ Quality)",
+                                    bytes as f64 / 1e6, limit as f64 / 1e6))
+}
+
 /// [`gpu_footprint_bytes`] from the counts: n³ grid, N electrons, k_max = max(n↑, n↓).
 pub fn solve_footprint_bytes(n: usize, n_el: u64, k_max: u64) -> u64 {
     let fields = 2 * n_el + 5 + 8 + 24 + 60 + (8 * k_max + 2) + 4;
@@ -1219,15 +1230,8 @@ impl GpuKs {
     /// (`witness_cap_for`; `MAX_WITNESS_GROWTH` without a budget) for `apply_witness_cap`.
     fn check_vram(&mut self, scene: &Scene) -> Result<(), ProviderError> {
         let limits = self.ctx.device.limits();
-        let field = field_bytes(scene.cell.n);
-        let max_field = (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size);
-        if field > max_field {
-            return Err(ProviderError::Invalid(format!(
-                "one {}³ field is {:.0} MB, over this GPU's {:.0} MB buffer limit: choose a coarser quality (Scene ▸ Quality)",
-                scene.cell.n,
-                field as f64 / 1e6,
-                max_field as f64 / 1e6
-            )));
+        if let Some(m) = binding_refusal(scene.cell.n, limits.max_storage_buffer_binding_size as u64, limits.max_buffer_size) {
+            return Err(ProviderError::Invalid(m));
         }
         if let Some(budget) = self.vram_budget {
             let need = gpu_footprint_bytes(scene);
@@ -3609,6 +3613,19 @@ pub(crate) mod tests {
         }
     }
 
+    /// Task 9d review m5: the device-limit check counts the Poisson boundary table, the largest binding from n ≈ 169:
+    /// at wgpu's default 128 MiB binding a 177³ solve is refused naming the table (147 MB), 161³ (122 MB) passes, and at
+    /// this project's adapter limit (2 GiB − 4 B) the largest grid (201³, 190 MB) passes.
+    #[test]
+    fn the_binding_check_counts_the_poisson_table() {
+        let default = 128u64 << 20;
+        let refused = binding_refusal(177, default, 256 << 20).expect("177³ is over the default binding");
+        assert!(refused.contains("Poisson boundary table") && refused.contains("147 MB"), "{refused}");
+        assert_eq!(binding_refusal(161, default, 256 << 20), None);
+        assert_eq!(binding_refusal(201, (2u64 << 30) - 4, 2 << 30), None);
+        assert_eq!(qm_gpu::poisson::ghost_table_bytes_for(177), 4704 * 177 * 177);
+    }
+
     /// Plan 2026-11-13 Task 9b ruling: the witness cap is min(32, what fits). `witness_cap_for` raises it from the counted
     /// start (`WITNESS_GROWTH_COUNTED`) only as far as the solve at the cap plus the largest orbital view and Harris
     /// display fit the budget, so every display guard passes at any request whenever the cap is above the count; it never
@@ -3990,9 +4007,9 @@ pub(crate) mod tests {
         let r = s.solve(&system, &settings, false).map(|(_, st)| st);
         let wall = t.elapsed().as_secs_f64();
         let p = s.profile().clone();
-        println!("H₂O 97³ × 0.25 all-electron, cold: {:?} after {wall:.1} s; peak block {}, witness growths {}, buffer witnesses {} / growths {}, class raises {}, locked calls {}, frozen steps {}, DIIS resets {}, freeze trims {}, restores {}",
+        println!("H₂O 97³ × 0.25 all-electron, cold: {:?} after {wall:.1} s; peak block {}, witness growths {}, buffer witnesses {} / growths {}, residual growths {}, class raises {}, locked calls {}, frozen steps {}, DIIS resets {}, freeze trims {}, restores {}",
                  r.as_ref().map(|st| (st.iterations, st.energy.total, st.energy.ts, st.max_eigen_residual, st.max_guard_residual)),
-                 p.peak_block, p.witness_growths, p.buffer_witnesses, p.buffer_growths, p.class_raises, p.locked_calls, p.frozen_steps, p.diis_resets, p.diis_freeze_trims, p.eigen_restores);
+                 p.peak_block, p.witness_growths, p.buffer_witnesses, p.buffer_growths, p.witness_residual_growths, p.class_raises, p.locked_calls, p.frozen_steps, p.diis_resets, p.diis_freeze_trims, p.eigen_restores);
         let st = r.unwrap_or_else(|e| panic!("H₂O 97³ × 0.25 cold: {e}"));
         let state = s.state().expect("converged");
         println!("  stored ↑ {} ↓ {} (n {} / {}), ε↑ {:?}", state.orbitals_up.len(), state.orbitals_dn.len(), system.n_up, system.n_dn, state.evals_up);

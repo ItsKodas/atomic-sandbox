@@ -3014,6 +3014,16 @@ fn a_change_over_the_vram_budget_is_refused() {
     if crate::quality::vram_budget().bytes < need {
         assert!(out.commands.is_empty() && out.error.as_deref().is_some_and(|e| e.contains("GPU memory")), "{:?}", out.error);
         assert_eq!((st.grid_n, st.quality_h), before, "nothing changed");
+    } else {
+        // a viewer test reported the card's memory first (test order): the change goes through on the estimated box the
+        // guard passes under that budget (task 9d review m7: the acceptance branch the test had before fix round 2)
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let n = crate::quality::estimated_box(&w8, 14.0, 0.08, &[], fits(crate::quality::vram_budget())).n;
+        assert!(
+            matches!(out.commands.as_slice(), [Command::SetGrid { n: g, h }, Command::Dyn(DynCommand::SetWalls(Some(_)))] if *h == 0.08 && *g == n),
+            "{:?}",
+            out.commands
+        );
     }
     // on this card's budget (half of the RX 7900 XTX's 25.76 GB) it goes through, on the estimated solver's own box: the
     // largest grid the guard passes below the wanted 201³

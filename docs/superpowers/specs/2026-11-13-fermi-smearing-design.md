@@ -204,7 +204,8 @@ Here ε_{N_σ,σ} is the N_σ-th lowest level [MUST-1].
     `crates/validate/references.md`; rulings: the SDD ledger.
 - Growth is one vector at a time, re-testing both arms on the re-solved levels. Growing the block re-solves every
   level, so no monotonicity is claimed. The loop is bounded by the cap.
-- The cap stays: `MAX_WITNESS_GROWTH` = 16, with the same error when it is exceeded.
+- The cap stays: `MAX_WITNESS_GROWTH` (16 at this spec's writing; 32 since plan Task 9b, and the solver's cap is
+  min(32, what the VRAM budget fits)), with the same error when it is exceeded.
   - **A new error path** [NOTE-6]. All-electron scenes now grow witnesses. In a large box, or with an unbound LSDA
     HOMO (anions), the density of box states inside 0.1 Ha of ε_{N_σ} can exceed 16. N(E) ∝ L³E^{3/2} gives about 28
     states per 0.1 Ha at L = 20 Bohr near 0.2 Ha.

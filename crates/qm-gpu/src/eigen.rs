@@ -821,9 +821,10 @@ fn lobpcg_core(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuH
         let stop_res = if locked > 0 { lock_res } else if tail.is_some() { split_res } else { max_res };
         if stop_res < 0.5 * best { best = stop_res; best_it = iterations; }
         // (the f32-floor diagnosis reads the scaled split residual, so a `Floor` exit can leave a loose column above its
-        // own tier — the witness test reads that column's true residual, θ − r, so the bound stays honest; holding the
-        // floor diagnosis until the loose tier is met was tried in task 9b fix round 1 and turned those exits into
-        // 200-iteration grinds on box states)
+        // own tier; the witness test reads that column's true residual, θ − r, and the SCF accepts a tested witness on a
+        // tight step only at r ≤ 1.5 g — premise M2, `qm_gpu::scf::Channel::solve_fd`, task 9d review m3 — growing the
+        // block otherwise; holding the floor diagnosis until the loose tier is met was tried in task 9b fix round 1 and
+        // turned those exits into 200-iteration grinds on box states)
         if let Some(stop) = classify(stop_res, tol, iterations, max_iter, best_it, floor, guess_tol) {
             stats = EigenStats { iterations, max_residual: max_res, stop, readbacks, dispatches: b.dispatches() + gram_dispatches, fallbacks, alpha_worst, split_residual,
                                  head_kept: iterations == 0 || locked > 0, restores, restores_exhausted };

@@ -5337,6 +5337,13 @@ the free-atom H), the water point's count.
   there). No trust rule changed — the teacher's path did. `h3plus_tier` passes (975 teacher solves, 6.8 steps each).
 - *Gates.* qm 253, qm-gpu 146, providers 461 (with the water re-pin), app `worker:: ui::` 471, gpu_vs_cpu 12
   (timing_table H₂O 97³ cold 10.1 s / 12 steps, warm 13 steps).
+- *Fix round 3 (task-9d-review.md, 8 minors).* The stall trigger reads the Gram (L2) norm the Pulay bound holds in
+  (‖r_k‖² > (1 − α)²·‖r_{k−1}‖²): provider test 9 / 7 / 7 (warm ≤ cold), stretched H₂ 11 / 12; the L1 trigger gave
+  9 / 7 / 7 and 11 / 11 on the same code — both pass, the Gram one is kept (a heuristic either way on the GPU: FD
+  levels, the clamp and the renormalisation bend the constant-map premise; a misfire costs steps, never the answer).
+  A tight step's tested witness decides only at r ≤ 1.5 g, else the block grows by one (LiH's GPU FD pin moves, 8 / 8
+  stored); the Poisson boundary table (4704·n² B) joins the device-limit check (`binding_refusal`: 177³ refused at the
+  default 128 MiB, 161³ passes); the old LOBPCG work is released before the grown one is allocated.
 - *Minors.* M4: the cold guess is per centre (`qm::nuclear::cold_guess`: free atoms at all-electron centres, Z_v blobs
   for pseudised). M6: `SolveProfile::eigen_restores` — 0 in every solve printed (97³ H₂O, the provider test).
 

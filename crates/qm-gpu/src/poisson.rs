@@ -158,9 +158,15 @@ fn classify(t: f64, rec: f64, last: f64) -> Option<Stop> {
     if t >= 4.0 * rec { Some(Stop::Floor) } else if t >= 2.0 * rec && t >= last { Some(Stop::Stagnated) } else { None }
 }
 
+/// The boundary table's size (bytes) on an n³ grid before it is built: 6 faces × `GHOST` layers × n² cells × the
+/// `N_MOMENTS` = 49 multipole terms × 4 B = 4704·n² B (`providers::ks`'s binding check, task 9d review m5).
+pub fn ghost_table_bytes_for(n: usize) -> u64 {
+    (6 * GHOST * n * n * N_MOMENTS * std::mem::size_of::<f32>()) as u64
+}
+
 impl GpuPoisson {
     /// The boundary table's size (bytes): one storage binding of `ghost_fill`, 147 MB at 177³ (the device must offer a
-    /// binding that large; `gpu::GpuContext` asks for the adapter's own limit).
+    /// binding that large; `gpu::GpuContext` asks for the adapter's own limit). Equals [`ghost_table_bytes_for`].
     pub fn ghost_table_bytes(&self) -> u64 { self.ghost_table.size() }
 
     /// Samples R_lm on the grid and tabulates the ghost shell (both f64 → f32), uploads once.
