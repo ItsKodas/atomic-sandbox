@@ -159,6 +159,7 @@ fn solve_small(mut m: Vec<f64>, mut v: Vec<f64>, n: usize) -> Option<Vec<f64>> {
 /// trust pass, O(P · m · Q′²): 4.6 ms per sample at Q′ 1 032 on one thread, `references.md`
 /// "Refit cost at scale").
 pub fn leave_one_out_many(model: &Model, samples: &[&Sample]) -> Vec<Option<SampleLoo>> {
+    let _prof = crate::prof::span("loo: leave_one_out_many");
     let threads = crate::threads::worker_threads();
     if threads == 1 || samples.len() < 2 {
         return samples.iter().map(|s| leave_one_out(model, s)).collect();
@@ -181,6 +182,8 @@ pub fn leave_one_out_many(model: &Model, samples: &[&Sample]) -> Vec<Option<Samp
 /// (a sample that alone determines a direction: its LOO prediction there is undefined).
 pub fn leave_one_out(model: &Model, sample: &Sample) -> Option<SampleLoo> {
     let l = model.sigma_inv_chol.as_ref()?;
+    let _prof_all = crate::prof::span("loo/sample (cpu-s, threads summed): total");
+    let _prof_rows = crate::prof::span("loo/sample (cpu-s):   design_rows + predict (descriptors twice)");
     let (e_row, f_rows) = design_rows(model, &sample.pos, &sample.z).ok()?;
     let q = e_row.len();
     let n = sample.pos.len();
@@ -203,6 +206,8 @@ pub fn leave_one_out(model: &Model, sample: &Sample) -> Option<SampleLoo> {
             e.push(sample.forces[j][a] - pred.forces[j][a]);
         }
     }
+    drop(_prof_rows);
+    let _prof_solve = crate::prof::span("loo/sample (cpu-s):   triangular solves + I-H (Q'^2 per row)");
     let w_e = sample.weight / (model.sigma_e * model.sigma_e);
     let w_f = sample.weight / (model.sigma_f * model.sigma_f);
     let rows: Vec<&[f64]> = std::iter::once(&e_row[..])

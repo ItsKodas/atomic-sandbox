@@ -557,6 +557,7 @@ impl SurrogateKs {
     /// Writes a status record for every collection sample whose quarantine code changed, and
     /// offers a promoted draft guess again (module doc). A failed write is said once.
     pub(super) fn sync_collection_status(&mut self) {
+        let _prof = surrogate::prof::span("P1 sync_collection_status");
         let Some(sh) = self.shared.as_mut() else { return };
         let mut failed: Option<String> = None;
         let mut promoted: Vec<(usize, usize, Option<u32>)> = Vec::new();
@@ -621,6 +622,7 @@ impl SurrogateKs {
 
     /// Writes the audit history (when it grew) and the README of the attached collection.
     pub(super) fn flush_collection(&mut self) {
+        let _prof = surrogate::prof::span("P1 flush_collection");
         let Some(sh) = self.shared.as_mut() else { return };
         if sh.coll.read_only {
             return;

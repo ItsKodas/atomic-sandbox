@@ -206,6 +206,10 @@ impl ActiveSet {
                     return None;
                 }
                 // the span (module doc): X_sᵀX_s, compensated like the fit's Gram
+                crate::prof::count("active set: species blocks", 1);
+                crate::prof::count("active set: features p (summed over species)", p as u64);
+                crate::prof::count("active set: atoms (rows)", xs.len() as u64);
+                let _pg = crate::prof::span("grade: active set Gram (serial, compensated)");
                 let mut g = vec![0.0; p * p];
                 let mut c = vec![0.0; p * p];
                 for x in &xs {
@@ -227,12 +231,16 @@ impl ActiveSet {
                 }
                 let tr: f64 = (0..p).map(|i| g[i * p + i]).sum();
                 let tau = p as f64 * f64::EPSILON * tr;
+                drop(_pg);
+                let _pe = crate::prof::span("grade: active set symmetric_eigen (Jacobi, p^3 x sweeps)");
                 let (ev, v) = symmetric_eigen(&g, p);
+                drop(_pe);
                 let keep: Vec<usize> = (0..p).filter(|&i| ev[i] > tau).collect();
                 let n_null = p - keep.len();
                 let u: Vec<Vec<f64>> = keep.iter().map(|&i| (0..p).map(|k| v[k * p + i]).collect()).collect();
                 let r = u.len();
                 let y: Vec<Vec<f64>> = xs.iter().map(|x| u.iter().map(|ui| ui.iter().zip(x).map(|(a, b)| a * b).sum()).collect()).collect();
+                let _pm = crate::prof::span("grade: active set projection + MaxVol");
                 let (active, a_inv, converged) = maxvol(&y, r, max_swaps);
                 Some(SpeciesActive { u, a_inv, active, null_threshold: if n_null > 0 { n_null as f64 * tau } else { f64::INFINITY }, converged })
             })

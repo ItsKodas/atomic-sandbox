@@ -11335,6 +11335,7 @@ fn a_pass_bringing_a_new_species_into_a_large_store_refits() {
 /// M8a Task 9: the knowledge map's builder (`knowledge.rs`), on this module's fixtures.
 mod knowledge;
 mod refit_cost;
+mod refit_profile;
 mod residual_diag;
 
 /// Rule 0b: lone atoms answered from the isolated-atom references (`lone.rs`).

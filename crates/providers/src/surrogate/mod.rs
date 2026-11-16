@@ -2917,6 +2917,7 @@ impl SurrogateKs {
     /// appended samples touch new columns and raise the floor above the count. Without the body-4
     /// block (per scene) the start, which such a basis carries unused.
     pub(super) fn grown_body4_degree(&self, species: &[u8]) -> usize {
+        let _prof = surrogate::prof::span("P3 grown_body4_degree");
         let start = surrogate::BODY4_DEGREE_START;
         let basis = self.fit_basis(species);
         if !basis.body4 {
@@ -2950,6 +2951,7 @@ impl SurrogateKs {
     /// attached (M8a Task 5: the collection's capacity; a per-scene model keeps its basis bit for
     /// bit, `surrogate::descriptor` "Body-4 features").
     pub(super) fn fit_basis(&self, species: &[u8]) -> Basis {
+        let _prof = surrogate::prof::span("P3 fit_basis");
         let mut b = self.default_basis(species);
         if let Some(d) = self.degree_cap.filter(|_| b.body3) {
             b.degree_cap = d;

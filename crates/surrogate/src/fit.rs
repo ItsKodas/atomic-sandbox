@@ -786,6 +786,7 @@ impl Accumulator {
     /// # Panics
     /// As [`add`](Self::add).
     pub fn add_many(&mut self, samples: &[&Sample], basis: &Basis, ref_energy: &[f64], opts: &FitOptions) -> Result<(), DescribeError> {
+        let _prof = crate::prof::span("fit: Accumulator::add_many");
         if samples.is_empty() {
             return Ok(());
         }
@@ -1075,6 +1076,7 @@ impl Accumulator {
         provenance: &Provenance,
         ref_energy: &[f64],
     ) -> Result<(Model, FitReport), FitError> {
+        let _prof = crate::prof::span("fit:   Accumulator::solve (reference search)");
         let opts = &self.effective_options(opts);
         let (scale, d, problem) = self.prepare(ref_energy, None)?;
         let (hyper, sol) = problem.estimate(opts)?;
@@ -1097,6 +1099,7 @@ impl Accumulator {
     /// The standardisation (from the energy rows, or `frozen` = a warm state's (scale, d)) and the
     /// standardised two-noise problem (module doc). Refuses an empty or non-finite accumulator.
     fn prepare(&self, ref_energy: &[f64], frozen: Option<(&[f64], &[f64])>) -> Result<(Vec<f64>, Vec<f64>, TwoNoise), FitError> {
+        let _prof = crate::prof::span("fit:     prepare (standardise)");
         if self.n_samples == 0 || self.n_scale == 0 {
             return Err(FitError::NoSamples);
         }
@@ -1172,6 +1175,7 @@ impl Accumulator {
         log_evidence: f64,
         condition: f64,
     ) -> Result<(Model, FitReport), FitError> {
+        let _prof = crate::prof::span("fit:     assemble (model)");
         let basis = &self.basis;
         let p = basis.n_features();
         let n_s = basis.n_species();
@@ -1309,6 +1313,7 @@ impl Accumulator {
     /// valid (the same options, the store grown by less than [`WARM_GROWTH`] since the last search,
     /// at most [`WARM_MAX_PENDING`] samples since the last refit), else the spectral search.
     pub fn refit(&mut self, opts: &FitOptions, provenance: &Provenance, ref_energy: &[f64]) -> Result<(Model, FitReport), FitError> {
+        let _prof = crate::prof::span("fit: Accumulator::refit");
         let opts = &self.effective_options(opts);
         if !self.basis.body4 {
             self.warm = None;
@@ -1348,6 +1353,7 @@ impl Accumulator {
     /// reopened collection's first fit equals the session's last search, bit for bit); leaves a
     /// warm state for the next refit.
     fn solve_spectral(&mut self, opts: &FitOptions, provenance: &Provenance, ref_energy: &[f64]) -> Result<(Model, FitReport), FitError> {
+        let _prof = crate::prof::span("fit:   solve_spectral (search)");
         let start = None;
         self.warm = None;
         self.pending.clear();
@@ -1386,6 +1392,7 @@ impl Accumulator {
     /// tr Σ and tr(Σ G̃_E) carried by Woodbury, the mean solved with the updated factor. On any
     /// failure the warm state is dropped (the caller searches).
     fn solve_warm(&mut self, opts: &FitOptions, provenance: &Provenance, ref_energy: &[f64]) -> Result<(Model, FitReport), FitError> {
+        let _prof = crate::prof::span("fit:   solve_warm");
         let mut w = self.warm.take().expect("refit checked the warm state");
         let pending = std::mem::take(&mut self.pending);
         let (_, _, problem) = self.prepare(ref_energy, Some((&w.scale, &w.d)))?;
@@ -1757,6 +1764,7 @@ const NOISE_TOL: f64 = 1e-6;
 
 impl TwoNoise {
     fn solve(&self, lambda: f64, s_e2: f64, s_f2: f64) -> Result<Solved, FitError> {
+        let _prof = crate::prof::span("fit:     TwoNoise::solve (reference chol+inv)");
         let q = self.q;
         let (ie, i_f) = (1.0 / s_e2, 1.0 / s_f2);
         let mut a = vec![0.0; q * q];
@@ -2016,6 +2024,7 @@ impl TwoNoise {
     /// The spectrum at ratio ρ: one Householder tridiagonalisation of H_ρ and an implicit QL
     /// iteration that carries Qᵀc along (no eigenvectors are formed).
     fn spectrum(&self, rho: f64) -> Result<Spectrum, FitError> {
+        let _prof = crate::prof::span("fit:     spectrum (tridiag+QL, Q'^3)");
         let q = self.q;
         let mut h = vec![0.0; q * q];
         let mut max_diag = 0.0f64;
@@ -2041,6 +2050,7 @@ impl TwoNoise {
     /// [`TwoNoise::solve`] with the large-basis kernels (the vectorised Cholesky and the
     /// triangular inverse: ≈ Q′³ flops instead of ≈ 2.3 Q′³), plus tr Σ and tr(Σ G̃_E).
     fn solve_large(&self, lambda: f64, s_e2: f64, s_f2: f64) -> Result<(Solved, LargeExtra), FitError> {
+        let _prof = crate::prof::span("fit:     solve_large (chol+inverse, Q'^3)");
         let q = self.q;
         let (ie, i_f) = (1.0 / s_e2, 1.0 / s_f2);
         let mut a = vec![0.0; q * q];
@@ -2296,6 +2306,7 @@ fn rel_change(a: f64, b: f64) -> f64 {
 /// κ₂(A) by power iteration (largest eigenvalue) and inverse iteration through the Cholesky
 /// factor (smallest), 40 steps each from a fixed start vector.
 fn condition_estimate(a: &[f64], chol: &[f64], q: usize) -> f64 {
+    let _prof = crate::prof::span("fit:     condition_estimate");
     if q == 0 {
         return 1.0;
     }
