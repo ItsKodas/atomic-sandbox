@@ -736,6 +736,20 @@ All of this came from the user's play-testing in one day. They saw the mockup of
 
 **Paused once.** The user suspected their GPU was overheating. Everything was stopped, including a measurement script that kept relaunching itself. Since then GPU work has run one job at a time, in batches of 15 min at most, with cool-downs between them.
 
+### Orbitals while the model plays (Nov 14–16; branch `live-orbitals`, Phase A, 10 tasks)
+
+The user asked why the orbital views went blank in Estimated mode: the model has no electrons. The approved answer (spec Nov 14 01:35) was a **Harris display solve**: place the teacher's own isolated atoms at the current nuclei, build the Kohn–Sham potential of that density once, and diagonalise it. One eigensolve, no SCF, labelled *not self-consistent*, every ε printed with ≈, and never used to teach the model. A second phase (a learned "density experience") waits behind a spike.
+
+**How it went:**
+- 28 commits on the branch, about 7,100 lines added across 51 files; spec to merge about 2.5 days, including one shutdown for GPU overheating.
+- **The speed fix (Task 8b).** At the bigger estimated box (109³) a refresh took 3–4 s, because the eigensolver polished guard levels nobody looks at. The display solve now tests only the displayed levels at the SCF tolerance and the guards at 1e-3 Ha: 1.45–1.6 s. The review then found a ratchet (the block could only grow between calls) and a buffer column that sat untested above the record; both fixed, and the reviewer fuzzed the buffer proof over 77,000 cases.
+- **V-A4, the bonds record (Task 9).** On held-out water, H₂ and H₂ + H frames, the bonds read off the Harris density matched DFT's on every pair near the bond length and on 93 % of stretched ones. Its partial charges for water came out about twice DFT's.
+- **Physics honesty, caught by review.** The docs first said the Harris density "has no charge transfer". V-A4 contradicted that: one solve in the neutral atoms' potential *over*-responds (q_out ≈ 2 q*). The README, references and tooltips were rewritten to say so.
+
+**What the final review caught:** a V-A4 water test that failed once in the full suite. The cause was inside the test process: the other Harris tests held the GPU lock, and the sampler's time limit (5 × the median solve) counted the wait as a failed solve. Fixed with a time-limit floor for that pass, not by loosening the assert. Also: a memory estimate one column short, a race that could start one duplicate solve, and an exhaustive match so the smearing merge must decide what Harris counts as occupied.
+
+**Gate (Nov 16, the branch with main merged in, each suite alone):** units/qm/sim/surrogate 516, providers 428, qm-gpu 136, gpu_vs_cpu 9, `--test surrogate` 7, `--test orbitals` 12, `--test harris` 6 (V-A4 water alone after the fix: 0 failed samples, numbers identical to the record), app 752 (incl. replays), non-test app build clean.
+
 ## Failures and dead ends
 
 These are the places where the first idea was wrong, or an approach was tried and abandoned. They are

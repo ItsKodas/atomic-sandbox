@@ -5172,3 +5172,184 @@ fix must bring it inside one batch, then it must pass). Pre-preview check on the
 a cold H₃⁺ with the pair at 1.6 r₀, tol 1e-6, through `problem` + `effective_gpu_tol` converges in 15 steps at
 49³ × 0.25 (no DIIS reset) and in 16 at 81³ × 0.15 (one reset after a single frozen step at Δρ 6.6e-4), without the
 all-electron case's 0/25-iteration alternation.
+
+## Live orbitals (Harris display; spec 2026-11-14)
+
+`tests/harris.rs` (spec `docs/superpowers/specs/2026-11-14-live-orbitals-design.md` §7, V-A1–V-A3; V-A4, a record for §9 Q2, below). First measured 2026-11-14; **re-measured 2026-11-15 after the Harris LOBPCG change of task 8b** (the stop test reads the displayed levels at the SCF's tol, the guards at τ_c/100, the top level a buffer — `qm_gpu::harris` "Three roles"): the tables below are the 2026-11-15 numbers, with the 2026-11-14 ones where they changed. **Re-run 2026-11-16 after task 8b fix 1** (the block memory keeps the last call's need, not the split it ran with; the record's last vector tested, under a buffer, when it can change the shown rows — `qm_gpu::harris` "The record's edge"; the at-cap note prints the displayed and guard tiers' residuals): every gate passes, the changes are noted where they occur. Release, RX 7900 XTX (Vulkan) / Ryzen 7 9800X3D, BelowNormal, the user's app open (the GPU shared with an idle window), each test its own invocation (`--test harris va1`, `va2`, `va3`) with a 3-minute cool-down between them. All cases: σ = h = 0.15 Bohr (the app's Accurate grid), ionic `Accepted` (the app default: H, N and O pseudised; `DegenerateShells` occupations), SCF tol 1e-6 (the floor-aware GPU tol, `effective_gpu_tol`, stays 1e-6 for N ≤ 8), cold SCF on a fresh `GpuSolver`, then `GpuSolver::harris` on the same solver with a new `HarrisState` (m = 0).
+
+**Geometries** (inline in the test; Bohr): H₂ R = 1.4 on x centred at 0; H₂O O–H 1.809, ∠HOH 104.5° (O at the origin); NH₃ N–H 1.913, ∠HNH 106.7° (N at the origin, C₃ along z); H₂ + H: H₂ as above, H at (3.0, 0, 0) (2.3 and 3.7 from the H₂ atoms), multiplicity auto = doublet (n↑ 2, n↓ 1); H₃⁺ equilateral, side 2.1, charge +1; pseudo-O one O at the origin, multiplicity auto = singlet (n↑ = n↓ = 3, the 2p shell shared, f = 1, ⅔, ⅔, ⅔). Grids: H₂, H₂ + H, H₃⁺ 81³ (12 Bohr); H₂O, NH₃, pseudo-O 97³ (14.4 Bohr).
+
+**The overlap measure.** Per spin channel, over the f > 0 levels, C_ij = h³⟨ψ^H_i|ψ^SCF_j⟩ (f64 Neumaier) and O = ‖C‖_F² / max(n_occ^H, n_occ^SCF) = (1/n)Σ cos²θ_k over the principal angles between the two occupied subspaces. The plan wrote the normaliser as n_σ; that is the same number whenever the f > 0 levels are n_σ whole orbitals (every case below but pseudo-O). Pseudo-O's shared shell has 4 f > 0 levels for n_σ = 3, where 1/n_σ would make the identity read 4/3; max(n_occ) is the strict choice (a count mismatch alone keeps O < 1). The f32 orbitals' normalisation (h³Σψ² = 1 to ≈ 1e-7) is this measure's floor: O can read 1 + 7e-8.
+
+### V-A1 — identity on the converged density (gate: every occupied |Δε| ≤ 1e-5 Ha, |f_H − f_SCF| ≤ 1e-12, O ≥ 1 − 1e-6 per channel) — **passes**
+
+ρ_in = the SCF state's ρ↑/ρ↓; the Harris operator then differs from the SCF's last one by f_Hxc δρ with ‖δρ‖₁ ≤ tol, so |Δε| ~ 1e-6 Ha and 1 − O ~ (δV/gap)² are expected.
+
+| case | grid | SCF steps (Δρ) | max occupied \|Δε\| ↑ / ↓ (Ha) | 1 − O ↑ / ↓ | Harris (cold; LOBPCG iterations ↑ / ↓) |
+|---|---|---|---|---|---|
+| H₂ | 81³ | 10 (4.5e-7) | 8.9e-8 / 9.1e-8 | 8.7e-8 / −2.7e-9 | 0.39 s (190 / 123; was 0.70 s at the cap) |
+| H₂ + H (doublet, n↑ 2, n↓ 1) | 81³ | 15 (3.4e-7) | 4.6e-8 / 4.9e-8 | 7.7e-8 / −9.3e-9 | 0.40 s (132 / 93) |
+| H₂O | 97³ | 17 (7.0e-7) | 1.3e-7 / 1.3e-7 | 1.2e-7 / 8.6e-8 | 1.16 s (108 / 107; was 2.59 s at the cap) |
+| pseudo-O (singlet, shared 2p) | 97³ | 13 (7.7e-7) | 1.7e-7 / 2.8e-7 (task 8b: 2.0e-7 / 2.2e-7) | −1.3e-8 / 4.3e-8 | 0.96 s (111 / 116 in 2 solves per channel: n_occ 4 > n_σ 3; was 4.29 s at the cap) |
+
+Every occupied ε agrees to ≤ 2.8e-7 Ha (gate 1e-5; re-measured 2026-11-16 after task 8b fix 1: H₂, H₂ + H and H₂O unchanged to the digits shown, pseudo-O 2.0e-7 / 2.2e-7 → 1.7e-7 / 2.8e-7, its first solve now starting one vector smaller), with the SCF's f exactly (|Δf| ≤ 1e-12; pseudo-O: 1, ⅔, ⅔, ⅔ in both channels): the potential assembly (V_loc and the KB projectors, V_H of ρ without ρ_pc, ½ρ_pc in each spin's xc input) is the SCF's. **The spin assignment** is pinned by the H₂ + H doublet (added 2026-11-15, review M2): its ↑ levels −0.43558 and −0.21206 Ha and ↓ level −0.40292 Ha differ by the exchange splitting, and each matches its own channel's SCF level to ≤ 4.9e-8 Ha — v_xc,↑ on ↓ would move them by ~0.03 Ha. Total 87 s (2026-11-14: 125 s for three cases), of which ≈ 54 s is generating the H pseudopotential.
+
+**Cold cost note.** Before task 8b every cold Harris solve ended at the 200-iteration LOBPCG cap (max residual 2e-4–7e-2 > tol 1.5e-5), polishing the guard levels; the column that held the cap is always the block's top one (the last column converges at the rate of the gap to the first level outside the block — a near continuum of box states). Now the guards below the top are held to 1e-3 Ha and the top is a buffer: the cold solves above finish in 93–190 iterations, none at the cap. The occupied levels are unchanged (the ε above agree to 2e-7 either way).
+
+### V-A2 — superposed atoms against the SCF (record; gate O ≥ 0.95 per channel on the neutral cases) — **passes**
+
+ρ_in = `providers::superposition` of this program's own isolated-atom profiles (`atom_profile`: the isolated neutral atom on the scene's cell, σ and policy, display on, partial core off, read back and binned by `radial_profile` — the app's Atom-job path), each atom renormalised to its Z_v, the sum rescaled to N. Profiles: pseudo-H 0.99956 e on 81³ (6.0 Bohr reach), 0.99990 e on 97³; pseudo-O 5.99975 e; pseudo-N 4.99983 e. No sanity-bound note fired; on-grid S_A within 0.4 % of Z_v.
+
+| case | grid | n↑ / n↓ | rescale | O ↑ / O ↓ | ∫\|ρ_in − ρ_SCF\|/N | ∫\|ρ_out − ρ_SCF\|/N | gate |
+|---|---|---|---|---|---|---|---|
+| H₂ | 81³ | 1 / 1 | 1 | 0.996858 / 0.996858 | 0.268 | 0.0842 | ≥ 0.95 |
+| H₂O | 97³ | 4 / 4 | 1 | 0.991879 / 0.991879 | 0.136 | 0.127 | ≥ 0.95 |
+| NH₃ | 97³ | 4 / 4 | 1 | 0.987909 / 0.987909 | 0.172 | 0.162 | ≥ 0.95 |
+| H₂ + H (doublet) | 81³ | 2 / 1 | 1 | 0.996170 / 0.998706 | 0.183 | 0.0641 | ≥ 0.95 |
+| H₃⁺ (charge +1) | 81³ | 1 / 1 | 2/3 | 0.998143 / 0.998143 | 0.427 | 0.0662 | recorded only |
+
+ε_H − ε_SCF per occupied level (Ha; ↑ = ↓ for the closed shells):
+
+| case | levels (ascending) |
+|---|---|
+| H₂ | σ_g −0.0993 (ε_H −0.4758, ε_SCF −0.3764) |
+| H₂O | −0.164, −0.143, −0.168, −0.171 (SCF −0.9253, −0.4879, −0.3442, −0.2711) |
+| NH₃ | −0.187, −0.169, −0.169, −0.188 (SCF −0.7735, −0.4167 ×2, −0.2289) |
+| H₂ + H | ↑ −0.101, −0.0265 (SCF −0.4356, −0.2121); ↓ −0.0731 (SCF −0.4029) |
+| H₃⁺ | −0.126 (ε_H −0.9733, ε_SCF −0.8477) |
+
+**The ε gap (rule 7; spec §5.3 as corrected 2026-11-14).** The Harris orbitals are eigenstates of H[ρ_in] = H[ρ_SCF] + f_Hxc δρ + O(δρ²), δρ = ρ_in − ρ_SCF, so the orbitals, their ε and ρ_out differ from the SCF's at **first order** in δρ (δε_i ≈ ⟨ψ_i|V_H[δρ] + f_xc δρ|ψ_i⟩); only the Harris *total energy* (not computed or shown) is second order. Here δρ is large (∫|δρ|/N = 0.14–0.43), and the measured occupied ε are **0.03–0.19 Ha too deep**: every level of every case on the same side, roughly a common shift per molecule (H₂O −0.14 to −0.17, NH₃ −0.17 to −0.19). The sign is the one the first-order term predicts, and two effects push it the same way. For H₂O and NH₃ the deeper levels come **mainly from the missing H → O/N charge transfer**: superposed neutral atoms leave less electron density on O/N (and more on the H's) than the SCF puts there, so V_H[ρ_in] repels less where the occupied orbitals concentrate and every level drops (that is ρ_in's deficit; the one-shot ρ_out overshoots the transfer instead, below and V-A4). For the H systems it is the free atoms' density being more diffuse than the bonded one (no contraction, no bond build-up), which screens the nuclei less. The third H of H₂ + H is **not** a free atom: it sits 2.3 Bohr from the nearer H₂ atom (3.7 from the far one); its level (↑ #1) is off by −0.027 Ha. This is why the app shows every Harris ε, HOMO, LUMO and gap with "≈" and the tooltip (Task 7): a Harris ε is not a DFT ε, and its occupied levels are off by ~0.1–0.2 Ha. **The gaps were not measured**: V-A2 runs at m = 0, so no unoccupied level (LUMO) is compared; the "≈" on the LUMO and the gap rests on the occupied shifts and on the first-order argument, not on a measured gap error. The occupied subspaces are close (O ≥ 0.987; 1 − O is quadratic in the first-order rotation: principal angles of ≈ 0.06–0.11 rad), which is what the display draws. ρ_out improves on ρ_in for the H systems (H₂ 0.268 → 0.084) but barely for H₂O and NH₃ (0.136 → 0.127, 0.172 → 0.162). The potential V[ρ_in] of the superposed neutral atoms has none of a polar molecule's charge transfer, but the orbitals and density solved once in it **over-respond** (V-A4, below: water's Hirshfeld q_O about 2× the SCF's). Linearised about the fixed point, ρ_out − ρ* = (1 − ε_d)(ρ_in − ρ*), with ε_d = 1 − χ₀f_Hxc the dielectric factor of the response (not an eigenvalue). So with q_in ≈ 0 the output charges are q_out ≈ ε_d·q*, and ε_d ≈ 2 for the charge-transfer mode. ρ_out then lands about as far from ρ* as ρ_in, on the other side, which is why it barely improves here (the overshoot that makes SCF mixing with α < 1 necessary). So the shapes and mixing are qualitative, as the labels say. H₃⁺'s rescale (2/3 of three neutral atoms' density) gives the largest ∫|δρ| yet O = 0.998: the rescaled cloud has the right count and roughly the right shape for its one σ orbital. Phase B's experience (spec §5) targets exactly the δρ recorded here.
+
+Total 116 s on 2026-11-15 (150 s on 2026-11-14; ≈ 55–76 s of it H pseudopotential generation; the pseudo-O and pseudo-N tables 13 s and 16 s). Re-measured after task 8b: every O and ∫|ρ − ρ_SCF| above is unchanged to the digits shown (the displayed levels are held to the same tol); the cold Harris solves take 0.30–1.33 s, one at the cap (H₂ ↑, cold, max residual 2.4e-3 — a guard; 2026-11-14 every one, 0.58–3.99 s). Re-verified 2026-11-16 after task 8b fix 1 (review M2: the note now prints the tested tiers' residuals, not the max over all columns, which includes the untested buffer): every O and ∫|ρ − ρ_SCF| unchanged, the same one solve at the cap with "displayed levels' residual 5.2e-6, tol 1.5e-5; guard levels' 2.4e-3, tol 1e-3" — the 2.4e-3 is indeed a guard's; cold solves 0.31–1.33 s.
+
+### V-A3 — warm refresh cost (record; target ≤ 0.3 s warm for H₂ and H₂ + H at 81³)
+
+Through `GpuKs::harris_display` on one teacher (All orbitals coloured, m = 0; the auditor teacher's path): a cold call, then five warm calls with atom 0 moved +0.01 Bohr along x before each, then one warm call after a +0.1 Bohr move (review M7: a playing run's step between two refreshes, or a drag; its own column). Times (s), warm calls: **total** = the payload's `OrbitalKind::Harris::wall_s` (set-up, superposition, solve, payload); **display** = the probe's display-solve record (the Activity row: solve + payload); **superposition** = `providers::superposition` on the same inputs, timed in the test; **solve** = `HarrisSolve::wall` of a replica `GpuSolver::harris` run on the identical input sequence, interleaved call by call (`GpuKs` does not expose its inner solve's time); payload ≈ display − solve.
+
+2026-11-15 (after task 8b; re-run 2026-11-16 after task 8b fix 1 — at m = 0 the layout is unchanged and every LOBPCG iteration count below repeats call for call; the times are within run-to-run noise: warm total medians H₂ 0.123 s, H₂ + H 0.159 s, H₂O 0.478 s, 0.1 Bohr steps 0.151 / 0.200 / 0.589 s, cold 0.70 / 0.70 / 1.56 s, 102 s for the test):
+
+| case | cold total | warm (0.01 Bohr) total min / median | display min / median | superposition | solve min / median (LOBPCG iterations per channel) | payload | 0.1 Bohr step: total (solve; iterations) | target |
+|---|---|---|---|---|---|---|---|---|
+| H₂ 81³ | 0.681 | 0.106 / 0.115 | 0.092 / 0.098 | 0.017 | 0.086 / 0.093 (41–42) | ≲ 0.01 | 0.138 (0.108; 54 / 54) | **met** |
+| H₂ + H 81³ | 0.672 | 0.144 / 0.147 | 0.122 / 0.128 | 0.018 | 0.111 / 0.117 (40–52) | ≲ 0.02 | 0.186 (0.153; 66 / 53) | **met** |
+| H₂O 97³ | 1.518 | 0.451 / 0.460 | 0.425 / 0.427 | 0.034 | 0.406 / 0.409 (48–49) | ≲ 0.03 | 0.585 (0.526; 61 / 61) | not met (recorded): ≈ 1.5× 0.3 s |
+
+2026-11-14 (before; every guard level polished to the SCF tol, cold solves at the cap):
+
+| case | cold total | warm total min / median | display min / median | superposition | solve min / median (LOBPCG iterations per channel) | payload | target |
+|---|---|---|---|---|---|---|---|
+| H₂ 81³ | 0.815 | 0.177 / 0.197 | 0.165 / 0.185 | 0.012 | 0.170 / 0.182 (60–66; the first warm call 105 / 144, 0.35 s) | ≲ 0.03 | **met** |
+| H₂ + H 81³ | 1.026 | 0.238 / 0.263 | 0.223 / 0.248 | 0.016 | 0.222 / 0.237 (59–65; the first warm call at the cap again, 0.73 s) | ≲ 0.03 | **met** |
+| H₂O 97³ | 2.729 | 1.129 / 1.308 | 1.104 / 1.274 | 0.025 | 1.157 / 1.260 (105–128) | ≲ 0.03 | not a target (recorded): ≈ 4× 0.3 s |
+
+The payload (the `OrbitalView` update, the colour texture, the shares) is small: display − solve scatters at the replica's run-to-run noise, ≲ 0.03 s. The solve is the cost. Task 8b removed two costs: the first warm call no longer finishes guard levels a cold call left at the cap (none is left there), and every warm call stops once the displayed levels converge (H₂O 97³: 48–49 iterations per channel instead of 105–128; 2.8× faster). A 0.1 Bohr step costs ≈ 1.2–1.3× a 0.01 Bohr one.
+
+**The live build, m = 4 (task 8b; `qm_gpu::harris::tests::diag_harris_warm_refresh_wall`, H₂ R = 1.4 with superposed free-atom 1s densities, 0.15 Bohr, the solve's own wall, warm after successive +0.1 Bohr moves):** 81³ 1.14–2.12 s (↓ at the cap on the first two moves) → 0.90–0.95 s, none at the cap; 109³ 2.99–4.07 s (the user's 3.6 s; at the cap on the first two) → 1.45–1.59 s, none at the cap (89–102 iterations: the m = 4 displayed box states themselves). Cold 81³ 2.24 → 1.72–1.86 s, 109³ 4.47 → 3.41 s (the cold block still reaches the cap once).
+
+**Task 8b fix 1 (2026-11-16; review I1, I2, M1–M4).** Re-measured with the same diagnostic over eight successive +0.1 Bohr moves (`HARRIS_DIAG_MOVES=8`), the task 8b test binary and the fixed one run back to back: 109³ warm 1.44–1.61 s (8b) vs 1.44–1.63 s (fixed), 81³ 0.72–0.94 s vs 0.76–0.95 s, cold 3.51 vs 3.58 s and 1.74 vs 1.81 s — the same LOBPCG iteration counts call for call (72–102 warm, none at the cap): H₂ at m = 4 never meets the record-edge case (below), so the fix leaves its layout as it was. The fix as first prescribed — one buffer above the record always, so the record's last vector is always tested — was measured first and **not kept**: 109³ warm 2.02–3.06 s, 81³ 1.01–2.22 s, cold 4.7 / 3.0 s with both channels at the cap. One vector more costs 1.4–1.55× per iteration (the Gram readback is ∝ (3k)²), and 7 of the 16 warm moves took 140–186 iterations instead of ≈ 90: traced (`LOBPCG_TRACE`), each is one Rayleigh–Ritz step that replaces the converged σ_g column by a combination of W and P directions with no X component (residual 5 Ha; a known fragility of LOBPCG's raw [X W P] basis, Hetmaniuk & Lehoucq, J. Comput. Phys. 218 (2006) 324), followed by ≈ 90 iterations of re-convergence; the 8b layout showed none in the same 16 moves. The kept fix tests the record's last vector (with a buffer above the record) only when its Ritz value can change the shown rows — the window's last row and the first guard one τ-set (`qm_gpu::harris` "The record's edge", with the proof that otherwise `block_edge`'s result does not depend on it). `harris_record_edge_is_a_tested_guard` (H atom centred in 49³ × 0.25, m = 6: the 3-fold d level on the ↓ record's last three vectors) measures the ↓ record's last vector at residual 3.9e-4 (≤ 1e-3) and hides the triplet whole; before the fix it was the buffer at 5.3e-3.
+
+**What the cadence does with this** (`app::worker::harris`: playing, one solve per max(1 s, the "refresh orbitals every N s" setting, default 2 s, last wall / 0.15)): H₂ (0.12 s → 0.8 s) and H₂ + H (0.15 s → 1.0 s) refresh every 2 s at the default, inside the 15 % budget; H₂O at 97³ (0.46 s → ≈ 3.1 s; before task 8b 1.3 s → ≈ 8.7 s) is stretched to one refresh every ≈ 3 s while playing, so the display solves stay at ≤ 15 % of the wall time (the anti-goal is held by the budget, not by the solve). Paused, each edit gets one solve after the 300 ms debounce, ≈ 0.45–0.6 s later for H₂O. Total 97 s on 2026-11-15 (126 s on 2026-11-14; ≈ 55–76 s H pseudopotential generation).
+
+### V-A4 — bonds from the Harris density vs SCF and bond experience (record only: measurement for spec §9 Q2, not a gate)
+
+**Question (spec §7, §9 Q2).** Between DFT solves the viewer guesses bonds from *experience* (`sim::bond_experience`, moved there unchanged from the app for this measurement). Would reading bonds and partial charges off the Harris ρ_out instead do better? Nothing in the app changes; this records the numbers for the decision. Measured 2026-11-16, release, RX 7900 XTX, each frame set its own invocation with a cool-down between them: `cargo test -p validate --release --test harris va4_harris_bonds_against_scf_and_experience_h2o` (997 s: the sampling pass 528 s, then 468 s), `…_h2_scan` (90 s), `…_h2_plus_h` (75 s).
+
+**Frames** (the plan's, verbatim). (a) H₂O 97³: a sampling pass (`common::surrogate::student`, `sample_and_fit`, 60 perturbations σ 0.15 Bohr, no burst, no scans, seed 0; 60 samples, 0 skipped, 0 failed); its samples in store order, #0–#39 train experience, #40–#59 are held out. (b) H₂ 81³, R = 0.8, 1.0, …, 6.0 Bohr (27 frames). (c) H₂ + H 81³, the third H at d = 6.0, 5.75, …, 2.0 Bohr from H₂'s centre on its axis, H₂ at R = 1.4 (17 frames; the chain is centred in the box, because at d = 6 a third H measured from an H₂ at the origin would sit on the box face). In (b) and (c) even-index frames train and odd-index frames are held out (14 / 13 and 9 / 8). All at h = σ = 0.15, `Accepted` (H and O pseudised), SCF tol 1e-6, multiplicity auto (H₂ + H a doublet).
+
+**How each frame is read.**
+- SCF: `GpuSolver::solve` at the problem `GpuKs` poses, warm from the set's previous frame.
+- Bonds: the driver's detector, `sim::Detector` with its constants unchanged (`RHO_FLOOR`, `DELTA`, `EPS_TRANSVERSE`, `R_MAX`). It runs against the driver's bond references: `sim::solve_atom` on each cell through a display-off `GpuKs` at tol 1e-6, the driver's side solver. H on 81³ is the doublet, −0.477787 Ha; on 97³ the doublet, −0.478097 Ha. O on 97³ is the triplet, −16.104938 Ha. The density is read back and sampled with `sim::bonds::trilinear_blend`, which is the GPU sampler's operator in f64 on the f32 values, in place of the provider's `sample_density`.
+- Training frames: `sim::bond_experience::examples` of the SCF graph go into one fresh `Store` per set, as the viewer records a fresh graph.
+- Held-out frames: the Harris ρ_out (`GpuSolver::harris`, V-A2's ρ_in from superposed isolated-atom profiles, warm `HarrisState` per set, m = 0; 0 of 41 solves at the LOBPCG cap) goes through the same detector and references. Hirshfeld charges (`sim::charges::hirshfeld`, the driver's free atoms and valence counts) are taken of both densities. Once every training example is in, `Store::predict(pair_key(…), R)` is asked for each pair within `R_MAX`.
+
+**Scoring, per held-out pair within `R_MAX`, against the SCF.**
+- **Harris agreement:** bonded / not bonded, the same.
+- **Kind agreement:** `Bond::kind` (Shared / ClosedShell / Indeterminate), counted over the pairs both densities call bonded (n in brackets).
+- **|Δρ_b|, |Δ pile-up|:** ρ̂ (e/Bohr³) and q = ρ/ρ_pro at each detector's own bond point (`PairReport::rho_min`, `enhancement`), for every pair, bonded or not.
+- **|Δq|:** the mean of the pair's two atoms' |q_Harris − q_SCF| (e).
+- **Experience coverage:** the share of pairs it answers at all (≥ `MIN_AGREE` = 3 examples within `MATCH_R` = 0.1 Bohr, all agreeing).
+- **Experience agreement:** with the SCF, where it answers.
+
+Means are f64 Neumaier sums. **Split** (a display split): "near the bond length" means SCF bonded with ρ_b ≥ 0.1 e/Bohr³; "stretched/borderline" is every other pair within `R_MAX`, the non-bonded ones included (water's H–H pairs among them).
+
+**(a) H₂O sampling pass, 97³** (20 held-out frames, 40 training; per-atom |Δq| mean 0.201, max 0.376 e over 60 atoms):
+
+| split | pairs | Harris agreement | kind agreement | mean \|Δρ_b\| | mean \|Δ pile-up\| | mean \|Δq\| | experience coverage | experience agreement |
+|---|---|---|---|---|---|---|---|---|
+| near the bond length | 39 | 100 % (39/39) | 85 % (33/39) | 3.21e-2 | 0.045 | 2.27e-1 | 56 % (22/39) | 100 % (22/22) |
+| stretched/borderline | 21 | 95 % (20/21) | — (0/0) | 6.04e-2 | 0.130 | 1.54e-1 | 95 % (20/21) | 100 % (20/20) |
+| all | 60 | 98 % (59/60) | 85 % (33/39) | 4.20e-2 | 0.075 | 2.01e-1 | 70 % (42/60) | 100 % (42/42) |
+
+**(b) H₂ scan, 81³** (13 held-out frames, R = 1.0, 1.4, …, 5.8; 14 training; per-atom |Δq| mean 1.3e-6, max 5.5e-6: zero by symmetry in both). **Experience coverage 0 % here is by construction** (every held-out R is 0.2 Bohr from a training R, beyond `MATCH_R`); the Harris columns carry this table:
+
+| split | pairs | Harris agreement | kind agreement | mean \|Δρ_b\| | mean \|Δ pile-up\| | mean \|Δq\| | experience coverage | experience agreement |
+|---|---|---|---|---|---|---|---|---|
+| near the bond length | 4 | 100 % (4/4) | 100 % (4/4) | 3.85e-2 | 0.235 | 3.7e-8 | 0 % (0/4) | — (0/0) |
+| stretched/borderline | 9 | 89 % (8/9) | 83 % (5/6) | 1.35e-3 | 0.092 | 1.9e-6 | 0 % (0/9) | — (0/0) |
+| all | 13 | 92 % (12/13) | 90 % (9/10) | 1.28e-2 | 0.136 | 1.3e-6 | 0 % (0/13) | — (0/0) |
+
+**(c) H₂ + H approach, 81³** (8 held-out frames, d = 5.75, 5.25, …, 2.25; 9 training; per-atom |Δq| mean 0.021, max 0.044 e over 24 atoms):
+
+| split | pairs | Harris agreement | kind agreement | mean \|Δρ_b\| | mean \|Δ pile-up\| | mean \|Δq\| | experience coverage | experience agreement |
+|---|---|---|---|---|---|---|---|---|
+| near the bond length | 9 | 100 % (9/9) | 100 % (9/9) | 3.26e-2 | 0.214 | 1.72e-2 | 89 % (8/9) | 100 % (8/8) |
+| stretched/borderline | 15 | 93 % (14/15) | 100 % (1/1) | 2.83e-3 | 0.053 | 2.28e-2 | 0 % (0/15) | — (0/0) |
+| all | 24 | 96 % (23/24) | 100 % (10/10) | 1.40e-2 | 0.113 | 2.07e-2 | 33 % (8/24) | 100 % (8/8) |
+
+**What the numbers say.**
+- **Bonded / not bonded.** Near the bond length the Harris density gives the SCF's verdict on every pair (52 of 52). The three disagreements over all sets (3 of 97 pairs) are of two kinds.
+  - Two are threshold crossings. H₂ at R = 5.0: SCF ρ_b 0.0098, Harris 0.0103, against the floor 0.01. H₂ + H at d = 3.25, the 1–2 contact at 2.55 Bohr: SCF q 1.066, Harris 1.120, against 1 + δ = 1.11.
+  - The third is an SCF-side detector miss (below).
+- **The bias.** Harris ρ_b runs 3–18 % above the SCF's at every H–H chord point of (b) and (c), most at short R: 0.5891 vs 0.4986 at R = 1.0, 0.3223 vs 0.2838 at 1.4, 0.0103 vs 0.0098 at 5.0. The pile-up q runs higher too: 2.102 vs 1.851 at 1.4. At water's O–H points the error is −2 % to +29 % (largest at the short O–H of the most distorted frames).
+  - This is the first-order δρ of V-A2. What ρ_in lacks is the bond build-up itself, and with it the build-up's Hartree repulsion between the nuclei. V[ρ_in] is therefore too attractive there, and the one-shot ρ_out over-accumulates in the bond (the same over-response as the charges, below).
+  - It moves borderline pairs toward "bonded".
+- **Kind.** The kind follows the sign of ∇²ρ_b against its band, and it flips in the same borderline cases:
+  - H₂ R = 4.6: SCF Indeterminate, Harris Shared.
+  - Water's long O–H bonds (R ≥ 2.08, 6 of 39): SCF Shared, Harris Indeterminate. There the Harris pile-up is also lower (q 1.26–1.34 vs 1.38–1.41).
+- **Charges.** The Hirshfeld charges are where the Harris density is poor for a polar molecule. The water oxygen comes out at q_O = −0.56 to −0.68 against the SCF's −0.29 to −0.31: about **twice** the SCF's charge transfer.
+  - V-A2 says ρ_in, the neutral atoms, has too little electron density on O. V[ρ_in] is then too attractive there, and one diagonalisation without mixing overshoots the transfer: the charge-sloshing response that SCF mixing exists to damp. Linearised about the fixed point ρ*, ρ_out − ρ_in = ε_d(ρ* − ρ_in) (ε_d the response's dielectric factor, V-A2 above); with q_in ≈ 0 this gives q_out ≈ ε_d·q*, and the measured ratio says ε_d ≈ 2 for this mode.
+  - **Why q_in ≈ 0 (analytic, not measured).** Hirshfeld's weights are w_A = ρ_A⁰/Σ_B ρ_B⁰, the promolecule's own atoms. For ρ = Σ_B ρ_B⁰ exactly, each atom's share is ∫ρ_A⁰ = its counted charge, so q_A = 0 by construction. ρ_in is that superposition up to three caveats: (i) the Harris profiles (`AtomProfile`, the display path) and the bond references (`solve_atom`) are two solves of the same isolated atom and may differ slightly (shell occupation, binning); (ii) each atom is renormalised to its counted charge on the grid; (iii) the sum is rescaled to the scene's N, a factor s ≠ 1 only for a charged scene (every V-A4 frame is neutral, s = 1.0000 as printed; H₃⁺ would give q_A = Z_A(1 − s) ≠ 0). So the measured q_out ≈ 2 q* is the response of one diagonalisation, not an offset carried in from ρ_in.
+  - For the H systems the charges are small either way (|Δq| ≤ 0.044 e).
+- **Experience.** It answered 50 of 97 held-out pairs and agreed with the SCF on all 50. Its coverage depends only on how densely the training frames sample (R, neighbour counts).
+  - **0 % on the H₂ scan, by construction.** The held-out R lie 0.2 Bohr from the nearest training R, beyond `MATCH_R` = 0.1, and each R was seen once (< `MIN_AGREE` = 3).
+  - **33 % on H₂ + H.** It answers only the H₂ pair, which sits at R = 1.4 in every training frame. The third H's two pairs are unreachable by construction, as in the scan: each held-out d is 0.25 Bohr from a training d, beyond `MATCH_R` = 0.1, and each was seen once.
+  - **70 % on water.** 80 O–H and 40 H–H examples from 40 perturbations. In the "near" split it falls to 56 % for a second reason: one training frame (#16, O–H 1.697 / 1.780 Bohr) recorded an O–H pair as not bonded. That is the SCF-side miss below, and it makes every O–H window it falls in mixed, hence unknown. The unknown near-equilibrium O–H pairs span R = 1.69–1.87, which fits the 1.780 pair (window 1.68–1.88); the other two unknowns, at 1.283 and 2.378, are simply sparse.
+- **The SCF-side miss.** In 2 of the 60 water frames (#16, training; #58, held out: O–H 1.726 Bohr) the SCF graph lacks an O–H bond. The detector's chord minimum lands at s = 1/32, 0.054 Bohr from the pseudised O, below the bond saddle (#58: ρ̂ 0.275 there, q 0.849). The transverse march from it then runs into the O nucleus (`NotATransverseMaximum`). The Harris density of #58 finds the bond normally (s 0.75, ρ_b 0.44). This is a weakness of the existing detector on a pseudised O valence density at h = 0.15, not of Harris. It is recorded here and not investigated (no detector change in this task). It counts as the one "stretched/borderline" disagreement in (a). Water's H–H pairs are `NeighbourRegion` or `NotAccumulated` in both densities, but their chord point can sit at different s in the two (#40: s 0.41 vs 0.84). Their |Δρ_b| then compares different points, which is most of the stretched split's 6.0e-2. More generally, |Δ pile-up| (both splits) and the stretched split's |Δρ_b| include jumps of the bond point and of its route (S ↔ D) between the two densities, quantised at the chord spacing R/32: q is not stationary at p* on Route S, and ρ is not stationary on Route D, so a moved point enters those columns at first order. The near split's |Δρ_b| is a fixed-point density error to first order (on Route S ρ̂ is stationary along the chord at p*, so a moved p* changes it only at second order). No fixed-point diagnostic was run.
+
+**Reading for Q2 (record, not a decision).**
+- **Bond verdicts.** Harris ρ_out reproduces the SCF's bonded / not-bonded verdicts on every pair near the bond length and on 93 % of the rest (42 of 45). It answers every pair in every frame at the cost of one display solve (these runs: 0.13–0.28 s warm at 81³, 0.53–0.68 s at 97³).
+- **Kinds and bond-point numbers.** They carry its first-order bias: 3–18 % in ρ_b at H–H, more pile-up at short range, and the kind flips where ∇²ρ_b is near its band.
+- **Charges.** Its partial charges for a polar molecule are about 2× too large and should not be shown as charges.
+- **Experience.** It agreed with the SCF on all 50 pairs it answered (several of them near-duplicates of training geometries, so this is not a measure of generalisation) but often does not answer: 33–70 % coverage on the water and H₂ + H frames, and 0 % on the H₂ scan as an artefact of a scan sampled more coarsely than the match window.
+
+### V-A4 suite time
+Three processes: H₂O 997 s (the 60-solve sampling pass 528 s at 97³; 60 SCF re-solves at 4–9 s, 20 Harris 0.5–1.0 s, the O reference 28 s), the H₂ scan 90 s, H₂ + H 75 s. The H₂O set exceeds the 15-minute GPU batch on its own: run it alone, with a cool-down after.
+
+**Suite time:** 2026-11-15: V-A1 87 s, V-A2 116 s, V-A3 97 s (2026-11-14: 126 / 150 / 126 s) as three processes (each regenerates the H pseudopotential, ≈ 75–85 s); one `cargo test -p validate --release --test harris` process would generate it once, ≈ 5 min (an estimate from the three runs; measured 2026-11-16 as one process with V-A4 added: 640 s).
+
+### Harris under Fermi–Dirac (the scf-stall ← main merge, 2026-11-16)
+
+The merge of `main` (live orbitals Phase A) into the smearing branch put every scene's occupations — and so the Harris
+display solve's — on `FermiDirac { kt = ELECTRON_KT }`. Ruling: the one-shot occupations are `qm::fermi_dirac` of the
+Harris levels at the same kT per spin at the scene's (n↑, n↓); the block grows to the SCF's witness
+(`qm::witness_reached`) up to `MAX_WITNESS_GROWTH`, and a window still short there is a note ("the occupations are
+approximate"), never an error; the occupied levels are those with f ≥ `PARTIAL_OCCUPATION_MIN`, never the witness
+column (`qm_gpu::harris` "Fermi–Dirac"). `harris_footprint_bytes` counts W = 16 for all-electron scenes too.
+
+qm-gpu tests (release, RX 7900 XTX, 2026-11-16):
+- `harris_fermi_dirac_on_gapped_h2_is_aufbau` (H₂ 33³ × 0.25, FD SCF density, m = 2): FD and `Aufbau` give the same
+  payload — n_occ [1, 1], f = {1, 0, 0, 0, 0} per spin (identical to 1e-12; printed bitwise 1.0 / 0.0), the same ε to
+  the last bit, split (6, 4, 5) in 2 solves per channel each, no note.
+- `harris_fermi_dirac_on_pseudo_o_m3_matches_the_scf` (pseudo-O `All`, 33³ × 0.25, off-site, M = 3; FD SCF 16 steps,
+  stop 1e-5, TS 9.5476e-3 Ha = 3kT s(⅓) to 1e-7): n_occ [4, 4]; ↓ p f = 0.334786, 0.334304, 0.330910 (lattice
+  splitting 8.7e-5 Ha ≪ kT); |Δε| ≤ 1.7e-7 Ha and |Δf| ≤ 3.9e-7 against the SCF's FD f (bound f(1 − f)·2·1e-5/kT =
+  8.9e-4).
+
+V-A1 under FD (`--test harris va1`, 142 s): ε and O gates pass for all four cases (max |Δε| 8.9e-8 / 9.1e-8 H₂,
+4.5e-8 / 3.6e-8 H₂ + H, 1.7e-7 / 9.9e-8 H₂O, 1.2e-7 / 1.7e-7 pseudo-O; 1 − O ≤ 1.03e-7). The gapped cases' f match
+to 1e-12. **Pseudo-O's FD f do not match to `OCC_EPS` = 1e-12**: the singlet's 2p ⅔ levels differ by 5.2e-7–5.8e-6
+(↑ #1–3: 5.2e-7, 2.0e-6, 2.6e-6; ↓ #1–3: 5.8e-6, 9.6e-7, 4.8e-6). OCC_EPS assumed `DegenerateShells`' exact fractions;
+FD's f are continuous in ε with slope f(1 − f)/kT = 44 per Ha, so the measured |Δε| ≤ 1.7e-7 implies |Δf| ≤ 1.5e-5.
+Not re-pinned (a tolerance, not a value): the controller decides. V-A2 (O 0.988–0.999, gate ≥ 0.95) passes unchanged.
+V-A3 (record): warm medians H₂ 0.172 s (was 0.115), H₂ + H 0.402 s (was 0.147), H₂O 0.792 s (was 0.46): the FD witness
+column above the occupied levels and its tested guards cost 1.5–2.7× per refresh; the 0.3 s target is missed by H₂ + H.

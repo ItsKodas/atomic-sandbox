@@ -44,6 +44,8 @@ pub enum JobProgress {
     Steps { step: u32, last: Option<u32> },
     Indeterminate,
     Waiting,
+    /// The share of an estimated total elapsed (0–1; a refit's countdown, `sim::refit_eta`).
+    Estimate(f32),
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +87,11 @@ pub fn scf_lines(l: &sim::ScfLive) -> (String, Option<String>) {
     let tag = (l.stall_left().is_some() && l.since_gain >= STALL_TAG_FROM).then(|| format!("no 2× gain for {} / {}", l.since_gain, l.window));
     (parts.join(" · "), tag)
 }
+
+/// An orbital display solve's job title (live-orbitals spec §4.3; never "DFT fallback").
+pub const HARRIS_JOB_TITLE: &str = "Orbital display solve";
+/// Why it has no control, and what it is (also the solve log's hover).
+pub const HARRIS_JOB_WHY: &str = "display only: one diagonalisation in the potential of the superposed isolated atoms at the current nuclei, for the orbital view of the estimated solver — not self-consistent, no SCF; it never feeds a step, nothing learns from it, no counter counts it, and a newer command or geometry replaces it";
 
 /// The rows for what the worker does now. `probe` is the live solve state (`PanelInput::probe`).
 pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRow> {
@@ -136,8 +143,8 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             count: None,
         });
     }
-    if let Some((s, m)) = probe.and_then(|p| p.display) {
-        v.push(JobRow {
+    match probe.and_then(|p| p.display) {
+        Some((s, sim::DisplayJob::Unoccupied(m))) => v.push(JobRow {
             key: JobKey::Orbitals,
             title: "Computing orbitals".into(),
             detail: format!("{m} unoccupied orbital{} per spin for the Orbitals view, on the last DFT step's converged state · display only", if m == 1 { "" } else { "s" }),
@@ -150,25 +157,45 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             keeps_block: false,
             stage: None,
             count: None,
-        });
+        }),
+        // an orbital display solve (live-orbitals spec §4.3): its own job, never a fallback, an
+        // audit or a teacher solve
+        Some((s, sim::DisplayJob::Harris)) => v.push(JobRow {
+            key: JobKey::Orbitals,
+            title: HARRIS_JOB_TITLE.into(),
+            detail: format!("orbital display solve (not self-consistent) · {s:.1} s"),
+            progress: JobProgress::Indeterminate,
+            elapsed_s: Some(s),
+            eta_s: None,
+            control: None,
+            no_control_why: Some(HARRIS_JOB_WHY),
+            scf: None,
+            keeps_block: false,
+            stage: None,
+            count: None,
+        }),
+        None => {}
     }
     let pending = m.map_or(0, |m| m.user_changes_pending);
-    if let Some((s, n)) = probe.and_then(|p| p.refit) {
+    if let Some(r) = probe.and_then(|p| p.refit) {
         // the user's changes made while it runs: refitted right after it (the worker coalesces them)
         let more = if pending > 0 { format!(" · {pending} more pending after this one") } else { String::new() };
+        let n = super::words::thousands(r.samples as u64);
         v.push(JobRow {
             key: JobKey::Refit,
             title: "Refitting".into(),
-            detail: format!("{n} samples{more}"),
-            progress: JobProgress::Indeterminate,
-            elapsed_s: Some(s),
+            detail: format!("{n} samples · {}{more}", super::words::refit_eta_words(&r, false)),
+            progress: r.eta.fraction().map_or(JobProgress::Indeterminate, |f| JobProgress::Estimate(f as f32)),
+            elapsed_s: Some(r.elapsed_s),
             eta_s: None,
             control: None,
             no_control_why: Some("a refit takes milliseconds to minutes and runs off the step path; Forget and Restore meanwhile apply at once and are refitted right after it"),
             scf: None,
             keeps_block: false,
-            stage: None,
-            count: None,
+            // "Refitting · 2,077 samples · about 2:20 left (from your last 3 refits)"
+            stage: Some(format!("{n} samples · {}{more}", super::words::refit_eta_words(&r, true))),
+            // "fit 4 of 12 · leave-one-out 1 of 5"
+            count: Some(super::words::refit_stage_words(&r)),
         });
     }
     // the user's Forget / Restore waiting for their refit (no refit runs: else the row above says so)
@@ -177,7 +204,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
         v.push(JobRow {
             key: JobKey::PendingRefit,
             title: "Refit pending".into(),
-            detail: crate::ui::dock::model::refit_banner(m, sampling, Instant::now()).unwrap_or_default(),
+            detail: crate::ui::dock::model::refit_banner(m, sampling, Instant::now(), None).unwrap_or_default(),
             progress: JobProgress::Waiting,
             elapsed_s: None,
             eta_s: None,
@@ -624,7 +651,13 @@ fn bar(ui: &mut Ui, r: &JobRow, c: Color32) {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
         }
         JobProgress::Waiting => {}
+        JobProgress::Estimate(f) => {
+            p.rect_filled(egui::Rect::from_x_y_ranges(rect.left()..=at(f), rect.y_range()), 3.0, c);
+            // the countdown moves every second
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        }
     }
+    let resp = if r.key == JobKey::Refit { resp.on_hover_text(super::words::REFIT_ETA_TIP) } else { resp };
     resp.on_hover_text(r.detail.as_str());
 }
 

@@ -24,4 +24,4 @@ pub use occupations::{
     fd_entropy, fermi_dirac, partial_levels, witness_reached, FdOccupations, PartialLevel, ELECTRON_KT, GPU_PARTIAL_TOL, MAX_MU_HALVINGS, MU_BRACKET_KT,
     PARTIAL_OCCUPATION_MIN, WITNESS_GAP, WITNESS_TAIL_KT,
 };
-pub use scf::{extrapolate_sigma, scf, scf_observed, valence_electrons, Energy, KsState, Occupations, ScfProgress, ScfSettings, ScfStats, StallWatch, System, DEGENERACY_TAU, SCF_STALL_WINDOW};
+pub use scf::{extrapolate_sigma, one_shot_occupations, scf, scf_observed, valence_electrons, Energy, KsState, OneShot, Occupations, ScfProgress, ScfSettings, ScfStats, StallWatch, System, DEGENERACY_TAU, SCF_STALL_WINDOW};

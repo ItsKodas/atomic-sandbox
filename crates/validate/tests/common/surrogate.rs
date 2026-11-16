@@ -64,9 +64,22 @@ pub fn sample_and_fit(s: &mut SurrogateKs, sc: &Scene, plan: &SamplingPlan, out:
 /// is returned. The pass's cutoff is the provider's (`SurrogateKs::cutoff`: its basis's, else the
 /// basis a fit would use — a shared collection's reach).
 pub fn sample_and_fit_counted(s: &mut SurrogateKs, sc: &Scene, plan: &SamplingPlan, out: &mut String) -> (FitReport, Duration, SamplingProgress) {
+    sample_and_fit_with_floor(s, sc, plan, None, out)
+}
+
+/// [`sample_and_fit_counted`] with the sampler's time-limit floor (s) set
+/// (`Sampler::with_time_limit_floor`; `None` keeps the sampler's own). `f64::INFINITY` turns the
+/// limit off: a pass whose teacher takes the suite's `GPU` lock per evaluation, while other tests
+/// in the process hold that lock for minutes, would otherwise count a lock wait as a failed solve
+/// (the limit is a viewer-responsiveness device, not part of a measurement; a real SCF stall still
+/// counts as failed).
+pub fn sample_and_fit_with_floor(s: &mut SurrogateKs, sc: &Scene, plan: &SamplingPlan, floor_s: Option<f64>, out: &mut String) -> (FitReport, Duration, SamplingProgress) {
     let t = Instant::now();
     let r_cut = s.cutoff();
     let mut sampler = Sampler::with_cutoff(sc, plan, r_cut).unwrap_or_else(|e| panic!("sampling plan: {e}")).with_body4(s.collection().is_some());
+    if let Some(f) = floor_s {
+        sampler = sampler.with_time_limit_floor(f);
+    }
     while sampler.step_own_teacher(s, &mut never()).unwrap_or_else(|e| panic!("sampling: {e}")).is_some() {}
     let p = sampler.progress();
     let notes = sampler.take_notes();

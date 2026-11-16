@@ -107,7 +107,7 @@ mod tests {
         assert_ne!(probe_token(&probe), stepped, "the solve finished");
         // a display eigensolve starting and ending is work too
         let before = probe_token(&probe);
-        let d = probe.display_solve(4);
+        let d = probe.display_solve(sim::DisplayJob::Unoccupied(4));
         let running = probe_token(&probe);
         assert_ne!(running, before, "a display eigensolve started");
         d.finish(false);

@@ -46,7 +46,7 @@ pub mod version;
 mod workspace;
 
 pub use actions::Action;
-#[cfg(test)]
+/// The Orbitals panel module (its honesty texts and the Harris label are read by the viewer).
 pub use dock::orbitals as orbital_tab;
 pub use theme::apply as apply_theme;
 /// The built-in layouts (Window ▸ Layouts, docking spec D-11), for the screenshot harness's `layout=`.
@@ -714,6 +714,9 @@ pub struct UiState {
     pub dots_blur: f32,
     /// When "Bonds now" was pressed (its button spins until the graph is fresh, at most 20 s).
     pub bonds_refresh: Option<Instant>,
+    /// A Relax or Stop click the worker has not answered yet: the button shows the new state at
+    /// once, with a spinner, until [`RelaxPending::settled`] (display only, never recorded).
+    pub relax_pending: Option<RelaxPending>,
     /// The bond reference's last progress report: (egui time it arrived, its elapsed s) — the
     /// smooth bar fills in from it.
     pub ref_seen: Option<(f64, f64)>,
@@ -767,6 +770,10 @@ pub struct UiState {
     pub bloom_threshold: f32,
     pub cloud_refresh: bool,
     pub cloud_refresh_s: f64,
+    /// The View setting "refresh orbitals every N s" (`Action::OrbitalRefresh`,
+    /// `Command::SetOrbitalRefresh`): the estimated solver's Harris display solves while playing
+    /// (`worker::harris`; default 2 s, the budget may stretch it). Like the cloud's, not persisted.
+    pub orbital_refresh_s: f64,
     /// The surrogate's DFT audit cadence (`FallbackPolicy::default`: 2000, ruling S14's interim;
     /// `Command::SetAudit`).
     pub audit_every: usize,
@@ -1023,6 +1030,7 @@ impl UiState {
             dots_feather: 0.0,
             dots_blur: 0.5,
             bonds_refresh: None,
+            relax_pending: None,
             ref_seen: None,
             trail_fs: crate::trails::LENGTH_DEFAULT_FS,
             trail_opacity: crate::trails::OPACITY_DEFAULT,
@@ -1057,6 +1065,7 @@ impl UiState {
             bloom_threshold: 0.6,
             cloud_refresh: false,
             cloud_refresh_s: 2.0,
+            orbital_refresh_s: 2.0,
             workspace: workspace::Workspace::default(),
             view_sections: dock::view::Sections::default(),
             model_sections: dock::model::Sections::default(),
@@ -1096,6 +1105,13 @@ impl UiState {
             superposition: self.cloud_superposition,
             refresh_s: self.cloud_refresh.then_some(self.cloud_refresh_s),
         }
+    }
+
+    /// "refresh orbitals every N s" as the worker command (`worker::harris`), within the slider's
+    /// 1–10 s (a script's value is clamped likewise).
+    pub fn orbital_refresh_command(&self) -> Command {
+        let s = if self.orbital_refresh_s.is_finite() { self.orbital_refresh_s.clamp(1.0, 10.0) } else { 2.0 };
+        Command::SetOrbitalRefresh(std::time::Duration::from_secs_f64(s))
     }
 
     /// Sets the status line; a repeat of the same text still counts as a new message (toast, log).
@@ -1406,6 +1422,8 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
         st.last_solve = Some((d.scene.cell.n, d.eval.solve_ms as f64 / 1e3));
     }
     keys(root.ctx(), st, &mut acts);
+    // a Relax / Stop click answered by the worker (or given up on) shows the snapshot's state again
+    settle_relax_pending(st, input, Instant::now());
     // the activity headline (the chip, the bar, the Activity tab's hover peek): rebuilt at most every 100 ms
     let reference = st.activity.current_reference();
     st.activity.headline.get(Instant::now(), || activity::headline::display(input, reference));
@@ -1642,19 +1660,122 @@ pub fn rich(text: &str, size: f32, colour: Color32) -> egui::text::LayoutJob {
 /// The tooltip of Stop (the toolbar, Physics ▸ Relax geometry, the relax card).
 pub const STOP_RELAX_TIP: &str = "end the relax now: the nuclei stay where FIRE has brought them, at rest";
 
-/// Relax, or Stop while a relax runs (the toolbar's Time group, Physics ▸ Relax geometry): disabled
-/// during a sampling pass. `probes` names the two buttons for the click tests.
-fn relax_toggle(ui: &mut egui::Ui, input: &PanelInput<'_>, size: egui::Vec2, (relax, stop): (&str, &str), acts: &mut Vec<Action>) {
-    if input.relaxing() {
-        if probed(stop, ui.add(egui::Button::new("Stop").min_size(size))).on_hover_text(STOP_RELAX_TIP).clicked() {
-            acts.push(Action::StopRelax);
+/// How long a Relax / Stop click may wait for the worker before the button shows the snapshot's
+/// state again ([`RelaxPending::settled`]): a safety net, so a spinner never sticks.
+pub const RELAX_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The hover of the disabled Relax while a Stop waits for the worker ([`RelaxButton::Stopping`]).
+pub const RELAX_STOPPING_TIP: &str = "stopping the relax: Relax is back once the worker has ended it";
+
+/// A Relax or Stop click the worker has not answered yet (`UiState::relax_pending`): the button
+/// shows the clicked state at once, with a spinner, instead of waiting for a snapshot to say so.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RelaxPending {
+    /// Stop was clicked (else Relax).
+    pub stop: bool,
+    /// When.
+    pub since: Instant,
+    /// The viewer's count of commands sent once this click's command went out
+    /// (`Viewer::commands_sent`, set by the viewer as it sends it): a snapshot whose `commands`
+    /// reaches it was taken after the worker handled the command. `None` until sent.
+    pub sent: Option<u64>,
+    /// The snapshot showed the other state at the click, so reaching the clicked state proves the
+    /// worker acted. A Stop clicked while its Relax was itself still pending sees "not relaxing"
+    /// already: only the command count (or the timeout) settles that one.
+    pub state_counts: bool,
+}
+
+impl RelaxPending {
+    /// A click on Relax (`stop` false) or Stop; `relaxing`: the snapshot's state at the click.
+    pub fn new(stop: bool, relaxing: bool, now: Instant) -> Self {
+        RelaxPending { stop, since: now, sent: None, state_counts: relaxing == stop }
+    }
+
+    /// The button may show the snapshot's state again, whichever comes first: the snapshot shows
+    /// the clicked state (relaxing after Relax, ended after Stop); the worker has seen the command
+    /// (`seen`: the snapshot's command count) though the relax already ended or was refused (at a
+    /// minimum already, a sampling pass, an empty scene); or [`RELAX_PENDING_TIMEOUT`] has passed.
+    pub fn settled(&self, relaxing: bool, seen: Option<u64>, now: Instant) -> bool {
+        (self.state_counts && relaxing != self.stop)
+            || self.sent.zip(seen).is_some_and(|(k, s)| s >= k)
+            || now.saturating_duration_since(self.since) >= RELAX_PENDING_TIMEOUT
+    }
+}
+
+/// Drops `st.relax_pending` once it has [settled](RelaxPending::settled) against this frame's snapshot.
+fn settle_relax_pending(st: &mut UiState, input: &PanelInput<'_>, now: Instant) {
+    if st.relax_pending.is_some_and(|p| p.settled(input.relaxing(), input.snapshot.map(|s| s.commands), now)) {
+        st.relax_pending = None;
+    }
+}
+
+/// What the Relax / Stop button shows ([`relax_toggle`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelaxButton {
+    /// Relax (disabled during a sampling pass).
+    Relax,
+    /// Stop: a relax runs.
+    Stop,
+    /// Stop with a spinner: Relax was clicked and the worker has not reported the relax yet. Stop
+    /// works meanwhile.
+    Starting,
+    /// Relax with a spinner, disabled: Stop was clicked and the relax has not ended yet, so a
+    /// quick re-click cannot race it.
+    Stopping,
+}
+
+impl RelaxButton {
+    /// The button for the snapshot's state and the click still waiting for the worker, if any.
+    pub fn of(relaxing: bool, pending: Option<&RelaxPending>) -> Self {
+        match pending.map(|p| p.stop) {
+            Some(false) => RelaxButton::Starting,
+            Some(true) => RelaxButton::Stopping,
+            None if relaxing => RelaxButton::Stop,
+            None => RelaxButton::Relax,
         }
-    } else if probed(relax, ui.add_enabled(!input.sampling(), egui::Button::new("Relax").min_size(size)))
-        .on_hover_text(RELAX_TIP)
-        .on_disabled_hover_text(RELAX_REFUSED_SAMPLING)
-        .clicked()
-    {
-        acts.push(Action::Relax);
+    }
+}
+
+/// Relax, or Stop while a relax runs (the toolbar's Time group, Physics ▸ Relax geometry): disabled
+/// during a sampling pass. A click shows its new state at once, a spinner beside the label, until
+/// the worker answers ([`RelaxButton`]; `pending` is `UiState::relax_pending`). `probes` names the
+/// two buttons for the click tests; the spinner is probed as "<relax>-pending".
+fn relax_toggle(ui: &mut egui::Ui, input: &PanelInput<'_>, pending: Option<&RelaxPending>, size: egui::Vec2, (relax, stop): (&str, &str), acts: &mut Vec<Action>) {
+    let spin = egui::Id::new(("relax-pending", relax));
+    let spin_size = egui::Vec2::splat(ui.text_style_height(&egui::TextStyle::Button).clamp(10.0, 14.0));
+    let spinner = |ui: &egui::Ui, r: &egui::AtomLayoutResponse| {
+        if let Some(rect) = r.rect(spin) {
+            egui::Spinner::new().paint_at(ui, rect);
+            probe_rect(&format!("{relax}-pending"), rect);
+        }
+    };
+    match RelaxButton::of(input.relaxing(), pending) {
+        RelaxButton::Stop => {
+            if probed(stop, ui.add(egui::Button::new("Stop").min_size(size))).on_hover_text(STOP_RELAX_TIP).clicked() {
+                acts.push(Action::StopRelax);
+            }
+        }
+        RelaxButton::Starting => {
+            let r = egui::Button::new((egui::Atom::custom(spin, spin_size), "Stop")).min_size(size).atom_ui(ui);
+            spinner(ui, &r);
+            if probed(stop, r.response.clone()).on_hover_text(STOP_RELAX_TIP).clicked() {
+                acts.push(Action::StopRelax);
+            }
+        }
+        RelaxButton::Stopping => {
+            let r = ui.add_enabled_ui(false, |ui| egui::Button::new((egui::Atom::custom(spin, spin_size), "Relax")).min_size(size).atom_ui(ui)).inner;
+            spinner(ui, &r);
+            probed(relax, r.response.clone()).on_disabled_hover_text(RELAX_STOPPING_TIP);
+        }
+        RelaxButton::Relax => {
+            if probed(relax, ui.add_enabled(!input.sampling(), egui::Button::new("Relax").min_size(size)))
+                .on_hover_text(RELAX_TIP)
+                .on_disabled_hover_text(RELAX_REFUSED_SAMPLING)
+                .clicked()
+            {
+                acts.push(Action::Relax);
+            }
+        }
     }
 }
 
@@ -1793,6 +1914,7 @@ pub fn charges_label(d: &sim::DynSnapshot) -> Option<String> {
         sim::ChargeSource::Step => "a DFT step",
         sim::ChargeSource::Side(sim::SideKind::Audit) => "an audit's DFT density",
         sim::ChargeSource::Side(sim::SideKind::Refresh) => "a DFT display refresh",
+        sim::ChargeSource::Side(sim::SideKind::Harris) => unreachable!("a Harris job carries no density"),
     };
     Some(format!("charges from t = {:.2} fs ({from}) — faded until the next DFT density", c.t_fs()))
 }

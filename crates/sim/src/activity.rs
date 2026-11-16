@@ -3,10 +3,13 @@
 //! between the solver threads and the render thread), one [`TeachEvent`] per teaching solve with
 //! the rule that caused it and what happened to the answer, lifetime [`SolveCounts`], the trust
 //! rule's conditions ([`TrustCheck`]), a stuck model's reason ([`StuckInfo`]) and the training
-//! views' data ([`TrainingViews`]), and the display eigensolve of unoccupied orbitals
-//! ([`DisplaySolve`], [`ActivityProbe::display_solve`]: display only, never a teaching solve).
+//! views' data ([`TrainingViews`]), the display solves ([`DisplaySolve`],
+//! [`ActivityProbe::display_solve`]: the eigensolve of unoccupied orbitals, or a Harris display
+//! solve — [`DisplayJob`]; display only, never a teaching solve), and the running refit's stages
+//! with its time estimate from the refit history ([`RefitView`], [`crate::refit_eta`]).
 //! Atomic units (Hartree, Bohr), kelvin, milliseconds. Nothing
 //! here decides anything: the providers fill these from decisions they already made.
+use crate::refit_eta::{self, RefitEstimate, RefitEta, RefitRecord, RefitStage, RefitStages};
 use crate::AuditVerdict;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -132,12 +135,25 @@ pub struct ActivityProbe {
     /// Start of the refit in flight (µs since `origin`), `u64::MAX` when none.
     refit_started_us: AtomicU64,
     refit_samples: AtomicU32,
+    /// The refit in flight's species count and where it runs (`begin_refit`).
+    refit_species: AtomicU32,
+    refit_background: AtomicBool,
+    /// The refit in flight's stages (`refit_stage`): fits and leave-one-out passes started, the
+    /// trust recovery entered, and when the latest stage started (µs since `origin`).
+    refit_fits: AtomicU32,
+    refit_loo: AtomicU32,
+    refit_recovery: AtomicBool,
+    refit_stage_us: AtomicU64,
+    /// The refit history the estimate reads (`set_refit_history`, `record_refit`; oldest first,
+    /// at most `refit_eta::REFIT_HISTORY_CAP`): the attached collection's, else this session's —
+    /// the probe outlives a provider.
+    refit_history: Mutex<Vec<RefitRecord>>,
     /// Refits ended so far (`end_refit`).
     refits: AtomicU64,
-    /// Start of the display eigensolve in flight (µs since `origin`), `u64::MAX` when none, and
-    /// the unoccupied orbitals it solves for (user request 2026-10-19: the Activity tab shows it).
+    /// Start of the display solve in flight (µs since `origin`), `u64::MAX` when none, and its
+    /// job (user request 2026-10-19: the Activity tab shows it; [`DisplayJob::code`]).
     display_started_us: AtomicU64,
-    display_unoccupied: AtomicU32,
+    display_job: AtomicU32,
     /// Display eigensolves ended so far (finished or interrupted).
     display_solves: AtomicU64,
     /// Ended display eigensolves not yet taken by [`ActivityProbe::take_display_solves`]
@@ -149,17 +165,44 @@ pub struct ActivityProbe {
 /// publish, so this only bounds a worker that stopped publishing).
 pub const DISPLAY_SOLVES_KEPT: usize = 256;
 
-/// One display eigensolve (the unoccupied orbitals of the Orbitals view, computed on the
-/// converged state after a DFT step): display only — it never feeds the solve, so it is not a
-/// [`TeachEvent`] and no counter counts it.
+/// What a display solve on the probe's one display slot computes. The two never overlap on one
+/// teacher (both run on that teacher's thread), and only the background auditor's teacher runs
+/// Harris solves (live-orbitals spec §4.2), so one slot serves both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayJob {
+    /// The eigensolve of this many unoccupied orbitals per spin channel on the converged state of
+    /// the last DFT step.
+    Unoccupied(u32),
+    /// A Harris display solve (live-orbitals spec §4): one diagonalisation in the potential of the
+    /// superposed isolated atoms — not self-consistent, not a DFT solve.
+    Harris,
+}
+
+impl DisplayJob {
+    /// The job as one atomic word: `Harris` is `u32::MAX`, `Unoccupied(m)` is m (capped below it).
+    fn code(self) -> u32 {
+        match self {
+            DisplayJob::Unoccupied(m) => m.min(u32::MAX - 1),
+            DisplayJob::Harris => u32::MAX,
+        }
+    }
+
+    fn from_code(c: u32) -> DisplayJob {
+        if c == u32::MAX { DisplayJob::Harris } else { DisplayJob::Unoccupied(c) }
+    }
+}
+
+/// One display solve (the unoccupied orbitals of the Orbitals view, computed on the converged
+/// state after a DFT step, or a Harris display solve): display only — it never feeds the solve, so
+/// it is not a [`TeachEvent`] and no counter counts it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DisplaySolve {
     /// When it ended.
     pub at: Instant,
     /// Wall time (ms).
     pub ms: f64,
-    /// Unoccupied orbitals per spin channel it solved for.
-    pub unoccupied: u32,
+    /// What it computed.
+    pub job: DisplayJob,
     /// A scene edit or Pause (the driver's display interrupt) stopped it before the end.
     pub interrupted: bool,
 }
@@ -170,7 +213,7 @@ pub struct DisplaySolve {
 pub struct DisplayBusy {
     probe: Arc<ActivityProbe>,
     started: Instant,
-    unoccupied: u32,
+    job: DisplayJob,
     done: bool,
 }
 
@@ -185,7 +228,7 @@ impl DisplayBusy {
             return;
         }
         let p = &self.probe;
-        let rec = DisplaySolve { at: Instant::now(), ms: self.started.elapsed().as_secs_f64() * 1e3, unoccupied: self.unoccupied, interrupted };
+        let rec = DisplaySolve { at: Instant::now(), ms: self.started.elapsed().as_secs_f64() * 1e3, job: self.job, interrupted };
         {
             let mut q = p.display_done.lock().unwrap_or_else(|e| e.into_inner());
             if q.len() == DISPLAY_SOLVES_KEPT {
@@ -237,14 +280,33 @@ pub struct SlotView {
 pub struct ProbeView {
     pub main: SlotView,
     pub side: SlotView,
-    /// (seconds since the refit started, samples it fits) while one runs.
-    pub refit: Option<(f64, u32)>,
+    /// The refit running, its stages and time estimate.
+    pub refit: Option<RefitView>,
     /// Refits ended so far (successful or not).
     pub refits: u64,
-    /// (seconds since it started, unoccupied orbitals) while a display eigensolve runs.
-    pub display: Option<(f64, u32)>,
-    /// Display eigensolves ended so far.
+    /// (seconds since it started, its job) while a display solve runs.
+    pub display: Option<(f64, DisplayJob)>,
+    /// Display solves ended so far (both jobs).
     pub display_solves: u64,
+}
+
+/// A running refit (`ProbeView::refit`; [`crate::refit_eta`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RefitView {
+    /// Seconds since it started.
+    pub elapsed_s: f64,
+    /// Samples it fits.
+    pub samples: u32,
+    /// Their species.
+    pub species: u32,
+    /// It runs on its own thread (else in the tick).
+    pub background: bool,
+    /// Its stages so far.
+    pub stages: RefitStages,
+    /// The history's prediction (`None`: no history).
+    pub estimate: Option<RefitEstimate>,
+    /// The time left.
+    pub eta: RefitEta,
 }
 
 impl ActivityProbe {
@@ -255,9 +317,16 @@ impl ActivityProbe {
             side: SolveSlot::default(),
             refit_started_us: AtomicU64::new(u64::MAX),
             refit_samples: AtomicU32::new(0),
+            refit_species: AtomicU32::new(0),
+            refit_background: AtomicBool::new(false),
+            refit_fits: AtomicU32::new(0),
+            refit_loo: AtomicU32::new(0),
+            refit_recovery: AtomicBool::new(false),
+            refit_stage_us: AtomicU64::new(0),
+            refit_history: Mutex::new(Vec::new()),
             refits: AtomicU64::new(0),
             display_started_us: AtomicU64::new(u64::MAX),
-            display_unoccupied: AtomicU32::new(0),
+            display_job: AtomicU32::new(0),
             display_solves: AtomicU64::new(0),
             display_done: Mutex::new(VecDeque::new()),
         })
@@ -339,9 +408,56 @@ impl ActivityProbe {
         self.slot(slot).scf_step.fetch_add(1, Relaxed);
     }
 
-    pub fn begin_refit(&self, samples: usize) {
+    /// A refit of `samples` samples of `species` species starts, on its own thread when
+    /// `background`; its stages start at none.
+    pub fn begin_refit(&self, samples: usize, species: usize, background: bool) {
         self.refit_samples.store(samples.min(u32::MAX as usize) as u32, Relaxed);
-        self.refit_started_us.store(self.now_us(), Relaxed);
+        self.refit_species.store(species.min(u32::MAX as usize) as u32, Relaxed);
+        self.refit_background.store(background, Relaxed);
+        self.refit_fits.store(0, Relaxed);
+        self.refit_loo.store(0, Relaxed);
+        self.refit_recovery.store(false, Relaxed);
+        let now = self.now_us();
+        self.refit_stage_us.store(now, Relaxed);
+        self.refit_started_us.store(now, Relaxed);
+    }
+
+    /// A stage of the running refit starts (`crate::refit_eta`, "The countdown"); ignored when no
+    /// refit runs.
+    pub fn refit_stage(&self, stage: RefitStage) {
+        if self.refit_started_us.load(Relaxed) == u64::MAX {
+            return;
+        }
+        match stage {
+            RefitStage::Fit => {
+                self.refit_fits.fetch_add(1, Relaxed);
+            }
+            RefitStage::LeaveOneOut => {
+                self.refit_loo.fetch_add(1, Relaxed);
+            }
+            RefitStage::Recovery => {
+                self.refit_recovery.store(true, Relaxed);
+                return;
+            }
+        }
+        self.refit_stage_us.store(self.now_us(), Relaxed);
+    }
+
+    /// Replaces the refit history (a collection's file at its attach).
+    pub fn set_refit_history(&self, history: Vec<RefitRecord>) {
+        *self.refit_history.lock().unwrap_or_else(|e| e.into_inner()) = history;
+    }
+
+    /// Appends a finished refit (capped) and returns the history as it now stands (to persist).
+    pub fn record_refit(&self, r: RefitRecord) -> Vec<RefitRecord> {
+        let mut h = self.refit_history.lock().unwrap_or_else(|e| e.into_inner());
+        refit_eta::push(&mut h, r);
+        h.clone()
+    }
+
+    /// The refit history, oldest first.
+    pub fn refit_history(&self) -> Vec<RefitRecord> {
+        self.refit_history.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The refit in flight ended (successfully or not): the phase clears and `refits` counts it.
@@ -350,12 +466,12 @@ impl ActivityProbe {
         self.refits.fetch_add(1, Relaxed);
     }
 
-    /// A display eigensolve of `unoccupied` orbitals starts; it ends with the guard's `finish`.
-    pub fn display_solve(self: &Arc<Self>, unoccupied: usize) -> DisplayBusy {
-        let unoccupied = unoccupied.min(u32::MAX as usize) as u32;
-        self.display_unoccupied.store(unoccupied, Relaxed);
+    /// A display solve of `job` starts; it ends with the guard's `finish`. It is not a solve of
+    /// either slot: `main`/`side` and their counts are untouched.
+    pub fn display_solve(self: &Arc<Self>, job: DisplayJob) -> DisplayBusy {
+        self.display_job.store(job.code(), Relaxed);
         self.display_started_us.store(self.now_us(), Relaxed);
-        DisplayBusy { probe: self.clone(), started: Instant::now(), unoccupied, done: false }
+        DisplayBusy { probe: self.clone(), started: Instant::now(), job: DisplayJob::from_code(job.code()), done: false }
     }
 
     /// The display eigensolves that ended since the last take, oldest first.
@@ -376,14 +492,26 @@ impl ActivityProbe {
             }
         };
         let r = self.refit_started_us.load(Relaxed);
+        let refit = (r != u64::MAX).then(|| {
+            let elapsed_s = now.saturating_sub(r) as f64 * 1e-6;
+            let (samples, species) = (self.refit_samples.load(Relaxed), self.refit_species.load(Relaxed));
+            let stages = RefitStages {
+                fits: self.refit_fits.load(Relaxed),
+                loo: self.refit_loo.load(Relaxed),
+                recovery: self.refit_recovery.load(Relaxed),
+                at_s: self.refit_stage_us.load(Relaxed).saturating_sub(r) as f64 * 1e-6,
+            };
+            let estimate = refit_eta::estimate(&self.refit_history.lock().unwrap_or_else(|e| e.into_inner()), samples, species, stages.recovery);
+            RefitView { elapsed_s, samples, species, background: self.refit_background.load(Relaxed), stages, estimate, eta: refit_eta::eta(elapsed_s, estimate.as_ref(), &stages) }
+        });
         ProbeView {
             main: slot(&self.main),
             side: slot(&self.side),
-            refit: (r != u64::MAX).then(|| (now.saturating_sub(r) as f64 * 1e-6, self.refit_samples.load(Relaxed))),
+            refit,
             refits: self.refits.load(Relaxed),
             display: {
                 let d = self.display_started_us.load(Relaxed);
-                (d != u64::MAX).then(|| (now.saturating_sub(d) as f64 * 1e-6, self.display_unoccupied.load(Relaxed)))
+                (d != u64::MAX).then(|| (now.saturating_sub(d) as f64 * 1e-6, DisplayJob::from_code(self.display_job.load(Relaxed))))
             },
             display_solves: self.display_solves.load(Relaxed),
         }
@@ -940,11 +1068,43 @@ mod tests {
     fn the_refit_phase_is_reported_with_its_sample_count() {
         let p = ActivityProbe::new();
         assert_eq!((p.view().refit, p.view().refits), (None, 0));
-        p.begin_refit(250);
-        assert!(matches!(p.view().refit, Some((t, 250)) if t >= 0.0));
+        p.begin_refit(250, 2, true);
+        let v = p.view().refit.unwrap();
+        assert!(v.elapsed_s >= 0.0 && (v.samples, v.species, v.background) == (250, 2, true));
         assert_eq!(p.view().refits, 0, "counted when it ends");
         p.end_refit();
         assert_eq!((p.view().refit, p.view().refits), (None, 1));
+    }
+
+    /// The stages are published while a refit runs (ignored outside one, restarted by the next),
+    /// and the view's estimate reads the history the probe holds.
+    #[test]
+    fn the_refit_stages_and_estimate_are_published() {
+        use crate::refit_eta::RefitKind;
+        let p = ActivityProbe::new();
+        p.refit_stage(RefitStage::Fit);
+        p.begin_refit(2000, 3, false);
+        let v = p.view().refit.unwrap();
+        assert_eq!((v.stages.fits, v.stages.loo, v.stages.recovery), (0, 0, false), "a stage outside a refit is not counted");
+        assert_eq!((v.estimate, v.eta), (None, RefitEta::Estimating));
+        for s in [RefitStage::Fit, RefitStage::Fit, RefitStage::LeaveOneOut, RefitStage::Recovery, RefitStage::Fit] {
+            p.refit_stage(s);
+        }
+        let v = p.view().refit.unwrap();
+        assert_eq!((v.stages.fits, v.stages.loo, v.stages.recovery), (3, 1, true));
+        assert!(v.stages.at_s >= 0.0 && v.stages.at_s <= v.elapsed_s);
+        p.end_refit();
+        let rec = RefitRecord { at_unix_s: 0, wall_s: 120.0, samples: 1000, species: 3, background: true, kind: RefitKind::Recovery, fits: 8, loo: 3 };
+        assert_eq!(p.record_refit(rec), vec![rec]);
+        assert_eq!(p.refit_history(), vec![rec]);
+        p.begin_refit(2000, 3, true);
+        let v = p.view().refit.unwrap();
+        assert_eq!((v.stages.fits, v.stages.loo, v.stages.recovery), (0, 0, false), "restarted");
+        let e = v.estimate.unwrap();
+        assert_eq!((e.total_s, e.from, e.fits, e.loo), (240.0, 1, 8, 3));
+        assert!(matches!(v.eta, RefitEta::Left { remaining_s, .. } if remaining_s > 239.0 && remaining_s <= 240.0));
+        p.set_refit_history(Vec::new());
+        assert_eq!(p.view().refit.unwrap().eta, RefitEta::Estimating);
     }
 
     /// The display eigensolve: running while the guard lives, recorded once with its time when it
@@ -953,18 +1113,18 @@ mod tests {
     fn the_display_eigensolve_is_reported_and_taken_once() {
         let p = ActivityProbe::new();
         assert_eq!((p.view().display, p.view().display_solves), (None, 0));
-        let b = p.display_solve(4);
-        assert!(matches!(p.view().display, Some((t, 4)) if t >= 0.0));
+        let b = p.display_solve(DisplayJob::Unoccupied(4));
+        assert!(matches!(p.view().display, Some((t, DisplayJob::Unoccupied(4))) if t >= 0.0));
         b.finish(false);
         assert_eq!((p.view().display, p.view().display_solves), (None, 1));
-        drop(p.display_solve(2));
+        drop(p.display_solve(DisplayJob::Unoccupied(2)));
         let v = p.take_display_solves();
-        assert_eq!(v.iter().map(|d| (d.unoccupied, d.interrupted)).collect::<Vec<_>>(), vec![(4, false), (2, true)]);
+        assert_eq!(v.iter().map(|d| (d.job, d.interrupted)).collect::<Vec<_>>(), vec![(DisplayJob::Unoccupied(4), false), (DisplayJob::Unoccupied(2), true)]);
         assert!(v.iter().all(|d| d.ms >= 0.0));
         assert!(p.take_display_solves().is_empty(), "a take drains them");
         assert_eq!(p.view().display_solves, 2);
         for _ in 0..DISPLAY_SOLVES_KEPT + 3 {
-            p.display_solve(1).finish(false);
+            p.display_solve(DisplayJob::Unoccupied(1)).finish(false);
         }
         assert_eq!(p.take_display_solves().len(), DISPLAY_SOLVES_KEPT, "bounded: the oldest go first");
     }

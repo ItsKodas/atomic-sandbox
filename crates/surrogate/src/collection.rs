@@ -16,11 +16,12 @@
 //! | `references.txt` | isolated-atom energies **per box**, one `Z E n ρ` line per (species, box) (Hartree, the solve's grid points per side — the box length (n − 1)·h at the key's h —, its face density in e/Bohr³ or `-`; shortest round-trip decimals; "References" below) |
 //! | `history.bin` | the audit history ([`AuditHistory::encode`]) |
 //! | `README.txt` | what it knows, for people: species, pairs, counts, scenes ([`Collection::write_readme`]) |
+//! | `refit_times.csv` | the provider's refit history, for the time estimate only ([`Collection::save_refit_times`]; its format is `sim::refit_eta`'s — the collection stores the text) |
 //! | `.lock` | the owning process id while a writer has it open |
 //! | `samples.bin.dropped-<n>` | the bytes a damaged tail held, set aside when it was cut (never deleted) |
 //! | `samples.bin.bak` | the samples file as it was before the last purge ([`Collection::purge`]; replaced by the next purge) |
 //!
-//! `references.txt` and `history.bin` are rewritten whole through a temporary file renamed into
+//! `references.txt`, `history.bin` and `refit_times.csv` are rewritten whole through a temporary file renamed into
 //! place; `samples.bin` is only ever appended to (or cut back to its last whole record after a
 //! crash, below) — except by the user's **purge** of forgotten samples (below), which rewrites it.
 //!
@@ -265,6 +266,9 @@ fn refuse_surface(difference: &str) -> String {
 /// The index of an [`ImportReport::refused`] entry that refuses the whole file (its charge, a
 /// forced multiplicity, another surface, or no samples at all) rather than one sample.
 pub const WHOLE_FILE: usize = usize::MAX;
+
+/// The refit history's file in a collection's folder (module doc).
+pub const REFIT_TIMES_FILE: &str = "refit_times.csv";
 
 const REC_HEADER: u8 = 0;
 const REC_SAMPLE: u8 = 1;
@@ -1489,6 +1493,19 @@ impl Collection {
         }
     }
 
+    /// The refit history's text (`refit_times.csv`; module doc), `None` when there is none or it
+    /// cannot be read (the estimate then starts from nothing).
+    pub fn read_refit_times(&self) -> Option<String> {
+        std::fs::read_to_string(self.folder.join(REFIT_TIMES_FILE)).ok()
+    }
+
+    /// Writes the refit history's text to `refit_times.csv` (module doc); refused when read-only.
+    pub fn save_refit_times(&self, text: &str) -> Result<(), String> {
+        self.writable()?;
+        let path = self.folder.join(REFIT_TIMES_FILE);
+        write_atomic(&path, text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
     /// Writes [`history`](Self::history) to `history.bin`.
     pub fn save_history(&self) -> Result<(), String> {
         self.writable()?;
@@ -1814,6 +1831,26 @@ mod tests {
         let e = c.append(f).unwrap_err();
         assert!(e.contains("forced"), "{e}");
         assert!(c.samples.is_empty());
+    }
+
+    /// The refit history's text: none at first, written whole, read back after a reopen, refused
+    /// by a read-only handle.
+    #[test]
+    fn the_refit_times_round_trip_and_a_read_only_handle_refuses_them() {
+        let dir = root("refit_times");
+        let key = prov().surface_key();
+        let (c, _) = Collection::open(&dir, &key).unwrap();
+        assert_eq!(c.read_refit_times(), None);
+        c.save_refit_times("a\nb\n").unwrap();
+        c.save_refit_times("c\n").unwrap();
+        assert_eq!(c.read_refit_times().as_deref(), Some("c\n"));
+        let (other, _) = Collection::open(&dir, &key).unwrap();
+        assert!(other.read_only);
+        assert_eq!(other.read_refit_times().as_deref(), Some("c\n"));
+        assert!(other.save_refit_times("d\n").is_err());
+        drop((c, other));
+        let (c, _) = Collection::open(&dir, &key).unwrap();
+        assert_eq!(c.read_refit_times().as_deref(), Some("c\n"));
     }
 
     /// Appends, status updates, references and the history survive a reopen bit-exactly.

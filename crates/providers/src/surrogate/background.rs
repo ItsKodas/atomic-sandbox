@@ -87,13 +87,16 @@ impl ForceProvider for NoTeacher {
 /// Dropped — installed, discarded, or with the provider (a backend switch) — it asks the thread to
 /// stop at its next fit (`refit_cancel`) and ends the probe's refit phase.
 pub(super) struct BackgroundRefit {
-    handle: Option<std::thread::JoinHandle<(Box<SurrogateKs>, Result<FitReport, FitError>)>>,
+    /// The thread: the copy, its refit's outcome and wall (seconds).
+    handle: Option<std::thread::JoinHandle<(Box<SurrogateKs>, Result<FitReport, FitError>, f64)>>,
     snap: Snapshot,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     probe: Option<Arc<sim::ActivityProbe>>,
     /// The user's Forget / Restore codes set while it runs (module doc, "The user's codes"): the
     /// last one per sample, re-applied at the install.
     user_codes: BTreeMap<usize, u8>,
+    /// The species of the samples it fits (its refit record, `sim::refit_eta`).
+    species: usize,
 }
 
 impl BackgroundRefit {
@@ -233,18 +236,26 @@ impl SurrogateKs {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut fork = self.fork_for_refit();
         fork.refit_cancel = Some(cancel.clone());
+        // the copy publishes its stages on the live provider's probe: the phase begins first, so
+        // the copy's first stage is not reset by it
+        fork.stage_probe = self.probe.clone();
+        let species = self.store_species();
+        let probe = self.probe.clone();
+        if let Some(p) = &probe {
+            p.begin_refit(self.samples(), species, true);
+        }
         let handle = std::thread::Builder::new()
             .name("surrogate-refit".into())
             .spawn(move || {
+                // below normal, as the fit's own worker threads (`surrogate::threads`): a refit of
+                // minutes must not make the machine laggy
+                surrogate::threads::lower_priority();
+                let t0 = std::time::Instant::now();
                 let r = SurrogateKs::refit(&mut fork);
-                (Box::new(fork), r)
+                (Box::new(fork), r, t0.elapsed().as_secs_f64())
             })
             .expect("spawn the background refit");
-        let probe = self.probe.clone();
-        if let Some(p) = &probe {
-            p.begin_refit(self.samples());
-        }
-        self.background = Some(BackgroundRefit { handle: Some(handle), snap, cancel, probe, user_codes: BTreeMap::new() });
+        self.background = Some(BackgroundRefit { handle: Some(handle), snap, cancel, probe, user_codes: BTreeMap::new(), species });
         true
     }
 
@@ -294,13 +305,18 @@ impl SurrogateKs {
         let snap = std::mem::replace(&mut done.snap, Snapshot::empty());
         let user = std::mem::take(&mut done.user_codes);
         // `done` drops at the end: the probe's refit phase ends whatever the outcome
-        let (fork, result) = match handle.join() {
+        let (fork, result, wall_s) = match handle.join() {
             Ok(x) => x,
             Err(_) => {
                 self.pending_refit = true;
                 return BackgroundPoll::Discarded("the background refit panicked; it is due again".into());
             }
         };
+        // the refit history (`sim::refit_eta`): a refit that fitted took its time whether it is
+        // installed or discarded below; a cancelled one ends in an error and is not recorded
+        if let (Ok(_), Some(c)) = (result.as_ref(), fork.refit_counts) {
+            self.record_refit(wall_s, snap.p, done.species, true, c);
+        }
         if let Some(why) = self.background_conflict(&snap, &user) {
             self.pending_refit = true;
             return BackgroundPoll::Discarded(why);

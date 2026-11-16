@@ -130,6 +130,15 @@ pub enum Command {
     /// `sim::TrainingViews` only while they are (`worker::activity`, "The training views'
     /// schedule"). A view setting: not an edit, never aborts, never reaches the driver.
     SetActivityViews(bool),
+    /// Estimated solver: ⚠ Model only is on (true) or off (`ui::Action::ModelOnly`, which also
+    /// sends its draft mode and audit cadence): a changed orbital view then asks for a Harris
+    /// display solve instead of a DFT refresh (`worker::harris`, spec §4.2). A worker setting: not
+    /// an edit, never aborts, never reaches the driver.
+    SetModelOnly(bool),
+    /// Estimated solver: the View setting "refresh orbitals every N s" — the Harris display
+    /// solves' interval while playing (`worker::harris`; the budget may stretch it). A worker
+    /// setting: not an edit, never aborts, never reaches the driver.
+    SetOrbitalRefresh(Duration),
     /// The orbital view (orbital-viewer spec §3, §4.3; `worker` module doc, "The orbital view"):
     /// display only — never an edit, never aborts a step; consecutive ones collapse to the last.
     OrbitalView(sim::OrbitalViewRequest),
@@ -210,6 +219,8 @@ impl Command {
             | Command::SetDraft(_)
             | Command::SetCloud { .. }
             | Command::SetActivityViews(_)
+            | Command::SetModelOnly(_)
+            | Command::SetOrbitalRefresh(_)
             | Command::OrbitalView(_)
             | Command::Shutdown => {}
         }
@@ -248,6 +259,8 @@ impl Command {
             | Command::SetDraft(_)
             | Command::SetCloud { .. }
             | Command::SetActivityViews(_)
+            | Command::SetModelOnly(_)
+            | Command::SetOrbitalRefresh(_)
             | Command::DisplayPartialCore(_)
             | Command::OrbitalView(_) => false,
             _ => true,
@@ -294,6 +307,8 @@ impl Command {
                 | Command::SetDraft(_)
                 | Command::SetCloud { .. }
                 | Command::SetActivityViews(_)
+                | Command::SetModelOnly(_)
+                | Command::SetOrbitalRefresh(_)
                 | Command::Shutdown
         )
     }
@@ -325,6 +340,8 @@ impl Command {
             | Command::SetDraft(_)
             | Command::SetCloud { .. }
             | Command::SetActivityViews(_)
+            | Command::SetModelOnly(_)
+            | Command::SetOrbitalRefresh(_)
             | Command::TrainingCheckpoints(_)
             | Command::Collections(_)
             | Command::ImportModel(_)
@@ -492,6 +509,8 @@ impl Worker {
                 self.cloud_refresh = refresh_s.filter(|x| x.is_finite() && *x > 0.0).map(Duration::from_secs_f64);
             }
             Command::SetActivityViews(on) => self.activity.set_views(on),
+            Command::SetModelOnly(on) => self.model_only = on,
+            Command::SetOrbitalRefresh(d) => self.harris.set_every(d),
             Command::OrbitalView(req) => self.orbital_view(req),
             Command::Shutdown => {} // `Inbox::take` never hands it out
         }
@@ -515,7 +534,9 @@ impl Worker {
     /// [`Command::OrbitalView`] (module doc, "The orbital view"): to the driver, which forwards it
     /// to its provider and, paused, shows a changed view at once without a solve. In estimated
     /// mode the one producer is the background teacher, whose state is an older geometry's: a
-    /// changed view asks it for a display refresh at the current one.
+    /// changed view asks it for a display refresh at the current one — or, under ⚠ Model only, for
+    /// a Harris display solve, and nothing while Harris is not eligible
+    /// (`harris::view_change_job`; spec §4.2: Model only starts no DFT solve for a view).
     ///
     /// Cost (Task 3 review M6, for Task 7): *any* changed view asks for that refresh — each new
     /// orbital picked in the list included — even when the side solver's last solve is already at
@@ -526,11 +547,23 @@ impl Worker {
         let snap = self.dy.snapshot();
         let changed = !req.same_view(&snap.orbital_view);
         let on = !req.what.is_off();
+        let harris_ok = self.harris_ok(&req.what, &snap).is_ok();
         self.dy.apply(DynCommand::SetOrbitalView(req));
-        if on && changed && !snap.scene.nuclei.is_empty() {
-            if let Some(t) = trainable(&mut self.dy) {
-                t.request_display(&snap.scene);
+        if !changed || snap.scene.nuclei.is_empty() {
+            return;
+        }
+        match harris::view_change_job(self.model_only, harris_ok, on) {
+            harris::ViewJob::Refresh => {
+                if let Some(t) = trainable(&mut self.dy) {
+                    if t.request_display(&snap.scene) {
+                        // the refresh covers this geometry: no Harris job for it
+                        let here: Vec<[f64; 3]> = snap.scene.nuclei.iter().map(|n| n.pos).collect();
+                        self.harris.covered(&here);
+                    }
+                }
             }
+            harris::ViewJob::Harris => self.harris_view_changed = true,
+            harris::ViewJob::Nothing => {}
         }
     }
 

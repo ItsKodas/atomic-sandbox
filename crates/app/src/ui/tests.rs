@@ -104,6 +104,13 @@ fn m5b_actions_send_walls_cloud_and_draft() {
     assert!(matches!(c.commands.as_slice(), [Command::SetCloud { superposition: false, refresh_s: Some(x) }] if *x == 4.0));
     let c = act(&mut st, &inp, Action::Draft(true));
     assert!(matches!(c.commands.as_slice(), [Command::SetDraft(true)]) && st.draft);
+    // "refresh orbitals every N s" (live-orbitals Task 6): 2 s by default, sent as the worker's
+    // Harris cadence, a script's value kept within the slider's 1–10 s
+    assert_eq!(st.orbital_refresh_s, 2.0);
+    let c = act(&mut st, &inp, Action::OrbitalRefresh(3.0));
+    assert!(matches!(c.commands.as_slice(), [Command::SetOrbitalRefresh(d)] if *d == std::time::Duration::from_secs(3)) && st.orbital_refresh_s == 3.0);
+    let c = act(&mut st, &inp, Action::OrbitalRefresh(60.0));
+    assert!(matches!(c.commands.as_slice(), [Command::SetOrbitalRefresh(d)] if *d == std::time::Duration::from_secs(10)), "{:?}", c.commands);
 }
 
 /// "watchable": one ~10 fs vibration in ≈ 0.5 s — at dt 0.25 fs on the surrogate (≈ 0.01 ms
@@ -242,6 +249,7 @@ fn snapshot(scene: &Scene, backend: Backend, model: Option<ModelStatus>) -> Snap
         engine: if backend == Backend::Cpu { Backend::Cpu } else { Backend::Gpu },
         model,
         atom_profiles: Default::default(),
+        harris_note: None,
         edits: 0,
         driver_commands: 0,
         commands: 0,
@@ -1596,27 +1604,28 @@ fn model_only_saves_and_restores_draft_and_audits() {
     assert!(st.model_only.is_none() && overlays::model_only_chip(&st).is_none(), "every session starts with it off");
     act(&mut st, &inp, Action::SetAudit(500));
     let out = act(&mut st, &inp, Action::ModelOnly(true));
-    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(true), Command::SetAudit(0)]), "{:?}", out.commands);
+    // (and the worker's Model only: a changed orbital view then asks for a Harris solve, live-orbitals Task 6)
+    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(true), Command::SetAudit(0), Command::SetModelOnly(true)]), "{:?}", out.commands);
     assert!(st.draft && st.audit_every == 0);
     assert_eq!(st.model_only, Some(ModelOnlySaved { draft: false, audit_every: 500 }));
     assert_eq!(st.audit_every_on, 500, "\"audits on\" would bring back the replaced cadence");
     assert_eq!(overlays::model_only_chip(&st), Some("model only — no DFT checks"));
     assert!(act(&mut st, &inp, Action::ModelOnly(true)).commands.is_empty(), "already on: nothing");
     let out = act(&mut st, &inp, Action::ModelOnly(false));
-    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(false), Command::SetAudit(500)]), "{:?}", out.commands);
+    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(false), Command::SetAudit(500), Command::SetModelOnly(false)]), "{:?}", out.commands);
     assert!(!st.draft && st.audit_every == 500 && st.model_only.is_none() && overlays::model_only_chip(&st).is_none());
     assert!(act(&mut st, &inp, Action::ModelOnly(false)).commands.is_empty(), "already off: nothing");
     // draft already on before: it stays on after
     act(&mut st, &inp, Action::Draft(true));
     act(&mut st, &inp, Action::ModelOnly(true));
     let out = act(&mut st, &inp, Action::ModelOnly(false));
-    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(true), Command::SetAudit(500)]), "{:?}", out.commands);
+    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(true), Command::SetAudit(500), Command::SetModelOnly(false)]), "{:?}", out.commands);
     // the solver leaves Estimated: off, restored
     let mut st = fresh();
     act(&mut st, &inp, Action::SetAudit(700));
     act(&mut st, &inp, Action::ModelOnly(true));
     let out = act(&mut st, &inp, Action::Backend(Backend::Gpu));
-    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(false), Command::SetAudit(700)]), "{:?}", out.commands);
+    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(false), Command::SetAudit(700), Command::SetModelOnly(false)]), "{:?}", out.commands);
     assert!(st.backend == Backend::Gpu && st.model_only.is_none() && !st.draft && st.audit_every == 700);
     // not on another solver (the toggle is hidden there; a script could still ask)
     let out = act(&mut st, &inp, Action::ModelOnly(true));
@@ -1625,14 +1634,14 @@ fn model_only_saves_and_restores_draft_and_audits() {
     let mut st = fresh();
     act(&mut st, &inp, Action::ModelOnly(true));
     let out = act(&mut st, &inp, Action::Draft(false));
-    assert!(matches!(out.commands.as_slice(), [Command::SetDraft(false)]), "{:?}", out.commands);
+    assert!(matches!(out.commands.as_slice(), [Command::SetModelOnly(false), Command::SetDraft(false)]), "{:?}", out.commands);
     assert!(st.model_only.is_none() && !st.draft && st.audit_every == 0);
     assert!(st.status.contains("by hand"), "{}", st.status);
     // a hand change of the cadence: off, the cadence kept, draft left on
     let mut st = fresh();
     act(&mut st, &inp, Action::ModelOnly(true));
     let out = act(&mut st, &inp, Action::SetAudit(300));
-    assert!(matches!(out.commands.as_slice(), [Command::SetAudit(300)]), "{:?}", out.commands);
+    assert!(matches!(out.commands.as_slice(), [Command::SetModelOnly(false), Command::SetAudit(300)]), "{:?}", out.commands);
     assert!(st.model_only.is_none() && st.draft && st.audit_every == 300);
     // Ctrl K finds it by either name
     for q in ["model only", "no DFT checks"] {
@@ -2526,6 +2535,112 @@ fn clicking_the_m6_controls_sends_their_commands() {
     assert_eq!((st.element, st.isotope), (1, Some(2)));
 }
 
+/// A Relax / Stop click shows at once (user request 2026-11-16): pending from the click until the
+/// snapshot shows the clicked state, a snapshot has seen the command, or the safety timeout.
+#[test]
+fn relax_pending_settles_whichever_comes_first() {
+    let t0 = Instant::now();
+    let at = |s: f64| t0 + Duration::from_secs_f64(s);
+    // Relax clicked while not relaxing: Stop with a spinner at once
+    let p = RelaxPending::new(false, false, t0);
+    assert_eq!(RelaxButton::of(false, Some(&p)), RelaxButton::Starting);
+    assert!(!p.settled(false, None, at(0.1)), "pending right after the click");
+    assert!(!p.settled(false, Some(7), at(0.1)), "not sent yet: no count to compare against");
+    assert!(p.settled(true, None, at(0.1)), "the snapshot reports the relax running");
+    let sent = RelaxPending { sent: Some(5), ..p };
+    assert!(!sent.settled(false, Some(4), at(1.0)), "a snapshot taken before the worker saw it");
+    assert!(sent.settled(false, Some(5), at(1.0)), "seen, not relaxing: already at a minimum, or refused");
+    assert!(sent.settled(false, Some(9), at(1.0)));
+    assert!(!p.settled(false, None, at(9.9)));
+    assert!(p.settled(false, None, at(10.0)), "the safety timeout");
+    // Stop clicked while relaxing: Relax back at once, disabled with a spinner
+    let s = RelaxPending::new(true, true, t0);
+    assert_eq!(RelaxButton::of(true, Some(&s)), RelaxButton::Stopping);
+    assert!(!s.settled(true, None, at(0.1)), "still relaxing");
+    assert!(s.settled(false, None, at(0.1)), "the snapshot reports the relax ended");
+    assert!(RelaxPending { sent: Some(3), ..s }.settled(true, Some(3), at(0.1)), "seen (a later Relax runs)");
+    assert!(s.settled(true, None, at(10.0)), "the safety timeout");
+    // Stop while its Relax was itself pending: "not relaxing" is the old state, not an answer
+    let s2 = RelaxPending::new(true, false, t0);
+    assert!(!s2.settled(false, None, at(0.1)));
+    assert!(!RelaxPending { sent: Some(6), ..s2 }.settled(false, Some(5), at(0.1)));
+    assert!(RelaxPending { sent: Some(6), ..s2 }.settled(false, Some(6), at(0.1)));
+    assert!(s2.settled(false, None, at(10.0)));
+    // nothing pending: the snapshot's state
+    assert_eq!(RelaxButton::of(true, None), RelaxButton::Stop);
+    assert_eq!(RelaxButton::of(false, None), RelaxButton::Relax);
+}
+
+/// Clicked as a user would: the toolbar's Relax turns into Stop with a spinner in the click's own
+/// frames, Stop works while pending, Stop turns it back into a disabled Relax with a spinner, and
+/// each settles on the snapshot's state or the worker's command count. Physics ▸ Relax likewise.
+#[test]
+fn relax_click_shows_at_once() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let mut idle = snapshot(&scene, Backend::Gpu, None);
+    idle.commands = 3;
+    let mut relaxing = snapshot(&scene, Backend::Gpu, None);
+    relaxing.dynamics.relax = Some(relax_progress(None));
+    relaxing.commands = 4;
+    let inp = input(&scene, Some(&idle), &cam);
+    let inp_r = input(&scene, Some(&relaxing), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    let spinning = |ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, name: &str| {
+        PROBES.with(|p| p.borrow_mut().clear());
+        frame(ctx, st, inp, WIDE, vec![]);
+        PROBES.with(|p| p.borrow().contains_key(name))
+    };
+    // Relax: Stop with a spinner while the snapshot still says idle
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, WIDE, "relax", 0.0));
+    assert!(matches!(c.as_slice(), [DynCommand::Relax]), "{c:?}");
+    assert!(st.relax_pending.is_some_and(|p| !p.stop && p.sent.is_none()), "pending right after the click");
+    assert!(spinning(&ctx, &mut st, &inp, "relax-pending"), "the spinner beside Stop");
+    // Stop works while pending; it shows Relax again at once, disabled with a spinner
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, WIDE, "relax", 0.0));
+    assert!(matches!(c.as_slice(), [DynCommand::StopRelax]), "{c:?}");
+    assert!(st.relax_pending.is_some_and(|p| p.stop));
+    assert!(spinning(&ctx, &mut st, &inp, "relax-pending"));
+    assert!(dyn_commands(&press_widget_w(&ctx, &mut st, &inp, WIDE, "relax", 0.0)).is_empty(), "disabled: a quick re-click cannot race");
+    // the worker has seen the Stop (the viewer numbers it as it sends it): settled, Relax again
+    st.relax_pending.as_mut().unwrap().sent = Some(3);
+    assert!(!spinning(&ctx, &mut st, &inp, "relax-pending"));
+    assert!(st.relax_pending.is_none(), "cleared when the command is seen");
+    // Relax, then the snapshot reports the relax: the plain Stop, no spinner
+    press_widget_w(&ctx, &mut st, &inp, WIDE, "relax", 0.0);
+    assert!(st.relax_pending.is_some_and(|p| !p.stop));
+    assert!(!spinning(&ctx, &mut st, &inp_r, "relax-pending"));
+    assert!(st.relax_pending.is_none(), "cleared when relaxing");
+    // Stop from a running relax, then the snapshot reports it ended
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp_r, WIDE, "relax", 0.0));
+    assert!(matches!(c.as_slice(), [DynCommand::StopRelax]), "{c:?}");
+    assert!(spinning(&ctx, &mut st, &inp_r, "relax-pending"), "Stop pending while the snapshot still relaxes");
+    assert!(!spinning(&ctx, &mut st, &inp, "relax-pending"));
+    assert!(st.relax_pending.is_none(), "Stop pending, then cleared");
+    // Relax that the worker answers with nothing to do (at a minimum already): seen, not relaxing
+    press_widget_w(&ctx, &mut st, &inp, WIDE, "relax", 0.0);
+    st.relax_pending.as_mut().unwrap().sent = Some(3);
+    assert!(!spinning(&ctx, &mut st, &inp, "relax-pending"));
+    assert!(st.relax_pending.is_none(), "cleared when seen without relaxing");
+    // the timeout: a click no snapshot ever answers
+    press_widget_w(&ctx, &mut st, &inp, WIDE, "relax", 0.0);
+    st.relax_pending.as_mut().unwrap().since -= RELAX_PENDING_TIMEOUT;
+    assert!(!spinning(&ctx, &mut st, &inp, "relax-pending"));
+    assert!(st.relax_pending.is_none(), "cleared by the timeout");
+    // Physics ▸ Relax geometry gets the same: Stop with a spinner after its Relax
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "m-relax"));
+    assert!(matches!(c.as_slice(), [DynCommand::Relax]), "{c:?}");
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    assert!(spinning(&ctx, &mut st, &inp, "m-relax-pending"));
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "m-relax-stop"));
+    assert!(matches!(c.as_slice(), [DynCommand::StopRelax]), "{c:?}");
+    egui::Popup::close_all(&ctx);
+}
+
 fn relax_progress(converged: Option<bool>) -> sim::RelaxProgress {
     sim::RelaxProgress {
         steps: 42,
@@ -3185,6 +3300,7 @@ mod orbital_viewer {
             what,
             lone_atom: LoneAtomLabels::NotLoneAtom,
             share_z: None,
+            kind: sim::OrbitalKind::Converged,
         }
     }
 
@@ -3537,6 +3653,114 @@ mod orbital_viewer {
         assert_eq!(orbital_view_commands(&outs)[0].what, OrbitalRequest::SpinDensity);
     }
 
+    fn shows(spin: Spin, track: u32) -> OrbitalRequest {
+        OrbitalRequest::Orbital { spin, track, squared: true }
+    }
+
+    /// The mark of the entry for `(spin, track)` in `o`.
+    fn mark_of(o: &OrbitalDisplay, pending: Option<(Spin, u32)>, spin: Spin, track: u32) -> orbitals::RowPick {
+        let (_, es) = orbitals::entries(o);
+        let e = es.iter().find(|e| (e.r.spin, e.r.track) == (spin, track)).expect("an entry");
+        let shown = match o.what {
+            OrbitalRequest::Orbital { spin, track, .. } => Some((spin, track)),
+            _ => None,
+        };
+        orbitals::RowPick::of(e, shown, pending)
+    }
+
+    /// User request 2026-11-16: a picked orbital that is not shown yet is pending — its row marked
+    /// and disabled — until a payload shows it; a newer pick moves the mark.
+    #[test]
+    fn a_pending_orbital_pick_is_marked_until_shown() {
+        use orbitals::{pending_pick, RowPick};
+        let o = payload(h2_rows(), shows(Spin::Up, 1));
+        // nothing picked (the HOMO placeholder), or the pick on screen: nothing pending
+        assert_eq!(pending_pick(ShowMode::Orbitals, None, Some(&o)), None);
+        assert_eq!(pending_pick(ShowMode::Orbitals, Some((Spin::Up, 1)), Some(&o)), None);
+        assert_eq!(mark_of(&o, None, Spin::Up, 1), RowPick::Shown);
+        // a pick pending: its row pending and not clickable, the shown one still marked shown
+        let p = pending_pick(ShowMode::Orbitals, Some((Spin::Down, 2)), Some(&o));
+        assert_eq!(p, Some((Spin::Down, 2)));
+        assert_eq!(mark_of(&o, p, Spin::Down, 2), RowPick::Pending);
+        assert!(!RowPick::Pending.clickable());
+        assert_eq!(mark_of(&o, p, Spin::Up, 1), RowPick::Shown);
+        assert!(mark_of(&o, p, Spin::Up, 3).clickable() && mark_of(&o, p, Spin::Up, 1).clickable());
+        // another pick: the mark moves
+        let p = pending_pick(ShowMode::Orbitals, Some((Spin::Up, 3)), Some(&o));
+        assert_eq!(p, Some((Spin::Up, 3)));
+        assert_eq!((mark_of(&o, p, Spin::Up, 3), mark_of(&o, p, Spin::Down, 2)), (RowPick::Pending, RowPick::None));
+        // the matching payload shown: cleared
+        let o2 = payload(h2_rows(), shows(Spin::Up, 3));
+        assert_eq!(pending_pick(ShowMode::Orbitals, Some((Spin::Up, 3)), Some(&o2)), None);
+        assert_eq!(mark_of(&o2, None, Spin::Up, 3), RowPick::Shown);
+        // only the Orbitals view picks; no payload yet: nothing to mark
+        assert_eq!(pending_pick(ShowMode::Coloured, Some((Spin::Up, 3)), Some(&o)), None);
+        assert_eq!(pending_pick(ShowMode::Orbitals, Some((Spin::Up, 3)), None), None);
+    }
+
+    /// The pending mark clears on an interrupted payload of the pick (its status line says so) and
+    /// on a pick that no longer exists (the producer's fallback, the viewer adopts what it shows);
+    /// an interrupted payload of the earlier pick, made before the worker read the newer request,
+    /// leaves it pending.
+    #[test]
+    fn a_pending_orbital_pick_clears_when_interrupted_or_gone() {
+        use orbitals::pending_pick;
+        let interrupted = Some(UnoccupiedStatus { requested: 4, current: true, interrupted: true, ..Default::default() });
+        let mut o = payload(h2_rows(), shows(Spin::Up, 3));
+        o.unoccupied = interrupted.clone();
+        assert_eq!(pending_pick(ShowMode::Orbitals, Some((Spin::Up, 3)), Some(&o)), None);
+        assert!(orbitals::unoccupied_lines(4, o.unoccupied.as_ref(), false).iter().any(|l| l == "interrupted — recomputed when idle"));
+        // the earlier pick's interrupted payload: still on its way
+        let mut stale = payload(h2_rows(), shows(Spin::Up, 1));
+        stale.unoccupied = interrupted;
+        assert_eq!(pending_pick(ShowMode::Orbitals, Some((Spin::Up, 3)), Some(&stale)), Some((Spin::Up, 3)));
+        // gone: the producer fell back to another orbital and said so
+        let mut gone = payload(h2_rows(), shows(Spin::Up, 1));
+        gone.notes = vec![format!("{} — showing #1 ↑", orbitals::NO_LONGER_EXISTS)];
+        assert_eq!(pending_pick(ShowMode::Orbitals, Some((Spin::Down, 77)), Some(&gone)), None);
+    }
+
+    /// In the tab: the clicked row shows a spinner and is disabled (a second click sends nothing),
+    /// every other row and level stays clickable and moves the spinner; the payload showing the pick
+    /// clears it.
+    #[test]
+    fn a_pending_orbital_row_spins_and_ignores_clicks() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let snap = with_payload(&scene, Backend::Gpu, payload(h2_rows(), shows(Spin::Up, 1)));
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        st.orbital_pick = Some((Spin::Up, 1));
+        alone(&mut st, DockTab::Orbitals);
+        let probed = |k: &str| PROBES.with(|p| p.borrow().contains_key(k));
+        // the probes of one fresh frame
+        let fresh = |ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>| {
+            PROBES.with(|p| p.borrow_mut().clear());
+            frame(ctx, st, inp, 1400.0, vec![]);
+        };
+        fresh(&ctx, &mut st, &inp);
+        assert!(!probed("pending-↓-2") && !probed("pending-↑-3"), "nothing pending");
+        assert_eq!(orbital_view_commands(&click_widget(&ctx, &mut st, &inp, "orbital-↓-2")).len(), 1);
+        fresh(&ctx, &mut st, &inp);
+        assert!(probed("pending-↓-2"), "the spinner on the clicked row");
+        assert!(hover_text(&ctx, &mut st, &inp, "orbital-↓-2").contains(orbitals::PENDING_TIP));
+        assert!(click_widget(&ctx, &mut st, &inp, "orbital-↓-2").iter().all(|o| o.commands.is_empty()), "the pending row is disabled");
+        assert!(click_widget(&ctx, &mut st, &inp, "level-↓-2").iter().all(|o| o.commands.is_empty()), "so is its level");
+        // another row supersedes it
+        assert_eq!(orbital_view_commands(&click_widget(&ctx, &mut st, &inp, "orbital-↑-3")).len(), 1);
+        fresh(&ctx, &mut st, &inp);
+        assert!(probed("pending-↑-3") && !probed("pending-↓-2"), "the spinner moved");
+        // the payload shows it: cleared, and the row clickable again
+        let snap = with_payload(&scene, Backend::Gpu, payload(h2_rows(), shows(Spin::Up, 3)));
+        let inp = input(&scene, Some(&snap), &cam);
+        fresh(&ctx, &mut st, &inp);
+        assert!(!probed("pending-↑-3"));
+        assert_eq!(orbital_view_commands(&click_widget(&ctx, &mut st, &inp, "orbital-↓-2")).len(), 1);
+    }
+
     /// A closed-shell spin readout: ∫|m| inside the solver's noise budget (no net spin).
     fn closed_spin() -> SpinSummary {
         SpinSummary { n_up: 1, n_dn: 1, integral: 0.0, abs_integral: 2e-6, max_abs: 1e-7, rho_max: 0.4, scale: 4e-4, noise: 1.4e-4 }
@@ -3849,6 +4073,172 @@ mod orbital_viewer {
         // and none at all in Density mode
         st.show = ShowMode::Density;
         assert_eq!(shown.label(&st, Some(&cpu_teacher)), None);
+    }
+
+    // ---- live orbitals (live-orbitals Task 7: the Harris display solve's labels, spec §6) ----
+
+    /// A Harris display payload over `rows` at `positions`.
+    fn harris_payload(rows: Vec<OrbitalInfo>, positions: Vec<[f64; 3]>, rescale: f64) -> OrbitalDisplay {
+        OrbitalDisplay { positions, kind: sim::OrbitalKind::Harris { experience: None, rescale, wall_s: 0.31 }, ..payload(rows, OrbitalRequest::List) }
+    }
+
+    /// Spec §6 / §4.3: a Harris payload at the current positions is drawn at full strength and says
+    /// what it is — solved once in the potential of superposed atoms, not self-consistent — never
+    /// "last DFT solve"; moved since, it is faded and says "an earlier geometry"; a charged scene's
+    /// says the atoms were rescaled; with no payload yet, the reason no display solve runs is the label.
+    #[test]
+    fn harris_labels_say_what_they_are() {
+        use super::super::dock::orbitals::{HARRIS_DENSITY_NOTE, HARRIS_NOTE, HARRIS_RESCALED};
+        let scene = Scene::preset("h2").unwrap();
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        let here: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        let mut snap = with_payload(&scene, Backend::Estimated, harris_payload(h2_rows(), here.clone(), 1.0));
+        let mut m = model();
+        m.audits_background = true;
+        snap.model = Some(m);
+        snap.dynamics.orbitals_t = units::fs_to_au_time(12.5);
+        snap.dynamics.orbitals_side = Some(SideKind::Harris);
+        let mut shown = OrbitalShown::default();
+        shown.follow(&snap.dynamics);
+        assert_eq!(shown.fade(), 1.0, "a Harris payload at the current positions is current");
+        let label = shown.label(&st, Some(&snap)).expect("a display solve's orbitals are always labelled");
+        assert!(label.starts_with("orbitals solved once at t = 12.50 fs in the potential of superposed atoms, not self-consistent"), "{label}");
+        assert!(label.contains(HARRIS_NOTE), "{label}");
+        assert!(!label.contains("last DFT solve") && !label.contains("earlier geometry") && !label.contains(HARRIS_RESCALED), "{label}");
+        // Spin density: the field drawn is this solve's output
+        st.show = ShowMode::Spin;
+        snap.dynamics.orbitals.as_mut().unwrap().field = Some(sim::OrbitalField::Cpu { values: std::sync::Arc::new(vec![0.0; 8]), signed: true, scale: 1.0 });
+        assert!(shown.label(&st, Some(&snap)).unwrap().contains(HARRIS_DENSITY_NOTE));
+        st.show = ShowMode::Orbitals;
+        // the nuclei moved on by 0.1 Bohr: faded, an earlier geometry
+        snap.dynamics.scene.nuclei[0].pos[0] += 0.1;
+        shown.follow(&snap.dynamics);
+        assert_eq!(shown.fade(), SURROGATE_DENSITY_FADE);
+        let label = shown.label(&st, Some(&snap)).unwrap();
+        assert!(label.contains(HARRIS_NOTE) && label.contains("earlier geometry"), "{label}");
+        // a charged scene: the superposed atoms were rescaled to its electrons
+        snap.dynamics.orbitals = Some(harris_payload(h2_rows(), here.clone(), 0.667));
+        snap.dynamics.scene.nuclei[0].pos[0] -= 0.1;
+        shown.follow(&snap.dynamics);
+        let label = shown.label(&st, Some(&snap)).unwrap();
+        assert!(label.contains(HARRIS_RESCALED) && label.contains("× 0.667") && !label.contains("earlier geometry"), "{label}");
+        assert_eq!(shown.fade(), 1.0);
+        // a converged background payload keeps its own (faded) label
+        snap.dynamics.orbitals = Some(OrbitalDisplay { positions: here.clone(), ..payload(h2_rows(), OrbitalRequest::List) });
+        snap.dynamics.orbitals_side = Some(SideKind::Refresh);
+        shown.follow(&snap.dynamics);
+        assert_eq!(shown.fade(), SURROGATE_DENSITY_FADE);
+        assert!(shown.label(&st, Some(&snap)).unwrap().contains("last DFT solve"));
+        // ... with the reason no display solve runs said first
+        snap.harris_note = Some(crate::sim::HARRIS_WAITING_ATOMS);
+        let label = shown.label(&st, Some(&snap)).unwrap();
+        assert!(label.starts_with(crate::sim::HARRIS_WAITING_ATOMS) && label.contains("last DFT solve"), "{label}");
+        // no payload yet: the note is the label
+        snap.dynamics.orbitals = None;
+        snap.harris_note = Some(crate::sim::HARRIS_PAUSED_PASS);
+        shown.follow(&snap.dynamics);
+        assert_eq!(shown.label(&st, Some(&snap)).as_deref(), Some(crate::sim::HARRIS_PAUSED_PASS));
+    }
+
+    /// Spec §6: a Harris payload's ε cells, the levels line and the diagram's HOMO / LUMO / gap
+    /// print with "≈" and say on hover that they are approximate; a converged payload's print none.
+    /// The details line names the display solve; its per-atom electrons are not drawn.
+    #[test]
+    fn harris_eps_cells_are_approximate() {
+        use super::super::dock::orbitals::{harris_line, levels_line, visible_notes, HARRIS_EPS_TIP, PER_ATOM_NOTE};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let here: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        let mut o = harris_payload(h2_rows(), here.clone(), 1.0);
+        o.notes = vec![format!("{PER_ATOM_NOTE}: atom 0 H 0.9931 → 1, atom 1 H 0.9931 → 1")];
+        // the pure parts
+        let levels = Levels::of_payload(&o);
+        assert!(levels.approx);
+        let (_, es) = orbitals::entries(&o);
+        let v = es[0].view(&levels);
+        assert!(v.ha.starts_with('≈') && v.ev.starts_with('≈') && v.eps_tip().contains(HARRIS_EPS_TIP), "{v:?}");
+        let line = levels_line(&levels).unwrap();
+        assert!(line.contains("HOMO ≈−0.500 Ha") && line.contains("gap ≈0.520 Ha"), "{line}");
+        assert!(visible_notes(&o, false).is_empty(), "the per-atom electrons are for the log");
+        assert!(harris_line(&o.kind).is_some_and(|l| l.contains("not self-consistent") && l.contains("0.31 s")));
+        assert_eq!(harris_line(&sim::OrbitalKind::Converged), None);
+        // rendered
+        let snap = with_payload(&scene, Backend::Estimated, o);
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Orbitals;
+        st.open_tab(DockTab::Orbitals);
+        let texts = frame_texts(&ctx, &mut st, &inp, vec![], 1.0);
+        assert!(texts.iter().any(|(t, _)| t.starts_with("≈−0.500")), "an ε cell: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "HOMO ≈−0.500 Ha"), "the diagram's HOMO: {texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t.starts_with(PER_ATOM_NOTE)), "not drawn");
+        let t = hover_text(&ctx, &mut st, &inp, "eps-↑-1");
+        assert!(t.contains(HARRIS_EPS_TIP), "{t}");
+        let t = hover_text(&ctx, &mut st, &inp, "levels-homo");
+        assert!(t.contains(HARRIS_EPS_TIP), "{t}");
+        // a converged payload: no "≈" anywhere in the panel
+        let snap = with_payload(&scene, Backend::Gpu, OrbitalDisplay { positions: here, ..payload(h2_rows(), OrbitalRequest::List) });
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let texts = frame_texts(&ctx, &mut st, &inp, vec![], 1.0);
+        assert!(texts.iter().any(|(t, _)| t.starts_with("−0.500")), "{texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t.starts_with('≈') || t.contains("≈−") || t.contains("gap ≈")), "{texts:?}");
+        let t = hover_text(&ctx, &mut st, &inp, "eps-↑-1");
+        assert!(!t.contains(HARRIS_EPS_TIP), "{t}");
+    }
+
+    /// Spec §4.3: an orbital display solve has its own job row — never "DFT fallback" — and its own
+    /// words in the solve log; ⚠ Model only says what it still runs; the Density view says the list
+    /// gets no fresh rows under Model only.
+    #[test]
+    fn harris_job_row_is_not_a_fallback() {
+        use activity::jobs::{rows, JobKey, HARRIS_JOB_TITLE};
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut m = model();
+        m.audits_background = true;
+        let snap = snapshot(&scene, Backend::Estimated, Some(m));
+        let probe = sim::ProbeView { display: Some((0.3, sim::DisplayJob::Harris)), ..Default::default() };
+        let inp = PanelInput { probe: Some(probe), ..input(&scene, Some(&snap), &cam) };
+        let r = rows(&inp, inp.probe.as_ref());
+        let jobs: Vec<&activity::jobs::JobRow> = r.iter().filter(|r| r.key == JobKey::Orbitals).collect();
+        assert_eq!(jobs.len(), 1, "one row");
+        assert_eq!(jobs[0].title, HARRIS_JOB_TITLE);
+        assert_eq!(jobs[0].title, "Orbital display solve");
+        assert!(jobs[0].detail.contains("not self-consistent") && jobs[0].detail.contains("0.3 s"), "{}", jobs[0].detail);
+        assert!(jobs[0].control.is_none() && jobs[0].no_control_why.is_some_and(|w| w.contains("not self-consistent")));
+        assert!(r.iter().all(|r| r.title != "DFT fallback"), "{:?}", r.iter().map(|r| &r.title).collect::<Vec<_>>());
+        // the solve log's words (Task 4 review M6): not the unoccupied eigensolve's
+        let (what, hover) = activity::log::display_words(sim::DisplayJob::Harris);
+        assert!(what.contains("not self-consistent") && !hover.contains("converged state"), "{what} / {hover}");
+        assert!(activity::log::display_words(sim::DisplayJob::Unoccupied(4)).1.contains("converged state"));
+        // ⚠ Model only's promise
+        let tip = super::super::toolbar::MODEL_ONLY_TIP;
+        assert!(tip.contains("display-only orbital solves") && tip.contains("not self-consistent") && tip.contains("no DFT runs for forces or motion"), "{tip}");
+        // the Density view under Model only: the list is not refreshed
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.show = ShowMode::Density;
+        st.open_tab(DockTab::Orbitals);
+        let inp = input(&scene, Some(&snap), &cam);
+        let texts = |st: &mut UiState| frame_texts(&ctx, st, &inp, vec![], 1.0).into_iter().map(|(t, _)| t).collect::<Vec<_>>().join("\n");
+        assert!(!texts(&mut st).contains(orbitals::MODEL_ONLY_LIST));
+        st.model_only = Some(super::super::ModelOnlySaved { draft: false, audit_every: 2000 });
+        assert!(texts(&mut st).contains(orbitals::MODEL_ONLY_LIST));
+        // no payload yet (fix round 1, minor 5): an orbital view of the estimated GPU solver says a
+        // display solve fills it, or why none runs; the DFT solvers still need a DFT step
+        st.show = ShowMode::Orbitals;
+        assert_eq!(orbitals::no_orbitals_note(&inp, &st), orbitals::HARRIS_PENDING);
+        let mut paused = snapshot(&scene, Backend::Estimated, snap.model.clone());
+        paused.harris_note = Some(crate::sim::HARRIS_PAUSED_PASS);
+        assert_eq!(orbitals::no_orbitals_note(&input(&scene, Some(&paused), &cam), &st), crate::sim::HARRIS_PAUSED_PASS);
+        let gpu = snapshot(&scene, Backend::Gpu, None);
+        assert_eq!(orbitals::no_orbitals_note(&input(&scene, Some(&gpu), &cam), &st), "needs a DFT step");
     }
 
     /// Ctrl K finds the modes by their names.
@@ -4739,6 +5129,8 @@ mod orbital_viewer {
             let inp = input(&scene, Some(&snap), &cam);
             let level = orbital_view_commands(&click_widget(&ctx, &mut st, &inp, &format!("level-{probe}")));
             let pick = st.orbital_pick;
+            // the level's pick is pending now (its row disabled): undo it so the row's click is compared
+            st.orbital_pick = None;
             let row = orbital_view_commands(&click_widget(&ctx, &mut st, &inp, &format!("orbital-{probe}")));
             assert_eq!(level.len(), 1, "{probe}");
             assert_eq!(level, row, "{probe}");
@@ -5096,9 +5488,9 @@ mod activity_tab {
         let r = rows(&paused, paused.probe.as_ref());
         let solve = r.iter().find(|r| r.key == JobKey::LiveSolve).unwrap();
         assert!(solve.control.is_none() && solve.no_control_why.is_some());
-        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((0.2, 250)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some(refit_view(0.2, 250)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
         let r = rows(&refit, refit.probe.as_ref());
-        assert!(r.iter().any(|r| r.key == JobKey::Refit && r.detail == "250 samples"));
+        assert!(r.iter().any(|r| r.key == JobKey::Refit && r.detail == "250 samples · estimating…"));
         // the first-pass offer waits for "Start anyway"
         snap.model.as_mut().unwrap().pass_offer = Some(PassOffer { plan: sim::SamplingPlan::default(), solves: 365, eta_s: 366.0, per_solve_s: 1.0, full_solves: 512, full_eta_s: 512.0 });
         let offered = input(&scene, Some(&snap), &cam);
@@ -5212,7 +5604,7 @@ mod activity_tab {
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
         let snap = snapshot(&scene, Backend::Gpu, None);
-        let probe = sim::ProbeView { display: Some((0.3, 4)), display_solves: 2, ..Default::default() };
+        let probe = sim::ProbeView { display: Some((0.3, sim::DisplayJob::Unoccupied(4))), display_solves: 2, ..Default::default() };
         let inp = PanelInput { probe: Some(probe), ..input(&scene, Some(&snap), &cam) };
         let r = rows(&inp, inp.probe.as_ref());
         let job = r.iter().find(|r| r.key == JobKey::Orbitals).expect("the eigensolve's job row");
@@ -5222,7 +5614,7 @@ mod activity_tab {
         assert!(rows(&idle, idle.probe.as_ref()).iter().all(|r| r.key != JobKey::Orbitals));
 
         let mut st = activity::ActivityState::new();
-        let solve = |ms: f64, interrupted: bool| sim::DisplaySolve { at: Instant::now(), ms, unoccupied: 4, interrupted };
+        let solve = |ms: f64, interrupted: bool| sim::DisplaySolve { at: Instant::now(), ms, job: sim::DisplayJob::Unoccupied(4), interrupted };
         st.absorb_display(vec![solve(120.0, false)]);
         std::thread::sleep(Duration::from_millis(2));
         let mut s = snapshot(&scene, Backend::Estimated, Some(model()));
@@ -5411,7 +5803,7 @@ mod activity_headline {
         assert!(matches!(h.bar, BarMode::Fraction(f) if (f - 41.0 / 273.0).abs() < 1e-6));
         // a refit
         let snap = snapshot(&scene, Backend::Estimated, Some(model()));
-        let inp = PanelInput { busy: true, probe: Some(sim::ProbeView { refit: Some((0.1, 250)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+        let inp = PanelInput { busy: true, probe: Some(sim::ProbeView { refit: Some(refit_view(0.1, 250)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
         assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Refitting · 250 samples");
         // the CPU solver (no step count)
         let mut snap = snapshot(&scene, Backend::Cpu, None);
@@ -8530,6 +8922,8 @@ mod view_panel {
         st.backend = Backend::Estimated;
         let p = probes_now(&ctx, &mut st, &inp);
         assert!(p.contains("cloud-refresh") && p.contains("cloud-superposition") && p.contains("aid-warp"));
+        // "refresh orbitals every N s" beside them (live-orbitals Task 6)
+        assert!(p.contains("orbital-refresh-s"));
     }
 
     /// A press and release at `at`.
@@ -10096,7 +10490,7 @@ mod updates {
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
         let idle = input(&scene, None, &cam);
-        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((3.0, 120)), ..Default::default() }), ..input(&scene, None, &cam) };
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some(refit_view(3.0, 120)), ..Default::default() }), ..input(&scene, None, &cam) };
         let ctx = ctx();
         let mut st = UiState::new("h2", &scene);
         let root = temp_root("restart");
@@ -10283,7 +10677,7 @@ mod updates {
         assert!(frame(&ctx, &mut st, &stopped, 1400.0, vec![]).restart_for_update, "stopped: the restart follows");
         assert_eq!(st.update.guard, Guard::Idle);
         // paused onto a running refit: that is still waited for
-        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some(refit_view(1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
         act(&mut st, &playing, Action::RestartToUpdate);
         click_widget(&ctx, &mut st, &playing, "guard-pause-restart");
         assert!(!frame(&ctx, &mut st, &refit, 1400.0, vec![]).restart_for_update);
@@ -10396,8 +10790,8 @@ mod updates {
         assert_eq!(st.update.guard, Guard::Idle);
         // N3: Cancel it and restart (for the refit) while playing turns to the playing question
         // and is spent there; after Pause and restart the refit is waited for again
-        let refit_playing = PanelInput { playing: true, busy: true, probe: Some(sim::ProbeView { refit: Some((1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
-        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
+        let refit_playing = PanelInput { playing: true, busy: true, probe: Some(sim::ProbeView { refit: Some(refit_view(1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some(refit_view(1.0, 50)), ..Default::default() }), ..input(&scene, None, &cam) };
         act(&mut st, &refit, Action::RestartToUpdate);
         assert_eq!(st.update.guard, Guard::Waiting { what: "the refit", prompt: true });
         let outs = click_widget(&ctx, &mut st, &refit_playing, "guard-cancel-restart");
@@ -10416,7 +10810,7 @@ mod updates {
     fn closing_the_panel_calls_a_pending_restart_off() {
         let scene = Scene::preset("h2").unwrap();
         let cam = camera();
-        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some((3.0, 120)), ..Default::default() }), ..input(&scene, None, &cam) };
+        let refit = PanelInput { probe: Some(sim::ProbeView { refit: Some(refit_view(3.0, 120)), ..Default::default() }), ..input(&scene, None, &cam) };
         let idle = input(&scene, None, &cam);
         let ctx = ctx();
         let mut st = UiState::new("h2", &scene);
@@ -12448,6 +12842,108 @@ fn checked_rows_forget_and_restore_as_one_batch() {
     }
 }
 
+/// A running refit's view for the tests: `elapsed_s` seconds in, `samples` samples of 2 species,
+/// no stage yet and no history (estimating…).
+fn refit_view(elapsed_s: f64, samples: u32) -> sim::RefitView {
+    sim::RefitView { elapsed_s, samples, species: 2, background: true, stages: sim::RefitStages::default(), estimate: None, eta: sim::RefitEta::Estimating }
+}
+
+/// A refit view with a history estimate of `total_s` from `from` refits (6 fits, 3 leave-one-out
+/// passes expected) and `stages`, its countdown as the probe computes it.
+fn refit_view_est(elapsed_s: f64, samples: u32, total_s: f64, from: u32, stages: sim::RefitStages) -> sim::RefitView {
+    let estimate = sim::RefitEstimate { total_s, from, exponent: 1.0, kind: sim::RefitKind::Recovery, fits: 6, loo: 3 };
+    sim::RefitView { elapsed_s, samples, species: 3, background: true, stages, estimate: Some(estimate), eta: sim::refit_eta::eta(elapsed_s, Some(&estimate), &stages) }
+}
+
+/// 2026-11-15, the refit's time estimate (`sim::refit_eta`): the words — "about 2:20 left (from
+/// your last 3 refits)", "estimating…" without a history, "finishing…" past the estimate (never a
+/// negative time) — the stage line, the thousands, and the Activity card / headline / Model banner
+/// that carry them.
+#[test]
+fn the_refit_estimate_words_card_headline_and_banner() {
+    use super::activity::headline::{headline, BarMode};
+    use super::activity::jobs::{rows, JobKey, JobProgress};
+    use super::activity::words::{refit_eta_words, refit_stage_words, thousands};
+    use super::dock::model::refit_banner;
+    assert_eq!([thousands(0), thousands(999), thousands(2077), thousands(1_234_567)], ["0", "999", "2,077", "1,234,567"]);
+    let st = |fits, loo, recovery, at_s| sim::RefitStages { fits, loo, recovery, at_s };
+    // the history alone: 140 s total, 0.4 s in → 139.6 s left, rounded up to 2:20
+    let v = refit_view_est(0.4, 2077, 140.0, 3, st(0, 0, false, 0.0));
+    assert_eq!(refit_eta_words(&v, true), "about 2:20 left (from your last 3 refits)");
+    assert_eq!(refit_eta_words(&v, false), "about 2:20 left");
+    assert_eq!(refit_eta_words(&refit_view_est(0.4, 2077, 140.0, 1, st(0, 0, false, 0.0)), true), "about 2:20 left (from your last refit)");
+    assert_eq!(refit_stage_words(&v), "starting");
+    // counting down, then finishing… past the estimate, never negative
+    assert_eq!(refit_eta_words(&refit_view_est(80.0, 2077, 140.0, 3, st(0, 0, false, 0.0)), false), "about 1:00 left");
+    for t in [139.5, 140.0, 141.0, 900.0] {
+        assert_eq!(refit_eta_words(&refit_view_est(t, 2077, 140.0, 3, st(0, 0, false, 0.0)), true), "finishing…", "{t} s");
+    }
+    assert_eq!(refit_eta_words(&refit_view(5.0, 2077), true), "estimating…");
+    // the stages: "of N" while within the history's counts, the trust recovery named
+    assert_eq!(refit_stage_words(&refit_view_est(30.0, 2077, 140.0, 3, st(4, 1, false, 29.0))), "fit 4 of 6 · leave-one-out 1 of 3");
+    assert_eq!(refit_stage_words(&refit_view_est(30.0, 2077, 140.0, 3, st(7, 0, true, 29.0))), "fit 7 · trust recovery");
+    assert_eq!(refit_stage_words(&refit_view(3.0, 2077)), "starting");
+    assert_eq!(refit_stage_words(&sim::RefitView { stages: st(2, 1, false, 1.0), ..refit_view(3.0, 2077) }), "fit 2 · leave-one-out 1");
+
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    // the Activity card: title, count line, the bar driven by the estimate
+    let v = refit_view_est(42.0, 2077, 140.0, 3, st(4, 1, false, 41.0));
+    let inp = PanelInput { busy: true, probe: Some(sim::ProbeView { refit: Some(v), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+    let r = rows(&inp, inp.probe.as_ref());
+    let row = r.iter().find(|r| r.key == JobKey::Refit).unwrap();
+    let left = refit_eta_words(&v, true);
+    assert!(left.starts_with("about ") && left.ends_with(" left (from your last 3 refits)"), "{left}");
+    assert_eq!(row.stage.as_deref(), Some(format!("2,077 samples · {left}").as_str()));
+    assert_eq!(row.count.as_deref(), Some("fit 4 of 6 · leave-one-out 1 of 3"));
+    let f = v.eta.fraction().unwrap() as f32;
+    assert!(matches!(row.progress, JobProgress::Estimate(x) if x == f && x > 0.0 && x < 1.0));
+    // the headline: the same time left, the bar a fraction
+    let h = headline(&inp, inp.probe.as_ref()).unwrap();
+    assert_eq!(h.text, format!("Refitting · 2,077 samples · {}", refit_eta_words(&v, false)));
+    assert!(matches!(h.bar, BarMode::Fraction(x) if x == f));
+    // no history: a sweeping bar, "estimating…"
+    let inp = PanelInput { busy: true, probe: Some(sim::ProbeView { refit: Some(refit_view(5.0, 2077)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+    let row = rows(&inp, inp.probe.as_ref()).into_iter().find(|r| r.key == JobKey::Refit).unwrap();
+    assert!(matches!(row.progress, JobProgress::Indeterminate));
+    assert_eq!(row.stage.as_deref(), Some("2,077 samples · estimating…"));
+    assert_eq!(headline(&inp, inp.probe.as_ref()).unwrap().text, "Refitting · 2,077 samples · 5.0 s · estimating…");
+    // the Model banner: the same time left; a running refit with nothing queued from 2 s on
+    let now = std::time::Instant::now();
+    let m = |n: usize, running| ModelStatus { user_changes_pending: n, refit_running: running, ..model() };
+    assert_eq!(refit_banner(&m(0, true), false, now, Some(&v)).as_deref(), Some(format!("refitting · {}", refit_eta_words(&v, false)).as_str()));
+    assert_eq!(refit_banner(&m(0, false), false, now, Some(&refit_view(0.5, 20))), None, "a refit of milliseconds flashes no banner");
+    assert_eq!(refit_banner(&m(2, true), false, now, Some(&refit_view(0.5, 20))).as_deref(), Some("refitting · estimating… · 2 more pending after this one"));
+    let past = refit_view_est(300.0, 2077, 140.0, 3, st(0, 0, false, 0.0));
+    assert_eq!(refit_banner(&m(1, true), false, now, Some(&past)).as_deref(), Some("refitting · finishing… · 1 more pending after this one"));
+}
+
+/// UI frame tests (2026-11-15): the Activity tab draws the refit's card with its estimate, and the
+/// Model tab its banner with the time left — no Refit now while it runs.
+#[test]
+fn the_refit_estimate_is_drawn_in_the_activity_card_and_the_model_banner() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    let snap = snapshot(&scene, Backend::Estimated, Some(ModelStatus { refit_running: true, ..model() }));
+    let v = refit_view_est(42.0, 2077, 140.0, 3, sim::RefitStages { fits: 4, loo: 1, recovery: false, at_s: 41.0 });
+    let inp = PanelInput { busy: true, probe: Some(sim::ProbeView { refit: Some(v), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+    alone(&mut st, DockTab::Activity);
+    assert!(drawn(&ctx, &mut st, &inp, "activity-job-card"));
+    assert!(drawn(&ctx, &mut st, &inp, "activity-job-title"));
+    alone(&mut st, DockTab::Model);
+    assert!(drawn(&ctx, &mut st, &inp, "model-refit-banner"));
+    assert!(!PROBES.with(|p| p.borrow().contains_key("refit-now")), "no Refit now while a refit runs");
+    // a refit of milliseconds: no banner
+    let snap = snapshot(&scene, Backend::Estimated, Some(model()));
+    let inp = PanelInput { busy: true, probe: Some(sim::ProbeView { refit: Some(refit_view(0.2, 20)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+    assert!(!drawn(&ctx, &mut st, &inp, "model-refit-banner"));
+}
+
 /// 2026-11-14, the batched forget: the pending-refit banner's words — "N changes pending · refit in
 /// 8 s" while the debounce waits, "· refit starting" once due, "· the sampling pass's fit takes
 /// them" during a pass, "refitting · N more pending after this one" while a refit runs, nothing with
@@ -12460,14 +12956,14 @@ fn the_pending_refit_banner_and_refit_now() {
     use std::time::{Duration, Instant};
     let now = Instant::now();
     let pending = |n, due: Option<Instant>, running| ModelStatus { user_changes_pending: n, refit_due: due, refit_running: running, ..model() };
-    assert_eq!(refit_banner(&pending(0, None, false), false, now), None);
-    assert_eq!(refit_banner(&pending(0, None, true), false, now), None);
-    assert_eq!(refit_banner(&pending(2, Some(now + Duration::from_millis(7400)), false), false, now).as_deref(), Some("2 changes pending · refit in 8 s"));
-    assert_eq!(refit_banner(&pending(1, Some(now + Duration::from_secs(3)), false), false, now).as_deref(), Some("1 change pending · refit in 3 s"));
-    assert_eq!(refit_banner(&pending(1, Some(now), false), false, now).as_deref(), Some("1 change pending · refit starting"));
-    assert_eq!(refit_banner(&pending(3, Some(now), false), true, now).as_deref(), Some("3 changes pending · the sampling pass's fit takes them"));
-    assert_eq!(refit_banner(&pending(1, Some(now + Duration::from_secs(9)), true), false, now).as_deref(), Some("refitting · 1 more pending after this one"));
-    assert_eq!(refit_banner(&pending(2, None, false), false, now).as_deref(), Some("2 changes pending · refit due"));
+    assert_eq!(refit_banner(&pending(0, None, false), false, now, None), None);
+    assert_eq!(refit_banner(&pending(0, None, true), false, now, None), None);
+    assert_eq!(refit_banner(&pending(2, Some(now + Duration::from_millis(7400)), false), false, now, None).as_deref(), Some("2 changes pending · refit in 8 s"));
+    assert_eq!(refit_banner(&pending(1, Some(now + Duration::from_secs(3)), false), false, now, None).as_deref(), Some("1 change pending · refit in 3 s"));
+    assert_eq!(refit_banner(&pending(1, Some(now), false), false, now, None).as_deref(), Some("1 change pending · refit starting"));
+    assert_eq!(refit_banner(&pending(3, Some(now), false), true, now, None).as_deref(), Some("3 changes pending · the sampling pass's fit takes them"));
+    assert_eq!(refit_banner(&pending(1, Some(now + Duration::from_secs(9)), true), false, now, None).as_deref(), Some("refitting · 1 more pending after this one"));
+    assert_eq!(refit_banner(&pending(2, None, false), false, now, None).as_deref(), Some("2 changes pending · refit due"));
     // drawn: the verdict card's banner and Refit now
     let scene = Scene::preset("h2").unwrap();
     let cam = camera();
@@ -12489,11 +12985,11 @@ fn the_pending_refit_banner_and_refit_now() {
     assert!(matches!(&row.control, Some((l, Action::RefitNow)) if l == "Refit now"));
     // running with more queued: no Refit now in the card, the Refitting row says what follows
     let snap = snapshot(&scene, Backend::Estimated, Some(pending(1, Some(Instant::now() + Duration::from_secs(60)), true)));
-    let inp = PanelInput { probe: Some(sim::ProbeView { refit: Some((12.0, 250)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
+    let inp = PanelInput { probe: Some(sim::ProbeView { refit: Some(refit_view(12.0, 250)), ..Default::default() }), ..input(&scene, Some(&snap), &cam) };
     assert!(drawn(&ctx, &mut st, &inp, "model-refit-banner") && !PROBES.with(|p| p.borrow().contains_key("refit-now")));
     let r = rows(&inp, inp.probe.as_ref());
     assert!(r.iter().all(|r| r.key != JobKey::PendingRefit));
-    assert!(r.iter().any(|r| r.key == JobKey::Refit && r.detail == "250 samples · 1 more pending after this one"), "{:?}", r.iter().map(|r| &r.detail).collect::<Vec<_>>());
+    assert!(r.iter().any(|r| r.key == JobKey::Refit && r.detail == "250 samples · estimating… · 1 more pending after this one"), "{:?}", r.iter().map(|r| &r.detail).collect::<Vec<_>>());
     // nothing pending: no banner, no row
     let snap = snapshot(&scene, Backend::Estimated, Some(model()));
     let inp = input(&scene, Some(&snap), &cam);

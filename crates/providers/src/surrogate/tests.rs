@@ -4260,6 +4260,70 @@ fn a_refit_reports_its_phase_on_the_probe() {
     assert_eq!((v.refit, v.refits), (None, 2), "the refit was bracketed and closed");
 }
 
+/// 2026-11-15, the refit time estimate (`sim::refit_eta`): a refit that ends with a fit leaves a
+/// record (its samples, species, stages, wall; a failed one none); a background refit publishes its
+/// stages on the probe while it runs and records them at its install; with a collection attached the
+/// history is written to `refit_times.csv` and read back at the next attach (a corrupt line skipped,
+/// with a note), and the running refit's view carries the estimate it gives.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn refit_times_are_recorded_published_and_kept_with_the_collection() {
+    // a failed refit leaves no record
+    let probe = sim::ActivityProbe::new();
+    let (s, _) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    let mut s = s.with_probe(probe.clone());
+    assert!(s.refit().is_err());
+    assert!(probe.refit_history().is_empty());
+
+    let dir = collection_root("refit-times");
+    let probe = sim::ActivityProbe::new();
+    let (s, _) = pair_student();
+    let mut s = s.with_probe(probe.clone());
+    s.attach_collection(&dir, &h2(1.4)).unwrap();
+    let slug = s.provenance_for(&h2(1.4)).surface_key().slug();
+    // one synchronous refit (the H₂ fit) inside
+    let (h2_steps, all) = teach_h2_then_h2_he(&mut s);
+    let h = probe.refit_history();
+    assert_eq!(h.len(), 1, "{h:?}");
+    assert_eq!((h[0].samples as usize, h[0].species, h[0].background), (h2_steps, 1, false));
+    assert!(h[0].fits >= 1 && h[0].loo >= 1 && h[0].wall_s > 0.0, "{:?}", h[0]);
+    // a background refit: its stages on the probe while it runs (the phase stays open until the
+    // install), with the estimate from the one record
+    assert!(s.pending_refit() && s.begin_refit_background());
+    let t0 = std::time::Instant::now();
+    let v = loop {
+        let v = probe.view().refit.expect("the refit's phase is open until the install");
+        if v.stages.fits >= 1 && v.stages.loo >= 1 {
+            break v;
+        }
+        assert!(t0.elapsed().as_secs() < 120, "no stages published: {v:?}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert_eq!((v.samples as usize, v.species, v.background), (all, 2, true));
+    let e = v.estimate.expect("one record: an estimate");
+    assert_eq!(e.from, 1);
+    assert!(e.total_s > 0.0 && v.eta != sim::RefitEta::Estimating);
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Installed(Ok(_))));
+    assert!(probe.view().refit.is_none());
+    let h = probe.refit_history();
+    assert_eq!(h.len(), 2);
+    assert_eq!((h[1].samples as usize, h[1].species, h[1].background), (all, 2, true));
+    assert!(h[1].fits >= 1 && h[1].loo >= 1, "{:?}", h[1]);
+    // written with the collection, read back at the next attach (a corrupt line skipped)
+    let path = dir.join(&slug).join(surrogate::REFIT_TIMES_FILE);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(sim::refit_eta::decode(&text), (h.clone(), 0));
+    drop(s);
+    std::fs::write(&path, format!("{text}this is not a record\n")).unwrap();
+    let probe2 = sim::ActivityProbe::new();
+    let (s2, _) = pair_student();
+    let mut s2 = s2.with_probe(probe2.clone());
+    s2.attach_collection(&dir, &h2(1.4)).unwrap();
+    assert_eq!(probe2.refit_history(), h);
+    let notes = Trainable::take_notes(&mut s2);
+    assert!(notes.iter().any(|n| n.contains("1 unreadable lines of refit_times.csv skipped")), "{notes:?}");
+}
+
 // ---- the decision golden (Activity Task 2: the codes, outcomes and events change no decision) ----
 
 /// `MorseDimer` answers only two nuclei; the pass's isolated-atom references need one. This
@@ -4568,7 +4632,7 @@ fn scripted_session_with(views: bool) -> String {
     let (mut s, h, _open, _calls) = with_gated_auditor(0, 0.0);
     let answer = |s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>| {
         let generation = s.auditor.as_ref().expect("an auditor").generation.load(Ordering::Relaxed);
-        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None };
+        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
         AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps: None }
     };
     let mut teacher = MorseDimer::h2();
@@ -4974,7 +5038,7 @@ fn solved(r: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>)
 /// fields; the tests below hand its answer to `handle_answer` directly).
 fn audit_answer(s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>) -> AuditAnswer {
     let generation = s.auditor.as_ref().expect("an auditor").generation();
-    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None };
+    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
     let scf_steps = result.is_ok().then_some(5);
     AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps }
 }
@@ -6487,7 +6551,7 @@ impl ForceProvider for Producer {
             r.orbitals = Some(sim::OrbitalDisplay {
                 cell: scene.cell.clone(), origin: [0.0; 3], positions: scene.nuclei.iter().map(|n| n.pos).collect(), rows: vec![row],
                 field: None, spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what: self.view.what.clone(),
-                lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None,
+                lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None, kind: sim::OrbitalKind::Converged,
             });
         }
         Ok(r)
@@ -8401,7 +8465,7 @@ fn nothing_inside_a_fenced_band_is_fitted_or_judged() {
     // a background audit landing in the band, its answer 0.5 Ha off the model
     let scene = h2(5.5);
     let prov = s.provenance_for(&scene);
-    let job = AuditJob { scene, prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None };
+    let job = AuditJob { scene, prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
     s.judge_audit(job, t.energy - 0.5, t.forces.clone(), None, None, None, 1.0, Some(10));
     let note = s.pending_notes.last().cloned().unwrap_or_default();
     println!("{note}");
@@ -8427,7 +8491,7 @@ fn judged_audits_are_recorded_in_the_history() {
     let (pos, z) = pos_z(&scene);
     let pred = s.model().unwrap().predict(&pos, &z, true).unwrap();
     let prov = s.provenance_for(&scene);
-    let job = || AuditJob { scene: scene.clone(), prov: prov.clone(), generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None };
+    let job = || AuditJob { scene: scene.clone(), prov: prov.clone(), generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
     s.judge_audit(job(), t.energy, t.forces.clone(), None, None, None, 1.0, Some(10));
     assert_eq!(s.audit_history().len(), 1);
     let p = s.audit_history().iter().next().unwrap().clone();
@@ -11313,6 +11377,9 @@ mod fence_lift;
 /// Scoped-trust study step 3 (2026-11-13): the block downdate by a suspect set and its shift on
 /// the stored scenes, a measurement only (`scope_measure.rs`).
 mod scope_measure;
+
+/// Live-orbitals Task 5: the background auditor's Harris display job (`harris.rs`).
+mod harris;
 
 // ---- M8a Task 10: masked scenes (a capped segment teaches only its interior atoms) ----
 

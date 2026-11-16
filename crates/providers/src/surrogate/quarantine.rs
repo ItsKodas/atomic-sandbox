@@ -624,6 +624,7 @@ impl SurrogateKs {
     /// cap), so the collection gets no status record from it either (`sync_collection_status`
     /// finds no code changed). The entry report is returned, the note says so.
     pub(super) fn recover_trust(&mut self, report: FitReport) -> FitReport {
+        self.refit_stage(sim::RefitStage::Recovery);
         let body3 = self.basis().is_some_and(|b| b.body3);
         // the state on entry: what a recovery that does not restore the residuals returns to
         let (entry_state, entry_flags, entry_dirty) = (self.save_state(), self.quarantine.clone(), self.species_dirty);
@@ -1149,6 +1150,9 @@ impl SurrogateKs {
     /// the class pass's numbers, bit for bit). `None` without a model or a store.
     pub(super) fn ensure_loo_ratios(&mut self) -> Option<&LooRatios> {
         if self.fresh_loo_ratios().is_none() {
+            if self.model.is_some() && self.store.is_some() {
+                self.refit_stage(sim::RefitStage::LeaveOneOut);
+            }
             let (model, store) = (self.model.as_ref()?, self.store.as_ref()?);
             let members: Vec<usize> = self.fit_member_indices().collect();
             let samples: Vec<&Sample> = members.iter().map(|&i| &store.samples[i]).collect();

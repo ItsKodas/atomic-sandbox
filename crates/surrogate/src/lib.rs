@@ -29,6 +29,7 @@ pub mod model;
 pub mod novelty;
 pub mod quarantine;
 pub mod sidecar;
+pub mod threads;
 
 pub use descriptor::{describe, describe_values, no_neighbours, touched_columns, AtomDescriptor, Basis, Body3Term, Body4Term, DescribeError, BODY4_DEGREE_CAP, BODY4_DEGREE_START, COLLECTION_R_CUT};
 pub use envelope::Envelope;
@@ -36,7 +37,7 @@ pub use fit::{
     fit, Accumulator, FitError, FitOptions, FitReport, RefitKind, Sample, SampleStore, SampleTag, StoreError, Sums,
 };
 pub use model::{energy_and_forces, Model, Prediction, Provenance, SurfaceKey};
-pub use collection::{Collection, CollectionReference, CollectionSample, ImportReport, OpenReport, PurgeOutcome, ReferenceOutcome};
+pub use collection::{Collection, CollectionReference, REFIT_TIMES_FILE, CollectionSample, ImportReport, OpenReport, PurgeOutcome, ReferenceOutcome};
 pub use grade::ActiveSet;
 pub use history::{AuditHistory, AuditPoint, EnvKey, HISTORY_CAP};
 pub use novelty::NullSpace;

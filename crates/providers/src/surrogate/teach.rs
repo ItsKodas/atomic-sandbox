@@ -738,7 +738,7 @@ impl SurrogateKs {
             started: Instant::now(),
         });
         self.pass_start = Some(self.samples());
-        self.pass = Some(crate::sampling::Sampler::targeted(scene, jobs));
+        self.begin_pass(crate::sampling::Sampler::targeted(scene, jobs));
         Ok(())
     }
 

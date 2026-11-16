@@ -647,7 +647,7 @@ mod tests {
                     unoccupied: None,
                     notes: Vec::new(),
                     what: crate::provider::OrbitalRequest::List,
-                    lone_atom: Default::default(), share_z: None,
+                    lone_atom: Default::default(), share_z: None, kind: crate::provider::OrbitalKind::Converged,
                 });
             }
             Ok(r)

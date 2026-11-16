@@ -64,7 +64,7 @@ pub(crate) fn thermostat_from_travel(u: f64) -> f64 {
 /// The ⚠ Model only toggle's label and tooltip (user request 2026-11-12; rule 7: it says plainly
 /// what goes unchecked).
 pub const MODEL_ONLY: &str = "⚠ Model only";
-pub const MODEL_ONLY_TIP: &str = "model only: the model answers every step and no DFT solve interrupts the run — draft mode on and the background DFT audits off, in one switch, until you turn it off (it then restores the draft mode and audit cadence you had). Nothing checks the model's answers while it is on: energies and forces can drift from DFT unnoticed, and the model does not learn from audits (there are none). The red draft banner and the red atom tint still show where it extrapolates. Changing draft mode or the audit cadence by hand turns it off and keeps your change; leaving Estimated turns it off and restores. Not saved: every session starts with it off.";
+pub const MODEL_ONLY_TIP: &str = "model only: the model answers every step and no DFT solve interrupts the run — draft mode on and the background DFT audits off, in one switch, until you turn it off (it then restores the draft mode and audit cadence you had). Nothing checks the model's answers while it is on: energies and forces can drift from DFT unnoticed, and the model does not learn from audits (there are none). The red draft banner and the red atom tint still show where it extrapolates. Opening Orbitals, All orbitals coloured or Spin density still runs display-only orbital solves (in the potential of the superposed atoms: not self-consistent, no SCF, nothing learned) plus the one isolated-atom solve per species the cloud already makes; no DFT runs for forces or motion. Changing draft mode or the audit cadence by hand turns it off and keeps your change; leaving Estimated turns it off and restores. Not saved: every session starts with it off.";
 
 fn estimated_tip(gpu: bool) -> String {
     let teacher = if gpu { "GPU" } else { "CPU" };
@@ -405,7 +405,7 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     group(ui, st, "tb-time", "Time", None, w.time, |ui, st| {
         row(ui, |ui| {
             time_buttons(ui, st, input, sampling, false, acts);
-            super::relax_toggle(ui, input, Vec2::new(RELAX_W, 28.0), ("relax", "relax"), acts);
+            super::relax_toggle(ui, input, st.relax_pending.as_ref(), Vec2::new(RELAX_W, 28.0), ("relax", "relax"), acts);
         });
         ui.horizontal(|ui| match d.and_then(|d| d.relax.as_ref()).filter(|r| r.converged.is_none()) {
             Some(r) => {
