@@ -5,6 +5,10 @@ version.workspace = true
 
 [dependencies]
 units = { path = "../units" }
+# dense f64 linear algebra for the large-basis fit (MIT; CLAUDE.md rule 2): blocked, threaded
+# Cholesky, triangular inverse, tridiagonalisation and symmetric eigensolver
+faer = { version = "=0.24.4", default-features = false, features = ["std", "rayon"] }
+rayon = "1.11"
 
 [features]
 # test hooks for other crates' tests (`Collection::inject_purge_failure`); never in a build

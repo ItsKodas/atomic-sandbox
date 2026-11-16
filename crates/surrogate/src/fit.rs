@@ -190,12 +190,14 @@
 //!
 //! i.e. the whole evidence (the formula above, with the nominal λ in (Q′/2) ln λ and λ‖m‖²) in O(Q′)
 //! per evaluation. No eigenvectors are formed: H_ρ is reduced to tridiagonal form by Householder
-//! reflections (`linalg::Tridiagonal`, 2Q′³) and diagonalised by implicit QL, the reflections and
-//! rotations applied to b̃_F + ρ b̃_E alone. Per outer round: the λ search (the same grid and
+//! reflections (faer's blocked, threaded reduction, `dense::tridiagonal_qtc`, ≈ 4Q′³/3) and
+//! diagonalised by implicit QL (`linalg::tridiagonal_ql`, O(Q′²)), the reflections and rotations
+//! applied to b̃_F + ρ b̃_E alone. Per outer round: the λ search (the same grid and
 //! golden section, now O(Q′) per point) and — with neither noise level pinned — the common scale t
 //! by MacKay's β update at fixed ρ, t = ρRSS_E + RSS_F over n_E + n_F − γ (stationarity in t:
 //! d ln p/dt = [−(n_E + n_F) + γ]/(2t) + (ρRSS_E + RSS_F)/(2t²)), alternated to 1e-6; then one
-//! exact factorisation and inverse at (λ, s_E², s_F²) (the vectorised kernels, ≈ Q′³) gives
+//! exact factorisation and inverse at (λ, s_E², s_F²) (faer's blocked, threaded Cholesky and SPD
+//! inverse, `dense`, ≈ Q′³) gives
 //! RSS_κ and γ_κ per kind and the per-kind fixed points s_κ² = RSS_κ/(n_κ − γ_κ) the next ρ, as a
 //! step in ln ρ whose multiplier halves each time the step reverses direction (the bare fixed point
 //! cycled — ρ 460 → 2.1e4 → 1.4e3 → 460 — on a near-noise-free collection fixture; an evidence
@@ -207,7 +209,10 @@
 //! falls back to the reference search. Measured on a Q′ 250 body-4 fixture
 //! (`large_basis_search_finds_the_reference_search_optimum`): λ equal to 5 digits, σ_E within
 //! 0.05 %, ln p equal to 7 digits, 49 ms against 4 007 ms; at Q′ 2 688 and 10 000 samples a search
-//! takes 27.8 s (6 rounds; `references.md` "M8a body-4").
+//! takes 27.8 s (6 rounds; `references.md` "M8a body-4"). Since 2026-11-17 the O(Q′³) kernels are
+//! faer's (`dense`: blocked, threaded on the fit's CPU share, the same numbers on any thread
+//! count) instead of `linalg`'s single-threaded loops — the same algorithms and backward errors,
+//! other last bits (`references.md`, "Refit speed-up").
 //!
 //! **Warm refit.** Between searches the hyperparameters and the standardisation D stand (the
 //! search's, frozen), and a new sample only adds rows: A ← A + U Uᵀ with U the sample's k = 3N + 1
@@ -310,8 +315,7 @@
 use crate::descriptor::{describe, Basis, DescribeError};
 use crate::envelope::Envelope;
 use crate::linalg::{
-    cholesky_in_place, cholesky_in_place_fast, cholesky_inverse, cholesky_logdet, cholesky_solve, cholesky_update_upper, dot,
-    inverse_from_lower_inverse, lower_inverse_transposed, mat_vec, mat_vec_fast, tridiagonal_ql, upper_solve, Tridiagonal,
+    cholesky_in_place, cholesky_inverse, cholesky_logdet, cholesky_solve, cholesky_update_upper, dot, mat_vec, mat_vec_fast, tridiagonal_ql, upper_solve,
 };
 use crate::model::{energy_and_forces, Model, Provenance};
 use std::fmt;
@@ -2021,8 +2025,9 @@ impl Spectrum {
 }
 
 impl TwoNoise {
-    /// The spectrum at ratio ρ: one Householder tridiagonalisation of H_ρ and an implicit QL
-    /// iteration that carries Qᵀc along (no eigenvectors are formed).
+    /// The spectrum at ratio ρ: one Householder tridiagonalisation of H_ρ with Qᵀc (faer's
+    /// blocked, threaded reduction: `dense::tridiagonal_qtc`) and an implicit QL iteration that
+    /// carries Qᵀc along (no eigenvectors are formed).
     fn spectrum(&self, rho: f64) -> Result<Spectrum, FitError> {
         let _prof = crate::prof::span("fit:     spectrum (tridiag+QL, Q'^3)");
         let q = self.q;
@@ -2034,10 +2039,8 @@ impl TwoNoise {
             }
             max_diag = max_diag.max(h[i * q + i]);
         }
-        let tri = Tridiagonal::of(&h, q);
         let mut c: Vec<f64> = (0..q).map(|i| self.b_f[i] + rho * self.b_e[i]).collect();
-        tri.apply_qt(&mut c);
-        let (mut d, mut e) = (tri.d.clone(), tri.e.clone());
+        let (mut d, mut e) = crate::dense::tridiagonal_qtc(&h, q, &mut c);
         tridiagonal_ql(&mut d, &mut e, |i, cc, ss| {
             let (x, y) = (c[i], c[i + 1]);
             c[i] = cc * x - ss * y;
@@ -2047,8 +2050,8 @@ impl TwoNoise {
         Ok(Spectrum { rho, h: d, c, mu_floor: 4.0 * q.max(1) as f64 * f64::EPSILON * max_diag })
     }
 
-    /// [`TwoNoise::solve`] with the large-basis kernels (the vectorised Cholesky and the
-    /// triangular inverse: ≈ Q′³ flops instead of ≈ 2.3 Q′³), plus tr Σ and tr(Σ G̃_E).
+    /// [`TwoNoise::solve`] with the large-basis kernels (faer's blocked, threaded Cholesky and SPD
+    /// inverse, `dense`: ≈ Q′³ flops instead of ≈ 2.3 Q′³), plus tr Σ and tr(Σ G̃_E).
     fn solve_large(&self, lambda: f64, s_e2: f64, s_f2: f64) -> Result<(Solved, LargeExtra), FitError> {
         let _prof = crate::prof::span("fit:     solve_large (chol+inverse, Q'^3)");
         let q = self.q;
@@ -2065,13 +2068,12 @@ impl TwoNoise {
         for i in 0..q {
             a[i * q + i] += lambda_eff;
         }
-        let mut chol = a.clone();
-        cholesky_in_place_fast(&mut chol, q).map_err(|_| FitError::Singular)?;
+        let chol = crate::dense::cholesky_lower(&a, q).map_err(|_| FitError::Singular)?;
         let mut m: Vec<f64> = (0..q).map(|i| self.b_e[i] * ie + self.b_f[i] * i_f).collect();
         cholesky_solve(&chol, q, &mut m);
         let rss_e = residual_ss(&self.g_e, &self.b_e, self.yy_e, q, &m);
         let rss_f = residual_ss(&self.g_f, &self.b_f, self.yy_f, q, &m);
-        let inv = inverse_from_lower_inverse(&lower_inverse_transposed(&chol, q), q);
+        let inv = crate::dense::spd_inverse(&chol, q);
         let tr_sigma_ge = trace_product(&inv, &self.g_e, q);
         let gamma_e = tr_sigma_ge * ie;
         let gamma_f = trace_product(&inv, &self.g_f, q) * i_f;
@@ -3614,7 +3616,7 @@ mod tests {
         let (model, report) = acc.refit(&opts, &provenance(), &refs).unwrap();
         let q = report.q_prime;
         let l = model.sigma_inv_chol.as_ref().unwrap();
-        let sigma = inverse_from_lower_inverse(&lower_inverse_transposed(l, q), q);
+        let sigma = crate::linalg::inverse_from_lower_inverse(&crate::linalg::lower_inverse_transposed(l, q), q);
         let (s, u) = crate::linalg::symmetric_eigen_householder(&sigma, q);
         let mut order: Vec<usize> = (0..q).collect();
         order.sort_by(|&a, &b| s[b].total_cmp(&s[a]));

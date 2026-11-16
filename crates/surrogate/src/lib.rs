@@ -18,6 +18,7 @@
 
 pub mod basis;
 pub mod collection;
+pub mod dense;
 pub mod descriptor;
 pub mod envelope;
 pub mod fit;
