@@ -3955,13 +3955,40 @@ pub(crate) mod tests {
         let r = s.solve(&system, &settings, false).map(|(_, st)| st);
         let wall = t.elapsed().as_secs_f64();
         let p = s.profile().clone();
-        println!("H₂O 97³ × 0.25 all-electron, cold: {:?} after {wall:.1} s; witness growths {}, class raises {}, locked calls {}, frozen steps {}, DIIS resets {}",
+        println!("H₂O 97³ × 0.25 all-electron, cold: {:?} after {wall:.1} s; peak block {}, witness growths {}, class raises {}, locked calls {}, frozen steps {}, DIIS resets {}",
                  r.as_ref().map(|st| (st.iterations, st.energy.total, st.energy.ts, st.max_eigen_residual, st.max_guard_residual)),
-                 p.witness_growths, p.class_raises, p.locked_calls, p.frozen_steps, p.diis_resets);
+                 p.peak_block, p.witness_growths, p.class_raises, p.locked_calls, p.frozen_steps, p.diis_resets);
         let st = r.unwrap_or_else(|e| panic!("H₂O 97³ × 0.25 cold: {e}"));
         let state = s.state().expect("converged");
         println!("  stored ↑ {} ↓ {} (n {} / {}), ε↑ {:?}", state.orbitals_up.len(), state.orbitals_dn.len(), system.n_up, system.n_dn, state.evals_up);
         assert!(st.energy.total.is_finite());
+    }
+
+    /// Plan 2026-11-13 Task 9c, the VRAM measurement: the cold all-electron H₂O of the app's
+    /// `a_change_over_the_vram_budget_is_refused` (177³ × 0.08, 14.08 Bohr) under FermiDirac at the app's 1e-5 — the
+    /// solve's peak witness allocation (`SolveProfile::peak_block` − n_σ extra vectors per spin), against which the
+    /// footprint's counted growth is set. Run at 167³ × 0.0848 (the same 14.08 Bohr box): 177³ does not run on a
+    /// default-limits device — the Poisson boundary table (`ghost_fill`'s binding 3, 147 MB at 177³) is over wgpu's
+    /// 128 MiB `max_storage_buffer_binding_size`, which `gpu::GpuContext` keeps at its default. A measurement:
+    /// `cargo test -p providers --release --lib -- --ignored --nocapture cold_all_electron_h2o_at_177_peak`.
+    #[test]
+    #[ignore = "measurement (GPU, 167³ all-electron, minutes)"]
+    fn cold_all_electron_h2o_at_177_peak() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sc = h2o(167);
+        sc.cell.h = 14.08 / 166.0;
+        let (grid, system, settings) = problem(&sc, 1e-5, &mut Vec::new()).expect("H₂O 167³ × 0.0848 is posed");
+        assert!(system.ionic.is_none());
+        let mut s = qm_gpu::GpuSolver::new(ctx, &grid);
+        let t = Instant::now();
+        let r = s.solve(&system, &settings, false).map(|(_, st)| st);
+        let wall = t.elapsed().as_secs_f64();
+        let p = s.profile().clone();
+        println!("H₂O 167³ × 0.0848 (14.08 Bohr) all-electron, cold: {:?} after {wall:.1} s; peak block {} (n↑ {}, n↓ {}), witness growths {}, trims {}, class raises {}, locked calls {}, DIIS resets {}",
+                 r.as_ref().map(|st| (st.iterations, st.energy.total, st.max_eigen_residual)), p.peak_block, system.n_up, system.n_dn,
+                 p.witness_growths, p.witness_trims, p.class_raises, p.locked_calls, p.diis_resets);
+        r.unwrap_or_else(|e| panic!("H₂O 167³ cold: {e}"));
     }
 
     // ---- the Harris display (module doc, "Harris display"; live-orbitals Task 4) ----

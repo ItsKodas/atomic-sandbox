@@ -5262,6 +5262,47 @@ since M7). It is **real allocation, not over-counting**: the solver's pool and `
 all-electron FD solves reach ≥ 16 extra vectors per spin on transient steps (97³ H₂O 20, 95³ H⁻ 16 before the trim).
 Each extra vector costs 12 fields (8 `LobpcgWork` slots, the orbital, its kinetic scratch, per spin).
 
+### The cold-start window (plan 2026-11-13 Task 9c, 2026-11-17, release, RX 7900 XTX)
+
+What changed (derivations in `qm::occupations` "The step-accuracy tail" / "The loose stop", `qm::nuclear::free_atom_density`,
+`qm_gpu::scf` "The cold-start window"): (a) the FermiDirac cold density is the superposition of the free atoms'
+LSDA densities (`qm::radial`, Z only) convolved with the nuclear Gaussian σ and rescaled per atom to Z on the grid
+(pseudised centres keep the σ = 1 blobs); (b) a loosened GPU step's witness tail is X = ln(n_w/(1e-3·Δρ_prev)) kT,
+clamped to [6, 36] (tight steps keep 36 kT), with a DIIS reset when a widened window grew the block; (c) the GPU block's
+top column is an untested buffer (f = 0, outside the witness test; none at the cap); (d) the GPU's loose columns stop
+once Σ_L (2 + 2r_j/kT)·f̂_j < 1e-2·tol, no class raise is needed and the witness passes (`SolveProfile::loose_stops`;
+those calls' residuals leave `max_guard_residual`); and `should_abort` reaches the FD channels' LOBPCG (pause/cancel
+inside an eigensolve, the iterate parked as the warm start). (e), a chunked witness tail, was not needed.
+
+**Why the free atoms are smeared.** Unsmeared, the O 1s (⟨r⟩ ≈ 0.19 Bohr) sits inside the σ = h = 0.25 nucleus and
+over-screens it: on all-electron H₂O 97³ × 0.25 every first-step level lay above −0.04 Ha (μ −0.003 Ha; no witness in
+32 extra vectors, the solve failed). Unrescaled, the point samples of that core carried several times Z (every level
+above +0.39 Ha). Smeared and rescaled, the first step's μ is −0.127 Ha (converged −0.138).
+
+**All-electron H₂O 97³ × 0.25 cold** (`providers` `cold_all_electron_h2o_at_97_converges`, 1e-5; 9b: 22 steps, 123 s,
+peak 20 extra vectors per spin): **11 steps, 7.3 s** (uncontended), peak block 13 (8 extra vectors per spin, the buffer
+included, all on step 1's 36 kT window), 6 growths, 1 DIIS reset; F −37.530159 (9b −37.530154: the f32 path scatter at
+Δρ < 1e-5). Measured on the way (the user's app on 43 % of the GPU): (a)+(b) alone 11 steps / 38.2 s, peak 12–13; with
+(c) the eigen iterations fell from 2474 to 1581, with (d) to 1175.
+`timing_table` (`gpu_vs_cpu`, 1e-6, CPU references alongside): **H₂O 97³ cold 13.5 s**, 13 steps (9b 114.5 s; target
+5 s still missed, reported), warm 5.0 s / 11 steps; H₂ 97³ cold 0.54 s / 11 steps, warm 0.55 s / 9.
+
+**The app's 177³ VRAM case** (`providers` `cold_all_electron_h2o_at_177_peak`, `#[ignore]`d measurement): the
+all-electron H₂O at the app's 14.08 Bohr box, run at 167³ × 0.0848 — 177³ does not run on the solver's device: the
+Poisson boundary table (`ghost_fill`'s binding 3) is 147 MB at 177³, over wgpu's default 128 MiB
+`max_storage_buffer_binding_size`, which `gpu::GpuContext` keeps — **17 steps, 152 s (contended), peak block 9: 4 extra
+vectors per spin** (3 tested + the buffer), 2 growths. The scene guard's estimate still counts `WITNESS_GROWTH_COUNTED`
+= 16, so the app test still reads 21.58 GB (estimated mode, 2 solvers). At a counted w the estimate is 9.91 + 0.729·w
+GB: w = 4 (the measured peak) 12.83 GB, under this card's 12.88 GB budget (half its 25.76 GB) but over the 12.0 GB
+default the test pins; w ≤ 2 fits 12.0 GB. Not re-pinned: the count is the 9b ruling's acceptance number (open).
+
+**The gates after 9c.** CPU loose vs all-tight (`fd_guard_tier_matches_all_tight`, the six gated cases): H₂O ΔF
++7.8e-12 (|ΔF_I| 1.1e-10), LiH −7.0e-13, Li +1.0e-12, H₄ −1.4e-12, pseudo-O M = 1 −4.3e-12, M = 3 −1.1e-11 Ha (all
+|ΔF_I| ≤ 1.1e-10); the off-site record −5.4e-10 / 2.0e-9 inside its derived bounds (1.47e-9, 2e-8). GPU H₃⁺ 1.6 r₀:
+**12 steps, 0 DIIS resets**, 10 loose stops (worst bound 1.0e-9 against 1e-2·tol = 1e-8), the guard-tier calls ≤ 8.3e-4.
+`gpu_vs_cpu` 12 passed in 7.6 min. Re-pinned with reasons: the CPU and GPU FD pins of `none_policy` (the start moved;
+Aufbau bits unchanged), the frozen-density stall test's anchor (the frozen first Δρ, 0.077 from the free-atom H).
+
 ## Live orbitals (Harris display; spec 2026-11-14)
 
 `tests/harris.rs` (spec `docs/superpowers/specs/2026-11-14-live-orbitals-design.md` §7, V-A1–V-A3; V-A4, a record for §9 Q2, below). First measured 2026-11-14; **re-measured 2026-11-15 after the Harris LOBPCG change of task 8b** (the stop test reads the displayed levels at the SCF's tol, the guards at τ_c/100, the top level a buffer — `qm_gpu::harris` "Three roles"): the tables below are the 2026-11-15 numbers, with the 2026-11-14 ones where they changed. **Re-run 2026-11-16 after task 8b fix 1** (the block memory keeps the last call's need, not the split it ran with; the record's last vector tested, under a buffer, when it can change the shown rows — `qm_gpu::harris` "The record's edge"; the at-cap note prints the displayed and guard tiers' residuals): every gate passes, the changes are noted where they occur. Release, RX 7900 XTX (Vulkan) / Ryzen 7 9800X3D, BelowNormal, the user's app open (the GPU shared with an idle window), each test its own invocation (`--test harris va1`, `va2`, `va3`) with a 3-minute cool-down between them. All cases: σ = h = 0.15 Bohr (the app's Accurate grid), ionic `Accepted` (the app default: H, N and O pseudised; `DegenerateShells` occupations), SCF tol 1e-6 (the floor-aware GPU tol, `effective_gpu_tol`, stays 1e-6 for N ≤ 8), cold SCF on a fresh `GpuSolver`, then `GpuSolver::harris` on the same solver with a new `HarrisState` (m = 0).

@@ -103,6 +103,24 @@
 //! - **Growth** (`grown_extras`): when the witness fails the block grows by its current extra count (the extra block
 //!   doubles: 1, 2, 4, 8, 16, 32), clamped to the cap, instead of one vector per re-solve; each grown vector keeps
 //!   its index-seeded guess. Reaching e extras costs ⌈log₂ e⌉ re-solves instead of e − 1.
+//! - **The step-accuracy tail** (plan 2026-11-13 Task 9c (b), `step_tail_kt`; the task 9b review's lever). On a
+//!   *loosened* GPU step (its eigen tol above the tight one, i.e. far from convergence) the tail arm is
+//!   X = ln(n_w/(c·Δρ_prev)) clamped to [6, 36] kT, c = `STEP_TAIL_C` = 1e-3, n_w the block's levels: the levels it
+//!   leaves out hold f ≤ e^{−X} each, n_w of them at most c·Δρ_prev of charge — the same error class as the Δρ-tied
+//!   eigen tol, a thousandth of the step's own error. The gap arm and the lower bound stay. A tight step (the only kind
+//!   that can converge) runs the full 36 kT window, so a level that crosses into the window can never be missed at
+//!   convergence; a descending level enters on a transient step once its f exceeds c·Δρ, at the cost of one growth.
+//!   A step whose window widened and grew the block resets the DIIS history (the map changed, like an unfreeze).
+//! - **The loose stop** (plan 2026-11-13 Task 9c (d), `loose_bound`; GPU). The bound above holds per column: a loose
+//!   column at residual r_j moves ∫|δρ| by ≤ (2 + 2r_j/kT)·f_j ≤ (2 + 2r_j/kT)·f̂_j, whatever r_j is. So the guard
+//!   tolerance g is only a sufficient condition; the GPU eigensolve also stops the loose columns as soon as
+//!   ```text
+//!   Σ_{j∈L} (2 + 2r_j/kT)·f̂_j < LOOSE_STOP_FACTOR·tol  (= 1e-2·tol)   and the witness passes on θ − r,
+//!   ```
+//!   with the head (the tight columns) at its own tol and no column needing a class raise (`tight_columns` ≤ head) —
+//!   a ∫|δρ| bound of 1e-2·tol, tighter than the guard rule's 2.9e-2·tol. The witness's own lower bound θ − r is
+//!   valid at any r, so a column far above the window stops long before 1e-3 Ha. The CPU reference keeps the guard
+//!   tolerance (its loose columns converge cheaply); both meet the same ∫|δρ| class.
 //! - **Trim** (`witness_keep`): a doubled block overshoots (the 14 Bohr H⁻ needs 10–11 extras and doubled to 16, which
 //!   made every LOBPCG iteration of the solve ~2× dearer: 185 s against 75 s). Once the witness passes, the columns
 //!   above the lowest level t that passes it alone (with one spare above t when that spare passes too) are dropped:
@@ -123,12 +141,27 @@ pub const WITNESS_GAP: f64 = 0.1;
 pub const WITNESS_TAIL_KT: f64 = 36.0;
 /// A level with min(f, 1 − f) at or above this is partly occupied (|ε − μ| ≲ 13.8 kT).
 pub const PARTIAL_OCCUPATION_MIN: f64 = 1e-6;
+/// The loose columns' ∫|δρ| bound (module doc, "The loose stop"): Σ_{j ≥ head} (2 + 2r_j/kT)·f̂_j over the positions
+/// from `head` on, f̂_j = f(θ_j − r_j; μ) the upper-bound occupation. Non-finite inputs give +∞ (never a stop).
+pub fn loose_bound(evals: &[f64], residuals: &[f64], head: usize, mu: f64, kt: f64) -> f64 {
+    assert_eq!(evals.len(), residuals.len(), "loose_bound: one residual per level");
+    let b = neumaier((head..evals.len()).map(|j| (2.0 + 2.0 * residuals[j] / kt) * occupation((evals[j] - residuals[j] - mu) / kt)));
+    if b.is_finite() { b } else { f64::INFINITY }
+}
+
+/// The step-accuracy tail (plan 2026-11-13 Task 9c (b)): the omitted charge's fraction of the previous step's Δρ.
+pub const STEP_TAIL_C: f64 = 1e-3;
+/// Its floor, in kT (f ≤ e^{−6} ≈ 2.5e-3 per omitted level at the widest Δρ).
+pub const STEP_TAIL_MIN_KT: f64 = 6.0;
 /// The GPU SCF's convergence stop on a step whose occupations have a partial level (spec §5.1; the user's
 /// 2026-11-14 value). The one definition (preflight F11): `qm-gpu`, the tags and the dimer ledger read it.
 pub const GPU_PARTIAL_TOL: f64 = 1e-5;
 /// A column is loose when the tail sum of the upper-bound occupations over it and every column above it is below this
 /// × the SCF's Δρ tolerance (module doc, "Witness columns at a guard tolerance"): ∫|δρ| ≤ 2.4e-2·tol (≲ 2.9e-2·tol).
 pub const LOOSE_F_FACTOR: f64 = 1e-2;
+/// The loose stop (module doc, "The loose stop"; plan 2026-11-13 Task 9c (d)): the loose columns stop iterating once
+/// `loose_bound` is below this × the SCF's Δρ tolerance and the witness passes.
+pub const LOOSE_STOP_FACTOR: f64 = 1e-2;
 /// The loose (guard) columns' residual tolerance (Ha): `WITNESS_GAP`/100 = 1e-3, so the witness's lower bound
 /// θ − r loses ≤ 1e-3 Ha of its 0.18 Ha window (module doc). The Harris display's `GUARD_TOL` is the same value.
 pub const WITNESS_GUARD_TOL: f64 = WITNESS_GAP / 100.0;
@@ -245,6 +278,12 @@ pub fn witness_reached(evals: &[f64], n: usize, mu: f64, kt: f64) -> bool {
 /// `WITNESS_TAIL_KT`·kT; ε_(n) is the n-th lowest Ritz value. An empty channel (n = 0) needs none; a channel with no
 /// level above its n-th never has one. `residuals[i]` belongs to `evals[i]`; a non-finite residual never passes.
 pub fn witness_bound_reached(evals: &[f64], residuals: &[f64], n: usize, mu: f64, kt: f64) -> bool {
+    witness_bound_reached_tail(evals, residuals, n, mu, kt, WITNESS_TAIL_KT)
+}
+
+/// `witness_bound_reached` with the tail arm at `tail_kt`·kT (plan 2026-11-13 Task 9c (b): `step_tail_kt` on a loosened
+/// GPU step; `WITNESS_TAIL_KT` everywhere else).
+pub fn witness_bound_reached_tail(evals: &[f64], residuals: &[f64], n: usize, mu: f64, kt: f64, tail_kt: f64) -> bool {
     assert_eq!(evals.len(), residuals.len(), "witness_bound_reached: one residual per level");
     if n == 0 {
         return true;
@@ -255,7 +294,15 @@ pub fn witness_bound_reached(evals: &[f64], residuals: &[f64], n: usize, mu: f64
     let order = ascending(evals);
     let (eps_n, top) = (evals[order[n - 1]], order[order.len() - 1]);
     let lower = evals[top] - residuals[top];
-    lower >= eps_n + WITNESS_GAP && lower - mu >= WITNESS_TAIL_KT * kt
+    lower >= eps_n + WITNESS_GAP && lower - mu >= tail_kt * kt
+}
+
+/// The witness tail of a loosened SCF step (plan 2026-11-13 Task 9c (b); module doc, "The step-accuracy tail"):
+/// X = ln(n_w / (`STEP_TAIL_C`·Δρ_prev)) clamped to [`STEP_TAIL_MIN_KT`, `WITNESS_TAIL_KT`], n_w the block's levels.
+/// A non-finite or non-positive Δρ_prev gives the full `WITNESS_TAIL_KT`.
+pub fn step_tail_kt(n_w: usize, delta_rho_prev: f64) -> f64 {
+    if !(delta_rho_prev.is_finite() && delta_rho_prev > 0.0) { return WITNESS_TAIL_KT; }
+    (n_w.max(1) as f64 / (STEP_TAIL_C * delta_rho_prev)).ln().clamp(STEP_TAIL_MIN_KT, WITNESS_TAIL_KT)
 }
 
 /// How many columns are **tight** (module doc, "Witness columns at a guard tolerance"), as a position count: the
@@ -303,6 +350,11 @@ pub fn tight_start(f: Option<&[f64]>, n: usize, tol: f64) -> usize {
 /// arms (with μ = `mu`, the full block's), or t + 2 when the level above t clears them too (a spare above the witness);
 /// `evals.len()` when nothing passes (never after a passed test) or n = 0.
 pub fn witness_keep(evals: &[f64], residuals: &[f64], n: usize, mu: f64, kt: f64) -> usize {
+    witness_keep_tail(evals, residuals, n, mu, kt, WITNESS_TAIL_KT)
+}
+
+/// `witness_keep` with the tail arm at `tail_kt`·kT (`witness_bound_reached_tail`).
+pub fn witness_keep_tail(evals: &[f64], residuals: &[f64], n: usize, mu: f64, kt: f64, tail_kt: f64) -> usize {
     assert_eq!(evals.len(), residuals.len(), "witness_keep: one residual per level");
     if n == 0 || evals.len() <= n {
         return evals.len();
@@ -312,7 +364,7 @@ pub fn witness_keep(evals: &[f64], residuals: &[f64], n: usize, mu: f64, kt: f64
     let passes = |rank: usize| {
         let i = order[rank];
         let lower = evals[i] - residuals[i];
-        lower >= eps_n + WITNESS_GAP && lower - mu >= WITNESS_TAIL_KT * kt
+        lower >= eps_n + WITNESS_GAP && lower - mu >= tail_kt * kt
     };
     match (n..order.len()).find(|&t| passes(t)) {
         Some(t) if t + 1 < order.len() && passes(t + 1) => t + 2,
@@ -629,5 +681,33 @@ mod tests {
             ]
         );
         assert!(partial_levels(&[-0.5, 0.2], &[1.0, 0.0], 0).is_empty());
+    }
+
+    /// Task 9c (b): X = ln(n_w/(c·Δρ_prev)) kT, clamped to [6, 36]; no Δρ yet (∞, NaN, 0) is the full window.
+    #[test]
+    fn step_tail_follows_the_step_accuracy() {
+        // n_w = 10, Δρ = 1e-2: ln(10 / 1e-5) = ln 1e6 = 13.8155
+        assert!((step_tail_kt(10, 1e-2) - (1e6f64).ln()).abs() < 1e-12);
+        assert!((step_tail_kt(10, 10.0) - (1e3f64).ln()).abs() < 1e-12); // ln 1000 = 6.91, just above the floor
+        assert_eq!(step_tail_kt(10, 100.0), STEP_TAIL_MIN_KT); // ln 100 = 4.6 → 6
+        assert_eq!(step_tail_kt(10, 1e-15), WITNESS_TAIL_KT); // ln 1e19 = 43.7 → 36
+        for d in [f64::INFINITY, f64::NAN, 0.0, -1.0] { assert_eq!(step_tail_kt(7, d), WITNESS_TAIL_KT); }
+        // monotone: a smaller Δρ_prev never shortens the window
+        let xs: Vec<f64> = (0..60).map(|e| step_tail_kt(8, 10f64.powf(2.0 - e as f64 / 4.0))).collect();
+        assert!(xs.windows(2).all(|w| w[1] >= w[0]) && xs[0] == STEP_TAIL_MIN_KT && xs[59] == WITNESS_TAIL_KT, "{xs:?}");
+    }
+
+    /// Task 9c (d): Σ_{j ≥ head} (2 + 2r_j/kT)·f(θ_j − r_j; μ), by position; the head is outside it.
+    #[test]
+    fn loose_bound_is_the_per_column_density_bound() {
+        let kt = ELECTRON_KT;
+        let (evals, res) = ([-0.5, -0.3, 0.05, 0.1], [1e-6, 1e-6, 2e-3, 1e-2]);
+        let mu = -0.2;
+        let want = (2.0 + 2.0 * 2e-3 / kt) * occupation((0.05 - 2e-3 - mu) / kt) + (2.0 + 2.0 * 1e-2 / kt) * occupation((0.1 - 1e-2 - mu) / kt);
+        assert!((loose_bound(&evals, &res, 2, mu, kt) / want - 1.0).abs() < 1e-14, "{} vs {want}", loose_bound(&evals, &res, 2, mu, kt));
+        assert_eq!(loose_bound(&evals, &res, 4, mu, kt), 0.0);
+        // the head's own levels (f ≈ 1) would dominate if counted
+        assert!(loose_bound(&evals, &res, 0, mu, kt) > 3.9);
+        assert_eq!(loose_bound(&[0.1], &[f64::NAN], 0, mu, kt), f64::INFINITY);
     }
 }

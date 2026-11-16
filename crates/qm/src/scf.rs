@@ -309,7 +309,7 @@ use crate::grid::{neumaier, Grid};
 use crate::ionic::{core_overlaps, IonicSetup, CORE_OVERLAP_WARNING};
 use crate::nonlocal::{NonlocalOp, PseudoHamiltonian};
 use crate::nuclear::{centres, deposit_centres, has_partial_core, ionic_local_potential, ionic_repulsion, partial_core_field, Centre};
-use crate::nuclear::{deposit_charge, nuclear_potential, nuclear_repulsion, Nucleus};
+use crate::nuclear::{deposit_charge, free_atom_density, nuclear_potential, nuclear_repulsion, Nucleus};
 use crate::poisson::{hartree_energy, PoissonSolver, PoissonStats};
 use crate::stencil::kinetic;
 use crate::xc::{lsda_pw92, XcResult};
@@ -1123,7 +1123,12 @@ fn scf_tiered(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option
             let total = (system.n_up + system.n_dn) as f64;
             // broad atomic-like blobs (σ = 1 Bohr) carrying each centre's charge (Z, or Z_v when pseudised)
             let (z_tot, guess) = match system.ionic.as_deref() {
-                None => (system.nuclei.iter().map(|q| q.z as f64).sum::<f64>(), deposit_charge(grid, &system.nuclei, 1.0)),
+                // FermiDirac starts from the free atoms' densities (plan 2026-11-13 Task 9c (a), `qm::nuclear::free_atom_density`);
+                // Aufbau and DegenerateShells keep the sigma = 1 blobs (their bits)
+                None => (system.nuclei.iter().map(|q| q.z as f64).sum::<f64>(), match settings.occupations {
+                    Occupations::FermiDirac { .. } => free_atom_density(grid, &system.nuclei, settings.sigma).unwrap_or_else(|| deposit_charge(grid, &system.nuclei, 1.0)),
+                    Occupations::Aufbau | Occupations::DegenerateShells { .. } => deposit_charge(grid, &system.nuclei, 1.0),
+                }),
                 Some(s) => {
                     let c: Vec<Centre> = centres(&system.nuclei, s).into_iter().map(|c| Centre { sigma: 1.0, ..c }).collect();
                     (c.iter().map(|c| c.charge).sum::<f64>(), deposit_centres(grid, &c))
@@ -1485,10 +1490,13 @@ mod tests {
     // −0.952449176832 / +0.128755999523, LiH −5.219911361078 / −0.022680293939).
     // and again in its fix round 1 (the checked dense eigensolve, as the Aufbau pins above): H₂ −0.952449176833 /
     // +0.128755991978, LiH −5.219911361013 / −0.022680034925 before it.
-    const FD_H2_E: u64 = 0xbfee7a76b2327729; // -0.952449176828 (Aufbau −0.952449176828; TS 4.3e-20; 10 steps, 2 / 2 stored)
-    const FD_H2_FX: u64 = 0x3fc07b135970b544; // +0.128755968735 (Aufbau +0.128755968665)
-    const FD_LIH_E: u64 = 0xc014e130719e4468; // -5.219911361012 (Aufbau −5.219911350989: −1.0e-8 = −TS 1.59e-7 + E − E_A +1.49e-7; 13 steps, 6 / 6 stored)
-    const FD_LIH_FX: u64 = 0xbf97396f60026ec0; // -0.022680034862 (Aufbau −0.022680156352: +1.2e-7)
+    // and again in plan Task 9c (the FermiDirac cold guess is the σ-smeared free-atom superposition,
+    // `nuclear::free_atom_density`, instead of the σ = 1 blobs; a different start converging to Δρ < 1e-6): H₂
+    // −0.952449176828 / +0.128755968735, LiH −5.219911361012 / −0.022680034862 (13 steps) before it.
+    const FD_H2_E: u64 = 0xbfee7a76b23415b9; // -0.952449176839 (Aufbau −0.952449176828; TS 4.3e-20; 10 steps, 2 / 2 stored)
+    const FD_H2_FX: u64 = 0x3fc07b0e18a16136; // +0.128755342509 (Aufbau +0.128755968665: −6.3e-7, first order in Δρ < 1e-6)
+    const FD_LIH_E: u64 = 0xc014e130719f3759; // -5.219911361068 (Aufbau −5.219911350989: −1.0e-8 = −TS 1.59e-7 + E − E_A +1.49e-7; 14 steps, 6 / 6 stored)
+    const FD_LIH_FX: u64 = 0xbf973981766585e0; // -0.022680304386 (Aufbau −0.022680156352: −1.5e-7)
 
     /// Global constraint: IonicPolicy::None is today's solver, bit for bit (energies and forces) — under `Aufbau`, set
     /// explicitly since plan Task 7 made FermiDirac `for_grid`'s default; the for_grid (FD) solves are pinned beside it.
@@ -2087,7 +2095,10 @@ mod tests {
         match r {
             Err(QmError::ScfStalled { iterations, best_delta_rho, tol, window: 6, level }) => {
                 assert_eq!(iterations, 7, "anchored at iteration 1, stopped at 1 + W");
-                assert!(best_delta_rho > 0.1 && tol == s.tol);
+                // the anchor is the frozen first iteration's Δρ (every step repeats it); far from tol. (Before plan
+                // Task 9c the cold guess was the σ = 1 blob and this read "> 0.1"; the free-atom start's frozen H density
+                // is closer, Δρ 0.077, and what the test is about is that the stall anchors on it.)
+                assert!((best_delta_rho - seen[0].delta_rho).abs() <= 1e-12 * seen[0].delta_rho && best_delta_rho > 1e4 * s.tol && tol == s.tol, "{best_delta_rho}");
                 assert_eq!(level, SCF_STALL_LEVEL_PER_ELECTRON, "one electron");
             }
             other => panic!("expected ScfStalled, got {:?}", other.map(|(_, st)| st)),
