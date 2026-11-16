@@ -37,14 +37,26 @@
 //! of its masked-in (interior) atoms — so m = [use_energy] + 3·n_interior. [`SampleLoo`] then has
 //! no energy residual (`None`) for a sample whose energy was not fitted and none for a masked-out
 //! atom (a cap or an edge atom is not a training point: every consumer — the class and key
-//! statistics, the LOO RMS, an audit's re-judgement — skips it). Cost per sample: m triangular solve pairs of size Q′ (A⁻¹Φ_sᵀ,
-//! O(m Q′²)), the m × m block and its solve O(m²Q′ + m³) — for H₂ (m = 7, Q′ = 29) ≈ 2·10⁴
-//! flops, for an S = 2 sample of 3 atoms (m = 10, Q′ = 176) ≈ 6·10⁵: a store of a few hundred
-//! samples costs milliseconds per refit.
+//! statistics, the LOO RMS, an audit's re-judgement — skips it).
+//!
+//! **The forward-solve form** (2026-11-17, the refit speed-up): with A = L Lᵀ, H_ss's
+//! (i, j) entry φ_iᵀA⁻¹φ_j w_j = (L⁻¹φ_i)·(L⁻¹φ_j) w_j, so Y = L⁻¹Φ_sᵀ — one forward
+//! substitution per row, no back substitution — gives the whole block as w_j y_i·y_j. The m
+//! right-hand sides are substituted together, one pass over L's rows for all of them
+//! ([`forward_many`]: L's row i is read once and dotted with every y_t, where the earlier form
+//! read L twice per row, the second time down its columns), and a row's leading zeros (a species
+//! block the sample does not touch) are skipped — exact, they stay zero. The same numbers to
+//! rounding as A⁻¹Φᵀ by two solves (`loo_matches_a_downdate_of_the_fit`); each right-hand side's
+//! arithmetic is its own, so the batch changes no bit of any of them.
+//!
+//! Cost per sample: m forward substitutions of size Q′ (O(m Q′²/2), one pass over L), the m × m
+//! block O(m²Q′) and its solve O(m³) — for H₂ (m = 7, Q′ = 29) ≈ 10⁴ flops, for an S = 2 sample
+//! of 3 atoms (m = 10, Q′ = 176) ≈ 3·10⁵: a store of a few hundred samples costs milliseconds per
+//! refit.
 
 use crate::descriptor::{describe, Basis, DescribeError};
 use crate::fit::Sample;
-use crate::linalg::cholesky_solve;
+use crate::linalg::dot;
 use crate::model::Model;
 
 /// A sample's leave-one-out residuals (y − prediction of the fit without it): the energy per
@@ -117,6 +129,30 @@ pub(crate) fn standardised_rows(
         }
     }
     Ok((e_row, f_rows))
+}
+
+/// Y = L⁻¹Φᵀ for the rows `rows` (each of length q), L the lower factor (row-major, `linalg`'s
+/// layout): one forward substitution per row, all of them in one pass over L's rows (module doc,
+/// "The forward-solve form"). A row's leading zeros are skipped — y stays zero there exactly —
+/// and every right-hand side is substituted with its own arithmetic, so a row's result does not
+/// depend on the others in the batch.
+pub fn forward_many(l: &[f64], q: usize, rows: &[&[f64]]) -> Vec<Vec<f64>> {
+    debug_assert_eq!(l.len(), q * q);
+    let mut y: Vec<Vec<f64>> = rows.iter().map(|r| r.to_vec()).collect();
+    let start: Vec<usize> = y.iter().map(|v| v.iter().position(|&x| x != 0.0).unwrap_or(q)).collect();
+    let first = start.iter().copied().min().unwrap_or(q);
+    for i in first..q {
+        let li = &l[i * q..i * q + i];
+        let lii = l[i * q + i];
+        for (yt, &st) in y.iter_mut().zip(&start) {
+            if i < st {
+                continue;
+            }
+            let s = yt[i] - dot(&li[st..], &yt[st..i]);
+            yt[i] = s / lii;
+        }
+    }
+    y
 }
 
 /// Solve the small dense system M x = v (m × m, row-major) by Gaussian elimination with partial
@@ -215,21 +251,17 @@ pub fn leave_one_out(model: &Model, sample: &Sample) -> Option<SampleLoo> {
         .chain(taught.iter().flat_map(|&j| (0..3).map(move |a| 3 * j + a)).map(|r| &f_rows[r][..]))
         .collect();
     let w: Vec<f64> = std::iter::once(w_e).take(ne).chain(std::iter::repeat_n(w_f, 3 * taught.len())).collect();
-    // Z = A⁻¹Φᵀ, column by column
-    let z: Vec<Vec<f64>> = rows
-        .iter()
-        .map(|r| {
-            let mut v = r.to_vec();
-            cholesky_solve(l, q, &mut v);
-            v
-        })
-        .collect();
-    // I − H, H_ij = (φ_i · z_j) w_j
+    // Y = L⁻¹Φᵀ, all m rows in one pass over L (module doc, "The forward-solve form")
+    let y = forward_many(l, q, &rows);
+    // I − H, H_ij = (y_i · y_j) w_j
     let mut ih = vec![0.0; m * m];
     for i in 0..m {
-        for jj in 0..m {
-            let h: f64 = rows[i].iter().zip(&z[jj]).map(|(a, b)| a * b).sum::<f64>() * w[jj];
-            ih[i * m + jj] = if i == jj { 1.0 - h } else { -h };
+        for jj in i..m {
+            let g = dot(&y[i], &y[jj]);
+            ih[i * m + jj] = if i == jj { 1.0 - g * w[jj] } else { -g * w[jj] };
+            if jj != i {
+                ih[jj * m + i] = -g * w[i];
+            }
         }
     }
     let r = solve_small(ih, e, m)?;
@@ -320,6 +352,40 @@ mod tests {
     /// force residual for a masked-out atom.
     /// The threaded map is the one-at-a-time loop, bit for bit and in order (the provider's class
     /// rule reads it: `references.md` "Refit cost at scale").
+    /// The batched forward substitution (module doc, "The forward-solve form"): each right-hand
+    /// side's result does not depend on the batch (bit for bit alone or together), leading zeros
+    /// stay exactly zero, and L·y = φ to rounding.
+    #[test]
+    fn forward_many_is_each_rows_own_substitution() {
+        let q = 37;
+        let mut seed = 3u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let mut l = vec![0.0; q * q];
+        for i in 0..q {
+            for j in 0..i {
+                l[i * q + j] = rnd();
+            }
+            l[i * q + i] = 1.0 + rnd().abs();
+        }
+        let rows: Vec<Vec<f64>> = (0..5).map(|t| (0..q).map(|k| if k < 4 * t { 0.0 } else { rnd() }).collect()).collect();
+        let refs: Vec<&[f64]> = rows.iter().map(|r| &r[..]).collect();
+        let all = forward_many(&l, q, &refs);
+        for (t, r) in refs.iter().enumerate() {
+            let alone = forward_many(&l, q, &[r]);
+            assert_eq!(alone[0].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), all[t].iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "row {t}");
+            assert!(all[t][..4 * t].iter().all(|&v| v == 0.0), "row {t}: leading zeros");
+            for i in 0..q {
+                let ly: f64 = (0..=i).map(|k| l[i * q + k] * all[t][k]).sum();
+                assert!((ly - r[i]).abs() < 1e-13, "row {t}, {i}: L y = {ly} vs {}", r[i]);
+            }
+        }
+    }
+
     #[test]
     fn leave_one_out_many_is_the_serial_loop_bit_for_bit() {
         let (basis, prov, samples, opts) = fixture();
