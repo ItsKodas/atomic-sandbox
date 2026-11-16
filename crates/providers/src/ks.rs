@@ -104,7 +104,9 @@
 //! = F) and the forces are −dF/dR. The all-electron surface is no longer today's aufbau bit for bit: every channel now
 //! solves its witness vectors (the levels above μ + 36 kT, `qm::scf` "Occupations"), so the all-electron bitwise pins
 //! were re-pinned with that reason, and the all-electron tag moved with it (`crate::pseudo::all_electron_tag`). A
-//! gapped state's TS is ≤ 1e-12 Ha, so its F equals the aufbau E to the solver's scatter.
+//! gapped state's TS falls as e^−(ε_LUMO − μ)/kT: ≤ 1e-12 Ha only once ε_LUMO − μ ≳ 25 kT (H₂ at R_e: 4e-20), while a
+//! narrower gap leaves a small TS (LiH at 57³ × 0.25 ≈ 2.4e-6 Ha, H₃⁺ stretched to 1.6 r₀ ≈ 2.8e-8 Ha); F equals the
+//! aufbau E to that TS plus the solver's scatter.
 //!
 //! Each result then carries `EvalStats::{pseudised, core_overlaps, partial}`: the species' generation records, the pairs
 //! whose frozen cores overlap (spec §5.6, never trained on) and the partly occupied levels of the final step
@@ -3520,26 +3522,41 @@ pub(crate) mod tests {
 
     /// Plan 2026-11-13 Task 8 review M6 (Task 9): the `branch_jump` guard picks its surface as `system.ionic.is_none()`
     /// (no cache lock on the evaluation path); that is exactly `is_all_electron_tag` of the scene's provenance tag, since
-    /// `setup_for` and the tag apply one per-species rule. Scenes that need no dimer gate (no H or He under `All` or
-    /// `Accepted`).
+    /// `setup_for` and the tag apply one per-species rule. Review M3 (fix round 1): H₂ under `Accepted` and `All` too,
+    /// with the GPU dimer backend the tests use (the gated H: about 1 min once per process); without an adapter those
+    /// two legs are skipped.
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "release-only (generates O); cargo test -p providers --release")]
+    #[cfg_attr(debug_assertions, ignore = "release-only (generates O, and the gated H on the GPU); cargo test -p providers --release")]
     fn the_guard_surface_is_the_tag_surface() {
         use sim::IonicPolicy::{All, Accepted, CoresOnly, None as AllElectron};
         let water = |ionic| Scene { ionic, cell: Cell { n: 61, h: 0.2 }, ..h2o(61) };
         let h2c = |ionic| Scene { ionic, ..h2(33, 1.4) };
         let cases = [h2c(AllElectron), h2c(CoresOnly), water(AllElectron), water(CoresOnly), o_scene(0.2, AllElectron), o_scene(0.2, CoresOnly),
                      o_scene(0.2, All), o_scene(0.2, Accepted)];
-        for scene in &cases {
+        let check = |scene: &Scene| {
             let (_, system, _) = problem(scene, 1e-6, &mut Vec::new()).expect("posed");
             let tag = crate::pseudo::provenance_tag(scene);
             assert_eq!(system.ionic.is_none(), crate::pseudo::is_all_electron_tag(&tag), "{:?} {:?}: tag {tag}", scene.ionic, scene.nuclei.iter().map(|n| n.z).collect::<Vec<_>>());
+            tag
+        };
+        for scene in &cases {
+            check(scene);
+        }
+        // H and He are dimer-gated: with the GPU backend `Accepted` and `All` pseudise H (the gate runs on the GPU)
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        crate::pseudo::set_dimer_backend(crate::pseudo::DimerBackend::Gpu(ctx));
+        for policy in [Accepted, All] {
+            let tag = check(&h2c(policy));
+            assert!(!crate::pseudo::is_all_electron_tag(&tag), "{policy:?} H₂ with the GPU gate is pseudised: {tag}");
         }
     }
 
     /// Spec 2026-11-13 NOTE-6 / V8 (plan Task 9): the all-electron witness cap on an anion whose LSDA HOMO is unbound, in
-    /// the largest box the app's presets offer at its default quality — the 14 Bohr box of the h2o/h2s/hcl/ph3/sih4/lih
-    /// presets (57³ × 0.25) regridded to Accurate, 95³ × 0.15. All-electron H⁻ (2 electrons, singlet), cold, at the app's
+    /// the largest **preset** box at the app's default quality — the 14 Bohr box of the h2o/h2s/hcl/ph3/sih4/lih presets
+    /// (57³ × 0.25) regridded to Accurate, 95³ × 0.15. This pin covers that box only: the app's largest box (Scene ▸ Grid,
+    /// `MAX_GRID_N` = 201, 30 Bohr at h = 0.15) is `all_electron_h_minus_witness_cap_at_the_largest_box`, a plan Task 9b
+    /// RED test (review I1). All-electron H⁻ (2 electrons, singlet), cold, at the app's
     /// interactive tolerance 1e-5, through `problem` (FD at kT = 5 mHa) and the GPU solver. The measured outcome is pinned
     /// (2026-11-16, RX 7900 XTX): it **converges**, in 18 steps (74.5 s), F = −0.474954 Ha, TS = 1.9e-7 Ha (gapped); the
     /// HOMO is unbound in LSDA (ε = +0.089 Ha, held by the box) and the witness arms took 10 extra vectors ↑ and 11 ↓, under
@@ -3572,5 +3589,51 @@ pub(crate) mod tests {
         assert!(extra.iter().all(|&e| e >= 1 && e <= qm::scf::MAX_WITNESS_GROWTH), "{extra:?}");
         let homo = state.evals_up.iter().copied().fold(f64::INFINITY, f64::min);
         assert!(homo > 0.0, "LSDA's H⁻ HOMO is unbound (held by the box): ε = {homo}");
+    }
+
+    /// Spec 2026-11-13 NOTE-6 / V8 at the app's **largest** box (review I1): all-electron H⁻ at 201³ × 0.15 (`MAX_GRID_N`,
+    /// 30 Bohr), cold, 1e-5. Weyl's estimate gives ≈ 79 box states below ≈ 0.21 Ha at L = 30 (≈ 7.5 at the 14 Bohr box,
+    /// where 10–11 witness vectors were measured), so the cap of 16 is expected to fail here: the documented outcome is
+    /// `Err(QmError::Numerical)` naming the cap ("no gap witness within 16 extra levels …"). Not run in Task 9 (its cost,
+    /// minutes per growth at 201³, and the cap belong to plan Task 9b); 9b runs it and either pins that error or
+    /// replaces this assertion with its cap decision (a VRAM-derived cap under which the solve converges).
+    #[test]
+    #[ignore = "plan Task 9b: witness cap"]
+    fn all_electron_h_minus_witness_cap_at_the_largest_box() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let scene = Scene { nuclei: vec![Nucleus::new(1, [0.0; 3])], cell: Cell { n: 201, h: 0.15 }, charge: -1, multiplicity: None, sigma: None,
+                            external_field: [0.0; 3], ionic: sim::IonicPolicy::None, train_mask: None };
+        let (grid, system, settings) = problem(&scene, 1e-5, &mut Vec::new()).expect("H⁻ is posed");
+        let mut s = qm_gpu::GpuSolver::new(ctx, &grid);
+        let t = Instant::now();
+        let r = s.solve(&system, &settings, false);
+        println!("H⁻ 201³ × 0.15 (30 Bohr): {:?} after {:.1} s", r.as_ref().map(|(_, st)| (st.iterations, st.energy.total)), t.elapsed().as_secs_f64());
+        match r {
+            Err(qm::QmError::Numerical(m)) => {
+                assert!(m.contains(&format!("within {} extra levels", qm::scf::MAX_WITNESS_GROWTH)), "the cap error names MAX_WITNESS_GROWTH: {m}");
+            }
+            Err(e) => panic!("expected the witness-cap error at the largest box (or plan Task 9b's cap decision), got {e}"),
+            Ok((_, st)) => panic!("expected the witness-cap error at the largest box (or plan Task 9b's cap decision), got convergence in {} steps", st.iterations),
+        }
+    }
+
+    /// Review I4: the cold all-electron H₂O at 97³ × 0.25 (24 Bohr) — `unoccupied_budget_in_play`'s former leg and
+    /// `gpu_vs_cpu::timing_table`'s held case — under FermiDirac through `problem`, at the app's 1e-5. RED: measured
+    /// 2026-11-16 it ends after 630 s with "no gap witness within 16 extra levels of spin 0" on a transient step (Task 7
+    /// fix round 1's diagnosis). Plan Task 9b's cost fix and cap decision must make it converge.
+    #[test]
+    #[ignore = "plan Task 9b: witness cap"]
+    fn cold_all_electron_h2o_at_97_converges() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let (grid, system, settings) = problem(&h2o(97), 1e-5, &mut Vec::new()).expect("H₂O 97³ × 0.25 is posed");
+        assert!(system.ionic.is_none());
+        let mut s = qm_gpu::GpuSolver::new(ctx, &grid);
+        let t = Instant::now();
+        let r = s.solve(&system, &settings, false);
+        println!("H₂O 97³ × 0.25 all-electron, cold: {:?} after {:.1} s", r.as_ref().map(|(_, st)| (st.iterations, st.energy.total)), t.elapsed().as_secs_f64());
+        let (_, st) = r.unwrap_or_else(|e| panic!("H₂O 97³ × 0.25 cold: {e}"));
+        assert!(st.energy.total.is_finite());
     }
 }

@@ -103,11 +103,20 @@ fn seed() -> u64 {
 
 fn nucleus(pos: [f64; 3], z: u8) -> Nucleus { Nucleus { pos, z } }
 
-/// A cold, converged GPU solve of `nuclei` on n³ × h (σ = h) at `tol`.
+/// A cold, converged GPU solve of `nuclei` on n³ × h (σ = h) at `tol`, with `for_grid`'s occupations (FermiDirac).
 fn solve(ctx: &GpuContext, n: usize, h: f64, nuclei: &[Nucleus], tol: f64, multiplicity: Option<u32>) -> (GpuSolver, ScfSettings, usize, f64) {
+    solve_with(ctx, n, h, nuclei, tol, multiplicity, None)
+}
+
+/// [`solve`] with the occupation scheme given (`None`: `for_grid`'s).
+fn solve_with(ctx: &GpuContext, n: usize, h: f64, nuclei: &[Nucleus], tol: f64, multiplicity: Option<u32>, occupations: Option<qm::Occupations>)
+              -> (GpuSolver, ScfSettings, usize, f64) {
     let grid = Grid::cube(n, h);
     let mut settings = ScfSettings::for_grid(&grid);
     settings.tol = tol;
+    if let Some(o) = occupations {
+        settings.occupations = o;
+    }
     let mut s = GpuSolver::new(ctx.clone(), &grid);
     let t = Instant::now();
     let (_, st) = s.solve(&System::new(nuclei.to_vec(), 0, multiplicity), &settings, false)
@@ -516,7 +525,10 @@ fn h2_signs_and_tracks_hold_for_100_steps() {
 }
 
 /// Spec §11 "Spin": ∫m = n↑ − n↓ to 1e-4 for H (1↑) and Li (2↑ 1↓) — the viewer's spin summary
-/// (the reduction the readout shows) and the spin texture integrated in f64; ∫|m| printed.
+/// (the reduction the readout shows) and the spin texture integrated in f64; ∫|m| printed. Li runs with
+/// `Occupations::Aufbau` explicit (review I2, plan 2026-11-13 Task 9 fix round 1): its core spin polarisation is a feature
+/// of the integer-occupied LSDA atom; under FermiDirac at σ = h = 0.25 the partly occupied 2p (f ≈ 0.083 each) fills the
+/// 2s node and ∫|m| − ∫m is 0 — the documented gap in `references.md` "The providers' Fermi–Dirac surface".
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn spin_density_integrals() {
@@ -524,7 +536,8 @@ fn spin_density_integrals() {
     let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
     for (name, z, n_up, n_dn) in [("H", 1u8, 1usize, 0usize), ("Li", 3, 2, 1)] {
         let nuclei = [nucleus([0.0; 3], z)];
-        let (s, settings, steps, wall) = solve(&ctx, 49, 0.25, &nuclei, VALIDATE_TOL, None);
+        let occupations = (z == 3).then_some(qm::Occupations::Aufbau);
+        let (s, settings, steps, wall) = solve_with(&ctx, 49, 0.25, &nuclei, VALIDATE_TOL, None, occupations);
         let state = s.state().expect("converged");
         let dv = s.grid().dv();
         let mut view = OrbitalView::new(&s);
@@ -542,12 +555,9 @@ fn spin_density_integrals() {
         assert!((tex - want).abs() <= 1e-4, "{name}: texture ∫m = {tex}");
         assert_eq!(u.scale, sp.scale() as f32);
         if z == 3 {
-            // core spin polarisation (radial LSDA: 4–8e-4, against f32 noise of ~1e-7) under aufbau: the view resolved
-            // a real feature of the functional. Re-pinned in plan 2026-11-13 Task 9 (was > 1e-4): under FermiDirac at
-            // kT = 5 mHa this Li (σ = h = 0.25, its 2s/2p 0.018 Ha apart) spreads the ↑ valence electron over 2s (f ≈ 0.75)
-            // and 2p (≈ 0.083 each, plan Task 7), and the measured ∫|m| − ∫m is 0 to f32 (2026-11-16: m ≥ 0 everywhere);
-            // the check is that the view does not invent a negative m. Reported to the controller (a physics review item)
-            assert!(sp.abs_integral - sp.integral >= -1e-6, "Li: ∫|m| − ∫m = {:.3e}", sp.abs_integral - sp.integral);
+            // core spin polarisation (radial LSDA: 4–8e-4, against f32 noise of ~1e-7): the view resolves a real feature
+            // of the functional, not just ∫m = n↑ − n↓ — on the integer-occupied (Aufbau) Li, see the doc
+            assert!(sp.abs_integral - sp.integral > 1e-4, "Li: ∫|m| − ∫m = {:.3e}", sp.abs_integral - sp.integral);
         }
     }
 }

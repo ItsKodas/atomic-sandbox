@@ -586,8 +586,13 @@ pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
 /// spec's §6.3.
 pub fn untrainable_citation(reason: &str) -> &'static str {
     match reason {
+        CORE_OVERLAP_WARNING => "spec §5.6",
         BRANCH_JUMP_WARNING => "Fermi–Dirac spec §6.3",
-        _ => "spec §5.6",
+        // a reason added to `untrainable` without its section here: caught by the tests, never a panic in the app
+        _ => {
+            debug_assert!(false, "untrainable_citation: no spec section for {reason:?}");
+            "no spec section recorded"
+        }
     }
 }
 

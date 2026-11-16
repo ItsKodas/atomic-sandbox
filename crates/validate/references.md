@@ -5131,7 +5131,44 @@ cold against 3·lo, where `max_eigen_residual` (witness included) reads 7.45e-6 
 - `unoccupied_budget_in_play`'s H₂O leg runs on the preset's 95³ × 0.15 cell (cold 106.8 s): at 97³ × 0.25 the cold
   all-electron solve hits the witness cap on a transient step after 630 s (Task 9b).
 - display tests: see "The orbital display under FD"; LiH's "occupied" helper is f > ½ (its LUMO set at 11.7–13.4 kT
-  above μ carries f ≈ 8e-6 / 1.5e-6); Li's core spin polarisation (∫|m| − ∫m, > 1e-4 under aufbau) is 0 to f32 under
-  FD at σ = h = 0.25 (the ↑ valence electron spread over 2s 0.75 / 2p 0.083 each), re-pinned to "no negative m".
+  above μ carries f ≈ 8e-6 / 1.5e-6); Li's core-spin check runs with `Occupations::Aufbau` explicit and keeps
+  ∫|m| − ∫m > 1e-4 (fix round 1, review I2; the first round's "no negative m" re-pin was vacuous) — the FD gap below.
 - the tag tests, `the_provenance_carries_the_stop_rule_not_its_value` (`…/fd5e-3/…/stop2x5e-8/pin1e-5`), and the
   scripted-session digest (0x09f6_9183_02c2_fda9 → 0xe356_bcdb_45e7_b03c, field and tag text only).
+
+**Documented gap: Li's core spin polarisation under FD** (rule 7; plan Task 9 review I2). Under aufbau LSDA the ↑ 2s
+exchange pulls the ↑ 1s inward, so m = ρ↑ − ρ↓ turns negative near the nucleus and ∫|m| − ∫m > 0. Under FD at kT = 5 mHa
+the all-electron Li of the grid (σ = h = 0.25) shares its ↑ valence electron between 2s (f ≈ 0.75) and 2p (≈ 0.083 each,
+plan Task 7), and the partial 2p fills the 2s node: ∫|m| − ∫m = 0 to f32 (2026-11-16, `spin_density_integrals`). The
+2p occupation is mostly a smeared-nucleus artefact that FD amplifies: the smeared nucleus pulls 2p down toward 2s. Radial
+LSDA (the reviewer's f64 atom, `scratchpad/li_rev/li_radial.py`):
+
+| nucleus | ε2p − ε2s (↑, Ha) | aufbau ∫\|m\| − ∫m | FD f per 2p at that gap |
+|---|---|---|---|
+| point | 0.0669 | 2.4e-4 | ≈ 7e-4 |
+| σ = 0.15 | 0.0426 | 3.1e-4 | ≈ 0.008 |
+| σ = 0.25 | 0.0224 | 4.0e-4 | — (grid: gap 0.018 Ha, f2s 0.75, f2p 0.083; ∫\|m\| − ∫m = 0) |
+
+The display test therefore checks the integer-occupied Li (Aufbau explicit); what FD shows at coarse σ is this gap.
+
+**Open failure: `validate --test surrogate h3plus_tier`** (plan Task 9; owned by plan Task 9b, review C1). The H₃⁺
+pass's scan 0–2 point at 1.6 r₀ (atom 2 moved along the 0–2 axis of the relaxed triangle; all-electron, 49³ × 0.25, the
+sample tolerance 1e-6) ends at the 200-step cap with Δρ 9.2e-5, and the stretched-tail rule skips its 2 further-out points;
+the test requires (failed, skipped) = (0, 0). Reproduced cold through `problem` + `GpuSolver`: from step 9 the steps
+alternate between 0 and ≈ 25 LOBPCG iterations and Δρ cycles between 4e-5 and 3e-4. Mechanism (review C1):
+`qm_gpu::eigen::lobpcg` takes one max residual over every block column, the FD witness column included, and it feeds both
+the tol stop and the guess acceptance at 1.5·tol; an accepted guess is a "frozen" orbital set, and the next iterating step
+restarts DIIS, so the history stays at 1–2 entries (effectively linear mixing) and every re-solve kicks Δρ by ≈ 1e-4. The
+state is gapped (↑ level 2 f ≈ 5e-11, TS 2.8e-8). Under aufbau the same geometry converges in 13 steps (two consecutive
+frozen steps let DIIS solve the constant map; its occupied column sits at 7–8e-6 against the 8.13e-6 band, already
+marginal — the diffuse witness tips it). Plan Task 9b fixes it: both classify decisions read the tight columns only,
+"frozen" means the tight columns did not move, and `h3plus_tier` plus a direct cold H₃⁺ test (1.6 r₀, bounded steps and
+DIIS resets) become its acceptance tests. Task 9 is not done until it passes.
+
+**Not completed: `validate --test surrogate the_stuck_escape_repro_is_answered_honestly`** (all-electron H₂ teacher
+under FD). Run alone twice (2026-11-16, 11:35 and 12:53), it did not finish within the 15-minute GPU batch and was
+stopped; at Task 8 the whole surrogate suite took 532–545 s. It becomes a plan Task 9b acceptance test (the witness cost
+fix must bring it inside one batch, then it must pass). Pre-preview check on the user's surface (Accepted, pseudo-H):
+a cold H₃⁺ with the pair at 1.6 r₀, tol 1e-6, through `problem` + `effective_gpu_tol` converges in 15 steps at
+49³ × 0.25 (no DIIS reset) and in 16 at 81³ × 0.15 (one reset after a single frozen step at Δρ 6.6e-4), without the
+all-electron case's 0/25-iteration alternation.
