@@ -1012,7 +1012,27 @@ mod tests {
             assert_eq!(rows.iter().filter(|r| r.index == 0 && r.occupation == 1.0).count(), 1, "spin {ch}: the occupied σ_g row");
             assert_eq!(unocc.len(), shown - 1, "spin {ch}: the unoccupied rows the block edge keeps");
             assert_eq!(unocc.len(), 3, "spin {ch}: m = 2 plus the degenerate pair's partner");
-            assert!(unocc.windows(2).all(|w| w[0] <= w[1]) && unocc.iter().all(|e| *e > homo), "spin {ch}: unoccupied ε ascending above the HOMO {homo}");
+            assert!(unocc.iter().all(|e| *e > homo), "spin {ch}: unoccupied ε above the HOMO {homo}");
+            // Controller ruling (2), 2026-11-16 (scf-stall ← main merge): the order of eigenvalues inside a degenerate
+            // cluster is not physical — on the FD SCF density ↓'s box pair at 0.20857 Ha came out of the view 1.7e-10 Ha
+            // inverted (the tracker orders a set's rows by character). Clusters are the display's own test (the ×n
+            // badges: `qm::orbitals::clusters` at τ = `tau(tol)`); the rows ascend strictly between clusters, and within
+            // a cluster they are, as a set, the Harris record's levels to within the converged residual bound.
+            let mut by_e = unocc.clone();
+            by_e.sort_by(f64::total_cmp);
+            let sets = qm::orbitals::clusters(&by_e, tau_scf);
+            let set_of = |e: f64| sets.iter().position(|r| by_e[r.clone()].contains(&e)).expect("every row is in a cluster");
+            let ids: Vec<usize> = unocc.iter().map(|&e| set_of(e)).collect();
+            assert!(ids.windows(2).all(|w| w[0] <= w[1]), "spin {ch}: rows out of order between clusters: {unocc:?} (clusters {sets:?})");
+            assert!(sets.windows(2).all(|w| by_e[w[0].end - 1] < by_e[w[1].start]), "spin {ch}: clusters not strictly ascending");
+            let record = &info.evals[ch][..by_e.len()];
+            for r in &sets {
+                let bound = r.clone().map(|j| info.residuals[ch][j]).fold(0.0, f64::max);
+                for j in r.clone() {
+                    let d = (by_e[j] - record[j]).abs();
+                    assert!(d <= bound, "spin {ch}: cluster {r:?} row ε {} vs the record's {} (|Δ| {d:.2e} > residual bound {bound:.2e})", by_e[j], record[j]);
+                }
+            }
             assert!(rows.iter().filter(|r| r.index >= 1).all(|r| r.occupation == 0.0));
         }
         // the converged path's display solve on the SCF state: the same unoccupied levels

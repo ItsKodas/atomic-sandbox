@@ -5350,6 +5350,24 @@ V-A1 under FD (`--test harris va1`, 142 s): ε and O gates pass for all four cas
 to 1e-12. **Pseudo-O's FD f do not match to `OCC_EPS` = 1e-12**: the singlet's 2p ⅔ levels differ by 5.2e-7–5.8e-6
 (↑ #1–3: 5.2e-7, 2.0e-6, 2.6e-6; ↓ #1–3: 5.8e-6, 9.6e-7, 4.8e-6). OCC_EPS assumed `DegenerateShells`' exact fractions;
 FD's f are continuous in ε with slope f(1 − f)/kT = 44 per Ha, so the measured |Δε| ≤ 1.7e-7 implies |Δf| ≤ 1.5e-5.
-Not re-pinned (a tolerance, not a value): the controller decides. V-A2 (O 0.988–0.999, gate ≥ 0.95) passes unchanged.
-V-A3 (record): warm medians H₂ 0.172 s (was 0.115), H₂ + H 0.402 s (was 0.147), H₂O 0.792 s (was 0.46): the FD witness
-column above the occupied levels and its tested guards cost 1.5–2.7× per refresh; the 0.3 s target is missed by H₂ + H.
+**The FD f gate** (controller ruling (1), 2026-11-16; `fd_occ_gate` in `tests/harris.rs`). The 1e-12 gate presumed
+`DegenerateShells`' exact fractions, f = (N − n_below)/|C|, a constant of the level count. Under FD,
+f = 1/(1 + e^{(ε − μ)/kT}) is smooth in ε with ∂f/∂ε = −f(1 − f)/kT, so a level that passes the ε gate
+(|Δε| ≤ `IDENTITY_EPS` = 1e-5 Ha) has |Δf| ≤ f(1 − f)/kT · 1e-5 to first order. The gate for a partly filled level
+(1e-6 < f < 1 − 1e-6) is that propagated ε gate: 4.4e-4 at f = ⅔, kT = 5 mHa. A level within 1e-6 of 0 or 1 keeps 1e-12.
+This is derived from an existing gate, not loosened to pass. The measured pseudo-O |Δf| ≤ 5.8e-6 is 76× inside it.
+V-A2 (O 0.988–0.999, gate ≥ 0.95) passes unchanged.
+
+**V-A3 regression under FD (record; Task 9b owns the fix).** Warm Harris refresh after a 0.01 Bohr move, median of 5,
+through `GpuKs::harris_display` (`--test harris va3`, 2026-11-16, RX 7900 XTX, the user's preview app open):
+
+| case | grid | warm median, main (Aufbau/DS) | warm median, FD | ratio | 0.1 Bohr step, FD | cold, FD |
+|---|---|---|---|---|---|---|
+| H₂ | 81³ | 0.115 s | 0.172 s | 1.5× | 0.219 s | 0.833 s |
+| H₂ + H (doublet) | 81³ | 0.147 s | 0.402 s | 2.7× | 0.520 s | 2.470 s |
+| H₂O | 97³ | 0.46 s | 0.792 s | 1.7× | 1.002 s | 2.114 s |
+
+The 0.3 s target (spec §7) is missed by H₂ + H. Cause: the FD witness growth. The witness column above the occupied
+levels, and the tested guards up to it, are solved at the guard tier or above, where main's `Aufbau` block stopped at
+n + G. Plan Task 9b owns the fix: the Harris witness columns go to the guard tolerance by the same per-column rule as the
+SCF's; V-A3 is re-measured there; the 0.3 s target is restored or the miss explained.
