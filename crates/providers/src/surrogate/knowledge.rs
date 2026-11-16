@@ -28,7 +28,7 @@
 //! Cost: two passes over the fitted samples, O(Σ N²) distances and O(Σ N·k²) angles (k the shell
 //! neighbours), plus one verdict lookup per key. No prediction, no teacher.
 use super::*;
-use sim::knowledge::{angle_bin, first_shell, ElementKnowledge, KnowledgeMap, PairHistogram, PairKnowledge, ANGLE_BINS, BIN};
+use sim::knowledge::{angle_bin, first_shell, molecules, Composition, ElementKnowledge, KnowledgeMap, PairHistogram, PairKnowledge, RowStatus, SampleRow, StoredSample, ANGLE_BINS, BIN};
 use sim::Confidence;
 use std::collections::BTreeSet;
 
@@ -137,6 +137,15 @@ impl SurrogateKs {
                 pair_list.push(PairKnowledge { z, samples, hist: PairHistogram { z, bin: BIN, counts }, confidence });
             }
         }
+        // the molecules: every stored sample by composition (`sim::knowledge`, "Molecules")
+        let rows = self.sample_rows();
+        let stored: Vec<StoredSample> = rows
+            .into_iter()
+            .zip(&store.samples)
+            .filter(|(_, s)| s.z.len() == s.pos.len())
+            .map(|(row, s)| StoredSample { row, z: &s.z, pos: &s.pos, mask: s.force_mask.as_deref() })
+            .collect();
+        let molecules = molecules(&stored, &shells, r_cut);
         let elements = atoms
             .into_iter()
             .map(|(z, (atoms_seen, coordination))| ElementKnowledge { z, atoms_seen, coordination, angles: angles.remove(&z).unwrap_or_else(|| vec![0; ANGLE_BINS]) })
@@ -147,6 +156,41 @@ impl SurrogateKs {
             slug: self.shared.as_ref().map_or_else(String::new, |s| s.coll.key.slug()),
             samples: fitted.len(),
             r_cut,
+            molecules,
         })
+    }
+
+    /// Every stored sample as the molecules and a Forget rule see it (`sim::knowledge`,
+    /// "Molecules"), in store order: its composition, its scene (the shared
+    /// collection's record; empty for a session-only sample or a model file's), its status — fitted
+    /// as the map counts it (the accumulated prefix in the fit's codes, not in the misfit set),
+    /// waiting (in the fit's codes otherwise), forgotten, or held — and its leave-one-out ratio from
+    /// the standing fit's cache when it is in the fit's codes (as `sample_suspects` reads it).
+    pub(super) fn sample_rows(&self) -> Vec<SampleRow> {
+        let Some(store) = self.store.as_ref() else { return Vec::new() };
+        let cache = self.fresh_loo_ratios();
+        let fitted_to = self.accumulated.min(store.len());
+        store
+            .samples
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let status = if self.is_forgotten(i) {
+                    RowStatus::Forgotten
+                } else if self.excluded(i) {
+                    RowStatus::Held
+                } else if i < fitted_to && !self.in_misfit(i) {
+                    RowStatus::Fitted
+                } else {
+                    RowStatus::Waiting
+                };
+                let ratio = if status.open() { cache.and_then(|c| c.rows.binary_search_by_key(&i, |x| x.0).ok().map(|k| c.rows[k].1)) } else { None };
+                let scene = match self.shared.as_ref().and_then(|sh| sh.link.get(i).map(|l| (sh, l))) {
+                    Some((sh, super::shared::Link::In(k))) => sh.coll.samples.get(*k).map_or_else(String::new, |c| c.scene.clone()),
+                    _ => String::new(),
+                };
+                SampleRow { index: i, composition: Composition::of(&s.z), scene, status, ratio }
+            })
+            .collect()
     }
 }

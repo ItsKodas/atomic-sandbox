@@ -930,6 +930,29 @@ impl Worker {
         }
     }
 
+    /// [`Command::ForgetByRule`] (2026-11-16): the provider resolves the rule against its samples
+    /// now and forgets them as one batch (`Trainable::forget_by_rule`: refused, nothing changed,
+    /// when nothing in the fit matches or another count than the confirmed one does), then the
+    /// debounced refit, as [`user_samples`](Self::user_samples).
+    pub(super) fn forget_by_rule(&mut self, rule: &sim::knowledge::ForgetRule, expected: usize) {
+        let Some(s) = trainable(&mut self.dy) else {
+            self.error("forget samples: the estimated solver is not running".to_string());
+            return;
+        };
+        let r = s.forget_by_rule(rule, expected);
+        let notes = s.take_notes();
+        for n in notes {
+            self.dy.add_note(n);
+        }
+        match r {
+            Ok(_) => {
+                self.user_refit.changed(Instant::now());
+                self.owns_autosave = true;
+            }
+            Err(e) => self.error(format!("forget samples: {e}")),
+        }
+    }
+
     /// [`Command::RefitNow`]: the pending refit after the user's changes starts at once — after a
     /// running refit lands, if one runs. Nothing pending: nothing to do.
     pub(super) fn refit_now(&mut self) {

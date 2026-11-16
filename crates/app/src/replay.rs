@@ -416,6 +416,7 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::RestoreSample(_) => "restore-sample",
         Action::ForgetSamples(_) => "forget-samples",
         Action::RestoreSamples(_) => "restore-samples",
+        Action::ForgetByRule(..) => "forget-by-rule",
         Action::RefitNow => "refit-now",
         Action::PurgeForgotten(_) => "purge-forgotten",
         Action::SampleAfterRefusal => "sample-after-refusal",

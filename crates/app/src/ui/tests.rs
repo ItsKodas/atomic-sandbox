@@ -7902,6 +7902,60 @@ mod knowledge_map {
         snap
     }
 
+    /// 2026-11-16, "Molecules trained": every composition with its fitted count, most fitted first;
+    /// the held-out and forgotten ones are not in the fitted count but shown as a faint suffix, the
+    /// scenes on hover; a click picks one (its distances and the angle histogram of its own
+    /// samples), and **Forget these…** only pre-fills the Model tab's "Forget samples…" with exactly
+    /// that composition (the tab shown, nothing sent: its confirmation still applies).
+    #[test]
+    fn molecules_trained_lists_compositions_and_prefills_the_forget_tool() {
+        use sim::knowledge::{Composition, PairRange, ANGLE_BINS};
+        let scene = chain();
+        let cam = camera();
+        let mut map = forget_rule_map();
+        let ph3 = Composition::of(&[15, 1, 1, 1]);
+        {
+            let m = map.molecules.iter_mut().find(|m| m.composition == ph3).unwrap();
+            m.pairs = vec![PairRange { z: (1, 1), min: 3.4, max: 3.7, count: 594 }, PairRange { z: (1, 15), min: 2.5, max: 2.9, count: 594 }];
+            let mut h = vec![0u32; ANGLE_BINS];
+            h[sim::knowledge::angle_bin(93.5)] = 594;
+            m.angles = vec![(1, vec![0; ANGLE_BINS]), (15, h)];
+        }
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        snap.activity.knowledge = Some(Arc::new(map.clone()));
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.backend = Backend::Estimated;
+        st.activity.absorb(&snap);
+        // a wide leaf: the list and the card side by side, on screen
+        st.workspace.set_node(super::super::workspace::layout::parse("H(0.3,3D,[Knowledge*])").unwrap());
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("MOLECULES TRAINED"), "{t}");
+        assert!(t.contains("H₂ 961\n") && t.contains("PH₃ 198 · 3 held out · 9 forgotten") && t.contains("PH₅ 16"), "fitted counts, the rest faint: {t}");
+        assert!(t.contains(knowledge::MOLECULES_NOTE), "{t}");
+        let mols = &map.molecules;
+        assert_eq!(knowledge::molecule_scenes(&mols[0]), "H₂: 961 samples, 961 fitted — from h2 (960), (no scene recorded) (1). Click for its distances and angles");
+        assert_eq!(knowledge::molecule_suffix(&mols[0]), "");
+        // the pick: the card of the composition
+        let outs = click_widget(&ctx, &mut st, &inp, &knowledge::molecule_probe(&ph3));
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display only");
+        assert_eq!((st.knowledge.pick, st.knowledge.molecule.clone()), (Pick::Molecule, Some(ph3.clone())));
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("198 fitted samples · 3 held out · 9 forgotten") && t.contains("P–H") && t.contains("2.50–2.90 Bohr") && t.contains("BOND ANGLES AT P"), "{t}");
+        assert!(!t.contains("BOND ANGLES AT H"), "an element with no angle in it has no histogram: {t}");
+        assert!(probed_rect("knowledge-molecule-angles-15").width() > 0.0);
+        // Forget these…: a pre-fill only
+        assert!(!st.forget_rule.open);
+        let outs = click_widget(&ctx, &mut st, &inp, "knowledge-molecule-forget");
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "nothing forgotten by the click");
+        let f = &st.forget_rule;
+        assert!(f.open && f.kind == super::super::dock::model::RuleKind::Composition && f.composition.as_ref() == Some(&ph3) && !f.confirm && !f.above_confirm, "{f:?}");
+        assert_eq!(f.rule(), Some(sim::knowledge::ForgetRule::Composition(ph3.clone())));
+        assert!(st.tab_shown(DockTab::Model), "the Model tab is shown");
+    }
+
     #[test]
     fn the_knowledge_tab_draws_the_map_and_picks_by_click() {
         let scene = chain();
@@ -12994,4 +13048,162 @@ fn the_pending_refit_banner_and_refit_now() {
     let inp = input(&scene, Some(&snap), &cam);
     assert!(!drawn(&ctx, &mut st, &inp, "model-refit-banner"));
     assert!(rows(&inp, None).iter().all(|r| r.key != JobKey::PendingRefit));
+}
+
+/// 2026-11-16: the molecules the forget-by-rule tests use — PH₃ (198 in the fit, 3 held, 9
+/// forgotten; two ratios above 5), PH₃ beside an H₂ (16, the formula PH₅, from "mix"), and H₂ (961,
+/// one ratio above 5, from "h2" and a session-only sample with no scene).
+fn forget_rule_map() -> sim::KnowledgeMap {
+    use sim::knowledge::{Composition, MoleculeKnowledge, SceneCount};
+    let mol = |z: &[u8], fitted, held, forgotten, scenes: Vec<SceneCount>, ratios: Vec<f64>| MoleculeKnowledge {
+        composition: Composition::of(z),
+        fitted,
+        waiting: 0,
+        held,
+        forgotten,
+        scenes,
+        ratios,
+        pairs: Vec::new(),
+        angles: Vec::new(),
+    };
+    let sc = |name: &str, open, held, forgotten| SceneCount { name: name.into(), open, held, forgotten };
+    let mut m = knowledge::fixture_map();
+    m.molecules = vec![
+        mol(&[1, 1], 961, 0, 0, vec![sc("", 1, 0, 0), sc("h2", 960, 0, 0)], vec![0.5, 1.0, 9.0]),
+        mol(&[15, 1, 1, 1], 198, 3, 9, vec![sc("ph3", 198, 3, 9)], vec![1.0, 6.0, f64::INFINITY]),
+        mol(&[15, 1, 1, 1, 1, 1], 16, 0, 0, vec![sc("mix", 16, 0, 0)], vec![2.0]),
+    ];
+    m
+}
+
+/// 2026-11-16: the preview's words — the count and its breakdown by composition (formulas, most
+/// first, the rest folded), the matched samples already out of the fit, a species left with no
+/// sample in the fit, and the recovery's cap; nothing in the fit: says so.
+#[test]
+fn the_forget_preview_says_what_goes_and_what_it_costs() {
+    use sim::knowledge::{Composition, ForgetPreview, ForgetRule};
+    use super::dock::model::forget_preview_text;
+    let mols = forget_rule_map().molecules;
+    let p = ForgetPreview::of(&mols, &ForgetRule::Element(15));
+    let t = forget_preview_text(&p, 12, 1500);
+    assert!(t.starts_with("Forget 214 samples: 198 PH₃, 16 PH₅."), "{t}");
+    assert!(t.contains(" 12 already held out: 9 forgotten, 3 held by the trust recovery or excluded."), "{t}");
+    assert!(t.contains(" P will have no samples in the fit: P atoms fall back to DFT until taught again."), "{t}");
+    assert!(t.contains("Held and forgotten together will be 226 of 1500 samples, past the 10 % the trust recovery may hold out"), "{t}");
+    // within the cap, and a species kept: neither note
+    let t = forget_preview_text(&ForgetPreview::of(&mols, &ForgetRule::Composition(Composition::of(&[15, 1, 1, 1]))), 12, 100_000);
+    assert_eq!(t, "Forget 198 samples: 198 PH₃. 12 already held out: 9 forgotten, 3 held by the trust recovery or excluded.");
+    let t = forget_preview_text(&ForgetPreview::of(&mols, &ForgetRule::Above(5.0)), 0, 100_000);
+    assert_eq!(t, "Forget 3 samples: 2 PH₃, 1 H₂.");
+    assert_eq!(forget_preview_text(&ForgetPreview::of(&mols, &ForgetRule::Element(8)), 0, 1500), "No sample in the fit matches.");
+    // H everywhere: two species emptied
+    let t = forget_preview_text(&ForgetPreview::of(&mols, &ForgetRule::Element(1)), 0, 100_000);
+    assert!(t.contains(" H and P will have no samples in the fit: their atoms fall back to DFT until taught again."), "{t}");
+    // more compositions than the preview names: the rest folded
+    let many: Vec<sim::knowledge::MoleculeKnowledge> = (2u8..10)
+        .map(|k| sim::knowledge::MoleculeKnowledge { composition: Composition::of(&vec![1; k as usize]), fitted: 10 - k as usize, waiting: 0, held: 0, forgotten: 0, scenes: Vec::new(), ratios: Vec::new(), pairs: Vec::new(), angles: Vec::new() })
+        .collect();
+    let t = forget_preview_text(&ForgetPreview::of(&many, &ForgetRule::Element(1)), 0, 100_000);
+    assert!(t.starts_with("Forget 36 samples: 8 H₂, 7 H₃, 6 H₄, 5 H₅, 4 H₆, 3 H₇, + 3 in 2 more compositions."), "{t}");
+}
+
+/// 2026-11-16: "Forget samples…" and "Forget all above x×" in the Worst-fitting samples — a
+/// filter and its preview, Forget… opens the inline confirmation (nothing sent), Cancel closes it
+/// (nothing sent), Forget sends exactly `Command::ForgetByRule` with the previewed count, recorded
+/// as `# not replayable: forget-by-rule`; the threshold row likewise, with its honesty line.
+#[test]
+fn forget_by_rule_needs_its_inline_confirmation() {
+    use sim::knowledge::{Composition, ForgetRule};
+    fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 1400.0))), ..Default::default() };
+        let mut full = ctx.run_ui(raw, |root| {
+            show(root, st, inp);
+        });
+        full.textures_delta.clear();
+        let mut out = String::new();
+        full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        out
+    }
+    let suspect = |index, formula: &str, loo_ratio| sim::SampleSuspect { id: sim::SampleId { index, key: index as u64 }, formula: formula.into(), origin: "fallback".into(), loo_ratio };
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let m = ModelStatus { suspects: vec![suspect(7, "H3P", Some(f64::INFINITY)), suspect(8, "H2", Some(9.0))], samples: 1500, quarantined: 3, forgotten: 9, ..model() };
+    let mut snap = snapshot(&scene, Backend::Estimated, Some(m));
+    snap.activity.knowledge = Some(std::sync::Arc::new(forget_rule_map()));
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    alone(&mut st, DockTab::Model);
+    st.activity.absorb(&snap);
+    let inp = input(&scene, Some(&snap), &cam);
+    search::pick(&ctx, &mut st, search::ENTRIES.iter().find(|e| e.anchor == "d-suspects").unwrap());
+    for _ in 0..40 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
+    let sent = |outs: &[PanelOutput]| outs.iter().flat_map(|o| o.commands.clone()).collect::<Vec<_>>();
+    let acted = |outs: &[PanelOutput]| outs.iter().flat_map(|o| o.actions.clone()).collect::<Vec<_>>();
+    // the threshold row: 5.0× by default, 3 samples above it
+    let t = texts(&ctx, &mut st, &inp);
+    assert!(t.contains("Forget all above") && t.contains("Forget (3)…"), "{t}");
+    let outs = click_widget(&ctx, &mut st, &inp, "forget-above");
+    assert!(sent(&outs).is_empty() && acted(&outs).is_empty() && st.forget_rule.above_confirm, "the first click only opens the confirmation");
+    let t = texts(&ctx, &mut st, &inp);
+    assert!(t.contains("Forget 3 samples: 2 PH₃, 1 H₂.") && t.contains("The ratios are recomputed at every refit") && t.contains("hides that gap rather than fixing it"), "{t}");
+    let outs = click_widget(&ctx, &mut st, &inp, "forget-above-cancel");
+    assert!(sent(&outs).is_empty() && !st.forget_rule.above_confirm, "Cancel sends nothing");
+    click_widget(&ctx, &mut st, &inp, "forget-above");
+    let outs = click_widget(&ctx, &mut st, &inp, "forget-above-confirm");
+    assert!(matches!(sent(&outs).as_slice(), [Command::ForgetByRule { rule: ForgetRule::Above(x), expected: 3 }] if *x == 5.0), "{:?}", sent(&outs));
+    assert!(!st.forget_rule.above_confirm);
+    // the tool sits below a 900-high window's fold: scrolled into view (the panel's own scroll)
+    let low = |st: &mut UiState, name: &str| {
+        let at = probed_rect("forget-above-value").center();
+        frame(&ctx, st, &inp, 1400.0, vec![egui::Event::PointerMoved(at), egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, -600.0), phase: egui::TouchPhase::Move, modifiers: egui::Modifiers::NONE }]);
+        click_widget(&ctx, st, &inp, name)
+    };
+    // "Forget samples…": a filter, its preview, then the confirmation
+    low(&mut st, "forget-rule-open");
+    assert!(st.forget_rule.open);
+    low(&mut st, "forget-rule-kind-composition");
+    assert_eq!(st.forget_rule.kind, super::dock::model::RuleKind::Composition);
+    // the combo box's pick (a popup row): set as its selectable value would
+    st.forget_rule.composition = Some(Composition::of(&[15, 1, 1, 1]));
+    let t = texts(&ctx, &mut st, &inp);
+    assert!(t.contains("Forget 198 samples: 198 PH₃.") && t.contains("12 already held out"), "{t}");
+    let outs = low(&mut st, "forget-rule-go");
+    assert!(sent(&outs).is_empty() && acted(&outs).is_empty() && st.forget_rule.confirm, "Forget… only opens the confirmation");
+    let outs = low(&mut st, "forget-rule-cancel");
+    assert!(sent(&outs).is_empty() && !st.forget_rule.confirm, "Cancel sends nothing");
+    low(&mut st, "forget-rule-go");
+    let outs = low(&mut st, "forget-rule-confirm");
+    let want = ForgetRule::Composition(Composition::of(&[15, 1, 1, 1]));
+    assert!(matches!(sent(&outs).as_slice(), [Command::ForgetByRule { rule, expected: 198 }] if *rule == want), "{:?}", sent(&outs));
+    assert!(matches!(acted(&outs).as_slice(), [Action::ForgetByRule(rule, 198)] if *rule == want));
+    assert!(!st.forget_rule.confirm);
+    // the element filter: the species emptied and the cap in the preview
+    low(&mut st, "forget-rule-kind-element");
+    st.forget_rule.element = Some(15);
+    let t = texts(&ctx, &mut st, &inp);
+    assert!(t.contains("Forget 214 samples: 198 PH₃, 16 PH₅.") && t.contains("P will have no samples in the fit"), "{t}");
+    // the scene filter
+    low(&mut st, "forget-rule-kind-scene");
+    st.forget_rule.scene = Some("mix".into());
+    assert!(texts(&ctx, &mut st, &inp).contains("Forget 16 samples: 16 PH₅."));
+    // recorded, not replayable, like a Forget batch
+    let a = Action::ForgetByRule(want.clone(), 198);
+    assert_eq!(crate::replay::unreplayable_kind(&a), Some("forget-by-rule"));
+    let line = crate::replay::write_line(&crate::replay::Line::Action(a));
+    assert!(line.starts_with("# not replayable: forget-by-rule"), "{line}");
+    assert!(!crate::replay::is_harmless("forget-by-rule"));
 }

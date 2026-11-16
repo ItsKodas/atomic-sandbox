@@ -1743,6 +1743,27 @@ impl SurrogateKs {
         Ok(())
     }
 
+    /// **Forgets by rule** (2026-11-16, the Model tab's "Forget samples…" and "Forget all above
+    /// x×"): the rule resolved against every stored sample now (`sim::knowledge::select` over
+    /// [`sample_rows`](Self::sample_rows), the ratios from the standing fit's cache) — only samples in the fit's codes, as for a Forget —
+    /// then forgotten as one batch ([`forget_samples`](Self::forget_samples): written at once, one
+    /// refit due, past the cap with its warning). Refused, nothing changed: nothing in the fit matched, or a count other than
+    /// `expected`, the one the user confirmed (the samples changed since the preview). `Ok` with
+    /// the count forgotten.
+    pub fn forget_by_rule(&mut self, rule: &sim::knowledge::ForgetRule, expected: usize) -> Result<usize, String> {
+        let sel = sim::knowledge::select(&self.sample_rows(), rule);
+        let n = sel.chosen.len();
+        if n == 0 {
+            return Err(format!("no sample in the fit matches ({} held out already)", sel.held + sel.forgotten));
+        }
+        if n != expected {
+            return Err(format!("the samples changed: {n} match now, not the {expected} confirmed — check the preview again"));
+        }
+        let ids: Vec<sim::SampleId> = sel.chosen.iter().filter_map(|&i| self.sample_id(i)).collect();
+        self.forget_samples(&ids)?;
+        Ok(n)
+    }
+
     /// Puts every forgotten sample `ids` names back **as one batch** (2026-11-14; "Restore N
     /// selected"): all or nothing, as [`forget_samples`](Self::forget_samples) — each must be
     /// forgotten; written at once, one refit due, one note. One id is
