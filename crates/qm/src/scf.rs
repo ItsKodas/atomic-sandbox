@@ -159,11 +159,14 @@
 //!     plateau of μ, and μ is the plateau midpoint). The f are recomputed from each step's levels and never mixed (the
 //!     mixer sees densities only); ρ_σ = Σ_i f_iσ ψ_iσ². An empty channel is not solved: no levels, μ_σ = `None`.
 //!   - *The witness* (spec §4.2): FD needs every level with a non-negligible f, so each occupied channel grows its
-//!     block by one vector at a time, re-solving every level, until its highest level ε_kσ satisfies
-//!       ε_kσ ≥ ε_(N_σ) + `WITNESS_GAP`   and   ε_kσ − μ_σ ≥ `WITNESS_TAIL_KT`·kT        (`witness_reached`)
+//!     block, re-solving every level, until the lower bound θ − r of its highest level satisfies
+//!       θ_k − r_k ≥ ε_(N_σ) + `WITNESS_GAP`   and   θ_k − r_k − μ_σ ≥ `WITNESS_TAIL_KT`·kT      (`witness_bound_reached`)
 //!     (ε_(N_σ) the N_σ-th lowest; at 36 kT the first unsolved level would hold f < 2.4e-16, below f64 resolution next
-//!     to 1). At most `MAX_WITNESS_GROWTH` extra vectors, else `QmError::Numerical`. A cold start solves N_σ + 1; a warm
-//!     start keeps its grown block; growth uses `DegenerateShells`' seeds. Under `Aufbau` an all-electron scene solved
+//!     to 1). Plan Task 9b (`occupations` module doc, "Witness columns at a guard tolerance"): the columns whose f is
+//!     negligible against the Δρ stop are held to `WITNESS_GUARD_TOL` instead of eig_tol (`tight_columns`), the extra
+//!     block doubles per growth (`grown_extras`) and its overshoot is trimmed once the witness passes (`witness_keep`).
+//!     At most `MAX_WITNESS_GROWTH` extra vectors, else `QmError::Numerical`. A cold start solves N_σ + 1; a warm
+//!     start keeps its block; growth uses `DegenerateShells`' seeds. Under `Aufbau` an all-electron scene solved
 //!     exactly N_σ vectors, so FD costs it at least one extra vector per occupied channel.
 //!   - *The energies* (spec §4.3): E (`Energy::internal`) = T_s + E_ext (incl. E_NL) + E_H + E_xc + E_nn as above with
 //!     T_s = Σ f⟨ψ|−½∇²|ψ⟩ and E_NL = Σ f Σ E_KB c², all from the output orbitals and ρ_out of the final step;
@@ -300,7 +303,7 @@
 //! ρ_out = ρ_in it is the reported F; under the other schemes S = 0 and nothing changes.
 //! Computed only when an observer is attached; `scf` attaches none.
 
-use crate::eigen::{jacobi_precond, lobpcg, EigenStats, LocalHamiltonian};
+use crate::eigen::{jacobi_precond, lobpcg, lobpcg_tiers, EigenStats, LocalHamiltonian};
 use crate::error::QmError;
 use crate::grid::{neumaier, Grid};
 use crate::ionic::{core_overlaps, IonicSetup, CORE_OVERLAP_WARNING};
@@ -326,18 +329,22 @@ pub enum Occupations { Aufbau, DegenerateShells { tau: f64 }, FermiDirac { kt: f
 /// cluster's converged spread. A solver constant.
 pub const DEGENERACY_TAU: f64 = 1e-3;
 
-/// The most extra vectors a spin channel may grow to find the gap witness (a method literal and a cost cap only: the
-/// largest symmetry degeneracy of a Z ≤ 18 open shell is 3, plus box continuum states above it; spec 2026-11-13 §4.2
-/// measured at most 15 under `FermiDirac` at kT = 5 mHa in a 14 Bohr box).
+/// The most extra vectors a spin channel may grow to find the gap witness: the ceiling of the cap (a method literal and
+/// a cost cap only: the largest symmetry degeneracy of a Z ≤ 18 open shell is 3, plus box continuum states above it;
+/// spec 2026-11-13 §4.2 measured at most 15 under `FermiDirac` at kT = 5 mHa in a 14 Bohr box). The CPU solver uses
+/// it as its cap; the GPU solver's cap is min(this, what its VRAM budget fits) (`qm_gpu::GpuSolver::set_witness_cap`,
+/// set by `providers::ks` from the budget; plan 2026-11-13 Task 9b ruling: the error then names the budget).
 ///
 /// Measured (plan 2026-11-13 Task 7 fix rounds 1–2): a cold all-electron H₂O at 97³ × 0.25 (a 24.5 Bohr box) reaches
 /// 16 on its 3rd and 4th SCF steps. Their spectrum is far from self-consistent: Δρ_prev 4.8 and 2.3, ε_N = −0.152 /
 /// −0.132 Ha against ≈ −0.26 converged, μ ≈ −0.067 / −0.053. So the window top μ + 36 kT ≈ +0.11–0.13 Ha holds
 /// 15–16 box states. The block stays orthonormal (max |⟨ψ_i|ψ_j⟩| ≤ 2.9e-8, Ritz gaps ≥ 2.4e-4 Ha): no collapsed
-/// columns. A cap of 32 passed step 4 (19 extras) but did not converge within a 15-minute GPU run, because every growth
-/// re-solves the ~20-vector block, so the cap stays 16. The cap and its memory budget (`providers::ks`, which counts it)
-/// are decided in plan Task 9b. `pub` for `qm-gpu::scf`, which implements the same rule.
-pub const MAX_WITNESS_GROWTH: usize = 16;
+/// columns. A cap of 32 passed step 4 (19 extras) but did not converge within a 15-minute GPU run while every growth
+/// re-solved the ~20-vector block one vector at a time with every column at the SCF's eigen tolerance. Plan Task 9b
+/// holds the witness columns to the guard tolerance and doubles the extra block per growth (`occupations` module doc,
+/// "Witness columns at a guard tolerance"), and raises the ceiling to 32. `pub` for `qm-gpu::scf`, which implements the
+/// same rule.
+pub const MAX_WITNESS_GROWTH: usize = 32;
 
 /// A shared (fractionally occupied) cluster of one spin channel: spin (0 ↑, 1 ↓), the index of its first
 /// level in ascending order, its size, the occupation f of each level and its eigenvalue spread (Ha).
@@ -687,10 +694,16 @@ pub struct Energy { pub kinetic: f64, pub external: f64, pub hartree: f64, pub x
 /// `tol_used`: the Δρ tolerance the converged step was tested against — always `settings.tol` on the CPU (f64 has no
 /// occupation-noise floor); on the GPU max(`settings.tol`, `GPU_PARTIAL_TOL`) when that step's occupations have a
 /// partial level (spec §5.1, `qm_gpu::scf` "Fermi–Dirac occupations"), else `settings.tol`.
+/// Under `FermiDirac` the eigen residuals are split (plan 2026-11-13 Task 9b; `occupations` module doc, "Witness
+/// columns at a guard tolerance"): `max_eigen_residual` is the worst of the **tight** columns (the ones the density
+/// rests on, held to eig_tol), `max_guard_residual` the worst of the loose witness columns (held to
+/// `WITNESS_GUARD_TOL`, f negligible against the stop); 0 under the other schemes, where every column is tight.
 #[derive(Debug, Clone)]
 pub struct ScfStats {
     pub iterations: usize, pub delta_rho: f64, pub energy: Energy, pub boundary_density: f64,
-    pub max_eigen_residual: f64, pub poisson_residual: f64, pub poisson_iterations: usize,
+    pub max_eigen_residual: f64,
+    pub max_guard_residual: f64,
+    pub poisson_residual: f64, pub poisson_iterations: usize,
     pub warnings: Vec<String>,
     pub core_overlaps: Vec<(usize, usize, f64)>,
     pub fractional: Vec<FractionalShell>,
@@ -721,12 +734,22 @@ const POISSON_MAX_ITER: usize = 5000;
 /// insensitive) barely amplify it.
 fn poisson_tol(tol: f64) -> f64 { POISSON_TOL.min(1e-3 * tol) }
 
-/// Worst-case inner-solver diagnostics accumulated over an SCF run (see `ScfStats`).
-struct InnerStats { eigen_residual: f64, poisson_residual: f64, poisson_iterations: usize, poisson_tol: f64, warnings: Vec<String> }
+/// Worst-case inner-solver diagnostics accumulated over an SCF run (see `ScfStats`). `guard_residual`: the loose
+/// (witness) columns' worst exit residual under `FermiDirac` (`occupations` module doc, "Witness columns at a guard
+/// tolerance"); `eigen_residual` is then the tight columns' only.
+struct InnerStats { eigen_residual: f64, guard_residual: f64, poisson_residual: f64, poisson_iterations: usize, poisson_tol: f64, warnings: Vec<String> }
 
 impl InnerStats {
     /// `poisson_tol`: the tolerance the run's Poisson solves were asked for (`poisson_tol(settings.tol)`).
-    fn new(poisson_tol: f64) -> InnerStats { InnerStats { eigen_residual: 0.0, poisson_residual: 0.0, poisson_iterations: 0, poisson_tol, warnings: Vec::new() } }
+    fn new(poisson_tol: f64) -> InnerStats { InnerStats { eigen_residual: 0.0, guard_residual: 0.0, poisson_residual: 0.0, poisson_iterations: 0, poisson_tol, warnings: Vec::new() } }
+
+    /// Records one tiered LOBPCG exit (`lobpcg_tiers`): the columns at positions < `head` were held to the eigen tol
+    /// and enter `eigen_residual`, the others to the guard tolerance and enter `guard_residual`.
+    fn eigen_tiers(&mut self, residuals: &[f64], head: usize) {
+        for (i, &r) in residuals.iter().enumerate() {
+            if i < head { self.eigen_residual = self.eigen_residual.max(r) } else { self.guard_residual = self.guard_residual.max(r) }
+        }
+    }
 
     /// Records one LOBPCG exit. A residual not below `eig_tol` means the 200-iteration cap was
     /// hit; that is reported through `max_eigen_residual` only, not as a warning: on the oracle
@@ -932,26 +955,85 @@ fn solve_shared(grid: &Grid, v_eff: &[f64], nl: Option<&NonlocalOp>, orbitals: &
     }
 }
 
-/// One spin channel under `FermiDirac { kt }` (module doc, "Occupations"): solve the block, take `fermi_dirac`'s
-/// occupations of the step's levels, and while the highest level is no witness (`witness_reached`: ≥ ε_(n) +
-/// `WITNESS_GAP` and ≥ μ + `WITNESS_TAIL_KT`·kT) grow the block by one vector and re-solve every level. The cap and the
-/// grown vectors' seeds are `solve_shared`'s. Errors: more than `MAX_WITNESS_GROWTH` extra vectors, and
-/// `fermi_dirac`'s refusals (a non-finite level). An empty channel (n = 0) is not solved: f = [], μ = None, S = 0.
+/// `solve_channel` with the split stop of `lobpcg_tiers` (the lowest `head` columns to `eig_tol`, the rest to
+/// `guard_tol`); `residuals` receives every column's exit residual.
+#[allow(clippy::too_many_arguments)]
+fn solve_channel_tiers(grid: &Grid, v_eff: &[f64], nl: Option<&NonlocalOp>, orbitals: &mut [Vec<f64>], evals: &mut [f64], eig_tol: f64,
+                       head: usize, guard_tol: f64, residuals: &mut [f64]) -> EigenStats {
+    let lambda = evals.first().copied().unwrap_or(-1.0);
+    let pc = jacobi_precond(grid, v_eff, lambda);
+    match nl {
+        None => lobpcg_tiers(grid, &LocalHamiltonian { grid, v: v_eff }, orbitals, evals, Some(&pc), eig_tol, head, guard_tol, 200, residuals),
+        Some(nl) => lobpcg_tiers(grid, &PseudoHamiltonian { grid, v: v_eff, nl }, orbitals, evals, Some(&pc), eig_tol, head, guard_tol, 200, residuals),
+    }
+}
+
+/// The witness columns' guard tier (`occupations` module doc, "Witness columns at a guard tolerance"): `Loose` holds
+/// the columns whose f is negligible against the Δρ stop (`tight_columns` at the SCF's `tol`) to
+/// max(`WITNESS_GUARD_TOL`, eig_tol); `AllTight` holds every column to eig_tol (the reference the rule is tested
+/// against, `#[cfg(test)]`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Tiers { Loose { tol: f64 }, #[cfg(test)] AllTight }
+
+/// One spin channel under `FermiDirac { kt }` (module doc, "Occupations"; `occupations` module doc, "Witness columns at
+/// a guard tolerance"): solve the block with its lowest `*tight` columns at `eig_tol` and the rest at the guard
+/// tolerance, take `fermi_dirac`'s occupations of the step's levels, and
+/// - if a column held loose has an upper-bound occupation that needs it tight (`tight_columns`), raise `*tight` over it
+///   and re-solve (a column changing class; `*tight` keeps the step's need for the next step);
+/// - while the highest level's lower bound θ − r is no witness (`witness_bound_reached`), grow the extra block
+///   (`grown_extras`: it doubles, at most `cap` extra vectors; the grown vectors' seeds are `solve_shared`'s) and
+///   re-solve every level; once it is, trim the overshoot above the lowest witness (`witness_keep`) and return the
+///   occupations of what is kept.
+/// Errors: the witness still missing at `cap` extra vectors, and `fermi_dirac`'s refusals (a non-finite level). An
+/// empty channel (n = 0) is not solved: f = [], μ = None, S = 0.
 #[allow(clippy::too_many_arguments)]
 fn solve_fd(grid: &Grid, v_eff: &[f64], nl: Option<&NonlocalOp>, orbitals: &mut Vec<Vec<f64>>, evals: &mut Vec<f64>, n: usize, kt: f64,
-            eig_tol: f64, nuclei: &[Nucleus], spin: u8, inner: &mut InnerStats) -> Result<FdOccupations, QmError> {
+            eig_tol: f64, tiers: Tiers, tight: &mut usize, cap: usize, nuclei: &[Nucleus], spin: u8, inner: &mut InnerStats)
+            -> Result<FdOccupations, QmError> {
     if n == 0 { return fermi_dirac(evals, 0, kt); }
+    let guard_tol = WITNESS_GUARD_TOL.max(eig_tol);
+    let mut residuals = vec![0.0; orbitals.len()];
     loop {
-        inner.eigen(solve_channel(grid, v_eff, nl, orbitals, evals, eig_tol));
+        let head = match tiers { Tiers::Loose { .. } => (*tight).min(orbitals.len()), #[cfg(test)] Tiers::AllTight => orbitals.len() };
+        residuals.resize(orbitals.len(), 0.0);
+        let stats = solve_channel_tiers(grid, v_eff, nl, orbitals, evals, eig_tol, head, guard_tol, &mut residuals);
+        inner.eigen_tiers(&residuals, head);
+        debug_assert!(stats.max_residual.is_nan() || residuals.iter().all(|&r| r <= stats.max_residual));
         let occ = fermi_dirac(evals, n, kt)?;
-        if witness_reached(evals, n, occ.mu.expect("an occupied channel has μ"), kt) { return Ok(occ); }
-        if orbitals.len() >= n + MAX_WITNESS_GROWTH {
-            return Err(QmError::Numerical(format!("no gap witness within {MAX_WITNESS_GROWTH} extra levels of spin {spin} \
-                                                   (WITNESS_GAP = {WITNESS_GAP} Ha above ε_N and {WITNESS_TAIL_KT} kT above μ)")));
+        let mu = occ.mu.expect("an occupied channel has μ");
+        let need = match tiers { Tiers::Loose { tol } => tight_columns(evals, &residuals, occ.mu, kt, tol), #[cfg(test)] Tiers::AllTight => orbitals.len() };
+        *tight = need;
+        if need > head {
+            #[cfg(test)]
+            CLASS_RAISES.with(|c| c.set(c.get() + 1));
+            continue; // a column held loose needs the eigen tol: re-solve with it tight
         }
-        orbitals.extend(initial_orbitals(grid, nuclei, 1, 1000 + 2 * orbitals.len() as u64 + spin as u64));
-        evals.push(*evals.last().expect("n > 0 vectors"));
+        if witness_bound_reached(evals, &residuals, n, mu, kt) {
+            // the trim (`occupations` module doc): drop the overshoot of a doubled block above the lowest witness
+            let keep = witness_keep(evals, &residuals, n, mu, kt);
+            if keep >= orbitals.len() { return Ok(occ); }
+            let order = ascending(evals);
+            let mut dropped: Vec<usize> = order[keep..].to_vec();
+            dropped.sort_unstable_by(|a, b| b.cmp(a));
+            for i in dropped { orbitals.remove(i); evals.remove(i); }
+            return fermi_dirac(evals, n, kt);
+        }
+        let extras = orbitals.len() - n;
+        if extras >= cap {
+            return Err(QmError::Numerical(format!("no gap witness within {cap} extra levels of spin {spin} \
+                                                   (WITNESS_GAP = {WITNESS_GAP} Ha above ε_N and {WITNESS_TAIL_KT} kT above μ, on the lower bound θ − r)")));
+        }
+        for _ in extras..grown_extras(extras, cap) {
+            orbitals.extend(initial_orbitals(grid, nuclei, 1, 1000 + 2 * orbitals.len() as u64 + spin as u64));
+            evals.push(*evals.last().expect("n > 0 vectors"));
+        }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `solve_fd`'s re-solves for a column that changed class (loose → tight) on this thread (`fd_a_column_changes_class_mid_solve`).
+    static CLASS_RAISES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Indices of `evals` in ascending order (`pub` for `qm-gpu::scf`).
@@ -1007,8 +1089,20 @@ pub fn scf(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&K
 /// `scf` with a per-iteration observer (module doc, "Progress"): `observe` gets one
 /// `ScfProgress` per iteration, its Harris–Foulkes energy included. With `None` it is `scf`; an
 /// observer changes no number of the solve (it only reads).
-pub fn scf_observed(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&KsState>, mut observe: Option<&mut dyn FnMut(&ScfProgress)>)
+pub fn scf_observed(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&KsState>, observe: Option<&mut dyn FnMut(&ScfProgress)>)
                     -> Result<(KsState, ScfStats), QmError> {
+    scf_tiered(grid, system, settings, warm, observe, Tiers::Loose { tol: settings.tol })
+}
+
+/// `scf` with every `FermiDirac` column held to `eig_tol` (`Tiers::AllTight`): the reference the guard tier is tested
+/// against (`occupations` module doc, "Witness columns at a guard tolerance").
+#[cfg(test)]
+pub(crate) fn scf_all_tight(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&KsState>) -> Result<(KsState, ScfStats), QmError> {
+    scf_tiered(grid, system, settings, warm, None, Tiers::AllTight)
+}
+
+fn scf_tiered(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option<&KsState>, mut observe: Option<&mut dyn FnMut(&ScfProgress)>,
+              tiers: Tiers) -> Result<(KsState, ScfStats), QmError> {
     let n = grid.len();
     let terms = IonicTerms::new(grid, system, settings)?;
     let v_nuc = &terms.v_loc;
@@ -1016,9 +1110,13 @@ pub fn scf_observed(grid: &Grid, system: &System, settings: &ScfSettings, warm: 
     let mut inner = InnerStats::new(poisson_tol(settings.tol));
 
     // starting point
-    let (mut orb_up, mut orb_dn, mut ev_up, mut ev_dn, mut rho_in_up, mut rho_in_dn, mut v_h) = match warm {
-        Some(w) if w.grid == *grid && counts_match(w, system, settings.occupations) && w.occupations == settings.occupations
-                   && same_ionic(w.ionic.as_deref(), system.ionic.as_deref()) => (
+    let reused = warm.filter(|w| w.grid == *grid && counts_match(w, system, settings.occupations) && w.occupations == settings.occupations
+                                 && same_ionic(w.ionic.as_deref(), system.ionic.as_deref()));
+    // `FermiDirac`'s tight column counts per spin (`solve_fd`): from the warm state's f, else N_σ
+    let mut tight = [tight_start(reused.map(|w| w.occ_up.as_slice()), system.n_up, settings.tol),
+                     tight_start(reused.map(|w| w.occ_dn.as_slice()), system.n_dn, settings.tol)];
+    let (mut orb_up, mut orb_dn, mut ev_up, mut ev_dn, mut rho_in_up, mut rho_in_dn, mut v_h) = match reused {
+        Some(w) => (
             w.orbitals_up.clone(), w.orbitals_dn.clone(), w.evals_up.clone(), w.evals_dn.clone(),
             w.rho_up.clone(), w.rho_dn.clone(), w.v_h.clone()),
         _ => {
@@ -1088,8 +1186,11 @@ pub fn scf_observed(grid: &Grid, system: &System, settings: &ScfSettings, warm: 
             }
             Occupations::FermiDirac { kt } => {
                 // the step's own levels decide the f (never mixed; spec 2026-11-13 §5 "Unchanged")
-                let ou = solve_fd(grid, &v_up, terms.nl.as_ref(), &mut orb_up, &mut ev_up, system.n_up, kt, settings.eig_tol, &system.nuclei, 0, &mut inner)?;
-                let od = solve_fd(grid, &v_dn, terms.nl.as_ref(), &mut orb_dn, &mut ev_dn, system.n_dn, kt, settings.eig_tol, &system.nuclei, 1, &mut inner)?;
+                let [tu, td] = &mut tight;
+                let ou = solve_fd(grid, &v_up, terms.nl.as_ref(), &mut orb_up, &mut ev_up, system.n_up, kt, settings.eig_tol, tiers, tu, MAX_WITNESS_GROWTH,
+                                  &system.nuclei, 0, &mut inner)?;
+                let od = solve_fd(grid, &v_dn, terms.nl.as_ref(), &mut orb_dn, &mut ev_dn, system.n_dn, kt, settings.eig_tol, tiers, td, MAX_WITNESS_GROWTH,
+                                  &system.nuclei, 1, &mut inner)?;
                 rho_out_up = weighted_density(grid, &orb_up, &ou.f);
                 rho_out_dn = weighted_density(grid, &orb_dn, &od.f);
                 entropy = neumaier([ou.entropy, od.entropy].into_iter());
@@ -1194,7 +1295,7 @@ pub fn scf_observed(grid: &Grid, system: &System, settings: &ScfSettings, warm: 
                   rho_up: rho_out_up, rho_dn: rho_out_dn, v_nuc: v_loc, v_h, grid: grid.clone(), sigma: settings.sigma,
                   ionic: system.ionic.clone(), occ_up, occ_dn, occupations: settings.occupations },
         ScfStats { iterations, delta_rho, energy, boundary_density,
-                   max_eigen_residual: inner.eigen_residual, poisson_residual: inner.poisson_residual,
+                   max_eigen_residual: inner.eigen_residual, max_guard_residual: inner.guard_residual, poisson_residual: inner.poisson_residual,
                    poisson_iterations: inner.poisson_iterations, warnings, core_overlaps: overlaps, fractional, released,
                    entropy, mu, partial, tol_used: settings.tol }))
 }
@@ -1374,10 +1475,13 @@ mod tests {
     // Re-pinned (plan Task 7, 2026-11-16; printed by this test): the same scenes under `ScfSettings::for_grid`'s default
     // since Task 7, FermiDirac at kT = 5 mHa — all-electron now solves witness vectors (FD, spec 2026-11-13). The move
     // from the Aufbau bits above and the −TS of each are recorded beside the values.
-    const FD_H2_E: u64 = 0xbfee7a76b232ffed; // -0.952449176832 (Aufbau −0.952449176828: −4.5e-12; TS 4.3e-20; 10 steps, 2 / 2 stored)
-    const FD_H2_FX: u64 = 0x3fc07b139b8e8122; // +0.128755999523 (Aufbau +0.128755968432)
-    const FD_LIH_E: u64 = 0xc014e130719f64f8; // -5.219911361078 (Aufbau −5.219911351003: −1.0e-8 = −TS 1.59e-7 + E − E_A +1.49e-7; 15 steps, 6 / 6 stored)
-    const FD_LIH_FX: u64 = 0xbf973980c2ecf2d0; // -0.022680293939 (Aufbau −0.022680157203)
+    // Re-pinned again (plan Task 9b, 2026-11-16): the witness columns at the guard tolerance (`lobpcg_tiers`), the lower-bound
+    // witness and the doubled growth change the eigensolves' paths; the moves are inside Δρ < 1e-6 (Task 7's pins: H₂
+    // −0.952449176832 / +0.128755999523, LiH −5.219911361078 / −0.022680293939).
+    const FD_H2_E: u64 = 0xbfee7a76b2332abb; // -0.952449176833 (Aufbau −0.952449176828: −5e-12; TS 4.3e-20; 10 steps, 2 / 2 stored)
+    const FD_H2_FX: u64 = 0x3fc07b138b5aa128; // +0.128755991978 (Aufbau +0.128755968432: +2.4e-8)
+    const FD_LIH_E: u64 = 0xc014e130719e4631; // -5.219911361013 (Aufbau −5.219911351003: −1.0e-8 = −TS 1.59e-7 + E − E_A +1.49e-7; 13 steps, 6 / 6 stored)
+    const FD_LIH_FX: u64 = 0xbf97396f611800a0; // -0.022680034925 (Aufbau −0.022680157203: +1.2e-7)
 
     /// Global constraint: IonicPolicy::None is today's solver, bit for bit (energies and forces) — under `Aufbau`, set
     /// explicitly since plan Task 7 made FermiDirac `for_grid`'s default; the for_grid (FD) solves are pinned beside it.
@@ -2174,6 +2278,157 @@ mod tests {
             assert!((neumaier(occ.iter().copied()) - n as f64).abs() < 1e-12, "spin {spin}: Σf {occ:?}");
         }
         assert_eq!(st.occupations, fd(ELECTRON_KT));
+    }
+
+    /// A slice printed in `{:e}` with one decimal.
+    struct Sci<'a>(&'a [f64]);
+    impl std::fmt::Display for Sci<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "[{}]", self.0.iter().map(|v| format!("{v:.1e}")).collect::<Vec<_>>().join(", "))
+        }
+    }
+
+    /// The pseudo-O (`CoresOnly`, `from_tables` at h) at `pos` with multiplicity `m`.
+    fn pseudo_o(h: f64, m: u32, pos: [f64; 3]) -> System {
+        use crate::ionic::{Ionic, IonicPolicy, IonicSetup};
+        use crate::radial::test_cache::filtered_at;
+        let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([(8, Ionic::Pseudo(filtered_at(8, h)))])));
+        System::with_ionic(vec![Nucleus { pos, z: 8 }], 0, Some(m), setup)
+    }
+
+    /// The H₄ square of `fd_h4_square_closed_form` (a = 1.8, axes-aligned, centred).
+    fn h4_square() -> System {
+        let c = 0.5 * 1.8;
+        System::new([[c, c], [c, -c], [-c, c], [-c, -c]].iter().map(|&[x, y]| Nucleus { pos: [x, y, 0.0], z: 1 }).collect(), 0, None)
+    }
+
+    /// Every column's residual ‖H x − θ x‖ of a converged all-electron state in H[ρ_out] (the potential of the state's own
+    /// output density; it differs from the last step's H[ρ_in] by the converged Δρ).
+    fn state_residuals(g: &Grid, st: &KsState, spin: usize) -> Vec<f64> {
+        use crate::eigen::Operator;
+        assert!(st.ionic.is_none());
+        let xc = xc_with_core(&st.rho_up, &st.rho_dn, None);
+        let v: Vec<f64> = (0..g.len()).map(|i| st.v_nuc[i] + st.v_h[i] + if spin == 0 { xc.v_up[i] } else { xc.v_dn[i] }).collect();
+        let op = LocalHamiltonian { grid: g, v: &v };
+        let (orbs, evals) = if spin == 0 { (&st.orbitals_up, &st.evals_up) } else { (&st.orbitals_dn, &st.evals_dn) };
+        let mut hx = vec![0.0; g.len()];
+        orbs.iter().zip(evals).map(|(x, &e)| {
+            op.apply(x, &mut hx);
+            let r: Vec<f64> = (0..g.len()).map(|i| hx[i] - e * x[i]).collect();
+            g.dot(&r, &r).sqrt()
+        }).collect()
+    }
+
+    /// Plan Task 9b (`occupations` module doc, "Witness columns at a guard tolerance"): the guard tier changes neither F
+    /// nor the forces. CPU f64, FermiDirac at kT = `ELECTRON_KT`, tol = eig_tol = 1e-10, cold; each system solved with
+    /// the loose witness columns (production) and with every column held to eig_tol (`scf_all_tight`): |ΔF| ≤ 1e-10 Ha
+    /// and |ΔF_I| ≤ 1e-9 Ha/Bohr per component (the brief's bounds; the derivation bounds the rule's own part by
+    /// 2.2e-2·tol in ∫|δρ|). Also: the loose solve's guard columns met the guard tolerance.
+    ///
+    /// The pseudo-O sits on a grid point (the origin of the odd 33³ grid), where the cubic site keeps its 2p set exactly
+    /// degenerate, as in V4. Off site the lattice splits the partly filled p set by δ ~ 1e-5 Ha, so its f differ by
+    /// f(1 − f)/kT·δ ~ 4e-4 and ρ depends on the rotation inside the set, which an eigensolve to residual r fixes only to
+    /// r/δ: at eig_tol = 1e-10 that is a Δρ floor ~ 4e-4·1e-5 ≈ 4e-9, above tol = 1e-10, for both tiers (measured
+    /// 2026-11-16: off-site M = 1, loose 200 steps at Δρ ≈ 3e-9, all-tight 86 steps — it crossed 1e-10 on a fluctuation).
+    /// The off-site M = 1 case is therefore a printed record at tol = 1e-8, not a gate: there the two solves differ by the
+    /// stop's own resolution (measured |ΔF| 4.9e-10, |ΔF_I| 1.1e-9 — both tiers stop anywhere inside Δρ < 1e-8, and the
+    /// forces are first order in that), which the brief's bounds do not resolve; its guard columns' f ≤ e^{−36} bound
+    /// the rule's own part by 2.2·e^{−36} in ∫|δρ|.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
+    fn fd_guard_tier_matches_all_tight() {
+        let lih = System::new(vec![Nucleus { pos: [-0.8, 0.1, 0.0], z: 3 }, Nucleus { pos: [2.2, 0.0, 0.0], z: 1 }], 0, None);
+        let li = System::new(vec![Nucleus { pos: [0.0; 3], z: 3 }], 0, None);
+        let cases: Vec<(&str, Grid, System)> = vec![
+            ("H₂O", Grid::cube(33, 0.30), h2o_sys()),
+            ("LiH", Grid::cube(33, 0.30), lih),
+            ("Li", Grid::cube(33, 0.25), li),
+            ("H₄ square", Grid::cube(33, 0.30), h4_square()),
+            ("pseudo-O M = 1", Grid::cube(33, 0.25), pseudo_o(0.25, 1, [0.0; 3])),
+            ("pseudo-O M = 3", Grid::cube(33, 0.25), pseudo_o(0.25, 3, [0.0; 3])),
+            ("pseudo-O M = 1 off site (tol 1e-8)", Grid::cube(33, 0.25), pseudo_o(0.25, 1, [0.07, -0.03, 0.02])),
+        ];
+        let mut failures = Vec::new();
+        std::thread::scope(|sc| {
+            let handles: Vec<_> = cases.iter().map(|(name, g, sys)| sc.spawn(move || {
+                let mut s = ScfSettings { occupations: fd(ELECTRON_KT), ..ScfSettings::for_grid(g) };
+                (s.tol, s.eig_tol) = (if name.contains("off site") { 1e-8 } else { 1e-10 }, 1e-10);
+                let t = std::time::Instant::now();
+                let (sl, l) = scf(g, sys, &s, None).unwrap_or_else(|e| panic!("{name} loose: {e}"));
+                let tl = t.elapsed().as_secs_f64();
+                let t = std::time::Instant::now();
+                let (sa, a) = scf_all_tight(g, sys, &s, None).unwrap_or_else(|e| panic!("{name} all-tight: {e}"));
+                let ta = t.elapsed().as_secs_f64();
+                let (fl, fa) = (crate::forces::forces(g, &sl, &sys.nuclei, s.sigma).unwrap(), crate::forces::forces(g, &sa, &sys.nuclei, s.sigma).unwrap());
+                let df = fl.iter().zip(&fa).flat_map(|(x, y)| (0..3).map(move |c| (x[c] - y[c]).abs())).fold(0.0, f64::max);
+                let de = l.energy.total - a.energy.total;
+                let line = format!("{name}: F {:+.12} (loose − tight {de:+.2e}), max |ΔF_I| {df:.2e}, TS {:.3e}; steps {}/{}, wall {tl:.1}/{ta:.1} s; \
+                                    stored ↑ {}/{} ↓ {}/{}; residual tight {:.1e} guard {:.1e} (all-tight run {:.1e})",
+                                   l.energy.total, l.energy.ts, l.iterations, a.iterations, sl.orbitals_up.len(), sa.orbitals_up.len(),
+                                   sl.orbitals_dn.len(), sa.orbitals_dn.len(), l.max_eigen_residual, l.max_guard_residual, a.max_eigen_residual);
+                let gated = !name.contains("off site");
+                (line, !gated || (de.abs() <= 1e-10 && df <= 1e-9), l.max_guard_residual <= WITNESS_GUARD_TOL && a.max_guard_residual == 0.0)
+            })).collect();
+            for h in handles {
+                let (line, ok, tiers) = h.join().unwrap();
+                eprintln!("{line}");
+                if !ok || !tiers { failures.push(line); }
+            }
+        });
+        assert!(failures.is_empty(), "loose vs all-tight beyond |ΔF| ≤ 1e-10, |ΔF_I| ≤ 1e-9 (or a tier off): {failures:#?}");
+    }
+
+    /// Plan Task 9b: the final state's witness passes on the eigenvalue **lower bound** θ − ‖r‖ with ‖r‖ measured afresh
+    /// on the returned vectors (H₂O, 33³ × 0.30, the production settings): both arms hold at the reported μ, and every
+    /// tight column (by `tight_columns` on those residuals) is within 10 × eig_tol of its eigenpair in H[ρ_out] (the
+    /// difference from the last step's H[ρ_in] is the converged Δρ's), every loose one within the guard tolerance.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
+    fn fd_witness_holds_on_the_lower_bound() {
+        let g = Grid::cube(33, 0.30);
+        let sys = h2o_sys();
+        let s = ScfSettings { occupations: fd(ELECTRON_KT), ..ScfSettings::for_grid(&g) };
+        let (st, stats) = scf(&g, &sys, &s, None).unwrap();
+        for (spin, n) in [(0usize, sys.n_up), (1, sys.n_dn)] {
+            let evals = if spin == 0 { &st.evals_up } else { &st.evals_dn };
+            let res = state_residuals(&g, &st, spin);
+            let mu = stats.mu[spin].unwrap();
+            let top = ascending(evals)[evals.len() - 1];
+            let tight = tight_columns(evals, &res, Some(mu), ELECTRON_KT, s.tol);
+            eprintln!("H₂O spin {spin}: {} stored, {tight} tight; top θ {:.6} r {:.2e} → θ − r − μ = {:.4} Ha (36 kT = {:.3}); residuals {}",
+                      evals.len(), evals[top], res[top], evals[top] - res[top] - mu, 36.0 * ELECTRON_KT, Sci(&res));
+            assert!(witness_bound_reached(evals, &res, n, mu, ELECTRON_KT), "spin {spin}: θ − r fails the witness");
+            assert!(tight >= n && tight < evals.len(), "spin {spin}: tight {tight} of {}", evals.len());
+            assert!(res[..tight].iter().all(|&r| r <= 10.0 * s.eig_tol), "spin {spin}: a tight column off its tol {res:?}");
+            assert!(res[tight..].iter().all(|&r| r <= WITNESS_GUARD_TOL), "spin {spin}: a guard column off the guard tol {res:?}");
+        }
+    }
+
+    /// Plan Task 9b: a column that changes class mid-solve. H₂ warm-started at R = 4.0 from R = 1.4 (33³ × 0.30): at 1.4
+    /// σ_u holds f ≈ e^{−36} and is a loose column; at 4.0 it is partly occupied (f ~ 1e-5, tight at tol 1e-6). The solve
+    /// starts it loose (the warm state's f), finds it needs the eigen tol and re-solves it tight; the result matches the
+    /// all-tight solve of the same warm start (|ΔF| ≤ 1e-10), and σ_u ends within 10 × eig_tol in H[ρ_out].
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm --release")]
+    fn fd_a_column_changes_class_mid_solve() {
+        let g = Grid::cube(33, 0.30);
+        let mut s = ScfSettings { occupations: fd(ELECTRON_KT), ..ScfSettings::for_grid(&g) };
+        (s.tol, s.eig_tol) = (1e-9, 1e-9);
+        let (near, _) = scf(&g, &h2_sys(1.4), &s, None).unwrap();
+        let tight_near = tight_start(Some(&near.occ_up), 1, s.tol);
+        assert_eq!(tight_near, 1, "σ_u is loose at R = 1.4: f {:?}", near.occ_up);
+        CLASS_RAISES.with(|c| c.set(0));
+        let (far, stats) = scf(&g, &h2_sys(4.0), &s, Some(&near)).unwrap();
+        let raises = CLASS_RAISES.with(|c| c.get());
+        let (_, all) = scf_all_tight(&g, &h2_sys(4.0), &s, Some(&near)).unwrap();
+        let res = state_residuals(&g, &far, 0);
+        let order = ascending(&far.evals_up);
+        eprintln!("H₂ 1.4 → 4.0 warm: {raises} class raise(s), f ↑ {}, residuals {}, F {:+.12} (− all-tight {:+.2e}), partial {:?}",
+                  Sci(&far.occ_up), Sci(&res), stats.energy.total, stats.energy.total - all.energy.total, stats.partial);
+        assert!(raises >= 1, "σ_u started loose and had to be raised");
+        assert!(far.occ_up[order[1]] >= LOOSE_F_FACTOR * s.tol, "σ_u carries f {:e}", far.occ_up[order[1]]);
+        assert!(res[order[1]] <= 10.0 * s.eig_tol, "σ_u is tight: residual {:e}", res[order[1]]);
+        assert!((stats.energy.total - all.energy.total).abs() <= 1e-10, "F {} vs all-tight {}", stats.energy.total, all.energy.total);
     }
 
     /// Spec §4.1: an empty channel is not solved and has no μ. The H atom: μ↑ is reported, μ↓ is None, no level is

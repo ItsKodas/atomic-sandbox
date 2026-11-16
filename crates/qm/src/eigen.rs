@@ -193,7 +193,31 @@ fn orthonormalise(grid: &Grid, s: &mut Vec<Vec<f64>>) {
 #[allow(clippy::too_many_arguments)]
 pub fn lobpcg(grid: &Grid, op: &dyn Operator, x: &mut [Vec<f64>], evals: &mut [f64],
               precond: Option<&dyn Fn(&[f64], &mut [f64])>, tol: f64, max_iter: usize,
-              mut should_abort: Option<&mut dyn FnMut() -> bool>) -> EigenStats {
+              should_abort: Option<&mut dyn FnMut() -> bool>) -> EigenStats {
+    let k = x.len();
+    lobpcg_impl(grid, op, x, evals, precond, tol, k, tol, max_iter, should_abort, None)
+}
+
+/// `lobpcg` with a split stop test (plan 2026-11-13 Task 9b; `occupations` module doc, "Witness columns at a guard
+/// tolerance"): it stops when the lowest `head` columns (by position: after a Rayleigh–Ritz step the columns are
+/// ascending, at the guess they are as given) have max residual < `tol` and the others < `tail_tol` ≥ `tol`, or after
+/// `max_iter` steps. `residuals[i]` receives ‖H xᵢ − λᵢ xᵢ‖ of every returned column; `EigenStats::max_residual`
+/// stays the max over all of them. With `head` = `x.len()` the iteration is `lobpcg`'s instruction for instruction
+/// (the tail test is then empty).
+#[allow(clippy::too_many_arguments)]
+pub fn lobpcg_tiers(grid: &Grid, op: &dyn Operator, x: &mut [Vec<f64>], evals: &mut [f64],
+                    precond: Option<&dyn Fn(&[f64], &mut [f64])>, tol: f64, head: usize, tail_tol: f64, max_iter: usize,
+                    residuals: &mut [f64]) -> EigenStats {
+    assert!(tail_tol >= tol, "lobpcg_tiers: tail_tol {tail_tol} must not be below tol {tol}");
+    assert!(head <= x.len(), "lobpcg_tiers: head {head} > {} columns", x.len());
+    assert_eq!(residuals.len(), x.len(), "lobpcg_tiers: one residual slot per column");
+    lobpcg_impl(grid, op, x, evals, precond, tol, head, tail_tol, max_iter, None, Some(residuals))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lobpcg_impl(grid: &Grid, op: &dyn Operator, x: &mut [Vec<f64>], evals: &mut [f64],
+               precond: Option<&dyn Fn(&[f64], &mut [f64])>, tol: f64, head: usize, tail_tol: f64, max_iter: usize,
+               mut should_abort: Option<&mut dyn FnMut() -> bool>, mut residuals: Option<&mut [f64]>) -> EigenStats {
     let k = x.len();
     let n = grid.len();
     assert_eq!(evals.len(), k, "evals must have one slot per eigenvector");
@@ -209,15 +233,20 @@ pub fn lobpcg(grid: &Grid, op: &dyn Operator, x: &mut [Vec<f64>], evals: &mut [f
         for i in 0..k { op.apply(&xs[i], &mut hx[i]); evals[i] = grid.dot(&xs[i], &hx[i]); }
         let mut w: Vec<Vec<f64>> = Vec::with_capacity(k);
         let mut max_res = 0.0f64;
+        // the two tiers' maxima (`lobpcg_tiers`; head = k leaves the tail empty, so the test is `max_res < tol`)
+        let (mut head_res, mut tail_res) = (0.0f64, 0.0f64);
         for i in 0..k {
             let r: Vec<f64> = (0..n).map(|j| hx[i][j] - evals[i] * xs[i][j]).collect();
-            max_res = max_res.max(grid.dot(&r, &r).sqrt());
+            let ri = grid.dot(&r, &r).sqrt();
+            max_res = max_res.max(ri);
+            if i < head { head_res = head_res.max(ri); } else { tail_res = tail_res.max(ri); }
+            if let Some(out) = residuals.as_deref_mut() { out[i] = ri; }
             let mut wi = vec![0.0; n];
             match precond { Some(t) => t(&r, &mut wi), None => wi.copy_from_slice(&r) }
             w.push(wi);
         }
         stats.max_residual = max_res;
-        if max_res < tol || stats.iterations >= max_iter { break; }
+        if (head_res < tol && tail_res < tail_tol) || stats.iterations >= max_iter { break; }
         if let Some(abort) = should_abort.as_mut() {
             if abort() { stats.aborted = true; break; }
         }
@@ -325,6 +354,29 @@ mod tests {
         let pc = jacobi_precond(&g, &v, 1.5);
         let pre = lobpcg(&g, &op, &mut x2, &mut e2, Some(&pc), 1e-6, 500, None);
         assert!(pre.iterations < plain.iterations, "plain {} pre {}", plain.iterations, pre.iterations);
+    }
+
+    /// Plan Task 9b: `lobpcg_tiers` holds the lowest `head` columns to `tol` and the rest to `tail_tol`; with head = k it
+    /// is `lobpcg` bit for bit. Oscillator 33³, k = 4 (1.5 and the 2.5 triplet), head 1.
+    #[test]
+    fn tiers_hold_the_tail_to_its_own_tolerance() {
+        let (g, v) = oscillator(33, 0.25);
+        let op = LocalHamiltonian { grid: &g, v: &v };
+        let pc = jacobi_precond(&g, &v, 1.5);
+        let (mut xa, mut ea) = (random_guess(&g, 4), vec![0.0; 4]);
+        let plain = lobpcg(&g, &op, &mut xa, &mut ea, Some(&pc), 1e-8, 500, None);
+        let (mut xb, mut eb, mut rb) = (random_guess(&g, 4), vec![0.0; 4], vec![0.0; 4]);
+        let full = lobpcg_tiers(&g, &op, &mut xb, &mut eb, Some(&pc), 1e-8, 4, 1e-8, 500, &mut rb);
+        assert_eq!(plain.iterations, full.iterations);
+        assert_eq!(plain.max_residual.to_bits(), full.max_residual.to_bits());
+        assert!(ea.iter().zip(&eb).all(|(a, b)| a.to_bits() == b.to_bits()) && xa == xb, "head = k is lobpcg");
+        let (mut xc, mut ec, mut rc) = (random_guess(&g, 4), vec![0.0; 4], vec![0.0; 4]);
+        let tiered = lobpcg_tiers(&g, &op, &mut xc, &mut ec, Some(&pc), 1e-8, 1, 1e-3, 500, &mut rc);
+        eprintln!("tiers: all at 1e-8 {} iterations; head 1 at 1e-8, tail at 1e-3: {} iterations, residuals {rc:?}", full.iterations, tiered.iterations);
+        assert!(rc[0] < 1e-8 && rc[1..].iter().all(|&r| r < 1e-3), "{rc:?}");
+        assert_eq!(tiered.max_residual, rc.iter().copied().fold(0.0, f64::max));
+        assert!(tiered.iterations <= full.iterations);
+        assert!((ec[0] - 1.5).abs() < 1e-4, "{ec:?}");
     }
 
     #[test]

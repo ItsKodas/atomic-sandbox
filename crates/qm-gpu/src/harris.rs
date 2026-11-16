@@ -131,9 +131,11 @@
 //! **Fermi–Dirac** (the scf-stall ← main merge ruling, 2026-11-16; smearing spec 2026-11-13 §4, plan Task 9's display
 //! rule). Under `FermiDirac { kt }` — every scene's occupations on the smearing surface — the f are
 //! `qm::fermi_dirac` of this solve's own levels at the same kT, per spin at the scene's (n↑, n↓): the rule every SCF
-//! step applies, applied once. Its window is the SCF's witness (`qm::witness_reached`: the top computed level
-//! ≥ ε_(n_σ) + `WITNESS_GAP` and ≥ μ_σ + `WITNESS_TAIL_KT`·kT); short of it the block grows one level at a time, as
-//! above, up to `MAX_WITNESS_GROWTH` tested levels beyond n_σ + m + G (`split_bound`), and a window still short at that
+//! step applies, applied once. Its window is the SCF's witness on the levels' lower bounds (plan 2026-11-13 Task 9b,
+//! `decisive_levels_fd`: the smallest prefix whose top θ − r ≥ ε_(n_σ) + `WITNESS_GAP` and ≥ μ_σ +
+//! `WITNESS_TAIL_KT`·kT, r the column's true residual from `lobpcg_split`); short of it the extra levels double, as the
+//! SCF's growth does, up to the solver's witness cap (`GpuSolver::witness_cap`) of tested levels beyond n_σ + m + G
+//! (`split_bound`), and a window still short at that
 //! bound leaves the f approximate — a note in the payload ("the occupations are approximate"), never an error. Every FD
 //! level has f > 0, so "occupied" is not f > 0: the occupied levels (the state's orbitals, ρ_out's terms, the displayed
 //! occupied rows) are those with f ≥ `PARTIAL_OCCUPATION_MIN` (1e-6, `qm::orbitals::shown_columns`' rule) — the lowest
@@ -178,8 +180,8 @@ use crate::pointwise::{fill_in, lincomb_in};
 use crate::scf::{accumulate_density, take_device_error, xc_in, GpuSolver, GpuState, HarrisWork, EIGEN_MAX_ITER, POISSON_MAX_ITER};
 use gpu::GpuContext;
 use qm::orbitals::{block_edge, tau, Unoccupied, UNOCC_GUARD};
-use qm::scf::{ascending, initial_orbitals, MAX_WITNESS_GROWTH};
-use qm::{Occupations, PARTIAL_OCCUPATION_MIN, WITNESS_GAP};
+use qm::scf::{ascending, initial_orbitals};
+use qm::{fermi_dirac, grown_extras, witness_bound_reached, Occupations, PARTIAL_OCCUPATION_MIN, WITNESS_GAP};
 use qm::{one_shot_occupations, QmError, ScfSettings, System};
 use std::time::{Duration, Instant};
 
@@ -376,9 +378,24 @@ fn occupied_count(f: &[f64], order: &[usize], fermi_dirac: bool) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Split { len: usize, head: usize, checked: usize }
 
-/// The largest block of a channel with n_σ electrons and m unoccupied rows: n_σ + m + G tested levels, up to
-/// `MAX_WITNESS_GROWTH` more for a shared shell's gap witness (the SCF's growth bound), and the buffer.
-fn split_bound(n: usize, m: usize) -> usize { n + m + UNOCC_GUARD + MAX_WITNESS_GROWTH + 1 }
+/// The largest block of a channel with n_σ electrons and m unoccupied rows: n_σ + m + G tested levels, up to `w` more
+/// for the witness (the solver's cap, `GpuSolver::witness_cap`: `MAX_WITNESS_GROWTH` or what the VRAM budget fits —
+/// the SCF's growth bound), and the buffer.
+fn split_bound(n: usize, m: usize, w: usize) -> usize { n + m + UNOCC_GUARD + w + 1 }
+
+/// `decisive_levels` under `FermiDirac` (plan 2026-11-13 Task 9b, the SCF's rule: `qm::occupations` "Witness columns at
+/// a guard tolerance"): the smallest b > n whose lowest b levels (ascending, `res` their residuals) hold a witness on
+/// the lower bound θ − r (`qm::witness_bound_reached`, μ of those b levels); when no prefix does, every computed level
+/// decides and the extra levels above n double (`qm::grown_extras`, the SCF's growth): 2·len − n.
+fn decisive_levels_fd(sorted: &[f64], res: &[f64], n: usize, kt: f64) -> usize {
+    if n == 0 { return sorted.len().min(1); } // an empty channel needs no witness (`decisive_levels`' n + 1)
+    for b in (n + 1)..=sorted.len() {
+        if let Ok(Some(mu)) = fermi_dirac(&sorted[..b], n, kt).map(|o| o.mu) {
+            if witness_bound_reached(&sorted[..b], &res[..b], n, mu, kt) { return b; }
+        }
+    }
+    n + grown_extras(sorted.len().saturating_sub(n), usize::MAX)
+}
 
 /// Whether the record's last vector can change what `block_edge` shows (module doc, "The record's edge"):
 /// only when the window's last row (position n_occ + m − 1 of `sorted`, ascending) and the first guard
@@ -418,13 +435,13 @@ impl Memory {
 
 /// The split a call starts from: the last call's need (`Memory`) when it had this n_σ, clamped to the
 /// minimal split — the displayed n_σ + m at tol, the G guards, the last of them the buffer — and to
-/// `split_bound`; the minimal split otherwise. The final pass then raises it where this call needs more.
-fn start_split(mem: Option<Memory>, n: usize, m: usize) -> Split {
+/// `split_bound` at the witness cap `w`; the minimal split otherwise. The final pass then raises it where this call needs more.
+fn start_split(mem: Option<Memory>, n: usize, m: usize, w: usize) -> Split {
     let base = n + m;
     let min = Split { len: base + UNOCC_GUARD, head: base, checked: base + UNOCC_GUARD - 1 };
     match mem {
         Some(mm) if mm.n == n => {
-            let len = (base + mm.len).clamp(min.len, split_bound(n, m));
+            let len = (base + mm.len).clamp(min.len, split_bound(n, m, w));
             let checked = (base + mm.checked).clamp(min.checked, len);
             Split { len, head: (base + mm.head).clamp(min.head, checked), checked }
         }
@@ -462,6 +479,7 @@ impl GpuSolver {
         hs.park();
         if should_abort() { return Ok(None); }
         let n = [system.n_up, system.n_dn];
+        let w_cap = self.witness_cap();
         let tol = self.effective_eig_tol(settings);
         let tau_scf = tau(settings.tol);
         let HarrisWork { ctx, k, r, g, grid, poisson, poisson_tol, work, work_k } = self.harris_work();
@@ -538,10 +556,10 @@ impl GpuSolver {
             }
             let seed = 5 + ch as u64;
             let guard_tol = GUARD_TOL.max(tol);
-            let k_max = split_bound(nc, m);
+            let k_max = split_bound(nc, m, w_cap);
             // the split to start from (module doc, "Block memory"): what the last call's final occupation
             // pass needed, when it had this n_σ; else the displayed n_σ + m and G guards, the last the buffer
-            let mut cur = start_split(last[ch], nc, m);
+            let mut cur = start_split(last[ch], nc, m, w_cap);
             let mut x = std::mem::take(&mut guess[ch]);
             if x.is_empty() { cold = true; }
             if x.len() > cur.len { free.extend(x.drain(cur.len..)); } // ascending: the highest go
@@ -549,12 +567,13 @@ impl GpuSolver {
             let h = GpuHamiltonian { v: if ch == 0 { &p.vu } else { &p.vd }, nl };
             let (ev, one, need, fd) = loop {
                 let mut ev = vec![0.0; x.len()];
+                let mut res = vec![0.0; x.len()];
                 let w = grown(work, work_k, ctx, g, x.len());
                 solves[ch] += 1;
                 splits[ch] = (cur.len, cur.head, cur.checked);
                 // the lowest `head` at the SCF's tol, the guards up to `checked` at GUARD_TOL, the rest
                 // buffers (module doc, "Three roles, three tolerances")
-                let es = match lobpcg_split(ctx, k, g, r, &h, &mut x, &mut ev, w, tol, cur.head, guard_tol, cur.checked, EIGEN_MAX_ITER, Some(&mut *should_abort)) {
+                let es = match lobpcg_split(ctx, k, g, r, &h, &mut x, &mut ev, w, tol, cur.head, guard_tol, cur.checked, EIGEN_MAX_ITER, Some(&mut *should_abort), Some(&mut res)) {
                     Ok(es) => es,
                     Err(e) => { free.append(&mut x); outcome = Err(take_device_error().unwrap_or(e)); break 'channels; }
                 };
@@ -579,14 +598,24 @@ impl GpuSolver {
                     Occupations::FermiDirac { .. } => true,
                 };
                 // the occupations of this one diagonalisation; the occupied levels are the lowest by rank
-                let one = match one_shot_occupations(&ev, nc, ch as u8, settings.occupations) {
+                let mut one = match one_shot_occupations(&ev, nc, ch as u8, settings.occupations) {
                     Ok(o) => o,
                     Err(e) => { free.append(&mut x); outcome = Err(e); break 'channels; }
                 };
                 let order = ascending(&ev);
                 let n_occ = occupied_count(&one.f, &order, fd);
                 let sorted: Vec<f64> = order.iter().map(|&i| ev[i]).collect();
-                let decisive = decisive_levels(&sorted, nc, ch as u8, settings.occupations);
+                // under FermiDirac the window reads the lower bound θ − r and a short one doubles the extra levels (plan
+                // 2026-11-13 Task 9b: the SCF's rule; `decisive_levels_fd`); the untested buffer's residual is its own
+                let decisive = match settings.occupations {
+                    Occupations::FermiDirac { kt } => {
+                        let sorted_res: Vec<f64> = order.iter().map(|&i| res[i]).collect();
+                        let d = decisive_levels_fd(&sorted, &sorted_res, nc, kt);
+                        one.window_short = d > sorted.len();
+                        d
+                    }
+                    Occupations::Aufbau | Occupations::DegenerateShells { .. } => decisive_levels(&sorted, nc, ch as u8, settings.occupations),
+                };
                 // the record's shown rows (a τ-set reaching into the guards raises the head over n_occ + m)
                 let keep = n_occ + m + UNOCC_GUARD;
                 let shown = if keep <= sorted.len() { block_edge(&sorted[..keep], n_occ, keep, tau_scf).0 } else { 0 };
@@ -691,6 +720,7 @@ impl GpuSolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qm::scf::MAX_WITNESS_GROWTH;
     use crate::orbitals::{OrbitalView, Product, Spin};
     use crate::reduce::neumaier;
     use qm::{Grid, KsState, Nucleus, Occupations};
@@ -758,7 +788,7 @@ mod tests {
         let o = one_shot_occupations(&short, 2, 0, ds).expect("one shot");
         let n_occ = o.f.iter().filter(|f| **f > 0.0).count();
         assert!(o.window_short && o.released && n_occ == 2, "{o:?}");
-        let k_max = split_bound(2, 0);
+        let k_max = split_bound(2, 0, MAX_WITNESS_GROWTH);
         assert_eq!(k_max, 2 + UNOCC_GUARD + MAX_WITNESS_GROWTH + 1);
         assert_eq!(decisive_levels(&short, 2, 0, ds), 4, "no witness: every computed level decides");
         assert_eq!(split_need(2, 0, 2, 4, false, true, k_max), split(5, 2, 4), "a short window grows by one level");
@@ -768,8 +798,17 @@ mod tests {
         let witnessed = [-1.0, -0.40, 0.1, 0.2, 0.3];
         assert_eq!(decisive_levels(&witnessed, 2, 0, ds), 3, "the witness 0.1 is the 3rd level");
         assert_eq!(decisive_levels(&levels, 2, 0, Occupations::Aufbau), 3, "Aufbau: n + 1");
+        // FermiDirac on the lower bound (plan 2026-11-13 Task 9b): μ at the mid-gap of −0.40 / 0.1 for n = 2 (−0.15) → the
+        // witness needs θ − r ≥ μ + 36 kT = 0.03 and ≥ ε_(2) + 0.1 = −0.3
+        let kt = qm::ELECTRON_KT;
+        let fdl = [-1.0, -0.40, 0.1, 0.2, 0.3];
+        assert_eq!(decisive_levels_fd(&fdl, &[0.0; 5], 2, kt), 3, "0.1 clears both arms by θ alone");
+        let r = [0.0, 0.0, 0.1, 0.0, 0.0];
+        assert_eq!(decisive_levels_fd(&fdl, &r, 2, kt), 4, "a residual of 0.1 Ha drops its lower bound to 0.0 < 0.03: the next level");
+        assert_eq!(decisive_levels_fd(&fdl[..3], &r[..3], 2, kt), 2 + 2, "no witness: the extra levels double (1 → 2)");
+        assert_eq!(decisive_levels_fd(&[0.1, 0.2], &[0.0; 2], 0, kt), 1, "an empty channel needs none");
         assert_eq!(split_need(2, 0, 2, 3, false, false, k_max), split(4, 2, 3), "the record n_occ + G, its last vector the buffer");
-        let k_max = split_bound(2, 2);
+        let k_max = split_bound(2, 2, MAX_WITNESS_GROWTH);
         assert_eq!(split_need(4, 2, 6, 5, false, false, k_max), split(8, 6, 7), "a shared shell: n_occ + m at tol, + G − 1 tested");
         assert_eq!(split_need(4, 2, 7, 5, true, false, k_max), split(9, 7, 8), "a shown τ-set into the guards: at tol, the record's edge tested");
         assert_eq!(split_need(4, 2, 6, 9, false, false, k_max), split(10, 6, 9), "a witness above the record: tested, a buffer above");
@@ -794,12 +833,12 @@ mod tests {
     #[test]
     fn split_memory_is_no_ratchet() {
         let (n, m) = (2, 4);
-        let k_max = split_bound(n, m);
-        assert_eq!(start_split(None, n, m), split(8, 6, 7), "minimal: n + m at tol, G guards, the last the buffer");
+        let k_max = split_bound(n, m, MAX_WITNESS_GROWTH);
+        assert_eq!(start_split(None, n, m, MAX_WITNESS_GROWTH), split(8, 6, 7), "minimal: n + m at tol, G guards, the last the buffer");
         let mut last = None;
         let mut ran = Vec::new();
         for (n_occ, shown) in [(4, 8), (2, 6), (2, 6), (2, 7), (2, 6), (2, 6), (4, 8), (2, 6), (2, 6)] {
-            let mut cur = start_split(last, n, m);
+            let mut cur = start_split(last, n, m, MAX_WITNESS_GROWTH);
             let need = loop {
                 let need = split_need(n_occ, m, shown, n + 1, shown > n_occ + m, false, k_max);
                 let next = split(cur.len.max(need.len), cur.head.max(need.head), cur.checked.max(need.checked));
@@ -812,7 +851,7 @@ mod tests {
         let (shared, aufbau, raised) = (split(10, 8, 9), split(8, 6, 7), split(9, 7, 8));
         assert_eq!(ran, [shared, shared, aufbau, raised, raised, aufbau, shared, shared, aufbau]);
         // another n_σ: the memory does not apply
-        assert_eq!(start_split(Some(Memory::of(shared, n, m)), n + 1, m), split(9, 7, 8));
+        assert_eq!(start_split(Some(Memory::of(shared, n, m)), n + 1, m, MAX_WITNESS_GROWTH), split(9, 7, 8));
     }
 
     fn ctx() -> Option<GpuContext> {

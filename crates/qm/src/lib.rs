@@ -21,7 +21,7 @@ pub use grid::Grid;
 pub use ionic::{IonicPolicy, IonicSetup};
 pub use nuclear::Nucleus;
 pub use occupations::{
-    fd_entropy, fermi_dirac, partial_levels, witness_reached, FdOccupations, PartialLevel, ELECTRON_KT, GPU_PARTIAL_TOL, MAX_MU_HALVINGS, MU_BRACKET_KT,
-    PARTIAL_OCCUPATION_MIN, WITNESS_GAP, WITNESS_TAIL_KT,
+    fd_entropy, fermi_dirac, grown_extras, partial_levels, tight_columns, tight_start, witness_bound_reached, witness_keep, witness_reached, FdOccupations, PartialLevel, ELECTRON_KT,
+    GPU_PARTIAL_TOL, LOOSE_F_FACTOR, MAX_MU_HALVINGS, MU_BRACKET_KT, PARTIAL_OCCUPATION_MIN, WITNESS_GAP, WITNESS_GUARD_TOL, WITNESS_TAIL_KT,
 };
 pub use scf::{extrapolate_sigma, one_shot_occupations, scf, scf_observed, valence_electrons, Energy, KsState, OneShot, Occupations, ScfProgress, ScfSettings, ScfStats, StallWatch, System, DEGENERACY_TAU, SCF_STALL_WINDOW};

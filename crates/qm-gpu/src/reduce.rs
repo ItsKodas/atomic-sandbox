@@ -62,6 +62,13 @@ pub struct GramSlot { pub dispatch: usize, pub a: usize, pub b: usize }
 /// allowed) by dispatches binding at most `f_max` fields each: seed with the field that has the
 /// most uncovered pairs, grow with the field adding the most, emit, repeat. Returns the
 /// dispatches and one `GramSlot` per needed pair (input order). Pure; pinned by `plan_gram_covers`.
+/// One memoised `plan_gram` (`Reducer::gram_plans`): its inputs and its result.
+struct GramPlanEntry { n_fields: usize, f_max: usize, needed: Vec<(usize, usize)>, plan: (Vec<GramDispatch>, Vec<GramSlot>) }
+
+/// How many distinct `plan_gram` inputs a `Reducer` remembers (a LOBPCG call uses one or two shapes; the SCF, the
+/// display and the Harris solves a few more).
+const GRAM_PLAN_CACHE: usize = 16;
+
 pub fn plan_gram(n_fields: usize, needed: &[(usize, usize)], f_max: usize) -> (Vec<GramDispatch>, Vec<GramSlot>) {
     assert!(f_max >= 2, "plan_gram: a dispatch must bind at least two fields");
     let norm = |(a, b): (usize, usize)| if a >= b { (a, b) } else { (b, a) };
@@ -137,6 +144,12 @@ pub struct Reducer {
     scratch: RefCell<Option<(wgpu::Buffer, wgpu::Buffer, usize)>>,
     /// Scratch for the fused Gram dispatches: (partials, staging, capacity in bytes).
     gram_scratch: RefCell<Option<(wgpu::Buffer, wgpu::Buffer, u64)>>,
+    /// The last `plan_gram` results by input (n_fields, the needed index pairs, f_max): LOBPCG asks for the same pair
+    /// pattern every iteration of a call, and the greedy planner costs O(fields × pairs × f_max) per dispatch on the
+    /// CPU — measured (plan 2026-11-13 Task 9b, a 97³ witness block of 37 columns, S of 101 columns): 2.6 s per
+    /// iteration, against milliseconds of GPU work. A plan is a pure function of its input, so reusing it changes
+    /// no number.
+    gram_plans: RefCell<Vec<GramPlanEntry>>,
     /// The staging buffer of `combined_*` (grow-only) and its capacity in bytes.
     combined_staging: RefCell<Option<(wgpu::Buffer, u64)>>,
     /// Workgroups dispatched = partials produced: min(ceil(n³/256), 1024).
@@ -152,7 +165,7 @@ impl Reducer {
         let blocks = g.interior_len().div_ceil(WORKGROUP as usize) as u32;
         Reducer {
             params: uniform(ctx, "reduce", &Params::new(g, 0.0, 0.0)),
-            partials, staging, scratch: RefCell::new(None), gram_scratch: RefCell::new(None), combined_staging: RefCell::new(None),
+            partials, staging, scratch: RefCell::new(None), gram_scratch: RefCell::new(None), gram_plans: RefCell::new(Vec::new()), combined_staging: RefCell::new(None),
             workgroups: blocks.clamp(1, MAX_PARTIALS), gram_workgroups: blocks.clamp(1, GRAM_WORKGROUPS), n: g.n,
         }
     }
@@ -367,7 +380,18 @@ impl Reducer {
         }
         let variants = k.gram_variants();
         let f_max = *variants.last().expect("at least one gram variant");
-        let (dispatches, slots) = plan_gram(fields.len(), &needed, f_max);
+        let (dispatches, slots) = {
+            let mut cache = self.gram_plans.borrow_mut();
+            match cache.iter().position(|e| e.n_fields == fields.len() && e.f_max == f_max && e.needed == needed) {
+                Some(i) => { let e = cache.remove(i); let plan = e.plan.clone(); cache.push(e); plan }
+                None => {
+                    let plan = plan_gram(fields.len(), &needed, f_max);
+                    if cache.len() >= GRAM_PLAN_CACHE { cache.remove(0); }
+                    cache.push(GramPlanEntry { n_fields: fields.len(), f_max, needed: needed.clone(), plan: plan.clone() });
+                    plan
+                }
+            }
+        };
         // partial blocks: each dispatch d uses variant F_d and writes F_d(F_d+1)/2 blocks at `offsets[d]`
         let variant_of = |n: usize| *variants.iter().find(|f| **f >= n).expect("a variant at least as large as the dispatch");
         let mut offsets = Vec::with_capacity(dispatches.len());

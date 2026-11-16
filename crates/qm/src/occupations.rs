@@ -55,6 +55,50 @@
 //!   ε_max − μ ≥ `WITNESS_TAIL_KT`·kT; at 36 kT the first unsolved level would hold f < 2.4e-16.
 //! - A level is partial when min(f, 1 − f) ≥ `PARTIAL_OCCUPATION_MIN` = 1e-6, i.e. |ε − μ| ≲ 13.8 kT; the GPU
 //!   stop is max(tol_eff, `GPU_PARTIAL_TOL`) on a step with one (spec §5.1).
+//!
+//! # Witness columns at a guard tolerance (plan 2026-11-13 Task 9b; both solvers)
+//! One channel σ, a block of k columns: Ritz pairs (θ_j, x_j), ‖x_j‖ = 1 in the grid's L² product, residual
+//! r_j = ‖H x_j − θ_j x_j‖, occupations f_j = f(θ_j; μ) of this module's rule, ρ_σ = Σ_j f_j x_j². The witness columns
+//! carry f ≤ e^{−36}: only their eigenvalue bound is used, so holding them to the SCF's eigen tolerance (Task 7: LOBPCG
+//! at its 200-iteration cap among box states) is pure cost. The rule splits the block **per column by f**, never by
+//! position (a column between the occupied levels and the witness can be partly occupied: it stays tight).
+//! - **What a loose column can do to Δρ.** Replacing x_j by any unit vector changes ρ_σ by f_j(x_j'² − x_j²), of L1
+//!   norm ≤ 2f_j. Its level shift δθ_j moves μ (Σ_i f_i = N_σ fixed; ∂f_i/∂θ_i = −f_i(1 − f_i)/kT = −∂f_i/∂μ) by
+//!   δμ = Σ_{j∈L} f_j(1 − f_j)δθ_j / Σ_i f_i(1 − f_i), so the tight columns' weights move by
+//!   Σ_{i∈T} |δf_i| ≤ |δμ|·Σ_{i∈T} f_i(1 − f_i)/kT ≤ Σ_{j∈L} f_j |δθ_j| / kT, each |δf_i| moving ∫|δρ| by ≤ |δf_i|.
+//!   A loose column held to r_j ≤ g has |δθ_j| ≤ r_j ≤ g (below), so over the loose set L
+//!   ```text
+//!   ∫|δρ| ≤ (2 + g/kT) · Σ_{j∈L} f_j            (= 2.2 Σ_L f_j at g = 1e-3 Ha, kT = 5 mHa)
+//!   ```
+//! - **The rule** (`tight_columns`). L is the set of the highest-ranked columns whose tail sum of the **upper-bound**
+//!   occupations f̂_j = f(θ_j − r_j; μ) ≥ f_j (the level lies above θ_j − r_j) stays below `LOOSE_F_FACTOR`·tol,
+//!   tol the SCF's Δρ stop: ∫|δρ| ≤ 2.2e-2·tol, so no loose column can move Δρ across the stop; f̂ also covers the
+//!   loose levels' own shift of μ (a factor e^{r/kT} ≤ e^{0.2} on f, inside the 1e-2). The threshold comes from the
+//!   stop, not from a fixed f: H₃⁺ at 1.6 r₀ has its ↑ level 2 at f ≈ 5e-11, and at tol = 1e-6 (threshold 1e-8)
+//!   that level is loose, while a level at 2e-10 would be too (task 9 review C1's caution). Every other column is
+//!   **tight**: held to the SCF's eigen tolerance, as before. Because f falls with θ, L is a top segment of the ranks.
+//! - **The energy and forces.** F is stationary in ψ at fixed f (spec §4.4), so a loose column's error enters F at
+//!   second order, f_j r_j²/δ_j (δ_j its distance to the rest of the spectrum), and through ρ: ≤ (2.2e-2·tol)²-sized.
+//!   The Hellmann–Feynman force moves by ≤ ∫|δρ|·max|∇V_I| ≤ 2.2e-2·tol·max|∇V_I|. Tested on the CPU f64 reference
+//!   (`scf` tests, loose against all-tight): |ΔF| ≤ 1e-10 Ha, |ΔF_I| ≤ 1e-9 Ha/Bohr.
+//! - **The guard tolerance** g = `WITNESS_GUARD_TOL` = `WITNESS_GAP`/100 = 1e-3 Ha (the Harris display's `GUARD_TOL`),
+//!   or the step's eigen tol when that is looser (the GPU's Δρ-tied early steps).
+//! - **The witness test reads a lower bound** (`witness_bound_reached`): for a unit x there is an eigenvalue λ with
+//!   |λ − θ| ≤ ‖Hx − θx‖ (the Krylov–Weinstein bound; Parlett, *The Symmetric Eigenvalue Problem*, Thm 4.5.1), so
+//!   the highest column's level is ≥ θ_top − r_top, and both arms are tested on it:
+//!   ```text
+//!   θ_top − r_top ≥ ε_(N_σ) + WITNESS_GAP   and   θ_top − r_top − μ ≥ WITNESS_TAIL_KT · kT
+//!   ```
+//!   (the block holds the lowest k levels, as for every LOBPCG block). At r ≤ g it costs ≤ 1e-3 Ha of the 0.18 Ha
+//!   window; a tight top (r ~ 1e-6) gives the Ritz test to 1e-6. Never the Ritz value alone.
+//! - **Growth** (`grown_extras`): when the witness fails the block grows by its current extra count (the extra block
+//!   doubles: 1, 2, 4, 8, 16, 32), clamped to the cap, instead of one vector per re-solve; each grown vector keeps
+//!   its index-seeded guess. Reaching e extras costs ⌈log₂ e⌉ re-solves instead of e − 1.
+//! - **Trim** (`witness_keep`): a doubled block overshoots (the 14 Bohr H⁻ needs 10–11 extras and doubled to 16, which
+//!   made every LOBPCG iteration of the solve ~2× dearer: 185 s against 75 s). Once the witness passes, the columns
+//!   above the lowest level t that passes it alone (with one spare above t when that spare passes too) are dropped:
+//!   their f are below e^{−36} each, so the occupations of what is kept change by less than f64 resolves next to 1, and
+//!   F, ρ and the forces by nothing the stop can see. The kept block still passes the witness by construction.
 
 use crate::error::QmError;
 use crate::grid::neumaier;
@@ -73,6 +117,12 @@ pub const PARTIAL_OCCUPATION_MIN: f64 = 1e-6;
 /// The GPU SCF's convergence stop on a step whose occupations have a partial level (spec §5.1; the user's
 /// 2026-11-14 value). The one definition (preflight F11): `qm-gpu`, the tags and the dimer ledger read it.
 pub const GPU_PARTIAL_TOL: f64 = 1e-5;
+/// A column is loose when the tail sum of the upper-bound occupations over it and every column above it is below this
+/// × the SCF's Δρ tolerance (module doc, "Witness columns at a guard tolerance"): ∫|δρ| ≤ 2.2e-2·tol.
+pub const LOOSE_F_FACTOR: f64 = 1e-2;
+/// The loose (guard) columns' residual tolerance (Ha): `WITNESS_GAP`/100 = 1e-3, so the witness's lower bound
+/// θ − r loses ≤ 1e-3 Ha of its 0.18 Ha window (module doc). The Harris display's `GUARD_TOL` is the same value.
+pub const WITNESS_GUARD_TOL: f64 = WITNESS_GAP / 100.0;
 /// The μ bracket's margin beyond the extreme levels, in kT.
 pub const MU_BRACKET_KT: f64 = 50.0;
 /// Backstop on each μ bisection; never binds for finite inputs (≲ 120 halvings at kT = 5 mHa, ≈ 1 100 only for a
@@ -180,6 +230,91 @@ pub fn witness_reached(evals: &[f64], n: usize, mu: f64, kt: f64) -> bool {
     let (eps_n, eps_max) = (evals[order[n - 1]], evals[order[order.len() - 1]]);
     eps_max >= eps_n + WITNESS_GAP && eps_max - mu >= WITNESS_TAIL_KT * kt
 }
+
+/// `witness_reached` on the levels' lower bounds (module doc, "Witness columns at a guard tolerance"): the highest
+/// level's θ − r (θ_top the largest Ritz value, r its residual) must lie ≥ ε_(n) + `WITNESS_GAP` and ≥ μ +
+/// `WITNESS_TAIL_KT`·kT; ε_(n) is the n-th lowest Ritz value. An empty channel (n = 0) needs none; a channel with no
+/// level above its n-th never has one. `residuals[i]` belongs to `evals[i]`; a non-finite residual never passes.
+pub fn witness_bound_reached(evals: &[f64], residuals: &[f64], n: usize, mu: f64, kt: f64) -> bool {
+    assert_eq!(evals.len(), residuals.len(), "witness_bound_reached: one residual per level");
+    if n == 0 {
+        return true;
+    }
+    if evals.len() <= n {
+        return false;
+    }
+    let order = ascending(evals);
+    let (eps_n, top) = (evals[order[n - 1]], order[order.len() - 1]);
+    let lower = evals[top] - residuals[top];
+    lower >= eps_n + WITNESS_GAP && lower - mu >= WITNESS_TAIL_KT * kt
+}
+
+/// How many columns are **tight** (module doc, "Witness columns at a guard tolerance"), as a position count: the
+/// columns of `evals` (positions 0..k, residuals `residuals`) whose upper-bound occupation f̂ = f(θ − r; μ) is needed
+/// to keep the loose tail sum below `LOOSE_F_FACTOR`·`tol` are tight; the returned count covers every one of them,
+/// i.e. it is 1 + the largest position of a tight column (0 if none). By rank the loose columns are the top segment
+/// whose Σ f̂ < `LOOSE_F_FACTOR`·tol; positions are ranks once the block is ascending, and a column out of rank order
+/// (a warm guess) only raises the count. An empty channel (`mu` None) has no tight column.
+pub fn tight_columns(evals: &[f64], residuals: &[f64], mu: Option<f64>, kt: f64, tol: f64) -> usize {
+    assert_eq!(evals.len(), residuals.len(), "tight_columns: one residual per level");
+    let Some(mu) = mu else { return 0 };
+    let order = ascending(evals);
+    let limit = LOOSE_F_FACTOR * tol;
+    // from the top rank down: the loose ranks are those whose running tail sum stays below the limit
+    let mut tail = 0.0;
+    let mut loose_from = order.len(); // ranks ≥ loose_from are loose
+    for (rank, &i) in order.iter().enumerate().rev() {
+        tail += occupation((evals[i] - residuals[i] - mu) / kt);
+        if !(tail < limit) {
+            break;
+        }
+        loose_from = rank;
+    }
+    order[..loose_from].iter().map(|&i| i + 1).max().unwrap_or(0)
+}
+
+/// The tight count a solve starts from (both solvers' `solve_fd`): the positions whose stored occupation `f` (a warm state's,
+/// ascending) the tail rule of `tight_columns` needs at the SCF's `tol`, at least `n`; `n` on a cold start (no f yet).
+/// Only a start: every solve verifies it on its own levels and re-solves when a column needs the eigen tol.
+pub fn tight_start(f: Option<&[f64]>, n: usize, tol: f64) -> usize {
+    let Some(f) = f else { return n };
+    let limit = LOOSE_F_FACTOR * tol;
+    let mut tail = 0.0;
+    let mut loose_from = f.len();
+    for (i, &fi) in f.iter().enumerate().rev() {
+        tail += fi;
+        if !(tail < limit) { break; }
+        loose_from = i;
+    }
+    loose_from.max(n)
+}
+
+/// After `witness_bound_reached` has passed on `evals` (any order; `residuals` theirs), how many of the lowest-ranked
+/// levels to keep (module doc, "Trim"): t + 1 for the lowest rank t ≥ n whose lower bound θ_t − r_t clears both witness
+/// arms (with μ = `mu`, the full block's), or t + 2 when the level above t clears them too (a spare above the witness);
+/// `evals.len()` when nothing passes (never after a passed test) or n = 0.
+pub fn witness_keep(evals: &[f64], residuals: &[f64], n: usize, mu: f64, kt: f64) -> usize {
+    assert_eq!(evals.len(), residuals.len(), "witness_keep: one residual per level");
+    if n == 0 || evals.len() <= n {
+        return evals.len();
+    }
+    let order = ascending(evals);
+    let eps_n = evals[order[n - 1]];
+    let passes = |rank: usize| {
+        let i = order[rank];
+        let lower = evals[i] - residuals[i];
+        lower >= eps_n + WITNESS_GAP && lower - mu >= WITNESS_TAIL_KT * kt
+    };
+    match (n..order.len()).find(|&t| passes(t)) {
+        Some(t) if t + 1 < order.len() && passes(t + 1) => t + 2,
+        Some(t) => t + 1,
+        None => evals.len(),
+    }
+}
+
+/// The extra-vector count after one growth of a block holding `extras` vectors beyond its n (module doc, "Growth"):
+/// the extra block doubles (at least one vector), clamped to `cap`.
+pub fn grown_extras(extras: usize, cap: usize) -> usize { (2 * extras).max(extras + 1).min(cap) }
 
 /// One partly occupied level: min(f, 1 − f) ≥ `PARTIAL_OCCUPATION_MIN`.
 #[derive(Clone, Debug, PartialEq)]
@@ -385,6 +520,91 @@ mod tests {
         assert!(!witness_reached(&[-0.5, -0.3], 2, -0.9, 3e-3));
         // An empty channel needs no witness.
         assert!(witness_reached(&[], 0, 0.0, 3e-3));
+    }
+
+    /// Plan Task 9b: the tight count follows f and the Δρ stop, not position. One electron, a 0.2 Ha gap: μ at mid-gap,
+    /// the level above holds f = e^{−20} ≈ 2.1e-9.
+    #[test]
+    fn tight_columns_follow_f_and_the_stop() {
+        let kt = ELECTRON_KT;
+        let evals = [-0.5, -0.3, 0.0, 0.1];
+        let zero = [0.0; 4];
+        let mu = fermi_dirac(&evals, 1, kt).unwrap().mu;
+        let f1 = 1.0 / (1.0 + ((-0.3 - mu.unwrap()) / kt).exp());
+        assert!((1e-9..1e-8).contains(&f1), "f(−0.3) = {f1:e}");
+        // tol 1e-6: limit 1e-8 > f1 + the tail: the level above is loose
+        assert_eq!(tight_columns(&evals, &zero, mu, kt, 1e-6), 1);
+        // tol 1e-7: limit 1e-9 < f1: it stays tight (the threshold comes from the stop)
+        assert_eq!(tight_columns(&evals, &zero, mu, kt, 1e-7), 2);
+        // its residual raises the upper bound f̂ = f(θ − r): r = 0.03 Ha gives e^{6}·f1 ≈ 8.6e-7 ≥ 1e-8
+        assert_eq!(tight_columns(&evals, &[0.0, 0.03, 0.0, 0.0], mu, kt, 1e-6), 2);
+        // positions, not ranks: the same levels out of order — the tight level sits at position 1, so 2 columns
+        assert_eq!(tight_columns(&[-0.3, -0.5, 0.1, 0.0], &zero, mu, kt, 1e-6), 2);
+        // a partly occupied level between the occupied one and the witness stays tight whatever its position
+        let p = [-0.5, -0.49, 0.3];
+        let mp = fermi_dirac(&p, 1, kt).unwrap().mu;
+        assert_eq!(tight_columns(&p, &[0.0; 3], mp, kt, 1e-6), 2);
+        // the tail is a sum: twenty levels each at 1e-9 (alone below 1e-8) are not all loose together
+        let mut many = vec![-0.5];
+        let e9 = mu.unwrap() + kt * (1e9f64).ln(); // f = 1/(1 + 1e9) ≈ 1e-9
+        many.extend(std::iter::repeat_n(e9, 20));
+        many.push(0.3);
+        let t = tight_columns(&many, &vec![0.0; many.len()], mu, kt, 1e-6);
+        assert!((2..=many.len() - 9).contains(&t), "tight {t} of {}", many.len());
+        // an empty channel has no tight column
+        assert_eq!(tight_columns(&[0.1, 0.2], &[0.0, 0.0], None, kt, 1e-6), 0);
+        // a non-finite residual is never loose
+        assert_eq!(tight_columns(&evals, &[0.0, 0.0, 0.0, f64::NAN], mu, kt, 1e-6), 4);
+    }
+
+    /// Plan Task 9b: the witness test reads θ − r, never the Ritz value alone.
+    #[test]
+    fn witness_reads_the_lower_bound() {
+        let kt = ELECTRON_KT;
+        let mu = -0.4;
+        let top = mu + 36.0 * kt + 0.001; // the Ritz value clears the tail arm by 1 mHa (the gap arm by far)
+        let evals = [-0.5, top, -0.3];
+        assert!(witness_reached(&evals, 1, mu, kt));
+        assert!(witness_bound_reached(&evals, &[0.0, 0.0009, 0.0], 1, mu, kt), "θ − r still clears it");
+        assert!(!witness_bound_reached(&evals, &[0.0, 0.002, 0.0], 1, mu, kt), "θ − r = top − 2 mHa does not");
+        // the gap arm on the lower bound: ε_(1) = −0.5, top − r must be ≥ −0.4
+        let near = [-0.5, -0.399];
+        assert!(witness_reached(&near, 1, -0.9, kt));
+        assert!(!witness_bound_reached(&near, &[0.0, 0.002], 1, -0.9, kt));
+        assert!(!witness_bound_reached(&evals, &[0.0, f64::NAN, 0.0], 1, mu, kt), "a NaN residual never passes");
+        assert!(witness_bound_reached(&[], &[], 0, 0.0, kt));
+        assert!(!witness_bound_reached(&[-0.5], &[0.0], 1, -0.9, kt));
+    }
+
+    /// Plan Task 9b: the trim keeps the lowest witness and one passing spare above it.
+    #[test]
+    fn witness_keep_trims_the_overshoot() {
+        let kt = ELECTRON_KT;
+        let mu = -0.4;
+        let evals = [-0.5, -0.3, -0.25, -0.1, -0.05, 0.0, 0.3];
+        let zero = [0.0; 7];
+        // the first level ≥ μ + 0.18 = −0.22 (and ≥ ε_(1) + 0.1 = −0.4) is −0.1 at rank 3; the spare −0.05 passes too
+        assert_eq!(witness_keep(&evals, &zero, 1, mu, kt), 5);
+        // the spare's residual fails it: the witness alone on top
+        assert_eq!(witness_keep(&evals, &[0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0], 1, mu, kt), 4);
+        // the witness's own residual pushes it up a rank
+        assert_eq!(witness_keep(&evals, &[0.0, 0.0, 0.0, 0.15, 0.0, 0.0, 0.0], 1, mu, kt), 6);
+        // whatever is kept passes the witness on its own
+        for res in [zero, [0.0, 0.0, 0.0, 0.0, 0.2, 0.0, 0.0]] {
+            let k = witness_keep(&evals, &res, 1, mu, kt);
+            assert!(witness_bound_reached(&evals[..k], &res[..k], 1, mu, kt));
+        }
+        assert_eq!(witness_keep(&evals, &zero, 0, mu, kt), 7, "an empty channel keeps its block");
+    }
+
+    #[test]
+    fn growth_doubles_the_extra_block() {
+        let seq: Vec<usize> = std::iter::successors(Some(1usize), |&e| (e < 32).then(|| grown_extras(e, 32))).collect();
+        assert_eq!(seq, vec![1, 2, 4, 8, 16, 32]);
+        assert_eq!(grown_extras(0, 32), 1);
+        assert_eq!(grown_extras(3, 32), 6);
+        assert_eq!(grown_extras(20, 32), 32);
+        assert_eq!(grown_extras(4, 5), 5);
     }
 
     #[test]

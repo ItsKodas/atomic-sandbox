@@ -68,7 +68,8 @@
 //!   = 0): the state's own vectors, a block grows behind its Ritz vectors (a shared shell or a short
 //!   window) up to that bound — and an `Aufbau` block whose window's last row and first guard are
 //!   one τ-set runs n_σ + m + G + 1 (final review M1) — and the fields it trims stay on the state's
-//!   free list. W = `MAX_WITNESS_GROWTH` for every scene: `crate::ks::problem` poses every scene under
+//!   free list. W = the solver's witness cap for every scene (`crate::ks::witness_cap_for` under a budget: the counted
+//!   16 up to `qm::scf::MAX_WITNESS_GROWTH` = 32, plan 2026-11-13 Task 9b): `crate::ks::problem` poses every scene under
 //!   `FermiDirac` (smearing plan Task 9), whose Harris block grows to the SCF's witness
 //!   (`qm_gpu::harris` "Fermi–Dirac"; the scf-stall ← main merge) — all-electron too, where main's
 //!   `Aufbau` block never grew (W was 0 without a setup until that merge). The SCF's own growth is
@@ -88,7 +89,6 @@
 //! Each field is `crate::ks::field_bytes(n)`.
 use crate::ks::field_bytes;
 use qm::orbitals::UNOCC_GUARD;
-use qm::scf::MAX_WITNESS_GROWTH;
 use qm_gpu::orbitals::OrbitalView;
 use sim::AtomProfile;
 
@@ -216,11 +216,12 @@ fn splat(grid: &qm::Grid, pos: [f64; 3], p: &AtomProfile, at: &mut Vec<usize>, v
 
 /// The GPU memory (bytes) a Harris display solve holds on top of the solve and the orbital view
 /// of an n³ grid with n↑, n↓ occupied orbitals and m unoccupied ones per channel (module doc, "GPU
-/// memory"); `pseudised`: the scene has an ionic setup (the partial-core fields counted). The witness growth
-/// is counted for every scene (FermiDirac everywhere: module doc, "GPU memory").
-pub fn harris_footprint_bytes(n: usize, n_up: usize, n_dn: usize, m: usize, pseudised: bool) -> u64 {
+/// memory"); `pseudised`: the scene has an ionic setup (the partial-core fields counted); `w`: the witness cap the
+/// block grows to (the solver's, `GpuSolver::witness_cap`: `crate::ks::witness_cap_for` under a budget). The witness
+/// growth is counted for every scene (FermiDirac everywhere: module doc, "GPU memory").
+pub fn harris_footprint_bytes(n: usize, n_up: usize, n_dn: usize, m: usize, pseudised: bool, w: usize) -> u64 {
     // the witness growth for every scene: `crate::ks::problem` poses all of them under FermiDirac
-    let (g, w) = (UNOCC_GUARD, MAX_WITNESS_GROWTH);
+    let g = UNOCC_GUARD;
     // + 1: the untested buffer column above the tested levels (`qm_gpu::harris`'s `split_bound`)
     let block = |n_s: usize| if n_s + m > 0 { n_s + m + g + w + 1 } else { 0 };
     let vectors = block(n_up) + block(n_dn);
@@ -398,7 +399,7 @@ mod tests {
     #[test]
     fn harris_footprint_counts_its_fields() {
         let fields = |b: u64| b as f64 / (field_bytes(33) as f64 * 1.2);
-        let at = |n_up, n_dn, m, ps| fields(harris_footprint_bytes(33, n_up, n_dn, m, ps));
+        let at = |n_up, n_dn, m, ps| fields(harris_footprint_bytes(33, n_up, n_dn, m, ps, crate::ks::WITNESS_GROWTH_COUNTED));
         for (got, want) in [(at(1, 1, 0, false), 77.0), (at(1, 1, 4, false), 69.0), (at(4, 2, 2, true), 72.0), (at(4, 2, 0, true), 84.0), (at(1, 0, 0, false), 20.0 + 13.0 + 24.0)] {
             assert!((got - want).abs() < 1e-3, "{got} fields, expected {want} (the bytes are truncated to an integer)");
         }
