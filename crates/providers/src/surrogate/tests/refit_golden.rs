@@ -218,3 +218,41 @@ fn refit_golden() {
     let over: Vec<_> = worst.iter().filter(|(k, (d, _))| *d > tol(k)).collect();
     assert!(exact_fail.is_empty() && over.is_empty(), "not equivalent: {} exact items, {} categories over tolerance", exact_fail.len(), over.len());
 }
+
+/// Where the active set's kept span ends against τ on the collection copy (`surrogate::grade`
+/// module doc, "Eigenvalues within rounding of τ"): per species, τ, the band δ = √P·ε·max|λ|, the
+/// kept counts of Jacobi (λ > τ) and of faer with the band rule (λ > τ + δ), the nearest
+/// eigenvalues on either side of τ, and the largest Jacobi–faer eigenvalue gap. Reported.
+#[test]
+#[ignore = "measurement: COLLECTION_DIR=<copy> cargo test -p providers --release --lib active_span_margins -- --ignored --nocapture"]
+fn active_span_margins() {
+    let mut s = provider();
+    attach(&mut s, open_copy());
+    s.ensure_desc_cache();
+    let model = s.model.clone().unwrap();
+    let basis = s.desc_basis.clone().unwrap();
+    let n = s.accumulated.min(s.desc_cache.len());
+    let store = s.store.as_ref().unwrap();
+    let atoms: Vec<(usize, Vec<f64>)> = (0..n)
+        .filter(|&i| !s.excluded(i))
+        .flat_map(|i| s.desc_cache[i].iter().enumerate().filter(move |(j, _)| store.samples[i].trains_atom(*j)).map(|(_, (sp, b))| (*sp, b.clone())))
+        .collect();
+    let spectra = surrogate::ActiveSet::species_spectra(&basis, &model.scale, atoms.iter().map(|(sp, b)| (*sp, &b[..])));
+    println!("\n| species | P | τ | δ/τ | kept Jacobi | kept faer (λ > τ) | kept faer+band | nearest above τ (×τ) | nearest below τ (×τ) | max |λ_J − λ_f|/τ in (0.1τ, 10τ) |\n|---|---|---|---|---|---|---|---|---|---|");
+    for (k, sp) in spectra.iter().enumerate() {
+        let Some((ej, ef, tau)) = sp else { continue };
+        let p = ej.len();
+        let delta = (p as f64).sqrt() * f64::EPSILON * ef.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        let kept_j = ej.iter().filter(|&&v| v > *tau).count();
+        let kept_f = ef.iter().filter(|&&v| v > tau + delta).count();
+        let kept_fb = ef.iter().filter(|&&v| v > *tau).count();
+        // the eigenvalues nearest τ from each solver, in units of τ
+        let near = |ev: &[f64]| { let mut x: Vec<f64> = ev.iter().map(|v| v / tau).filter(|r| (0.1..10.0).contains(r)).collect(); x.sort_by(f64::total_cmp); x.iter().map(|r| format!("{r:.3}")).collect::<Vec<_>>().join(" ") };
+        println!("species {k}: Jacobi λ/τ in (0.1, 10): {}
+           faer   λ/τ in (0.1, 10): {}", near(ej), near(ef));
+        let above = ef.iter().filter(|&&v| v > *tau).fold(f64::INFINITY, |m, &v| m.min(v)) / tau;
+        let below = ef.iter().filter(|&&v| v <= *tau).fold(f64::NEG_INFINITY, |m, &v| m.max(v)) / tau;
+        let gap = ej.iter().zip(ef).filter(|(a, _)| (0.1 * tau..10.0 * tau).contains(*a)).fold(0.0f64, |m, (a, b)| m.max((a - b).abs())) / tau;
+        println!("| {k} | {p} | {tau:.3e} | {:.3} | {kept_j} | {kept_fb} | {kept_f} | {above:.3e} | {below:.3e} | {gap:.3e} |", delta / tau);
+    }
+}
