@@ -100,6 +100,10 @@ pub struct SamplingProgress {
     pub failed: usize,
     /// No job left (complete, cancelled, or ended by a failed reference).
     pub finished: bool,
+    /// The user paused the pass (`DynCommand::PauseSampling`; `sim::dynamics`, "Pausing a pass"):
+    /// it keeps its queue and its place but solves nothing until `ContinueSampling`. Set by the
+    /// driver on its snapshot, never by the pass itself; false once the pass has finished.
+    pub paused: bool,
 }
 
 /// One nucleus of the pass's ghost: Z and position (Bohr).

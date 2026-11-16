@@ -3461,6 +3461,179 @@ fn an_interrupted_pass_resumes_in_a_new_worker_and_its_files_go_when_it_ends() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The pass card's Pause (user request 2026-11-16; `checkpoint` module doc, "Paused passes"): a
+/// paused pass is checkpointed at the pause — where it stands, not at the last 2-second
+/// checkpoint — and the worker goes idle (no solve, no snapshot) until Resume, which goes on to the
+/// full plan with every sample once; a scene change while paused ends the pass but keeps its files
+/// as an interrupted pass, which a new worker resumes on its scene; Cancel while paused removes
+/// them. Analytic teacher, seconds.
+#[test]
+fn a_paused_pass_is_checkpointed_at_the_pause_and_survives_a_scene_change() {
+    use super::checkpoint::{CHECKPOINT_FILE, MODEL_FILE};
+    let dir = std::env::temp_dir().join(format!("atomic-sandbox-pause-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let spawn = || {
+        SimWorker::spawn_test(
+            h2_33(),
+            Box::new(|| {
+                let teacher = ScriptedMorse { morse: sim::MorseDimer::h2(), script: Arc::new(std::sync::Mutex::new(VecDeque::new())), rest_s: 0.02 };
+                Box::new(SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(SAMPLE_TOL))
+            }),
+        )
+    };
+    let plan = SamplingPlan { perturbations: 90, hot_burst_steps: 10, scan_points_per_pair: 0, ..SamplingPlan::default() };
+    let paused_at = |w: &SimWorker, after: usize| -> Snapshot {
+        snapshot_until(w, "a pass under way", |s| s.dynamics.sampling.as_ref().is_some_and(|p| !p.finished && p.done >= after));
+        w.send(Command::Dyn(DynCommand::PauseSampling));
+        snapshot_until(w, "the paused pass", |s| pass_paused(&s.dynamics))
+    };
+
+    // paused: written at once, then idle
+    let w = spawn();
+    let before = model(&idle(&w)).samples;
+    w.send(Command::TrainingCheckpoints(Some(dir.clone())));
+    w.send(Command::Dyn(DynCommand::StartSampling(plan.clone())));
+    let s = paused_at(&w, 30);
+    let p = s.dynamics.sampling.clone().unwrap();
+    let (_, info) = interrupted_pass(&dir).expect("the paused pass is on disk");
+    assert_eq!((info.done, info.total), (p.done, p.total), "the checkpoint is the pause's (published in its round)");
+    assert_eq!(info.samples, model(&s).samples, "with every sample taught so far");
+    assert!(s.dynamics.notes.iter().any(|n| n.contains("sampling pass paused at sample")), "{:?}", s.dynamics.notes);
+    // the worker is idle from the pause's own round on (a paused pass is no work)
+    let s = if s.working { snapshot_until(&w, "an idle worker", |s| !s.working) } else { s };
+    assert!(pass_paused(&s.dynamics));
+    std::thread::sleep(Duration::from_millis(300));
+    let mut later = None;
+    while let Some(e) = w.try_recv() {
+        if let Event::Snapshot(s) = e {
+            later = Some(s);
+        }
+    }
+    if let Some(l) = later {
+        assert_eq!(l.dynamics.sampling.as_ref().unwrap().done, p.done, "nothing solved while paused");
+    }
+    w.send(Command::Dyn(DynCommand::ContinueSampling));
+    let s = snapshot_until(&w, "the end of the resumed pass", |s| s.dynamics.sampling.as_ref().is_some_and(|p| p.finished));
+    let q = s.dynamics.sampling.clone().unwrap();
+    assert_eq!((q.done, q.total, q.cancelled, q.paused), (p.total, p.total, false, false));
+    assert_eq!(model(&s).samples, before + plan.perturbations + plan.hot_burst_steps, "every planned sample, none twice");
+    assert!(interrupted_pass(&dir).is_none() && !dir.join(MODEL_FILE).exists(), "a finished pass leaves nothing to resume");
+
+    // paused, then a new scene: the pass ends, its files stay as the interrupted pass
+    w.send(Command::Dyn(DynCommand::StartSampling(plan.clone())));
+    let s = paused_at(&w, 10);
+    let p = s.dynamics.sampling.clone().unwrap();
+    let mut other = h2_33();
+    other.nuclei[0].pos[0] += 0.2;
+    w.send(Command::SetScene(other));
+    let s = snapshot_until(&w, "the pass ended by the new scene", |s| s.dynamics.sampling.as_ref().is_some_and(|p| p.finished));
+    assert!(s.dynamics.notes.iter().any(|n| n.contains("its checkpoint is kept")), "{:?}", s.dynamics.notes);
+    let (_, info) = interrupted_pass(&dir).expect("a scene change keeps the paused pass's files");
+    assert_eq!((info.done, info.total), (p.done, p.total));
+    assert_eq!(Scene::from_sim(&info.scene).nuclei[0].pos, h2_33().nuclei[0].pos, "on the pass's own scene");
+    // a later round of this worker leaves them be
+    w.send(Command::Dyn(DynCommand::Step(1)));
+    idle(&w);
+    assert!(interrupted_pass(&dir).is_some() && dir.join(CHECKPOINT_FILE).exists());
+    assert!(w.retire(Duration::from_secs(10)));
+
+    // a new worker resumes it from the pause
+    let w = spawn();
+    idle(&w);
+    w.send(Command::TrainingCheckpoints(Some(dir.clone())));
+    w.send(Command::ResumeTraining(dir.clone()));
+    let s = snapshot_until(&w, "the resumed pass", |s| s.dynamics.sampling.is_some() || s.dynamics.last_rejection.is_some());
+    assert_eq!(s.dynamics.last_rejection, None, "{:?}", s.dynamics.notes);
+    let r = s.dynamics.sampling.clone().unwrap();
+    assert!(r.done >= info.done && r.total == info.total && !r.paused, "{r:?}");
+
+    // Cancel while paused discards
+    let s = paused_at(&w, r.done + 5);
+    assert!(pass_paused(&s.dynamics) && interrupted_pass(&dir).is_some());
+    w.send(Command::Dyn(DynCommand::CancelSampling));
+    let s = snapshot_until(&w, "the cancel", |s| s.dynamics.sampling.as_ref().is_some_and(|p| p.finished));
+    assert!(s.dynamics.sampling.as_ref().unwrap().cancelled);
+    assert!(interrupted_pass(&dir).is_none() && !dir.join(MODEL_FILE).exists(), "Cancel while paused discards the pass");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A paused first pass survives a solver switch (review of 750bc82, item 1): the new estimated
+/// worker's `EnsureModel { auto_pass: true }` finds the interrupted pass on disk and starts no
+/// automatic pass, so the paused pass's files stay as they were — the Model tab offers them.
+/// Analytic teacher, seconds.
+#[test]
+fn a_solver_switch_starts_no_automatic_pass_over_a_paused_one() {
+    let dir = std::env::temp_dir().join(format!("atomic-sandbox-pause-switch-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let spawn = || {
+        SimWorker::spawn_test(
+            h2_33(),
+            Box::new(|| {
+                let teacher = ScriptedMorse { morse: sim::MorseDimer::h2(), script: Arc::new(std::sync::Mutex::new(VecDeque::new())), rest_s: 0.02 };
+                Box::new(SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(SAMPLE_TOL))
+            }),
+        )
+    };
+    let plan = SamplingPlan { perturbations: 90, hot_burst_steps: 10, scan_points_per_pair: 0, ..SamplingPlan::default() };
+    let w = spawn();
+    idle(&w);
+    w.send(Command::TrainingCheckpoints(Some(dir.clone())));
+    w.send(Command::EnsureModel { autoload: None, plan: plan.clone(), auto_pass: true });
+    snapshot_until(&w, "the first pass under way", |s| s.dynamics.sampling.as_ref().is_some_and(|p| !p.finished && p.done >= 10));
+    w.send(Command::Dyn(DynCommand::PauseSampling));
+    let s = snapshot_until(&w, "the paused pass", |s| pass_paused(&s.dynamics));
+    assert!(!model(&s).fitted, "the first pass has not fitted yet");
+    let (text, info) = interrupted_pass(&dir).expect("the paused pass is on disk");
+    // the solver switch: this worker goes, a new estimated one comes with the window's commands
+    assert!(w.retire(Duration::from_secs(10)));
+    let w = spawn();
+    w.send(Command::TrainingCheckpoints(Some(dir.clone())));
+    w.send(Command::EnsureModel { autoload: None, plan, auto_pass: true });
+    let s = idle(&w);
+    let s = if s.dynamics.notes.iter().any(|n| n.contains("no automatic sampling pass")) { s } else { snapshot_until(&w, "the note", |s| s.dynamics.notes.iter().any(|n| n.contains("no automatic sampling pass"))) };
+    assert!(!sampling_active(&s.dynamics), "no automatic pass over the interrupted one: {:?}", s.dynamics.sampling);
+    std::thread::sleep(Duration::from_millis(2500));
+    let (text2, info2) = interrupted_pass(&dir).expect("still on disk");
+    assert_eq!((info2.done, info2.total), (info.done, info.total));
+    assert_eq!(text2, text, "the paused pass's checkpoint is untouched");
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A Pause and a new scene in one go (review of 750bc82, item 4): the paused pass's checkpoint is
+/// the one it stands at when the scene changes — written before the pass ends if the pause's own
+/// round has not written it yet — not an older periodic one. Analytic teacher, seconds.
+#[test]
+fn a_pause_with_a_scene_change_keeps_the_pass_where_it_stood() {
+    let dir = std::env::temp_dir().join(format!("atomic-sandbox-pause-scene-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let w = SimWorker::spawn_test(
+        h2_33(),
+        Box::new(|| {
+            let teacher = ScriptedMorse { morse: sim::MorseDimer::h2(), script: Arc::new(std::sync::Mutex::new(VecDeque::new())), rest_s: 0.02 };
+            Box::new(SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(SAMPLE_TOL))
+        }),
+    );
+    idle(&w);
+    w.send(Command::TrainingCheckpoints(Some(dir.clone())));
+    w.send(Command::Dyn(DynCommand::StartSampling(SamplingPlan { perturbations: 90, hot_burst_steps: 10, scan_points_per_pair: 0, ..SamplingPlan::default() })));
+    snapshot_until(&w, "a first checkpoint", |_| interrupted_pass(&dir).is_some());
+    let first = interrupted_pass(&dir).unwrap().1.done;
+    snapshot_until(&w, "the pass past it", |s| s.dynamics.sampling.as_ref().is_some_and(|p| p.done >= first + 10));
+    let mut other = h2_33();
+    other.nuclei[0].pos[0] += 0.2;
+    w.send(Command::Dyn(DynCommand::PauseSampling));
+    w.send(Command::SetScene(other));
+    let s = snapshot_until(&w, "the pass ended by the new scene", |s| s.dynamics.sampling.as_ref().is_some_and(|p| p.finished));
+    let p = s.dynamics.sampling.clone().unwrap();
+    let (_, info) = interrupted_pass(&dir).expect("the paused pass's files are kept");
+    eprintln!("first checkpoint at {first}, paused and replaced at {}, kept checkpoint at {}", p.done, info.done);
+    assert_eq!(info.done, p.done, "the checkpoint is where the pass stood at the scene change");
+    assert!(s.dynamics.notes.iter().any(|n| n.contains("its checkpoint is kept")), "{:?}", s.dynamics.notes);
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---- the shared collection (M8a Task 4b) ----
 
 /// [`ScriptedMorse`] reporting what a Kohn-Sham solve reports for a collection to judge an answer:

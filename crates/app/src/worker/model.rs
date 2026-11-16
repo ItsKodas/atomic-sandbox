@@ -339,6 +339,12 @@ pub fn sampling_active(s: &DynSnapshot) -> bool {
     s.sampling.as_ref().is_some_and(|p| !p.finished)
 }
 
+/// The pass is active but paused by the user (`DynCommand::PauseSampling`; `sim::dynamics`,
+/// "Pausing a pass"): it solves nothing until Resume, and it is still [`sampling_active`].
+pub fn pass_paused(s: &DynSnapshot) -> bool {
+    s.sampling.as_ref().is_some_and(|p| !p.finished && p.paused)
+}
+
 /// The driver's provider as a [`Trainable`], if it can be taught (the estimated solver): the
 /// worker's refits, readouts and density requests (`providers::surrogate` module doc). Never a
 /// downcast.
@@ -639,6 +645,12 @@ impl Worker {
         }
         let fitted = trainable(&mut self.dy).is_some_and(|s| s.fitted());
         if auto_pass && !fitted && !sampling_active(&self.dy.snapshot()) {
+            // an interrupted (or paused) pass on disk is the user's to resume or discard: a new
+            // pass would replace its files at its first checkpoint (review of 750bc82, item 1)
+            if self.checkpoints.as_ref().is_some_and(|ck| super::checkpoint::interrupted_pass(ck.dir()).is_some()) {
+                self.dy.add_note("no automatic sampling pass: an interrupted training pass is on disk — resume or discard it in the Model tab (a new pass would replace it)".into());
+                return;
+            }
             self.start_first_pass(plan);
         }
     }
@@ -1078,7 +1090,17 @@ impl Worker {
     pub(super) fn track_cost(&mut self, snap: &DynSnapshot) {
         let teacher_step = !matches!(snap.source, sim::Source::Surrogate | sim::Source::Reference) && !snap.forces_stale && snap.eval.solve_ms > 0;
         match snap.sampling.as_ref().filter(|p| !p.finished) {
+            // paused time is not solve time: the pass's clock stops and its ETA holds (user
+            // request 2026-11-16); Resume moves the clock's start on by the pause
+            Some(p) if p.paused => {
+                self.pass_pause.get_or_insert_with(Instant::now);
+            }
             Some(p) => {
+                if let Some(at) = self.pass_pause.take() {
+                    if let Some(c) = self.pass_clock.as_mut() {
+                        c.0 += at.elapsed();
+                    }
+                }
                 // the isolated-atom reference scans (open-shell and cold: 13–15 s each for O)
                 // are cached for later passes, so they are timed apart: the rate a later "Sample
                 // more" is estimated with is the geometry solves' alone (Task 9 review M2)
@@ -1098,6 +1120,7 @@ impl Worker {
                 }
             }
             None => {
+                self.pass_pause = None;
                 if self.pass_clock.take().is_none() && teacher_step && self.solve_s.is_none() {
                     // no pass timed yet: the scene's own teacher evaluation, as measured
                     self.solve_s = Some(snap.eval.solve_ms as f64 * 1e-3);

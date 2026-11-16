@@ -164,7 +164,15 @@
 //! returns, so the dynamics worker can advance it one solve per tick slice and stay responsive.
 //! A solve the teacher abandons (`ProviderError::Cancelled`) leaves the job queued: the next
 //! `step` retries it. [`run_sampling`] is the convenience loop over it. Neither refits — the
-//! caller does (a partial pass refits like a full one).
+//! caller does (a partial pass refits like a full one). A pass the user **paused** (`sim::Dynamics`,
+//! "Pausing a pass") is nothing more than a sampler no one steps: the solve in flight comes back
+//! `Cancelled` and stays queued, and the next `step` after the pause solves it: the same jobs at
+//! the same geometries as without the pause. With an exact teacher the samples are bit-equal (test
+//! `a_paused_pass_solves_nothing_and_resumes_to_the_unpaused_samples`, a synthetic Morse teacher);
+//! with real DFT the re-solved job starts from another warm state (the abandoned solve's parked
+//! density, a live evaluation in between), so its energy and forces agree with an unpaused run's
+//! only to the SCF tolerance, and the hot burst's later geometries — which follow from those
+//! forces — can differ at that level (rule 7).
 //!
 //! # Checkpoints
 //!
@@ -636,6 +644,7 @@ impl Sampler {
                 failed: 0,
                 finished: total == 0,
                 target: None,
+                paused: false,
             },
             notes,
             added: 0,
@@ -688,7 +697,7 @@ impl Sampler {
             scan_planned: Vec::new(),
             burst: Burst { left: 0, scene: base, forces: None, csvr: Csvr::new(300.0, HOT_BURST_TAU_FS, 0), dt: units::fs_to_au_time(HOT_BURST_DT_FS), trail: VecDeque::new(), failures_in_a_row: 0, restarts: 0 },
             refs: ReferenceCache::default(),
-            progress: SamplingProgress { done: 0, total, stage: "teaching", last_energy: f64::NAN, cancelled: false, skipped: 0, failed: 0, finished: total == 0, target: first },
+            progress: SamplingProgress { done: 0, total, stage: "teaching", last_energy: f64::NAN, cancelled: false, skipped: 0, failed: 0, finished: total == 0, target: first, paused: false },
             notes: Vec::new(),
             added: 0,
             boxed: 0,

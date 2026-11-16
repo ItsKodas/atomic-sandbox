@@ -277,8 +277,22 @@
 //! on the stepping path. The messages the provider produces for them (a pass started or
 //! finished, the references, a model loaded, refused or forgotten) are its queued notes
 //! ([`Trainable::take_notes`](crate::Trainable::take_notes)), logged at once. **The worker should
-//! raise `should_abort` for CancelSampling, ForgetModel and LoadModel** (they make a running
-//! sampling solve pointless) and, as for steps, not for anything else.
+//! raise `should_abort` for CancelSampling, PauseSampling, ForgetModel and LoadModel** (they make
+//! a running sampling solve pointless) and, as for steps, not for anything else.
+//! # Pausing a pass (user request 2026-11-16)
+//! `PauseSampling` holds the running pass where it stands: the tick spends nothing on it, so no
+//! teacher solve of the pass starts; the solve in flight is abandoned by the worker's
+//! `should_abort` (the job stays queued — the same path as any interrupted solve — and is solved
+//! afresh after the pause). The pass keeps its queue, progress, samples, references and burst; it
+//! is still *active* — Play, Step, Relax, another pass (StartSampling, ResumeSampling,
+//! StartTeaching, RetryFit) and LoadModel are refused, each with "paused" in the reason —, edits are accepted as during a running pass, and nothing that waits for
+//! a pass to end (the bond references, the idle orbital retry) starts. The snapshot's
+//! `sampling.paused` says so. `ContinueSampling` goes on from the queue at the next tick. Both note
+//! the sample the pass stands at; both are no-ops when there is nothing to change. Cancel, Forget,
+//! a `ReplaceScene` and the end of the pass clear the pause (`ReplaceScene` cancels a paused pass
+//! as it does a running one: the app keeps a paused pass's checkpoint, `app::worker::checkpoint`).
+//! The simulation's own `Pause` is unrelated: during a pass it only interrupts the solve in flight,
+//! which the next tick retries.
 //! # Side densities (M5b, "Density in estimated mode")
 //! A provider may solve densities off the stepping path ([`ForceProvider::side_jobs`] /
 //! [`ForceProvider::take_side_display`]: the surrogate's background audits and display refreshes).
@@ -735,6 +749,15 @@ pub enum DynCommand {
     RetryFit,
     /// End the running pass early (no-op without one); the samples so far are refitted.
     CancelSampling,
+    /// Pause the running pass where it stands (module doc, "Pausing a pass"): no new solve starts,
+    /// its queue, progress and samples are kept, and the dynamics stay paused. The worker raises
+    /// `should_abort` for it, so the solve in flight is abandoned and its job stays queued. No-op
+    /// without a running pass or when it is already paused.
+    PauseSampling,
+    /// Go on with a paused pass from its queue (the pass card's Resume; module doc, "Pausing a
+    /// pass"). No-op unless a pass is paused. Not `ResumeSampling`, which starts an interrupted
+    /// pass from its checkpoint text.
+    ContinueSampling,
     /// Drop the surrogate's model, samples and references (a running pass is cancelled first).
     ForgetModel,
     /// Write the surrogate's `.model` sidecar (`surrogate::sidecar`).
@@ -1115,6 +1138,9 @@ pub struct Dynamics {
     ghost: Option<PassGhost>,
     /// Mean wall cost of one sampling solve (ms, moving average).
     sample_ms: f64,
+    /// The running pass is paused (`PauseSampling`; module doc, "Pausing a pass"): the tick spends
+    /// nothing on it. Cleared when the pass ends, is cancelled or forgotten, and when one starts.
+    pass_paused: bool,
     /// The running relaxation (module doc, "Relax").
     fire: Option<Fire>,
     /// Its progress, kept after it ends (the snapshot's `relax`).
@@ -1233,6 +1259,7 @@ impl Dynamics {
             sampling: None,
             ghost: None,
             sample_ms: 0.0,
+            pass_paused: false,
             fire: None,
             relax: None,
             side_jobs_seen: 0,
@@ -1279,6 +1306,9 @@ impl Dynamics {
         match cmd {
             DynCommand::Play | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::ResumeSampling(_) | DynCommand::StartTeaching | DynCommand::RetryFit | DynCommand::Rewind if self.fire.is_some() => {
                 return self.reject("relaxing: Stop relax first".into());
+            }
+            DynCommand::Play | DynCommand::Step(_) | DynCommand::Relax if self.pass_active() && self.pass_paused => {
+                return self.reject("a sampling pass is paused: the dynamics stay paused until it is resumed and finishes, or is cancelled".into());
             }
             DynCommand::Play | DynCommand::Step(_) | DynCommand::Relax if self.pass_active() => {
                 return self.reject("a sampling pass is running: the dynamics stay paused until it finishes or is cancelled".into());
@@ -1513,6 +1543,8 @@ impl Dynamics {
             DynCommand::StartTeaching => self.start_teaching(),
             DynCommand::RetryFit => self.retry_fit(),
             DynCommand::CancelSampling => self.cancel_sampling(),
+            DynCommand::PauseSampling => self.pause_sampling(true),
+            DynCommand::ContinueSampling => self.pause_sampling(false),
             DynCommand::ForgetModel => self.forget_model(),
             DynCommand::SaveModel(path) => self.save_model(path),
             DynCommand::LoadModel(path) => self.load_model(path),
@@ -1784,7 +1816,7 @@ impl Dynamics {
             }
         }
         self.steps_last_tick = done;
-        if self.pass_active() {
+        if self.pass_active() && !self.pass_paused {
             self.advance_sampling(t0, budget_ms, evaluated, should_abort);
         }
         let wall = t0.elapsed().as_secs_f64();
@@ -1923,7 +1955,10 @@ impl Dynamics {
             },
             work_mismatch: self.work_mismatch,
             work_refit: self.work_refit,
-            sampling: self.sampling.clone(),
+            sampling: self.sampling.clone().map(|mut p| {
+                p.paused = self.pass_paused && !p.finished;
+                p
+            }),
             ghost: self.ghost.clone(),
             relax: self.relax.clone(),
             side_display: self.side_display.clone(),
@@ -1973,6 +2008,16 @@ impl Dynamics {
         self.ghost = self.provider.as_trainable().and_then(|t| t.pass_ghost());
     }
 
+    /// Why another pass cannot start now (a pass is active): "paused" when the user paused it
+    /// (module doc, "Pausing a pass").
+    fn pass_busy(&self) -> &'static str {
+        if self.pass_paused {
+            "a pass is paused (resume or cancel it first)"
+        } else {
+            "a pass is already running (cancel it first)"
+        }
+    }
+
     /// A sampling pass is running in the provider.
     fn pass_active(&mut self) -> bool {
         self.provider.as_trainable().is_some_and(|t| t.pass_active())
@@ -1994,7 +2039,7 @@ impl Dynamics {
             return self.reject(crate::sampling::EMPTY_SCENE.into());
         }
         if t.pass_active() {
-            return self.reject("start sampling: a pass is already running (cancel it first)".into());
+            return self.reject(format!("start sampling: {}", self.pass_busy()));
         }
         // the driver's references seed the pass (a species solved here costs the pass no solve)
         if let Err(e) = t.start_pass(&self.scene, &plan, &mut self.refs) {
@@ -2003,6 +2048,7 @@ impl Dynamics {
         let p = t.progress();
         self.paused = true;
         self.pending_steps = 0;
+        self.pass_paused = false;
         self.take_provider_notes();
         self.sampling = p;
         self.refresh_ghost();
@@ -2018,7 +2064,7 @@ impl Dynamics {
             return self.reject(crate::sampling::EMPTY_SCENE.into());
         }
         if t.pass_active() {
-            return self.reject("resume the interrupted training: a pass is already running (cancel it first)".into());
+            return self.reject(format!("resume the interrupted training: {}", self.pass_busy()));
         }
         if let Err(e) = t.resume_pass(&self.scene, checkpoint, &mut self.refs) {
             self.take_provider_notes();
@@ -2027,6 +2073,7 @@ impl Dynamics {
         let p = t.progress();
         self.paused = true;
         self.pending_steps = 0;
+        self.pass_paused = false;
         self.take_provider_notes();
         self.sampling = p;
         self.refresh_ghost();
@@ -2042,7 +2089,7 @@ impl Dynamics {
             return self.reject(crate::sampling::EMPTY_SCENE.into());
         }
         if t.pass_active() {
-            return self.reject("teach around the blockers: a pass is already running (cancel it first)".into());
+            return self.reject(format!("teach around the blockers: {}", self.pass_busy()));
         }
         if let Err(e) = t.start_teach(&self.scene) {
             return self.reject(format!("teach around the blockers: {e}"));
@@ -2050,6 +2097,7 @@ impl Dynamics {
         let p = t.progress();
         self.paused = true;
         self.pending_steps = 0;
+        self.pass_paused = false;
         self.take_provider_notes();
         self.sampling = p;
     }
@@ -2062,13 +2110,14 @@ impl Dynamics {
             return self.no_surrogate("retry the fit");
         };
         if t.pass_active() {
-            return self.reject("retry the fit: a pass is already running (cancel it first)".into());
+            return self.reject(format!("retry the fit: {}", self.pass_busy()));
         }
         match t.retry_fit(&self.scene, &mut self.refs) {
             Ok(true) => {
                 let p = t.progress();
                 self.paused = true;
                 self.pending_steps = 0;
+                self.pass_paused = false;
                 self.take_provider_notes();
                 self.sampling = p;
                 self.refresh_ghost();
@@ -2127,6 +2176,25 @@ impl Dynamics {
         self.pass_ended();
     }
 
+    /// `PauseSampling` (`pause` true) and `ContinueSampling` (module doc, "Pausing a pass"): the
+    /// flag the tick reads, a note, and the snapshot's progress at once. No-op without a running
+    /// pass or when the pass is already in that state.
+    fn pause_sampling(&mut self, pause: bool) {
+        if !self.pass_active() || self.pass_paused == pause {
+            return;
+        }
+        self.pass_paused = pause;
+        self.sampling = self.provider.as_trainable().and_then(|t| t.progress());
+        if let Some(p) = &self.sampling {
+            let at = format!("sample {} of {}", (p.done + 1).min(p.total.max(1)), p.total);
+            self.note(if pause {
+                format!("sampling pass paused at {at}: nothing more is solved until Resume (its queue, samples and place are kept); Cancel ends it")
+            } else {
+                format!("sampling pass going on at {at} (resumed after a pause)")
+            });
+        }
+    }
+
     /// Shrinks the running pass to `plan`'s counts through the provider
     /// (`Trainable::rescale_pass`: only jobs not yet run are dropped, the references and the
     /// trust floor are kept — the viewer's automatic pass re-sized from the median of its first
@@ -2145,6 +2213,7 @@ impl Dynamics {
     /// After a pass (complete or cancelled; the provider told its teacher that its state is a
     /// sample geometry's and refitted over everything it holds): its final progress.
     fn pass_ended(&mut self) {
+        self.pass_paused = false;
         self.sampling = self.provider.as_trainable().and_then(|t| t.progress());
         self.refresh_ghost();
         self.seq += 1;
@@ -2153,6 +2222,7 @@ impl Dynamics {
     fn forget_model(&mut self) {
         let Some(t) = self.provider.as_trainable() else { return self.no_surrogate("forget model") };
         t.forget();
+        self.pass_paused = false;
         self.sampling = None;
         self.ghost = None;
         self.take_provider_notes();
@@ -2175,7 +2245,8 @@ impl Dynamics {
     fn load_model(&mut self, path: PathBuf) {
         let Some(t) = self.provider.as_trainable() else { return self.no_surrogate("load model") };
         if t.pass_active() {
-            return self.reject("load model: cancel the running sampling pass first".into());
+            let which = if self.pass_paused { "paused" } else { "running" };
+            return self.reject(format!("load model: cancel the {which} sampling pass first"));
         }
         let loaded = t.load(&path, &self.scene);
         if loaded.is_ok() {
