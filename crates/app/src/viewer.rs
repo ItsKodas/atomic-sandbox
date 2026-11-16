@@ -2134,7 +2134,7 @@ impl Viewer {
         if !s.working {
             self.last_play_log = None;
             eprintln!(
-                "snapshot ({}, idle): {} nuclei, {}³ × {} Bohr, E_KS {:+.6} Ha, t {:.2} fs, step {}, T {:.1} K, {} SCF steps, {} ms{r01}{model}{}",
+                "snapshot ({}, idle): {} nuclei, {}³ × {} Bohr, F {:+.6} Ha, t {:.2} fs, step {}, T {:.1} K, {} SCF steps, {} ms{r01}{model}{}",
                 s.backend.label(),
                 d.scene.nuclei.len(),
                 d.scene.cell.n,

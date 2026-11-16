@@ -4633,7 +4633,7 @@ fn scripted_session_with(views: bool) -> String {
     let answer = |s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>| {
         let generation = s.auditor.as_ref().expect("an auditor").generation.load(Ordering::Relaxed);
         let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
-        AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps: None }
+        AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps: None, ts: None }
     };
     let mut teacher = MorseDimer::h2();
     for (i, (r, de, face, fail, charged)) in
@@ -5040,7 +5040,7 @@ fn audit_answer(s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result
     let generation = s.auditor.as_ref().expect("an auditor").generation();
     let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
     let scf_steps = result.is_ok().then_some(5);
-    AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps }
+    AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps, ts: None }
 }
 
 /// Plan review S11: the background auditor's failed solve and its discarded answer are solves
@@ -8466,7 +8466,7 @@ fn nothing_inside_a_fenced_band_is_fitted_or_judged() {
     let scene = h2(5.5);
     let prov = s.provenance_for(&scene);
     let job = AuditJob { scene, prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
-    s.judge_audit(job, t.energy - 0.5, t.forces.clone(), None, None, None, 1.0, Some(10));
+    s.judge_audit(job, t.energy - 0.5, t.forces.clone(), None, None, None, 1.0, Some(10), None);
     let note = s.pending_notes.last().cloned().unwrap_or_default();
     println!("{note}");
     assert!(note.starts_with("surrogate audit not judged: H–H at 5.50 Bohr is in the cutoff shell") && note.ends_with("the answer is not fitted"), "{note}");
@@ -8492,7 +8492,7 @@ fn judged_audits_are_recorded_in_the_history() {
     let pred = s.model().unwrap().predict(&pos, &z, true).unwrap();
     let prov = s.provenance_for(&scene);
     let job = || AuditJob { scene: scene.clone(), prov: prov.clone(), generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
-    s.judge_audit(job(), t.energy, t.forces.clone(), None, None, None, 1.0, Some(10));
+    s.judge_audit(job(), t.energy, t.forces.clone(), None, None, None, 1.0, Some(10), None);
     assert_eq!(s.audit_history().len(), 1);
     let p = s.audit_history().iter().next().unwrap().clone();
     assert_eq!((p.kind, p.n_atoms, p.classes.clone(), p.model_gen), (surrogate::history::PointKind::Audit, 2, vec![1, 1], s.model_gen));
@@ -8505,10 +8505,10 @@ fn judged_audits_are_recorded_in_the_history() {
         assert_eq!(*e, d, "‖F_teacher − F_model‖ of atom {j}");
     }
     // a box-affected answer (face density above the rule): judged "not judged", no point, counted
-    s.judge_audit(job(), t.energy, t.forces.clone(), Some(1.0), None, None, 1.0, Some(10));
+    s.judge_audit(job(), t.energy, t.forces.clone(), Some(1.0), None, None, 1.0, Some(10), None);
     assert_eq!((s.audit_history().len(), s.audit_history().unrecorded.box_affected), (1, 1));
     // a draft-mode guess at a geometry strict mode refuses: no point, counted
-    s.judge_audit(AuditJob { draft_guess: true, ..job() }, t.energy, t.forces.clone(), None, None, None, 1.0, Some(10));
+    s.judge_audit(AuditJob { draft_guess: true, ..job() }, t.energy, t.forces.clone(), None, None, None, 1.0, Some(10), None);
     assert_eq!((s.audit_history().len(), s.audit_history().unrecorded.draft), (1, 1));
     // the in-step audit (no auditor attached, audit every 2 answered steps): the second answered
     // step is audited inside `evaluate`; the cadence had reused the first verdict, so the point's

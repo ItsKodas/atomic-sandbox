@@ -54,13 +54,13 @@ pub fn lone_atom_tip(n: u64) -> String {
     )
 }
 
-/// A solve's electronic-entropy term as its solve line prints it (spec 2026-11-13 §6.6): "−TS = 9.5 mHa" (µHa below
-/// 0.1 mHa), only when TS ≥ 1e-6 Ha — a gapped solve says nothing.
+/// A solve's electronic-entropy term as its solve line prints it (spec 2026-11-13 §6.6, its sign corrected at Task 12):
+/// the signed value, "−TS = −9.5 mHa" (µHa below 0.1 mHa), only when TS ≥ 1e-6 Ha — a gapped solve says nothing.
 pub fn ts_text(ts: f64) -> Option<String> {
     if !(ts >= 1e-6) {
         return None;
     }
-    Some(if ts >= 1e-4 { format!("−TS = {:.1} mHa", ts * 1e3) } else { format!("−TS = {:.1} µHa", ts * 1e6) })
+    Some(if ts >= 1e-4 { format!("−TS = −{:.1} mHa", ts * 1e3) } else { format!("−TS = −{:.1} µHa", ts * 1e6) })
 }
 
 /// The step cell of a log row and its hover (plan review M6): `pass` for a pass solve, else the
@@ -160,11 +160,20 @@ pub fn gap_cell(e: &sim::TeachEvent) -> (String, Option<String>) {
 
 /// The solve cell: the time (ms, or s above 10 s) and the SCF iterations with how they ended —
 /// "840 ms · 37 it" converged, "6.1 s · 61 stalled" (the stall stop), "9.8 s · 200 cap"; "—" for a
-/// row with no solve.
+/// row with no solve; a solve with TS ≥ 1e-6 Ha ends with its [`ts_text`] ("· −TS = −9.5 mHa").
 pub fn solve_cell(e: &sim::TeachEvent) -> String {
     if !e.is_solve() {
         return "—".into();
     }
+    let cell = solve_cell_time(e);
+    match e.ts.and_then(ts_text) {
+        Some(ts) => format!("{cell} · {ts}"),
+        None => cell,
+    }
+}
+
+/// [`solve_cell`] without the −TS.
+fn solve_cell_time(e: &sim::TeachEvent) -> String {
     let t = if e.solve_ms >= 10_000.0 { format!("{:.1} s", e.solve_ms / 1e3) } else { format!("{:.0} ms", e.solve_ms) };
     match (e.scf_steps.filter(|&n| n > 0), e.scf_end) {
         (Some(n), None | Some(sim::ScfEnd::Converged)) => format!("{t} · {n} it"),
@@ -187,7 +196,8 @@ pub fn solve_hover(e: &sim::TeachEvent) -> Option<String> {
         Some(sim::ScfEnd::NonFinite) => " — stopped: Δρ was not finite",
         Some(sim::ScfEnd::TimeLimit) | None => "",
     };
-    Some(format!("{n} SCF iterations{why}"))
+    let ts = e.ts.and_then(ts_text).map_or(String::new(), |t| format!("; {t} (the electronic entropy term of F at T_el: partly occupied levels)"));
+    Some(format!("{n} SCF iterations{why}{ts}"))
 }
 
 /// One line of the displayed list (oldest-first positions are indices into `rows`).

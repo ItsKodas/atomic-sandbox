@@ -1599,7 +1599,8 @@ pub fn relaxing(d: &sim::DynSnapshot) -> bool {
 
 /// The relax readout (Physics menu, the relax card): the progress or result line, the teacher's
 /// verification under the estimated solver, and the driver's note (why it ended early).
-/// "relaxing: step 42 · max|F| 3.1e-3 Ha/Bohr (stop < 1e-3) · ΔE −2.10e-3 Ha · Δt 0.60 fs".
+/// "relaxing: step 42 · max|F| 3.1e-3 Ha/Bohr (stop < 1e-3) · ΔF −2.10e-3 Ha · Δt 0.60 fs" — ΔF: relax minimises the
+/// electronic free energy F at T_el (Fermi–Dirac spec 2026-11-13 §6.5).
 pub fn relax_lines(r: &sim::RelaxProgress) -> Vec<String> {
     let de = r.energy - r.energy_start;
     let forces = if (r.max_force_augmented - r.max_force).abs() > 1e-12 {
@@ -1608,9 +1609,9 @@ pub fn relax_lines(r: &sim::RelaxProgress) -> Vec<String> {
         format!("max|F| {:.1e} Ha/Bohr", r.max_force)
     };
     let mut v = vec![match r.converged {
-        None => format!("relaxing: step {} · {forces} (stop < {:.0e}) · ΔE {de:+.2e} Ha · Δt {:.2} fs", r.steps, sim::F_TOL, r.dt_fs),
-        Some(true) => format!("relaxed in {} steps: {forces} (< {:.0e}) · ΔE {de:+.2e} Ha", r.steps, sim::F_TOL),
-        Some(false) => format!("relax ended after {} steps: {forces} · ΔE {de:+.2e} Ha", r.steps),
+        None => format!("relaxing: step {} · {forces} (stop < {:.0e}) · ΔF {de:+.2e} Ha · Δt {:.2} fs", r.steps, sim::F_TOL, r.dt_fs),
+        Some(true) => format!("relaxed in {} steps: {forces} (< {:.0e}) · ΔF {de:+.2e} Ha", r.steps, sim::F_TOL),
+        Some(false) => format!("relax ended after {} steps: {forces} · ΔF {de:+.2e} Ha", r.steps),
     }];
     if let Some(vf) = r.verified_max_force {
         v.push(format!("verified by one teacher solve: DFT max|F| {vf:.1e} Ha/Bohr"));

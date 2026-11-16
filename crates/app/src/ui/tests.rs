@@ -2661,14 +2661,14 @@ fn relax_progress(converged: Option<bool>) -> sim::RelaxProgress {
 #[test]
 fn the_relax_readout_shows_progress_the_drop_and_the_verification() {
     let r = relax_progress(None);
-    assert_eq!(relax_lines(&r), vec!["relaxing: step 42 · max|F| 3.1e-3 Ha/Bohr (stop < 1e-3) · ΔE -2.10e-3 Ha · Δt 0.60 fs"]);
+    assert_eq!(relax_lines(&r), vec!["relaxing: step 42 · max|F| 3.1e-3 Ha/Bohr (stop < 1e-3) · ΔF -2.10e-3 Ha · Δt 0.60 fs"]);
     let mut done = relax_progress(Some(true));
     done.max_force = 8.2e-4;
     done.max_force_augmented = 8.2e-4;
     done.verified_max_force = Some(6.1e-4);
     assert_eq!(
         relax_lines(&done),
-        vec!["relaxed in 42 steps: max|F| 8.2e-4 Ha/Bohr (< 1e-3) · ΔE -2.10e-3 Ha", "verified by one teacher solve: DFT max|F| 6.1e-4 Ha/Bohr"]
+        vec!["relaxed in 42 steps: max|F| 8.2e-4 Ha/Bohr (< 1e-3) · ΔF -2.10e-3 Ha", "verified by one teacher solve: DFT max|F| 6.1e-4 Ha/Bohr"]
     );
     let mut held = relax_progress(Some(false));
     held.max_force_augmented = 5e-4;
@@ -13309,16 +13309,30 @@ fn forget_by_rule_needs_its_inline_confirmation() {
 /// Fermi–Dirac smearing's words outside the Readouts (plan 2026-11-13 Task 12, spec §6.6, §4.7(i)).
 mod fermi_smearing_words {
     use super::*;
+    use sim::activity::{TeachOrigin, TeachOutcome, TeachRule};
 
-    /// The solve line's −TS: 9.5477e-3 Ha (a lone O at M = 3 at 5 mHa) reads "−TS = 9.5 mHa"; below 1e-6 Ha nothing.
+    /// The solve line's −TS: 9.5477e-3 Ha (a lone O at M = 3 at 5 mHa) reads "−TS = −9.5 mHa" (signed); below 1e-6 Ha
+    /// nothing. The solve log's cell and hover carry it from `TeachEvent::ts`.
     #[test]
     fn solve_log_ts_line() {
         use activity::log::ts_text;
-        assert!(ts_text(9.5477e-3).is_some_and(|t| t.contains("−TS = 9.5 mHa")), "{:?}", ts_text(9.5477e-3));
+        // the signed value (rule 7: the spec's string dropped the sign; corrected 2026-11-16, Task 12 fix round)
+        assert!(ts_text(9.5477e-3).is_some_and(|t| t.contains("−TS = −9.5 mHa")), "{:?}", ts_text(9.5477e-3));
         assert_eq!(ts_text(9e-7), None);
         assert_eq!(ts_text(0.0), None);
         assert_eq!(ts_text(f64::NAN), None);
-        assert_eq!(ts_text(2e-6).as_deref(), Some("−TS = 2.0 µHa"), "a small TS keeps its digits");
+        assert_eq!(ts_text(2e-6).as_deref(), Some("−TS = −2.0 µHa"), "a small TS keeps its digits");
+        // the solve log's row: the cell and its hover carry it; a gapped or unreported TS says nothing
+        use activity::log::{solve_cell, solve_hover};
+        let mut e = sim::TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(sim::activity::PassJob::Scan), TeachOutcome::Kept);
+        (e.solve_ms, e.scf_steps, e.scf_end) = (840.0, Some(37), Some(sim::ScfEnd::Converged));
+        assert_eq!(solve_cell(&e), "840 ms · 37 it");
+        e.ts = Some(9e-7);
+        assert_eq!(solve_cell(&e), "840 ms · 37 it");
+        assert_eq!(solve_hover(&e).as_deref(), Some("37 SCF iterations — converged"));
+        e.ts = Some(9.5477e-3);
+        assert_eq!(solve_cell(&e), "840 ms · 37 it · −TS = −9.5 mHa");
+        assert!(solve_hover(&e).is_some_and(|h| h.starts_with("37 SCF iterations — converged; −TS = −9.5 mHa")), "{:?}", solve_hover(&e));
     }
 
     /// Spec §4.7(i): every text that shows energies against the isolated-atom references says they are free
