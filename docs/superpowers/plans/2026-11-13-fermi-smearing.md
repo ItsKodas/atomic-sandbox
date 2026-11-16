@@ -40,7 +40,7 @@
 - **Heavy jobs one at a time.** Never kill the user's cargo or `app.exe`. With another cargo job running, build at BelowNormal priority with `-j 4`. Heavy tests stay release-only (`#[cfg_attr(debug_assertions, ignore)]`).
 - **Commits:** `git commit -o -m "<message>" -- <paths>` (options before `--`; a new file needs `git add <path>` first). Messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Never pipe a gating git command (`git merge … | tail`). Edit files with Edit/Write or Python, never PowerShell `Set-Content`.
   - **No bare `git stash`** (F6; the stash stack is shared by every worktree). Set work aside with a WIP commit, or `git stash push -u -m "<unique-tag>"` applied by its SHA (`git stash apply <sha>`, never `pop`).
-  - **No diagnostic code is ever committed on `scf-stall`** (F5). The V0/A1 prototype (`SCF_SMEAR`/`SCF_TRACE2` knobs in `crates/qm/src/scf.rs` and `crates/qm-gpu/src/scf.rs`, `crates/providers/src/scf_stall_diag.rs` and its `lib.rs` mod line) is committed on the side branch `smearing-prototype` at the end of Task 3 and leaves the tree there. Implementers may read it (`git show smearing-prototype:<path>`); nobody merges it. `git commit -o` commits whole files, so before every commit that touches one of those files, `rg "SCF_SMEAR|SCF_TRACE2|DIAG_|scf_stall_diag" crates` returns nothing.
+  - **No diagnostic code is ever committed on `scf-stall`** (F5). The V0/A1 prototype (`SCF_SMEAR`/`SCF_TRACE2` knobs in `crates/qm/src/scf.rs` and `crates/qm-gpu/src/scf.rs`, `crates/providers/src/scf_stall_diag.rs` and its `lib.rs` mod line) is committed on the side branch `smearing-prototype` at the end of Task 3 and leaves the tree there. Implementers may read it (`git show smearing-prototype:<path>`); nobody merges it. `git commit -o` commits whole files, so before every commit that touches one of those files, `rg "SCF_SMEAR|SCF_TRACE2|scf_stall_diag" crates` (the pre-existing `DIAG_*` knobs on main are not the prototype's; review M6) returns nothing.
 - **Task order** (preflight ruling): Task 1 → **Task 3 → Task 2** → Tasks 4–18. Task 3 (GPU measurements on the prototype, independent of `main`) runs before Task 2. Task 2 waits until `purge-forgotten` (and the trust rework) have merged to `main`.
 - **Docs move with the code:** README (user rule), `crates/validate/references.md`, `docs/dev-reference.md`, and the spec sections each task changes are updated in that task.
 - **It ships as one merge** (spec §11): the solver change and the migration together.
@@ -229,7 +229,7 @@ name a kT or a stop.
 - Modify:
   - `crates/qm/src/lib.rs`: the module, and re-exports of the items below at the crate root as `qm::…`;
   - `crates/qm/src/scf.rs`: `pub use crate::occupations::*` so `qm::scf::fermi_dirac` resolves (spec §5).
-- Nothing to remove: Task 1's `SCF_SMEAR` knob left the tree in Task 3 step 6 (`smearing-prototype`). Before committing, `rg "SCF_SMEAR|SCF_TRACE2|DIAG_|scf_stall_diag" crates` returns nothing (F5).
+- Nothing to remove: Task 1's `SCF_SMEAR` knob left the tree in Task 3 step 6 (`smearing-prototype`). Before committing, `rg "SCF_SMEAR|SCF_TRACE2|scf_stall_diag" crates` (the pre-existing `DIAG_*` knobs on main are not the prototype's; review M6) returns nothing (F5).
 
 **Interfaces:**
 - Produces:
@@ -352,7 +352,7 @@ pub fn partial_levels(evals: &[f64], f: &[f64], spin: u8) -> Vec<PartialLevel>;
 
   Fix every MUST before continuing.
 - [ ] **Step 6: Run the gates,** one at a time: `cargo test -p units -p qm -p sim -p surrogate --release` (~6.5 min), then `cargo test -p providers --release` (~5.5 min). Expected: PASS with no pin moved; providers still select `Aufbau`/DS explicitly or by default.
-- [ ] **Step 7: Commit** with `git commit -o --` the files above. First check that `rg "SCF_SMEAR|SCF_TRACE2|DIAG_|scf_stall_diag" crates` returns nothing: `-o` commits whole files, and `crates/qm/src/scf.rs` and `crates/qm-gpu/src/scf.rs` carried the prototype's knobs (now only on `smearing-prototype`, F5). Message: `feat(qm): SCF on Fermi–Dirac occupations; Energy.total = F (spec 2026-11-13 §4–5)`.
+- [ ] **Step 7: Commit** with `git commit -o --` the files above. First check that `rg "SCF_SMEAR|SCF_TRACE2|scf_stall_diag" crates` (the pre-existing `DIAG_*` knobs on main are not the prototype's; review M6) returns nothing: `-o` commits whole files, and `crates/qm/src/scf.rs` and `crates/qm-gpu/src/scf.rs` carried the prototype's knobs (now only on `smearing-prototype`, F5). Message: `feat(qm): SCF on Fermi–Dirac occupations; Energy.total = F (spec 2026-11-13 §4–5)`.
 
 **Time:** about 12 min of gates plus the release-only tests (a few min).
 
@@ -442,7 +442,7 @@ pub fn partial_levels(evals: &[f64], f: &[f64], spin: u8) -> Vec<PartialLevel>;
   - `cargo test -p providers --release` (~5.5 min; the hold keeps its pins).
 
   Expected: PASS, existing numbers within the existing tolerances.
-- [ ] **Step 6: Commit** the files above (`git commit -o --`), after `rg "SCF_SMEAR|SCF_TRACE2|DIAG_|scf_stall_diag" crates` returns nothing (F5). Message: `feat(qm-gpu): Fermi–Dirac on the shared host rule; FD is ScfSettings' default (spec 2026-11-13 §5, V3/V4)`.
+- [ ] **Step 6: Commit** the files above (`git commit -o --`), after `rg "SCF_SMEAR|SCF_TRACE2|scf_stall_diag" crates` (the pre-existing `DIAG_*` knobs on main are not the prototype's; review M6) returns nothing (F5). Message: `feat(qm-gpu): Fermi–Dirac on the shared host rule; FD is ScfSettings' default (spec 2026-11-13 §5, V3/V4)`.
 
 **Time:** about 50 min of gates plus qm-gpu's own suite.
 
@@ -518,7 +518,7 @@ pub fn branch_jump_warning(m: f64) -> String;   // the EvalStats warning (spec �
 
   None of them may be loosened.
 - [ ] **Step 7: Run the gates,** serially: `cargo test -p units -p qm -p sim -p surrogate --release` (~6.5 min), `cargo test -p providers --release` (~5.5 min), `cargo test -p validate --release --test surrogate` (~12–17 min).
-- [ ] **Step 8: Commit** the files above, after `rg "SCF_SMEAR|SCF_TRACE2|DIAG_|scf_stall_diag" crates` returns nothing (`crates/providers/src/lib.rs` carried the prototype's mod line; F5).
+- [ ] **Step 8: Commit** the files above, after `rg "SCF_SMEAR|SCF_TRACE2|scf_stall_diag" crates` (the pre-existing `DIAG_*` knobs on main are not the prototype's; review M6) returns nothing (`crates/providers/src/lib.rs` carried the prototype's mod line; F5).
 
 **Time:** about 35 min of gates plus about 10 min to measure the tier.
 
@@ -580,7 +580,7 @@ pub fn branch_jump_warning(m: f64) -> String;   // the EvalStats warning (spec �
   - `cargo test -p providers --release` (~5.5 min, plus V2's 9 GPU cases, about 10 min);
   - `cargo test -p validate --release --test surrogate` (~12–17 min);
   - `cargo test -p validate --release --test gpu_vs_cpu` (~3.5 min).
-- [ ] **Step 7: Commit** the files above, after `rg "SCF_SMEAR|SCF_TRACE2|DIAG_|scf_stall_diag" crates` returns nothing (F5).
+- [ ] **Step 7: Commit** the files above, after `rg "SCF_SMEAR|SCF_TRACE2|scf_stall_diag" crates` (the pre-existing `DIAG_*` knobs on main are not the prototype's; review M6) returns nothing (F5).
 
 **Time:** about 40 min of gates.
 
@@ -596,6 +596,13 @@ Runs after the preview build that follows Task 9, before Task 10. Witness column
 - Grow several witness vectors per re-solve (doubling the extra block) instead of one.
 - Tests: CPU f64 loose-vs-tight on H₂O, LiH, Li, H₄ square, pseudo-O M = 1 and 3: |ΔF| ≤ 1e-10 Ha, |ΔF_I| ≤ 1e-9 Ha/Bohr; the lower-bound assertion; a column that changes class mid-solve; cold GPU solves stay bitwise reproducible; V4 re-passes; re-time gpu_vs_cpu and oracles (they rose 3.5 → 23.7 min and 31 → 51 min at Task 7) and record the times.
 - **The witness cap and the memory guard** (Task 7 fix round 1/2, ruling 2026-11-16): cold all-electron H₂O at 97³ × 0.25 grows past 16 extras on transient steps 3–4 (μ ≈ −0.06 Ha before self-consistency; no column collapse); cap 32 passed step 4 at 19 extras but had not converged in 15 min. Raising the cap means the memory guard must count it (at 32, 384 fields: Precise 141³ no longer fits the auditor's half budget). Decide here, after the cost fixes, with the measured growth: preferably derive the growth cap from the VRAM budget (cap = min(32, what fits), error message names the budget) instead of a bigger constant. Re-run the 97³ H₂O cold case and record steps, extras and time.
+- **The H₃⁺ cycle** (Task 9 review C1, ruling 2026-11-16; `task-9-review.md`): `h3plus_tier` fails because one block-wide `max_res` (qm-gpu/src/eigen.rs:624-632, witness columns included) drives both of `classify`'s decisions, and the DIIS reset after a frozen step (scf.rs:1239-1244) then fires every other step. 9b must:
+  - (a) make both decisions — the tol stop and the `guess_tol` 0-iteration accept — read the tight columns only;
+  - (b) make `frozen` mean "the tight columns did not move" (or lock the tight columns while the loose ones iterate), so a witness-only iteration never resets DIIS;
+  - (c) acceptance tests: `h3plus_tier` passes, and a direct cold H₃⁺ (pair at 1.6 r₀, 49³ × 0.25, tol 1e-6) converges in a bounded number of steps with bounded `diis_resets`.
+- **The loose threshold comes from the stop**, not a fixed 1e-10: H₃⁺'s ↑ level 2 sits at f ≈ 5e-11, so a neighbour at 2e-10 would stay tight and could cycle. Use f < 1e-2·tol, justified by f·κ·r ≪ tol and dμ/dε ∝ f(1−f), or verify every point of an H₃⁺ scan.
+- **The RED tests Task 9 left** become green or are re-ruled here: the 201³ × 0.15 all-electron H⁻ leg (V8 at the app's largest box) and the cold all-electron H₂O at 97³ × 0.25 (both `#[ignore = "plan Task 9b: witness cap"]`), plus `the_stuck_escape_repro_is_answered_honestly` if Task 9 could not run it inside a batch.
+- **Task 9 is complete only when `h3plus_tier` passes** (it closes here).
 - Physics review before commit.
 
 ---
