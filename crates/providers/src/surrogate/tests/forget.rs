@@ -821,3 +821,55 @@ fn assert_matches_a_rebuild(s: &mut SurrogateKs) {
     let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * b.abs().max(f64::MIN_POSITIVE);
     assert!(before.0 == after.0 && close(before.1, after.1) && close(before.2, after.2), "{before:?} vs a rebuild {after:?}");
 }
+
+/// 2026-11-16, "Forget samples…" / "Forget all above x×": a rule is resolved against the stored
+/// samples now — only samples in the fit's codes (a held one is never taken), the count the user
+/// confirmed checked (another count is refused, nothing changed), an empty match refused — and
+/// forgotten as one batch (one note, one refit due). The ratio rule takes exactly the samples whose
+/// leave-one-out ratio in the standing fit's cache is above x; the knowledge map's molecules count
+/// the result (forgotten apart from fitted).
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn forget_by_rule_takes_only_samples_in_the_fit_and_checks_the_count() {
+    use sim::knowledge::{Composition, ForgetRule};
+    let mut s = window();
+    s.ensure_loo_ratios();
+    let unchanged = |s: &SurrogateKs| s.forgotten() == 0 && s.user_changes_pending() == 0;
+    let map = s.knowledge_map().unwrap();
+    let h2 = Composition::of(&[1, 1]);
+    assert_eq!(map.molecules.len(), 1);
+    assert_eq!((map.molecules[0].composition.clone(), map.molecules[0].fitted, map.molecules[0].scenes.len()), (h2.clone(), 40, 1));
+    // nothing matched, or a count other than the confirmed one: refused, nothing changed
+    let e = s.forget_by_rule(&ForgetRule::Element(8), 0).unwrap_err();
+    assert!(e.contains("no sample in the fit matches"), "{e}");
+    assert!(s.forget_by_rule(&ForgetRule::Scene("elsewhere".into()), 0).is_err());
+    let e = s.forget_by_rule(&ForgetRule::Composition(h2.clone()), 39).unwrap_err();
+    assert!(e.contains("the samples changed: 40 match now, not the 39 confirmed"), "{e}");
+    assert!(unchanged(&s));
+    // the ratio rule: exactly the cache's rows above x
+    let mut ratios: Vec<(usize, f64)> = s.fresh_loo_ratios().unwrap().rows.clone();
+    ratios.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let x = ratios[4].1;
+    let mut want: Vec<usize> = ratios.iter().filter(|r| r.1 > x).map(|r| r.0).collect();
+    want.sort_unstable();
+    assert_eq!(want.len(), 4, "distinct ratios: {ratios:?}");
+    let notes0 = s.user_notes.len();
+    assert_eq!(s.forget_by_rule(&ForgetRule::Above(x), 4), Ok(4));
+    let got: Vec<usize> = (0..s.samples()).filter(|&i| s.is_forgotten(i)).collect();
+    assert_eq!(got, want);
+    assert_eq!((s.user_changes_pending(), s.user_notes.len() - notes0), (4, 1), "one batch, one note");
+    assert!(s.pending_refit());
+    // a held sample is never taken: the composition rule takes the 35 left in the fit's codes
+    let held = (0..40).find(|i| !want.contains(i)).unwrap();
+    s.quarantine.resize(s.samples(), Q_NONE);
+    s.quarantine[held] = Q_HELD;
+    let m = s.knowledge_map().unwrap();
+    let mol = m.molecule(&h2).unwrap();
+    assert_eq!((mol.fitted + mol.waiting, mol.held, mol.forgotten), (35, 1, 4), "held and forgotten apart from the fitted count");
+    assert_eq!(s.forget_by_rule(&ForgetRule::Scene(String::new()), 35), Ok(35), "no collection: no scene recorded");
+    assert_eq!(s.quarantine[held], Q_HELD, "the held sample stays held");
+    assert_eq!(s.forgotten(), 39);
+    // everything forgotten: nothing left to match
+    let e = s.forget_by_rule(&ForgetRule::Element(1), 0).unwrap_err();
+    assert!(e.contains("no sample in the fit matches (40 held out already)"), "{e}");
+}

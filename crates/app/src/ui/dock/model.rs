@@ -1220,7 +1220,11 @@ pub fn suspects(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling
                 }
             }
             ui.label(RichText::new(SUSPECTS_CAPTION).size(11.0).color(theme::INK_DIM));
+            forget_above(ui, st, m, sampling, acts);
         }
+    }
+    if let Some(m) = m.filter(|m| m.fitted) {
+        forget_tool(ui, st, m, sampling, acts);
     }
     let Some(m) = m.filter(|m| !m.forgotten_samples.is_empty()) else {
         st.purge_confirm = false;
@@ -1288,6 +1292,266 @@ pub fn suspects(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling
         if super::super::probed("restore-selected", ui.button(format!("Restore {n} selected"))).on_hover_text("put the checked samples back into the fit together: applied at once, then one refit").clicked() {
             acts.push(Action::RestoreSamples(st.restore_selection.clone()));
         }
+    }
+}
+
+/// Which samples "Forget samples…" picks (2026-11-16): one filter at a time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RuleKind {
+    /// Holding an atom of the element.
+    #[default]
+    Element,
+    /// Of exactly the composition (the multiset of Z, a formula).
+    Composition,
+    /// From the scene.
+    Scene,
+}
+
+/// "Forget samples…" and "Forget all above x×" (2026-11-16; `UiState::forget_rule`, display state):
+/// the tool's fold, its filter and value, the threshold, and which inline confirmation shows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForgetTool {
+    pub open: bool,
+    pub kind: RuleKind,
+    pub element: Option<u8>,
+    pub composition: Option<sim::knowledge::Composition>,
+    pub scene: Option<String>,
+    /// "Forget all above x×": x, 5.0 by default.
+    pub above: f64,
+    pub confirm: bool,
+    pub above_confirm: bool,
+}
+
+impl Default for ForgetTool {
+    fn default() -> ForgetTool {
+        ForgetTool { open: false, kind: RuleKind::Element, element: None, composition: None, scene: None, above: 5.0, confirm: false, above_confirm: false }
+    }
+}
+
+impl ForgetTool {
+    /// The rule the tool's filter names now (`None`: no value chosen).
+    pub fn rule(&self) -> Option<sim::knowledge::ForgetRule> {
+        use sim::knowledge::ForgetRule as R;
+        match self.kind {
+            RuleKind::Element => self.element.map(R::Element),
+            RuleKind::Composition => self.composition.clone().map(R::Composition),
+            RuleKind::Scene => self.scene.clone().map(R::Scene),
+        }
+    }
+}
+
+/// A composition as a formula (`crate::names::formula`: "PH₃", "H₂O").
+pub fn composition_words(c: &sim::knowledge::Composition) -> String {
+    crate::names::formula(&c.0, None)
+}
+
+/// A scene name as the tool shows it.
+pub fn scene_words(name: &str) -> String {
+    if name.is_empty() { "(no scene recorded)".to_string() } else { name.to_string() }
+}
+
+/// "P", "P and N", "P, N and O".
+fn and_list(words: &[String]) -> String {
+    match words {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// The compositions a preview names before "+ N more".
+pub const PREVIEW_GROUPS: usize = 6;
+
+/// A rule's preview (2026-11-16; `sim::knowledge::ForgetPreview`) in words: the count and its
+/// breakdown by composition ("Forget 214 samples: 198 PH₃, 16 PH₅."), the matched samples out of
+/// the fit already ("12 already held out: 9 forgotten, 3 held by the trust recovery or excluded."),
+/// a species it leaves with no sample in the fit ("P will have no samples in the fit: P atoms fall
+/// back to DFT until taught again."), and the recovery's cap when the held and forgotten samples
+/// would pass it (`out_now` held and forgotten of `samples`). Nothing in the fit: "No sample in the
+/// fit matches." with the held-out count.
+pub fn forget_preview_text(p: &sim::knowledge::ForgetPreview, out_now: usize, samples: usize) -> String {
+    let mut t = if p.total == 0 {
+        "No sample in the fit matches.".to_string()
+    } else {
+        let mut parts: Vec<String> = p.groups.iter().take(PREVIEW_GROUPS).map(|(c, n)| format!("{n} {}", composition_words(c))).collect();
+        if p.groups.len() > PREVIEW_GROUPS {
+            let rest: usize = p.groups[PREVIEW_GROUPS..].iter().map(|g| g.1).sum();
+            parts.push(format!("+ {rest} in {} more compositions", p.groups.len() - PREVIEW_GROUPS));
+        }
+        format!("Forget {} sample{}: {}.", p.total, if p.total == 1 { "" } else { "s" }, parts.join(", "))
+    };
+    let out = p.held + p.forgotten;
+    if out > 0 {
+        let mut why = Vec::new();
+        if p.forgotten > 0 {
+            why.push(format!("{} forgotten", p.forgotten));
+        }
+        if p.held > 0 {
+            why.push(format!("{} held by the trust recovery or excluded", p.held));
+        }
+        t += &format!(" {out} already held out: {}.", why.join(", "));
+    }
+    if !p.emptied.is_empty() {
+        let names: Vec<String> = p.emptied.iter().map(|&z| render::elements::symbol(z).to_string()).collect();
+        let list = and_list(&names);
+        let (have, atoms) = if names.len() == 1 { ("will have", format!("{list} atoms")) } else { ("will have", "their atoms".to_string()) };
+        t += &format!(" {list} {have} no samples in the fit: {atoms} fall back to DFT until taught again.");
+    }
+    let after = out_now + p.total;
+    if p.total > 0 && after as f64 > providers::surrogate::QUARANTINE_MAX_FRACTION * samples as f64 {
+        t += &format!(
+            " Held and forgotten together will be {after} of {samples} samples, past the {:.0} % the trust recovery may hold out: applied anyway, and the recovery holds no more.",
+            100.0 * providers::surrogate::QUARANTINE_MAX_FRACTION
+        );
+    }
+    t
+}
+
+/// The honesty line under "Forget all above x×".
+pub const FORGET_ABOVE_NOTE: &str = "The ratios are recomputed at every refit, so other samples can rise above it afterwards. A high ratio often marks hard but real physics (a stretched bond): forgetting it hides that gap rather than fixing it.";
+
+/// The tip of "Forget samples…".
+const FORGET_TOOL_TIP: &str = "forget every sample in the fit that holds an element, has exactly a composition, or came from a scene: a preview, then an inline confirmation. Forgotten samples are held out of the fit until restored (Restore below), fence their geometries (those fall back to DFT), and can be purged for good";
+
+/// The inline confirmation of a rule (the purge's look): the preview, **Forget** (emits
+/// `Action::ForgetByRule` with the previewed count; disabled with nothing to forget or during a
+/// pass) and **Cancel**. Returns whether it is still open.
+fn rule_confirm(ui: &mut Ui, text: &str, extra: Option<&str>, rule: &sim::knowledge::ForgetRule, n: usize, sampling: bool, probe: &str, acts: &mut Vec<Action>) -> bool {
+    let mut open = true;
+    egui::Frame::new()
+        .fill(AMBER.gamma_multiply(0.08))
+        .stroke(egui::Stroke::new(1.0, AMBER.gamma_multiply(0.6)))
+        .corner_radius(7)
+        .inner_margin(egui::Margin::symmetric(9, 7))
+        .show(ui, |ui| {
+            super::super::probed(&format!("{probe}-preview"), ui.add(egui::Label::new(RichText::new(text).size(11.5)).wrap()));
+            if let Some(x) = extra {
+                ui.add(egui::Label::new(RichText::new(x).size(11.0).color(theme::INK_DIM)).wrap());
+            }
+            ui.horizontal(|ui| {
+                let why = if sampling { Some("a sampling pass is running — forget once it is done") } else if n == 0 { Some("nothing in the fit to forget") } else { None };
+                let r = super::super::probed(&format!("{probe}-confirm"), ui.add_enabled(why.is_none(), egui::Button::new(RichText::new(format!("Forget {n}")).strong())));
+                let r = match why {
+                    Some(w) => r.on_disabled_hover_text(w),
+                    None => r.on_hover_text("held out of the fit until restored, written at once; one refit follows (10 s after your last change, or Refit now)"),
+                };
+                if r.clicked() {
+                    acts.push(Action::ForgetByRule(rule.clone(), n));
+                    open = false;
+                }
+                if super::super::probed(&format!("{probe}-cancel"), ui.button("Cancel")).clicked() {
+                    open = false;
+                }
+            });
+        });
+    open
+}
+
+/// "Forget all above [x]× (N)" under the Worst-fitting ranking (2026-11-16): x a number field
+/// (5.0 by default), N the samples in the fit whose leave-one-out ratio is above it (the knowledge
+/// map's molecules, `sim::knowledge::ForgetPreview`); the button opens the inline confirmation
+/// with the preview and [`FORGET_ABOVE_NOTE`].
+fn forget_above(ui: &mut Ui, st: &mut UiState, m: &ModelStatus, sampling: bool, acts: &mut Vec<Action>) {
+    let Some(map) = st.activity.knowledge.clone() else { return };
+    let rule = sim::knowledge::ForgetRule::Above(st.forget_rule.above);
+    let p = sim::knowledge::ForgetPreview::of(&map.molecules, &rule);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Forget all above").size(11.5));
+        let r = super::super::probed("forget-above-value", ui.add(egui::DragValue::new(&mut st.forget_rule.above).range(0.0..=1e6).speed(0.1).max_decimals(1).suffix("×")));
+        if r.changed() {
+            st.forget_rule.above_confirm = false;
+        }
+        let b = egui::Button::new(format!("Forget ({})…", p.total));
+        let r = super::super::probed("forget-above", ui.add_enabled(p.total > 0 && !st.forget_rule.above_confirm, b))
+            .on_hover_text("forget every sample in the fit whose leave-one-out ratio is above this: a preview, then an inline confirmation")
+            .on_disabled_hover_text("no sample in the fit is above it");
+        if r.clicked() {
+            st.forget_rule.above_confirm = true;
+        }
+    });
+    if st.forget_rule.above_confirm {
+        let text = forget_preview_text(&p, m.quarantined + m.forgotten, m.samples);
+        st.forget_rule.above_confirm = rule_confirm(ui, &text, Some(FORGET_ABOVE_NOTE), &rule, p.total, sampling, "forget-above", acts);
+    }
+}
+
+/// "Forget samples…" (2026-11-16): a fold with one filter at a time — contains element, exact
+/// composition, from scene — each value chosen from what the stored samples hold (the knowledge
+/// map's molecules), the preview line ([`forget_preview_text`]) and **Forget…**, which opens the
+/// inline confirmation emitting `Action::ForgetByRule`. Without a knowledge map yet it says so.
+fn forget_tool(ui: &mut Ui, st: &mut UiState, m: &ModelStatus, sampling: bool, acts: &mut Vec<Action>) {
+    ui.add_space(4.0);
+    let label = if st.forget_rule.open { "Forget samples… ▾" } else { "Forget samples…" };
+    if super::super::probed("forget-rule-open", ui.small_button(label)).on_hover_text(FORGET_TOOL_TIP).clicked() {
+        st.forget_rule.open = !st.forget_rule.open;
+        st.forget_rule.confirm = false;
+    }
+    if !st.forget_rule.open {
+        return;
+    }
+    let Some(map) = st.activity.knowledge.clone() else {
+        ui.weak("the stored samples are listed once the knowledge map is built (after the fit)");
+        return;
+    };
+    let mols = &map.molecules;
+    ui.horizontal_wrapped(|ui| {
+        for (k, word, probe) in [(RuleKind::Element, "contains element", "forget-rule-kind-element"), (RuleKind::Composition, "exact composition", "forget-rule-kind-composition"), (RuleKind::Scene, "from scene", "forget-rule-kind-scene")] {
+            if super::super::probed(probe, ui.selectable_label(st.forget_rule.kind == k, word)).clicked() && st.forget_rule.kind != k {
+                st.forget_rule.kind = k;
+                st.forget_rule.confirm = false;
+            }
+        }
+    });
+    let before = st.forget_rule.clone();
+    match st.forget_rule.kind {
+        RuleKind::Element => {
+            let mut species: Vec<u8> = mols.iter().flat_map(|m| m.composition.species()).collect();
+            species.sort_unstable();
+            species.dedup();
+            let shown = st.forget_rule.element.map_or("pick an element".to_string(), |z| render::elements::symbol(z).to_string());
+            egui::ComboBox::from_id_salt("forget-rule-element").selected_text(shown).show_ui(ui, |ui| {
+                for z in species {
+                    ui.selectable_value(&mut st.forget_rule.element, Some(z), render::elements::symbol(z));
+                }
+            });
+        }
+        RuleKind::Composition => {
+            let shown = st.forget_rule.composition.as_ref().map_or("pick a composition".to_string(), composition_words);
+            egui::ComboBox::from_id_salt("forget-rule-composition").selected_text(shown).show_ui(ui, |ui| {
+                for mk in mols.iter() {
+                    let words = format!("{} ({} in the fit)", composition_words(&mk.composition), mk.open());
+                    ui.selectable_value(&mut st.forget_rule.composition, Some(mk.composition.clone()), words);
+                }
+            });
+        }
+        RuleKind::Scene => {
+            let mut scenes: Vec<String> = mols.iter().flat_map(|m| m.scenes.iter().map(|s| s.name.clone())).collect();
+            scenes.sort();
+            scenes.dedup();
+            let shown = st.forget_rule.scene.as_deref().map_or("pick a scene".to_string(), scene_words);
+            egui::ComboBox::from_id_salt("forget-rule-scene").selected_text(shown).show_ui(ui, |ui| {
+                for name in scenes {
+                    let words = scene_words(&name);
+                    ui.selectable_value(&mut st.forget_rule.scene, Some(name), words);
+                }
+            });
+        }
+    }
+    if st.forget_rule != before {
+        st.forget_rule.confirm = false;
+    }
+    let Some(rule) = st.forget_rule.rule() else { return };
+    let p = sim::knowledge::ForgetPreview::of(mols, &rule);
+    let text = forget_preview_text(&p, m.quarantined + m.forgotten, m.samples);
+    if st.forget_rule.confirm {
+        st.forget_rule.confirm = rule_confirm(ui, &text, None, &rule, p.total, sampling, "forget-rule", acts);
+    } else {
+        ui.horizontal_wrapped(|ui| {
+            ui.add(egui::Label::new(RichText::new(&text).size(11.5).color(theme::INK_DIM)).wrap());
+            if super::super::probed("forget-rule-go", ui.add_enabled(p.total > 0, egui::Button::new(format!("Forget {}…", p.total)))).on_disabled_hover_text("nothing in the fit matches").clicked() {
+                st.forget_rule.confirm = true;
+            }
+        });
     }
 }
 

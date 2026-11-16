@@ -1232,6 +1232,16 @@ pub trait Trainable {
     fn restore_samples(&mut self, ids: &[SampleId]) -> Result<(), String> {
         ids.iter().try_for_each(|&id| self.restore_sample(id))
     }
+    /// **Forgets by rule** (2026-11-16, the Model tab's "Forget samples…" and "Forget all above
+    /// x×"): every stored sample in the fit's codes that `rule` matches (`crate::knowledge`,
+    /// "Molecules": resolved against the stored samples now), forgotten as one batch as
+    /// [`forget_samples`](Self::forget_samples). `expected` is the count the user confirmed: a
+    /// different count now is refused ("the samples changed"), and so is a rule that matches
+    /// nothing in the fit. `Ok` with the count forgotten; `Err` with the reason, nothing changed.
+    /// The default: unsupported.
+    fn forget_by_rule(&mut self, _rule: &crate::knowledge::ForgetRule, _expected: usize) -> Result<usize, String> {
+        Err("this provider does not learn".into())
+    }
     /// The user's Forget / Restore changes no fit holds yet (2026-11-14): made since the fit that
     /// stands, or — while a background refit runs — since it started. Each made a refit due; the
     /// worker debounces that refit and the Model tab counts them. The default: 0.

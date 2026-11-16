@@ -1260,5 +1260,6 @@ pub(crate) fn fixture_map() -> KnowledgeMap {
         slug: "lsda-h0.15-s0.15-tol1e-6-gpu-accepted-3f9a".into(),
         samples: 2140,
         r_cut: 6.0,
+        molecules: Vec::new(),
     }
 }
