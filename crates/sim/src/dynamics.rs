@@ -284,8 +284,8 @@
 //! teacher solve of the pass starts; the solve in flight is abandoned by the worker's
 //! `should_abort` (the job stays queued — the same path as any interrupted solve — and is solved
 //! afresh after the pause). The pass keeps its queue, progress, samples, references and burst; it
-//! is still *active* — Play, Step, Relax and another pass are refused (with "paused" in the
-//! reason), LoadModel too, edits are accepted as during a running pass, and nothing that waits for
+//! is still *active* — Play, Step, Relax, another pass (StartSampling, ResumeSampling,
+//! StartTeaching, RetryFit) and LoadModel are refused, each with "paused" in the reason —, edits are accepted as during a running pass, and nothing that waits for
 //! a pass to end (the bond references, the idle orbital retry) starts. The snapshot's
 //! `sampling.paused` says so. `ContinueSampling` goes on from the queue at the next tick. Both note
 //! the sample the pass stands at; both are no-ops when there is nothing to change. Cancel, Forget,
@@ -2008,6 +2008,16 @@ impl Dynamics {
         self.ghost = self.provider.as_trainable().and_then(|t| t.pass_ghost());
     }
 
+    /// Why another pass cannot start now (a pass is active): "paused" when the user paused it
+    /// (module doc, "Pausing a pass").
+    fn pass_busy(&self) -> &'static str {
+        if self.pass_paused {
+            "a pass is paused (resume or cancel it first)"
+        } else {
+            "a pass is already running (cancel it first)"
+        }
+    }
+
     /// A sampling pass is running in the provider.
     fn pass_active(&mut self) -> bool {
         self.provider.as_trainable().is_some_and(|t| t.pass_active())
@@ -2029,7 +2039,7 @@ impl Dynamics {
             return self.reject(crate::sampling::EMPTY_SCENE.into());
         }
         if t.pass_active() {
-            return self.reject("start sampling: a pass is already running (cancel it first)".into());
+            return self.reject(format!("start sampling: {}", self.pass_busy()));
         }
         // the driver's references seed the pass (a species solved here costs the pass no solve)
         if let Err(e) = t.start_pass(&self.scene, &plan, &mut self.refs) {
@@ -2054,7 +2064,7 @@ impl Dynamics {
             return self.reject(crate::sampling::EMPTY_SCENE.into());
         }
         if t.pass_active() {
-            return self.reject("resume the interrupted training: a pass is already running (cancel it first)".into());
+            return self.reject(format!("resume the interrupted training: {}", self.pass_busy()));
         }
         if let Err(e) = t.resume_pass(&self.scene, checkpoint, &mut self.refs) {
             self.take_provider_notes();
@@ -2079,7 +2089,7 @@ impl Dynamics {
             return self.reject(crate::sampling::EMPTY_SCENE.into());
         }
         if t.pass_active() {
-            return self.reject("teach around the blockers: a pass is already running (cancel it first)".into());
+            return self.reject(format!("teach around the blockers: {}", self.pass_busy()));
         }
         if let Err(e) = t.start_teach(&self.scene) {
             return self.reject(format!("teach around the blockers: {e}"));
@@ -2100,7 +2110,7 @@ impl Dynamics {
             return self.no_surrogate("retry the fit");
         };
         if t.pass_active() {
-            return self.reject("retry the fit: a pass is already running (cancel it first)".into());
+            return self.reject(format!("retry the fit: {}", self.pass_busy()));
         }
         match t.retry_fit(&self.scene, &mut self.refs) {
             Ok(true) => {
@@ -2235,7 +2245,8 @@ impl Dynamics {
     fn load_model(&mut self, path: PathBuf) {
         let Some(t) = self.provider.as_trainable() else { return self.no_surrogate("load model") };
         if t.pass_active() {
-            return self.reject("load model: cancel the running sampling pass first".into());
+            let which = if self.pass_paused { "paused" } else { "running" };
+            return self.reject(format!("load model: cancel the {which} sampling pass first"));
         }
         let loaded = t.load(&path, &self.scene);
         if loaded.is_ok() {

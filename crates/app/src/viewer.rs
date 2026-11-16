@@ -1688,11 +1688,12 @@ impl Viewer {
                 if let Some(note) = self.bond_exp.note.take() {
                     self.ui.log.push(ui::logbook::LogKind::Warning, note);
                 }
-                // a paused pass that ended without its Cancel (a new scene) left its checkpoint as an
-                // interrupted pass: the Model tab offers it now (a Cancel removed it: no offer)
-                let paused_pass_ended = self.snapshot.as_ref().is_some_and(|p| crate::sim::pass_paused(&p.dynamics)) && !crate::sim::sampling_active(&s.dynamics);
+                // a pass ended: whatever the folder holds now is offered — a paused pass ended by a new
+                // scene left its checkpoint as an interrupted pass; a finished or cancelled one
+                // removed its files (no offer)
+                let pass_ended = self.snapshot.as_ref().is_some_and(|p| crate::sim::sampling_active(&p.dynamics)) && !crate::sim::sampling_active(&s.dynamics);
                 self.snapshot = Some(*s);
-                if paused_pass_ended {
+                if pass_ended {
                     self.refresh_resume_offer();
                 }
                 self.record_trails();

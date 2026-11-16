@@ -166,9 +166,13 @@
 //! `step` retries it. [`run_sampling`] is the convenience loop over it. Neither refits — the
 //! caller does (a partial pass refits like a full one). A pass the user **paused** (`sim::Dynamics`,
 //! "Pausing a pass") is nothing more than a sampler no one steps: the solve in flight comes back
-//! `Cancelled` and stays queued, and the next `step` after the pause solves it — the same jobs, the
-//! same geometries and the same samples as without the pause (test
-//! `a_paused_pass_solves_nothing_and_resumes_to_the_unpaused_samples`).
+//! `Cancelled` and stays queued, and the next `step` after the pause solves it: the same jobs at
+//! the same geometries as without the pause. With an exact teacher the samples are bit-equal (test
+//! `a_paused_pass_solves_nothing_and_resumes_to_the_unpaused_samples`, a synthetic Morse teacher);
+//! with real DFT the re-solved job starts from another warm state (the abandoned solve's parked
+//! density, a live evaluation in between), so its energy and forces agree with an unpaused run's
+//! only to the SCF tolerance, and the hot burst's later geometries — which follow from those
+//! forces — can differ at that level (rule 7).
 //!
 //! # Checkpoints
 //!

@@ -75,7 +75,7 @@ pub struct JobRow {
 }
 
 /// The pass card's Pause hover.
-pub const PAUSE_PASS_TIP: &str = "pause the pass where it stands: the solve in progress is dropped (it is solved again on Resume) and nothing more is solved; the samples, the queue and its place are kept, and written to disk, so closing the app or switching scene keeps it resumable from the Model tab. The dynamics stay paused";
+pub const PAUSE_PASS_TIP: &str = "pause the pass where it stands: the solve in progress is dropped (it is solved again on Resume) and nothing more is solved; the samples, the queue and its place are kept. Once the pass has at least one sample its place is also written to disk, so closing the app or switching scene keeps it resumable from the Model tab; a pause before that (the reference stage) holds only while the app stays open. The GPU is idle; the dynamics stay paused until you continue or cancel the pass";
 /// The paused pass card's Resume hover.
 pub const RESUME_PASS_TIP: &str = "go on with the pass from where it was paused (the solve that was dropped is solved first)";
 

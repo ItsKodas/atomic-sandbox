@@ -436,9 +436,8 @@ impl Worker {
         match c {
             Command::SetScene(s) => match s.to_sim() {
                 Ok(mut new) => {
-                    let snap = self.dy.snapshot();
-                    new.external_field = snap.scene.external_field;
-                    let was_paused = pass_paused(&snap);
+                    new.external_field = self.dy.snapshot().scene.external_field;
+                    let was_paused = self.before_scene_change();
                     self.dy.apply(DynCommand::Pause);
                     self.dy.apply(DynCommand::ReplaceScene(new));
                     self.set_aside_paused_pass(was_paused);
@@ -585,7 +584,7 @@ impl Worker {
     /// Pause, then replace the scene by the driver's current one with `f` applied: a new run
     /// (`worker::activity`, "Runs").
     pub(super) fn replace(&mut self, f: impl FnOnce(&mut sim::Scene)) {
-        let was_paused = pass_paused(&self.dy.snapshot());
+        let was_paused = self.before_scene_change();
         self.dy.apply(DynCommand::Pause);
         let mut s = self.dy.snapshot().scene;
         f(&mut s);

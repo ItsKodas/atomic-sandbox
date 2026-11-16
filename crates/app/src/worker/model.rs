@@ -645,6 +645,12 @@ impl Worker {
         }
         let fitted = trainable(&mut self.dy).is_some_and(|s| s.fitted());
         if auto_pass && !fitted && !sampling_active(&self.dy.snapshot()) {
+            // an interrupted (or paused) pass on disk is the user's to resume or discard: a new
+            // pass would replace its files at its first checkpoint (review of 750bc82, item 1)
+            if self.checkpoints.as_ref().is_some_and(|ck| super::checkpoint::interrupted_pass(ck.dir()).is_some()) {
+                self.dy.add_note("no automatic sampling pass: an interrupted training pass is on disk — resume or discard it in the Model tab (a new pass would replace it)".into());
+                return;
+            }
             self.start_first_pass(plan);
         }
     }

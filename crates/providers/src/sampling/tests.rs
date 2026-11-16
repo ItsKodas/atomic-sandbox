@@ -2500,7 +2500,11 @@ fn paused_pass(plan: &SamplingPlan, pauses: &[usize], idle: usize) -> PassRun {
             let rej = d.snapshot().last_rejection.expect("Play is refused while a pass is paused");
             assert!(rej.contains("paused"), "{rej}");
             d.apply(DynCommand::StartSampling(plan.clone()));
-            assert!(d.snapshot().last_rejection.is_some(), "one pass at a time, paused or not");
+            let rej = d.snapshot().last_rejection.expect("one pass at a time, paused or not");
+            assert!(rej.contains("a pass is paused (resume or cancel it first)"), "{rej}");
+            d.apply(DynCommand::LoadModel(tmp("never-read.model")));
+            let rej = d.snapshot().last_rejection.expect("no load while a pass is paused");
+            assert!(rej.contains("cancel the paused sampling pass first"), "{rej}");
             for _ in 0..idle {
                 let s = d.tick(f64::INFINITY, &mut never());
                 let q = s.sampling.unwrap();

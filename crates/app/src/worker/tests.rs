@@ -3557,6 +3557,83 @@ fn a_paused_pass_is_checkpointed_at_the_pause_and_survives_a_scene_change() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A paused first pass survives a solver switch (review of 750bc82, item 1): the new estimated
+/// worker's `EnsureModel { auto_pass: true }` finds the interrupted pass on disk and starts no
+/// automatic pass, so the paused pass's files stay as they were — the Model tab offers them.
+/// Analytic teacher, seconds.
+#[test]
+fn a_solver_switch_starts_no_automatic_pass_over_a_paused_one() {
+    let dir = std::env::temp_dir().join(format!("atomic-sandbox-pause-switch-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let spawn = || {
+        SimWorker::spawn_test(
+            h2_33(),
+            Box::new(|| {
+                let teacher = ScriptedMorse { morse: sim::MorseDimer::h2(), script: Arc::new(std::sync::Mutex::new(VecDeque::new())), rest_s: 0.02 };
+                Box::new(SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(SAMPLE_TOL))
+            }),
+        )
+    };
+    let plan = SamplingPlan { perturbations: 90, hot_burst_steps: 10, scan_points_per_pair: 0, ..SamplingPlan::default() };
+    let w = spawn();
+    idle(&w);
+    w.send(Command::TrainingCheckpoints(Some(dir.clone())));
+    w.send(Command::EnsureModel { autoload: None, plan: plan.clone(), auto_pass: true });
+    snapshot_until(&w, "the first pass under way", |s| s.dynamics.sampling.as_ref().is_some_and(|p| !p.finished && p.done >= 10));
+    w.send(Command::Dyn(DynCommand::PauseSampling));
+    let s = snapshot_until(&w, "the paused pass", |s| pass_paused(&s.dynamics));
+    assert!(!model(&s).fitted, "the first pass has not fitted yet");
+    let (text, info) = interrupted_pass(&dir).expect("the paused pass is on disk");
+    // the solver switch: this worker goes, a new estimated one comes with the window's commands
+    assert!(w.retire(Duration::from_secs(10)));
+    let w = spawn();
+    w.send(Command::TrainingCheckpoints(Some(dir.clone())));
+    w.send(Command::EnsureModel { autoload: None, plan, auto_pass: true });
+    let s = idle(&w);
+    let s = if s.dynamics.notes.iter().any(|n| n.contains("no automatic sampling pass")) { s } else { snapshot_until(&w, "the note", |s| s.dynamics.notes.iter().any(|n| n.contains("no automatic sampling pass"))) };
+    assert!(!sampling_active(&s.dynamics), "no automatic pass over the interrupted one: {:?}", s.dynamics.sampling);
+    std::thread::sleep(Duration::from_millis(2500));
+    let (text2, info2) = interrupted_pass(&dir).expect("still on disk");
+    assert_eq!((info2.done, info2.total), (info.done, info.total));
+    assert_eq!(text2, text, "the paused pass's checkpoint is untouched");
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A Pause and a new scene in one go (review of 750bc82, item 4): the paused pass's checkpoint is
+/// the one it stands at when the scene changes — written before the pass ends if the pause's own
+/// round has not written it yet — not an older periodic one. Analytic teacher, seconds.
+#[test]
+fn a_pause_with_a_scene_change_keeps_the_pass_where_it_stood() {
+    let dir = std::env::temp_dir().join(format!("atomic-sandbox-pause-scene-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let w = SimWorker::spawn_test(
+        h2_33(),
+        Box::new(|| {
+            let teacher = ScriptedMorse { morse: sim::MorseDimer::h2(), script: Arc::new(std::sync::Mutex::new(VecDeque::new())), rest_s: 0.02 };
+            Box::new(SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(SAMPLE_TOL))
+        }),
+    );
+    idle(&w);
+    w.send(Command::TrainingCheckpoints(Some(dir.clone())));
+    w.send(Command::Dyn(DynCommand::StartSampling(SamplingPlan { perturbations: 90, hot_burst_steps: 10, scan_points_per_pair: 0, ..SamplingPlan::default() })));
+    snapshot_until(&w, "a first checkpoint", |_| interrupted_pass(&dir).is_some());
+    let first = interrupted_pass(&dir).unwrap().1.done;
+    snapshot_until(&w, "the pass past it", |s| s.dynamics.sampling.as_ref().is_some_and(|p| p.done >= first + 10));
+    let mut other = h2_33();
+    other.nuclei[0].pos[0] += 0.2;
+    w.send(Command::Dyn(DynCommand::PauseSampling));
+    w.send(Command::SetScene(other));
+    let s = snapshot_until(&w, "the pass ended by the new scene", |s| s.dynamics.sampling.as_ref().is_some_and(|p| p.finished));
+    let p = s.dynamics.sampling.clone().unwrap();
+    let (_, info) = interrupted_pass(&dir).expect("the paused pass's files are kept");
+    eprintln!("first checkpoint at {first}, paused and replaced at {}, kept checkpoint at {}", p.done, info.done);
+    assert_eq!(info.done, p.done, "the checkpoint is where the pass stood at the scene change");
+    assert!(s.dynamics.notes.iter().any(|n| n.contains("its checkpoint is kept")), "{:?}", s.dynamics.notes);
+    drop(w);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---- the shared collection (M8a Task 4b) ----
 
 /// [`ScriptedMorse`] reporting what a Kohn-Sham solve reports for a collection to judge an answer:

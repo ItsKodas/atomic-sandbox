@@ -35,6 +35,8 @@
 //!   their median wall time (never below what trust needs; M6 Task 9: [`pass_resize`],
 //!   `Trainable::rescale_pass`), or — when even that floor exceeds the target at the scene's cold
 //!   evaluation — nothing and a [`PassOffer`] for the panel's "Start anyway" ([`first_pass`]).
+//!   No automatic pass starts while an interrupted (or paused) pass is on disk in the checkpoint
+//!   folder: it would replace those files; the Model tab offers to resume or discard them.
 //!   While a pass runs, [`ModelStatus::pass_eta_s`] is its time
 //!   left at its measured rate. A refused autoload (another provenance) starts nothing: the
 //!   panel offers to forget it. Playing while no model exists (an offer waiting, a refused
@@ -1012,11 +1014,16 @@ impl Worker {
         // a background refit in flight is work: the view shows it until the new model stands
         self.set_busy(will_work || self.refit_started.is_some());
         let t0 = Instant::now();
-        let mut snap = self
-            .dy
-            .tick(TICK_BUDGET_MS, &mut || inbox.abort_pending());
+        // whether a queued command cut the tick short (a Pause, PauseSampling, an edit …)
+        let mut aborted = false;
+        let mut snap = self.dy.tick(TICK_BUDGET_MS, &mut || {
+            let a = inbox.abort_pending();
+            aborted |= a;
+            a
+        });
         let tick_s = t0.elapsed().as_secs_f64();
-        self.size_pass(&mut snap, done_before, tick_s, pass_only);
+        // a tick cut short by an abort times an abandoned solve too: it does not size the pass
+        self.size_pass(&mut snap, done_before, tick_s, pass_only && !aborted);
         // pacing (module doc): a playing tick that ran all its steps early waits out the budget.
         // The deadlines follow a fixed 16 ms schedule rather than "start + 16 ms": a sleep that
         // overshoots (Windows timers tick at ~15.6 ms) is made up by not waiting next time, so the

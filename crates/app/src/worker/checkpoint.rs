@@ -17,8 +17,8 @@
 //! (the abandoned solve's job is back in its queue). Nothing is written while it stays paused.
 //! Cancel while paused removes the files as any Cancel does. A new scene while paused (a preset, a
 //! loaded scene, a charge, grid, σ or ionic change: `ReplaceScene`) ends the pass in the driver as
-//! it would a running one, but its files are **kept** — the worker lets go of them
-//! ([`Worker::set_aside_paused_pass`]) — so the pass is an interrupted one, which the Model tab
+//! it would a running one, but its files are **kept** — written first if the pause came in the same
+//! batch ([`Worker::before_scene_change`]), then let go of ([`Worker::set_aside_paused_pass`]) — so the pass is an interrupted one, which the Model tab
 //! offers to resume on its own scene; a solver switch or a shutdown keeps them as before.
 //!
 //! # Collection mode (M8a Task 4b; Task 4a review concern 6)
@@ -155,6 +155,20 @@ impl Worker {
         std::fs::rename(tmp(&model), &model).map_err(|e| format!("{}: {e}", model.display()))?;
         std::fs::rename(tmp(&ckpt), &ckpt).map_err(|e| format!("{}: {e}", ckpt.display()))?;
         Ok(true)
+    }
+
+    /// Before a scene replacement (module doc, "Paused passes"): whether the pass is paused, and —
+    /// when its pause is not checkpointed yet (the Pause arrived in the same batch as the new scene)
+    /// — its checkpoint written now, while the pass still exists.
+    pub(super) fn before_scene_change(&mut self) -> bool {
+        let snap = self.dy.snapshot();
+        if !pass_paused(&snap) {
+            return false;
+        }
+        if self.checkpoints.as_ref().is_some_and(|ck| !ck.pause_written) {
+            self.checkpoint_round(&snap);
+        }
+        true
     }
 
     /// A scene replacement ended a paused pass (module doc, "Paused passes"): its files, written
