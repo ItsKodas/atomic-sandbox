@@ -4888,3 +4888,30 @@ Means are f64 Neumaier sums. **Split** (a display split): "near the bond length"
 Three processes: H₂O 997 s (the 60-solve sampling pass 528 s at 97³; 60 SCF re-solves at 4–9 s, 20 Harris 0.5–1.0 s, the O reference 28 s), the H₂ scan 90 s, H₂ + H 75 s. The H₂O set exceeds the 15-minute GPU batch on its own: run it alone, with a cool-down after.
 
 **Suite time:** 2026-11-15: V-A1 87 s, V-A2 116 s, V-A3 97 s (2026-11-14: 126 / 150 / 126 s) as three processes (each regenerates the H pseudopotential, ≈ 75–85 s); one `cargo test -p validate --release --test harris` process would generate it once, ≈ 5 min (an estimate from the three runs; measured 2026-11-16 as one process with V-A4 added: 640 s).
+
+## Refit speed-up (2026-11-17; branch `refit-speed`; `providers` `surrogate::tests::refit_profile` and `refit_golden`, `#[ignore]`d; release, Ryzen 7 9800X3D, 12 fit threads, another worktree's `oracles` suite running throughout — both columns measured back to back under the same load)
+
+A read-only copy of the user's BEST collection: 1 588 samples, H/O/P, body-3 + body-4, Q′ 2 460 at the recovery's degree cap 6 (1 902 without it). Four changes, each committed alone:
+1. **Spectral search on faer** (`surrogate::dense`, faer `=0.24.4`, MIT): `solve_large`'s Cholesky and SPD inverse and `spectrum`'s Householder reduction with Qᵀc, blocked and threaded (a fixed split of 16, so the same numbers on any thread count); our QL on the tridiagonal.
+2. **Active set**: a body-4 basis's span from faer's reduction + our QL per unreduced block + faer's back-transformation instead of Jacobi (faer's own tridiagonal QR did not converge on a graded 37×37 block of the O species); the Gram, projection and MaxVol scan threaded with the serial bits. An eigenvalue within δ = √P·ε‖G‖₂ above τ counts null.
+3. **`NullSpace::of` deferred** to the fit that stands (`null_space_pending`, `ensure_null_space`), like the class pass and the active set.
+4. **Leave-one-out by forward substitutions only** (`loo::forward_many`, the sample's m right-hand sides in one pass over L).
+
+**Wall (s), before → after:**
+
+| stage | cold refit (attach) | append-20 refit | misfit recovery (energy tier ÷ 3) |
+|---|---|---|---|
+| **whole refit** | **89.4 → 13.1 (6.8×)** | **98.0 → 15.2 (6.4×)** | **188.5 → 31.3 (6.0×)** |
+| spectral search | 36.6 → 4.55 (8.0×), 2 searches | 38.1 → 4.53 (8.4×), 2 | 114.8 → 19.9 (5.8×), 11 |
+| · spectrum (tridiag + QL) | 22.4 → 2.29, 12→13 calls | 23.6 → 2.29, 12 | 64.6 → 10.0, 67→69 |
+| · solve_large (Cholesky + inverse) | 13.5 → 1.66, 14→15 calls | 13.9 → 1.60, 14 | 47.4 → 7.29, 78→80 |
+| `NullSpace::of` | 8.1 (2 calls) → 5.8 (1) | 15.0 (3) → 5.7 (1) | 27.2 (11) → 2.3 (1) |
+| active set (rule 5e) | 37.0 → 0.81 (46×) | 28.2 → 0.72 (39×) | 10.4 → 0.71 (15×) |
+| leave-one-out passes | 6.7 → 1.02 (6.6×) | 14.4 → 2.0 (7.2×) | 26.0 → 3.9 (6.7×) |
+
+The second refit with nothing new: 192.6 → 10.6 s. What is left: `NullSpace::of` (our single-threaded Householder–QL with eigenvectors, kept bit for bit by change 3) is now 40 % of a cold refit; moving it to `dense::symmetric_eigen` would take ≈ 5.5 s off, with the τ-band question of change 2 for rule 5d — not done.
+
+**Equivalence** (`refit_golden`: hyperparameters, predictions and variances at 398 fixed geometries — every 8th collection sample as stored and displaced ±0.04 Bohr —, every sample's quarantine code, the class and key verdicts, M, the LOO ratios and statistics, the active sets, the null space, the grade and the novelty ν at the probes, and the `would_answer` verdict at all 1 194 probes of the three cases):
+- **Identical in every case:** every quarantine code, every class and key verdict, M (empty in all three), the trust verdict, the recovery's outcome and note, the null space (dimension 2 265 / 1 725; τ and ν bit for bit), every `would_answer` verdict, the active-set ranks (194, 27, 48 at Q′ 2 460; 169, 24, 43 at 1 902).
+- **Per change, against a golden recorded just before it:** change 3 — 0 difference in every number; change 4 — LOO numbers within 9.7e-9 (cold), 2.7e-9 (append), 1.5e-9 (recovery), all else bit for bit.
+- **Changes 1–2, not within 1e-9:** λ, σ_E, σ_F within 9.4e-5 (cold), 2.1e-4 (append), 5.2e-4 (recovery) relative; predictions and stds within 3.4e-3; LOO numbers within 2.0e-3; grades within 2.0e-4; the recovery case's last search took 6 rounds instead of 5; in the append case MaxVol's greedy start took one other H row (2017 for 2068) of 194. Why: the search resolves the hyperparameters only to its own tests (1e-3 relative stopping, 1.5e-4 in ln λ for the golden section; ln p carries ~5e-6 of rounding, `fit` module doc), and κ₂(A) = 1.2–1.4e13 here, so two backward-stable factorisations of the same A give means that differ by up to κε ≈ 3e-3 — the earlier kernels' answer is one draw from that spread, not a sharper one. Grades: τ sits in no spectral gap on this collection (nearest eigenvalues at 1.055τ and 0.89τ for H, measured by `refit_golden::active_span_margins`; Jacobi and faer agree on them to ≤ 1.0e-3·τ), so the kept span is determined only to ε‖G‖/gap ≈ 1e-4 by rounding, whatever the solver.
