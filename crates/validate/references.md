@@ -5463,6 +5463,64 @@ behaviour. **Fix rounds 1–2** (review I1), assertions unchanged:
   pre-existing: a warm call whose head boundary newly cuts a τ-set (no growth) can still spend one capped solve before
   the post-solve raise.
 
+### V5: dynamics on Fermi–Dirac (plan 2026-11-13 Task 11; `tests/dynamics.rs`; spec §9 "V5 new tests", ruling R10)
+
+**Sign convention (ruling R10).** The forces are F_I = −∂F/∂R_I (`qm::forces` module doc), so the work the forces do
+along a path, W = ∫F·dR, satisfies ΔF + W = 0, and ΔE + W = ΔE − ΔF = Δ(TS). The spec's "W = −∫F_HF·dx" written with
+"|W + ΔF|" is inconsistent; the tests use W = +∫F·dx (the work the forces do), the same physics as `branch_jump`'s
+|ΔF − (−∫F·dR)|.
+
+#### Step 1: the NVE case measured and its bounds pre-registered (2026-11-17, release, RX 7900 XTX; written before the NVE test existed)
+
+Measured by `v5_co2_plus_cost_and_path_scatter` (`#[ignore]`d; `-- --ignored --nocapture v5_co2_plus`). CO₂⁺ (charge
++1, auto doublet, `Accepted`: pseudised C and O), 71³ × 0.20, C on the origin node, O at (∓R sin 55°, −R cos 55°, 0),
+R = 2.226, β = 70°, at rest; `GpuKs` asked for 1e-6, every solve stopped at `GPU_PARTIAL_TOL` = 1e-5 (`scf_tol_used`).
+
+| quantity | value |
+|---|---|
+| cold start | F −37.886924954, E −37.886411159, TS 5.1379e-4 Ha (A1: 0.514 mHa); 28 SCF steps, 37.8 s (incl. the first table load); face 4.3e-7 (rule `box_affected_face_density(0.20)` 1.28e-5); ↓ π pair f 0.99121 / 0.00879 |
+| warm − cold at the start, from a cold neighbour bent by δβ = +0.5°, −0.5°, +1°, −1°, +2° | F +3.9e-7, +5.9e-7, +1.06e-6, +1.60e-6, +2.15e-6 Ha (E within 1.4e-8 of F's); max force component 6.3e-6 … 1.31e-5 Ha/Bohr; warm 15–27 SCF steps |
+| **σ_path** (largest \|F_warm − F_cold\| of the 5, rounded up to two digits, as the `branch_jump` tiers are) | **2.2e-6 Ha** (RMS 1.33e-6); force σ_F = **1.31e-5 Ha/Bohr** (largest component) |
+| warm Verlet step (first 20 from rest, dt = 0.25 fs) | **1.35 s mean** (max 1.62), 8–15 SCF steps, 0 `branch_jump` flags; 600 steps ≈ 13.5 min, inside one 15-min GPU batch, so **no checkpointed split** |
+
+The warm − cold differences are all positive (the 1e-5 stop ends warm solves slightly above the cold one) and grow with
+the neighbour's distance: the stop's own error, ≤ 1.7 µHa in V0's measurement, not f32 noise.
+
+**Step count: `CO2_NVE_STEPS` = 600 = 150 fs ≥ 2 bend periods.** The harmonic bend period is 2π/ω_b = 2691 a.u. = 260
+steps (A1: ω_b = 2.335e-3 a.u.); the 70° amplitude stiffens the bend (F(70°) − F(0) = 98.75 mHa against ½k_ββ² = 80 mHa),
+so the period is shorter and 600 steps hold ≥ 2.3 periods. The test measures the period from the zero crossings of the
+signed bend coordinate and asserts the run covers ≥ 2 periods (a design guard on this count).
+
+**Fluctuation bound (pre-registered), `nve_energy_drift_is_bounded`'s rule**: FLUCT_MARGIN × (h_b²/4·E_mode + 2σ_path)
+with h_b = ω_b·dt = 2.335e-3 × 10.335 = 0.02413, E_mode = F(70°) − F(0°) = 98.75 mHa (A1), h_b²/4·E_mode = 1.438e-5 Ha:
+**3 × (1.438e-5 + 2 × 2.2e-6) = 5.6e-5 Ha**, on the peak-to-peak residual of F + K about its least-squares line. Not
+scaled per atom. The raw peak to peak is reported.
+
+**What I expect it to measure (a prediction, recorded before the run; not the bound).** h²/4·E_mode is exact for a
+harmonic mode. The shadow Hamiltonian of velocity Verlet, H̃ = H + dt²[(1/12)V″(M⁻¹p, M⁻¹p) − (1/24)∇V·M⁻¹∇V] + O(dt⁴)
+(Hairer, Lubich & Wanner, *Geometric Numerical Integration*, 2nd ed., §IX.8), gives H − H̃ = +dt²/24·∇V·M⁻¹∇V at a
+turning point and −(h²/6)·K at the linear crossing (h²/12 + h²/6 = h²/4 for a harmonic mode). On this anharmonic bend the
+turning-point term is h²V′(70°)²/(24k_β)·(G_ββ(110°)/G_ββ(180°)) = 5.82e-4 × 0.2207²/(24 × 0.1073) × 0.76 = 8.4e-6 and the
+crossing term h²/6 × 98.75 mHa = 9.6e-6, i.e. ≈ 1.8e-5 for the bend; the symmetric stretch, which the bent start feeds,
+adds h_s²/4·E_s ≈ 5.6e-6 (A1). So the Verlet swing is ≈ 2.4e-5 rather than 1.44e-5, and with the white per-solve noise
+(RMS ≈ 1.3e-6 Ha, ≈ 6σ peak to peak over 600 samples ≈ 8e-6) I expect a detrended peak to peak of ≈ 3e-5, 1.7× under
+the bound. The bound stays the brief's formula; the gap between 1.44e-5 and ≈ 2.4e-5 is recorded here, not absorbed.
+
+**Drift bound: `DRIFT_BOUND` = 2e-4 Ha/ps (the suite's), with this trajectory's budget by the suite's method.**
+- Force scatter: δW ≈ σ_F·‖ΔR‖ per step, random-walking. ‖v‖² = Σ v_i² ≤ 2K/m_C with K ≤ E_mode + the stretch's 5.8 mHa =
+  0.105 Ha, so ‖v‖ ≤ 3.1e-3 Bohr/a.u. and ‖ΔR‖ ≤ 0.032 Bohr per step. δW ≤ 1.31e-5 × 0.032 = 4.2e-7 Ha per step, so
+  √600 × 4.2e-7 = 1.0e-5 Ha over 0.15 ps: **≤ 6.9e-5 Ha/ps** apparent (≈ 4.9e-5 at the RMS speed).
+- The Verlet swing leaking into the slope: F + K oscillates at 2ω_b with amplitude a ≤ ½ × 2.4e-5. The least-squares
+  slope of a sin(ωt + φ) over a window T is at most 24a|sin x − x cos x|/(ω²T³), x = ωT/2; with ω = 2ω_b = 4.67e-3,
+  T = 6201 a.u. (x = 14.5): ≤ 7.2e-5·a per a.u. = **3.5e-5 Ha/ps**. (At 300 steps it would be 8× larger: the spec's
+  reason for ≥ 2 periods.)
+- Sum ≤ 1.0e-4 Ha/ps; `DRIFT_BOUND` is 1.9× above it and is kept. A systematic SCF-lag heating or cooling at the 1e-5
+  stop is not in the budget: it is what the drift assertion detects.
+
+**Other assertions (spec §9 V5 2, brief):** max TS − min TS ≥ 1e-3 Ha along the run (A1: 0.514 → 6.931 mHa at each
+linear crossing); the face density ≤ `box_affected_face_density(0.20)` = 1.28e-5 at every step (A1: ≤ 1.1e-6). The
+`branch_jump` flag count (expected 0) and the largest m/b over the run are recorded (Task 8 amendment I1), not asserted.
+
 ## Live orbitals (Harris display; spec 2026-11-14)
 
 `tests/harris.rs` (spec `docs/superpowers/specs/2026-11-14-live-orbitals-design.md` §7, V-A1–V-A3; V-A4, a record for §9 Q2, below). First measured 2026-11-14; **re-measured 2026-11-15 after the Harris LOBPCG change of task 8b** (the stop test reads the displayed levels at the SCF's tol, the guards at τ_c/100, the top level a buffer — `qm_gpu::harris` "Three roles"): the tables below are the 2026-11-15 numbers, with the 2026-11-14 ones where they changed. **Re-run 2026-11-16 after task 8b fix 1** (the block memory keeps the last call's need, not the split it ran with; the record's last vector tested, under a buffer, when it can change the shown rows — `qm_gpu::harris` "The record's edge"; the at-cap note prints the displayed and guard tiers' residuals): every gate passes, the changes are noted where they occur. Release, RX 7900 XTX (Vulkan) / Ryzen 7 9800X3D, BelowNormal, the user's app open (the GPU shared with an idle window), each test its own invocation (`--test harris va1`, `va2`, `va3`) with a 3-minute cool-down between them. All cases: σ = h = 0.15 Bohr (the app's Accurate grid), ionic `Accepted` (the app default: H, N and O pseudised; `DegenerateShells` occupations), SCF tol 1e-6 (the floor-aware GPU tol, `effective_gpu_tol`, stays 1e-6 for N ≤ 8), cold SCF on a fresh `GpuSolver`, then `GpuSolver::harris` on the same solver with a new `HarrisState` (m = 0).

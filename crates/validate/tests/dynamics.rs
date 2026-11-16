@@ -110,7 +110,7 @@
 //! The GPU work of concurrently running tests is serialised through `GPU`, one evaluation at a
 //! time, so the per-solve times in the timing rows are uncontended while the tests interleave.
 use gpu::GpuContext;
-use sim::{DynCommand, Dynamics, Integrator, Nucleus, Scene};
+use sim::{DynCommand, Dynamics, ForceProvider, Integrator, Nucleus, Scene};
 use std::fmt::Write as _;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -552,4 +552,96 @@ fn rewind_retraces_on_the_gpu() {
     record(&ctx, timing_row("rewind", "H₂", N_H2, TOL_H2, &log, t_test.elapsed(), &format!("max Δr = {dr:.1e} Bohr")));
     assert!(far > 0.02, "test assumption: the molecule moved ({far})");
     assert!(dr <= REWIND_BOUND, "rewind missed the start by {dr:.3e} Bohr (bound {REWIND_BOUND:.0e})");
+}
+
+// ---- V5: Fermi–Dirac NVE through the TS swing (spec 2026-11-13 §9 "V5 new tests" 2; plan Task 11) ----
+/// CO₂⁺'s grid (A1 note §2.3): 71³ × 0.20 = a 14 Bohr box, h_req of pseudo-O; the origin is a grid node.
+const CO2_N: usize = 71;
+const CO2_H: f64 = 0.20;
+/// The start: both C–O bonds at R = 2.226 Bohr (R_e = 2.225), bent by β = 70° from linear (bond angle 110°), at rest.
+const CO2_R: f64 = 2.226;
+const CO2_BETA_DEG: f64 = 70.0;
+/// The SCF tolerance asked of the GPU (the suite's); every solve along this trajectory has a partly occupied ↓ π level,
+/// so the GPU stops at `qm::GPU_PARTIAL_TOL` = 1e-5 (spec §5.1) whatever is asked — `scf_tol_used` records it.
+const CO2_TOL: f64 = TOL_H2;
+
+/// CO₂⁺ (charge +1, auto multiplicity = doublet, `Accepted`: pseudised C and O) bent by `beta_deg` from linear with both
+/// bonds `r`: C at the origin (a grid node), the O at (∓r sin(θ/2), −r cos(θ/2), 0) with θ = 180° − β the bond angle.
+fn co2_plus(beta_deg: f64, r: f64) -> Scene {
+    let half = (180.0 - beta_deg).to_radians() / 2.0;
+    let (sx, cy) = (r * half.sin(), r * half.cos());
+    let nuclei = vec![Nucleus::new(6, [0.0; 3]), Nucleus::new(8, [-sx, -cy, 0.0]), Nucleus::new(8, [sx, -cy, 0.0])];
+    Scene { nuclei, cell: sim::Cell { n: CO2_N, h: CO2_H }, charge: 1, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::Accepted, train_mask: None }
+}
+
+/// The bend β = 180° − ∠O–C–O (degrees) and the two C–O bond lengths of a CO₂ scene (C first).
+fn co2_shape(s: &Scene) -> (f64, f64, f64) {
+    let c = s.nuclei[0].pos;
+    let d = |i: usize| -> [f64; 3] { std::array::from_fn(|k| s.nuclei[i].pos[k] - c[k]) };
+    let (a, b) = (d(1), d(2));
+    let (la, lb) = ((a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt(), (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt());
+    let cos = ((a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (la * lb)).clamp(-1.0, 1.0);
+    (180.0 - cos.acos().to_degrees(), la, lb)
+}
+
+/// V5 Step 1 (plan Task 11), a measurement, not a gate: CO₂⁺ at the NVE start on the GPU — one cold solve, then five
+/// warm-vs-cold repeats (reset, a cold solve at a neighbour bent by δβ ∈ {+0.5°, −0.5°, +1°, −1°, +2°}, then the start
+/// warm from it: F_warm − F_cold and the largest force-component change), then 20 Verlet steps from rest timed one by
+/// one. Its numbers pre-register the NVE bounds in `references.md` ("Fermi–Dirac migration", V5).
+/// Run: `cargo test -p validate --release --test dynamics -- --ignored --nocapture v5_co2_plus_cost_and_path_scatter`.
+#[test]
+#[ignore = "measurement (plan 2026-11-13 Task 11 Step 1): σ_path and the per-step cost of the V5 NVE case; numbers in references.md"]
+fn v5_co2_plus_cost_and_path_scatter() {
+    let Some(ctx) = gpu() else { return };
+    let (mut p, log) = Locked::new(ctx.clone(), CO2_TOL);
+    let start = co2_plus(CO2_BETA_DEG, CO2_R);
+    let t = Instant::now();
+    let cold = solve(&mut p, &start, "CO₂⁺ start, cold");
+    let cold_s = t.elapsed().as_secs_f64();
+    let e = &cold.stats.energy;
+    println!("CO₂⁺ {CO2_N}³ × {CO2_H}, β = {CO2_BETA_DEG}°, R = {CO2_R}: cold F {:+.9} E {:+.9} TS {:.6e}, {} SCF steps, {cold_s:.1} s, tol used {:?}, face {:?} (rule {:.2e}), partial {:?}, forces {:?}",
+             e.total, e.internal, e.ts, cold.stats.scf_steps, cold.stats.scf_tol_used, cold.stats.face_density, providers::box_affected_face_density(CO2_H),
+             cold.stats.partial, cold.forces);
+    let (mut d_f, mut d_e, mut d_force) = (Vec::new(), Vec::new(), Vec::new());
+    for db in [0.5, -0.5, 1.0, -1.0, 2.0] {
+        p.reset();
+        let t = Instant::now();
+        let nb = solve(&mut p, &co2_plus(CO2_BETA_DEG + db, CO2_R), "neighbour");
+        let nb_s = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let w = solve(&mut p, &start, "CO₂⁺ start, warm");
+        let w_s = t.elapsed().as_secs_f64();
+        let df = w.stats.energy.total - e.total;
+        let de = w.stats.energy.internal - e.internal;
+        let dfo = w.forces.iter().flatten().zip(cold.forces.iter().flatten()).fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
+        println!("  δβ {db:+.1}°: neighbour {} steps {nb_s:.1} s; warm {} steps {w_s:.1} s: F_warm − F_cold {df:+.3e}, E {de:+.3e}, max |ΔF_I| {dfo:.3e} Ha/Bohr, tol used {:?}",
+                 nb.stats.scf_steps, w.stats.scf_steps, w.stats.scf_tol_used);
+        d_f.push(df);
+        d_e.push(de);
+        d_force.push(dfo);
+    }
+    let rms = |v: &[f64]| (v.iter().map(|x| x * x).sum::<f64>() / v.len() as f64).sqrt();
+    let maxabs = |v: &[f64]| v.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    println!("  path scatter of F: max |ΔF| {:.3e}, RMS {:.3e} (RMS/√2 {:.3e}); of E: max {:.3e}; forces: max {:.3e} Ha/Bohr",
+             maxabs(&d_f), rms(&d_f), rms(&d_f) / 2f64.sqrt(), maxabs(&d_e), maxabs(&d_force));
+    // 20 Verlet steps from rest, timed
+    p.reset();
+    let integ = Integrator::new_fs(DT_FS);
+    let mut s = start.clone();
+    let r0 = solve(&mut p, &s, "MD start");
+    let mut f = r0.forces.clone();
+    let mut walls = Vec::new();
+    for i in 1..=20 {
+        let t = Instant::now();
+        let (f_new, st) = integ.step(&mut s, &f, &mut p, &mut no_augment(), &mut never()).unwrap_or_else(|e| panic!("MD step {i}: {e}"));
+        let w = t.elapsed().as_secs_f64();
+        f = f_new;
+        let (beta, ra, rb) = co2_shape(&s);
+        println!("  step {i}: {w:.2} s, {} SCF steps, F + K {:+.9}, TS {:.4e}, β {beta:.3}°, R {ra:.4}/{rb:.4}, tol used {:?}, branch_jump {:?}",
+                 st.eval.scf_steps, st.total, st.eval.energy.ts, st.eval.scf_tol_used, st.eval.branch_jump);
+        walls.push(w);
+    }
+    let mean = walls.iter().sum::<f64>() / walls.len() as f64;
+    println!("  warm MD step: mean {mean:.2} s over 20 (max {:.2}); ⇒ 600 steps ≈ {:.1} min", walls.iter().fold(0.0f64, |m, &x| m.max(x)), 600.0 * mean / 60.0);
+    println!("  {}", log.lock().unwrap().summary());
 }
