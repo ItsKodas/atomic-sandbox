@@ -4,8 +4,11 @@
 //! are recorded — the hyperparameters, the model's predictions and variances at fixed geometries,
 //! every sample's quarantine code, the class verdicts, the misfit set M, the leave-one-out ratios,
 //! the active set and the null space — and a later build is compared against the record:
-//! hyperparameters and predictions within 1e-9 relative, the LOO numbers within 1e-8, codes,
-//! verdicts and M identical. `#[ignore]`d (minutes; needs the collection copy):
+//! every verdict identical (codes, trust and recovery, M, the class and key verdicts, every
+//! `would_answer` verdict and novelty refusal), and the predictions' absolute energy, force and std
+//! differences within 1 % of the policy tiers (`energy_std_per_atom`, `force_std_abs`; the
+//! controller's ruling 2026-11-17, replacing a 1e-9 relative bar no reordering of O(Q′³)
+//! arithmetic meets at κ₂(A) ≈ 1e13). Relative differences and the other exact items are reported. `#[ignore]`d (minutes; needs the collection copy):
 //!
 //! `COLLECTION_DIR=<copy> REFIT_GOLDEN=record:<file>|compare:<file> [REFIT_GOLDEN_CASES=cold,append,recovery] cargo test -p providers --release --lib refit_golden -- --ignored --nocapture --test-threads 1`
 //!
@@ -180,6 +183,10 @@ fn refit_golden() {
     // per (case, category): the worst relative difference, and the exact lines that differ
     let mut worst: std::collections::BTreeMap<String, (f64, String)> = Default::default();
     let mut exact_fail: Vec<String> = Vec::new();
+    // per case, the absolute prediction differences (the controller's ruling 2026-11-17, review
+    // I1): (|ΔE|/N Ha/atom, max |ΔF_component| Ha/Bohr, |Δσ_E|/N Ha/atom, max |Δσ_F| over the force
+    // std and its epistemic part, Ha/Bohr), each with where it was
+    let mut abs: std::collections::BTreeMap<&str, [(f64, String); 4]> = Default::default();
     let want_cases: std::collections::BTreeSet<&str> = cases.split(',').map(str::trim).collect();
     let want: Vec<&String> = want.iter().filter(|l| want_cases.contains(l.split(' ').next().unwrap())).collect();
     assert_eq!(want.len(), got.len(), "the records have different line counts");
@@ -197,6 +204,21 @@ fn refit_golden() {
         }
         let (a, b): (Vec<f64>, Vec<f64>) = (wv.split(' ').map(|x| x.parse().unwrap()).collect(), gv.split(' ').map(|x| x.parse().unwrap()).collect());
         assert_eq!(a.len(), b.len(), "{wk}: value counts differ");
+        if cat == "pred" && it.next().is_some_and(|k| k.starts_with("probe")) {
+            // [E, σ_E, F (3N), σ_F (N), σ_F epistemic (N)]
+            let n = (a.len() - 2) / 5;
+            let d = |i: usize| (a[i] - b[i]).abs();
+            let e = abs.entry(case).or_insert_with(|| std::array::from_fn(|_| (0.0, String::new())));
+            let mut put = |slot: usize, v: f64| {
+                if v > e[slot].0 {
+                    e[slot] = (v, wk.to_string());
+                }
+            };
+            put(0, d(0) / n as f64);
+            put(1, (2..2 + 3 * n).map(d).fold(0.0, f64::max));
+            put(2, d(1) / n as f64);
+            put(3, (2 + 3 * n..2 + 5 * n).map(d).fold(0.0, f64::max));
+        }
         let label = if cat == "hyper" { wk.to_string() } else { format!("{case} {cat}") };
         for (x, y) in a.iter().zip(&b) {
             let d = rel(*x, *y);
@@ -210,13 +232,39 @@ fn refit_golden() {
     for (k, (d, at)) in &worst {
         println!("| {k} | {d:.2e} | {at} |");
     }
-    println!("\nexact items differing: {}", exact_fail.len());
+    // the tiers each case was judged by (`recovery`: the energy tier at a third, as `run_cases`)
+    let p = FallbackPolicy::default();
+    let tiers = |case: &str| (if case == "recovery" { p.energy_std_per_atom / 3.0 } else { p.energy_std_per_atom }, p.force_std_abs);
+    let mut over_tier = Vec::new();
+    println!("\n| case | max |ΔE|/N (Ha/atom) | ÷ energy tier | max |ΔF| (Ha/Bohr) | ÷ force tier | max |Δσ_E|/N | ÷ energy tier | max |Δσ_F| | ÷ force tier |\n|---|---|---|---|---|---|---|---|---|");
+    for (case, e) in &abs {
+        let (te, tf) = tiers(case);
+        let frac = [e[0].0 / te, e[1].0 / tf, e[2].0 / te, e[3].0 / tf];
+        println!("| {case} (tiers {te:.2e}, {tf:.2e}) | {:.2e} | {:.2e} | {:.2e} | {:.2e} | {:.2e} | {:.2e} | {:.2e} | {:.2e} |", e[0].0, frac[0], e[1].0, frac[1], e[2].0, frac[2], e[3].0, frac[3]);
+        for (k, f) in frac.iter().enumerate() {
+            if *f > 0.01 {
+                over_tier.push(format!("{case}: quantity {k} at {:.2e} of its tier ({})", f, e[k].1));
+            }
+        }
+        println!("  where: E {} · F {} · σ_E {} · σ_F {}", e[0].1, e[1].1, e[2].1, e[3].1);
+    }
+    // every verdict identical (the ruling): the codes, the trust verdict and the recovery, M, the
+    // class and key verdicts and counts, the would_answer verdicts and the novelty refusals; the
+    // other exact items (the search's round count, the active rows, the LOO row membership, the
+    // worst-sample indices, the null-space dimension) are reported, not judged
+    let verdict = |item: &str| {
+        let key = item.split(['\n', ' ']).nth(2).unwrap_or("");
+        ["trust", "recovery", "codes", "misfit", "class", "key", "keyq"].contains(&key) || key.starts_with("verdict") || key.starts_with("novelty-at")
+    };
+    let verdict_fail: Vec<&String> = exact_fail.iter().filter(|f| verdict(f)).collect();
+    println!("\nexact items differing: {} ({} of them verdicts)", exact_fail.len(), verdict_fail.len());
     for f in &exact_fail {
         println!("{f}");
     }
-    let tol = |label: &str| if label.contains(" loo") || label.contains(" grade") || label.contains(" novelty") { 1e-8 } else { 1e-9 };
-    let over: Vec<_> = worst.iter().filter(|(k, (d, _))| *d > tol(k)).collect();
-    assert!(exact_fail.is_empty() && over.is_empty(), "not equivalent: {} exact items, {} categories over tolerance", exact_fail.len(), over.len());
+    for o in &over_tier {
+        println!("OVER 1 % OF A TIER: {o}");
+    }
+    assert!(verdict_fail.is_empty() && over_tier.is_empty(), "not equivalent: {} verdict items differ, {} predictions over 1 % of a tier", verdict_fail.len(), over_tier.len());
 }
 
 /// Where the active set's kept span ends against τ on the collection copy (`surrogate::grade`
@@ -248,8 +296,7 @@ fn active_span_margins() {
         let kept_fb = ef.iter().filter(|&&v| v > *tau).count();
         // the eigenvalues nearest τ from each solver, in units of τ
         let near = |ev: &[f64]| { let mut x: Vec<f64> = ev.iter().map(|v| v / tau).filter(|r| (0.1..10.0).contains(r)).collect(); x.sort_by(f64::total_cmp); x.iter().map(|r| format!("{r:.3}")).collect::<Vec<_>>().join(" ") };
-        println!("species {k}: Jacobi λ/τ in (0.1, 10): {}
-           faer   λ/τ in (0.1, 10): {}", near(ej), near(ef));
+        println!("species {k}: Jacobi λ/τ in (0.1, 10): {}\n           faer   λ/τ in (0.1, 10): {}", near(ej), near(ef));
         let above = ef.iter().filter(|&&v| v > *tau).fold(f64::INFINITY, |m, &v| m.min(v)) / tau;
         let below = ef.iter().filter(|&&v| v <= *tau).fold(f64::NEG_INFINITY, |m, &v| m.max(v)) / tau;
         let gap = ej.iter().zip(ef).filter(|(a, _)| (0.1 * tau..10.0 * tau).contains(*a)).fold(0.0f64, |m, (a, b)| m.max((a - b).abs())) / tau;
