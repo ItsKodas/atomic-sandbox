@@ -936,6 +936,8 @@ struct ListInput<'a> {
     refs_pending: bool,
     /// What stands where there is no payload yet ([`no_orbitals_note`]).
     none_note: String,
+    /// The pick still loading ([`pending_pick`]): its row and level are marked and not clickable.
+    pending: Option<(Spin, u32)>,
 }
 
 /// How one row is drawn besides its orbital: its share (text and hover; `None` = no share column)
@@ -1180,7 +1182,8 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     let scene_z: Vec<u8> = input.scene.nuclei.iter().map(|n| n.z).collect();
     let selected = selected_atoms(input.selected, &st.edit_group, scene_z.len());
     let refs_pending = input.snapshot.is_some_and(|s| !s.dynamics.bonds_pending.is_empty());
-    let li = ListInput { z_sigma, scene_z: &scene_z, selected: &selected, refs_pending, none_note: no_orbitals_note(input, st) };
+    let pending = pending_pick(st.show, st.orbital_pick, payload);
+    let li = ListInput { z_sigma, scene_z: &scene_z, selected: &selected, refs_pending, none_note: no_orbitals_note(input, st), pending };
     let name = crate::names::common_name(&scene_z, input.scene.charge)
         .map(str::to_string)
         .unwrap_or_else(|| crate::names::formula(&scene_z, (input.scene.charge != 0).then_some(input.scene.charge)));
@@ -1206,7 +1209,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
                     let head = if unbound { "Unbound in LSDA at this box size" } else { "States of the box (some bound, their tails on the walls)" };
                     ui.add(egui::Label::new(RichText::new(format!("{head}: {BOX_STATE_TIP}")).size(11.0).color(super::super::AMBER)).wrap());
                     for e in &boxed {
-                        row(ui, st, *e, &levels, e.picked(picked), &Place::default(), acts);
+                        row(ui, st, *e, &levels, RowPick::of(e, picked, li.pending), &Place::default(), acts);
                     }
                     let _ = split;
                 });
@@ -1539,6 +1542,51 @@ fn picked_of(o: &OrbitalDisplay) -> Option<(Spin, u32)> {
     }
 }
 
+/// The hover text of a row (and its level in the diagram) whose orbital is loading.
+pub const PENDING_TIP: &str = "loading this orbital…";
+
+/// The orbital the user picked that the payload on screen does not show yet (user request
+/// 2026-11-16: a spinner on the clicked row, which is disabled until it is shown): in Orbitals mode,
+/// a pick of the user's (`UiState::orbital_pick`) that is not the payload's `what`. It clears when a
+/// payload shows it — an interrupted one too: the producer still makes the payload, its status
+/// line says "interrupted" — and when the payload has no row with it (the producer's
+/// [`NO_LONGER_EXISTS`] fallback; the viewer then adopts what it shows). A payload of an earlier
+/// pick (one made before the worker read the newer request) leaves it pending. A newer pick
+/// replaces it, so the mark moves to that row.
+pub fn pending_pick(show: ShowMode, pick: Option<(Spin, u32)>, o: Option<&OrbitalDisplay>) -> Option<(Spin, u32)> {
+    let (pick, o) = (pick?, o?);
+    let shown = picked_of(o) == Some(pick);
+    let exists = o.rows.iter().any(|r| (r.spin, r.track) == pick);
+    (show == ShowMode::Orbitals && !shown && exists).then_some(pick)
+}
+
+/// How a row (or its level) is marked: the orbital on screen, the pick still loading (spinner,
+/// disabled), or neither. Loading wins: a pair's ↑ picked while its ↓ is shown is loading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowPick {
+    None,
+    Shown,
+    Pending,
+}
+
+impl RowPick {
+    /// `e`'s mark, given the orbital on screen and the pending pick ([`pending_pick`]).
+    pub fn of(e: &Entry<'_>, shown: Option<(Spin, u32)>, pending: Option<(Spin, u32)>) -> RowPick {
+        if pending.is_some() && e.picked(pending) {
+            RowPick::Pending
+        } else if e.picked(shown) {
+            RowPick::Shown
+        } else {
+            RowPick::None
+        }
+    }
+
+    /// A pending row is not clickable: re-clicking it would ask for what is already on its way.
+    pub fn clickable(self) -> bool {
+        self != RowPick::Pending
+    }
+}
+
 // ---- the energy-level diagram ----
 
 /// One orbital's line in the diagram: its entry (an index into the entries given), its column
@@ -1796,7 +1844,8 @@ const LABELS_W: f32 = 104.0;
 /// The diagram, painted: the ε axis (broken where a gap is too wide), one line per orbital in its
 /// colour, degenerate ones side by side, ↑/↓ on the occupied ones (a fraction labelled), HOMO and
 /// LUMO with ε, the Kohn–Sham gap bracket (none for a partly filled shell), the box states faded
-/// above a dashed line. A click on a line picks that orbital, as its row does.
+/// above a dashed line. A click on a line picks that orbital, as its row does; a pick still
+/// loading ([`RowPick::Pending`]) is outlined, pulsing, and not clickable.
 fn diagram(ui: &mut Ui, o: &OrbitalDisplay, levels: &Levels, li: &ListInput<'_>, acts: &mut Vec<Action>) {
     use egui::{pos2, vec2, Align2, FontId, Stroke};
     let (split, es) = entries(o);
@@ -1844,11 +1893,25 @@ fn diagram(ui: &mut Ui, o: &OrbitalDisplay, levels: &Levels, li: &ListInput<'_>,
         let c = swatch(colour);
         let c = if l.boxed { c.gamma_multiply(0.4) } else { c };
         let line = egui::Rect::from_min_max(at(l.x0, l.y - 6.0), at(l.x1, l.y + 6.0));
-        let r = ui.interact(line, ui.id().with(("orb-level", e.r.spin == Spin::Down, e.r.track)), egui::Sense::click());
-        if e.picked(picked) {
-            p.rect_filled(line.expand(1.0), 3.0, theme::ACCENT_BG);
-        } else if r.hovered() {
-            p.rect_filled(line.expand(1.0), 3.0, theme::PANEL_3);
+        let mark = RowPick::of(&e, picked, li.pending);
+        // a level still loading is not clickable (its row says so with a spinner)
+        let sense = if mark.clickable() { egui::Sense::click() } else { egui::Sense::hover() };
+        let r = ui.interact(line, ui.id().with(("orb-level", e.r.spin == Spin::Down, e.r.track)), sense);
+        match mark {
+            RowPick::Shown => {
+                p.rect_filled(line.expand(1.0), 3.0, theme::ACCENT_BG);
+            }
+            // the subtle pending mark: an accent outline, pulsing
+            RowPick::Pending => {
+                let t = ui.input(|i| i.time);
+                let a = 0.45 + 0.35 * (t * 4.0).sin().abs() as f32;
+                p.rect_stroke(line.expand(1.0), 3.0, Stroke::new(1.0, theme::ACCENT.gamma_multiply(a)), egui::StrokeKind::Outside);
+                ui.ctx().request_repaint();
+            }
+            RowPick::None if r.hovered() => {
+                p.rect_filled(line.expand(1.0), 3.0, theme::PANEL_3);
+            }
+            RowPick::None => {}
         }
         p.line_segment([pos2(line.left(), line.center().y), pos2(line.right(), line.center().y)], Stroke::new(2.5, c));
         let occ = e.occupation();
@@ -1866,8 +1929,9 @@ fn diagram(ui: &mut Ui, o: &OrbitalDisplay, levels: &Levels, li: &ListInput<'_>,
         super::super::probe(&format!("level-{}-{}", e.arrows(), e.r.track), &r);
         let v = e.view(levels);
         let share = e.r.shares.as_deref().filter(|_| by_atom && !e.box_state()).map(|s| share_hover(s, li.scene_z));
-        let r = r.on_hover_text(entry_tip(&e, &v, share.as_deref()));
-        if r.clicked() {
+        let tip = entry_tip(&e, &v, share.as_deref());
+        let r = r.on_hover_text(if mark.clickable() { tip } else { format!("{PENDING_TIP}\n\n{tip}") });
+        if r.clicked() && mark.clickable() {
             acts.push(Action::PickOrbital { spin: e.r.spin, track: e.r.track });
         }
     }
@@ -2001,7 +2065,7 @@ fn list(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay>, li: &Li
                             unocc_heading(ui, &format!("{} unoccupied", spin.map_or("↑↓", arrow)));
                         }
                         let place = owner.as_ref().map_or_else(Place::default, |w| Place::of(w, e.r.shares.as_deref(), li.scene_z, li.selected));
-                        row(ui, st, e, &levels, e.picked(picked), &place, acts);
+                        row(ui, st, e, &levels, RowPick::of(&e, picked, li.pending), &place, acts);
                     }
                 }
             }
@@ -2037,9 +2101,13 @@ fn group_heading(ui: &mut Ui, owner: &Owner, others: usize, z: &[u8]) {
 /// largest atom share (`place`, in a molecule with shares). A pair (`e.partner`, a closed shell)
 /// is labelled `↑↓`, probed `orbital-↑↓-{↑ track}`; a click picks the ↑ orbital and the include
 /// box toggles both tracks. A row the selection does not light (`place.faint`) is drawn in faint
-/// ink and stays clickable; its ⚠ keeps its amber; a picked row keeps its full ink.
-fn row(ui: &mut Ui, st: &mut UiState, e: Entry<'_>, levels: &Levels, picked: bool, place: &Place, acts: &mut Vec<Action>) {
+/// ink and stays clickable; its ⚠ keeps its amber; a picked row keeps its full ink. A pick still
+/// loading (`mark` [`RowPick::Pending`]) shows a spinner in the swatch's place and is disabled
+/// ([`PENDING_TIP`] on hover) until the payload shows it.
+fn row(ui: &mut Ui, st: &mut UiState, e: Entry<'_>, levels: &Levels, mark: RowPick, place: &Place, acts: &mut Vec<Action>) {
     let r = e.r;
+    let picked = mark == RowPick::Shown;
+    let pending = mark == RowPick::Pending;
     let v = e.view(levels);
     let arrows = e.arrows();
     let colour = providers::orbitals::ORBITAL_PALETTE[r.slot as usize % providers::orbitals::ORBITAL_PALETTE.len()];
@@ -2047,10 +2115,17 @@ fn row(ui: &mut Ui, st: &mut UiState, e: Entry<'_>, levels: &Levels, picked: boo
     let dim = if faint { theme::INK_FAINT } else { theme::INK_DIM };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-        let sw = swatch(colour);
-        ui.painter().rect_filled(rect, 2.5, if faint { sw.gamma_multiply(0.35) } else { sw });
-        resp.on_hover_text("this orbital's colour: its line in the diagram and in All orbitals coloured (a ↓ orbital shares its ↑ partner's colour)");
+        if pending {
+            // the clicked orbital is on its way: a spinner, sized to the row's text, in the swatch's place
+            let size = ui.text_style_height(&egui::TextStyle::Monospace).clamp(10.0, 14.0);
+            let s = ui.add(egui::Spinner::new().size(size).color(swatch(colour))).on_hover_text(PENDING_TIP);
+            super::super::probe(&format!("pending-{arrows}-{}", r.track), &s);
+        } else {
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+            let sw = swatch(colour);
+            ui.painter().rect_filled(rect, 2.5, if faint { sw.gamma_multiply(0.35) } else { sw });
+            resp.on_hover_text("this orbital's colour: its line in the diagram and in All orbitals coloured (a ↓ orbital shares its ↑ partner's colour)");
+        }
         if st.show == ShowMode::Coloured {
             // a pair's box is on while either member is drawn, and switches both
             let mut on = included(st, r) || e.partner.is_some_and(|d| included(st, d));
@@ -2070,10 +2145,11 @@ fn row(ui: &mut Ui, st: &mut UiState, e: Entry<'_>, levels: &Levels, picked: boo
         }
         let name = RichText::new(format!("{} {arrows}", v.label)).monospace();
         let name = if faint { name.color(theme::INK_FAINT) } else { name };
-        let b = ui.add(egui::Button::selectable(picked, name));
-        let b = b.on_hover_text(v.label_tip());
+        // a pick still loading is disabled: a newer click on another row supersedes it
+        let b = ui.add_enabled(mark.clickable(), egui::Button::selectable(picked, name));
+        let b = b.on_hover_text(v.label_tip()).on_disabled_hover_text(format!("{PENDING_TIP}\n\n{}", v.label_tip()));
         super::super::probe(&format!("orbital-{arrows}-{}", r.track), &b);
-        if b.clicked() {
+        if b.clicked() && mark.clickable() {
             acts.push(Action::PickOrbital { spin: r.spin, track: r.track });
         }
         let mut notes: Vec<&Tag> = Vec::new();
