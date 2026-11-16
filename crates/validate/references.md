@@ -5397,7 +5397,10 @@ state), FD at ELECTRON_KT E −2.0006504639744724, F −2.0144863903, TS 1.3836e
 **E_FD − E_DS = +2.83e-2 Ha** (≥ 3ε_E = 3e-5 by a factor of 940; class S). The other aspects scanned, all released
 under DS: 1.01 +2.82e-2, 1.02 +2.76e-2, 1.04 +2.52e-2, 1.083 +4.27e-3 (E_FD − E_DS). The DS label is the lower-F state
 (F_FD − E_DS = +1.45e-2 at 1.005): the shared-shell release found the broken-symmetry integer state FD does not reach
-from its cold start (spec §4.7(e), the restricted-vs-broken-symmetry H₄ gap).
+from its cold start (spec §4.7(e), the restricted-vs-broken-symmetry H₄ gap): **the migration replaces a lower-F label at
+this geometry** (rule 7). Fix round 1 (review M4), the same teacher under FD after the deletion: OH E_FD −16.777454783579,
+E_FD − E_DS = +7.3e-7 Ha (14× inside ε_E = 1e-5), F_FD − E_DS = −6.93074e-3 against −2 kT ln 2 = −6.931472e-3, max
+|ΔF_I| 1.23e-5 Ha/Bohr (12× inside ε_F); H₂ F_FD − E_DS = +7.6e-8, max |ΔF_I| 5.9e-6.
 
 **Moved references** (each converted test compares F with F on both sides, so no bound moved by −TS):
 
@@ -5415,7 +5418,8 @@ from its cold start (spec §4.7(e), the restricted-vs-broken-symmetry H₄ gap).
 highest, left out — Task 9c (c): its Ritz value decides nothing) with the CPU's lowest as many, and no longer pin the
 two block sizes equal: under FD each solver grows and trims its own witness block (pseudo-O 33³ ↓: CPU 6 tested, GPU 5
 tested + buffer, the buffer 6.0e-5 Ha from the CPU's 6th level). The compared levels must cover every CPU-occupied
-level and a witness; the ε bound (1e-5) is unchanged.
+level and at least one level above them (not necessarily an FD witness — that is each solver's own growth test; fix
+round 1, review M3); the ε bound (1e-5) is unchanged.
 
 The validate `pseudo` suite runs Fermi–Dirac (`solve_with`, the GPU probe, `eggbox`): 9/9 gates pass (2281 s).
 - `pseudo_o_triplet_below_singlet` (compares E = `energy.internal` with the radial atom): M = 1 −16.050054 vs radial
@@ -5437,7 +5441,7 @@ h_req 0.35) reproduces within the backend margin (2e-3 Bohr, 0.5 %). H₂O (All)
 tetrahedral, the egg-box records, the H₂O preset NVE (E spread 8.02e-6 Ha), the pseudo-O₂ NVE drift −9.85e-7 Ha/ps
 (bound 2e-4) and the CH₄ CSVR ⟨T⟩ 315.0 K (+5.0 %) all pass.
 
-**Open (not re-pinned; a ruling is needed):** `qm-gpu` `harris::tests::harris_block_follows_a_shared_shell` fails its
+**Resolved in fix round 1 (below the measurement):** `qm-gpu` `harris::tests::harris_block_follows_a_shared_shell` (renamed `harris_block_follows_a_partly_filled_shell` in fix round 1) fails its
 `out.at_cap == [false, false]` assertion under Fermi–Dirac (the fixture `solved_pseudo_o` ran the shared-shell rule
 before). Measured (a temporary per-solve trace, removed): ↓'s second Harris solve, split (8, 6, 7), ran to the
 200-iteration cap with its displayed tier at 2.33e-5 (tol 5.4e-6) and its guard tier at 6.9e-6 (GUARD_TOL 1e-3); the
@@ -5446,7 +5450,17 @@ its partner in the guard tier; the next solve raised the head over the shown pai
 iterations. The splits and solve counts are the shared-shell era's ([2, 3], (9, 7, 8)); only the first call's cap
 moved. FD's ↓ density (f 0.335 / 0.334 / 0.331, the off-site p set split 8.8e-5 Ha) is what splits that box pair
 differently; the head boundary splitting a near-degenerate pair before the post-solve raise is a pre-existing Harris
-behaviour.
+behaviour. **Fix round 1** (review I1), assertions unchanged:
+- the head is closed inside `eigen::lobpcg_split` after every Rayleigh–Ritz step: from the given head, while
+  θ_head − θ_{head−1} ≤ τ_scf + r_{head−1} + r_head (τ_scf = `qm::orbitals::tau(tol)`, 1e-4 at tol 1e-6; r the true
+  residuals), the head takes the next column, up to `checked`; `EigenStats::split_head` returns it and Harris records it
+  in `splits` (`the_split_head_closes_over_a_near_degenerate_pair`). Alone it did **not** clear the cap: the closed
+  7-column head of split (8, 6, 7) stalled at 2.3e-5 (the guard tier empty) for 200 iterations;
+- so the reviewer's minimal rule is applied as well: a pass that grows the block holds the head inside the old block,
+  at most cur.len − 1. ↓ now runs (6, 4, 5) → (8, 5, 7) → (9, 7, 8): 224 iterations in 3 solves, no cap, no floor exit
+  (265 with one capped solve before); ↑ is unchanged (153 in 2); the warm second call takes 0 iterations on both spins;
+  splits and solve counts are the shared-shell era's ([2, 3], (9, 7, 8)). The test is renamed
+  `harris_block_follows_a_partly_filled_shell` (review M5). Every other qm-gpu test passes unchanged.
 
 ## Live orbitals (Harris display; spec 2026-11-14)
 

@@ -871,8 +871,10 @@ impl BondForce {
                 qm::forces(grid, &st, &sys.nuclei, settings.sigma).map_err(|e| e.to_string())?
             }
             DimerBackend::Gpu(ctx) => {
-                // the solver's partial-level stop is `qm_gpu::GPU_PARTIAL_TOL`, the constant the procedure records
-                // (`DIMER_PROCEDURE.gpu_partial_tol`; `dimer_procedure_hashes_fd`)
+                // the solver's partial-level stop is `qm_gpu::scf::GPU_PARTIAL_TOL`, the constant the procedure records
+                // (`DIMER_PROCEDURE.gpu_partial_tol`; `dimer_procedure_hashes_fd`); the hashed field must be the stop the
+                // solver runs (review M2: the solver's stop, `qm_gpu::scf::GPU_PARTIAL_TOL`, is not settable outside its tests)
+                debug_assert_eq!(DIMER_PROCEDURE.gpu_partial_tol.to_bits(), qm_gpu::scf::GPU_PARTIAL_TOL.to_bits(), "the hashed GPU stop is the solver's");
                 let solver = self.gpu.get_or_insert_with(|| qm_gpu::GpuSolver::new(ctx.clone(), grid));
                 let mut s = *settings;
                 if sys.ionic.is_some() {

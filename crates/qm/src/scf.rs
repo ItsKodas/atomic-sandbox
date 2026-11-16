@@ -301,13 +301,12 @@ pub const MAX_WITNESS_GROWTH: usize = 32;
 #[derive(Clone, Debug, PartialEq)]
 pub struct OneShot { pub f: Vec<f64>, pub window_short: bool }
 
-/// Applies `rule` once to the levels `evals` (any order) of spin `spin` holding `n` electrons (module doc,
+/// Applies `rule` once to the levels `evals` (any order) of one spin channel holding `n` electrons (module doc,
 /// "Occupations", one-shot paragraph). `Aufbau`: 1 on the n lowest by rank. `FermiDirac { kt }` (the scf-stall ← main
 /// merge ruling): `fermi_dirac(evals, n, kt)`, the rule of every SCF step on that surface, with `window_short` =
-/// !`witness_reached` (the caller grows its block up to `MAX_WITNESS_GROWTH`, as the SCF does). `spin` names the
-/// channel in the caller's notes only. Errors: `fermi_dirac`'s (fewer than n + 1 levels, a non-finite ε or kT).
+/// !`witness_reached` (the caller grows its block up to `MAX_WITNESS_GROWTH`, as the SCF does). Errors: `fermi_dirac`'s (fewer than n + 1 levels, a non-finite ε or kT).
 /// Panics if n > 0 and `evals.len() < n` (`Aufbau`).
-pub fn one_shot_occupations(evals: &[f64], n: usize, _spin: u8, rule: Occupations) -> Result<OneShot, QmError> {
+pub fn one_shot_occupations(evals: &[f64], n: usize, rule: Occupations) -> Result<OneShot, QmError> {
     let none = |f| OneShot { f, window_short: false };
     if n == 0 { return Ok(none(vec![0.0; evals.len()])); }
     match rule {
@@ -1448,12 +1447,12 @@ mod tests {
     #[test]
     fn one_shot_aufbau_fills_the_lowest() {
         let evals = [-0.1, 0.3, -0.6, -0.2];
-        let o = one_shot_occupations(&evals, 2, 0, Occupations::Aufbau).expect("one shot");
+        let o = one_shot_occupations(&evals, 2, Occupations::Aufbau).expect("one shot");
         assert_eq!(o.f, vec![0.0, 0.0, 1.0, 1.0]);
         assert_eq!(o.f.iter().sum::<f64>(), 2.0);
         assert!(!o.window_short, "{o:?}");
         for rule in [Occupations::Aufbau, Occupations::FermiDirac { kt: ELECTRON_KT }] {
-            let o = one_shot_occupations(&evals, 0, 1, rule).expect("one shot");
+            let o = one_shot_occupations(&evals, 0, rule).expect("one shot");
             assert_eq!((o.f, o.window_short), (vec![0.0; 4], false));
         }
     }
@@ -1466,18 +1465,18 @@ mod tests {
     fn one_shot_fermi_dirac_is_the_scf_rule_once() {
         let fd = Occupations::FermiDirac { kt: ELECTRON_KT };
         let evals = [-0.1, 0.4, -0.6, -0.2];
-        let o = one_shot_occupations(&evals, 2, 0, fd).expect("one shot");
+        let o = one_shot_occupations(&evals, 2, fd).expect("one shot");
         assert_eq!(o.f, fermi_dirac(&evals, 2, ELECTRON_KT).unwrap().f);
         assert!(!o.window_short, "{o:?}");
         assert!((o.f[2] - 1.0).abs() < 1e-12 && (o.f[3] - 1.0).abs() < 1e-4 && o.f[0] < 1e-4 && o.f[1] < 1e-16, "{o:?}");
         let p = [-1.0, -0.40, -0.40, -0.40, 0.2];
-        let o = one_shot_occupations(&p, 2, 1, fd).expect("one shot");
+        let o = one_shot_occupations(&p, 2, fd).expect("one shot");
         for i in 1..4 { assert!((o.f[i] - 1.0 / 3.0).abs() < 1e-12, "{o:?}"); }
         assert!(!o.window_short && (o.f.iter().sum::<f64>() - 2.0).abs() < 1e-12, "{o:?}");
         // the top level 0.05 above ε_n: no witness (the caller grows the block)
-        let o = one_shot_occupations(&[-1.0, -0.40, -0.35], 2, 0, fd).expect("one shot");
+        let o = one_shot_occupations(&[-1.0, -0.40, -0.35], 2, fd).expect("one shot");
         assert!(o.window_short, "{o:?}");
-        assert!(one_shot_occupations(&[-1.0, -0.4], 2, 0, fd).is_err(), "fewer than n + 1 levels");
+        assert!(one_shot_occupations(&[-1.0, -0.4], 2, fd).is_err(), "fewer than n + 1 levels");
     }
 
     /// N = Σ q_I − charge (spec §5.2): Z_v for pseudised species, Z for all-electron ones; `System::new` is

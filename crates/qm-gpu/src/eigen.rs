@@ -298,6 +298,9 @@ pub struct EigenStats {
     /// head columns (held to `tol`) and over the tail columns `head..checked` (held to `tail_tol`; 0 when
     /// there are none); the untested buffer columns enter only `max_residual`. `None` otherwise.
     pub split_residual: Option<(f64, f64)>,
+    /// Under the split stop test: the head the last stop test read — `lobpcg_split`'s head closed over a near-degenerate
+    /// neighbour (`close_head`, plan 2026-11-13 Task 10 fix round 1), else the head as given. `None` otherwise.
+    pub split_head: Option<usize>,
     /// The head columns (all columns without a split) were returned exactly as given: a 0-iteration accept, or
     /// `lobpcg_guarded`'s locked head (module doc, "Guarded columns and locking").
     pub head_kept: bool,
@@ -315,6 +318,15 @@ pub fn residual_floor_estimate(g: &GpuGrid) -> f64 {
     let mean = 3.0 * COEFF[0].abs() * s;
     let var = 3.0 * 2.0 * COEFF[1..].iter().map(|c| c * c).sum::<f64>() * s * s;
     F32_RMS_ROUNDING * (mean * mean + var).sqrt()
+}
+
+/// `lobpcg_split`'s head closure (pure; its doc, plan 2026-11-13 Task 10 fix round 1): from `head`, while
+/// θ_head − θ_{head−1} ≤ `tau` + r_{head−1} + r_head, one more column, up to `checked`. `theta` ascending (a
+/// Rayleigh–Ritz output), `res` the true residuals; a head of 0 stays 0 (nothing to close).
+pub(crate) fn close_head(theta: &[f64], res: &[f64], head: usize, checked: usize, tau: f64) -> usize {
+    let mut h = head;
+    while h > 0 && h < checked && theta[h] - theta[h - 1] <= tau + res[h - 1] + res[h] { h += 1; }
+    h
 }
 
 /// The stop decision after a residual readback (pure, pinned by `stop_classification`):
@@ -622,15 +634,28 @@ pub fn lobpcg_with_guess_tol(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Red
 /// every returned column's true residual (the Harris FD window's lower bound θ − r). Column order: the
 /// Rayleigh–Ritz returns X ascending, so after the first step "the lowest `head`" are the first; at the
 /// guess they are the first `head` as given (a warm guess is stored ascending).
+///
+/// **The head is closed every iteration** (plan 2026-11-13 Task 10 fix round 1, review I1): after each Rayleigh–Ritz step,
+/// starting from the given `head`, while the first column outside it and the last inside are one set within their
+/// eigenvalue bounds,
+///   θ_head − θ_{head−1} ≤ `close_tau` + r_{head−1} + r_head      (r the true residuals: |θ_i − λ_i| ≤ r_i),
+/// the head is extended by one column, up to `checked` (`close_head`). A column within a residual-bounded `close_tau` of
+/// the head's last level converges only with it (a column's rate is set by its gap to the next level outside its tier),
+/// so holding one to `tol` and its near-degenerate partner to `tail_tol` can run to the cap — while the caller (the
+/// Harris display) shows such a pair whole (`qm::orbitals::block_edge` at τ = `close_tau`) and would raise the head after
+/// the solve anyway. The closure starts from the given head each iteration (no ratchet: early, large residuals widen it
+/// only while they last); the guess (iteration 0) reads the given head. `EigenStats::split_head` is the head of the last
+/// stop test.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lobpcg_split(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuHamiltonian, x: &mut [Field], evals: &mut [f64],
-                           work: &mut LobpcgWork, tol: f64, head: usize, tail_tol: f64, checked: usize, max_iter: usize,
+                           work: &mut LobpcgWork, tol: f64, head: usize, tail_tol: f64, checked: usize, close_tau: f64, max_iter: usize,
                            should_abort: Option<&mut dyn FnMut() -> bool>, residuals: Option<&mut [f64]>) -> Result<EigenStats, QmError> {
     assert!(tail_tol >= tol, "lobpcg_split: tail_tol {tail_tol} must not be below tol {tol}");
     assert!(head <= checked && checked <= x.len() && checked > 0, "lobpcg_split: need 0 < head ≤ checked ≤ {} (head {head}, checked {checked})", x.len());
     assert!(residuals.as_ref().is_none_or(|r| r.len() == x.len()), "lobpcg_split: one residual slot per column");
+    assert!(close_tau >= 0.0, "lobpcg_split: close_tau {close_tau} must not be negative");
     lobpcg_core(ctx, k, g, r, h, x, evals, work, tol, tol, max_iter, ALPHA_MAX, ALPHA_RESIDUAL_FRACTION, Some((head, tail_tol, checked)), false, residuals,
-                should_abort)
+                should_abort, Some(close_tau))
 }
 
 /// The SCF's Fermi–Dirac channel solve (module doc, "Guarded columns and locking"; plan 2026-11-13 Task 9b): the
@@ -649,7 +674,7 @@ pub(crate) fn lobpcg_guarded(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Red
     assert!(head <= checked && checked <= x.len() && checked > 0 && residuals.len() == x.len(),
             "lobpcg_guarded: head {head}, checked {checked}, {} residual slots for {} columns", residuals.len(), x.len());
     lobpcg_core(ctx, k, g, r, h, x, evals, work, tol, guess_tol, max_iter, ALPHA_MAX, ALPHA_RESIDUAL_FRACTION, Some((head, tail_tol, checked)), true,
-                Some(residuals), should_abort)
+                Some(residuals), should_abort, None)
 }
 
 /// `lobpcg` with the guard's two constants as parameters (tests force the fallback with 0, 0) and the
@@ -659,7 +684,7 @@ pub(crate) fn lobpcg_guarded(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Red
 pub(crate) fn lobpcg_with(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuHamiltonian, x: &mut [Field], evals: &mut [f64],
                           work: &mut LobpcgWork, tol: f64, guess_tol: f64, max_iter: usize, alpha_max: f64, alpha_fraction: f64,
                           tail: Option<(usize, f64, usize)>, should_abort: Option<&mut dyn FnMut() -> bool>) -> Result<EigenStats, QmError> {
-    lobpcg_core(ctx, k, g, r, h, x, evals, work, tol, guess_tol, max_iter, alpha_max, alpha_fraction, tail, false, None, should_abort)
+    lobpcg_core(ctx, k, g, r, h, x, evals, work, tol, guess_tol, max_iter, alpha_max, alpha_fraction, tail, false, None, should_abort, None)
 }
 
 /// Rayleigh–Ritz in the B-orthogonal complement of the first `locked` columns of S (module doc, "Guarded columns and
@@ -680,12 +705,13 @@ fn rayleigh_ritz_locked(a: &DMatrix<f64>, b: &DMatrix<f64>, locked: usize, na: u
     Ok((th, &q * cp, alpha))
 }
 
-/// The one implementation: `lobpcg_with`, plus `lobpcg_guarded`'s locking (`lock`) and per-column residual output.
+/// The one implementation: `lobpcg_with`, plus `lobpcg_guarded`'s locking (`lock`), per-column residual output and
+/// `lobpcg_split`'s head closure (`close`: its τ; `None` everywhere else, where the head is the one given).
 #[allow(clippy::too_many_arguments)]
 fn lobpcg_core(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuHamiltonian, x: &mut [Field], evals: &mut [f64],
                work: &mut LobpcgWork, tol: f64, guess_tol: f64, max_iter: usize, alpha_max: f64, alpha_fraction: f64,
                tail: Option<(usize, f64, usize)>, lock: bool, mut residuals: Option<&mut [f64]>,
-               mut should_abort: Option<&mut dyn FnMut() -> bool>) -> Result<EigenStats, QmError> {
+               mut should_abort: Option<&mut dyn FnMut() -> bool>, close: Option<f64>) -> Result<EigenStats, QmError> {
     let nk = x.len();
     assert!(nk > 0, "lobpcg: no eigenpairs requested");
     assert!(nk <= work.k, "lobpcg: work was built for k = {}, called with {nk} vectors", work.k);
@@ -742,6 +768,7 @@ fn lobpcg_core(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuH
     let mut locked = 0usize; // the locked head (module doc, "Guarded columns and locking"); 0 = none
     let mut iterations = 0usize;
     let (mut best, mut best_it) = (f64::INFINITY, 0usize);
+    let mut split_head: Option<usize>;
     let stats;
 
     loop {
@@ -778,7 +805,15 @@ fn lobpcg_core(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuH
             max_res = max_res.max(res);
             col_res[i] = res;
             if let Some(out) = residuals.as_deref_mut() { out[i] = res; }
-            if let Some((head, tail_tol, checked)) = tail {
+        }
+        // `lobpcg_split`'s head closure (its doc): after a Rayleigh–Ritz step, from the given head, while the next column
+        // and the head's last are one set within their bounds; the guess reads the given head
+        let tail_now = tail.map(|(head, tail_tol, checked)| {
+            (close.filter(|_| iterations > 0).map_or(head, |tau| close_head(&lambda, &col_res, head, checked, tau)), tail_tol, checked)
+        });
+        split_head = tail_now.map(|t| t.0);
+        for (i, &res) in col_res.iter().enumerate().take(nk) {
+            if let Some((head, tail_tol, checked)) = tail_now {
                 if i < head { head_res = head_res.max(res); } else if i < checked { tail_res = tail_res.max(res); }
                 if i < checked {
                     let scaled = if i < head { res } else { res * (tol / tail_tol) };
@@ -827,13 +862,13 @@ fn lobpcg_core(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuH
         // turned those exits into 200-iteration grinds on box states)
         if let Some(stop) = classify(stop_res, tol, iterations, max_iter, best_it, floor, guess_tol) {
             stats = EigenStats { iterations, max_residual: max_res, stop, readbacks, dispatches: b.dispatches() + gram_dispatches, fallbacks, alpha_worst, split_residual,
-                                 head_kept: iterations == 0 || locked > 0, restores, restores_exhausted };
+                                 split_head, head_kept: iterations == 0 || locked > 0, restores, restores_exhausted };
             break;
         }
         if let Some(abort) = should_abort.as_mut() {
             if abort() {
                 stats = EigenStats { iterations, max_residual: max_res, stop: Stop::Aborted, readbacks, dispatches: b.dispatches() + gram_dispatches, fallbacks, alpha_worst, split_residual,
-                                     head_kept: iterations == 0 || locked > 0, restores, restores_exhausted };
+                                     split_head, head_kept: iterations == 0 || locked > 0, restores, restores_exhausted };
                 break;
             }
         }
@@ -1371,6 +1406,27 @@ mod tests {
     /// The stop decision (module doc) on measured points: the early phase (residual ~30 Ha for
     /// 8+ iterations while the Ritz values descend) must not stop; a stall is a floor only
     /// inside the band; otherwise max_iter decides.
+    /// `lobpcg_split`'s head closure (plan 2026-11-13 Task 10 fix round 1, review I1), on the measured case: the Harris ↓
+    /// spectrum of pseudo-O M = 3 under Fermi–Dirac (33³ × 0.25, `harris_block_follows_a_partly_filled_shell`), split
+    /// (8, 6, 7) — the head's last level 0.4068616 and the guard 0.4068708 are a box pair 9.2e-6 Ha apart straddling the
+    /// head. With τ_scf = `qm::orbitals::tau(1e-6)` = 1e-4 and the measured residuals (head 2.3e-5, guard 6.9e-6) the head
+    /// takes the partner, up to `checked`; the next level, 3.3e-4 Ha up, is outside τ + r + r′ and stays out. A pair
+    /// 5e-4 apart (inside `GUARD_TOL` = 1e-3, which is not the gap) does not close; a head of 0 stays 0.
+    #[test]
+    fn the_split_head_closes_over_a_near_degenerate_pair() {
+        let tau = qm::orbitals::tau(1e-6);
+        assert_eq!(tau, 1e-4);
+        let eps = [-0.7836369, -0.2525990, -0.2525882, -0.2525115, 0.2613889, 0.4068616, 0.4068708, 0.4072016];
+        let res = [2e-6, 2e-6, 2e-6, 2e-6, 2e-6, 2.3e-5, 6.9e-6, 1e-5];
+        assert_eq!(close_head(&eps, &res, 6, 7, tau), 7, "the pair straddling the head joins it, up to checked");
+        assert_eq!(close_head(&eps, &res, 6, 8, tau), 7, "the level 3.3e-4 Ha above the pair stays out");
+        assert_eq!(close_head(&eps, &res, 5, 7, tau), 5, "0.2613889 → 0.4068616 is no set");
+        let apart = [-0.5, 0.1, 0.1005, 0.3];
+        assert_eq!(close_head(&apart, &[1e-6; 4], 2, 3, tau), 2, "5e-4 apart: not one set (GUARD_TOL is not the gap)");
+        assert_eq!(close_head(&apart, &[3e-4; 4], 2, 3, tau), 3, "the same pair while its residuals are large: one set within its bounds");
+        assert_eq!(close_head(&eps, &res, 0, 7, tau), 0, "no head, nothing to close");
+    }
+
     #[test]
     fn stop_classification() {
         let floor = 1.8e-6;

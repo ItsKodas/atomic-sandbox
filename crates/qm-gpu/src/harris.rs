@@ -111,7 +111,16 @@
 //! **A displayed τ-set reaching into the guards** (the m-th row degenerate with the next level — H₂ 33³'s
 //! box pair at 0.20857 Ha straddles m = 2): `block_edge` shows the whole set, so after each solve the shown
 //! count is checked against the head and, when it reaches past it, the head is raised to cover the shown
-//! rows and the solve continues (warm: only those columns move). Every shown row is then held to the full
+//! rows and the solve continues (warm: only those columns move). **Within** a solve the head is closed too (plan
+//! 2026-11-13 Task 10 fix round 1, review I1; `eigen::lobpcg_split`, `close_head`): after every Rayleigh–Ritz step,
+//! while the first tested column past the head lies within τ_scf + r + r′ of the head's last (r, r′ their true
+//! residuals: the pair may be one τ-set), the head takes it, up to `checked`. Without it a column held to the SCF's tol
+//! next to a near-degenerate partner held to `GUARD_TOL` converges at the rate of their tiny gap — pseudo-O ↓ under
+//! Fermi–Dirac, a box pair 9.2e-6 Ha apart (0.406862 / 0.406871) across the head of split (8, 6, 7), ran to the
+//! 200-iteration cap at a head residual of 2.3e-5 before the post-solve raise. The returned `splits` carry the closed head.
+//! The closure alone did not clear that cap (the closed 7-column head stalled at 2.3e-5), so a pass that **grows** the
+//! block also holds the head inside the old block, at most its length − 1: the grown columns are fresh seeds, and the
+//! head is raised over them in the next pass, warm (↓ there: (6, 4, 5) → (8, 5, 7) → (9, 7, 8), 224 iterations, no cap). Every shown row is then held to the full
 //! tol; the set's membership itself is judged on Ritz values whose error is ~r²/δ ≤ (1e-3)²/δ — at
 //! τ = 1e-4 a guard (the record's last vector included, when it matters) can be misjudged as in or out of
 //! the set only when its distance δ to the rest of the spectrum is ≲ 1e-2 Ha, and a level then shown is
@@ -571,8 +580,10 @@ impl GpuSolver {
                 solves[ch] += 1;
                 splits[ch] = (cur.len, cur.head, cur.checked);
                 // the lowest `head` at the SCF's tol, the guards up to `checked` at GUARD_TOL, the rest
-                // buffers (module doc, "Three roles, three tolerances")
-                let es = match lobpcg_split(ctx, k, g, r, &h, &mut x, &mut ev, w, tol, cur.head, guard_tol, cur.checked, EIGEN_MAX_ITER, Some(&mut *should_abort), Some(&mut res)) {
+                // buffers (module doc, "Three roles, three tolerances"); the head closed in-solve over a level within
+                // τ_scf + both residuals of its last one (module doc, "A displayed τ-set reaching into the guards")
+                let es = match lobpcg_split(ctx, k, g, r, &h, &mut x, &mut ev, w, tol, cur.head, guard_tol, cur.checked, tau_scf, EIGEN_MAX_ITER,
+                                            Some(&mut *should_abort), Some(&mut res)) {
                     Ok(es) => es,
                     Err(e) => { free.append(&mut x); outcome = Err(take_device_error().unwrap_or(e)); break 'channels; }
                 };
@@ -583,6 +594,8 @@ impl GpuSolver {
                     break 'channels;
                 }
                 info.iterations[ch] += es.iterations;
+                // the head the solve's last stop test read (its in-solve closure; `lobpcg_split`)
+                splits[ch].1 = es.split_head.unwrap_or(cur.head);
                 at_floor[ch] = es.stop == EigenStop::Floor;
                 if es.restores_exhausted {
                     notes.push(format!("spin {}: the eigensolve's Ritz-vector formation failed after {} restores (a level may be missing)", SPIN[ch], es.restores));
@@ -601,7 +614,7 @@ impl GpuSolver {
                     Occupations::FermiDirac { .. } => true,
                 };
                 // the occupations of this one diagonalisation; the occupied levels are the lowest by rank
-                let mut one = match one_shot_occupations(&ev, nc, ch as u8, settings.occupations) {
+                let mut one = match one_shot_occupations(&ev, nc, settings.occupations) {
                     Ok(o) => o,
                     Err(e) => { free.append(&mut x); outcome = Err(e); break 'channels; }
                 };
@@ -624,8 +637,15 @@ impl GpuSolver {
                 let shown = if keep <= sorted.len() { block_edge(&sorted[..keep], n_occ, keep, tau_scf).0 } else { 0 };
                 let edge = record_edge_matters(&sorted, n_occ, m, tau_scf);
                 let need = split_need(n_occ, m, shown, decisive, edge, one.window_short, k_max);
-                // never lower within a call (the next solve is warm: only the raised columns move)
-                let next = Split { len: cur.len.max(need.len), head: cur.head.max(need.head), checked: cur.checked.max(need.checked) };
+                // never lower within a call (the next solve is warm: only the raised columns move). A pass that grows the
+                // block holds the head inside the old block — at most cur.len − 1 (plan 2026-11-13 Task 10 fix round 1,
+                // review I1's minimal rule): the columns past it are fresh seeds, and a head raised over them at once can
+                // split a near-degenerate set with the new columns (pseudo-O ↓ under FD: a box pair 9.2e-6 Ha apart across
+                // split (8, 6, 7) ran to the 200-iteration cap even with the head closed in-solve, the closed 7-column head
+                // stalling at 2.3e-5 above its tol); the raise comes in the next pass, warm
+                let grows = need.len > cur.len;
+                let head = if grows { cur.head.max(need.head.min(cur.len.saturating_sub(1))) } else { cur.head.max(need.head) };
+                let next = Split { len: cur.len.max(need.len), head, checked: cur.checked.max(need.checked) };
                 if next == cur { break (ev, one, need, fd); }
                 // a partly filled shell or a witness reached past the tested columns, or a shown set into the guards:
                 // grow behind the Ritz vectors and/or raise the tiers, and solve again
@@ -784,7 +804,7 @@ mod tests {
         let kt = qm::ELECTRON_KT;
         let fd = Occupations::FermiDirac { kt };
         let short = [-1.0, -0.40, -0.39, -0.35];
-        let o = one_shot_occupations(&short, 2, 0, fd).expect("one shot");
+        let o = one_shot_occupations(&short, 2, fd).expect("one shot");
         assert!(o.window_short, "{o:?}");
         let k_max = split_bound(2, 0, MAX_WITNESS_GROWTH);
         assert_eq!(k_max, 2 + UNOCC_GUARD + MAX_WITNESS_GROWTH + 1);
@@ -980,8 +1000,14 @@ mod tests {
         let input = HarrisInput { system: &moved, settings: &settings, rho_in: [&scf.rho_up, &scf.rho_dn], unoccupied: 0 };
         let out = s.harris(&mut hs, &input, &mut || false).expect("no failure").expect("not aborted");
         println!("pseudo-O moved 0.3: ε {:?}, f {:?}, notes {:?}; SCF ε↑ {:?} f↑ {:?}", out.evals, out.occ, out.notes, scf.evals_up, scf.occ_up);
-        // Σf over the occupied levels: n_σ less the FD tail below PARTIAL_OCCUPATION_MIN (module doc, "Fermi–Dirac": ≤ k·1e-6)
-        for ch in 0..2 { assert!((neumaier(out.occ[ch].iter().copied()) - [at.n_up, at.n_dn][ch] as f64).abs() < 1e-5, "Σf = n_σ"); }
+        // Σf over the occupied levels: n_σ less the FD tail below PARTIAL_OCCUPATION_MIN (module doc, "Fermi–Dirac"): the
+        // computed levels not kept as occupied — at most split.len − n_occ of them — each hold f < 1e-6, and Σ over every
+        // computed f is n_σ to rounding (`fermi_dirac`), so the gap is ≤ (len − n_occ)·1e-6 + 1e-12 (review M1)
+        for ch in 0..2 {
+            let gap = (neumaier(out.occ[ch].iter().copied()) - [at.n_up, at.n_dn][ch] as f64).abs();
+            let dropped = out.split[ch].0 - out.n_occ[ch];
+            assert!(gap <= dropped as f64 * PARTIAL_OCCUPATION_MIN + 1e-12, "spin {ch}: |Σf − n_σ| = {gap:.3e} over {dropped} dropped levels");
+        }
         assert_eq!(hs.ionic.as_ref().expect("its own ionic terms").nuclei(), &moved.nuclei[..], "Harris's cache is the moved geometry");
         assert!(hs.state().unwrap().ionic.is_some(), "the Harris state records the setup");
         let dw = s.display_work(1).expect("the SCF state is still converged");
@@ -1112,7 +1138,7 @@ mod tests {
     /// n_occ: no growth solve).
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm-gpu --release")]
-    fn harris_block_follows_a_shared_shell() {
+    fn harris_block_follows_a_partly_filled_shell() {
         let Some(ctx) = ctx() else { return };
         let (mut s, sys, settings, scf) = solved_pseudo_o(&ctx);
         let mut hs = HarrisState::new();

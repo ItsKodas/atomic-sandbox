@@ -33,3 +33,12 @@ fd_internal -2.0006504639744724
 fd_ts 0.013835926284125768
 delta_e 0.028334552810852287
 # h4 FD at ELECTRON_KT: 31 steps; tol 1e-6, 31 steps, Δρ 9.26e-6, fractional [], released [], partial [PartialLevel { spin: 0, index: 1, eps: -0.1660917684388686, f: 0.5259828850299116 }, PartialLevel { spin: 0, index: 2, eps: -0.16505151598219517, f: 0.47401711497008836 }, PartialLevel { spin: 1, index: 1, eps: -0.1660917841521423, f: 0.5259836034753012 }, PartialLevel { spin: 1, index: 2, eps: -0.16505150287983622, f: 0.47401639652470023 }], notes []
+# Fix round 1 (Task 10 review M4): the same teacher under Fermi-Dirac at ELECTRON_KT (the GPU stops a partly occupied step
+# at GPU_PARTIAL_TOL = 1e-5), measured after the deletion. OH: E_FD -16.777454783579252, E_FD - E_DS = +7.3e-7 Ha (14x
+# inside eps_E = 1e-5; class T needs |E_new - E_old| <= eps_E), F_FD - E_DS = -6.93074e-3 (-2 kT ln 2 = -6.931472e-3, off
+# by +7.3e-7), TS 6.931472e-3, max |dF_I| 1.23e-5 Ha/Bohr (O, x; eps_F = 1.5e-4: 12x inside). H2: F_FD - E_DS = +7.6e-8,
+# TS 4.6e-19, max |dF_I| 5.9e-6. These margins are one cold solve each; V7 re-solves and judges its own.
+# Rule 7: at the H4 geometry the migration replaces a LOWER-F label. The shared-shell rule released the e pair into the
+# integer, broken-symmetry state (E_DS = F_DS -2.0289850168); Fermi-Dirac's cold solve reaches the symmetric ensemble,
+# F_FD -2.0144863903, i.e. F_FD - E_DS = +1.450e-2 Ha. The new label is the state the FD teacher converges to, not the
+# lowest one (spec 4.7(e), the restricted-vs-broken-symmetry H4 gap).

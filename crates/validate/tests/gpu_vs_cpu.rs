@@ -526,12 +526,13 @@ fn pseudo_case(ctx: &GpuContext, name: &str, grid: &Grid, sys: &System, settings
     // the levels compared (plan 2026-11-13 Task 10): the GPU's tested levels — all but its untested buffer, the highest
     // (Task 9c (c): its Ritz value decides nothing) — against the CPU's lowest as many; the two FD witness blocks need not
     // be the same size (each solver grows and trims its own), so the counts are not pinned equal, but the compared levels
-    // must cover every CPU-occupied level (f ≥ PARTIAL_OCCUPATION_MIN) and a witness above them
+    // must cover every CPU-occupied level (f ≥ PARTIAL_OCCUPATION_MIN) and at least one level above them (not necessarily
+    // an FD witness, θ − r ≥ μ + 36 kT: that is each solver's own growth test; review M3)
     let buffer = |n: usize| usize::from(n > 0);
     let (tu, td) = (gu.len() - buffer(sys.n_up), gd.len() - buffer(sys.n_dn));
     let occupied = |f: &[f64]| f.iter().filter(|&&x| x >= PARTIAL_OCCUPATION_MIN).count();
     let (nu, nd) = (occupied(&cpu_state.occ_up), occupied(&cpu_state.occ_dn));
-    assert!(tu.min(cu.len()) > nu && td.min(cd.len()) > nd, "{name}: the compared levels cover the occupied ones and a witness ({tu}/{} ↑ vs {nu}, {td}/{} ↓ vs {nd})", cu.len(), cd.len());
+    assert!(tu.min(cu.len()) > nu && td.min(cd.len()) > nd, "{name}: the compared levels cover the occupied ones and one level above ({tu}/{} ↑ vs {nu}, {td}/{} ↓ vs {nd})", cu.len(), cd.len());
     let deps = gu[..tu].iter().zip(&cu).chain(gd[..td].iter().zip(&cd)).map(|(g, c)| (g - c).abs()).fold(0.0, f64::max);
     let d = gpu.energy.total - cpu.energy.total;
     let (wc, wd) = worst_component(&gpu.energy, &cpu.energy);

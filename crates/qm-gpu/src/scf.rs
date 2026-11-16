@@ -2100,7 +2100,7 @@ mod tests {
     #[test]
     fn lobpcg_cap_warns_only_on_the_final_step() {
         let tol = 1e-6;
-        let es = |stop: EigenStop, res: f64| EigenStats { iterations: 7, max_residual: res, stop, readbacks: 15, dispatches: 80, fallbacks: 0, alpha_worst: 1.0, split_residual: None,
+        let es = |stop: EigenStop, res: f64| EigenStats { iterations: 7, max_residual: res, stop, readbacks: 15, dispatches: 80, fallbacks: 0, alpha_worst: 1.0, split_residual: None, split_head: None,
                                                           head_kept: false, restores: 0, restores_exhausted: false };
         let ms = Duration::from_millis(1);
         // early cap hit, final step converged: note, no warning
@@ -2919,7 +2919,8 @@ mod tests {
         // nothing; the levels compared are the GPU's tested ones against the CPU's lowest as many. Plan 2026-11-13 Task 10:
         // the two witness blocks need not have the same size under FD (pseudo-O ↓: the CPU's grown-and-trimmed block kept
         // 6 levels, the GPU 5 tested + the buffer, which sat 6.0e-5 Ha from the CPU's 6th tested level), so the counts
-        // are no longer pinned equal; the compared levels must still cover every CPU-occupied level and a witness above.
+        // are no longer pinned equal; the compared levels must still cover every CPU-occupied level and at least one level
+        // above them (not necessarily an FD witness, θ − r ≥ μ + 36 kT: that is each solver's own growth test; review M3).
         let buffer = |n: usize| usize::from(matches!(settings.occupations, Occupations::FermiDirac { .. }) && n > 0);
         let (tu, td) = (gu.len() - buffer(sys.n_up), gd.len() - buffer(sys.n_dn));
         let deps = gu[..tu].iter().zip(&cu).chain(gd[..td].iter().zip(&cd)).map(|(g, c)| (g - c).abs()).fold(0.0, f64::max);
@@ -2932,7 +2933,7 @@ mod tests {
                  stats.warnings, cpu_stats.warnings);
         let occupied = |f: &[f64]| f.iter().filter(|&&x| x >= qm::PARTIAL_OCCUPATION_MIN).count();
         let (ou, od) = (occupied(&cpu_state.occ_up), occupied(&cpu_state.occ_dn));
-        assert!(tu.min(cu.len()) > ou && td.min(cd.len()) > od, "{name}: the compared levels cover the occupied ones and a witness ({tu}/{} ↑ vs {ou}, {td}/{} ↓ vs {od})", cu.len(), cd.len());
+        assert!(tu.min(cu.len()) > ou && td.min(cd.len()) > od, "{name}: the compared levels cover the occupied ones and one level above ({tu}/{} ↑ vs {ou}, {td}/{} ↓ vs {od})", cu.len(), cd.len());
         assert!((st.occ_up.iter().sum::<f64>() - sys.n_up as f64).abs() < 1e-12 && (st.occ_dn.iter().sum::<f64>() - sys.n_dn as f64).abs() < 1e-12);
         // the same partly occupied levels (spin and rank; the shared clusters of the deleted shared-shell rule before plan
         // 2026-11-13 Task 10)
