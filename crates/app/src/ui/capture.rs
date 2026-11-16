@@ -6,7 +6,7 @@
 //! it, the finish's state and the last note. The popover's first button opens the pop-out view
 //! (`crate::capture::popout`, `Settings::popout`). Screenshot and Record go through [`Action`]; the
 //! settings are display state written to `UiState::capture` directly.
-use super::{icons, theme, Action, UiState, RED};
+use super::{icons, keyed, theme, Action, UiState, RED};
 use crate::capture::camera::{self, Aspect, CameraMode, CameraSettings};
 use crate::capture::{fs_words, RecordMode, Resolution};
 use egui::{pos2, Align2, Id, Order, Rect, RichText, Stroke, Vec2};
@@ -274,7 +274,7 @@ fn settings(ctx: &egui::Context, view: Rect, anchor: Rect, st: &mut UiState, cv:
                     if s.mode == RecordMode::SimTime {
                         ui.horizontal(|ui| {
                             ui.label("fs per frame");
-                            ui.add(egui::DragValue::new(&mut s.fs_per_frame).range(0.05..=100.0).speed(0.01).max_decimals(2).suffix(" fs"));
+                            keyed(ui, "capture-fs-per-frame", |ui| ui.add(egui::DragValue::new(&mut s.fs_per_frame).range(0.05..=100.0).speed(0.01).max_decimals(2).suffix(" fs")));
                         });
                         let per_ps = 1000.0 / s.fs_per_frame.max(1e-3) / crate::capture::clock::FPS;
                         theme::note(ui, format!("1 ps of simulation → {per_ps:.1} s of video; an O–H stretch (≈ 9 fs) gets {:.0} frames", 9.0 / s.fs_per_frame.max(1e-3)));
@@ -283,7 +283,7 @@ fn settings(ctx: &egui::Context, view: Rect, anchor: Rect, st: &mut UiState, cv:
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut s.stop_on, "stop at")
                             .on_hover_text("Stop by itself once the video is this long, however long the run takes to get there (a paused run records nothing in simulated time)");
-                        ui.add_enabled(s.stop_on, egui::DragValue::new(&mut s.stop_after_s).range(0.5..=3600.0).speed(0.5).max_decimals(1).suffix(" s of video"));
+                        keyed(ui, "capture-stop-after", |ui| ui.add_enabled(s.stop_on, egui::DragValue::new(&mut s.stop_after_s).range(0.5..=3600.0).speed(0.5).max_decimals(1).suffix(" s of video")));
                     });
                     if s.stop_on && s.mode == RecordMode::SimTime {
                         theme::note(ui, format!("{:.0} frames = {} of simulation at {} per frame", (s.stop_after_s * crate::capture::clock::FPS).round(), crate::capture::fs_words(s.stop_after_s * crate::capture::clock::FPS * s.fs_per_frame), fs_words(s.fs_per_frame)));
@@ -352,12 +352,12 @@ fn camera_controls(ui: &mut egui::Ui, c: &mut CameraSettings, window: &render::c
     });
     ui.horizontal(|ui| {
         ui.label("distance");
-        ui.add(egui::Slider::new(&mut c.distance, 1.0..=200.0).logarithmic(true).max_decimals(1).suffix(" Bohr"));
+        keyed(ui, "capture-distance", |ui| ui.add(egui::Slider::new(&mut c.distance, 1.0..=200.0).logarithmic(true).max_decimals(1).suffix(" Bohr")));
     });
     if c.mode == CameraMode::Orbit {
         ui.horizontal(|ui| {
             ui.label("orbit");
-            ui.add(egui::Slider::new(&mut c.orbit_deg_per_s, -120.0..=120.0).max_decimals(0).suffix("° / s of video"));
+            keyed(ui, "capture-orbit", |ui| ui.add(egui::Slider::new(&mut c.orbit_deg_per_s, -120.0..=120.0).max_decimals(0).suffix("° / s of video")));
         });
         if c.orbit_deg_per_s.abs() > 0.5 {
             theme::note(ui, format!("one turn per {:.0} s of video", 360.0 / c.orbit_deg_per_s.abs()));

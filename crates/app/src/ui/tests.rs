@@ -8845,6 +8845,60 @@ mod view_panel {
         assert_eq!(Look::of(&st), Look::of(&d));
     }
 
+    /// User report 2026-11-16 ("When trying to slide the brightness slider on View, it jumps up and
+    /// drags the amount slider"): a drag that starts on one of the LOOK card's two main sliders
+    /// moves that slider alone, though the first change turns the look "custom" and the label that
+    /// says so appears above the sliders mid-drag (it used to shift egui's auto ids by one, so the
+    /// lower slider's drag went to the upper one's new id). Each mode's pair, both ways, from the
+    /// preset that shows the pair.
+    #[test]
+    fn a_main_slider_drag_moves_only_that_slider() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let inp = input(&scene, None, &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        use super::super::dock::view::active_preset;
+        type Get = fn(&UiState) -> f32;
+        let amount: Get = |s| s.dots_amount;
+        let brightness: Get = |s| s.dots_brightness;
+        let opacity: Get = |s| s.opacity;
+        let gamma: Get = |s| s.gamma;
+        let iso: Get = |s| s.iso;
+        let bloom: Get = |s| s.bloom;
+        let pairs = [
+            (super::super::dock::view::GLOW, ("look-amount", amount), ("look-brightness", brightness)),
+            (super::super::dock::view::CLEAN, ("look-opacity", opacity), ("look-gamma", gamma)),
+            (super::super::dock::view::SCIENTIFIC, ("look-iso", iso), ("look-bloom", bloom)),
+        ];
+        for (look, upper, lower) in pairs {
+            for ((dragged, moves), (other, stays)) in [(lower, upper), (upper, lower)] {
+                let mut st = UiState::new("h2", &scene);
+                view_panel(&mut st, &[]);
+                look.apply(&mut st, &mut Vec::new());
+                st.volume_mode = look.volume_mode;
+                assert_eq!(active_preset(&st).map(|p| p.look()), Some(look), "{dragged}: a preset in force, no \"custom\" label yet");
+                for _ in 0..3 {
+                    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+                }
+                let (before, other_before) = (moves(&st), stays(&st));
+                // press on the rail's left part (the rail leads the slider's row), drag right
+                let r = probed_rect(dragged);
+                let mut at = egui::pos2(r.left() + 20.0, r.center().y);
+                frame(&ctx, &mut st, &inp, 1400.0, vec![egui::Event::PointerMoved(at), pointer(at, true)]);
+                for _ in 0..4 {
+                    at.x += 15.0;
+                    frame(&ctx, &mut st, &inp, 1400.0, vec![egui::Event::PointerMoved(at)]);
+                }
+                frame(&ctx, &mut st, &inp, 1400.0, vec![pointer(at, false)]);
+                frame(&ctx, &mut st, &inp, 1400.0, vec![egui::Event::PointerGone]);
+                assert_eq!(stays(&st), other_before, "dragging {dragged} moved {other}");
+                assert!(moves(&st) > before, "dragging {dragged} right raised it ({before} -> {})", moves(&st));
+                assert_eq!(active_preset(&st), None, "{dragged}: the look is custom now");
+            }
+        }
+    }
+
     /// Only the render mode's own controls are drawn: two in the card, the rest in "Fine-tune
     /// <mode>" (folded by default).
     #[test]

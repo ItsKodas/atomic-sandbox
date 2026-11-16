@@ -31,7 +31,7 @@
 //! row is drawn faint — never hidden, never re-sorted (the grouping reads the shares only). A
 //! one-nucleus scene and a payload without usable shares list as before ([`grouped`]; the latter
 //! with [`shares_note`]). Display only: nothing here is an `Action`.
-use super::super::{theme, Action, PanelInput, ShowMode, UiState, UNOCCUPIED_MAX};
+use super::super::{keyed, theme, Action, PanelInput, ShowMode, UiState, UNOCCUPIED_MAX};
 use super::selection::atom_name;
 use egui::{Color32, RichText, Ui};
 use sim::{LoneAtomLabels, OrbitalDisplay, OrbitalInfo, OrbitalRequest, Spin, SpinSummary, UnoccupiedStatus};
@@ -1352,8 +1352,7 @@ fn render_row(ui: &mut Ui, st: &mut UiState, spin: bool, acts: &mut Vec<Action>)
     if signed && st.volume_mode == VOLUME_ISO {
         super::group(ui, st, "d-orb-iso", |ui, st| {
             let iso = if spin { &mut st.spin_iso } else { &mut st.phase_iso };
-            let s = ui
-                .add(egui::Slider::new(iso, 0.02..=0.9).logarithmic(true).text(if spin { "iso (× the spin scale)" } else { "iso (× max|ψ|)" }))
+            let s = keyed(ui, "orbitals-iso", |ui| ui.add(egui::Slider::new(iso, 0.02..=0.9).logarithmic(true).text(if spin { "iso (× the spin scale)" } else { "iso (× max|ψ|)" })))
                 .on_hover_text("the ± isosurface: surfaces at ±iso times the field's scale. For an orbital the scale is the largest |ψ| over its degenerate set");
             super::super::probe("orbitals-iso", &s);
         });
@@ -1391,8 +1390,7 @@ fn coloured_controls(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisp
             }
         });
         if let Some(mut pct) = look.enclose {
-            let r = ui
-                .add(egui::Slider::new(&mut pct, 50..=99).suffix(" %").text("enclosed"))
+            let r = keyed(ui, "orbitals-enclosed", |ui| ui.add(egui::Slider::new(&mut pct, 50..=99).suffix(" %").text("enclosed")))
                 .on_hover_text("the share of each orbital's probability inside its surface (textbooks use 90 %): higher draws bigger, fuzzier-edged lobes");
             super::super::probe("orbitals-enclosed", &r);
             // one request when the slider is let go (or clicked), not one per step of a drag
@@ -1778,8 +1776,7 @@ fn levels_section(ui: &mut Ui, st: &mut UiState, payload: Option<&OrbitalDisplay
                     if unocc_here {
                         super::group(ui, st, "d-orb-unocc", |ui, st| {
                             let mut m = st.unoccupied;
-                            let r = ui
-                                .add(egui::DragValue::new(&mut m).range(0..=UNOCCUPIED_MAX).prefix("empty shown: "))
+                            let r = keyed(ui, "unoccupied", |ui| ui.add(egui::DragValue::new(&mut m).range(0..=UNOCCUPIED_MAX).prefix("empty shown: ")))
                                 .on_hover_text(format!("show unoccupied (m per spin, 0–{UNOCCUPIED_MAX}). {UNOCCUPIED_TIP}"));
                             super::super::probe("unoccupied", &r);
                             // one request when the drag is let go (or a value typed), not one per step of a drag

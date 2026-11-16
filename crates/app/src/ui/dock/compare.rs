@@ -3,7 +3,7 @@
 //! and with "relax both" the bond lengths and angles of both relaxed geometries. Raw total energies
 //! are never a deviation, and under pseudopotentials they are not shown at all (ours exclude the
 //! cores). Nothing here feeds the dynamics.
-use super::super::{theme, Action, PanelInput, UiState, AMBER, RED};
+use super::super::{keyed, theme, Action, PanelInput, UiState, AMBER, RED};
 use crate::reference::{self, Method, Probe, RelaxPhase};
 use egui::{RichText, Ui};
 
@@ -72,7 +72,7 @@ pub(super) fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: 
                 "relax ours (FIRE, as Relax does — it moves the scene) and theirs (geomeTRIC) from this geometry, then compare the bond lengths and angles",
             );
             ui.label("timeout");
-            ui.add(egui::DragValue::new(&mut st.compare.timeout_min).range(1..=600).suffix(" min"));
+            keyed(ui, "compare-timeout", |ui| ui.add(egui::DragValue::new(&mut st.compare.timeout_min).range(1..=600).suffix(" min")));
         });
     });
     if !geomopt {
