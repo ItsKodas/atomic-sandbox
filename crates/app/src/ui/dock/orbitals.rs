@@ -503,9 +503,10 @@ pub fn smeared_molecule_line(lone: LoneAtomLabels, z_sigma: f64) -> Option<Strin
 
 /// The notes of a payload the tab shows. A pick the viewer adopted from the HOMO placeholder
 /// (`UiState::orbital_pick_adopted`) never was the user's selection, so the producer's "selected
-/// orbital no longer exists" note — raised when its tracks restart, e.g. after an isolated-atom job
-/// of the estimated solver — is untrue for it and is dropped; the viewer re-adopts the HOMO. The
-/// note of a pick the user made stays. A Harris payload's per-atom electrons ([`PER_ATOM_NOTE`])
+/// orbital no longer exists" note — raised when it vanished — is untrue for it and is dropped; the
+/// viewer re-adopts the HOMO. (A renumbering, e.g. after an isolated-atom job of the estimated
+/// solver, raises no note: the producer finds the same orbital under its new track.) The note of a
+/// pick the user made stays. A Harris payload's per-atom electrons ([`PER_ATOM_NOTE`])
 /// are for the log (`Viewer::log_harris_input`), not the panel.
 pub fn visible_notes<'a>(o: &'a OrbitalDisplay, pick_adopted: bool) -> Vec<&'a String> {
     o.notes.iter().filter(|n| !(pick_adopted && n.starts_with(NO_LONGER_EXISTS)) && !n.starts_with(PER_ATOM_NOTE)).collect()

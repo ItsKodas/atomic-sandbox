@@ -23,12 +23,31 @@
 //!
 //! # The selection fallback (spec §7, "Orbital count changes")
 //! `OrbitalRequest::Orbital` names a track. When this update has no row with it (the producer was
-//! rebuilt, or the orbital stopped matching), the orbital shown is the one at the same channel
-//! and index as the vanished track had in the previous payload, if that exists, else the HOMO
-//! (the highest occupied row of either channel) — with the note "selected orbital no longer
-//! exists — showing …". The payload's `what` names the orbital actually shown. It is resolved
-//! inside the update (`qm_gpu::orbitals::OrbitalView::update_with`), so it costs no second
-//! readback.
+//! rebuilt, or the orbital stopped matching), the track's **identity** decides — its channel, its
+//! rank in the channel (`index`, energy order) and whether it is an unoccupied row of the display
+//! eigensolve, as of the last update that showed the requested track (kept across updates that do
+//! not), else as of the previous payload's rows:
+//! - an unoccupied pick in an update that computed **no unoccupied rows of its channel** (none
+//!   shown, none hidden at the block edge), with as many occupied rows per channel as then, is not
+//!   shown and has not vanished: the pick is left unresolved — no field, `what` the request, the
+//!   note [`NOT_COMPUTED`] — and such a payload does not answer the view (`sim::OrbitalViewRequest::answered_by`), so the driver keeps the
+//!   payload that shows it. Estimated mode with live orbitals meets this about every audit in
+//!   play (user report 2026-11-16: the pick switched to the HOMO every ~30 s): a Harris payload
+//!   carries its own unoccupied rows, the audit's converged payload after it carries none (the
+//!   Harris vectors are never a converged state's, `crate::ks` "Harris display", and its own
+//!   eigensolve is paused-only in play), and the tracker retires the unoccupied tracks for want
+//!   of their rows, so the next Harris payload numbers them afresh;
+//! - otherwise the row at the same channel and rank, of the same kind, is shown if it exists; it
+//!   is a **renumbering** — no note — when the occupied rows per channel are as many as then and
+//!   the track is a rebuilt producer's (below the id base: an isolated-atom job of the estimated
+//!   solver resets its teacher) or was retired across an update without unoccupied rows of its
+//!   channel (above); otherwise — another electron count or spin split, or a track the tracker
+//!   itself ended — it carries the note "selected orbital no longer exists — showing …";
+//! - else the HOMO (the highest occupied row of either channel), with that note: the orbital
+//!   genuinely vanished (fewer levels, its rank occupied now).
+//!
+//! The payload's `what` names the orbital actually shown. It is resolved inside the update
+//! (`qm_gpu::orbitals::OrbitalView::update_with`), so it costs no second readback.
 //!
 //! # Unoccupied orbitals (spec §4.5; plan Task 4)
 //! With `OrbitalViewRequest::unoccupied` = m > 0 (capped at [`UNOCCUPIED_MAX`]) the producer runs
@@ -437,6 +456,10 @@ pub enum TextureKind {
     Colour,
 }
 
+/// The note of a payload that cannot show the picked unoccupied orbital because it computed no
+/// unoccupied orbitals of that channel (module doc, "The selection fallback"): the pick stays.
+pub const NOT_COMPUTED: &str = "selected orbital not in this update";
+
 /// One provider's orbital-view state (module doc).
 #[derive(Debug, Default)]
 pub struct ViewState {
@@ -448,6 +471,48 @@ pub struct ViewState {
     next: u32,
     /// The last payload's rows (boundary ids): the selection fallback's "same channel and index".
     prev_rows: Vec<OrbitalInfo>,
+    /// The orbital the requested track was last resolved to (module doc, "The selection
+    /// fallback"): kept across payloads that do not show it.
+    identity: Option<Identity>,
+}
+
+/// What a picked orbital is when its track is gone: its channel, its rank in the channel (energy
+/// order, `OrbitalInfo::index`) and whether it is a display eigensolve's unoccupied row.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Identity {
+    /// The request's track (boundary id) it answers.
+    track: u32,
+    spin: qo::Spin,
+    index: usize,
+    unoccupied: bool,
+    /// The occupied rows per channel (↑, ↓) then: another count is another electron count or
+    /// spin split (spec §7, "Orbital count changes"), never a renumbering.
+    occupied: [usize; 2],
+    /// An update since computed no unoccupied rows of its channel: the tracker retired its track
+    /// for want of the row, not for a change of the orbital, so a later row at its rank is a
+    /// renumbering.
+    gap: bool,
+}
+
+/// The occupied rows (occupation > 0) per channel (↑, ↓).
+fn occupied_rows(rows: impl Iterator<Item = (qo::Spin, f64)>) -> [usize; 2] {
+    let mut n = [0; 2];
+    for (s, _) in rows.filter(|r| r.1 > 0.0) {
+        n[if s == qo::Spin::Up { 0 } else { 1 }] += 1;
+    }
+    n
+}
+
+/// A display eigensolve's unoccupied row (`qo::Row::residual` is set only for those).
+fn unoccupied_row(r: &qo::Row) -> bool {
+    r.residual.is_some()
+}
+
+/// The update shows no unoccupied row of channel `spin` and hides none at the block edge: none
+/// were computed (the view asks for none, or a converged state in play solved none).
+fn no_unoccupied(out: &qo::UpdateOutput, spin: qo::Spin) -> bool {
+    let ch = if spin == qo::Spin::Up { 0 } else { 1 };
+    out.hidden_unoccupied[ch] == 0 && !out.rows.iter().any(|r| r.spin == spin && unoccupied_row(r))
 }
 
 impl ViewState {
@@ -525,16 +590,34 @@ impl ViewState {
                 let (row, note) = match found {
                     Some(r) => (Some(r), None),
                     None => {
-                        // the same channel and index as the vanished track had, else the HOMO
-                        let same = self.prev_rows.iter().find(|r| r.spin == spin && r.track == track)
-                            .and_then(|p| out.rows.iter().find(|r| spin_out(r.spin) == p.spin && r.index == p.index));
+                        // what the track was: its last resolution, else its row in the last payload
+                        let id = self.identity.filter(|i| i.track == track).or_else(|| {
+                            self.prev_rows.iter().find(|r| r.spin == spin && r.track == track).map(|p| Identity {
+                                track, spin: spin_in(p.spin), index: p.index, unoccupied: p.residual.is_some(),
+                                occupied: occupied_rows(self.prev_rows.iter().map(|r| (spin_in(r.spin), r.occupation))), gap: false,
+                            })
+                        });
+                        let electrons = occupied_rows(out.rows.iter().map(|r| (r.spin, r.occupation)));
+                        // an unoccupied pick in an update that computed no unoccupied rows of its
+                        // channel, with the same electrons: not shown here, not vanished — the
+                        // request stays as it is
+                        if let Some(id) = id.filter(|i| i.unoccupied && i.occupied == electrons && no_unoccupied(out, i.spin)) {
+                            let note = format!("{NOT_COMPUTED} (no unoccupied orbitals of {} were computed for it) — it stays selected", if id.spin == qo::Spin::Up { "↑" } else { "↓" });
+                            return Pick { kind: PickKind::None, what: self.req.what.clone(), note: Some(note) };
+                        }
+                        // the same channel, rank and kind (occupied or unoccupied), else the HOMO
+                        let same = id.and_then(|i| out.rows.iter().find(|r| r.spin == i.spin && r.index == i.index && unoccupied_row(r) == i.unoccupied));
+                        // renumbered, not vanished: the same electrons per channel, and a track of a
+                        // producer since rebuilt (every id below `base`) or one retired across an
+                        // update without its row
+                        let renumbered = same.is_some() && id.is_some_and(|i| i.occupied == electrons && (track < self.base || i.gap));
                         let homo = || out.rows.iter().filter(|r| r.occupation > 0.0).fold(None::<&qo::Row>, |best, r| match best {
                             Some(b) if b.energy >= r.energy => Some(b),
                             _ => Some(r),
                         });
                         let r = same.or_else(homo);
                         // asking for the HOMO (`sim::TRACK_HOMO`) lost nothing: no note
-                        let note = r.filter(|_| track != sim::TRACK_HOMO).map(|r| format!("selected orbital no longer exists — showing {} {}", r.label, if r.spin == qo::Spin::Up { "↑" } else { "↓" }));
+                        let note = r.filter(|_| track != sim::TRACK_HOMO && !renumbered).map(|r| format!("selected orbital no longer exists — showing {} {}", r.label, if r.spin == qo::Spin::Up { "↑" } else { "↓" }));
                         (r, note)
                     }
                 };
@@ -602,6 +685,18 @@ impl ViewState {
         }).collect();
         if let Some(m) = rows.iter().map(|r| r.track + 1).max() {
             self.next = self.next.max(m);
+        }
+        // the requested orbital's identity, while its track is shown (module doc, "The selection
+        // fallback"); an update without unoccupied rows of its channel retires an unoccupied one's track
+        if let OrbitalRequest::Orbital { spin, track, .. } = self.req.what {
+            let shown = self.raw(track).and_then(|raw| out.rows.iter().find(|r| spin_out(r.spin) == spin && r.track == raw));
+            if let Some(r) = shown {
+                let occupied = occupied_rows(out.rows.iter().map(|r| (r.spin, r.occupation)));
+                self.identity = Some(Identity { track, spin: r.spin, index: r.index, unoccupied: unoccupied_row(r), occupied, gap: false });
+            }
+        }
+        if let Some(i) = self.identity.as_mut().filter(|i| i.unoccupied && no_unoccupied(out, i.spin)) {
+            i.gap = true;
         }
         let spin_out = spin_summary_out(spin, spin_noise);
         // the closed shell's spin density is noise (`SpinSummary::noise_l1`): nothing is drawn,
@@ -1233,8 +1328,9 @@ mod tests {
         assert!(show(&mut orbital_view, &summary(3e-5)).field.is_some());
     }
 
-    /// Ids exported past a rebuild never repeat; a selection of a vanished track falls back to the
-    /// same channel and index, else to the HOMO, with the note; an included track that vanished is
+    /// Ids exported past a rebuild never repeat; a selection of a vanished track (the electron
+    /// count changed) falls back to the same channel and index, else to the HOMO, with the note; an
+    /// included track that vanished is
     /// dropped with a note; "all occupied" takes the occupied rows.
     #[test]
     fn ids_survive_rebuilds_and_a_vanished_selection_falls_back() {
@@ -1289,6 +1385,105 @@ mod tests {
         let list = OrbitalViewRequest::new(OrbitalRequest::List);
         assert_eq!(v.set(list.clone()), ViewChange::Changed);
         assert_eq!(v.set(OrbitalViewRequest { force_every_step: true, ..list }), ViewChange::Same);
+    }
+
+    /// An unoccupied row of a display eigensolve (its residual set, occupation 0).
+    fn unocc_row(spin: qo::Spin, index: usize, track: u32, energy: f64) -> qo::Row {
+        qo::Row { residual: Some(1e-6), ..row(spin, index, track, energy, 0.0) }
+    }
+
+    /// One update through the view state: the pick, then the payload (as the producers call them).
+    fn show(v: &mut ViewState, out: &qo::UpdateOutput) -> OrbitalDisplay {
+        let spin = qo::SpinSummary { n_up: 1, n_dn: 1, integral: 0.0, abs_integral: 0.0, max_abs: 0.0, rho_max: 1.0 };
+        let p = v.pick(out);
+        let unoccupied = (v.request().unoccupied > 0).then(|| UnoccupiedStatus { requested: v.request().unoccupied, ..Default::default() });
+        v.display(Cell { n: 9, h: 0.5 }, [0.0; 3], Vec::new(), out, &spin, 0.0, p, None, unoccupied)
+    }
+
+    fn picked(d: &OrbitalDisplay) -> Option<(Spin, u32)> {
+        match d.what {
+            OrbitalRequest::Orbital { spin, track, .. } => Some((spin, track)),
+            _ => None,
+        }
+    }
+
+    /// The user report (2026-11-16, estimated mode with live orbitals): a picked unoccupied
+    /// orbital switched to the HOMO about every 30 s. A Harris payload carries its unoccupied
+    /// rows; an audit's converged payload in play carries none (the Harris vectors are dropped
+    /// before it, and its own eigensolve is paused-only), so the pick "vanished" and the HOMO was
+    /// shown — and the next Harris payload's unoccupied rows had fresh tracks, so it stayed lost.
+    /// Now the payload without unoccupied rows leaves the pick unresolved (no field, and it does
+    /// not answer the view, so the driver keeps the shown one), and the renumbered orbital is
+    /// found again by its identity: the same channel and energy rank, unoccupied — with no note.
+    #[test]
+    fn a_picked_unoccupied_orbital_survives_a_payload_without_unoccupied_rows() {
+        use qo::Spin::{Down, Up};
+        let mut v = ViewState::default();
+        v.set(OrbitalViewRequest { unoccupied: 4, ..OrbitalViewRequest::new(OrbitalRequest::List) });
+        let harris = |up_lumo: u32, dn_lumo: u32| output(vec![row(Up, 0, 0, -0.6, 1.0), unocc_row(Up, 1, up_lumo, 0.1), row(Down, 0, 2, -0.6, 1.0), unocc_row(Down, 1, dn_lumo, 0.1)]);
+        show(&mut v, &harris(1, 3));
+        // the user picks the ↑ LUMO (track 1); a Harris payload shows it
+        let req = OrbitalViewRequest { unoccupied: 4, ..OrbitalViewRequest::new(OrbitalRequest::Orbital { spin: Spin::Up, track: 1, squared: false }) };
+        v.set(req.clone());
+        assert_eq!(picked(&show(&mut v, &harris(1, 3))), Some((Spin::Up, 1)));
+        // an audit's converged payload: the occupied rows only
+        let audit = output(vec![row(Up, 0, 0, -0.61, 1.0), row(Down, 0, 2, -0.61, 1.0)]);
+        let d = show(&mut v, &audit);
+        assert_eq!(picked(&d), Some((Spin::Up, 1)), "not the HOMO: the request stays unresolved");
+        assert!(d.field.is_none());
+        assert!(!d.notes.iter().any(|n| n.starts_with("selected orbital no longer exists")), "{:?}", d.notes);
+        assert!(d.notes.iter().any(|n| n.starts_with(NOT_COMPUTED)), "{:?}", d.notes);
+        assert!(!req.answered_by(&d), "a payload that does not show the pick does not replace one that does");
+        // the next Harris payload: the tracker renumbered the unoccupied rows (4, 5)
+        let d = show(&mut v, &harris(4, 5));
+        assert_eq!(picked(&d), Some((Spin::Up, 4)), "the same orbital: ↑, rank 1, unoccupied");
+        assert!(d.notes.is_empty(), "renumbered, not vanished: {:?}", d.notes);
+        assert!(req.answered_by(&d));
+        // the viewer's newer request has not arrived yet: the same request resolves the same way
+        let d = show(&mut v, &harris(4, 5));
+        assert_eq!(picked(&d), Some((Spin::Up, 4)));
+        // it arrives; then an isolated-atom job rebuilds the producer: raw ids restart, still found
+        v.set(OrbitalViewRequest { unoccupied: 4, ..OrbitalViewRequest::new(OrbitalRequest::Orbital { spin: Spin::Up, track: 4, squared: false }) });
+        assert_eq!(picked(&show(&mut v, &harris(4, 5))), Some((Spin::Up, 4)));
+        v.rebuilt();
+        let d = show(&mut v, &harris(1, 3));
+        assert_eq!(picked(&d), Some((Spin::Up, 6 + 1)), "base 6 (ids 0..=5 exported) + raw 1");
+        assert!(d.notes.is_empty(), "{:?}", d.notes);
+    }
+
+    /// The fallback to the HOMO, with its note, stays for an orbital that genuinely vanished: the
+    /// unoccupied rows are there but not its rank (fewer levels), or its rank is occupied now (an
+    /// electron more); an occupied pick whose rank is gone (one ↓ electron less).
+    #[test]
+    fn a_vanished_pick_still_falls_back_to_the_homo() {
+        use qo::Spin::{Down, Up};
+        let pick = |track| OrbitalViewRequest { unoccupied: 4, ..OrbitalViewRequest::new(OrbitalRequest::Orbital { spin: Spin::Up, track, squared: false }) };
+        let first = output(vec![row(Up, 0, 0, -0.6, 1.0), unocc_row(Up, 1, 1, 0.1), unocc_row(Up, 2, 2, 0.2), row(Down, 0, 3, -0.6, 1.0)]);
+        let gone = |d: &OrbitalDisplay| d.notes.iter().any(|n| n.starts_with("selected orbital no longer exists"));
+        // fewer unoccupied levels: ↑ rank 2 is not shown any more
+        let mut v = ViewState::default();
+        v.set(pick(2));
+        show(&mut v, &first);
+        let fewer = output(vec![row(Up, 0, 0, -0.6, 1.0), unocc_row(Up, 1, 1, 0.1), row(Down, 0, 3, -0.6, 1.0)]);
+        let d = show(&mut v, &fewer);
+        assert_eq!(picked(&d), Some((Spin::Up, 0)), "the HOMO (↑ #1 at −0.6, before ↓ #1 at the same energy)");
+        assert!(gone(&d), "{:?}", d.notes);
+        // an electron more: rank 1 of ↑ is occupied now, its track renewed
+        let mut v = ViewState::default();
+        v.set(pick(1));
+        show(&mut v, &first);
+        let more = output(vec![row(Up, 0, 0, -0.6, 1.0), row(Up, 1, 7, -0.2, 1.0), unocc_row(Up, 2, 8, 0.2), row(Down, 0, 3, -0.6, 1.0)]);
+        let d = show(&mut v, &more);
+        assert_eq!(picked(&d), Some((Spin::Up, 7)), "the HOMO, not the unoccupied row at rank 2");
+        assert!(gone(&d), "{:?}", d.notes);
+        // an occupied pick whose rank is gone after a rebuild: the HOMO, with the note
+        let mut v = ViewState::default();
+        v.set(OrbitalViewRequest::new(OrbitalRequest::Orbital { spin: Spin::Down, track: 1, squared: false }));
+        show(&mut v, &output(vec![row(Up, 0, 0, -0.6, 1.0), row(Down, 0, 1, -0.5, 1.0)]));
+        v.rebuilt();
+        let d = show(&mut v, &output(vec![row(Up, 0, 0, -0.6, 1.0)]));
+        assert_eq!(picked(&d), Some((Spin::Up, 2)));
+        assert!(gone(&d), "{:?}", d.notes);
     }
 
     /// Task 4 re-review N2/N3: an interrupted eigensolve is stated in the status (`interrupted`,
