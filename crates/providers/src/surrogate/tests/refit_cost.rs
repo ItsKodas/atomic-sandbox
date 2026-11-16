@@ -430,7 +430,8 @@ fn refit_state(s: &SurrogateKs) -> String {
         format!("class_blockers {:?}", s.class_blockers),
         format!("class_memory {:?}", s.class_memory),
         format!("active_set {:?}", s.active_set),
-        format!("null_space {:?}", s.null_space.as_ref().map(|n| n.dimension())),
+        // the whole null space, bit for bit (2026-11-17: deferred to the standing fit too)
+        format!("null_space {:?} pending {}", s.null_space, s.null_space_pending),
         format!("quarantine {quarantine:?}"),
         format!("degree_cap {:?} body4_degree {}", s.degree_cap, s.body4_degree),
         format!("recovery {:?}", s.recovery_note()),
@@ -497,6 +498,7 @@ fn a_deferred_refit_leaves_the_eager_refits_state() {
             println!("body4_off {body4_off}, eager {eager}: {} fits in the refit, {} held, recovery {:?}, trusted {}", s.fits - fits, s.quarantined(), s.recovery_note(), s.trusted());
             assert!(s.fits - fits >= 3, "the premise: the refit runs the recovery's fits ({})", s.fits - fits);
             assert_eq!(s.deferred_trust, None, "the passes are the standing fit's");
+            assert!(!s.null_space_pending && s.null_space.is_some(), "the null space is the standing fit's");
             // and a second refit from there (the recovery's state carried over)
             s.refit().unwrap();
             states.push(refit_state(&s));
