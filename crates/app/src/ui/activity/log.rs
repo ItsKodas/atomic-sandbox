@@ -38,11 +38,29 @@ pub fn counters(ui: &mut Ui, st: &ActivityState, m: Option<&crate::sim::ModelSta
     // lone-atom steps answered from the references (rule 0b): their own kind — no solve, not a
     // fallback, not a model answer, nothing learned
     if let Some(n) = m.map(|m| m.solves.reference).filter(|&n| n > 0) {
-        tips.push(format!("lone-atom steps from the references: {n} — steps whose atoms had no neighbour within the model's cutoff, answered from the isolated-atom references (E = Σ E_ref, zero forces: the model's own answer there): no DFT solve, not a fallback, not a model answer, nothing learned, never audited. Counted since the solver was built or the model forgotten"));
+        tips.push(lone_atom_tip(n));
     }
     // teaching solves only: a plain DFT step is not one (plan review S16)
     tips.push(format!("teaching solves this session: {} — teacher solves offered to a model since the app started, over every solver switch; plain DFT steps are not counted", st.session_solves));
     super::jobs::two_sides(ui, &left, &right, FontId::monospace(11.0), theme::INK_DIM).on_hover_text(tips.join("\n\n"));
+}
+
+/// The counters' hover line for the lone-atom steps answered from the references (`n` of them): E = Σ E_ref, with the
+/// references' free-energy reading (spec 2026-11-13 §4.7(i), `pseudo::reference_free_energy_note`).
+pub fn lone_atom_tip(n: u64) -> String {
+    format!(
+        "lone-atom steps from the references: {n} — steps whose atoms had no neighbour within the model's cutoff, answered from the isolated-atom references (E = Σ E_ref, zero forces: the model's own answer there): no DFT solve, not a fallback, not a model answer, nothing learned, never audited. Counted since the solver was built or the model forgotten. {}",
+        crate::ui::pseudo::reference_free_energy_note()
+    )
+}
+
+/// A solve's electronic-entropy term as its solve line prints it (spec 2026-11-13 §6.6): "−TS = 9.5 mHa" (µHa below
+/// 0.1 mHa), only when TS ≥ 1e-6 Ha — a gapped solve says nothing.
+pub fn ts_text(ts: f64) -> Option<String> {
+    if !(ts >= 1e-6) {
+        return None;
+    }
+    Some(if ts >= 1e-4 { format!("−TS = {:.1} mHa", ts * 1e3) } else { format!("−TS = {:.1} µHa", ts * 1e6) })
 }
 
 /// The step cell of a log row and its hover (plan review M6): `pass` for a pass solve, else the

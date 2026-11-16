@@ -3571,7 +3571,7 @@ mod orbital_viewer {
         let levels = Levels::of(&rows);
         assert!(levels.fractional && levels.gap().is_none(), "{levels:?}");
         let line = orbitals::levels_line(&levels).expect("a HOMO line");
-        assert!(line.starts_with("HOMO −0.280 Ha") && line.contains("partly filled shell: no HOMO–LUMO gap"), "{line}");
+        assert!(line.starts_with("HOMO −0.280 Ha") && line.contains("partly occupied levels: no HOMO–LUMO gap"), "{line}");
         assert!(!line.contains("Kohn–Sham gap"), "{line}");
         let v = RowView::of(&rows[3], &levels);
         assert_eq!(v.occupation, "0.33", "{v:?}");
@@ -3579,6 +3579,37 @@ mod orbital_viewer {
         // an integer-occupation list is unchanged
         let h2 = Levels::of(&h2_rows());
         assert!(!h2.fractional && h2.gap().is_some());
+    }
+
+    /// Plan 2026-11-13 Task 12 (spec §6.6): the rows show each level's Fermi–Dirac f — f = ⅓ shows its f (and its
+    /// "occ 1/3" badge's tip is the per-level wording, not the `DegenerateShells` "shared equally" one); a level with
+    /// f < 1e-6 (a witness tail) shows as empty: not occupied, not the HOMO, and the LUMO when it is the lowest empty
+    /// level; one within 1e-6 of 1 shows as full.
+    #[test]
+    fn orbital_rows_per_level_f() {
+        let third = 1.0 / 3.0;
+        let rows = vec![
+            row(Spin::Up, 0, 1, 0, -0.87, 1.0 - 4e-7, idx(1)),
+            row(Spin::Down, 0, 2, 0, -0.83, 1.0, idx(1)),
+            row(Spin::Down, 1, 3, 1, -0.28, third, idx(2)),
+            row(Spin::Down, 2, 4, 2, 0.05, 9e-7, idx(3)),
+        ];
+        let levels = Levels::of(&rows);
+        assert_eq!(levels.homo, Some(-0.28), "the f-tail level is not the HOMO: {levels:?}");
+        assert_eq!(levels.lumo, Some(0.05), "{levels:?}");
+        let full = RowView::of(&rows[0], &levels);
+        assert_eq!((full.occupation.as_str(), full.occupied), ("1", true), "{full:?}");
+        let part = RowView::of(&rows[2], &levels);
+        assert_eq!((part.occupation.as_str(), part.occupied), ("0.33", true), "{part:?}");
+        assert_eq!(orbitals::fraction_text(orbitals::shown_f(&rows[2])), "1/3");
+        let empty = RowView::of(&rows[3], &levels);
+        assert_eq!((empty.occupation.as_str(), empty.occupied), ("0", false), "{empty:?}");
+        assert!(empty.tags.iter().any(|t| t.text == "LUMO") && !empty.tags.iter().any(|t| t.text.starts_with("HOMO")), "{empty:?}");
+        assert_eq!(orbitals::shown_f(&rows[3]), 0.0);
+        for tip in [orbitals::OCC_TIP, orbitals::OCC_PAIR_TIP] {
+            assert!(tip.contains("Fermi–Dirac f") && tip.contains("T_el") && tip.contains("f below 1e-6 shows as empty"), "{tip}");
+            assert!(!tip.contains("spherical-atom ensemble"), "the DegenerateShells wording is gone: {tip}");
+        }
     }
 
     /// ε = −0.5 Ha reads "−0.500" and "−13.61" (units::HARTREE_IN_EV); the tags the rows carry.
@@ -5936,7 +5967,7 @@ mod activity_headline {
         let pass = r.iter().find(|r| r.key == JobKey::Pass).unwrap();
         assert_eq!(pass.detail, "bond scan · sample 42 of 158 · iteration 37 / 200");
         let l = pass.scf.expect("the pass row carries the record");
-        assert_eq!(scf_lines(&l), ("Δρ 3.2e-5 → 1e-6 · ΔE −2.1e-4 Ha · 85 ms/iteration".to_string(), None));
+        assert_eq!(scf_lines(&l), ("Δρ 3.2e-5 → 1e-6 · ΔF_HF −2.1e-4 Ha · 85 ms/iteration".to_string(), None));
         // the stall countdown, from STALL_TAG_FROM on
         assert_eq!(scf_lines(&record(80, 1, STALL_TAG_FROM - 1)).1, None);
         assert_eq!(scf_lines(&record(80, 1, 31)).1.as_deref(), Some("no 2× gain for 31 / 50"));
@@ -12288,6 +12319,72 @@ mod readouts_merge {
             assert!(checked > 30, "{checked} texts checked");
         }
     }
+
+    // ---- Fermi–Dirac smearing (plan 2026-11-13 Task 12, spec §6.6) ----
+
+    /// The breakdown reads kinetic … nuclear, then E (internal), −TS at T_el and F, with −TS the negative of
+    /// `energy.ts` and F the total.
+    #[test]
+    fn breakdown_rows() {
+        use super::super::dock::readouts::breakdown_rows;
+        let e = sim::EnergyBreakdown { kinetic: 1.0, external: -2.0, hartree: 0.5, xc: -0.25, nuclear: 0.125, internal: -0.625, ts: 9.5477e-3, total: -0.625 - 9.5477e-3 };
+        let rows = breakdown_rows(&e);
+        let names: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["kinetic (electrons)", "external", "Hartree", "xc", "nuclear", "E (internal)", "−TS (electronic entropy, T_el 1579 K)", "F"]);
+        let values: Vec<f64> = rows.iter().map(|(_, x)| *x).collect();
+        assert_eq!(values, [1.0, -2.0, 0.5, -0.25, 0.125, -0.625, -9.5477e-3, -0.625 - 9.5477e-3]);
+    }
+
+    /// "E total" is KE + F; the F row's label and tooltip; on screen in the Energies section and the breakdown.
+    #[test]
+    fn e_total_reads_ke_plus_f() {
+        use super::super::dock::readouts::{energy_tip, ENERGIES_INFO, E_TOTAL_TIP, CHART_TIP};
+        assert_eq!(E_TOTAL_TIP, "KE + F: conserved in NVE without tools");
+        assert!(ENERGIES_INFO.starts_with("E total = KE + F: conserved in NVE without tools") && CHART_TIP.starts_with("E total = KE + F:"));
+        assert!(!ENERGIES_INFO.contains("E_KS") && !CHART_TIP.contains("E_KS"));
+        assert!(energy_tip(&[]).starts_with(pseudo::ENERGY_TOOLTIP));
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = with_history(&scene, 50, |_| -1.1667, |_| 300.0);
+        snap.dynamics.source = Source::Dft;
+        snap.dynamics.eval.energy = sim::EnergyBreakdown { internal: -1.16, ts: 2e-3, total: -1.162, ..Default::default() };
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        alone(&mut st, DockTab::Readouts);
+        st.energy_units = EnergyUnits::Ha;
+        st.readouts_sections.set(Section::Breakdown, true);
+        let (t, _) = texts_and_shapes(&ctx, &mut st, &inp, egui::vec2(1400.0, 1600.0));
+        for want in ["F (electronic free energy, T_el 1579 K)", "E total", "E (internal)", "−TS (electronic entropy, T_el 1579 K)", "-0.002000"] {
+            assert!(t.contains(want), "{want:?}:\n{t}");
+        }
+        assert!(!t.contains("E_KS"), "{t}");
+    }
+
+    /// A flagged step's formatted branch-jump warning (`sim::branch_jump_warning`, not the `BRANCH_JUMP_WARNING` key)
+    /// is exactly one line of the readouts' warning list, and prints on screen.
+    #[test]
+    fn branch_jump_warning_shown() {
+        use super::super::dock::readouts::eval_warnings;
+        let want = "F changed by 12.0 mHa more than the forces' work: the SCF moved to another stationary state (not trained on)";
+        let mut eval = sim::EvalStats::default();
+        eval.branch_jump = Some(0.012);
+        eval.warnings.push(sim::branch_jump_warning(0.012));
+        assert_eq!(eval_warnings(&eval), vec![want.to_string()]);
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = with_history(&scene, 50, |_| -1.1667, |_| 300.0);
+        snap.dynamics.eval = eval;
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        alone(&mut st, DockTab::Readouts);
+        let (t, _) = texts_and_shapes(&ctx, &mut st, &inp, egui::vec2(1400.0, 1200.0));
+        assert_eq!(t.matches(want).count(), 1, "{t}");
+        assert!(!t.contains(&format!("{}\n", sim::BRANCH_JUMP_WARNING)), "the formatted text, not the key:\n{t}");
+    }
 }
 
 /// The Selection panel (user request 2026-11-14, the approved mockup): the atom card with its
@@ -13207,4 +13304,45 @@ fn forget_by_rule_needs_its_inline_confirmation() {
     let line = crate::replay::write_line(&crate::replay::Line::Action(a));
     assert!(line.starts_with("# not replayable: forget-by-rule"), "{line}");
     assert!(!crate::replay::is_harmless("forget-by-rule"));
+}
+
+/// Fermi–Dirac smearing's words outside the Readouts (plan 2026-11-13 Task 12, spec §6.6, §4.7(i)).
+mod fermi_smearing_words {
+    use super::*;
+
+    /// The solve line's −TS: 9.5477e-3 Ha (a lone O at M = 3 at 5 mHa) reads "−TS = 9.5 mHa"; below 1e-6 Ha nothing.
+    #[test]
+    fn solve_log_ts_line() {
+        use activity::log::ts_text;
+        assert!(ts_text(9.5477e-3).is_some_and(|t| t.contains("−TS = 9.5 mHa")), "{:?}", ts_text(9.5477e-3));
+        assert_eq!(ts_text(9e-7), None);
+        assert_eq!(ts_text(0.0), None);
+        assert_eq!(ts_text(f64::NAN), None);
+        assert_eq!(ts_text(2e-6).as_deref(), Some("−TS = 2.0 µHa"), "a small TS keeps its digits");
+    }
+
+    /// Spec §4.7(i): every text that shows energies against the isolated-atom references says they are free
+    /// energies at T_el — the parity toggle, axis and caption, the pair curve's axis, the lone-atom counter's hover.
+    #[test]
+    fn reference_energies_say_free_energy() {
+        let says = |t: &str| t.contains("free energies") && t.contains("T_el");
+        let note = pseudo::reference_free_energy_note();
+        assert!(says(&note) && note.contains("T_el = 1579 K"), "{note}");
+        for (site, text) in [
+            ("parity toggle", activity::plots::parity_toggle_tip()),
+            ("parity axis", activity::plots::PARITY_AXIS.to_string()),
+            ("parity caption", activity::plots::parity_caption("")),
+            ("pair curve axis", activity::plots::PAIR_AXIS.to_string()),
+            ("lone-atom counter", activity::log::lone_atom_tip(3)),
+        ] {
+            assert!(says(&text), "{site}: {text}");
+        }
+        assert!(activity::plots::parity_toggle_tip().contains("(E − Σ E_ref)/N") && activity::log::lone_atom_tip(3).contains("E = Σ E_ref"));
+    }
+
+    /// The Activity iteration energy is F_HF (spec §6.6: same row, renamed).
+    #[test]
+    fn iteration_energy_is_f_hf() {
+        assert!(activity::jobs::ITERATION_ENERGY_TIP.contains("F_HF") && activity::jobs::ITERATION_ENERGY_TIP.contains("T_el"));
+    }
 }

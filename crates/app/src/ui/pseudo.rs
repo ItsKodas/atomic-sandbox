@@ -29,7 +29,7 @@ pub fn needs_finer(pseudised: &[PseudoSummary], h: f64) -> Option<String> {
 pub const IONIC_TIP: &str = "how the nuclei and their core electrons enter: all-electron — every electron on the grid, nuclei smeared at σ = h (heavy atoms lose most of their energy to the smearing); cores only — each species with a core gets a pseudopotential generated from this program's own all-electron atom (H, He stay all-electron); accepted species (the default) — every species the recipe accepts, H and He included (their first use checks the pseudised dimer against this program's own all-electron dimer: ≈ 1 min on the GPU, once per recipe — the verdict is kept on disk; without a GPU they stay all-electron with a note), and a species it refuses (Li, Be, Na, Mg, Al) all-electron with a note; all species — H and He too, and a refused species is an error. Pseudopotential energies are valence energies: not comparable with all-electron totals; energy differences are the physics";
 
 /// The honesty line under the policy switch (spec §6.5).
-pub const VALENCE_NOTE: &str = "E_KS is a valence energy under a pseudopotential (spec §6.5): totals are not comparable with all-electron ones — differences are the physics";
+pub const VALENCE_NOTE: &str = "F is a valence energy under a pseudopotential (spec §6.5): totals are not comparable with all-electron ones — differences are the physics";
 
 /// The tooltip of View ▸ Density ▸ with partial core.
 pub const PARTIAL_CORE_TIP: &str = "adds ρ_pc — a display of the generator's core model, not solved. The partial core is the smooth stand-in for the frozen core's density that the exchange–correlation functional sees (spec §4.5); it never enters the Hartree potential, and the display never feeds the solve. Applies from the next step";
@@ -106,10 +106,36 @@ pub fn coarsest_allowed(pseudised: &[PseudoSummary]) -> Option<(f64, u8)> {
     pseudised.iter().filter_map(|p| p.h_req.map(|h| (h, p.z))).min_by(|a, b| a.0.total_cmp(&b.0))
 }
 
-/// The Readouts row label of the Kohn-Sham energy ("E_KS", or its valence reading under a
-/// pseudopotential — spec §6.5).
-pub fn energy_label(pseudised: &[PseudoSummary]) -> &'static str {
-    if pseudised.is_empty() { "E_KS" } else { "E_KS (valence, pseudopotential)" }
+/// The electronic temperature T_el of every solve in kelvin, rounded: kT = `qm::ELECTRON_KT` (5 mHa) converted
+/// through `units` here, at the display edge (rule 3; Fermi–Dirac spec 2026-11-13 §6.6) — 1579 K.
+pub fn t_el_kelvin() -> u32 {
+    units::hartree_to_kelvin(qm::ELECTRON_KT).round() as u32
+}
+
+/// The Readouts row label of the Kohn–Sham energy (Fermi–Dirac spec 2026-11-13 §6.6): the electronic free energy F
+/// at T_el, with its valence reading under a pseudopotential (spec §6.5) — "F (electronic free energy, T_el 1579 K)".
+pub fn energy_label(pseudised: &[PseudoSummary]) -> String {
+    let t = t_el_kelvin();
+    if pseudised.is_empty() { format!("F (electronic free energy, T_el {t} K)") } else { format!("F (electronic free energy, valence, pseudopotential, T_el {t} K)") }
+}
+
+/// The tooltip of the F row (Fermi–Dirac spec 2026-11-13 §6.6, verbatim). Its T_el and kT are pinned to
+/// `qm::ELECTRON_KT` by the tests.
+pub const ENERGY_TOOLTIP: &str = "Kohn–Sham free energy F = E − T_el·S at the electronic temperature T_el = 1579 K (kT = 5 mHa). For a gapped molecule TS = 0 and F = E. Partly occupied levels (open shells, nearly degenerate frontier levels) carry TS > 0. The forces, the dynamics and the trained model all use F. T_el is a fixed numerical electronic temperature, independent of the thermostat; F does not include the nuclei's entropy.";
+
+/// The breakdown's −TS row label: "−TS (electronic entropy, T_el 1579 K)" (spec 2026-11-13 §6.6).
+pub fn ts_label() -> String {
+    format!("−TS (electronic entropy, T_el {} K)", t_el_kelvin())
+}
+
+/// What the app adds wherever it shows an energy against isolated-atom references (E − Σ E_ref, E = Σ E_ref; spec
+/// 2026-11-13 §4.7(i)): the references are free energies at T_el, so an open-shell atom's −TS (9.55 mHa for a lone O
+/// at M = 3) lowers its reference and a bound molecule's binding energy against it reads smaller by that much.
+pub fn reference_free_energy_note() -> String {
+    format!(
+        "the energies and the isolated-atom references E_ref are Kohn–Sham free energies F = E − TS at T_el = {} K: an open-shell atom's partly occupied levels lower its E_ref by TS (9.5 mHa for a lone O), so a molecule's binding energy against the references is smaller than with integer occupations by its atoms' TS",
+        t_el_kelvin()
+    )
 }
 
 /// One line per partly occupied level of the final step (`EvalStats::partial`, Fermi–Dirac occupations; spec
@@ -178,7 +204,26 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], "partly occupied: level 2 (↓), ε = -0.3123 Ha, f = 0.333");
         assert!(occupation_lines(&[]).is_empty());
-        assert_eq!(energy_label(&[]), "E_KS");
-        assert_eq!(energy_label(&[summary(8, 6.0, None, None)]), "E_KS (valence, pseudopotential)");
+    }
+
+    /// Plan 2026-11-13 Task 12 (spec §6.6): the row reads F at T_el, its K converted from `qm::ELECTRON_KT` here.
+    #[test]
+    fn energy_label_reads_f() {
+        assert_eq!(t_el_kelvin(), units::hartree_to_kelvin(qm::ELECTRON_KT).round() as u32);
+        assert_eq!(t_el_kelvin(), 1579);
+        assert_eq!(energy_label(&[]), "F (electronic free energy, T_el 1579 K)");
+        assert_eq!(energy_label(&[summary(8, 6.0, None, None)]), "F (electronic free energy, valence, pseudopotential, T_el 1579 K)");
+    }
+
+    /// Spec §6.6's tooltip, verbatim; its T_el and kT follow `qm::ELECTRON_KT`.
+    #[test]
+    fn energy_tooltip_text() {
+        assert_eq!(
+            ENERGY_TOOLTIP,
+            "Kohn–Sham free energy F = E − T_el·S at the electronic temperature T_el = 1579 K (kT = 5 mHa). For a gapped molecule TS = 0 and F = E. Partly occupied levels (open shells, nearly degenerate frontier levels) carry TS > 0. The forces, the dynamics and the trained model all use F. T_el is a fixed numerical electronic temperature, independent of the thermostat; F does not include the nuclei's entropy."
+        );
+        assert!(ENERGY_TOOLTIP.contains(&format!("T_el = {} K", t_el_kelvin())));
+        assert!(ENERGY_TOOLTIP.contains(&format!("(kT = {} mHa)", qm::ELECTRON_KT * 1e3)));
+        assert_eq!(ts_label(), "−TS (electronic entropy, T_el 1579 K)");
     }
 }
