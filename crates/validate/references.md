@@ -5151,7 +5151,9 @@ LSDA (the reviewer's f64 atom, `scratchpad/li_rev/li_radial.py`):
 
 The display test therefore checks the integer-occupied Li (Aufbau explicit); what FD shows at coarse σ is this gap.
 
-**Open failure: `validate --test surrogate h3plus_tier`** (plan Task 9; owned by plan Task 9b, review C1). The H₃⁺
+**Closed in plan Task 9b: `validate --test surrogate h3plus_tier`** (re-run 2026-11-17: the sampling pass solved 296 of
+297 jobs, 0 skipped, 0 failed; the held-out tier and both modes pass; "Witness columns at a guard tolerance" below).
+The failure as recorded at Task 9 (owned by plan Task 9b, review C1): The H₃⁺
 pass's scan 0–2 point at 1.6 r₀ (atom 2 moved along the 0–2 axis of the relaxed triangle; all-electron, 49³ × 0.25, the
 sample tolerance 1e-6) ends at the 200-step cap with Δρ 9.2e-5, and the stretched-tail rule skips its 2 further-out points;
 the test requires (failed, skipped) = (0, 0). Reproduced cold through `problem` + `GpuSolver`: from step 9 the steps
@@ -5165,13 +5167,94 @@ marginal — the diffuse witness tips it). Plan Task 9b fixes it: both classify 
 "frozen" means the tight columns did not move, and `h3plus_tier` plus a direct cold H₃⁺ test (1.6 r₀, bounded steps and
 DIIS resets) become its acceptance tests. Task 9 is not done until it passes.
 
-**Not completed: `validate --test surrogate the_stuck_escape_repro_is_answered_honestly`** (all-electron H₂ teacher
-under FD). Run alone twice (2026-11-16, 11:35 and 12:53), it did not finish within the 15-minute GPU batch and was
+**Run in plan Task 9b, failing: `validate --test surrogate the_stuck_escape_repro_is_answered_honestly`** (2026-11-17,
+with `h3plus_tier` in one invocation: 1280 s for the two, i.e. ≈ 20 min for this test alone — no longer cut off, the
+witness cost fix brought it in). It **fails its gate**: on the hot run 7 model answers lie beyond the energy tier or 3×
+the force bound (steps 163 and 804–810; |ΔE|/N 6.4e-4 … 3.9e-3 Ha, force residual / bound 3.2 … 9.1; face densities
+1.5–1.9e-5, just under the box-affected cut), and the edited NVE run judged 2 of 3 answers beyond 1× the bound (worst
+2.03×, inside its 3× gate). This is the surrogate's trust policy on the all-electron FD teacher surface (plan Task 9's
+switch), not a solver number: open for the controller. Before 9b the record was: Run alone twice (2026-11-16, 11:35 and 12:53), it did not finish within the 15-minute GPU batch and was
 stopped; at Task 8 the whole surrogate suite took 532–545 s. It becomes a plan Task 9b acceptance test (the witness cost
 fix must bring it inside one batch, then it must pass). Pre-preview check on the user's surface (Accepted, pseudo-H):
 a cold H₃⁺ with the pair at 1.6 r₀, tol 1e-6, through `problem` + `effective_gpu_tol` converges in 15 steps at
 49³ × 0.25 (no DIIS reset) and in 16 at 81³ × 0.15 (one reset after a single frozen step at Δρ 6.6e-4), without the
 all-electron case's 0/25-iteration alternation.
+
+### Witness columns at a guard tolerance (plan 2026-11-13 Task 9b, 2026-11-16/17, release, RX 7900 XTX)
+
+The rule and its derivation are `qm::occupations`' module doc ("Witness columns at a guard tolerance"); the GPU's
+split stop, locking, frozen definition, convergence-phase guess band and formation check are `qm_gpu::eigen` /
+`qm_gpu::scf` module docs. In short:
+- a column is **loose** iff the tail sum of upper-bound occupations f̂ = f(θ − r; μ) over it and every column above it
+  is below 1e-2·tol (tol = the SCF's Δρ stop); loose columns are held to `WITNESS_GUARD_TOL` = 1e-3 Ha, the rest
+  (tight) to the step's eigen tol; ∫|δρ| from the loose set ≤ (2 + g/kT)·Σ_L f = 2.2e-2·tol;
+- the witness reads the lower bound θ_top − r_top (Krylov–Weinstein), never the Ritz value alone;
+- growth doubles the extra block (1, 2, 4, …, the cap) and the overshoot is trimmed above the lowest witness;
+- the cap is min(`MAX_WITNESS_GROWTH` = 32, what the VRAM budget fits) (`providers::ks::witness_cap_for`); the
+  scene guard still counts 16 (`WITNESS_GROWTH_COUNTED`), so acceptance is unchanged.
+
+**CPU f64 loose vs all-tight** (`qm` `fd_guard_tier_matches_all_tight`; FD at kT = 5 mHa, tol = eig_tol = 1e-10,
+cold; gate |ΔF| ≤ 1e-10 Ha, |ΔF_I| ≤ 1e-9 Ha/Bohr per component):
+
+| system (grid) | F loose | ΔF (loose − tight) | max \|ΔF_I\| | TS | steps loose / tight | wall loose / tight (s) | stored ↑ / ↓ |
+|---|---|---|---|---|---|---|---|
+| H₂O (33³ × 0.30) | −34.291555816453 | +8.5e-13 | 5.4e-10 | 3.2e-15 | 24 / 29 | 73 / 109 | 7 / 7 |
+| LiH (33³ × 0.30) | −4.918157471927 | −3.1e-13 | 1.4e-11 | 7.8e-7 | 23 / 22 | 75 / 105 | 6 / 6 |
+| Li (33³ × 0.25) | −4.697501425788 | +9.1e-13 | 2.5e-12 | 9.57e-3 | 17 / 18 | 37 / 38 | 6 / 2 |
+| H₄ square (33³ × 0.30) | −1.615047599844 | −4.2e-13 | 2.4e-12 | 1.386e-2 | 19 / 17 | 37 / 50 | 6 / 6 |
+| pseudo-O M = 1, on site (33³ × 0.25) | −16.058593195275 | +3.8e-12 | 2.6e-14 | 1.910e-2 | 24 / 19 | 33 / 36 | 5 / 5 |
+| pseudo-O M = 3, on site | −16.105378836728 | −2.8e-12 | 1.7e-13 | 9.548e-3 | 18 / 17 | 39 / 46 | 5 / 6 |
+| *record:* pseudo-O M = 1 off site, tol 1e-8 | −16.058530205496 | +4.9e-10 | 1.1e-9 | 1.910e-2 | 27 / 18 | 41 / 57 | 5 / 5 |
+
+The guard columns ended ≤ 9.9e-4 in every loose run. Off site at tol 1e-10 neither tier converges reliably (the
+lattice splits the partly filled p set by δ ~ 1e-5 Ha, so ρ depends on the rotation inside it, fixed only to r/δ:
+a Δρ floor ≈ 4e-9 at eig_tol 1e-10 — measured loose 200 steps at ≈ 3e-9, all-tight 86 steps), so that case is a
+record at tol 1e-8, where both tiers stop anywhere inside Δρ < 1e-8 and the difference is the stop's own resolution.
+`fd_witness_holds_on_the_lower_bound` (H₂O 33³ × 0.30, residuals re-measured in H[ρ_out]): 5 tight / 2 loose per
+spin, θ_top − r − μ = 0.2332 Ha ≥ 36 kT; `fd_a_column_changes_class_mid_solve` (H₂ 1.4 → 4.0 warm): σ_u starts loose,
+2 class raises, ends tight (f 3.7e-5, residual 9.5e-10), F − F_all-tight = −8.8e-13.
+
+**GPU, the H₃⁺ cycle** (task 9 review C1): `qm-gpu` `gpu_fd_stretched_h3plus_converges_cold` (49³ × 0.25, pair at
+1.6 r₀, tol 1e-6, cold) converges in **13 steps, 0 DIIS resets** (Aufbau 13; before 9b the 200-step cap with a reset
+every other step), and a second cold solve gives the same bits. Measured on the way (with the guess band on every
+step, before the convergence-phase rule): 19 steps / 2 resets; off-site Li 33³ 146 steps / 23 resets (92 before 9b);
+the extrapolated H₂ MD path 7.11 steps against 8.00 plain (5.78 before 9b). With the rule: Li 93 / 5, MD path
+6.67 / 8.00, H₃⁺ 13 / 0.
+
+**GPU, the formation check** (`qm_gpu::eigen` "Ritz vectors that do not match their Ritz values"): the pseudo-H₂O
+orbital-display solve (33³, m = 2) lost its converged 2s column in one step at iteration 185 of a 200-iteration grind
+(λ = +0.770 against θ = −0.8687 Ha) and was rejected (|Δε_occ| 0.458 Ha); redoing the step on the MGS basis formed the
+same wrong vector, dropping P (the LOBPCG restart) fixed it: both channels keep the 2s and the solve is accepted.
+
+**GPU, cost at large blocks.** The fused Gram's greedy planner (`qm_gpu::reduce::plan_gram`) ran on the CPU every
+LOBPCG iteration: 2.65 s per iteration at a 37-column witness block (S of 101 columns) against ≈ 15 ms at 13 columns;
+plans are now memoised per pair pattern (a pure function: no number moves). Under a lock the α guard reads the
+active columns' own residual (the scaled one sent every locked step to the MGS fallback).
+
+**The RED tests** (`providers`):
+- cold all-electron H₂O at 97³ × 0.25 (24.5 Bohr), 1e-5, no budget (cap 32): **converges in 22 steps, 123 s**
+  (Task 7: the cap error after 525–630 s; held Aufbau 1.8 s); the witness block peaks at 20 extra vectors per spin on
+  the transient step 4 (μ ≈ −0.05 Ha) and ends at 6 (trimmed), 12 growths, 2 class raises, 6 frozen steps.
+- H⁻ at 95³ × 0.15 (V8, the 14 Bohr preset box): 18 steps, **62.6 s** (74.5 s before 9b; 184.7 s with doubling and
+  no trim), 8 extra vectors per spin, F −0.47495361.
+- H⁻ at the app's largest box (201³ × 0.15, 30 Bohr) under the app's budget (half the adapter's memory, 12.88 GB):
+  **refused by the scene guard** before any allocation, naming the budget — 13.45 GB with the counted 16 extra vectors
+  (5.04 GB without; one extra vector per spin costs 0.53 GB at 201³). Weyl's ≈ 79 box states under the window are out
+  of reach of any cap the card holds; a solve without the guard would end on the cap error (not run: ≈ 22 GB at 32).
+
+**Suite times after 9b** (2026-11-17, release, the gentle-GPU rules lifted by the user): `gpu_vs_cpu` 12 passed in
+10.1 min (Task 7: 23.7; pre-FD 3.5), V4 re-passes (H₄ ΔF −4.4e-8), `timing_table` on FD again (H₂ 49³ cold 482 ms /
+warm 146 ms, targets met; **H₂O 97³ cold 114.5 s**, 17 steps, LOBPCG 98 % — reported, target 5 s missed); `oracles` 5
+passed in 45.3 min (Task 7: 51; pre-FD 31; partly overlapping GPU runs), V3 ratio 3.9394; `qm` 249 passed in 571 s
+(the loose-vs-tight test adds ≈ 200 s); `qm-gpu` 144 passed in 303 s; `providers` 458 passed in 11.1 min.
+
+**The memory guard and the app's estimated mode** (open; not re-pinned). `app` `ui::tests::a_change_over_the_vram_budget_is_refused`
+pins the all-electron H₂O preset at Custom 0.08 (177³) in estimated mode (teacher + auditor) at 9.5–10.3 GB; it now
+reads **21.6 GB** (= 2 × (4.94 GB solve + 5.85 GB witness term)), over the 12 GB default, so the change is refused. The
+witness term was added to the all-electron estimate in Task 7 fix round 1 (the pseudised estimate has counted it
+since M7). It is **real allocation, not over-counting**: the solver's pool and `LobpcgWork` keep their peak, and cold
+all-electron FD solves reach ≥ 16 extra vectors per spin on transient steps (97³ H₂O 20, 95³ H⁻ 16 before the trim).
+Each extra vector costs 12 fields (8 `LobpcgWork` slots, the orbital, its kinetic scratch, per spin).
 
 ## Live orbitals (Harris display; spec 2026-11-14)
 
@@ -5357,6 +5440,13 @@ f = 1/(1 + e^{(ε − μ)/kT}) is smooth in ε with ∂f/∂ε = −f(1 − f)/k
 (1e-6 < f < 1 − 1e-6) is that propagated ε gate: 4.4e-4 at f = ⅔, kT = 5 mHa. A level within 1e-6 of 0 or 1 keeps 1e-12.
 This is derived from an existing gate, not loosened to pass. The measured pseudo-O |Δf| ≤ 5.8e-6 is 76× inside it.
 V-A2 (O 0.988–0.999, gate ≥ 0.95) passes unchanged.
+
+**V-A3 after plan Task 9b** (2026-11-17, `--test harris va3`, run while the CPU `oracles` suite was running — CPU
+contended, GPU alone): warm median H₂ **0.155 s** (FD before 9b 0.172, main 0.115), H₂ + H **0.258 s** (0.402; the 0.3 s
+target is met again), H₂O **0.404 s** (0.792; main 0.46); cold 0.753 / 1.625 / 1.293 s; 0.1 Bohr step 0.174 / 0.320 /
+0.499 s. What changed for Harris: the lower-bound FD window, the doubled growth and the solver's cap (the guard tier
+was already 1e-3 there), and — for every LOBPCG — the memoised Gram plans and the formation check. V-A1 passes
+(identity on the converged density, all four cases).
 
 **V-A3 regression under FD (record; Task 9b owns the fix).** Warm Harris refresh after a 0.01 Bohr move, median of 5,
 through `GpuKs::harris_display` (`--test harris va3`, 2026-11-16, RX 7900 XTX, the user's preview app open):
