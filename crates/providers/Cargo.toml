@@ -13,6 +13,10 @@ units = { path = "../units" }
 rand = { workspace = true }
 nalgebra = { workspace = true }
 
+[features]
+# the refit stage timers (`surrogate::prof`) for `surrogate::tests::refit_profile`; never in a build
+profile = ["surrogate/profile"]
+
 [dev-dependencies]
 gpu = { path = "../gpu", features = ["fault-injection"] }
 surrogate = { path = "../surrogate", features = ["test-hooks"] }

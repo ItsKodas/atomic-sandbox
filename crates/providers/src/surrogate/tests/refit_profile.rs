@@ -1,7 +1,8 @@
-//! TEMPORARY measurement (branch `refit-profile`, 2026-11-17; never merged): where a shared
-//! collection's refit spends its wall, stage by stage, with the stage timers of `surrogate::prof`
-//! (spans in `surrogate::fit`, `loo`, `novelty` and the provider's `trust`, `quarantine`,
-//! `shared`, `mod`). Reported, never asserted; nothing here changes what a refit does.
+//! Measurement (2026-11-17): where a shared collection's refit spends its wall, stage by stage,
+//! with the stage timers of `surrogate::prof` (spans in `surrogate::fit`, `loo`, `grade`,
+//! `novelty` and the provider's `trust`, `quarantine`, `shared`, `mod`) — built with
+//! `--features profile`, else the stage tables are empty. Reported, never asserted; nothing here
+//! changes what a refit does.
 //!
 //! Reads a **copy** of a collection folder (`COLLECTION_DIR`), opened read-only so every run
 //! starts from the same files. `REFIT_PROFILE` is a comma list of:
@@ -11,7 +12,7 @@
 //! - `scale`: the LOO pass, the class pass and the training residuals on subsets (first ½, H only,
 //!   H + O, all), each attached without the trust recovery (`skip_recovery`).
 //!
-//! `COLLECTION_DIR=<copy> REFIT_PROFILE=cold,append,scale cargo test -p providers --release --lib refit_profile -- --ignored --nocapture --test-threads 1`
+//! `COLLECTION_DIR=<copy> REFIT_PROFILE=cold,append,scale cargo test -p providers --release --features profile --lib refit_profile -- --ignored --nocapture --test-threads 1`
 use super::*;
 use std::time::Instant;
 use surrogate::Collection;
@@ -119,7 +120,7 @@ fn passes(s: &mut SurrogateKs, label: &str) {
 }
 
 #[test]
-#[ignore = "measurement: COLLECTION_DIR=<copy> REFIT_PROFILE=cold,append,scale cargo test -p providers --release --lib refit_profile -- --ignored --nocapture --test-threads 1"]
+#[ignore = "measurement: COLLECTION_DIR=<copy> REFIT_PROFILE=cold,append,scale cargo test -p providers --release --features profile --lib refit_profile -- --ignored --nocapture --test-threads 1"]
 fn refit_profile() {
     println!("worker threads {}", surrogate::threads::worker_threads());
     let runs = std::env::var("REFIT_PROFILE").unwrap_or_else(|_| "cold,append".into());

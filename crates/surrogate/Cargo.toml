@@ -13,6 +13,8 @@ rayon = "1.11"
 [features]
 # test hooks for other crates' tests (`Collection::inject_purge_failure`); never in a build
 test-hooks = []
+# the refit stage timers (`prof`): zero-sized no-ops without it; the profile harness only
+profile = []
 
 [dev-dependencies]
 rand = { workspace = true }
