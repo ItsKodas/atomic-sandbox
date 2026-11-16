@@ -211,8 +211,11 @@
 //! 0.05 %, ln p equal to 7 digits, 49 ms against 4 007 ms; at Q′ 2 688 and 10 000 samples a search
 //! takes 27.8 s (6 rounds; `references.md` "M8a body-4"). Since 2026-11-17 the O(Q′³) kernels are
 //! faer's (`dense`: blocked, threaded on the fit's CPU share, the same numbers on any thread
-//! count) instead of `linalg`'s single-threaded loops — the same algorithms and backward errors,
-//! other last bits (`references.md`, "Refit speed-up").
+//! count) instead of `linalg`'s single-threaded loops — the same algorithms and backward errors;
+//! the solution differs by up to κ(A)·ε (3e-3 at κ 1e13: the old kernels differ from themselves
+//! that much under a reordering, faer's forward error measured ~2× theirs on a synthetic κ 1e13),
+//! and every verdict and every prediction within 1 % of the tiers is unchanged on the user's
+//! collection (`references.md`, "Refit speed-up").
 //!
 //! **Warm refit.** Between searches the hyperparameters and the standardisation D stand (the
 //! search's, frozen), and a new sample only adds rows: A ← A + U Uᵀ with U the sample's k = 3N + 1

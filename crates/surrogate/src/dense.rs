@@ -15,8 +15,11 @@
 //! products tile the output by k), so the split is a constant [`SPLIT`] and the pool only decides
 //! how many of those pieces run at once — the fit's thread-count invariance
 //! (`fit::tests::the_fit_is_the_same_on_one_thread_and_on_the_capped_count`) holds through faer.
-//! faer picks its SIMD kernels at run time, so its last bits can differ between CPUs of different
-//! instruction sets (AVX2 against AVX-512); on one machine every call is reproducible.
+//! faer picks its SIMD kernels at run time, so its results differ between CPUs of different
+//! instruction sets (AVX2 against AVX-512) — in the last bits of each kernel, which an
+//! ill-conditioned fit (κ₂(A) ~ 1e13) carries to ~κε in the solution (`references.md`, "Refit
+//! speed-up"); on one machine every call is reproducible, and a golden compares bit for bit only
+//! on the same instruction set.
 //!
 //! **Accuracy.** The same algorithms as `linalg`'s (unpivoted Cholesky, Householder
 //! tridiagonalisation, and `linalg`'s implicit QL on the tridiagonal), with the same normwise
