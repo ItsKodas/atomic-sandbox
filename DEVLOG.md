@@ -1076,6 +1076,28 @@ scalar readback, plays at the same trajectory and rate with the view on (2.2 to 
 conserved spread 3.10e-5 Ha), and its unoccupied-orbital solve has a latency cap (0.25 s) so it cannot
 stall play. The display eigensolve agrees with the SCF's occupied eigenvalues to 1.9e-7 on the CPU.
 
+### A collection refit is about 6.5× faster (2026-11-17, merge 7e46006)
+
+Profiling showed refit time was fixed bookkeeping, not sample count. Four changes, each checked against a
+golden of 398 fixed geometries in three cases (cold, append-20, misfit recovery):
+
+- the spectral search's dense kernels on faer (MIT);
+- the active set's span from faer;
+- the null space computed once per refit;
+- a forward-solve leave-one-out.
+
+Results on the user's collection:
+
+| Case | Before | After |
+|---|---|---|
+| Cold refit | 89 s | 13 s |
+| Append-20 | 98 s | 15 s |
+| Misfit recovery | 189 s | 31 s |
+
+Every trust verdict is identical. The largest absolute difference is 0.38 % of a policy tier. The original
+1e-9 bar was unreachable: at κ ≈ 1e13, the old kernels differ from themselves by κε when reordered. One
+side finding: the active set's τ sits in no spectral gap on this collection (recorded in references.md).
+
 ### Process wins
 
 - An input-replay harness (M6 Task 8) that found a real app bug on its first scripts: a running relax
