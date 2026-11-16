@@ -3390,6 +3390,7 @@ impl Trainable for SurrogateKs {
             box_affected: self.box_affected(),
             trust_floor: self.trust_floor(),
             unfitted: self.unfitted(),
+            pending: self.pending_samples(),
             recovery: self.recovery_note().map(str::to_string),
             audits_background: self.audits_asynchronous(),
             audit_in_flight: self.audit_in_flight(),

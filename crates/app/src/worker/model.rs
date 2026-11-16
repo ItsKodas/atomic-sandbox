@@ -129,6 +129,9 @@ pub struct ModelStatus {
     pub superseded: usize,
     pub box_excluded: usize,
     pub unfitted: usize,
+    /// Of `unfitted`, the samples in the next fit's codes (`sim::TrainableStatus::pending`): the
+    /// knowledge map's "new, waiting for refit", which its rebuild key watches.
+    pub pending: usize,
     /// Stored box-affected samples (excluded yet or not) and the trust floor their exclusion waits
     /// for (`sim::TrainableStatus`): the Model tab names the box when it keeps the model
     /// untrusted ([`box_blocks_trust`]).
@@ -1052,6 +1055,7 @@ impl Worker {
             superseded: st.superseded,
             box_excluded: st.box_excluded,
             unfitted: st.unfitted,
+            pending: st.pending,
             box_affected: st.box_affected,
             trust_floor: st.trust_floor,
             fit_vs_held: st.fit.map(|f| fit_vs_held(f.0, st.samples, st.box_excluded, st.quarantined, st.superseded, st.forgotten, st.forgotten_in_fit, st.held_out, st.lone, st.unfitted)),
