@@ -1221,13 +1221,13 @@ fn unoccupied_cpu_is_a_display_solve_on_the_output_potential() {
         assert!(u.occupied_error[ch] <= tau(settings.tol), "|Δε_occ| {} > τ", u.occupied_error[ch]);
         assert!(u.evals[ch].windows(2).all(|w| w[0] <= w[1]), "ascending");
         assert!(u.evals[ch][0] > st.evals_up[0], "above the occupied σ_g");
-        let occ = if ch == 0 { &st.orbitals_up } else { &st.orbitals_dn };
+        let occ = shown_orbitals(&st, ch);
         let v = lsda_pw92(&st.rho_up, &st.rho_dn);
         let pot: Vec<f64> = (0..g.len()).map(|i| st.v_nuc[i] + st.v_h[i] + if ch == 0 { v.v_up[i] } else { v.v_dn[i] }).collect();
         let op = LocalHamiltonian { grid: &g, v: &pot };
         let mut hphi = vec![0.0; g.len()];
         for (i, phi) in vecs[ch].iter().enumerate() {
-            for psi in occ { assert!(g.dot(psi, phi).abs() <= 1e-10, "⟨ψ_occ|φ_{i}⟩ = {:.2e}", g.dot(psi, phi)); }
+            for psi in &occ { assert!(g.dot(psi, phi).abs() <= 1e-10, "⟨ψ_occ|φ_{i}⟩ = {:.2e}", g.dot(psi, phi)); }
             for (j, other) in vecs[ch].iter().enumerate() {
                 let want = if i == j { 1.0 } else { 0.0 };
                 assert!((g.dot(phi, other) - want).abs() <= 1e-10, "⟨φ_{i}|φ_{j}⟩");
@@ -1243,8 +1243,8 @@ fn unoccupied_cpu_is_a_display_solve_on_the_output_potential() {
             assert_eq!(u.face_density[ch][i], face_density_set(&g, &members), "the set's face density");
             assert!(u.face_density[ch][i] >= face_density(&g, phi), "≥ each member's own");
         }
-        let all: Vec<f64> = st_evals(&st, ch).iter().chain(&u.evals[ch]).copied().collect();
-        let n = st_evals(&st, ch).len();
+        let all: Vec<f64> = shown_evals(&st, ch).iter().chain(&u.evals[ch]).copied().collect();
+        let n = shown_evals(&st, ch).len();
         assert_eq!(u.hidden[ch], block_edge(&all, n, all.len(), tau(settings.tol)).1);
     }
     let t = std::time::Instant::now();
@@ -1257,6 +1257,22 @@ fn unoccupied_cpu_is_a_display_solve_on_the_output_potential() {
 }
 
 fn st_evals(st: &KsState, ch: usize) -> &[f64] { if ch == 0 { &st.evals_up } else { &st.evals_dn } }
+
+/// The state's shown (occupied) columns of channel `ch` (`shown_columns`: under FermiDirac the f-bearing ones; plan
+/// 2026-11-13 Task 9 — a FermiDirac state's witness columns are not the display's occupied orbitals).
+fn shown_cols(st: &KsState, ch: usize) -> Vec<usize> {
+    let (n, occ) = if ch == 0 { (st.orbitals_up.len(), &st.occ_up) } else { (st.orbitals_dn.len(), &st.occ_dn) };
+    shown_columns(n, occ, matches!(st.occupations, crate::scf::Occupations::FermiDirac { .. }))
+}
+
+fn shown_orbitals(st: &KsState, ch: usize) -> Vec<&Vec<f64>> {
+    let o = if ch == 0 { &st.orbitals_up } else { &st.orbitals_dn };
+    shown_cols(st, ch).into_iter().map(|i| &o[i]).collect()
+}
+
+fn shown_evals(st: &KsState, ch: usize) -> Vec<f64> {
+    shown_cols(st, ch).into_iter().map(|i| st_evals(st, ch)[i]).collect()
+}
 
 /// The occupied-agreement guard (§8) on a constructed failure: a state whose eigenvalue has been
 /// shifted by 0.3 Ha (as if the display solve had lost the ground state — Task 0's 0.34 Ha) is
@@ -1374,12 +1390,12 @@ fn unoccupied_cpu_uses_the_pseudo_hamiltonian() {
     assert!(u.rejected.is_none(), "{:?}", u.rejected);
     for ch in 0..2 {
         assert!(u.occupied_error[ch] <= tau_scf, "ch {ch}: |Δε_occ| {:.3e} > τ", u.occupied_error[ch]);
-        let occ = if ch == 0 { &st.orbitals_up } else { &st.orbitals_dn };
+        let occ = shown_orbitals(&st, ch);
         let op = PseudoHamiltonian { grid: &g, v: &full[ch], nl: &nl };
-        assert!(u.evals[ch][0] > *st_evals(&st, ch).last().unwrap(), "above the HOMO");
+        assert!(u.evals[ch][0] > *shown_evals(&st, ch).last().unwrap(), "above the HOMO");
         let mut hphi = vec![0.0; g.len()];
         for (i, phi) in vecs[ch].iter().enumerate() {
-            for psi in occ { assert!(g.dot(psi, phi).abs() <= 1e-10, "⟨ψ_occ|φ_{i}⟩ = {:.2e}", g.dot(psi, phi)); }
+            for psi in &occ { assert!(g.dot(psi, phi).abs() <= 1e-10, "⟨ψ_occ|φ_{i}⟩ = {:.2e}", g.dot(psi, phi)); }
             // the reported ε and residual are those of the full operator
             op.apply(phi, &mut hphi);
             let e = g.dot(phi, &hphi);
@@ -1424,4 +1440,16 @@ fn rows_carry_their_angular_character_about_one_nucleus() {
         assert!((dot.abs() - 1.0).abs() < 1e-9, "member {k}: {dot}");
     }
     assert!(rows(&out, Spin::Up)[2..].iter().all(|r| r.rotated));
+}
+
+/// Plan 2026-11-13 Task 9 (spec §6.6): a display row shows a level with f < `PARTIAL_OCCUPATION_MIN` as empty and one
+/// within it of 1 as full; a partly occupied level, Aufbau's 0/1 and a shared fraction keep their f.
+#[test]
+fn display_occupation_shows_witness_tails_as_empty() {
+    assert_eq!(display_occupation(2.3e-16), 0.0, "a witness column's FD tail");
+    assert_eq!(display_occupation(9.9e-7), 0.0);
+    assert_eq!(display_occupation(1.0 - 1e-9), 1.0, "a full level of a narrow gap");
+    for f in [0.0, 1.0, 1.0 / 3.0, 1e-6, 0.75, 1.0 - 2e-6] {
+        assert_eq!(display_occupation(f), f, "{f}");
+    }
 }

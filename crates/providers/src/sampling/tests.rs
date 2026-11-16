@@ -1050,17 +1050,27 @@ fn gpu_oxygen_reference_multiplicity() {
         let solved = |m: u32| -> Option<(f64, &EvalStats)> { seen.iter().find(|(mm, _)| *mm == Some(m)).and_then(|(_, r)| r.as_ref().ok()).map(|(e, st)| (*e, st)) };
         for (m, r) in seen.iter() {
             match r {
-                Ok((e, st)) => println!("  {label} M = {m:?}: E = {e:.6} Ha, {} SCF steps, tol used {:?}, shared {:?}, warnings {:?}", st.scf_steps, st.scf_tol_used, st.fractional, st.warnings),
+                Ok((e, st)) => println!("  {label} M = {m:?}: F = {e:.6} Ha (E {:.6}, TS {:.6}), {} SCF steps, tol used {:?}, partial {:?}, warnings {:?}",
+                                        st.energy.internal, st.energy.ts, st.scf_steps, st.scf_tol_used, st.partial, st.warnings),
                 Err(e) => println!("  {label} M = {m:?}: failed: {e}"),
             }
         }
-        let (e1, st1) = solved(1).unwrap_or_else(|| panic!("{label}: the singlet did not converge"));
-        let (e3, st3) = solved(3).unwrap_or_else(|| panic!("{label}: the triplet did not converge"));
+        let (f1, st1) = solved(1).unwrap_or_else(|| panic!("{label}: the singlet did not converge"));
+        let (f3, st3) = solved(3).unwrap_or_else(|| panic!("{label}: the triplet did not converge"));
+        // re-pinned in plan 2026-11-13 Task 9: the solves are Fermi–Dirac now and report F = E − TS. The radial KB atom's
+        // spherical configurations are energies E, so A.7 compares E (`energy.internal`); TS is the closed form of the
+        // shared p shells (M = 1: 2·3 kT s(2/3), M = 3: 3 kT s(1/3)), and the scan keeps the lowest F
+        let (e1, e3) = (st1.energy.internal, st3.energy.internal);
+        assert!(f3 < f1, "{label}: the scan's order, F(3) {f3:.6} < F(1) {f1:.6}");
         println!("{label}: M = 1 {e1:.6} vs radial {r1:.6} (Δ {:+.2} mHa); M = 3 {e3:.6} vs radial {r3:.6} (Δ {:+.2} mHa); splitting E(1) − E(3) = {:.3} mHa (radial {:.3}, all-electron spherical 54.14); M = 5: {:?}",
                  (e1 - r1) * 1e3, (e3 - r3) * 1e3, (e1 - e3) * 1e3, (r1 - r3) * 1e3, solved(5).map(|x| x.0));
         for (m, st) in [(1, st1), (3, st3)] {
-            for c in &st.fractional {
-                assert!(c.spread < qm::DEGENERACY_TAU / 10.0, "{label} M = {m}: shared cluster {c:?}");
+            // the spherical ensemble: each channel's partly occupied levels lie within τ/10 = 1e-4 Ha of each other (the
+            // bound the DS-era test put on a shared cluster's spread; τ = 1e-3 Ha, `DEGENERACY_TAU`)
+            for spin in 0..2u8 {
+                let eps: Vec<f64> = st.partial.iter().filter(|p| p.spin == spin).map(|p| p.eps).collect();
+                let spread = eps.iter().copied().fold(f64::NEG_INFINITY, f64::max) - eps.iter().copied().fold(f64::INFINITY, f64::min);
+                assert!(eps.len() < 2 || spread < 1e-4, "{label} M = {m} spin {spin}: partly occupied levels {:?}", st.partial);
             }
         }
         assert!((e1 - r1).abs() < 2e-3, "{label} M = 1: {e1:.6} vs radial {r1:.6}");
@@ -1422,8 +1432,10 @@ impl ForceProvider for Overlapping {
             r.stats.core_overlaps = vec![(0, 1, dist(scene, 0, 1))];
             r.stats.warnings.push(format!("{}: 0–1 at R = {:.3} Bohr", sim::CORE_OVERLAP_WARNING, dist(scene, 0, 1)));
         } else if pair && !self.flagged && self.pattern_change_after.is_some_and(|k| self.answers > k) {
+            // the `branch_jump` guard's flag (spec 2026-11-13 §6.3), which replaced the occupation watch in plan Task 9
             self.flagged = true;
-            r.stats.occupation_changed = true;
+            r.stats.branch_jump = Some(0.012);
+            r.stats.warnings.push(sim::branch_jump_warning(0.012));
         }
         Ok(r)
     }
@@ -1437,9 +1449,10 @@ impl ForceProvider for Overlapping {
     }
 }
 
-/// M7 Task 9 (spec §5.6; Task 6 review A.6): a sampling pass never stores a geometry whose cores overlap or whose
-/// shared-shell pattern changed — they are counted as skipped, noted, and leave an activity row of their own;
-/// every other geometry of the pass is stored as before.
+/// M7 Task 9 (spec §5.6) and spec 2026-11-13 §6.3: a sampling pass never stores a geometry whose cores overlap or
+/// that the `branch_jump` guard flagged (the shared-shell watch's successor, plan 2026-11-13 Task 9) — they are counted
+/// as skipped, noted with their own spec section, and leave an activity row of their own; every other geometry of the
+/// pass is stored as before.
 #[test]
 fn a_pass_never_stores_core_overlapping_or_pattern_changing_answers() {
     let mut teacher = Overlapping { inner: PairMorse::h2(), r_overlap: 1.2, answers: 0, pattern_change_after: Some(5), flagged: false };
@@ -1452,8 +1465,9 @@ fn a_pass_never_stores_core_overlapping_or_pattern_changing_answers() {
     let notes = sampler.take_notes();
     println!("progress {fin:?}; notes {notes:?}");
     let overlapping = notes.iter().filter(|n| n.contains("cores overlap")).count();
-    let changed = notes.iter().filter(|n| n.contains("occupation pattern changed")).count();
+    let changed = notes.iter().filter(|n| n.contains("F changed by more than the forces' work — Fermi–Dirac spec §6.3")).count();
     assert!(overlapping >= 1, "a perturbation or scan geometry closer than 1.2 Bohr: {notes:?}");
+    assert!(notes.iter().filter(|n| n.contains("cores overlap")).all(|n| n.contains("cores overlap — spec §5.6")), "{notes:?}");
     assert_eq!(changed, 1, "{notes:?}");
     assert!(fin.skipped >= overlapping + changed, "{fin:?}");
     assert_eq!(s.samples(), sampler.samples_added());

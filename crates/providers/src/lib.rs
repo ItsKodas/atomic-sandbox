@@ -7,6 +7,8 @@
 //! [`orbitals`] holds what the Kohn-Sham adapters share for the orbital display (plan Task 3 of
 //! the orbital viewer).
 pub mod branch_jump;
+#[cfg(test)]
+mod fd_regression;
 pub mod ks;
 pub mod orbitals;
 pub mod pseudo;

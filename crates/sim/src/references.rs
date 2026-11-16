@@ -197,14 +197,15 @@ pub struct ReferenceKey {
     pub teacher: String,
     pub z: u8,
     /// The ionic surface the atom was solved on (M7; `ForceProvider::ionic_tag`, `providers::pseudo::provenance_tag`):
-    /// `"none"` for the all-electron surface, else `"<policy>/<recipe hash>"`. An atom solved on one surface is never
-    /// reused on another — the valence energies differ by tens of Ha.
+    /// the all-electron tag (`none/fd5e-3/pin1e-5` since plan 2026-11-13 Task 9; the legacy `"none"` before) for the
+    /// all-electron surface, else `"<policy>/<recipe hash>/…"`. An atom solved on one surface is never reused on another —
+    /// the valence energies differ by tens of Ha, and the occupation rule moves them by −TS.
     pub ionic: String,
 }
 
 impl ReferenceKey {
     /// The key of species `z` at `cell` and `sigma` (`None` = h), solved by `teacher` at `tol` on the ionic
-    /// surface `ionic` (module doc; `"none"` = all-electron).
+    /// surface `ionic` (module doc; `"none"`/`"none/…"` = all-electron).
     pub fn new(cell: &Cell, sigma: Option<f64>, tol: Option<f64>, teacher: &str, z: u8, ionic: &str) -> ReferenceKey {
         ReferenceKey { grid_n: cell.n, h: cell.h, sigma: sigma.unwrap_or(cell.h), tol: tol.unwrap_or(0.0), teacher: teacher.to_string(), z, ionic: ionic.to_string() }
     }
@@ -216,9 +217,10 @@ impl ReferenceKey {
 /// with a density, module doc) and the winning solve's face density (e/Bohr³,
 /// `EvalStats::face_density`: how much the cell confines the atom — a shared collection takes a
 /// reference only when it passes the box rule, M8a Task 4a; `None` for a seeded energy or a
-/// provider without a grid). `fractional`: whether the winning solve's final state shared a
-/// degenerate shell fractionally (`EvalStats::fractional` non-empty — an open shell under the
-/// `DegenerateShells` occupations), recorded next to the multiplicity (`None` for a seeded energy).
+/// provider without a grid). `fractional`: whether the winning solve's final state has a partly
+/// occupied level (`EvalStats::partial` non-empty — an open shell, or near-degenerate frontier levels,
+/// under Fermi–Dirac occupations; spec 2026-11-13 §6.4), recorded next to the multiplicity (`None` for a
+/// seeded energy).
 #[derive(Clone, Debug, PartialEq)]
 pub struct AtomReference {
     pub energy: f64,
@@ -433,7 +435,7 @@ impl AtomScan {
             if !r.energy.is_finite() || r.forces.iter().flatten().any(|x| !x.is_finite()) {
                 return Err(ProviderError::Invalid(format!("provider '{}' returned a non-finite energy or force", provider.name())));
             }
-            Ok((r.energy, r.stats.face_density, !r.stats.fractional.is_empty()))
+            Ok((r.energy, r.stats.face_density, !r.stats.partial.is_empty()))
         });
         let r = match outcome {
             Err(ProviderError::Cancelled) => return Err(ProviderError::Cancelled),

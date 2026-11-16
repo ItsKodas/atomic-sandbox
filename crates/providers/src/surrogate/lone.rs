@@ -284,7 +284,7 @@ impl SurrogateKs {
         }
         // two or more copies compose only when the reference ends at a gap (review I4)
         if z.len() >= 2 {
-            let all_electron = prov.ionic == "none";
+            let all_electron = crate::pseudo::is_all_electron_tag(&prov.ionic);
             let fractional = self.ref_cache.get(&atom_key(prov, z[0])).and_then(|r| r.fractional);
             if !closed_spin_channels(z[0], all_electron, fractional) {
                 let why = match (all_electron, fractional) {
@@ -336,7 +336,7 @@ impl SurrogateKs {
         let mut stats = EvalStats::default();
         stats.source = Source::Reference;
         if let Some((tag, summaries)) = &self.last_pseudised {
-            if *tag == prov.ionic && prov.ionic != "none" {
+            if *tag == prov.ionic && !crate::pseudo::is_all_electron_tag(&prov.ionic) {
                 stats.pseudised = summaries.clone();
             }
         }

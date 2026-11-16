@@ -239,6 +239,8 @@
 //! unaffected.
 use crate::batch::Batch;
 use crate::eigen::{lobpcg_with_guess_tol, residual_floor_estimate, EigenStats, GpuHamiltonian, LobpcgWork, Stop as EigenStop};
+#[cfg(test)]
+use crate::eigen::rayleigh_residuals;
 use crate::grid::{clear_readback_fault, take_readback_fault, Field, GpuGrid};
 use crate::ionic::GpuIonic;
 use crate::kernels::{encoder, Kernels};
@@ -375,6 +377,12 @@ pub struct SolveProfile {
     /// Worst LOBPCG exit residual over every call, the loosened (Δρ-tied) steps included — not
     /// a statement about the converged state (`ScfStats::max_eigen_residual` is, M4 review I2).
     pub eigen_worst_residual_any_step: f64,
+    /// Test probe (`GpuSolver::set_occupied_residual_probe`, plan 2026-11-13 Task 9): the worst residual of the
+    /// f-bearing columns (f ≥ `qm::PARTIAL_OCCUPATION_MIN`) over the tight-tol `FermiDirac` eigensolves, i.e.
+    /// `ScfStats::max_eigen_residual` without the witness columns (f ≤ e^−36, which LOBPCG may leave at its cap;
+    /// plan Task 9b splits the reported residual). 0 with the probe off.
+    #[cfg(test)]
+    pub eigen_occupied_residual: f64,
     /// The LOBPCG tol of the final SCF step (`eig_tol_for`: tied to the previous step's Δρ) and
     /// of every step in order.
     pub eig_tol_used: f64,
@@ -513,12 +521,17 @@ struct Inner {
     /// the current SCF step's eigensolves (the final step's decides the warning).
     eig_tol: f64, step_tol: f64,
     profile: SolveProfile,
+    /// The occupied-residual test probe is on (`GpuSolver::set_occupied_residual_probe`).
+    #[cfg(test)]
+    probe_occupied: bool,
 }
 
 impl Inner {
     fn new(eig_tol: f64) -> Inner {
         Inner { eigen_residual: 0.0, poisson_residual: 0.0, poisson_iterations: 0, warnings: Vec::new(),
-                eigen_calls: 0, step_residual: 0.0, step_max_iter: false, eig_tol, step_tol: eig_tol, profile: SolveProfile::default() }
+                eigen_calls: 0, step_residual: 0.0, step_max_iter: false, eig_tol, step_tol: eig_tol, profile: SolveProfile::default(),
+                #[cfg(test)]
+                probe_occupied: false }
     }
 
     /// Call at the start of each SCF step with the step's eigen tol: resets the per-step eigen
@@ -725,7 +738,17 @@ impl Channel<'_> {
         loop {
             self.solve(orbs, evals, work, work_k, inner)?;
             let occ = fermi_dirac(evals, self.n, kt)?;
-            if witness_reached(evals, self.n, occ.mu.expect("an occupied channel has μ"), kt) { return Ok(occ); }
+            if witness_reached(evals, self.n, occ.mu.expect("an occupied channel has μ"), kt) {
+                #[cfg(test)]
+                if inner.probe_occupied && inner.step_tol <= inner.eig_tol {
+                    // the f-bearing columns' residuals on this step's H (read-only: `rayleigh_residuals` uses the work's
+                    // HX and R slots, which carry no state between calls)
+                    let (_, res) = rayleigh_residuals(self.ctx, self.k, self.g, self.r, &self.h, orbs, work.as_mut().expect("solved above"))?;
+                    let worst = (0..orbs.len()).filter(|&i| occ.f[i] >= qm::PARTIAL_OCCUPATION_MIN).map(|i| res[i]).fold(0.0, nan_max);
+                    inner.profile.eigen_occupied_residual = nan_max(inner.profile.eigen_occupied_residual, worst);
+                }
+                return Ok(occ);
+            }
             if orbs.len() >= self.n + MAX_WITNESS_GROWTH {
                 return Err(QmError::Numerical(format!("no gap witness within {MAX_WITNESS_GROWTH} extra levels of spin {} \
                                                        (WITNESS_GAP = {WITNESS_GAP} Ha above ε_N and {WITNESS_TAIL_KT} kT above μ)", self.spin)));
@@ -755,6 +778,9 @@ pub struct GpuSolver {
     eig_fraction: f64, eig_tol_max: f64,
     /// `GPU_PARTIAL_TOL` as an instance knob (tests: 0 turns the partial-level stop off, the comparison before it).
     partial_tol: f64,
+    /// The occupied-residual test probe (`set_occupied_residual_probe`).
+    #[cfg(test)]
+    probe_occupied: bool,
     /// Density extrapolation across warm solves (`set_density_extrapolation`) and ρ_{t−1},σ: the
     /// converged output densities of the solve before the last converged one (pool fields).
     extrapolate: bool, prev_rho: Option<(Field, Field)>,
@@ -784,8 +810,15 @@ impl GpuSolver {
                     warm: None, converged: false, rows, row_stride, profile: SolveProfile::default(),
                     poisson_tol: POISSON_TOL, eig_floor_factor: EIG_TOL_FLOOR_FACTOR,
                     eig_fraction: EIG_TOL_FRACTION, eig_tol_max: EIG_TOL_MAX, partial_tol: GPU_PARTIAL_TOL, extrapolate: false, prev_rho: None,
+                    #[cfg(test)]
+                    probe_occupied: false,
                     forces: Default::default(), sampler: Default::default(), ionic: None, core_display: Default::default() }
     }
+
+    /// Test probe (plan 2026-11-13 Task 9): record the f-bearing columns' worst residual on the tight `FermiDirac`
+    /// eigensolves (`SolveProfile::eigen_occupied_residual`; one extra residual pass per channel and tight step).
+    #[cfg(test)]
+    pub(crate) fn set_occupied_residual_probe(&mut self, on: bool) { self.probe_occupied = on; }
 
     /// Diagnostic knobs: the Poisson tolerance and the LOBPCG tolerance floor factor.
     #[cfg(test)]
@@ -936,6 +969,8 @@ impl GpuSolver {
         let nl = gion.and_then(|i| i.nonlocal());
         let eig_tol = effective_eig_tol(settings.eig_tol, eig_floor_factor, g);
         let mut inner = Inner::new(eig_tol);
+        #[cfg(test)]
+        { inner.probe_occupied = self.probe_occupied; }
         let trace = std::env::var_os("SCF_TRACE").is_some(); // per-step diagnostics on stderr
         let mut batch = Batch::new(ctx, "scf");
 
@@ -1823,14 +1858,15 @@ mod tests {
         let grid = Grid::cube(49, 0.25);
         let mut settings = ScfSettings::for_grid(&grid);
         settings.tol = 1e-5; // the viewer's interactive tol
-        // held until plan Task 9 switches it: the app's witness runs through `providers::ks::problem`, whose all-electron
-        // branch stays Aufbau until then. Measured 2026-11-16 under FermiDirac (for_grid's default since Task 7): steps
-        // and readbacks pass (warm 6 / 434, cold 9 / 868), but the cold solve's first, tight step leaves a witness at
-        // max_eigen_residual 1.85e-4 > 3·lo (a box-state witness converging slowly in LOBPCG), so the I2 check below
-        // cannot hold as written on FD — for Task 9 to decide, not a bound to raise here
-        settings.occupations = Occupations::Aufbau;
+        // FermiDirac, as `providers::ks::problem` poses the app's witness since plan 2026-11-13 Task 9 (the Task 7 Aufbau
+        // hold is gone). The block now carries a witness column per channel (f ≤ e^−36) that LOBPCG may leave at its cap
+        // (measured 2026-11-16: 1.85e-4 on the cold solve's first tight step); the state rests on the f-bearing columns,
+        // so the I2 check below reads their residual (`eigen_occupied_residual`, the test probe); Task 9b splits the
+        // reported residual (tight / guard) in the solver
+        assert_eq!(settings.occupations, Occupations::FermiDirac { kt: qm::ELECTRON_KT });
         let at = |x0: f64| System::new(vec![Nucleus { pos: [x0, 0.0, 0.0], z: 1 }, Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }], 0, None);
         let mut s = GpuSolver::new(ctx, &grid);
+        s.set_occupied_residual_probe(true);
         let lo = settings.eig_tol.max(EIG_TOL_FLOOR_FACTOR * residual_floor_estimate(&s.g));
         s.solve(&at(0.70), &settings, false).unwrap();
         let (_, warm) = s.solve(&at(0.72), &settings, true).unwrap();
@@ -1847,11 +1883,15 @@ mod tests {
         // ratio is robust to one step only; `steps ≤` above is the primary lag witness (M7)
         assert!((pw.readbacks as f64) < 0.85 * pc.readbacks as f64, "warm {} vs cold {} readbacks", pw.readbacks, pc.readbacks);
         assert!((warm.energy.total - cold.energy.total).abs() < 1e-5, "warm {} vs cold {}", warm.energy.total, cold.energy.total);
-        // review I2: `max_eigen_residual` describes the tight-tol solves the state rests on (M3
-        // meaning), the loosened early steps only the profile's any-step worst
+        // review I2: the tight-tol solves the state rests on (M3 meaning) are converged, the loosened early steps show
+        // only in the profile's any-step worst. Under FD the state rests on the f-bearing columns: their worst tight-step
+        // residual is the check (plan 2026-11-13 Task 9; `max_eigen_residual` also holds the witness columns)
         for (st, p) in [(&warm, &pw), (&cold, &pc)] {
-            println!("  max_eigen_residual {:.2e}, eigen_worst_residual_any_step {:.2e}, last step {:.2e}", st.max_eigen_residual, p.eigen_worst_residual_any_step, p.eigen_last_step_residual);
-            assert!(st.max_eigen_residual <= LAST_STEP_RESIDUAL_FACTOR * lo, "max_eigen_residual {:.2e} leaks a loosened step (lo {lo:.2e})", st.max_eigen_residual);
+            println!("  max_eigen_residual {:.2e} (f-bearing columns {:.2e}), eigen_worst_residual_any_step {:.2e}, last step {:.2e}",
+                     st.max_eigen_residual, p.eigen_occupied_residual, p.eigen_worst_residual_any_step, p.eigen_last_step_residual);
+            assert!(p.eigen_occupied_residual > 0.0, "the probe ran on a tight step");
+            assert!(p.eigen_occupied_residual <= LAST_STEP_RESIDUAL_FACTOR * lo, "the f-bearing residual {:.2e} leaks a loosened step (lo {lo:.2e})", p.eigen_occupied_residual);
+            assert!(p.eigen_occupied_residual <= st.max_eigen_residual * (1.0 + 1e-3), "the f-bearing columns are among the block's");
             assert!(st.max_eigen_residual >= p.eigen_last_step_residual && p.eigen_worst_residual_any_step >= st.max_eigen_residual);
         }
         assert!(pc.eigen_worst_residual_any_step > 10.0 * lo, "the cold solve's loosened steps are visible in the profile");

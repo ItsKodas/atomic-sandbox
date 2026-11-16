@@ -64,8 +64,10 @@
 //!    *ionic surface*) differ from the model's `Provenance` → teacher, unconditionally; the sample
 //!    is NOT kept (it belongs to a different Kohn-Sham surface than the store's). The ionic tag
 //!    (`Provenance::ionic`, `crate::pseudo::provenance_tag`) follows the physics, not the menu:
-//!    `"none"` whenever nothing is pseudised (H₂ under `CoresOnly` *is* the all-electron surface),
-//!    else `"<policy>/<recipe hash>/shared<τ>/<τ_c>/stop2x<floor>"`; the surfaces differ by tens of Ha per pseudised
+//!    the all-electron tag `none/fd5e-3/pin1e-5` whenever nothing is pseudised (H₂ under `CoresOnly` *is* the
+//!    all-electron surface; `crate::pseudo::is_all_electron_tag` also answers for the legacy `"none"`), else
+//!    `"<policy>/<surface hash>/fd5e-3/stop2x<floor>/pin1e-5"` (Fermi–Dirac at kT = 5 mHa and the GPU stop rules, plan
+//!    2026-11-13 Task 9; the `DegenerateShells`-era `…/shared1e-3/1e-1/stop2x5e-8` is the legacy tag); the surfaces differ by tens of Ha per pseudised
 //!    atom and in bond angles, so a model taught on one is never consulted on another. **With a
 //!    shared collection attached** (M8a Task 4a, `shared` module doc) the comparison is the
 //!    collection's surface-key check instead: any box, neutral, automatic multiplicity, the same
@@ -1044,15 +1046,16 @@
 //! # Pseudopotential scenes (M7 Task 9)
 //! - **Never trained on** (before `admit` can quarantine, fence or release anything on it): a teacher
 //!   answer with `EvalStats::core_overlaps` (two ions' frozen cores overlap — the approximation fails,
-//!   spec §5.6) and one with `EvalStats::occupation_changed` (the shared-shell pattern differs from the
-//!   previous step's: E(R) jumps by the orbital-polarisation energy, Task 6 review A.6). The answer is
-//!   still the step's; the note reads "surrogate: sample not kept (cores overlap — spec §5.6)", the
-//!   activity row is `TeachOutcome::UnfitNotKept`. The same holds for a background audit's answer and a
-//!   sampling pass's geometry (`EvalStats::untrainable`).
+//!   spec §5.6) and one the `branch_jump` guard flagged (`EvalStats::branch_jump`: F changed by more than the
+//!   forces' work since the teacher's previous answer — another stationary state, spec 2026-11-13 §6.3; it
+//!   replaced the shared-shell occupation watch in plan 2026-11-13 Task 9). The answer is still the step's;
+//!   the note reads "surrogate: sample not kept (cores overlap — spec §5.6)" or "(… the forces' work —
+//!   Fermi–Dirac spec §6.3)" (`sim::untrainable_citation`), the activity row is `TeachOutcome::UnfitNotKept`.
+//!   The same holds for a background audit's answer and a sampling pass's geometry (`EvalStats::untrainable`).
 //! - **Force-label noise prior** ([`PSEUDO_FORCE_NOISE`] = 5e-5 Ha/Bohr per component, task-8b review
 //!   ruling (b) and task-8a): the GPU pseudo path's own scatter at the sampling tolerance is measured
 //!   4.7–4.8e-5 on lone pseudo-O and OH, up to ≈ 7e-5 on warm teacher chains, and no model can represent
-//!   it. On a pseudo surface (`Provenance::ionic != "none"`) the fit's force noise s_F is floored at it
+//!   it. On a pseudo surface (`!pseudo::is_all_electron_tag(&Provenance::ionic)`) the fit's force noise s_F is floored at it
 //!   (`FitOptions::sigma_f_min`: the fit is redone with s_F pinned there when the evidence estimate falls
 //!   below it), so the posterior is never more confident about forces than the labels can support; and a
 //!   force **audit** is never judged against a tier below 3 × it (`policy::audit_force_floor`). The
@@ -1901,7 +1904,7 @@ impl SurrogateKs {
         let judged_audit = h.audit && !h.shell_fence;
         let n = h.pos.len().max(1) as f64;
         let mut stats = r.stats;
-        if stats.pseudised.is_empty() && h.prov.ionic == "none" {
+        if stats.pseudised.is_empty() && crate::pseudo::is_all_electron_tag(&h.prov.ionic) {
             self.last_pseudised = None;
         } else if !stats.pseudised.is_empty() {
             self.last_pseudised = Some((h.prov.ionic.clone(), stats.pseudised.clone()));
@@ -2483,7 +2486,7 @@ impl ForceProvider for SurrogateKs {
         let mut stats = EvalStats::default();
         stats.source = Source::Surrogate;
         if let Some((tag, summaries)) = &self.last_pseudised {
-            if *tag == prov.ionic && prov.ionic != "none" {
+            if *tag == prov.ionic && !crate::pseudo::is_all_electron_tag(&prov.ionic) {
                 stats.pseudised = summaries.clone();
             }
         }

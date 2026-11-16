@@ -758,11 +758,12 @@ pub struct DynSnapshot {
     /// True after a discontinuous edit until the next tick re-evaluates (then `energy_ks`,
     /// `eval` and `display` are the pre-edit values).
     pub forces_stale: bool,
-    /// The provider's energy at the current positions (Hartree).
+    /// The provider's energy at the current positions (Hartree): for a Kohn-Sham provider the Mermin free energy
+    /// F = E − TS its forces are the derivative of (`EnergyBreakdown::total`, spec 2026-11-13 §4.3), never E.
     pub energy_ks: f64,
     /// Σ ½ m v² (Hartree, lab frame).
     pub kinetic: f64,
-    /// `kinetic + energy_ks` — spec §7's total energy.
+    /// `kinetic + energy_ks` — spec §7's total energy (KE + F under Fermi–Dirac occupations).
     pub total: f64,
     /// The invariant the drift is fitted on (module doc): total + U_spring + U_field + U_wall − W.
     pub energy_conserved: f64,

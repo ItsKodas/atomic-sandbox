@@ -770,7 +770,7 @@ impl SurrogateKs {
             return;
         };
         let rule = box_affected_face_density(self.store.as_ref().map_or(0.25, |s| s.provenance.h));
-        let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
+        let ionic = self.store.as_ref().map_or_else(crate::pseudo::all_electron_tag, |s| s.provenance.ionic.clone());
         let has_store = self.store.is_some();
         let (mut judged, mut passed, mut deferred, mut worst) = (0usize, 0usize, 0usize, 0.0f64);
         let mut failed: Vec<FailedAudit> = Vec::new();
@@ -960,7 +960,7 @@ impl SurrogateKs {
     /// two ratios, `None` when the model cannot predict there.
     pub(super) fn check_ratios(&self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]]) -> Option<(f64, f64)> {
         let model = self.model.as_ref()?;
-        let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
+        let ionic = self.store.as_ref().map_or_else(crate::pseudo::all_electron_tag, |s| s.provenance.ionic.clone());
         let p = model.predict(pos, z, false).ok()?;
         let n = pos.len().max(1) as f64;
         let e = (energy - p.energy).abs() / n / self.policy.energy_std_per_atom;
@@ -990,7 +990,7 @@ impl SurrogateKs {
     pub(super) fn judge_shell_checks_with(&mut self, shells: Vec<crate::sampling::ShellCheck>, caveat: Option<&str>) {
         let tail = caveat.map_or(String::new(), |c| format!(" ({c}: possibly the fit's error, not the cutoff's — the next pass's shell check measures it again)"));
         let rule = box_affected_face_density(self.store.as_ref().map_or(0.25, |s| s.provenance.h));
-        let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
+        let ionic = self.store.as_ref().map_or_else(crate::pseudo::all_electron_tag, |s| s.provenance.ionic.clone());
         for c in shells {
             let name = format!("{}–{}", units::elements::symbol(c.pair.0), units::elements::symbol(c.pair.1));
             if c.unfit || c.face.is_some_and(|f| f > rule) {

@@ -4442,7 +4442,13 @@ fn fnv1a(text: &str) -> u64 {
 /// `spin_change` (the analytic teacher holds no guard: 341 occurrences of ", branch_jump: None, spin_change: None" in
 /// the 907-line trace). Removing exactly those strings from the new trace reproduces the old digest
 /// 0xfeaa_fe54_5608_3db3 — no decision, answer, note, sample or draw moved.
-const SCRIPTED_SESSION_DIGEST: u64 = 0x09f6_9183_02c2_fda9;
+/// **Re-pinned for plan 2026-11-13 Task 9** (0x09f6_9183_02c2_fda9 → below): `EvalStats::{fractional,
+/// occupation_changed}` became `partial` (341 occurrences of ", partial: []" for ", fractional: [], occupation_changed:
+/// false"), `EnergyBreakdown` gained `internal` and `ts` (341 occurrences of ", internal: 0.0, ts: 0.0"), and the
+/// provenance's all-electron tag is `none/fd5e-3/pin1e-5` (2 occurrences of "ionic none/fd5e-3/pin1e-5" for "ionic
+/// none"). Substituting exactly those strings back in the 907-line trace (and the views trace) reproduces the old digest
+/// 0x09f6_9183_02c2_fda9 — no decision, answer, note, sample or draw moved.
+const SCRIPTED_SESSION_DIGEST: u64 = 0xe356_bcdb_45e7_b03c;
 
 /// A fixed session through every decision path the providers' tests reach without a thread:
 /// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's
@@ -6707,7 +6713,7 @@ fn estimated_mode_has_one_orbital_producer() {
 /// Spec §8 row 9 first failing test (spec §5.5): a model taught under one ionic policy is never
 /// consulted under another — the surfaces differ by about 38 Ha per O and a bond angle — and the
 /// teacher's answer from the other policy is not kept. The tag follows the physics, not the menu:
-/// H has no core, so H2 under CoresOnly *is* today's surface (tag "none") and is answered.
+/// H has no core, so H2 under CoresOnly *is* the all-electron surface (the all-electron tag) and is answered.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only (generates H for the All tag); cargo test -p providers --release")]
 fn provenance_refuses_model_across_policies() {
@@ -6725,15 +6731,17 @@ fn provenance_refuses_model_across_policies() {
     assert!(r.stats.notes.iter().any(|n| n.contains("differs from the model's") && n.contains("ionic")), "{:?}", r.stats.notes);
     assert_eq!(calls(&h), 1);
     assert_eq!(s.samples(), 40, "no sample from another policy is kept");
-    assert_eq!(crate::pseudo::provenance_tag(&cores), "none");
+    // re-pinned in plan 2026-11-13 Task 9 (was "none"): the all-electron tag names the FD rule
+    assert_eq!(crate::pseudo::provenance_tag(&cores), crate::pseudo::all_electron_tag());
     assert!(crate::pseudo::provenance_tag(&all).starts_with("all/"));
 }
 
-/// A Morse teacher that reports what a pseudised one would: cores in contact, or a changed shared-shell pattern.
+/// A Morse teacher that reports what a Kohn-Sham one would: cores in contact, or a step the `branch_jump` guard flagged
+/// (spec 2026-11-13 §6.3; it replaced the shared-shell pattern watch in plan 2026-11-13 Task 9).
 struct Reporting {
     inner: Arc<Mutex<MorseDimer>>,
     overlap: bool,
-    pattern_changed: bool,
+    branch_jump: bool,
 }
 
 impl ForceProvider for Reporting {
@@ -6743,7 +6751,10 @@ impl ForceProvider for Reporting {
             r.stats.core_overlaps = vec![(0, 1, 0.5)];
             r.stats.warnings.push(format!("{}: 0–1 at R = 0.500 Bohr", sim::CORE_OVERLAP_WARNING));
         }
-        r.stats.occupation_changed = self.pattern_changed;
+        if self.branch_jump {
+            r.stats.branch_jump = Some(0.012);
+            r.stats.warnings.push(sim::branch_jump_warning(0.012));
+        }
         Ok(r)
     }
 
@@ -6754,13 +6765,15 @@ impl ForceProvider for Reporting {
     fn reset(&mut self) {}
 }
 
-/// Spec §5.5: a teacher answer with a core-overlap warning is used, never trained on; so is one whose
-/// shared-shell pattern changed since the previous step (Task 6 review A.6). An ordinary answer is kept.
+/// Spec §5.5: a teacher answer with a core-overlap warning is used, never trained on; so is one the `branch_jump` guard
+/// flagged (spec 2026-11-13 §6.3; the occupation-pattern watch's successor). Each note cites its own spec section (plan
+/// 2026-11-13 Task 8 review M5). An ordinary answer is kept.
 #[test]
 fn core_overlap_answers_are_never_kept() {
-    for (overlap, pattern_changed, why) in [(true, false, "cores overlap"), (false, true, "occupation pattern changed"), (false, false, "")] {
+    for (overlap, branch_jump, why) in [(true, false, "cores overlap — spec §5.6"), (false, true, "F changed by more than the forces' work — Fermi–Dirac spec §6.3"),
+                                        (false, false, "")] {
         let teacher = Arc::new(Mutex::new(MorseDimer::h2()));
-        let mut s = SurrogateKs::new(Box::new(Reporting { inner: teacher, overlap, pattern_changed }), FallbackPolicy::default());
+        let mut s = SurrogateKs::new(Box::new(Reporting { inner: teacher, overlap, branch_jump }), FallbackPolicy::default());
         let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
         assert_eq!(r.stats.source, Source::Fallback);
         if why.is_empty() {
@@ -6776,7 +6789,7 @@ fn core_overlap_answers_are_never_kept() {
 #[test]
 fn an_unfit_answer_leaves_its_own_activity_row() {
     let teacher = Arc::new(Mutex::new(MorseDimer::h2()));
-    let mut s = SurrogateKs::new(Box::new(Reporting { inner: teacher, overlap: true, pattern_changed: false }), FallbackPolicy::default());
+    let mut s = SurrogateKs::new(Box::new(Reporting { inner: teacher, overlap: true, branch_jump: false }), FallbackPolicy::default());
     s.evaluate(&h2(1.6), &mut never()).unwrap();
     let ev = s.take_events().into_iter().last().expect("an activity row");
     assert_eq!(ev.outcome, TeachOutcome::UnfitNotKept);
@@ -6806,6 +6819,8 @@ fn a_pseudo_surface_floors_the_force_noise_prior() {
     let pseudo = fit_on("cores/0123456789abcdef/shared1e-3");
     println!("sigma_F: all-electron {clean:.2e}, pseudo {pseudo:.2e}");
     assert!(clean < PSEUDO_FORCE_NOISE / 10.0, "exact Morse labels: the evidence estimate is tiny, got {clean:e}");
+    // plan 2026-11-13 Task 9: the Fermi–Dirac all-electron tag is the all-electron surface too (`is_all_electron_tag`)
+    assert_eq!(fit_on("none/fd5e-3/pin1e-5").to_bits(), clean.to_bits(), "the FD all-electron tag has no floor");
     assert!((pseudo - PSEUDO_FORCE_NOISE).abs() <= 1e-9, "the floor binds on the pseudo surface: {pseudo:e}");
     assert!(PSEUDO_FORCE_NOISE >= 4.7e-5, "the measured GPU path scatter (task-8b review ruling (b))");
 }
@@ -6820,6 +6835,7 @@ fn force_audits_do_not_judge_a_pseudo_model_below_its_label_noise() {
     let model = [[1.0e-4, 0.0, 0.0]]; // a 1e-4 Ha/Bohr disagreement: label noise on the pseudo path
     let none = worst_force_residual(&tight, &model, &teacher, audit_force_floor("none")).unwrap();
     assert!(none.0 > none.1, "the tight tier fails the all-electron model: {none:?}");
+    assert_eq!(audit_force_floor("none/fd5e-3/pin1e-5"), 0.0, "the FD all-electron tag (plan 2026-11-13 Task 9)");
     let pseudo = worst_force_residual(&tight, &model, &teacher, audit_force_floor("cores/0123456789abcdef/shared1e-3")).unwrap();
     assert!(pseudo.0 <= pseudo.1, "within 3 sigma_F of the noise prior: {pseudo:?}");
     assert_eq!(pseudo.1, 3.0 * PSEUDO_FORCE_NOISE);
@@ -6877,8 +6893,10 @@ fn the_provenance_carries_the_stop_rule_not_its_value() {
     let (a, b) = (s.provenance_for(&o2), s.provenance_for(&co2));
     assert_eq!(a, b, "{} vs {}", a.describe(), b.describe());
     assert_eq!((a.tol, b.tol), (1e-6, 1e-6), "the nominal tolerance");
-    assert!(a.ionic.starts_with("cores/") && a.ionic.ends_with("/stop2x5e-8"), "{}", a.ionic);
-    assert!(a.ionic.contains("/shared1e-3/1e-1/"), "τ and τ_c are in the tag: {}", a.ionic);
+    // re-pinned in plan 2026-11-13 Task 9 (was ".../shared1e-3/1e-1/stop2x5e-8"): the tag names the FD rule (kT) and the
+    // partial-level stop besides the floor rule
+    assert!(a.ionic.starts_with("cores/") && a.ionic.ends_with("/stop2x5e-8/pin1e-5"), "{}", a.ionic);
+    assert!(a.ionic.contains("/fd5e-3/"), "kT is in the tag: {}", a.ionic);
     let (t12, t16) = (crate::pseudo::effective_gpu_tol(1e-6, 12), crate::pseudo::effective_gpu_tol(1e-6, 16));
     assert!((t12 - 1.2e-6).abs() < 1e-15 && (t16 - 1.6e-6).abs() < 1e-15, "{t12} {t16}");
 }

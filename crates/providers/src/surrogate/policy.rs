@@ -126,9 +126,10 @@ pub(super) fn env_keys(pos: &[[f64; 3]], z: &[u8], rc2: f64) -> Vec<Option<surro
 pub const PSEUDO_FORCE_NOISE: f64 = 5e-5;
 
 /// The label-noise prior of the surface `ionic` (`Provenance::ionic`): [`PSEUDO_FORCE_NOISE`] for a pseudised
-/// surface, 0 for the all-electron one (whose labels keep the evidence-estimated noise, bitwise as before).
+/// surface, 0 for the all-electron one (whose labels keep the evidence-estimated noise, bitwise as before) — the legacy
+/// `"none"` and the Fermi–Dirac `none/fd5e-3/pin1e-5` alike (`crate::pseudo::is_all_electron_tag`, spec 2026-11-13 §6.2).
 pub(super) fn force_noise_prior(ionic: &str) -> f64 {
-    if ionic == "none" { 0.0 } else { PSEUDO_FORCE_NOISE }
+    if crate::pseudo::is_all_electron_tag(ionic) { 0.0 } else { PSEUDO_FORCE_NOISE }
 }
 
 /// The least tier an audit's force check may use on the surface `ionic`: 3σ of ONE label's noise, 0 on the

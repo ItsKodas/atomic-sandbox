@@ -56,7 +56,7 @@ pub fn fit_summary(rep: &FitReport, s: &SurrogateKs) -> String {
 /// the cutoff shell); [`sample_and_fit_counted`] returns the counts instead.
 pub fn sample_and_fit(s: &mut SurrogateKs, sc: &Scene, plan: &SamplingPlan, out: &mut String) -> (FitReport, Duration) {
     let (rep, pass, p) = sample_and_fit_counted(s, sc, plan, out);
-    assert_eq!((p.failed, p.skipped), (0, 0), "sampling pass: {p:?}");
+    assert_eq!((p.failed, p.skipped), (0, 0), "sampling pass: {p:?}; the pass's lines:\n{out}");
     (rep, pass)
 }
 

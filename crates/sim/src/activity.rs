@@ -491,8 +491,8 @@ pub enum TeachOutcome {
     Thinned,
     BoxNotKept,
     /// A teacher answer that is used for its step and never trained on: its cores overlap (the frozen-core
-    /// approximation fails, spec §5.6) or its shared-shell occupation pattern changed since the previous step
-    /// (E(R) jumps there, Task 6 review A.6). M7.
+    /// approximation fails, spec §5.6) or the `branch_jump` guard flagged it (F changed by more than the forces'
+    /// work since the previous step: another stationary state, spec 2026-11-13 §6.3). M7.
     UnfitNotKept,
     /// A teacher answer at a geometry inside a fenced cutoff shell (the surrogate's shell fence,
     /// 2026-10-19 final review I1): used for its step — a relax verification included — and never

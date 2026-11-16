@@ -118,10 +118,11 @@ pub struct Provenance {
     pub teacher: String,
     pub masses: Vec<(u8, u16)>,
     /// The ionic surface the samples were solved on (M7, spec §5.5; `providers::pseudo::provenance_tag`):
-    /// `"none"` for the all-electron surface (every model before M7), else `"<policy>/<recipe hash>"`.
+    /// the all-electron tag (`"none"` for every model before the Fermi–Dirac switch, `none/fd5e-3/pin1e-5` after it,
+    /// plan 2026-11-13 Task 9), else `"<policy>/<recipe hash>/…"`.
     /// **Compared**: the surfaces differ by tens of Ha per pseudised atom and in bond angles, so a model
     /// taught on one is never consulted on another. The tag follows the physics, not the menu — H₂ under
-    /// `CoresOnly` is the all-electron surface and carries `"none"`.
+    /// `CoresOnly` is the all-electron surface and carries the all-electron tag.
     pub ionic: String,
 }
 

@@ -104,11 +104,14 @@ fn gpu_solve(s: &mut GpuSolver, sys: &System, settings: &ScfSettings, warm: bool
     (stats, s.profile().clone(), t.elapsed())
 }
 
-fn components(e: &Energy) -> [(&'static str, f64); 6] {
-    [("kinetic", e.kinetic), ("external", e.external), ("hartree", e.hartree), ("xc", e.xc), ("nuclear", e.nuclear), ("total", e.total)]
+/// The energy's parts in order: the five components, their sum E (`internal`), the entropy term TS and the total
+/// F = E − TS (spec 2026-11-13 §4.3; plan Task 9 added `internal` and `ts`, so a rebuilt total subtracts TS).
+fn components(e: &Energy) -> [(&'static str, f64); 8] {
+    [("kinetic", e.kinetic), ("external", e.external), ("hartree", e.hartree), ("xc", e.xc), ("nuclear", e.nuclear), ("internal", e.internal), ("ts", e.ts),
+     ("total", e.total)]
 }
 
-/// The largest |Δ| over the five energy components (the total is the sixth).
+/// The largest |Δ| over the five energy components (E, TS and the total follow them).
 fn worst_component(a: &Energy, b: &Energy) -> (&'static str, f64) {
     components(a).iter().zip(components(b).iter()).take(5)
         .map(|((n, x), (_, y))| (*n, (x - y).abs())).fold(("", 0.0), |m, c| if c.1 > m.1 { c } else { m })
@@ -334,8 +337,8 @@ fn timing_table() {
     let mut setup = String::new();
     let mut run = |system: &'static str, n: usize, make: &dyn Fn(f64) -> System| {
         let grid = Grid::cube(n, 0.25);
-        // held until plan Task 9 switches it: the table times the app's all-electron surface, which
-        // `providers::ks::problem` keeps at Aufbau until then. Measured 2026-11-16 under `for_grid`'s FermiDirac (plan
+        // held until plan Task 9b (plan amendment 62ae478; Task 9 switched the app's all-electron surface to FD but this
+        // table's cold 97³ H₂O needs 9b's witness cost fix and cap decision). Measured 2026-11-16 under `for_grid`'s FermiDirac (plan
         // Task 7): H₂O at 97³ × 0.25 failed cold with "no gap witness within 16 extra levels". Cause (Task 7 fix round 1
         // diagnostic): transient pre-convergence steps 3–4 (ε_N −0.15 / −0.13 Ha, μ −0.067 / −0.053, so the window top
         // is at +0.11–0.13 Ha above 15–16 box states), not the converged spectrum and not collapsed columns (overlaps
@@ -360,7 +363,7 @@ fn timing_table() {
 
     let mut md = String::new();
     let _ = writeln!(md, "# GPU timing table (`validate::gpu_vs_cpu::timing_table`, {} UTC)\n", chrono_free_date());
-    let _ = writeln!(md, "Adapter: {} ({:?}, {:?}); release build; σ = h = 0.25, tol 1e-6 (`ScfSettings::for_grid` with `Occupations::Aufbau`, held until plan Task 9).", adapter.name, adapter.backend, adapter.device_type);
+    let _ = writeln!(md, "Adapter: {} ({:?}, {:?}); release build; σ = h = 0.25, tol 1e-6 (`ScfSettings::for_grid` with `Occupations::Aufbau`, held until plan Task 9b).", adapter.name, adapter.backend, adapter.device_type);
     let _ = writeln!(md, "**Contention:** the test cannot tell how it was invoked. Run as part of the suite (`--test gpu_vs_cpu`) the GPU is uncontended (the `GPU` lock) but three CPU reference solves run alongside, and the rows are 5–20 % slower than a solo run (`--test gpu_vs_cpu timing_table`), which is the mode of record in `references.md`. Treat this file as \"in-suite (contended)\" unless you ran the test alone.");
     let _ = writeln!(md, "\"first\" is the first solve on a fresh `GpuSolver` (pipeline warm-up, pool growth); \"cold\" the next cold solve of the same geometry; \"warm\" a warm start from it on the molecule shifted by 0.02 Bohr (the MD step). Phase walls from `SolveProfile`: Poisson = inside `GpuPoisson::solve` (every SCF step + the energy), LOBPCG = inside `lobpcg`, start = building/uploading the cold-start guess (CPU f64), rest = pointwise work, DIIS, the SCF readbacks and the energy.\n");
     md += &setup;

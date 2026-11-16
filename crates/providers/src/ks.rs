@@ -95,25 +95,30 @@
 //! this program's own atom, cached for the process, filtered for the scene's h, and **refused with the `h_req`
 //! named** when the grid is coarser than the table is certified for (`ProviderError::Invalid`, before any solve).
 //! Nothing pseudised (policy `None`; `CoresOnly` with only H/He or recipe-refused species, which fall back to
-//! all-electron with a note) is exactly today's problem: `System::new`, `Occupations::Aufbau`, the same bits.
-//! With a setup the electron count is the valence count (Z_v), `charge` and `multiplicity` are checked against it,
-//! and the occupations are `DegenerateShells { τ = DEGENERACY_TAU }` (Task 6 review A.6).
+//! all-electron with a note) is the all-electron problem, `System::new`. With a setup the electron count is the
+//! valence count (Z_v), and `charge` and `multiplicity` are checked against it.
 //!
-//! Each result then carries `EvalStats::{pseudised, core_overlaps, fractional, occupation_changed}`: the species'
-//! generation records, the pairs whose frozen cores overlap (spec §5.6), the shared shells of the final step and
-//! whether that pattern differs from the previous evaluation's (a warning; the surrogate never trains on such a
-//! step or on an overlapping one; under the surrogate the comparison is with *the same provider's previous
-//! evaluation* — the stepping teacher answers only at fallbacks, often thousands of steps apart, so "changed"
-//! there means "differs from the last teacher call", a conservative proxy for the Task 6 A.6 rule: it never trains
-//! on more than the rule would, but it also drops the first sample after any difference and cannot see a switch and
-//! switch-back between two calls). The occupation scheme is a property of the *scene*: one pseudised atom anywhere
-//! puts the whole scene on `DegenerateShells` (an all-electron open-shell fragment in the same scene is then shared
-//! too); the scheme can change only through an edit (Add, Remove, ReplaceScene, policy), each of which resets the
-//! provider and restarts the energy history. The GPU adapter stops its SCF at `max(tol, 2·floor(N))` under a setup
-//! (spec §7 risk 6: the f32 density floor grows with the valence electron count N); it is noted in
-//! `EvalStats::notes` and every answer records the tolerance it ran at, `EvalStats::scf_tol_used` (never compared;
-//! the surrogate's provenance carries the stop *rule* in its ionic tag, the nominal tolerance as before).
-//! `set_display_partial_core` adds ρ_pc to the
+//! # Occupations: Fermi–Dirac on every scene (spec 2026-11-13 §6.1; plan Task 9)
+//! Every scene, pseudised or not, solves with `Occupations::FermiDirac { kt: qm::ELECTRON_KT }` (kT = 5 mHa,
+//! T_el ≈ 1579 K): the energy is the Mermin free energy F = E − TS (`EvalStats::energy`: `internal` = E, `ts`, `total`
+//! = F) and the forces are −dF/dR. The all-electron surface is no longer today's aufbau bit for bit: every channel now
+//! solves its witness vectors (the levels above μ + 36 kT, `qm::scf` "Occupations"), so the all-electron bitwise pins
+//! were re-pinned with that reason, and the all-electron tag moved with it (`crate::pseudo::all_electron_tag`). A
+//! gapped state's TS is ≤ 1e-12 Ha, so its F equals the aufbau E to the solver's scatter.
+//!
+//! Each result then carries `EvalStats::{pseudised, core_overlaps, partial}`: the species' generation records, the pairs
+//! whose frozen cores overlap (spec §5.6, never trained on) and the partly occupied levels of the final step
+//! (min(f, 1 − f) ≥ `qm::PARTIAL_OCCUPATION_MIN`, `sim::PartialLevel`). The `branch_jump` guard below replaced the
+//! shared-shell occupation watch (plan Task 9): FD has no shared-shell pattern to switch, and a switch of stationary
+//! state shows as F changing by more than the forces' work. The GPU adapter stops its SCF at `max(tol, 2·floor(N))`
+//! under a setup (spec §7 risk 6: the f32 density floor grows with the valence electron count N; noted in
+//! `EvalStats::notes`), and on a step whose occupations have a partly occupied level at max(that, `qm::GPU_PARTIAL_TOL`)
+//! (spec 2026-11-13 §5.1, the solver's own rule). Every answer records the tolerance its converged step was tested
+//! against, `EvalStats::scf_tol_used` = `qm::ScfStats::tol_used` (F9: never compared for provenance — the surrogate's
+//! provenance carries the stop *rules* in its ionic tag, the nominal tolerance as before; the guard picks its noise
+//! tier from it).
+//!
+//! Under a setup, `set_display_partial_core` adds ρ_pc to the
 //! density shown — a display of the generator's core model, computed after the solve, never fed back.
 //! [`gpu_footprint_bytes`] counts the valence electrons and [`pseudo_extra_bytes`] under a setup.
 //!
@@ -122,14 +127,16 @@
 //! previous one*: ΔF against the forces' trapezoid work, within 3σ of the surface's path scatter at the tolerance the
 //! solve stopped at (`ScfStats::tol_used`, `branch_jump::noise_tier`) plus 3κ_max‖ΔR‖³. A flagged step carries
 //! `EvalStats::branch_jump = Some(m)` and the warning `sim::branch_jump_warning(m)`; the surrogate never trains on it
-//! (`EvalStats::untrainable`). Under the surrogate "previous" is the last teacher call, as for the occupation watch
-//! above, so only fallback streaks are judged (consecutive calls ≤ 0.1 Bohr apart): sampling-pass solves and sparse
+//! (`EvalStats::untrainable`). Under the surrogate "previous" is the last teacher call (as it was for the occupation
+//! watch the guard replaced), so only fallback streaks are judged (consecutive calls ≤ 0.1 Bohr apart): sampling-pass solves and sparse
 //! audits are not covered (R-NOTE-b). The guard forgets on `reset` (every edit, so every scene replace) and on a grid
 //! change, and restarts by itself on any change of species, atom count, cell or origin; `discontinuity` keeps it (a
 //! teleport of more than 0.1 Bohr is not judged anyway). With N↑ = N↓ a judged step also reports
 //! `EvalStats::spin_change`, |Δ∫|ρ↑ − ρ↓|| — the CPU from `qm::orbitals::spin_summary`, the GPU from
-//! `GpuSolver::spin_abs_integral` (one extra reduction and readback per such evaluation). It runs beside the
-//! occupation watch until plan Task 9 deletes the watch.
+//! `GpuSolver::spin_abs_integral` (one extra reduction and readback per such evaluation). The guard's surface (pseudo
+//! or all-electron tier) is `system.ionic.is_none()`, which is exactly `crate::pseudo::is_all_electron_tag` of the
+//! scene's provenance tag (`setup_for` and the tag share one per-species rule; pinned by
+//! `the_guard_surface_is_the_tag_surface`), read without taking the pseudopotential cache's lock.
 //!
 //! # Errors
 //! - [`ProviderError::Cancelled`]: `should_abort` returned true (the GPU keeps the in-progress
@@ -381,15 +388,17 @@ pub fn field_bytes(n: usize) -> u64 {
 /// `qm::IonicSetup` by [`crate::pseudo::setup_for`] — generation on first use, the `h_req` check, the fallback
 /// notes (pushed to `notes`) — and the electron count is the valence count: Z_v for a pseudised species, Z for
 /// the rest, minus the charge. When nothing is pseudised (policy `None`; `CoresOnly` with only H/He or refused
-/// species) the setup is `None` and the problem is exactly today's all-electron one, occupations included. With a
-/// setup the occupations are `DegenerateShells { τ = DEGENERACY_TAU }` (Task 6 review A.6: an open shell of a
-/// pseudo-atom has no well-posed integer fixed point).
+/// species) the setup is `None` and the problem is the all-electron one. Every scene's occupations are
+/// `FermiDirac { kt: qm::ELECTRON_KT }` (spec 2026-11-13 §6.1, plan Task 9; module doc, "Occupations").
 pub(crate) fn problem(scene: &Scene, tol: f64, notes: &mut Vec<String>) -> Result<(Grid, System, ScfSettings), ProviderError> {
     scene.check_inside_cell()?;
     let grid = Grid::cube(scene.cell.n, scene.cell.h);
     let nuclei: Vec<qm::Nucleus> = scene.nuclei.iter().map(|n| qm::Nucleus { pos: n.pos, z: n.z }).collect();
     let mut settings = ScfSettings::for_grid(&grid);
     settings.tol = tol;
+    // every scene, whatever its ionic policy (spec 2026-11-13 §6.1, G2); `for_grid`'s default too, stated here because the
+    // providers' surface (its provenance tag) is defined by it
+    settings.occupations = qm::Occupations::FermiDirac { kt: qm::ELECTRON_KT };
     if let Some(s) = scene.sigma {
         settings.sigma = s;
     }
@@ -411,16 +420,8 @@ pub(crate) fn problem(scene: &Scene, tol: f64, notes: &mut Vec<String>) -> Resul
         }
     }
     let system = match setup {
-        Some(setup) => {
-            settings.occupations = qm::Occupations::DegenerateShells { tau: qm::DEGENERACY_TAU };
-            System::with_ionic(nuclei, scene.charge, scene.multiplicity, setup)
-        }
-        None => {
-            // held until plan Task 9 switches it (the all-electron surface moves together with its provenance tag;
-            // `ScfSettings::for_grid` defaults to FermiDirac since plan Task 7)
-            settings.occupations = qm::Occupations::Aufbau;
-            System::new(nuclei, scene.charge, scene.multiplicity)
-        }
+        Some(setup) => System::with_ionic(nuclei, scene.charge, scene.multiplicity, setup),
+        None => System::new(nuclei, scene.charge, scene.multiplicity),
     };
     Ok((grid, system, settings))
 }
@@ -474,43 +475,13 @@ fn elapsed_ms(t0: Instant) -> u64 {
     t0.elapsed().as_millis() as u64
 }
 
-/// The shared-shell pattern (spin, first level, size) of the previous evaluation, to warn when it changes
-/// (Task 6 review A.6: E(R) jumps by up to the orbital-polarisation energy where a pair's splitting crosses τ).
-/// Forgotten on `reset` and on a grid change, so a new scene never warns; empty throughout without an ionic setup.
-#[derive(Default)]
-struct OccupationWatch {
-    last: Option<Vec<(u8, usize, usize)>>,
-}
-
-impl OccupationWatch {
-    /// Records this evaluation's pattern; true when it differs from the previous evaluation's.
-    fn changed(&mut self, shells: &[qm::scf::FractionalShell]) -> bool {
-        let now: Vec<(u8, usize, usize)> = shells.iter().map(|c| (c.spin, c.first, c.count)).collect();
-        let changed = self.last.as_ref().is_some_and(|l| *l != now);
-        self.last = Some(now);
-        changed
-    }
-
-    fn forget(&mut self) {
-        self.last = None;
-    }
-}
-
-/// The `EvalStats` fields that come straight from `ScfStats`, plus the M7 ones: the pseudised species' summaries
-/// (from `setup`), the core overlaps, the shared shells and whether their pattern changed since the previous
-/// evaluation (`watch`).
-#[allow(clippy::too_many_arguments)]
-fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec<String>, eig_tol_used: f64, scf_tol_used: f64, system: &System, watch: &mut OccupationWatch) -> EvalStats {
+/// The `EvalStats` fields that come straight from `ScfStats` — the energy breakdown with E, TS and F, the partly
+/// occupied levels, and the tolerance the converged step was tested against (`ScfStats::tol_used`, F9: the GPU's
+/// partial-level stop shows as 1e-5) — plus the M7 ones: the pseudised species' summaries (from `setup`) and the
+/// core overlaps.
+fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec<String>, eig_tol_used: f64, system: &System) -> EvalStats {
     let setup = system.ionic.as_deref();
-    let ScfStats { iterations, energy, boundary_density, max_eigen_residual, poisson_residual, mut warnings, core_overlaps, fractional, .. } = stats;
-    let occupation_changed = watch.changed(&fractional);
-    if occupation_changed {
-        warnings.push(format!(
-            "{}: the shared shells are now {} (E(R) can jump by the orbital-polarisation energy; not kept as training data)",
-            sim::OCCUPATION_CHANGE_WARNING,
-            if fractional.is_empty() { "none".to_string() } else { fractional.iter().map(|c| format!("{} of {} {}", c.count, c.first, if c.spin == 0 { "↑" } else { "↓" })).collect::<Vec<_>>().join(", ") }
-        ));
-    }
+    let ScfStats { iterations, energy, boundary_density, max_eigen_residual, poisson_residual, warnings, core_overlaps, partial, tol_used, .. } = stats;
     EvalStats {
         source: Source::Dft,
         uncertainty: None,
@@ -526,16 +497,24 @@ fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec
         // n↑ ≥ n↓ by construction (`qm::scf::spin_split`): 2S + 1 of the state solved
         multiplicity: Some((system.n_up - system.n_dn + 1) as u32),
         eig_tol_used: Some(eig_tol_used),
-        scf_tol_used: Some(scf_tol_used),
-        energy: EnergyBreakdown { kinetic: energy.kinetic, external: energy.external, hartree: energy.hartree, xc: energy.xc, nuclear: energy.nuclear, total: energy.total },
+        scf_tol_used: Some(tol_used),
+        energy: EnergyBreakdown {
+            kinetic: energy.kinetic,
+            external: energy.external,
+            hartree: energy.hartree,
+            xc: energy.xc,
+            nuclear: energy.nuclear,
+            internal: energy.internal,
+            ts: energy.ts,
+            total: energy.total,
+        },
         max_eigen_residual,
         poisson_residual,
         atom_uncertainty: None,
         extrapolation: None,
         pseudised: setup.map(crate::pseudo::summaries).unwrap_or_default(),
         core_overlaps,
-        fractional: fractional.into_iter().map(|c| sim::SharedShell { spin: c.spin, first: c.first, count: c.count, f: c.f, spread: c.spread }).collect(),
-        occupation_changed,
+        partial: partial.into_iter().map(|p| sim::PartialLevel { spin: p.spin, index: p.index, eps: p.eps, f: p.f }).collect(),
         branch_jump: None,
         spin_change: None,
     }
@@ -543,11 +522,10 @@ fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec
 
 /// The `branch_jump` guard on one finished evaluation (module doc, "The branch_jump guard"; spec 2026-11-13 §6.3):
 /// judged against the same provider's previous evaluation on the tier of the surface and of the tolerance the solve
-/// stopped at (`ScfStats::tol_used`); a flagged step gets `EvalStats::branch_jump` and the spec §6.6 warning, a judged
-/// one at N↑ = N↓ the spin measure. `spin_abs`: ∫|ρ↑ − ρ↓| when N↑ = N↓, else `None`.
-#[allow(clippy::too_many_arguments)]
-fn judge_branch(guard: &mut BranchJumpGuard, stats: &mut EvalStats, scene: &Scene, grid: &Grid, system: &System, forces: &[[f64; 3]], tol_used: f64,
-                spin_abs: Option<f64>) {
+/// stopped at (`EvalStats::scf_tol_used` = `ScfStats::tol_used`); a flagged step gets `EvalStats::branch_jump` and the
+/// spec §6.6 warning, a judged one at N↑ = N↓ the spin measure. `spin_abs`: ∫|ρ↑ − ρ↓| when N↑ = N↓, else `None`.
+fn judge_branch(guard: &mut BranchJumpGuard, stats: &mut EvalStats, scene: &Scene, grid: &Grid, system: &System, forces: &[[f64; 3]], spin_abs: Option<f64>) {
+    let tol_used = stats.scf_tol_used.expect("a Kohn-Sham evaluation records the tolerance it stopped at");
     let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
     let positions: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
     let j = guard.judge(&Evaluation {
@@ -558,6 +536,8 @@ fn judge_branch(guard: &mut BranchJumpGuard, stats: &mut EvalStats, scene: &Scen
         cell: scene.cell.clone(),
         origin: grid.origin,
         spin_abs,
+        // the all-electron surface iff nothing is pseudised, i.e. iff `is_all_electron_tag(provenance_tag(scene))` (module
+        // doc; `the_guard_surface_is_the_tag_surface`), without the cache lock
         tier: noise_tier(system.ionic.is_none(), tol_used, stats.energy.total),
     });
     stats.branch_jump = j.branch_jump();
@@ -593,7 +573,6 @@ pub struct CpuKs {
     interrupt: Option<DisplayInterrupt>,
     /// The density shown includes ρ_pc (`set_display_partial_core`).
     show_core: bool,
-    watch: OccupationWatch,
     /// The `branch_jump` guard (module doc): the previous evaluation.
     guard: BranchJumpGuard,
     /// The orbital shares' free-atom tables (`set_share_tables`; module doc, "Orbital display").
@@ -609,7 +588,6 @@ impl CpuKs {
             unocc: UnoccupiedState::default(),
             interrupt: None,
             show_core: false,
-            watch: OccupationWatch::default(),
             guard: BranchJumpGuard::new(),
             share_tables: None,
         }
@@ -701,7 +679,6 @@ impl ForceProvider for CpuKs {
         let t0 = Instant::now();
         if self.grid.as_ref() != Some(&grid) {
             self.warm = None;
-            self.watch.forget();
             self.guard.reset();
             self.grid = Some(grid.clone());
             // the orbital producer is grid-sized: rebuilt (module doc, "Orbital display")
@@ -755,9 +732,8 @@ impl ForceProvider for CpuKs {
                                stats.max_eigen_residual, settings.eig_tol));
         }
         let energy = stats.energy.total;
-        let tol_used = stats.tol_used;
-        let mut stats = eval_stats(stats, None, t0, notes, settings.eig_tol, settings.tol, &system, &mut self.watch);
-        judge_branch(&mut self.guard, &mut stats, scene, &grid, &system, &forces, tol_used, spin_abs);
+        let mut stats = eval_stats(stats, None, t0, notes, settings.eig_tol, &system);
+        judge_branch(&mut self.guard, &mut stats, scene, &grid, &system, &forces, spin_abs);
         Ok(ForceResult { energy, forces, stats, display, orbitals })
     }
 
@@ -767,7 +743,6 @@ impl ForceProvider for CpuKs {
 
     fn reset(&mut self) {
         self.warm = None;
-        self.watch.forget();
         self.guard.reset();
         self.density_current = false;
         self.rho = None;
@@ -883,7 +858,6 @@ pub struct GpuKs {
     interrupt: Option<DisplayInterrupt>,
     /// The density shown includes ρ_pc (`set_display_partial_core`).
     show_core: bool,
-    watch: OccupationWatch,
     /// The `branch_jump` guard (module doc): the previous evaluation.
     guard: BranchJumpGuard,
     /// The orbital shares' free-atom tables (`set_share_tables`; module doc, "Orbital display").
@@ -917,7 +891,6 @@ impl GpuKs {
             unocc: UnoccupiedState::default(),
             interrupt: None,
             show_core: false,
-            watch: OccupationWatch::default(),
             guard: BranchJumpGuard::new(),
             share_tables: None,
             share_gpu: None,
@@ -944,9 +917,14 @@ impl GpuKs {
         let solver = solver.as_mut()?;
         let (cell, nuclei, settings) = last.as_ref()?;
         let positions: Vec<[f64; 3]> = nuclei.iter().map(|n| n.pos).collect();
+        // the rows the view shows: the state's shown columns (under FermiDirac the f-bearing ones; its witness columns
+        // are the solve's, counted in the scene's estimate — `witness_extra_bytes` / `pseudo_extra_bytes` — and are not
+        // display rows, `qm::orbitals::shown_columns`, plan 2026-11-13 Task 9)
         let (n, n_up, n_dn, origin, all_electron) = {
             let st = solver.state()?;
-            (st.grid.n[0], st.orbitals_up.len(), st.orbitals_dn.len(), st.grid.origin, st.ionic.is_none())
+            let fd = matches!(st.occupations, qm::Occupations::FermiDirac { .. });
+            let shown = |len: usize, occ: &[f64]| qm::orbitals::shown_columns(len, occ, fd).len();
+            (st.grid.n[0], shown(st.orbitals_up.len(), &st.occ_up), shown(st.orbitals_dn.len(), &st.occ_dn), st.grid.origin, st.ionic.is_none())
         };
         // `requested` is the app's (the driver matches it); the solve is capped at UNOCCUPIED_MAX
         let requested = orb.request().unoccupied;
@@ -1226,7 +1204,6 @@ impl GpuKs {
             self.orbital = None;
             self.orb.rebuilt();
             self.unocc.dropped();
-            self.watch.forget();
             self.guard.reset();
             let mut s = qm_gpu::GpuSolver::new(self.ctx.clone(), &grid);
             s.set_density_extrapolation(self.extrapolate);
@@ -1304,9 +1281,8 @@ impl GpuKs {
             self.drop_view_after_fault();
             None
         };
-        let tol_used = stats.tol_used;
-        let mut stats = eval_stats(stats, Some(readbacks), t0, notes, eig_tol_used, settings.tol, &system, &mut self.watch);
-        judge_branch(&mut self.guard, &mut stats, scene, &grid, &system, &forces, tol_used, spin_abs);
+        let mut stats = eval_stats(stats, Some(readbacks), t0, notes, eig_tol_used, &system);
+        judge_branch(&mut self.guard, &mut stats, scene, &grid, &system, &forces, spin_abs);
         Ok(ForceResult { energy, forces, stats, display, orbitals })
     }
 }
@@ -1339,7 +1315,6 @@ impl ForceProvider for GpuKs {
     /// now (off, then back on) and `warm = false` discards the warm or parked state.
     fn reset(&mut self) {
         self.cold = true;
-        self.watch.forget();
         self.guard.reset();
         self.density_current = false;
         self.drop_extrapolation();
@@ -1432,15 +1407,16 @@ impl ForceProvider for GpuKs {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use sim::{Cell, Nucleus};
     use gpu::GpuContext;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    /// Serialises the GPU sections of concurrently running tests (poisoning is harmless here).
-    static GPU: Mutex<()> = Mutex::new(());
+    /// Serialises the GPU sections of concurrently running tests (poisoning is harmless here; `crate::fd_regression`
+    /// takes it too).
+    pub(crate) static GPU: Mutex<()> = Mutex::new(());
 
     fn gpu() -> Option<GpuContext> {
         let ctx = GpuContext::new_headless();
@@ -1737,7 +1713,8 @@ mod tests {
         }
     }
 
-    /// The CPU adapter is `qm::scf` + `qm::forces` and nothing else: bitwise.
+    /// The CPU adapter is `qm::scf` + `qm::forces` and nothing else: bitwise. Since plan 2026-11-13 Task 9 both sides run
+    /// `for_grid`'s Fermi–Dirac occupations (the Task 7 Aufbau hold is gone), and the breakdown carries E and TS.
     #[test]
     #[cfg_attr(debug_assertions, ignore)]
     fn cpu_provider_matches_qm_directly() {
@@ -1748,7 +1725,7 @@ mod tests {
         let sys = qm::System::new(vec![qm::Nucleus { pos: [0.7, 0.0, 0.0], z: 1 }, qm::Nucleus { pos: [-0.7, 0.0, 0.0], z: 1 }], 0, None);
         let mut settings = qm::ScfSettings::for_grid(&grid);
         settings.tol = 1e-6;
-        settings.occupations = qm::Occupations::Aufbau; // held until plan Task 9 switches it (`problem`'s all-electron branch)
+        assert_eq!(settings.occupations, qm::Occupations::FermiDirac { kt: qm::ELECTRON_KT }, "the providers' rule is for_grid's");
         let (state, stats) = qm::scf(&grid, &sys, &settings, None).expect("qm::scf");
         let f = qm::forces(&grid, &state, &sys.nuclei, settings.sigma).expect("qm::forces");
         println!("H₂ 33³: E = {:+.12} Ha ({} steps), F = {:?}", r.energy, r.stats.scf_steps, r.forces);
@@ -1758,9 +1735,12 @@ mod tests {
         assert_eq!(r.stats.readbacks, None);
         assert_eq!(r.stats.warnings, stats.warnings);
         let (a, b) = (r.stats.energy, stats.energy);
-        for (x, y) in [(a.kinetic, b.kinetic), (a.external, b.external), (a.hartree, b.hartree), (a.xc, b.xc), (a.nuclear, b.nuclear), (a.total, b.total)] {
+        for (x, y) in [(a.kinetic, b.kinetic), (a.external, b.external), (a.hartree, b.hartree), (a.xc, b.xc), (a.nuclear, b.nuclear), (a.internal, b.internal), (a.ts, b.ts),
+                       (a.total, b.total)] {
             assert_eq!(x.to_bits(), y.to_bits(), "energy breakdown {a:?} vs {b:?}");
         }
+        assert_eq!(r.stats.scf_tol_used, Some(stats.tol_used), "F9: the stop the solve was tested against");
+        assert!(r.stats.partial.is_empty() && a.ts <= 1e-12, "gapped H₂: no partial level, TS {:.1e}", a.ts);
         assert_eq!(r.stats.max_eigen_residual.to_bits(), stats.max_eigen_residual.to_bits());
         assert_eq!(r.stats.poisson_residual.to_bits(), stats.poisson_residual.to_bits());
         // the display payload is the converged density as f32, on the scene's cell
@@ -2699,8 +2679,12 @@ mod tests {
     ///   steps: one each. Then 5 s of play at full speed: at most one per second, and their summed
     ///   wall ≤ `UNOCCUPIED_BUDGET` × the summed SCF wall + one solve (printed: Task 0 found
     ///   the eigensolve 4–50 warm SCFs, so the budget keeps it paused-only — none runs).
-    /// - H₂O 97³, m = 4: one paused eigensolve, its wall printed against the SCF's; three play
+    /// - H₂O, m = 4: one paused eigensolve, its wall printed against the SCF's; three play
     ///   evaluations after it run none and the status says paused-only while the budget is short.
+    ///   Re-pinned in plan 2026-11-13 Task 9 (was 97³ × 0.25): under FermiDirac the cold all-electron H₂O at 97³ × 0.25
+    ///   (a 24 Bohr box) hits the witness cap on a transient step ("no gap witness within 16 extra levels", measured
+    ///   2026-11-16 after 630 s; the Task 7 fix-round-1 diagnosis, plan Task 9b owns the cap and the cost), so the leg
+    ///   runs on the H₂O preset's own Accurate cell, 95³ × 0.15 (14 Bohr; Task 8 measured it converging cold in 94 s).
     #[test]
     #[cfg_attr(debug_assertions, ignore)]
     fn unoccupied_budget_in_play() {
@@ -2755,15 +2739,16 @@ mod tests {
                  wall.as_secs_f64(), play.iter().filter(|s| s.1.is_some()).count());
         assert!(runs as f64 <= (wall.as_secs_f64() / UNOCCUPIED_MIN_INTERVAL.as_secs_f64()).ceil(), "{runs} eigensolves in {wall:?}");
         assert!(eig_s <= UNOCCUPIED_BUDGET * scf_s + first.wall_s.max(eig_s / runs.max(1) as f64), "{eig_s} s of eigensolves against {scf_s} s of SCF");
-        // H₂O at 97³: the measured cost, paused-only by the budget
+        // H₂O at the preset's Accurate cell (95³ × 0.15; re-pinned from 97³ × 0.25, doc above): the measured cost,
+        // paused-only by the budget
         let mut g = GpuKs::new(ctx, 1e-5);
         g.set_display(false);
         g.set_orbital_view(with_unoccupied(OrbitalRequest::List, 4, true));
-        let mut s = h2o(97);
-        let r = g.evaluate(&s, &mut never()).expect("H₂O 97³");
+        let mut s = Scene { cell: Cell { n: 95, h: 0.15 }, ..h2o(95) };
+        let r = g.evaluate(&s, &mut never()).expect("H₂O 95³ × 0.15");
         let u = r.orbitals.as_ref().and_then(|o| o.unoccupied.clone()).expect("a paused payload with m = 4");
         let scf = r.stats.solve_ms as f64 / 1e3 - u.wall_s;
-        println!("H₂O 97³ m = 4, paused: eigensolve {:.2} s vs the SCF's {scf:.2} s (cold) — a play solve needs {:.0} s of SCF wall first; shown {:?}, notes {:?}",
+        println!("H₂O 95³ × 0.15 m = 4, paused: eigensolve {:.2} s vs the SCF's {scf:.2} s (cold) — a play solve needs {:.0} s of SCF wall first; shown {:?}, notes {:?}",
                  u.wall_s, u.wall_s / UNOCCUPIED_BUDGET, u.shown, u.notes);
         g.set_orbital_view(with_unoccupied(OrbitalRequest::List, 4, false));
         let mut scf_play = 0.0;
@@ -3266,8 +3251,10 @@ mod tests {
         let li = |policy| Scene { nuclei: vec![Nucleus::new(3, [0.0; 3])], cell: Cell { n: 33, h: 0.25 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: policy, train_mask: None };
         let mut notes = Vec::new();
         let (_, sys, settings) = super::problem(&li(sim::IonicPolicy::CoresOnly), 1e-6, &mut notes).expect("posed");
-        assert!(sys.ionic.is_none(), "nothing pseudised: Li runs on today's all-electron path");
-        assert_eq!(settings.occupations, qm::Occupations::Aufbau, "with today's occupations, so the tag \"none\" is the same surface");
+        assert!(sys.ionic.is_none(), "nothing pseudised: Li runs on the all-electron path");
+        // re-pinned in plan 2026-11-13 Task 9 (was Aufbau): every scene is FD; the all-electron tag moved with it
+        assert_eq!(settings.occupations, qm::Occupations::FermiDirac { kt: qm::ELECTRON_KT }, "every scene's occupations are Fermi–Dirac");
+        assert!(crate::pseudo::is_all_electron_tag(&crate::pseudo::provenance_tag(&li(sim::IonicPolicy::CoresOnly))), "the all-electron surface");
         assert!(notes.iter().any(|n| n.contains("Li") && n.contains("two valence s states") && n.contains("all-electron")), "{notes:?}");
         let e = super::problem(&li(sim::IonicPolicy::All), 1e-6, &mut Vec::new()).err().expect("refused");
         assert!(matches!(&e, ProviderError::Invalid(m) if m.contains("refused") && m.contains("ONCV")), "{e:?}");
@@ -3348,7 +3335,10 @@ mod tests {
         g.set_display(false);
         let raised = |r: &ForceResult| r.stats.notes.iter().any(|n| n.contains("GPU SCF tolerance raised"));
         let o6 = g.evaluate(&o_scene(0.2, sim::IonicPolicy::CoresOnly), &mut never()).expect("pseudo-O");
-        assert_eq!(o6.stats.scf_tol_used, Some(1e-6), "N = 6");
+        // re-pinned in plan 2026-11-13 Task 9 (was 1e-6): the triplet's minority 2p is partly occupied under FD, so the GPU
+        // stops at the partial-level rule max(tol, GPU_PARTIAL_TOL) and `scf_tol_used` now records that stop (F9); the
+        // floor-aware part (N = 6: 2·floor = 6e-7 < 1e-6) still raises nothing
+        assert_eq!(o6.stats.scf_tol_used, Some(qm::GPU_PARTIAL_TOL), "N = 6, a partial level");
         assert!(!raised(&o6));
         g.reset();
         let o2 = Scene { nuclei: vec![Nucleus::new(8, [-1.15, 0.0, 0.0]), Nucleus::new(8, [1.15, 0.0, 0.0])], cell: Cell { n: 61, h: 0.20 }, ionic: sim::IonicPolicy::CoresOnly, multiplicity: Some(3), ..o_scene(0.2, sim::IonicPolicy::None) };
@@ -3366,22 +3356,29 @@ mod tests {
 
     /// Ruling (a) of the stall-stop review: the stop is level-gated (`qm::SCF_STALL_LEVEL_PER_ELECTRON`). On the measured
     /// cases, cold GPU solves at the default settings (stop on): stretched spin-symmetric H₂ at 65³ × 0.25, R = 6.0 and
-    /// 107³ × 0.15, R = 5.75 — plateaus of 152 and 118 iterations at a best Δρ ≤ 9.6e-5, below L = 2e-3 — converge
-    /// (191 and 144 iterations with the stop off, `scf_stall_stretched_h2`); water's O–H at 1.8 r₀ (95³ × 0.15,
-    /// `CoresOnly`, the sampling pass's failing point, Δρ oscillating at 0.3–1.5, L = 8e-3) still stalls early.
+    /// 107³ × 0.15, R = 5.75 — under aufbau plateaus of 152 and 118 iterations at a best Δρ ≤ 9.6e-5, below L = 2e-3 —
+    /// converge, the stop leaving them bitwise as with it off; water's O–H at 1.8 r₀ (95³ × 0.15, `CoresOnly`, the sampling
+    /// pass's failing point, Δρ oscillating at 0.3–1.5 under `DegenerateShells`, L = 8e-3) stalled early.
+    ///
+    /// **Re-pinned in plan 2026-11-13 Task 9** (the scenes are Fermi–Dirac now; all-electron now solves witness vectors):
+    /// the stretched H₂ converge in **14** and **13** iterations (were 191 and 144 under aufbau; measured 2026-11-16 with
+    /// the stop off too: the same counts and the same F bits), their σ_g/σ_u pair partly occupied (f ≈ 0.93 / 0.07 per
+    /// channel, TS 5.2 / 4.8 mHa); and the water point no longer stalls — it **converges in 16** (FD resolves the
+    /// oscillation the shared-shell rule's switching drove, spec 2026-11-13 §1). The stop's early end of a hopeless solve
+    /// is still pinned in `qm`'s and `qm-gpu`'s stall-watch tests.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only (generates O); cargo test -p providers --release")]
     fn the_level_gated_stall_stop_on_the_measured_cases() {
         let Some(ctx) = gpu() else { return };
         let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
-        for (n, h, r, off_iterations) in [(65usize, 0.25, 6.0, 191usize), (107, 0.15, 5.75, 144)] {
+        for (n, h, r, off_iterations) in [(65usize, 0.25, 6.0, 14usize), (107, 0.15, 5.75, 13)] {
             // the measurement's order (`sampling` tests' `pair`): −r/2 first
             let scene = Scene { nuclei: vec![Nucleus::new(1, [-0.5 * r, 0.0, 0.0]), Nucleus::new(1, [0.5 * r, 0.0, 0.0])], cell: Cell { n, h }, ..h2(33, r) };
             let (grid, system, settings) = problem(&scene, 1e-6, &mut Vec::new()).expect("H2");
             assert_eq!(settings.stall_window, qm::SCF_STALL_WINDOW);
             let mut s = qm_gpu::GpuSolver::new(ctx.clone(), &grid);
             let st = s.solve(&system, &settings, false).unwrap_or_else(|e| panic!("H₂ {n}³ R {r}: {e}")).1;
-            println!("H₂ {n}³ R {r} (stop on): converged in {} iterations, Δρ {:.2e}", st.iterations, st.delta_rho);
+            println!("H₂ {n}³ R {r} (stop on): converged in {} iterations, Δρ {:.2e}, F {:+.10}, TS {:.3e}", st.iterations, st.delta_rho, st.energy.total, st.energy.ts);
             assert_eq!(st.iterations, off_iterations, "the stop must leave this converging solve untouched");
         }
         let water = Scene {
@@ -3395,12 +3392,8 @@ mod tests {
         let t = Instant::now();
         let r = s.solve(&system, &settings, false).map(|(_, st)| st.iterations);
         println!("water O–H 1.8 r₀ (stop on): {r:?} after {:.1} s", t.elapsed().as_secs_f64());
-        match r {
-            Err(qm::QmError::ScfStalled { iterations, best_delta_rho, level, .. }) => {
-                assert!(iterations < 100 && best_delta_rho >= level && (level - 8e-3).abs() < 1e-12, "{iterations} iterations, best {best_delta_rho}, level {level}");
-            }
-            other => panic!("expected an early stall, got {other:?}"),
-        }
+        // re-pinned in plan 2026-11-13 Task 9 (was an early `ScfStalled`): under FD the point converges
+        assert_eq!(r.ok(), Some(16), "the water point converges under Fermi–Dirac");
     }
 
     /// Physics review S3 (stall stop): the shell-release path. The OH radical at 3.5 Bohr (`CoresOnly`: pseudo-O, an
@@ -3422,6 +3415,7 @@ mod tests {
         };
         let (grid, system, on) = problem(&scene, 1e-6, &mut Vec::new()).expect("OH");
         assert!(system.ionic.is_some());
+        assert_eq!(on.occupations, qm::Occupations::FermiDirac { kt: qm::ELECTRON_KT });
         let off = ScfSettings { stall_window: 0, ..on };
         let mut s = qm_gpu::GpuSolver::new(ctx, &grid);
         let a = s.solve(&system, &off, false).expect("OH converges").1;
@@ -3431,31 +3425,20 @@ mod tests {
         assert_eq!(a.delta_rho.to_bits(), c.delta_rho.to_bits());
         assert_eq!(a.iterations, c.iterations);
         let last = seen.last().unwrap();
-        println!("pseudo OH 3.5 Bohr M = 2 95³: {} steps, E {:+.10}, E_HF(last) {:+.10} (Δ {:.2e}); released {:?}; no-gain counter {:?}",
-                 a.iterations, a.energy.total, last.energy, last.energy - a.energy.total, a.released, seen.iter().map(|p| p.since_gain).collect::<Vec<_>>());
-        assert!(!a.released.is_empty(), "the shell release ran (the stall watch's restart path)");
-        assert!((last.energy - a.energy.total).abs() < 1e-5, "Harris–Foulkes {} vs E {}", last.energy, a.energy.total);
+        println!("pseudo OH 3.5 Bohr M = 2 95³: {} steps, F {:+.10}, F_HF(last) {:+.10} (Δ {:.2e}), TS {:.3e}, partial {:?}; no-gain counter {:?}",
+                 a.iterations, a.energy.total, last.energy, last.energy - a.energy.total, a.energy.ts, a.partial, seen.iter().map(|p| p.since_gain).collect::<Vec<_>>());
+        // re-pinned in plan 2026-11-13 Task 9 (was `!released.is_empty()`): the scene is FD now, which has no shell release
+        // (the stall watch's restart path went with `DegenerateShells`'s phase 2); the stop on and off still give the same
+        // bits on this slow, partly occupied solve, and the last Harris–Foulkes F lands on the reported F
+        assert!(a.released.is_empty() && !a.partial.is_empty(), "FD: nothing released, a partly occupied level: {:?}", a.partial);
+        assert!((last.energy - a.energy.total).abs() < 1e-5, "Harris–Foulkes {} vs F {}", last.energy, a.energy.total);
     }
 
-    /// Task 6 review A.6: the shared-shell pattern between consecutive evaluations — a change is reported once,
-    /// a first evaluation and a forgotten history never are.
-    #[test]
-    fn a_changed_shared_shell_pattern_is_noticed() {
-        let shell = |spin, first, count| qm::scf::FractionalShell { spin, first, count, f: 1.0 / count as f64, spread: 1e-7 };
-        let mut w = OccupationWatch::default();
-        assert!(!w.changed(&[shell(1, 1, 3)]), "first evaluation: nothing to compare with");
-        assert!(!w.changed(&[shell(1, 1, 3)]), "same pattern");
-        assert!(w.changed(&[]), "the shell was released: pattern changed");
-        assert!(!w.changed(&[]));
-        assert!(w.changed(&[shell(0, 1, 3)]), "a shell appeared");
-        w.forget();
-        assert!(!w.changed(&[shell(1, 1, 2)]), "after a reset (a new scene) no comparison");
-    }
-
-    /// Task 6 review A.6 and the orbital viewer under DegenerateShells (task-9 carry item 6): a lone pseudo-O
-    /// (triplet, 2p^4: three p electrons up full, one p electron down shared over the three p levels) — the CPU
-    /// solve reports the shared shell, the pseudised species and its h_req, and the orbital rows carry the
-    /// state's occupations (1, 1/3, 0 for the stored gap witness) with the electron counts n_up = 4, n_dn = 2.
+    /// Task 6 review A.6 and the orbital viewer (task-9 carry item 6), re-pinned for Fermi–Dirac in plan 2026-11-13 Task 9
+    /// (was the `DegenerateShells` shared cluster): a lone pseudo-O (triplet, 2p^4: three p electrons up full, one p
+    /// electron down over the three p levels, exactly degenerate at a grid point so f = 1/3 each) — the CPU solve reports
+    /// the three partly occupied ↓ levels, TS = 3 kT s(1/3), the pseudised species and its h_req, and the orbital rows
+    /// carry the state's occupations (1, 1/3, ≈ 0 for the stored witnesses) with the electron counts n_up = 4, n_dn = 2.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only (CPU pseudo-O solve); cargo test -p providers --release")]
     fn a_lone_pseudo_o_reports_its_shared_shell_and_fractional_orbital_rows() {
@@ -3469,10 +3452,13 @@ mod tests {
         let p = &r.stats.pseudised[0];
         assert_eq!((p.z, p.z_v), (8, 6.0));
         assert!(p.h_req.is_some_and(|h| h >= 0.20) && p.r_c_max > 0.5 && p.record.contains("recipe"), "{p:?}");
-        assert_eq!(r.stats.fractional.len(), 1, "one shared cluster: the minority 2p");
-        let c0 = &r.stats.fractional[0];
-        assert!(c0.spin == 1 && c0.count == 3 && (c0.f - 1.0 / 3.0).abs() < 1e-12, "{c0:?}");
-        assert!(!r.stats.occupation_changed && r.stats.core_overlaps.is_empty());
+        assert_eq!(r.stats.partial.len(), 3, "the minority 2p: three partly occupied levels {:?}", r.stats.partial);
+        assert!(r.stats.partial.iter().all(|p| p.spin == 1 && (p.f - 1.0 / 3.0).abs() < 1e-6), "{:?}", r.stats.partial);
+        // the closed form of three exactly degenerate levels at f = 1/3: kT·3·s(1/3), s(f) = −f ln f − (1 − f) ln(1 − f)
+        let s3 = 3.0 * (-(1.0f64 / 3.0) * (1.0f64 / 3.0).ln() - (2.0 / 3.0) * (2.0f64 / 3.0).ln());
+        assert!((r.stats.energy.ts - qm::ELECTRON_KT * s3).abs() < 1e-7, "TS {} vs 3 kT s(1/3) = {}", r.stats.energy.ts, qm::ELECTRON_KT * s3);
+        assert_eq!(r.stats.energy.total.to_bits(), (r.stats.energy.internal - r.stats.energy.ts).to_bits(), "F = E − TS");
+        assert!(r.stats.branch_jump.is_none() && r.stats.core_overlaps.is_empty());
         assert!(r.stats.notes.iter().all(|n| !n.contains("tolerance raised")), "CPU: no floor-aware stop");
         // the orbital rows
         let o = r.orbitals.expect("a payload");
@@ -3483,10 +3469,10 @@ mod tests {
         assert!(o.notes.iter().any(|n| n.contains("pseudised atom")), "{:?}", o.notes);
         let total: f64 = o.rows.iter().map(|r| r.occupation).sum();
         assert!((total - 6.0).abs() < 1e-9, "sum f = the 6 valence electrons, got {total}");
-        let dn_frac: Vec<f64> = o.rows.iter().filter(|r| r.spin == Spin::Down && r.occupation > 0.0 && r.occupation < 1.0).map(|r| r.occupation).collect();
+        let dn_frac: Vec<f64> = o.rows.iter().filter(|r| r.spin == Spin::Down && r.occupation > 1e-6 && r.occupation < 1.0 - 1e-6).map(|r| r.occupation).collect();
         assert_eq!(dn_frac.len(), 3, "three down p levels share the electron");
-        assert!(dn_frac.iter().all(|f| (f - 1.0 / 3.0).abs() < 1e-12), "{dn_frac:?}");
-        assert!(o.rows.iter().filter(|r| r.spin == Spin::Up).all(|r| r.occupation == 0.0 || r.occupation == 1.0), "up is closed");
+        assert!(dn_frac.iter().all(|f| (f - 1.0 / 3.0).abs() < 1e-6), "{dn_frac:?}");
+        assert!(o.rows.iter().filter(|r| r.spin == Spin::Up).all(|r| r.occupation < 1e-6 || r.occupation > 1.0 - 1e-6), "up is closed");
         assert_eq!((o.spin.n_up, o.spin.n_dn), (4, 2), "electrons per channel (the stored gap witnesses are not electrons)");
     }
 
@@ -3508,5 +3494,83 @@ mod tests {
             assert_eq!(r.multiplicity, Some(want), "Z = {z}");
             assert!(r.energy > -40.0, "a valence energy, not the all-electron total: {}", r.energy);
         }
+    }
+    /// Plan 2026-11-13 Task 9 (F9; spec §5.1): `EvalStats::scf_tol_used` is the tolerance the converged step was tested
+    /// against (`ScfStats::tol_used`). A lone pseudo-O at M = 3 (its minority 2p partly occupied) through the GPU provider
+    /// at the sample tolerance (1e-6, `branch_jump::SAMPLE_TOL`) stopped at the partial-level rule, `GPU_PARTIAL_TOL`;
+    /// gapped all-electron H₂ at the requested tolerance. The `branch_jump` guard judges each on that tier.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only (generates O); cargo test -p providers --release")]
+    fn scf_tol_used_reports_the_partial_stop() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let tol = crate::branch_jump::SAMPLE_TOL;
+        let mut g = GpuKs::new(ctx, tol);
+        g.set_display(false);
+        let o = g.evaluate(&o_scene(0.2, sim::IonicPolicy::CoresOnly), &mut never()).expect("pseudo-O M = 3");
+        println!("pseudo-O M = 3 61³ × 0.20: scf_tol_used {:?}, {} steps, TS {:.6e}, partial {:?}", o.stats.scf_tol_used, o.stats.scf_steps, o.stats.energy.ts, o.stats.partial);
+        assert!(!o.stats.partial.is_empty(), "the minority 2p is partly occupied");
+        assert_eq!(o.stats.scf_tol_used, Some(qm::GPU_PARTIAL_TOL), "the partial-level stop, not the requested {tol:e}");
+        g.reset();
+        let h2 = g.evaluate(&h2(33, 1.4), &mut never()).expect("H₂");
+        println!("H₂ 33³: scf_tol_used {:?}, TS {:.1e}", h2.stats.scf_tol_used, h2.stats.energy.ts);
+        assert!(h2.stats.partial.is_empty(), "gapped");
+        assert_eq!(h2.stats.scf_tol_used, Some(tol), "a gapped solve stops at the requested tolerance");
+    }
+
+    /// Plan 2026-11-13 Task 8 review M6 (Task 9): the `branch_jump` guard picks its surface as `system.ionic.is_none()`
+    /// (no cache lock on the evaluation path); that is exactly `is_all_electron_tag` of the scene's provenance tag, since
+    /// `setup_for` and the tag apply one per-species rule. Scenes that need no dimer gate (no H or He under `All` or
+    /// `Accepted`).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only (generates O); cargo test -p providers --release")]
+    fn the_guard_surface_is_the_tag_surface() {
+        use sim::IonicPolicy::{All, Accepted, CoresOnly, None as AllElectron};
+        let water = |ionic| Scene { ionic, cell: Cell { n: 61, h: 0.2 }, ..h2o(61) };
+        let h2c = |ionic| Scene { ionic, ..h2(33, 1.4) };
+        let cases = [h2c(AllElectron), h2c(CoresOnly), water(AllElectron), water(CoresOnly), o_scene(0.2, AllElectron), o_scene(0.2, CoresOnly),
+                     o_scene(0.2, All), o_scene(0.2, Accepted)];
+        for scene in &cases {
+            let (_, system, _) = problem(scene, 1e-6, &mut Vec::new()).expect("posed");
+            let tag = crate::pseudo::provenance_tag(scene);
+            assert_eq!(system.ionic.is_none(), crate::pseudo::is_all_electron_tag(&tag), "{:?} {:?}: tag {tag}", scene.ionic, scene.nuclei.iter().map(|n| n.z).collect::<Vec<_>>());
+        }
+    }
+
+    /// Spec 2026-11-13 NOTE-6 / V8 (plan Task 9): the all-electron witness cap on an anion whose LSDA HOMO is unbound, in
+    /// the largest box the app's presets offer at its default quality — the 14 Bohr box of the h2o/h2s/hcl/ph3/sih4/lih
+    /// presets (57³ × 0.25) regridded to Accurate, 95³ × 0.15. All-electron H⁻ (2 electrons, singlet), cold, at the app's
+    /// interactive tolerance 1e-5, through `problem` (FD at kT = 5 mHa) and the GPU solver. The measured outcome is pinned
+    /// (2026-11-16, RX 7900 XTX): it **converges**, in 18 steps (74.5 s), F = −0.474954 Ha, TS = 1.9e-7 Ha (gapped); the
+    /// HOMO is unbound in LSDA (ε = +0.089 Ha, held by the box) and the witness arms took 10 extra vectors ↑ and 11 ↓, under
+    /// the cap of 16 (`MAX_WITNESS_GROWTH`) — 5–6 to spare. A larger box (Scene ▸ Grid allows up to 201³, 30 Bohr at
+    /// h = 0.15) can still exceed it: N(E) ∝ L³ (spec §4.2), the cost and the cap are plan Task 9b's.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only (GPU, 95³ all-electron); cargo test -p providers --release")]
+    fn all_electron_h_minus_witness_cap() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let scene = Scene { nuclei: vec![Nucleus::new(1, [0.0; 3])], cell: Cell { n: 95, h: 0.15 }, charge: -1, multiplicity: None, sigma: None,
+                            external_field: [0.0; 3], ionic: sim::IonicPolicy::None, train_mask: None };
+        let (grid, system, settings) = problem(&scene, 1e-5, &mut Vec::new()).expect("H⁻ is posed");
+        assert!(system.ionic.is_none() && (system.n_up, system.n_dn) == (1, 1));
+        let mut s = qm_gpu::GpuSolver::new(ctx, &grid);
+        let t = Instant::now();
+        let r = s.solve(&system, &settings, false);
+        let wall = t.elapsed().as_secs_f64();
+        let st = match r {
+            Ok((_, st)) => st,
+            Err(e) => panic!("H⁻ 95³ × 0.15: the pinned outcome is convergence, got after {wall:.1} s: {e}"),
+        };
+        let state = s.state().expect("converged");
+        let extra = [state.orbitals_up.len() - system.n_up, state.orbitals_dn.len() - system.n_dn];
+        println!("H⁻ 95³ × 0.15 (14 Bohr): converged in {} steps, {wall:.1} s; F {:+.8}, TS {:.3e}, tol_used {:e}; extra vectors ↑ {} ↓ {} (cap {}); ε↑ {:?}",
+                 st.iterations, st.energy.total, st.energy.ts, st.tol_used, extra[0], extra[1], qm::scf::MAX_WITNESS_GROWTH, state.evals_up);
+        assert!(st.iterations <= 30, "{} steps (measured 18; the V2 rule ⌈1.5 n⌉ to a multiple of 5)", st.iterations);
+        assert!((st.energy.total - -0.474954).abs() <= 1e-5, "F {} vs the measured −0.474954", st.energy.total);
+        assert!(st.energy.ts < 1e-6, "gapped: TS {:.2e}", st.energy.ts);
+        assert!(extra.iter().all(|&e| e >= 1 && e <= qm::scf::MAX_WITNESS_GROWTH), "{extra:?}");
+        let homo = state.evals_up.iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(homo > 0.0, "LSDA's H⁻ HOMO is unbound (held by the box): ε = {homo}");
     }
 }

@@ -86,7 +86,12 @@
 //! vectors, `qm::scf::initial_orbitals` (seed 3 ↑ / 4 ↓) uploaded for the rest]. The occupied
 //! pairs are checked against the SCF's eigenvalues (τ, the runtime guard) and discarded; the
 //! unoccupied vectors are projected onto the complement of the SCF's occupied orbitals (one
-//! readback of the overlaps, in-place `lincomb`s), re-measured (`eigen::rayleigh_residuals`, two
+//! readback of the overlaps, in-place `lincomb`s). "Occupied" is the state's shown columns
+//! (`qm::orbitals::shown_columns`, plan 2026-11-13 Task 9; every column under the other schemes): a Fermi–Dirac
+//! state's f-bearing ones, f ≥ `qm::PARTIAL_OCCUPATION_MIN`. Such a state also stores its witness columns (f ≤ e^−36), which LOBPCG may leave at its iteration cap — they
+//! only seed the guess (after the previous vectors), are never compared or projected as occupied, and
+//! are never shown: the rows of every update are the f-bearing columns, then the display's own
+//! unoccupied vectors, which stand for those levels converged. The kept vectors are re-measured (`eigen::rayleigh_residuals`, two
 //! readbacks), sorted, given their τ-set's face density (max over the outermost plane of Σ_set φ²,
 //! one readback per set — review M1), and kept in this view's own fields: the next
 //! call's guess and, until [`OrbitalView::clear_unoccupied`], rows n_σ.. of every update (their
@@ -180,6 +185,12 @@ use nalgebra::DMatrix;
 use qm::orbitals::{block_edge, clusters, occupied_disagreement, occupied_error, tau, Tracker, UpdateInput, N_LM, RADIAL_BIN_H, UNOCC_GUARD};
 pub use qm::orbitals::{Moments, RadialProfile, Spin, SpinSummary, Unoccupied, UpdateOutput};
 use qm::scf::initial_orbitals;
+
+/// The state's shown columns per channel (`qm::orbitals::shown_columns`: under FermiDirac the f-bearing ones).
+fn shown(state: &GpuState) -> [Vec<usize>; 2] {
+    let fd = matches!(state.occupations, qm::Occupations::FermiDirac { .. });
+    [qm::orbitals::shown_columns(state.orbitals_up.len(), &state.occ_up, fd), qm::orbitals::shown_columns(state.orbitals_dn.len(), &state.occ_dn, fd)]
+}
 use qm::ScfSettings;
 
 /// The colours of the 12 colour slots of `qm::orbitals` (`PALETTE_SLOTS`; spec §3: a fixed
@@ -547,7 +558,10 @@ impl OrbitalView {
         // the unoccupied vectors (if any) are rows n_σ.. of each channel; taken out for the borrow
         let unocc = std::mem::take(&mut self.unocc);
         let (k, g, grid) = (&solver.k, self.g, &self.grid);
-        let raw: [Vec<&Field>; 2] = [state.orbitals_up.iter().chain(&unocc[0]).collect(), state.orbitals_dn.iter().chain(&unocc[1]).collect()];
+        // the state's shown (f-bearing) columns, then this view's unoccupied vectors (`qm::orbitals::shown_columns`)
+        let cols = shown(state);
+        let raw: [Vec<&Field>; 2] = [cols[0].iter().map(|&i| &state.orbitals_up[i]).chain(&unocc[0]).collect(),
+                                     cols[1].iter().map(|&i| &state.orbitals_dn[i]).chain(&unocc[1]).collect()];
         let n_ch = [raw[0].len(), raw[1].len()];
         let n_orb = n_ch[0] + n_ch[1];
         // a pseudised atom is no lone atom for the labels (M7: its orbitals have no core nodes; `#k` rows)
@@ -692,18 +706,21 @@ impl OrbitalView {
                            pick: impl FnOnce(&UpdateOutput) -> Product<'p>) -> ViewUpdate {
         let maps = readbacks_on_this_thread();
         let sc = self.read_scalars(solver, state, nuclei);
-        let n_occ = [state.orbitals_up.len(), state.orbitals_dn.len()];
-        assert_eq!((state.evals_up.len(), state.evals_dn.len()), (n_occ[0], n_occ[1]), "OrbitalView: one eigenvalue per orbital");
+        assert_eq!((state.evals_up.len(), state.evals_dn.len()), (state.orbitals_up.len(), state.orbitals_dn.len()), "OrbitalView: one eigenvalue per orbital");
+        // the shown (f-bearing) columns: a FermiDirac state's witness columns are not rows (`qm::orbitals::shown_columns`)
+        let cols = shown(state);
+        let n_occ = [cols[0].len(), cols[1].len()];
         let info = self.unocc_info.as_ref();
         let n_computed = [n_occ[0] + self.unocc[0].len(), n_occ[1] + self.unocc[1].len()];
         let evals: [Vec<f64>; 2] = std::array::from_fn(|ch| {
             let e = if ch == 0 { &state.evals_up } else { &state.evals_dn };
-            e.iter().chain(info.map_or(&[][..], |u| &u.evals[ch][..])).copied().collect()
+            cols[ch].iter().map(|&i| e[i]).chain(info.map_or(&[][..], |u| &u.evals[ch][..]).iter().copied()).collect()
         });
-        // the state's own occupations (M7): a fraction on a shared shell, 0 on the stored gap witnesses
+        // the state's own occupations (M7): a shown level's f, a full level's FermiDirac tail shown as full
+        // (`qm::orbitals::display_occupation`, spec 2026-11-13 §6.6)
         let occ: [Vec<f64>; 2] = std::array::from_fn(|ch| {
             let o = if ch == 0 { &state.occ_up } else { &state.occ_dn };
-            (0..n_computed[ch]).map(|i| if i < n_occ[ch] { o.get(i).copied().unwrap_or(1.0) } else { 0.0 }).collect()
+            (0..n_computed[ch]).map(|i| if i < n_occ[ch] { qm::orbitals::display_occupation(o.get(cols[ch][i]).copied().unwrap_or(1.0)) } else { 0.0 }).collect()
         });
         let lone = nuclei.len() == 1 && state.ionic.is_none();
         let input = UpdateInput {
@@ -737,7 +754,8 @@ impl OrbitalView {
             while self.prev[ch].len() < shown { let f = Self::field(&mut self.pool, &self.ctx, &g); self.prev[ch].push(f); }
         }
         let k = &solver.k;
-        let raw: [Vec<&Field>; 2] = [state.orbitals_up.iter().chain(&self.unocc[0]).collect(), state.orbitals_dn.iter().chain(&self.unocc[1]).collect()];
+        let raw: [Vec<&Field>; 2] = [cols[0].iter().map(|&i| &state.orbitals_up[i]).chain(&self.unocc[0]).collect(),
+                                     cols[1].iter().map(|&i| &state.orbitals_dn[i]).chain(&self.unocc[1]).collect()];
         let mut b = Batch::new(&self.ctx, "orbital view display");
         let ctx = b.ctx();
         for ((rotations, psis), shown) in out.rotations.iter().zip(&raw).zip(&self.prev) {
@@ -977,7 +995,8 @@ impl OrbitalView {
             return Some(out);
         };
         self.follow_grid(solver, st);
-        let n = [st.orbitals_up.len(), st.orbitals_dn.len()];
+        // the display block: the shown (occupied) columns + m + guard (`qm::orbitals::shown_columns`)
+        let n = shown(st).map(|c| c.len());
         let (ctx, g, grid) = (self.ctx.clone(), self.g, self.grid.clone());
         let Some(DisplayWork { k, state, work, ionic }) = solver.display_work(n[0].max(n[1]) + ku) else {
             unreachable!("a converged state was checked above");
@@ -1006,13 +1025,23 @@ impl OrbitalView {
                 aborted = true;
                 break;
             }
-            let (occ, ev_scf, v) = if ch == 0 { (&state.orbitals_up, &state.evals_up, &vu) } else { (&state.orbitals_dn, &state.evals_dn, &vd) };
+            let (stored, ev_all, f_all, v) = if ch == 0 { (&state.orbitals_up, &state.evals_up, &state.occ_up, &vu) } else { (&state.orbitals_dn, &state.evals_dn, &state.occ_dn, &vd) };
+            // the converged occupied eigenpairs are the f-bearing columns (`qm::orbitals::shown_columns`; every column under
+            // integer aufbau). Under FermiDirac the state also stores its witness columns (f ≤ e^−36): LOBPCG may stop at its
+            // cap on them, so they only seed the guess for the unoccupied vectors — never compared with the SCF's levels nor
+            // projected out as occupied (plan 2026-11-13 Task 9; Task 7 review I2: comparing them gave "occupied eigenvalues
+            // disagree … 7.39e-4 Ha")
+            let cols = qm::orbitals::shown_columns(stored.len(), f_all, matches!(state.occupations, qm::Occupations::FermiDirac { .. }));
+            let occ: Vec<&Field> = cols.iter().map(|&i| &stored[i]).collect();
+            let ev_scf: Vec<f64> = cols.iter().map(|&i| ev_all[i]).collect();
+            let witnesses: Vec<&Field> = (0..stored.len()).filter(|i| !cols.contains(i)).map(|i| &stored[i]).collect();
             let nc = occ.len();
             // the guess: copies of the occupied orbitals, copies of the previous vectors (kept
-            // intact for an abort), fresh ones
+            // intact for an abort), copies of the witness columns, fresh ones
             let mut x: Vec<Field> = Vec::with_capacity(nc + ku);
             let mut b = Batch::new(&ctx, "unoccupied guess");
-            for src in occ.iter().chain(self.unocc[ch].iter().take(ku)) {
+            let prev_n = self.unocc[ch].len().min(ku);
+            for src in occ.iter().copied().chain(self.unocc[ch].iter().take(ku)).chain(witnesses.iter().copied().take(ku - prev_n)) {
                 let f = Self::field(&mut self.pool, &ctx, &g);
                 lincomb_in(&mut b, k, &g, &f, &[(1.0, src)]);
                 x.push(f);
@@ -1048,18 +1077,18 @@ impl OrbitalView {
             let mut order: Vec<usize> = (0..x.len()).collect();
             order.sort_by(|&a, &c| ev[a].total_cmp(&ev[c]));
             let sorted: Vec<f64> = order.iter().map(|&i| ev[i]).collect();
-            out.occupied_error[ch] = occupied_error(&sorted[..nc], ev_scf);
+            out.occupied_error[ch] = occupied_error(&sorted[..nc], &ev_scf);
             let mut slots: Vec<Option<Field>> = x.into_iter().map(Some).collect();
             for &i in &order[..nc] { self.pool.push(slots[i].take().expect("each index once")); }
             let phis: Vec<Field> = order[nc..].iter().map(|&i| slots[i].take().expect("each index once")).collect();
             // project onto the complement of the SCF's occupied orbitals (one readback, in place)
             if nc > 0 {
-                let pairs: Vec<(&Field, &Field)> = phis.iter().flat_map(|phi| occ.iter().map(move |psi| (phi, psi))).collect();
+                let pairs: Vec<(&Field, &Field)> = phis.iter().flat_map(|phi| occ.iter().map(move |psi| (phi, *psi))).collect();
                 let (dots, _) = self.reducer.block_dots(&ctx, k, &g, &pairs);
                 let mut b = Batch::new(&ctx, "unoccupied projection");
                 for (i, phi) in phis.iter().enumerate() {
                     let mut terms: Vec<(f32, &Field)> = vec![(1.0, phi)];
-                    terms.extend(occ.iter().enumerate().map(|(j, psi)| (-dots[i * nc + j] as f32, psi)));
+                    terms.extend(occ.iter().enumerate().map(|(j, psi)| (-dots[i * nc + j] as f32, *psi)));
                     lincomb_in(&mut b, k, &g, phi, &terms);
                 }
                 b.submit();

@@ -132,7 +132,7 @@ fn mult_label(m: Option<u32>) -> String {
     m.map_or("lowest".to_string(), |m| m.to_string())
 }
 
-/// The ionic tag in words: "none" → all-electron; "cores/…" and "all/…" with their policy.
+/// The ionic tag in words: "none" and "none/fd…" → all-electron; "cores/…" and "all/…" with their policy.
 pub fn ionic_label(tag: &str) -> String {
     match tag.split('/').next().and_then(sim::IonicPolicy::parse) {
         Some(sim::IonicPolicy::None) => "all-electron (none)".to_string(),
@@ -242,7 +242,9 @@ pub fn offer(path: &Path, prov: &Provenance, scene: &Scene, ctx: &Context<'_>) -
     }
 
     // the ionic surface
-    let scene_tag = if ctx.pseudised { providers::pseudo::tag_of(scene.ionic) } else { "none".to_string() };
+    // the scene's surface tag: the all-electron one is `none/fd5e-3/pin1e-5` since plan 2026-11-13 Task 9 (a legacy
+    // "none" model differs from it; its refusal wording is plan Task 16's)
+    let scene_tag = if ctx.pseudised { providers::pseudo::tag_of(scene.ionic) } else { providers::pseudo::all_electron_tag() };
     let mut ionic_row = None;
     if prov.ionic != scene_tag {
         let mut r = row("ionic potential", ionic_label(&prov.ionic), ionic_label(&scene_tag), true);
@@ -353,7 +355,7 @@ mod tests {
             multiplicity: s.multiplicity,
             teacher: "Kohn-Sham (GPU)".into(),
             masses: vec![(1, 1)],
-            ionic: "none".into(),
+            ionic: providers::pseudo::all_electron_tag(), // this build's all-electron surface (plan 2026-11-13 Task 9)
         }
     }
 

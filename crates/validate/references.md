@@ -312,7 +312,8 @@ partial-level stop: a GPU step whose occupations have a partial level is tested 
 solves witness vectors. Held at `Aufbau` until plan Task 9 (the providers' all-electron surface and its tag move
 together): `providers::ks::problem`'s all-electron branch, `cpu_provider_matches_qm_directly`, `timing_table` (below),
 the qm-gpu orbital-display tests and its orbital-lag witness; `BondForce::settings` until Task 10. The pseudo cases keep
-`DegenerateShells` explicitly until Task 10.
+`DegenerateShells` explicitly until Task 10. (Task 9 removed every hold here except `timing_table`, now until Task 9b,
+and `BondForce::settings`, until Task 10: "The providers' Fermi–Dirac surface" below.)
 
 **V4** (`gpu_fd_h4_square_matches_cpu`, `gpu_fd_pseudo_o_m3_matches_cpu`, `gpu_fd_pseudo_o_m1_matches_cpu`; 49³ × 0.25,
 σ = h; CPU at tol 1e-6, GPU at its partial-level stop 1e-5; the H₄ square a = 1.8 centred on the middle grid point, the
@@ -5050,3 +5051,87 @@ streaks are. The CPU f64 path is judged on these GPU tiers (conservative: its sc
 so they are judged on the app tier (9.0e-5), and the pseudo sample tier now covers gapped pseudo solves at ≤ 1e-6, whose
 FD force scatter (H₂O 3.93e-5 even at 1e-5) is under 5e-5.
 
+### The providers' Fermi–Dirac surface (plan 2026-11-13 Task 9, 2026-11-16, release, RX 7900 XTX)
+
+**The switch.** `providers::ks::problem` poses every scene with `FermiDirac { kt: ELECTRON_KT }` (5 mHa), pseudised or
+not; `EvalStats` carries `partial` (the partly occupied levels), `energy.internal` (E), `energy.ts` and `energy.total`
+(F), and `scf_tol_used` = `ScfStats::tol_used` (a GPU solve with a partial level reports 1e-5). The shared-shell
+occupation watch is gone; the `branch_jump` guard above is its successor. Holds left: `BondForce::settings` (Task 10)
+and `gpu_vs_cpu::timing_table` (Task 9b).
+
+**Tags** (spec §6.2): pseudised `<word>/<surface_hash:016x>/fd5e-3/stop2x5e-8/pin1e-5`, all-electron
+`none/fd5e-3/pin1e-5`; `is_all_electron_tag` answers for `"none"` and `"none/…"`. **The legacy strings**, printed from
+`provenance_tag`/`tag_of` on the unmodified tree (62ae478) for every policy under `set_dimer_backend(Cpu)` and `Gpu`, are
+`legacy_tag_of`'s pins (`legacy_tag_of_matches_recorded_ds_strings`):
+
+| policy | CPU dimer backend | GPU dimer backend |
+|---|---|---|
+| None | `none` | `none` |
+| CoresOnly | `cores/eef0a918057a9fbe/shared1e-3/1e-1/stop2x5e-8` | the same |
+| Accepted | `cores/eef0a918057a9fbe/shared1e-3/1e-1/stop2x5e-8` | `all/30a74d9bda495668/shared1e-3/1e-1/stop2x5e-8` |
+| All | `all/30a74d9bda495668/shared1e-3/1e-1/stop2x5e-8` | the same |
+
+The new tags keep the table hashes: `cores/eef0a918057a9fbe/fd5e-3/stop2x5e-8/pin1e-5` and
+`all/30a74d9bda495668/fd5e-3/stop2x5e-8/pin1e-5`.
+
+**V2** (`providers::fd_regression`; spec §9 "V2 cases" as amended; through `problem`, cold, 81³ × 0.15, the app's 1e-5,
+stall stop on; "vectors" = electrons + extra witness vectors per channel). Every case converged without the stall stop,
+the step cap or the witness cap, in exactly A1's prototype count, and on A1's F and TS to ≤ 9.6e-7 Ha:
+
+| policy | case | steps (budget) | F (pin) | ΔF | TS (pin) | ΔTS | vectors ↑ / ↓ | wall (s) |
+|---|---|---|---|---|---|---|---|---|
+| default | H₄ rhombus | 12 (20) | −2.079322 | +3.2e-7 | 0.000027 | −3.0e-7 | 2+3 / 2+3 | 2.8 |
+| default | H₄ lopsided tetra | 16 (25) | −1.943830 | +9.5e-8 | 0.013889 | +3.4e-7 | 2+4 / 2+4 | 8.5 |
+| default | H₄ seed 1 | 13 (20) | −2.078602 | +4.7e-7 | 0.002076 | −9.6e-7 | 2+3 / 2+3 | 4.2 |
+| default | H₅ seed 3 | 15 (25) | −2.564249 | −2.8e-7 | 0.003006 | −1.5e-7 | 3+3 / 2+3 | 5.3 |
+| default | H₈ seed 8 | 14 (25) | −4.220394 | −5.6e-8 | 0.000163 | −3.6e-7 | 4+5 / 4+5 | 24.5 |
+| `ionic none` | H₅ ring | 11 (20) | −2.470682 | +4.6e-7 | 0.006932 | −5.3e-7 | 3+3 / 2+2 | 3.0 |
+| `ionic none` | H₆ seed 5 | 15 (25) | −2.973255 | +4.2e-7 | 0.009715 | −1.7e-7 | 3+3 / 3+3 | 5.5 |
+| `ionic none` | lopsided tetra | 15 (25) | −1.824952 | +2.6e-7 | 0.013978 | +1.2e-7 | 2+4 / 2+4 | 8.5 |
+| `ionic none` | H₂O + 2 H | 33 (50) | −47.350019 | +5.0e-7 | 0.013163 | −2.1e-8 | 6+9 / 6+9 | 336.5 |
+
+Controls: H₂ 9 steps, F −1.1361194 (Δ −4.0e-7 against −1.136119, bound 2e-6), TS 8e-19; H₂O 13 steps, F −17.4760229
+(Δ +7.2e-8, bound 6e-6), TS 1.4e-12.
+
+**The witness cap on an anion** (V8, NOTE-6; `all_electron_h_minus_witness_cap`): all-electron H⁻ in the presets'
+largest box at Accurate (the 14 Bohr box, 95³ × 0.15), cold, 1e-5: **converges** in 18 steps (74–76 s), F = −0.474954
+Ha, TS 1.9e-7; LSDA's HOMO is unbound (ε = +0.089 Ha, held by the box) and the witness took 10 extra vectors ↑ and 11 ↓
+of the cap 16. Larger user-chosen boxes (Scene ▸ Grid, up to 201³) can exceed the cap (N(E) ∝ L³); Task 9b.
+
+All-electron H₂O + 2 H grew 9 witness vectors per channel (6 occupied each): its 336.5 s (10 s per step, against A1's
+434 s) is the witness block's cost, plan Task 9b's item.
+
+**The orbital display under FD** (both producers: `qm_gpu::orbitals::OrbitalView`, `providers::orbitals::CpuView` and
+its reference `qm::orbitals::unoccupied_cpu`). A FermiDirac state's shown rows are its f-bearing columns
+(`qm::orbitals::shown_columns`: f ≥ `PARTIAL_OCCUPATION_MIN`); only they are compared with the display eigensolve's
+occupied pairs and projected out of its unoccupied vectors. The stored witness columns (which LOBPCG may leave at its
+cap; Task 7 measured "occupied eigenvalues disagree … 7.39e-4 Ha" when they were compared, and the first attempt that
+kept them as rows showed a display vector overlapping a stored Li witness by 0.49) are never rows: they seed the
+display eigensolve, whose unoccupied rows stand for those levels converged (overlap with the stored witnesses 1.00, i.e.
+the same states). A shown level within 1e-6 of 1 shows as full (`qm::orbitals::display_occupation`, spec §6.6). Li at
+σ = h = 0.25 now shows its ↑ 2p as the state's partly occupied rows (f ≈ 0.083), so `display_solve_converges_at_the_
+effective_tolerance` checks one bound unoccupied row, not three (re-pinned). The orbital-lag test reads the f-bearing
+columns' residual through a test probe (`SolveProfile::eigen_occupied_residual`, cfg(test)): 3.97e-6 warm, 5.38e-6
+cold against 3·lo, where `max_eigen_residual` (witness included) reads 7.45e-6 / 1.85e-4.
+
+**Re-pins of this switch** (each with its reason in the test; none deleted, no tolerance moved):
+- the stall stop on its measured cases (`the_level_gated_stall_stop_on_the_measured_cases`): stretched H₂ at 65³ × 0.25,
+  R = 6.0 and 107³ × 0.15, R = 5.75 converge in **14** and **13** iterations (were 191 and 144 under aufbau; the stop off
+  gives the same counts and F bits; σ_g/σ_u partly occupied, TS 5.2 / 4.8 mHa); the water O–H 1.8 r₀ point (95³ × 0.15,
+  `CoresOnly`) **converges in 16** (it stalled early under `DegenerateShells`). The stop's early end of a hopeless solve
+  stays pinned in `qm` and `qm-gpu`.
+- `the_stall_stop_leaves_a_released_pseudo_solve_bitwise`: OH 3.5 Bohr, FD: 24 steps, nothing released (no release under
+  FD), partly occupied π↓ (TS 6.93 mHa = 2 kT ln 2); the stop on/off bits and F_HF(last) − F = 2.8e-7 hold.
+- pseudo-O records the partial-level stop: `scf_tol_used` = 1e-5 at a requested 1e-6 (`the_gpu_stop_is_floor_aware…`,
+  `scf_tol_used_reports_the_partial_stop`, 30 steps, TS 9.547713e-3 = 3 kT s(⅓)); gapped H₂ records 1e-6.
+- the lone pseudo-O's rows (CPU): three ↓ 2p at f = ⅓, TS = 3 kT s(⅓) within 1e-7, F = E − TS bitwise.
+- `gpu_oxygen_reference_multiplicity` (A.7): E (= `energy.internal`) against the radial atom, −0.73 / −0.74 mHa at M = 1 /
+  3 (on- and off-grid); splitting E(1) − E(3) 56.069 mHa (radial 56.062); F: −16.069151 / −16.115673 / −15.756812 Ha at
+  M = 1 / 3 / 5 (TS 19.095, 9.548, 0.063 mHa); the scan keeps M = 3.
+- `unoccupied_budget_in_play`'s H₂O leg runs on the preset's 95³ × 0.15 cell (cold 106.8 s): at 97³ × 0.25 the cold
+  all-electron solve hits the witness cap on a transient step after 630 s (Task 9b).
+- display tests: see "The orbital display under FD"; LiH's "occupied" helper is f > ½ (its LUMO set at 11.7–13.4 kT
+  above μ carries f ≈ 8e-6 / 1.5e-6); Li's core spin polarisation (∫|m| − ∫m, > 1e-4 under aufbau) is 0 to f32 under
+  FD at σ = h = 0.25 (the ↑ valence electron spread over 2s 0.75 / 2p 0.083 each), re-pinned to "no negative m".
+- the tag tests, `the_provenance_carries_the_stop_rule_not_its_value` (`…/fd5e-3/…/stop2x5e-8/pin1e-5`), and the
+  scripted-session digest (0x09f6_9183_02c2_fda9 → 0xe356_bcdb_45e7_b03c, field and tag text only).

@@ -841,13 +841,17 @@ impl CpuView {
             *self = CpuView::new(&state.grid);
         }
         let grid = &state.grid;
-        // the occupied orbitals, then the unoccupied vectors held (module doc)
+        // the occupied orbitals, then the unoccupied vectors held (module doc). "Occupied" is the state's f-bearing
+        // columns (`qm::orbitals::shown_columns`): a FermiDirac state's witness columns are not shown (plan 2026-11-13
+        // Task 9); the display eigensolve's rows stand for those levels
+        let fd = matches!(state.occupations, qm::Occupations::FermiDirac { .. });
+        let cols = [qo::shown_columns(state.orbitals_up.len(), &state.occ_up, fd), qo::shown_columns(state.orbitals_dn.len(), &state.occ_dn, fd)];
         let raw: [Vec<&[f64]>; 2] = [
-            state.orbitals_up.iter().chain(&self.unocc[0]).map(|v| v.as_slice()).collect(),
-            state.orbitals_dn.iter().chain(&self.unocc[1]).map(|v| v.as_slice()).collect(),
+            cols[0].iter().map(|&i| &state.orbitals_up[i]).chain(&self.unocc[0]).map(|v| v.as_slice()).collect(),
+            cols[1].iter().map(|&i| &state.orbitals_dn[i]).chain(&self.unocc[1]).map(|v| v.as_slice()).collect(),
         ];
         let n = [raw[0].len(), raw[1].len()];
-        let n_occ = [state.orbitals_up.len(), state.orbitals_dn.len()];
+        let n_occ = [cols[0].len(), cols[1].len()];
         let pos: Vec<[f64; 3]> = nuclei.iter().map(|n| n.pos).collect();
         // a pseudised atom is no lone atom for the labels (M7: its orbitals have no core nodes; `#k` rows, `PSEUDO_LABELS_NOTE`)
         let lone = nuclei.len() == 1 && state.ionic.is_none();
@@ -867,13 +871,13 @@ impl CpuView {
         let info = self.unocc_info.as_ref();
         let evals: [Vec<f64>; 2] = [0, 1].map(|ch| {
             let e = if ch == 0 { &state.evals_up } else { &state.evals_dn };
-            e.iter().chain(info.map_or(&[][..], |u| &u.evals[ch][..])).copied().collect::<Vec<f64>>()
+            cols[ch].iter().map(|&i| e[i]).chain(info.map_or(&[][..], |u| &u.evals[ch][..]).iter().copied()).collect::<Vec<f64>>()
         });
-        // the state's own occupations (M7): 1 under Aufbau, and under DegenerateShells a fraction on a shared shell
-        // and 0 on the gap witnesses it stores (they are stored vectors, hence inside n_occ, but not occupied)
+        // the state's own occupations (M7): 1 under Aufbau, under FermiDirac each shown level's f, a full level's tail
+        // shown as full (`qm::orbitals::display_occupation`, spec 2026-11-13 §6.6)
         let occ: [Vec<f64>; 2] = [0, 1].map(|ch| {
             let o = if ch == 0 { &state.occ_up } else { &state.occ_dn };
-            (0..n[ch]).map(|i| if i < n_occ[ch] { o.get(i).copied().unwrap_or(1.0) } else { 0.0 }).collect::<Vec<f64>>()
+            (0..n[ch]).map(|i| if i < n_occ[ch] { qo::display_occupation(o.get(cols[ch][i]).copied().unwrap_or(1.0)) } else { 0.0 }).collect::<Vec<f64>>()
         });
         let input = qo::UpdateInput {
             evals: [&evals[0], &evals[1]],

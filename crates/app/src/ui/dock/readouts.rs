@@ -247,7 +247,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
             );
         });
         // M7 (Task 6 review A.6): a partly filled degenerate shell is shared equally, the spherical-atom ensemble
-        for line in pseudo::occupation_lines(&d.eval.fractional) {
+        for line in pseudo::occupation_lines(&d.eval.partial) {
             theme::note(ui, line);
         }
     });

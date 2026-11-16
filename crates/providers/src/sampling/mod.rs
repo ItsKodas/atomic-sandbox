@@ -1586,9 +1586,10 @@ impl Sampler {
     /// hot-burst geometry's temperature, module doc "Activity events").
     fn record(&mut self, surrogate: &mut SurrogateKs, scene: &Scene, r: ForceResult, tag: SampleTag, burst_t: Option<f64>) {
         let (face, multiplicity) = (r.stats.face_density, r.stats.multiplicity);
-        // M7 (spec §5.6; Task 6 review A.6): overlapping cores or a changed shared-shell pattern are never samples
+        // M7 (spec §5.6) and spec 2026-11-13 §6.3: overlapping cores or a flagged branch jump are never samples; the
+        // note cites each reason's own section (plan 2026-11-13 Task 8 review M5)
         if let Some(why) = r.stats.untrainable() {
-            let note = format!("sampling: a {} geometry was not kept ({why} — spec §5.6)", self.progress.stage);
+            let note = format!("sampling: a {} geometry was not kept ({why} — {})", self.progress.stage, sim::untrainable_citation(why));
             self.progress.done += 1;
             self.progress.skipped += 1;
             let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(pass_job(tag)), TeachOutcome::UnfitNotKept);

@@ -25,8 +25,10 @@
 //!
 //! Clusters never cross a change of occupation: rotating an occupied orbital into an empty one
 //! would change the displayed density (the colour view's Σ fᵢψ̃ᵢ² must stay ρ). Occupations are
-//! compared exactly; they are integers today (aufbau), and equal within a degenerate set under
-//! any future smearing rule that depends on ε only.
+//! compared exactly; they are integers under aufbau, and equal within a degenerate set under a
+//! smearing rule that depends on ε only — up to the rule's own rounding: Fermi–Dirac f of a
+//! degenerate set differ by ≲ 1e-6 on numerically split levels (plan 2026-11-13 Task 9), which
+//! splits such a set into runs here (plan Task 12 decides the per-level display).
 //!
 //! *Spread and residual.* Single linkage lets a cluster of d members spread s = max ε − min ε up
 //! to (d − 1)τ, not τ, so the tag shows the measured s. For a displayed combination
@@ -1513,6 +1515,31 @@ impl Unoccupied {
     pub fn count(&self) -> [usize; 2] { [self.evals[0].len(), self.evals[1].len()] }
 }
 
+/// The stored columns of a converged state that a display shows as the state's own rows, in storage order. Under
+/// `FermiDirac` (`fermi_dirac`) the f-bearing ones, f ≥ `PARTIAL_OCCUPATION_MIN`: the state also stores its witness
+/// columns (f ≤ e^−36, the levels above μ + 36 kT the occupation rule needs, `scf` "Occupations"), which LOBPCG may
+/// leave at its iteration cap, so they are not converged eigenpairs; a display never shows, compares or projects them
+/// as the state's orbitals (plan 2026-11-13 Task 9; Task 7 review I2) — the unoccupied rows come from its own
+/// eigensolve (§8), which the witness columns only seed. Under the other schemes every stored column, as before.
+pub fn shown_columns(n: usize, occ: &[f64], fermi_dirac: bool) -> Vec<usize> {
+    (0..n).filter(|&i| !fermi_dirac || occ.get(i).copied().unwrap_or(1.0) >= crate::occupations::PARTIAL_OCCUPATION_MIN).collect()
+}
+
+/// The occupation a display row shows for a stored level of occupation `f` (spec 2026-11-13 §6.6, plan Task 9): under
+/// `FermiDirac` every level carries some f, the witness columns ≤ e^−36 and a full level of a narrow gap 1 − tiny, so a
+/// level with f < `PARTIAL_OCCUPATION_MIN` (1e-6) shows as empty (0) and one within it of 1 as full (1); a partly
+/// occupied level (`ScfStats::partial`) keeps its f. Aufbau's 0/1 and `DegenerateShells`' shares are unchanged. The
+/// HOMO, the "occupied" selection and the colour view's weights read these rows, so a witness row is never "occupied".
+pub fn display_occupation(f: f64) -> f64 {
+    if f < crate::occupations::PARTIAL_OCCUPATION_MIN {
+        0.0
+    } else if 1.0 - f < crate::occupations::PARTIAL_OCCUPATION_MIN {
+        1.0
+    } else {
+        f
+    }
+}
+
 /// The occupied-agreement guard's number (§8): max_i |display_i − scf_i| over the SCF's occupied
 /// eigenvalues (both ascending); ∞ when the display solve returned fewer.
 pub fn occupied_error(display: &[f64], scf: &[f64]) -> f64 {
@@ -1598,12 +1625,19 @@ pub fn unoccupied_cpu(state: &KsState, nuclei: &[Nucleus], m: usize, settings: &
         if should_abort() {
             return None;
         }
-        let (occ, ev_scf) = if ch == 0 { (&state.orbitals_up, &state.evals_up) } else { (&state.orbitals_dn, &state.evals_dn) };
+        let (stored, ev_all, f_all) = if ch == 0 { (&state.orbitals_up, &state.evals_up, &state.occ_up) } else { (&state.orbitals_dn, &state.evals_dn, &state.occ_dn) };
+        // the state's occupied (f-bearing) columns; its FermiDirac witness columns only seed the guess (`shown_columns`)
+        let cols = shown_columns(stored.len(), f_all, matches!(state.occupations, crate::scf::Occupations::FermiDirac { .. }));
+        let occ: Vec<&Vec<f64>> = cols.iter().map(|&i| &stored[i]).collect();
+        let ev_scf: Vec<f64> = cols.iter().map(|&i| ev_all[i]).collect();
+        let witnesses: Vec<&Vec<f64>> = (0..stored.len()).filter(|i| !cols.contains(i)).map(|i| &stored[i]).collect();
         let n = occ.len();
         let prev: &[Vec<f64>] = previous.map_or(&[], |p| &p[ch][..]);
         let kept = prev.len().min(k);
+        let seeded = witnesses.len().min(k - kept);
         let fresh = initial_orbitals(grid, nuclei, k, 3 + ch as u64);
-        let mut x: Vec<Vec<f64>> = occ.iter().cloned().chain(prev[..kept].iter().cloned()).chain(fresh.into_iter().skip(kept)).collect();
+        let mut x: Vec<Vec<f64>> = occ.iter().map(|v| (*v).clone()).chain(prev[..kept].iter().cloned()).chain(witnesses[..seeded].iter().map(|v| (*v).clone()))
+            .chain(fresh.into_iter().skip(kept + seeded)).collect();
         independent_guess(grid, &mut x, nuclei, 1000 + 100 * ch as u64);
         let op: Box<dyn Operator + '_> = match &nl {
             None => Box::new(LocalHamiltonian { grid, v: &pots[ch] }),
@@ -1621,7 +1655,7 @@ pub fn unoccupied_cpu(state: &KsState, nuclei: &[Nucleus], m: usize, settings: &
         let mut order: Vec<usize> = (0..n + k).collect();
         order.sort_by(|&a, &b| ev[a].total_cmp(&ev[b]));
         let sorted: Vec<f64> = order.iter().map(|&i| ev[i]).collect();
-        out.occupied_error[ch] = occupied_error(&sorted[..n], ev_scf);
+        out.occupied_error[ch] = occupied_error(&sorted[..n], &ev_scf);
         // the occupied pairs are discarded; the unoccupied ones projected onto the complement of
         // the SCF's occupied orbitals and re-orthonormalised in energy order (twice: f64 MGS)
         let mut phis: Vec<Vec<f64>> = order[n..].iter().map(|&i| std::mem::take(&mut x[i])).collect();
@@ -1629,7 +1663,7 @@ pub fn unoccupied_cpu(state: &KsState, nuclei: &[Nucleus], m: usize, settings: &
             for i in 0..phis.len() {
                 let (done, rest) = phis.split_at_mut(i);
                 let v = &mut rest[0];
-                for psi in occ.iter().chain(done.iter()) { let c = grid.dot(psi, v); sub_scaled(v, c, psi); }
+                for psi in occ.iter().copied().chain(done.iter()) { let c = grid.dot(psi, v); sub_scaled(v, c, psi); }
                 let nv = grid.dot(v, v).sqrt();
                 for a in v.iter_mut() { *a /= nv; }
             }

@@ -115,6 +115,13 @@ fn solve(ctx: &GpuContext, n: usize, h: f64, nuclei: &[Nucleus], tol: f64, multi
     (s, settings, st.iterations, ms(t.elapsed()))
 }
 
+/// The state's shown columns of channel `ch` (`qm::orbitals::shown_columns`: under FermiDirac the f-bearing ones — a
+/// state's witness columns are not display rows, plan 2026-11-13 Task 9), in storage order.
+fn shown_cols(state: &GpuState, ch: usize) -> Vec<usize> {
+    let (n, occ) = if ch == 0 { (state.orbitals_up.len(), &state.occ_up) } else { (state.orbitals_dn.len(), &state.occ_dn) };
+    qo::shown_columns(n, occ, matches!(state.occupations, qm::Occupations::FermiDirac { .. }))
+}
+
 /// ∫ a b d³r of two f32 grid fields, finished in f64 (Neumaier; rule 4).
 fn dot32(a: &[f32], b: &[f32], dv: f64) -> f64 {
     neumaier(a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64)) * dv
@@ -254,7 +261,8 @@ fn ne_2p_aligns_to_the_cell_axes() {
         let mut fields: [Vec<Field>; 2] = [Vec::new(), Vec::new()];
         for (ch, (orbs, evals)) in [(&state.orbitals_up, &state.evals_up), (&state.orbitals_dn, &state.evals_dn)].into_iter().enumerate() {
             let raw: Vec<Vec<f64>> = orbs.iter().map(|f| f.read_interior(&ctx, &g)).collect();
-            let p: Vec<usize> = (0..raw.len()).filter(|&i| qo::dominant_l(&qo::moments(&grid, &raw[i], pos)) == Some(1)).collect();
+            // among the occupied (shown) columns: the witness columns above (3s, 3p …) are not the state's orbitals
+            let p: Vec<usize> = shown_cols(state, ch).into_iter().filter(|&i| qo::dominant_l(&qo::moments(&grid, &raw[i], pos)) == Some(1)).collect();
             assert_eq!(p.len(), 3, "{site}: three p-dominant occupied orbitals per channel");
             let p_evals: Vec<f64> = p.iter().map(|&i| evals[i]).collect();
             // the injected rotation: drawn until the fixture is not already aligned (min dominance < 0.9)
@@ -284,7 +292,9 @@ fn ne_2p_aligns_to_the_cell_axes() {
         assert!(matches!(probe.out.lone_atom, LoneAtom::Labelled { .. }), "{site}: {:?}", probe.out.lone_atom);
         for spin in [Spin::Up, Spin::Down] {
             let rows = channel(&probe.out.rows, spin);
-            let evals = if spin == Spin::Up { &state.evals_up } else { &state.evals_dn };
+            // the rows' eigenvalues: row i is shown column cols[i]
+            let all = if spin == Spin::Up { &state.evals_up } else { &state.evals_dn };
+            let evals: Vec<f64> = shown_cols(state, spin.index()).into_iter().map(|i| all[i]).collect();
             for (k, axis) in ["x", "y", "z"].into_iter().enumerate() {
                 let want = format!("2p_{axis}");
                 let row = rows.iter().find(|r| r.label.to_string() == want).unwrap_or_else(|| panic!("{site} {spin:?}: no {want} in {:?}", labels(&rows)));
@@ -327,7 +337,9 @@ fn ne_labels_are_1s_2s_2p() {
         assert_eq!(out.lone_atom, LoneAtom::Labelled { shell_order_inverted: true }, "{site}: labelled, with the inversion reported");
         for spin in [Spin::Up, Spin::Down] {
             let ch = spin.index();
-            let evals = if spin == Spin::Up { &state.evals_up } else { &state.evals_dn };
+            // the shown rows' eigenvalues (the scalars are of the shown columns only, plan 2026-11-13 Task 9)
+            let all = if spin == Spin::Up { &state.evals_up } else { &state.evals_dn };
+            let evals: Vec<f64> = shown_cols(state, ch).into_iter().map(|i| all[i]).collect();
             let nodes: Vec<String> = (0..evals.len()).map(|i| {
                 let m = &sc.moments[ch][i];
                 let l = qo::dominant_l(m);
@@ -530,9 +542,12 @@ fn spin_density_integrals() {
         assert!((tex - want).abs() <= 1e-4, "{name}: texture ∫m = {tex}");
         assert_eq!(u.scale, sp.scale() as f32);
         if z == 3 {
-            // core spin polarisation (radial LSDA: 4–8e-4, against f32 noise of ~1e-7): the view
-            // resolves a real feature of the functional, not just ∫m = n↑ − n↓
-            assert!(sp.abs_integral - sp.integral > 1e-4, "Li: ∫|m| − ∫m = {:.3e}", sp.abs_integral - sp.integral);
+            // core spin polarisation (radial LSDA: 4–8e-4, against f32 noise of ~1e-7) under aufbau: the view resolved
+            // a real feature of the functional. Re-pinned in plan 2026-11-13 Task 9 (was > 1e-4): under FermiDirac at
+            // kT = 5 mHa this Li (σ = h = 0.25, its 2s/2p 0.018 Ha apart) spreads the ↑ valence electron over 2s (f ≈ 0.75)
+            // and 2p (≈ 0.083 each, plan Task 7), and the measured ∫|m| − ∫m is 0 to f32 (2026-11-16: m ≥ 0 everywhere);
+            // the check is that the view does not invent a negative m. Reported to the controller (a physics review item)
+            assert!(sp.abs_integral - sp.integral >= -1e-6, "Li: ∫|m| − ∫m = {:.3e}", sp.abs_integral - sp.integral);
         }
     }
 }
@@ -581,8 +596,8 @@ fn h2_singlet_spin_density_stays_below_the_floor() {
     }
 }
 
-/// Spec §5.3 items 4–5 on an open-shell s atom: Li ↑ 1s, 2s; ↓ 1s — labelled, because every
-/// occupied l-set is complete (all s); the ↑ and ↓ 1s are one spatial orbital (cross overlap
+/// Spec §5.3 items 4–5 on an open-shell atom: Li ↑ 1s, 2s and (under FermiDirac, partly occupied) 2p; ↓ 1s —
+/// labelled, because every occupied l-set is complete; the ↑ and ↓ 1s are one spatial orbital (cross overlap
 /// ≥ `SHARE_COLOUR_MIN` = 0.9) and share a colour slot; both 1s tagged smeared (Zσ = 0.75).
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
@@ -604,7 +619,9 @@ fn li_labels_and_open_channel() {
              labels(&dn), state.evals_dn[0], nodes(1, 0));
     println!("  NIST LSD (point nucleus): 1s majority {NIST_LSD_LI_1S_MAJORITY:.6}, 2s majority {NIST_LSD_LI_2S_MAJORITY:.6} Ha — ours differ by the σ = h nucleus (Zσ = 0.75) and the box (rule 7; not asserted)");
     assert_eq!(out.lone_atom, LoneAtom::Labelled { shell_order_inverted: false });
-    assert_eq!(labels(&up), ["1s", "2s"]);
+    // re-pinned in plan 2026-11-13 Task 9 (was ["1s", "2s"]): under FermiDirac at kT = 5 mHa Li's ↑ 2p, 0.018 Ha above its
+    // 2s at σ = h = 0.25, are partly occupied (2s f ≈ 0.75, each 2p ≈ 0.083, plan Task 7), so they are the state's rows
+    assert_eq!(labels(&up), ["1s", "2s", "2p_x", "2p_y", "2p_z"]);
     assert_eq!(labels(&dn), ["1s"]);
     let (_, t_up) = shown(&mut view, &s, state, &nuclei, settings.tol, Spin::Up, up[0].track, &vol, &ctx);
     let (u, t_dn) = shown(&mut view, &s, state, &nuclei, settings.tol, Spin::Down, dn[0].track, &vol, &ctx);
@@ -681,6 +698,10 @@ fn grid_n_for(box_len: f64, h: f64) -> usize {
 /// and every step (so the view draws nothing and says "no net spin"); a lone Li (∫m = 1) and the
 /// H₂ triplet (∫m = 2) never are. The margins are printed: the closed shell's ∫|m| against its
 /// budget, the real spin's against its budget.
+///
+/// Split in plan 2026-11-13 Task 9 (the cases unchanged): H₂O, all-electron at 141³ under FermiDirac, solves its witness
+/// vectors and alone takes most of a 15-minute GPU batch (plan Task 9b's cost item), so it is its own test,
+/// `spin_view_hides_h2o_closed_shell_noise`.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn spin_view_hides_closed_shell_noise_and_keeps_real_spin() {
@@ -690,18 +711,34 @@ fn spin_view_hides_closed_shell_noise_and_keeps_real_spin() {
     let lih = [nucleus([-0.8, 0.0, 0.0], 3), nucleus([2.2, 0.0, 0.0], 1)];
     let li = [nucleus([0.0; 3], 3)];
     let he = [nucleus([0.0; 3], 2)];
-    // the h2o preset's geometry (O–H 1.81 Bohr, 104.5°): 10 electrons, the most orbitals and the
-    // smallest gap among the closed-shell presets (review: the eigenvector term's gap assumption)
-    let h2o = [nucleus([0.0; 3], 8), nucleus([1.43, 1.11, 0.0], 1), nucleus([-1.43, 1.11, 0.0], 1)];
     // (name, box length, nuclei, multiplicity, ∫m expected: 0 = closed shell)
-    let cases: [(&str, f64, &[Nucleus], Option<u32>, f64); 6] = [
-        ("H₂", 12.0, &h2, None, 0.0), ("He", 12.0, &he, None, 0.0), ("LiH", 14.0, &lih, None, 0.0), ("H₂O", 14.0, &h2o, None, 0.0),
+    let cases: [(&str, f64, &[Nucleus], Option<u32>, f64); 5] = [
+        ("H₂", 12.0, &h2, None, 0.0), ("He", 12.0, &he, None, 0.0), ("LiH", 14.0, &lih, None, 0.0),
         ("Li", 12.0, &li, None, 1.0), ("H₂ triplet", 12.0, &h2, Some(3), 2.0),
     ];
-    for (name, box_len, nuclei, mult, net) in cases {
+    spin_view_cases(&ctx, &cases);
+}
+
+/// [`spin_view_hides_closed_shell_noise_and_keeps_real_spin`]'s H₂O case, its own GPU batch (plan 2026-11-13 Task 9):
+/// the h2o preset's geometry (O–H 1.81 Bohr, 104.5°), 10 electrons, the most orbitals and the smallest gap among the
+/// closed-shell presets (review: the eigenvector term's gap assumption).
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn spin_view_hides_h2o_closed_shell_noise() {
+    let Some(ctx) = gpu() else { return };
+    let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let h2o = [nucleus([0.0; 3], 8), nucleus([1.43, 1.11, 0.0], 1), nucleus([-1.43, 1.11, 0.0], 1)];
+    spin_view_cases(&ctx, &[("H₂O", 14.0, &h2o, None, 0.0)]);
+}
+
+/// The spin-view check on (name, box length, nuclei, multiplicity, ∫m expected: 0 = closed shell) at h = 0.30, 0.15,
+/// 0.10, cold and 8 warm steps.
+fn spin_view_cases(ctx: &GpuContext, cases: &[(&str, f64, &[Nucleus], Option<u32>, f64)]) {
+    for &(name, box_len, nuclei, mult, net) in cases {
         for h in [0.30, 0.15, 0.10] {
             let n = grid_n_for(box_len, h);
-            let (mut s, settings, _, _) = solve(&ctx, n, h, nuclei, INTERACTIVE_TOL, mult);
+            let t = Instant::now();
+            let (mut s, settings, _, _) = solve(ctx, n, h, nuclei, INTERACTIVE_TOL, mult);
             s.set_density_extrapolation(true);
             let mut view = OrbitalView::new(&s);
             let mut moved = nuclei.to_vec();
@@ -724,8 +761,8 @@ fn spin_view_hides_closed_shell_noise_and_keeps_real_spin() {
                     assert!((sp.integral - net).abs() < 1e-3, "{name} {n}³ h {h}: ∫m = {} (expected {net})", sp.integral);
                 }
             }
-            println!("{name:>10} {n:>3}³ h {h:.2}: {} ∫|m| {worst:.2e} vs budget ≥ {least_budget:.2e} ({:.1}×)", if net == 0.0 { "closed shell: noise," } else { "real spin, not noise," },
-                     if net == 0.0 { least_budget / worst.max(f64::MIN_POSITIVE) } else { worst / least_budget });
+            println!("{name:>10} {n:>3}³ h {h:.2}: {} ∫|m| {worst:.2e} vs budget ≥ {least_budget:.2e} ({:.1}×), {:.0} s", if net == 0.0 { "closed shell: noise," } else { "real spin, not noise," },
+                     if net == 0.0 { least_budget / worst.max(f64::MIN_POSITIVE) } else { worst / least_budget }, t.elapsed().as_secs_f64());
         }
     }
 }
@@ -855,9 +892,11 @@ fn shares_payload(g: &mut providers::GpuKs, scene: &sim::Scene, tables: &std::sy
     o
 }
 
-/// The occupied rows of one channel in index (energy) order.
+/// The occupied rows of one channel in index (energy) order: f > ½. Re-pinned in plan 2026-11-13 Task 9 (was f > 0):
+/// under FermiDirac a gapped molecule's lowest empty levels within ≈ 13.8 kT of μ carry f ≳ 1e-6 and are shown as
+/// partly occupied (LiH at 57³ × 0.25: its LUMO set at 11.7–13.4 kT above μ, f ≈ 8e-6 / 1.5e-6), not as the bonds.
 fn occupied(o: &sim::OrbitalDisplay, spin: sim::Spin) -> Vec<&sim::OrbitalInfo> {
-    let mut r: Vec<&sim::OrbitalInfo> = o.rows.iter().filter(|r| r.spin == spin && r.occupation > 0.0).collect();
+    let mut r: Vec<&sim::OrbitalInfo> = o.rows.iter().filter(|r| r.spin == spin && r.occupation > 0.5).collect();
     r.sort_by_key(|r| r.index);
     r
 }

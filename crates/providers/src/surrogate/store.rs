@@ -692,10 +692,11 @@ impl SurrogateKs {
         mask: Option<&[bool]>,
         notes: &mut Vec<String>,
     ) -> TeachOutcome {
-        // M7 (spec §5.6; Task 6 review A.6): an answer with overlapping cores, or whose shared-shell pattern changed,
-        // is used for its step and never kept — before `admit` can quarantine, fence or release anything on it
+        // M7 (spec §5.6) and spec 2026-11-13 §6.3: an answer with overlapping cores, or one the `branch_jump` guard
+        // flagged, is used for its step and never kept — before `admit` can quarantine, fence or release anything on it;
+        // the note cites each reason's own section (plan 2026-11-13 Task 8 review M5)
         if let Some(why) = unfit {
-            notes.push(format!("surrogate: sample not kept ({why} — spec §5.6)"));
+            notes.push(format!("surrogate: sample not kept ({why} — {})", sim::untrainable_citation(why)));
             return TeachOutcome::UnfitNotKept;
         }
         // no atom with a neighbour within r_cut: nothing to learn, only an isolated atom's grid/box

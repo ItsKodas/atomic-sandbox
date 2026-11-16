@@ -7,11 +7,16 @@
 //!
 //! # What is decided here
 //! - [`setup_for`]: a scene's [`qm::IonicSetup`] under its [`sim::IonicPolicy`] — `None` when nothing is pseudised
-//!   (policy `None`; `CoresOnly` with only core-less or refused species), so those scenes run today's all-electron
-//!   path bit for bit. An `IonicError` (refused under `All`, h coarser than a table's `h_req`, a failed filtered
-//!   gate) is a `ProviderError::Invalid`, raised before any solve.
+//!   (policy `None`; `CoresOnly` with only core-less or refused species), so those scenes run the all-electron path.
+//!   An `IonicError` (refused under `All`, h coarser than a table's `h_req`, a failed filtered gate) is a
+//!   `ProviderError::Invalid`, raised before any solve.
 //! - [`provenance_tag`]: the *surface* a scene is solved on, for the surrogate's provenance and the references' key.
-//!   The tag follows the physics, not the menu: H₂ under `CoresOnly` has nothing pseudised and carries `"none"`.
+//!   The tag follows the physics, not the menu: H₂ under `CoresOnly` has nothing pseudised and carries the all-electron
+//!   tag. Since the Fermi–Dirac switch (spec 2026-11-13 §6.2; plan Task 9) the tags name the occupation rule:
+//!   pseudised `<word>/<surface_hash:016x>/fd5e-3/stop2x5e-8/pin1e-5`, all-electron `none/fd5e-3/pin1e-5`
+//!   ([`all_electron_tag`]: `fd{ELECTRON_KT:e}`, `pin{GPU_PARTIAL_TOL:e}`). Every "is this the all-electron
+//!   surface" test goes through [`is_all_electron_tag`], which also answers for the legacy `"none"`;
+//!   [`legacy_tag_of`] gives the tag the last `DegenerateShells` build computed, to find a predecessor collection.
 //! - [`gpu_tol_floor`] / [`effective_gpu_tol`]: the floor-aware GPU stop (spec §7 risk 6).
 //! - `Accepted` (M7 Task 11 fix round, the app's default): every species the recipe accepts, H and He included; a refused
 //!   one runs all-electron with a note (`qm::ionic`). In a run without a GPU dimer backend H and He are not generated at
@@ -259,13 +264,16 @@ pub fn setup_in(cache: &Mutex<PseudoCache>, scene: &Scene, sigma_ae: f64, notes:
     Ok((!setup.pseudised().is_empty()).then(|| Arc::new(setup)))
 }
 
-/// The surface the teacher solves: `"none"` when nothing is pseudised (policy `None`; `CoresOnly` with only core-less
-/// or refused species), else `"<policy word>/<surface_hash:016x>/shared<τ>/<τ_c>/stop2x<floor>"`: the policy, the identity
-/// of the tables the policy can hand out ([`surface_hash`]: since Task 11 not the whole recipe — a `CoresOnly` model from
-/// before the dimer gate keeps its provenance, an `All` one does not), the occupation scheme the pseudo path solves with (`DegenerateShells`: τ = `qm::DEGENERACY_TAU` decides
-/// the shared state and τ_c = `qm::WITNESS_GAP` (the value of the former `qm::scf::CANDIDATE_TAU`) which levels are candidates — Task 6 review A.6, Task 9 physics
-/// review SHOULD-3) and the GPU stop *rule* max(tol, 2·floor·N) ([`GPU_DRHO_FLOOR_PER_ELECTRON`]). The rule, not its
-/// N-dependent value, is the compared identity: an Add or Remove must not split a model's surface (MUST-1).
+/// The surface the teacher solves: [`all_electron_tag`] (`"none/fd5e-3/pin1e-5"`) when nothing is pseudised (policy
+/// `None`; `CoresOnly` with only core-less or refused species), else
+/// `"<policy word>/<surface_hash:016x>/fd<kT>/stop2x<floor>/pin<partial tol>"`: the policy, the identity of the tables the
+/// policy can hand out ([`surface_hash`]: since Task 11 not the whole recipe — a `CoresOnly` table set from before the
+/// dimer gate keeps its hash, an `All` one does not), the occupation rule every scene solves with (Fermi–Dirac at
+/// kT = `qm::ELECTRON_KT`, spec 2026-11-13 §6.2), the GPU stop *rule* max(tol, 2·floor·N)
+/// ([`GPU_DRHO_FLOOR_PER_ELECTRON`]) and the partial-level stop `qm::GPU_PARTIAL_TOL` (spec 2026-11-13 §5.1). The rules,
+/// not their N- and state-dependent values, are the compared identity: an Add or Remove must not split a model's surface
+/// (MUST-1). The all-electron tag names kT and the partial-level stop too: its labels moved with the occupation rule
+/// (aufbau labels of stretched bonds and open shells are not Fermi–Dirac's), so it is no longer the legacy `"none"`.
 pub fn provenance_tag(scene: &Scene) -> String {
     tag_in(cache(), scene)
 }
@@ -273,14 +281,54 @@ pub fn provenance_tag(scene: &Scene) -> String {
 /// [`provenance_tag`] on a given cache.
 pub fn tag_in(cache: &Mutex<PseudoCache>, scene: &Scene) -> String {
     if scene.ionic == IonicPolicy::None || scene.nuclei.is_empty() {
-        return "none".into();
+        return all_electron_tag();
     }
     let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
     if scene.nuclei.iter().any(|n| c.pseudised(scene.ionic, n.z)) {
         tag_with(scene.ionic)
     } else {
-        "none".into()
+        all_electron_tag()
     }
+}
+
+/// The all-electron surface's tag, `none/fd5e-3/pin1e-5` (spec 2026-11-13 §6.2): the legacy word `none`, kT
+/// (`qm::ELECTRON_KT`) and the partial-level GPU stop (`qm::GPU_PARTIAL_TOL`; the CPU teacher never reaches it, as the
+/// pseudised tags' `stop2x` part).
+pub fn all_electron_tag() -> String {
+    format!("none/fd{:e}/pin{:e}", qm::ELECTRON_KT, qm::GPU_PARTIAL_TOL)
+}
+
+/// Whether `tag` names the all-electron surface: the legacy `"none"` (every build before the Fermi–Dirac switch, and
+/// sidecars of version < 4) or any `"none/…"` ([`all_electron_tag`]). Every comparison that asks "is this the
+/// all-electron surface" goes through here (spec 2026-11-13 §6.2), never a `== "none"`.
+pub fn is_all_electron_tag(tag: &str) -> bool {
+    tag == "none" || tag.starts_with("none/")
+}
+
+/// `τ` and `τ_c` of the last `DegenerateShells` build's tags (`qm::DEGENERACY_TAU` = 1e-3 Ha and the former
+/// `qm::scf::CANDIDATE_TAU` = `qm::WITNESS_GAP` = 0.1 Ha), frozen here: [`legacy_tag_of`] must keep producing the strings
+/// that build wrote after the scheme and its constants are deleted (plan 2026-11-13 Task 10).
+const LEGACY_DS_TAU: f64 = 1e-3;
+const LEGACY_DS_TAU_C: f64 = 0.1;
+
+/// The tag the last `DegenerateShells` build computed for a scene that pseudises something under `policy`, with the
+/// current dimer backend (spec 2026-11-13 §6.2, §7.2): `"<word>/<surface_hash:016x>/shared1e-3/1e-1/stop2x5e-8"`, and
+/// `"none"` for `IonicPolicy::None`. Its only use is to find a predecessor collection; the all-electron predecessor is
+/// `"none"`, which a caller picks through [`is_all_electron_tag`] on the current tag. Pinned against the strings recorded
+/// from the last DS commit (62ae478) for every policy and both backends (`legacy_tag_of_matches_recorded_ds_strings`).
+/// The hash is today's [`surface_hash`]; plan Task 10 freezes it (`DIMER_PROCEDURE_DS`) when the dimer procedure moves.
+pub fn legacy_tag_of(policy: IonicPolicy) -> String {
+    legacy_tag_gpu(policy, dimer_backend_is_gpu())
+}
+
+/// [`legacy_tag_of`] with the dimer backend given (`gpu`: a GPU dimer backend is set), so the test reads both without
+/// switching the process-wide backend under the other tests.
+fn legacy_tag_gpu(policy: IonicPolicy, gpu: bool) -> String {
+    if policy == IonicPolicy::None {
+        return "none".into();
+    }
+    format!("{}/{:016x}/shared{:e}/{:e}/stop2x{:e}", surface_word_gpu(policy, gpu), surface_hash_gpu(policy, gpu), LEGACY_DS_TAU, LEGACY_DS_TAU_C,
+            GPU_DRHO_FLOOR_PER_ELECTRON)
 }
 
 /// The charge each nucleus's electrons are counted against under `scene`'s policy (`sim::ForceProvider::valence_charges`,
@@ -318,7 +366,7 @@ pub fn valence_in(cache: &Mutex<PseudoCache>, scene: &Scene) -> Option<Vec<f64>>
 
 /// The tag of a scene under `policy` with at least one species pseudised: the formatting half of
 /// [`provenance_tag`], needing no scene (no table is generated) — what the viewer compares a model file's
-/// ionic tag with before loading it. `"none"` for the policy `None`.
+/// ionic tag with before loading it. [`all_electron_tag`] for the policy `None`.
 ///
 /// **Takes no lock** (final review I3): the worker holds the process-wide cache lock for a whole table generation (the H
 /// dimer gate: about 1 min on the GPU, about 40 min on a CPU under `All`), and this is called on the UI thread (File ▸ Load
@@ -326,22 +374,21 @@ pub fn valence_in(cache: &Mutex<PseudoCache>, scene: &Scene) -> Option<Vec<f64>>
 /// `CoresOnly`, the core test of H and He ([`cores_only_gates`], a pure radial solve of milliseconds, memoised by itself).
 pub fn tag_of(policy: IonicPolicy) -> String {
     if policy == IonicPolicy::None {
-        return "none".into();
+        return all_electron_tag();
     }
     tag_with(policy)
 }
 
-/// The tag's text for `policy` on a given cache (the surface word, the table-identity hash and the stop rules).
+/// The tag's text for `policy` on a given cache (the surface word, the table-identity hash, the occupation rule and the
+/// stop rules; spec 2026-11-13 §6.2).
 fn tag_with(policy: IonicPolicy) -> String {
     format!(
-        "{}/{:016x}/shared{:e}/{:e}/stop2x{:e}",
+        "{}/{:016x}/fd{:e}/stop2x{:e}/pin{:e}",
         surface_word(policy),
         surface_hash(policy),
-        qm::DEGENERACY_TAU,
-        // TODO(plan Task 9): the tag's new format. Until then the old text: τ_c = 0.1 Ha, now `qm::WITNESS_GAP` (the
-        // former `qm::scf::CANDIDATE_TAU`, deleted in Task 5; the same f64, so the same string)
-        qm::WITNESS_GAP,
-        GPU_DRHO_FLOOR_PER_ELECTRON
+        qm::ELECTRON_KT,
+        GPU_DRHO_FLOOR_PER_ELECTRON,
+        qm::GPU_PARTIAL_TOL
     )
 }
 
@@ -354,15 +401,21 @@ fn tag_with(policy: IonicPolicy) -> String {
 /// refused across the gate's introduction too (over-invalidation on the safe side; it was made with a table set that
 /// included the ungated H).
 pub(crate) fn surface_hash(policy: IonicPolicy) -> u64 {
-    if gates_species(policy) { recipe_hash() } else { qm::radial::ledger::core_recipe_hash() }
+    surface_hash_gpu(policy, dimer_backend_is_gpu())
 }
 
-/// Whether `policy` can pseudise a dimer-gated species (Z ≤ `dimer_z_max`) in this run.
-fn gates_species(policy: IonicPolicy) -> bool {
+/// [`surface_hash`] with the dimer backend given.
+fn surface_hash_gpu(policy: IonicPolicy, gpu: bool) -> u64 {
+    if gates_species_gpu(policy, gpu) { recipe_hash() } else { qm::radial::ledger::core_recipe_hash() }
+}
+
+/// Whether `policy` can pseudise a dimer-gated species (Z ≤ `dimer_z_max`) with the dimer backend given (`gpu`: a GPU
+/// dimer backend is set; the callers pass `dimer_backend_is_gpu()` for this run).
+fn gates_species_gpu(policy: IonicPolicy, gpu: bool) -> bool {
     match policy {
         // the core test does not depend on the backend: memoised once, outside the cache lock
         IonicPolicy::CoresOnly => cores_only_gates(),
-        p => (1..=qm::radial::ledger::LEDGER.dimer_z_max).any(|z| wants_table(p, z, &Ok(false))),
+        p => (1..=qm::radial::ledger::LEDGER.dimer_z_max).any(|z| wants_table_gpu(p, z, &Ok(false), gpu)),
     }
 }
 
@@ -377,8 +430,13 @@ fn cores_only_gates() -> bool {
 /// `All` solves the two are the same physics) or, in a run without a GPU gate, `CoresOnly`'s (H and He all-electron) — the
 /// tag follows the physics, so models are shared across the menus that solve the same surface.
 fn surface_word(policy: IonicPolicy) -> &'static str {
+    surface_word_gpu(policy, dimer_backend_is_gpu())
+}
+
+/// [`surface_word`] with the dimer backend given.
+fn surface_word_gpu(policy: IonicPolicy, gpu: bool) -> &'static str {
     match policy {
-        IonicPolicy::Accepted if gates_species(policy) => IonicPolicy::All.word(),
+        IonicPolicy::Accepted if gates_species_gpu(policy, gpu) => IonicPolicy::All.word(),
         IonicPolicy::Accepted => IonicPolicy::CoresOnly.word(),
         p => p.word(),
     }
@@ -1246,7 +1304,7 @@ mod tests {
             let tag = tag_in(&private, &scene(&[8], policy, 33, 0.2));
             assert_eq!(tag, tag_of(policy), "{policy:?}");
         }
-        assert_eq!(tag_of(IonicPolicy::None), "none");
+        assert_eq!(tag_of(IonicPolicy::None), "none/fd5e-3/pin1e-5", "re-pinned in plan 2026-11-13 Task 9: the FD tags");
         // another thread holds the global cache (as a generating worker does) while this one asks
         let held = cache().lock().unwrap_or_else(|e| e.into_inner());
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1254,14 +1312,17 @@ mod tests {
         let got = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("tag_of returned while the cache lock was held");
         drop(held);
         t.join().unwrap();
-        assert!(got.iter().all(|g| g.contains("/shared")), "{got:?}");
+        assert!(got.iter().all(|g| g.contains("/fd5e-3/")), "{got:?}");
     }
 
     /// M7 Task 11 (the controller's requirement): the provenance is invalidated exactly when a table its surface can use
     /// changes. Switching the dimer gate on changed H and He only, so a `CoresOnly` surface (O pseudised, H all-electron)
-    /// keeps the tag it had at `m7-tm-kb-nlcc-4` — the exact string a -4 model's sidecar holds, with the -4 recipe hash
-    /// 0xeef0a918057a9fbe (references.md's records block before Task 11) — while an `All` surface's tag moves (it may hold the
-    /// gated H). The `All` side is checked on `surface_hash` (no generation: the gated H costs the GPU dimer gate).
+    /// keeps the table hash it had at `m7-tm-kb-nlcc-4` — the -4 recipe hash 0xeef0a918057a9fbe (references.md's records
+    /// block before Task 11) — while an `All` surface's tag moves (it may hold the gated H). The `All` side is checked on
+    /// `surface_hash` (no generation: the gated H costs the GPU dimer gate). Re-pinned in plan 2026-11-13 Task 9: the
+    /// Fermi–Dirac switch moved every tag (the occupation rule is part of the surface), so the exact string a -4 sidecar
+    /// holds is now the *legacy* tag, by which the predecessor collection is found ([`legacy_tag_of`]); the hash part is
+    /// unchanged.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only (generates O); cargo test -p providers --release")]
     fn cores_only_provenance_survives_the_dimer_gate_and_all_does_not() {
@@ -1271,8 +1332,9 @@ mod tests {
         let tag = tag_in(&private, &water);
         // The literal a -4 sidecar holds (Task 5 review): built from today's constants it would follow them if they moved.
         let minus_4 = format!("cores/{RECIPE_HASH_M7_4:016x}/shared1e-3/1e-1/stop2x5e-8");
-        assert_eq!(tag, minus_4, "a CoresOnly water model from -4 must still load");
-        assert_eq!(tag_in(&private, &scene(&[8], IonicPolicy::CoresOnly, 33, 0.2)), minus_4, "O alone: the same surface");
+        assert_eq!(legacy_tag_of(IonicPolicy::CoresOnly), minus_4, "a CoresOnly water model from -4 is found as the predecessor");
+        assert_eq!(tag, format!("cores/{RECIPE_HASH_M7_4:016x}/fd5e-3/stop2x5e-8/pin1e-5"), "the same table hash, the FD rule");
+        assert_eq!(tag_in(&private, &scene(&[8], IonicPolicy::CoresOnly, 33, 0.2)), tag, "O alone: the same surface");
         let c = private.lock().unwrap();
         assert_eq!(surface_hash(IonicPolicy::CoresOnly), RECIPE_HASH_M7_4);
         let all = surface_hash(IonicPolicy::All);
@@ -1280,7 +1342,7 @@ mod tests {
         assert_eq!(all, qm::radial::ledger::recipe_hash());
         assert!(!c.has_table(1), "no H was generated for the tag");
         drop(c);
-        assert_eq!(tag_in(&private, &scene(&[1, 1], IonicPolicy::CoresOnly, 33, 0.25)), "none", "CoresOnly H₂ is the all-electron surface");
+        assert!(is_all_electron_tag(&tag_in(&private, &scene(&[1, 1], IonicPolicy::CoresOnly, 33, 0.25))), "CoresOnly H₂ is the all-electron surface");
     }
 
     /// Task 11 fix round (controller's default ruling): `Accepted` pseudises every species the recipe accepts — H and He only
@@ -1418,21 +1480,83 @@ mod tests {
         assert_eq!(effective_gpu_tol(1e-6, -3), 1e-6);
     }
 
-    /// H₂ under CoresOnly has nothing pseudised: the tag is "none" (the all-electron surface) and `setup_for` is
-    /// `None`; under `None` the cache is never touched.
+    /// H₂ under CoresOnly has nothing pseudised: the tag is the all-electron surface's and `setup_for` is `None`; under
+    /// `None` the cache is never touched. (Re-pinned in plan 2026-11-13 Task 9: the all-electron tag is
+    /// `none/fd5e-3/pin1e-5`, no longer `"none"`.)
     #[test]
     fn nothing_pseudised_is_the_all_electron_surface() {
         // a private cache: no other test thread can generate into it or hold its lock, so the assertions always run
         let private = Mutex::new(PseudoCache::default());
         let h2 = scene(&[1, 1], IonicPolicy::CoresOnly, 33, 0.25);
-        assert_eq!(tag_in(&private, &h2), "none");
+        assert_eq!(tag_in(&private, &h2), all_electron_tag());
         let mut notes = Vec::new();
         assert!(setup_in(&private, &h2, 0.25, &mut notes).unwrap().is_none());
-        assert_eq!(tag_in(&private, &scene(&[8], IonicPolicy::None, 33, 0.25)), "none");
+        assert_eq!(tag_in(&private, &scene(&[8], IonicPolicy::None, 33, 0.25)), all_electron_tag());
         assert!(setup_in(&private, &scene(&[8], IonicPolicy::None, 33, 0.25), 0.25, &mut notes).unwrap().is_none());
         assert!(notes.is_empty());
         let c = private.lock().unwrap();
         assert_eq!(c.generated(), 0, "no table was generated for H₂ and for the None policy");
         assert!(!c.has_table(1) && !c.has_table(8));
+    }
+
+    /// Plan 2026-11-13 Task 9 (spec §6.2, V8): the tags name the Fermi–Dirac rule. The all-electron tag is
+    /// `none/fd5e-3/pin1e-5`; a pseudised one is `<word>/<16 hex>/fd5e-3/stop2x5e-8/pin1e-5` for every policy that can
+    /// pseudise, on either dimer backend. No table is generated (the tags are the scene-less `tag_of`).
+    #[test]
+    fn tag_strings_are_fd() {
+        assert_eq!(all_electron_tag(), "none/fd5e-3/pin1e-5");
+        assert_eq!(tag_of(IonicPolicy::None), "none/fd5e-3/pin1e-5");
+        let pseudised = |tag: &str, words: &[&str]| -> bool {
+            let parts: Vec<&str> = tag.split('/').collect();
+            parts.len() == 5
+                && words.contains(&parts[0])
+                && parts[1].len() == 16
+                && parts[1].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && parts[2] == "fd5e-3"
+                && parts[3] == "stop2x5e-8"
+                && parts[4] == "pin1e-5"
+        };
+        for policy in [IonicPolicy::CoresOnly, IonicPolicy::All, IonicPolicy::Accepted] {
+            let tag = tag_of(policy);
+            assert!(pseudised(&tag, &["cores", "all"]), "{policy:?}: {tag}");
+            assert!(!is_all_electron_tag(&tag), "{tag}");
+        }
+        assert!(pseudised("cores/0123456789abcdef/fd5e-3/stop2x5e-8/pin1e-5", &["cores"]), "the brief's example");
+        assert!(!pseudised("cores/0123456789abcdef/shared1e-3/1e-1/stop2x5e-8", &["cores"]), "a legacy DS tag is not an FD one");
+    }
+
+    /// Plan 2026-11-13 Task 9 step 1 (spec §6.2, R15): `legacy_tag_of` reproduces exactly the tags the last
+    /// `DegenerateShells` build (62ae478) computed, for every policy under both dimer backends. The literals were printed
+    /// from `provenance_tag` (and `tag_of`) on that unmodified tree, with `set_dimer_backend(Cpu)` and `Gpu`; they are the
+    /// only source of truth. The backend is passed explicitly here (`legacy_tag_gpu`), so the process-wide backend the
+    /// other tests read is never switched.
+    #[test]
+    fn legacy_tag_of_matches_recorded_ds_strings() {
+        const CORES: &str = "cores/eef0a918057a9fbe/shared1e-3/1e-1/stop2x5e-8";
+        const ALL: &str = "all/30a74d9bda495668/shared1e-3/1e-1/stop2x5e-8";
+        // (policy, CPU dimer backend, GPU dimer backend)
+        let recorded = [
+            (IonicPolicy::None, "none", "none"),
+            (IonicPolicy::CoresOnly, CORES, CORES),
+            (IonicPolicy::Accepted, CORES, ALL),
+            (IonicPolicy::All, ALL, ALL),
+        ];
+        for (policy, cpu, gpu) in recorded {
+            assert_eq!(legacy_tag_gpu(policy, false), cpu, "{policy:?}, CPU dimer backend");
+            assert_eq!(legacy_tag_gpu(policy, true), gpu, "{policy:?}, GPU dimer backend");
+        }
+        assert_eq!(legacy_tag_of(IonicPolicy::All), legacy_tag_gpu(IonicPolicy::All, dimer_backend_is_gpu()), "the current backend");
+        assert!(is_all_electron_tag(&legacy_tag_of(IonicPolicy::None)));
+    }
+
+    /// Plan 2026-11-13 Task 9 (spec §6.2): the one all-electron predicate answers for the legacy `"none"` and the FD tag,
+    /// never for a pseudised tag or the empty string.
+    #[test]
+    fn is_all_electron_tag_cases() {
+        assert!(is_all_electron_tag("none"));
+        assert!(is_all_electron_tag("none/fd5e-3/pin1e-5"));
+        assert!(!is_all_electron_tag("cores/0123456789abcdef/fd5e-3/stop2x5e-8/pin1e-5"));
+        assert!(!is_all_electron_tag(""));
+        assert!(!is_all_electron_tag("nonesuch"), "a prefix of the word is not the word");
     }
 }

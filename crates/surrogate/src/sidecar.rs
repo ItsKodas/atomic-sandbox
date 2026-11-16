@@ -141,7 +141,8 @@
 //!
 //! **Version 4** (M7 pseudopotentials): identical to version 3
 //! except that `provenance` carries the required `ionic` string (`Provenance::ionic`: `"none"` for the
-//! all-electron surface, else `"<policy>/<recipe hash>"`, at most 256 characters). Unlike `masses`,
+//! all-electron surface — `none/fd5e-3/pin1e-5` since the Fermi–Dirac switch, plan 2026-11-13 Task 9 — else
+//! `"<policy>/<recipe hash>/…"`, at most 256 characters). Unlike `masses`,
 //! `ionic` **is compared** — a model taught on one ionic surface is never consulted on another.
 //! Versions 1 to 3 are still read, with `ionic = "none"`: every model before M7 was all-electron.
 //!

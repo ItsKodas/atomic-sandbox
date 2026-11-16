@@ -476,12 +476,13 @@ fn a_model_at_other_settings_opens_the_card_and_apply_sends_the_edits_then_the_l
     let mut st = UiState::new("h2", &scene);
     (st.gpu_available, st.backend) = (true, Backend::Estimated);
     // matching: straight to the driver (the recorded D isotope does not matter)
-    let same = header_only_model("same.model", 49, 0.25, 0.25, 1e-6, 0, "null", "Kohn-Sham (GPU)", "none");
+    // the all-electron tag of this build (plan 2026-11-13 Task 9: `none/fd5e-3/pin1e-5`; a legacy "none" is plan Task 16's)
+    let same = header_only_model("same.model", 49, 0.25, 0.25, 1e-6, 0, "null", "Kohn-Sham (GPU)", "none/fd5e-3/pin1e-5");
     st.model_file = Some(same.clone());
     assert!(matches!(one_dyn(&act(&mut st, &inp, Action::LoadModel)), DynCommand::LoadModel(p) if *p == same));
     assert!(st.model_offer.is_none());
     // another grid, σ, charge and multiplicity: a card, nothing sent
-    let other = header_only_model("other.model", 81, 0.15, 0.2, 1e-6, 1, "2", "Kohn-Sham (GPU)", "none");
+    let other = header_only_model("other.model", 81, 0.15, 0.2, 1e-6, 1, "2", "Kohn-Sham (GPU)", "none/fd5e-3/pin1e-5");
     st.model_file = Some(other.clone());
     let out = act(&mut st, &inp, Action::LoadModel);
     assert!(out.commands.is_empty() && out.error.is_none(), "{:?}", out.commands);
@@ -551,7 +552,7 @@ fn settings_that_cannot_be_applied_disable_apply() {
     let out = frame(&ctx, &mut st, &inp, 1400.0, vec![]);
     assert!(out.commands.is_empty());
     // while a pass runs, Apply is refused even for an applicable offer
-    let p = header_only_model("pass.model", 81, 0.15, 0.15, 1e-6, 0, "null", "Kohn-Sham (GPU)", "none");
+    let p = header_only_model("pass.model", 81, 0.15, 0.15, 1e-6, 0, "null", "Kohn-Sham (GPU)", "none/fd5e-3/pin1e-5");
     st.model_file = Some(p);
     act(&mut st, &inp, Action::LoadModel);
     let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));

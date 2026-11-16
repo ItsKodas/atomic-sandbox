@@ -1658,7 +1658,7 @@ impl SurrogateKs {
         if self.misfit_fence_stands() {
             self.ensure_desc_cache();
         }
-        let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
+        let ionic = self.store.as_ref().map_or_else(crate::pseudo::all_electron_tag, |s| s.provenance.ionic.clone());
         let mut promoted = 0;
         for i in held {
             let s = self.store.as_ref().expect("held samples are stored").samples[i].clone();
