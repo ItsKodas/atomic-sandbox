@@ -2451,3 +2451,44 @@ fn a_pass_resumes_in_a_new_surrogate_from_its_samples_and_checkpoint() {
     assert_eq!(tags(&b), tags(&a));
     let _ = std::fs::remove_file(&path);
 }
+
+/// A `PairMorse` teacher whose answers carry an electronic entropy term TS (`EvalStats::energy.ts`).
+struct WithTs {
+    inner: PairMorse,
+    ts: f64,
+}
+
+impl ForceProvider for WithTs {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let mut r = self.inner.evaluate(scene, should_abort)?;
+        r.stats.energy.ts = self.ts;
+        Ok(r)
+    }
+
+    fn name(&self) -> &'static str {
+        "pair morse" // the surrogate's own teacher by name (the pass refuses another)
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+}
+
+/// Plan 2026-11-13 Task 12 fix round (review minor 5): every activity event `Sampler::record` writes for a pass solve
+/// carries that solve's TS, `Some(stats.energy.ts)` (the solve log's "−TS = …"); kept samples among them.
+#[test]
+fn pass_events_carry_their_solves_ts() {
+    let mut teacher = WithTs { inner: PairMorse::h2(), ts: 4.2e-3 };
+    let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let scene = pair(1, 1, 1.4, cell(41));
+    let plan = SamplingPlan { perturbations: 4, hot_burst_steps: 0, scan_points_per_pair: 3, seed: 3, ..SamplingPlan::default() };
+    let mut sampler = Sampler::new(&scene, &plan).unwrap();
+    while sampler.step(&mut teacher, &mut s, &mut never()).unwrap().is_some() {}
+    let events = Trainable::take_teach_events(&mut s);
+    let kept: Vec<_> = events.iter().filter(|e| e.outcome == sim::activity::TeachOutcome::Kept).collect();
+    assert!(!kept.is_empty(), "{events:?}");
+    assert!(kept.iter().all(|e| e.ts == Some(4.2e-3)), "{kept:?}");
+    // a solve's event always carries it; an event without a solve never does
+    assert!(events.iter().filter(|e| e.scf_steps.is_some()).all(|e| e.ts == Some(4.2e-3)), "{events:?}");
+    assert!(events.iter().filter(|e| !e.is_solve()).all(|e| e.ts.is_none()), "{events:?}");
+}

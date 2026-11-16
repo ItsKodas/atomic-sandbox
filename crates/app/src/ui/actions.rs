@@ -1136,6 +1136,7 @@ fn compare_reference(st: &mut UiState, input: &PanelInput<'_>, method: crate::re
         forces: d.forces.clone(),
         energy: d.energy_ks,
         ts: d.eval.energy.ts,
+        model_answer: d.source == sim::Source::Surrogate,
         pseudised: !d.eval.pseudised.is_empty(),
         estimated: s.backend == Backend::Estimated,
         engine: s.engine.label().to_string(),

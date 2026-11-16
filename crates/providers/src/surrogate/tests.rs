@@ -11769,3 +11769,34 @@ fn a_key_no_fitted_atom_holds_is_refused_on_the_sample_floor() {
     assert!(h.trusted, "H₂'s own key is judged on its own numbers: {h:?}");
     assert!(s.class_untrusted(&h_keys(&[1, 1])).is_none());
 }
+
+/// A Morse teacher whose answers carry an electronic entropy term TS (what a Fermi–Dirac solve with partly occupied
+/// levels reports in `EvalStats::energy.ts`).
+struct WithTs {
+    inner: MorseDimer,
+    ts: f64,
+}
+
+impl ForceProvider for WithTs {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let mut r = self.inner.evaluate(scene, should_abort)?;
+        r.stats.energy.ts = self.ts;
+        Ok(r)
+    }
+    fn name(&self) -> &'static str {
+        "morse dimer"
+    }
+    fn reset(&mut self) {}
+}
+
+/// Plan 2026-11-13 Task 12 fix round (review minor 5): a fallback's activity event carries its teacher solve's TS,
+/// `Some(stats.energy.ts)` (the solve log's "−TS = …").
+#[test]
+fn a_fallback_event_carries_its_solves_ts() {
+    let mut s = SurrogateKs::new(Box::new(WithTs { inner: MorseDimer::h2(), ts: 4.2e-3 }), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    s.evaluate(&h2(1.4), &mut never()).unwrap();
+    let events = Trainable::take_teach_events(&mut s);
+    let solved: Vec<_> = events.iter().filter(|e| e.is_solve() && e.origin == sim::activity::TeachOrigin::Fallback).collect();
+    assert!(!solved.is_empty(), "no model yet: the teacher answered — {events:?}");
+    assert!(solved.iter().all(|e| e.ts == Some(4.2e-3)), "{solved:?}");
+}

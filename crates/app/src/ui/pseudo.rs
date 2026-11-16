@@ -138,15 +138,16 @@ pub fn reference_free_energy_note() -> String {
     )
 }
 
-/// One line per partly occupied level of the final step (`EvalStats::partial`, Fermi–Dirac occupations; spec
-/// 2026-11-13 §6.3): "partly occupied: level k (↑/↓), ε = … Ha, f = …"; none for a gapped state. A compile-level
-/// rewrite of the `DegenerateShells`-era shared-shell line (plan 2026-11-13 Task 9); the wording is plan Task 12's.
+/// One line per partly occupied level of the final step (`EvalStats::partial`, Fermi–Dirac occupations at T_el; spec
+/// 2026-11-13 §6.3, §6.6): "partly occupied: level k (↑/↓), ε = −0.3123 Ha, f = 0.333" — ε with the orbital list's
+/// true minus sign (`dock::orbitals::minus`), f without trailing zeros; none for a gapped state. It replaced the
+/// `DegenerateShells` shared-shell line (plan 2026-11-13 Tasks 9 and 12).
 pub fn occupation_lines(levels: &[sim::PartialLevel]) -> Vec<String> {
     levels
         .iter()
         .map(|l| {
             let arrow = if l.spin == 0 { "↑" } else { "↓" };
-            format!("partly occupied: level {} ({arrow}), ε = {:.4} Ha, f = {}", l.index + 1, l.eps, trim(l.f))
+            format!("partly occupied: level {} ({arrow}), ε = {} Ha, f = {}", l.index + 1, super::dock::orbitals::minus(l.eps, 4), trim(l.f))
         })
         .collect()
 }
@@ -195,14 +196,14 @@ mod tests {
         assert_eq!(coarsest_allowed(&[]), None);
     }
 
-    /// Re-pinned in plan 2026-11-13 Task 9 (was ruling A.6's shared-shell line): one row per partly occupied level, the
-    /// minority 2p of a lone O at f = 1/3 (the wording is plan Task 12's).
+    /// Re-pinned in plan 2026-11-13 Tasks 9 and 12 (was ruling A.6's shared-shell line): one row per partly occupied
+    /// level, the minority 2p of a lone O at f = 1/3, ε with a true minus sign.
     #[test]
     fn the_occupation_line_is_ruling_a6s() {
         let levels: Vec<sim::PartialLevel> = (1..4).map(|index| sim::PartialLevel { spin: 1, index, eps: -0.31234, f: 1.0 / 3.0 }).collect();
         let lines = occupation_lines(&levels);
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], "partly occupied: level 2 (↓), ε = -0.3123 Ha, f = 0.333");
+        assert_eq!(lines[0], "partly occupied: level 2 (↓), ε = −0.3123 Ha, f = 0.333");
         assert!(occupation_lines(&[]).is_empty());
     }
 

@@ -7,11 +7,16 @@ use super::super::{theme, Action, PanelInput, UiState, AMBER, RED};
 use crate::reference::{self, Method, Probe, RelaxPhase};
 use egui::{RichText, Ui};
 
-/// The note beside the force deviations when our answer has partly occupied levels (`ts` = T_el·S ≥ 1e-6 Ha; Fermi–Dirac
-/// spec 2026-11-13 §6.6): our state is a Fermi–Dirac ensemble, PySCF's an integer-occupied one, so they differ by
-/// construction there.
-pub fn partial_note(ts: f64) -> Option<String> {
-    (ts >= 1e-6).then(|| format!("ours is at T_el = {} K with partly occupied levels; PySCF's is integer-occupied", super::super::pseudo::t_el_kelvin()))
+/// The note beside the force deviations (Fermi–Dirac spec 2026-11-13 §6.6). A DFT answer with partly occupied levels
+/// (`ts` = T_el·S ≥ 1e-6 Ha): our state is a Fermi–Dirac ensemble, PySCF's an integer-occupied one, so they differ by
+/// construction there. A model answer (`model`: the surrogate answered, so its breakdown has no TS to read) always gets
+/// the model's wording: it learned F at T_el, open-shell fragments included (Task 12 review I1).
+pub fn partial_note(ts: f64, model: bool) -> Option<String> {
+    let t = super::super::pseudo::t_el_kelvin();
+    if model {
+        return Some(format!("the model learned F at T_el = {t} K; open-shell fragments are Fermi–Dirac ensembles, PySCF's integer-occupied"));
+    }
+    (ts >= 1e-6).then(|| format!("ours is at T_el = {t} K with partly occupied levels; PySCF's is integer-occupied"))
 }
 
 /// "O1", "H2", … (1-based, scene order).
@@ -208,7 +213,7 @@ fn results(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>) {
                 ui.monospace(format!("{:.6} Ha", a.energy));
                 ui.end_row();
             });
-            theme::note(ui, format!("not a deviation: our absolute energy carries the nuclear smearing (σ = {} Bohr) and the grid; theirs the basis{}", o.sigma, if m == Method::Lda { "" } else { " and another method" }));
+            theme::note(ui, format!("not a deviation: our absolute energy carries the nuclear smearing (σ = {} Bohr) and the grid, and ours is F at T_el; theirs the basis{}", o.sigma, if m == Method::Lda { "" } else { " and another method" }));
         }
         forces(ui, o, a);
         dipole(ui, o, a, run.answer.is_some());
@@ -250,7 +255,7 @@ fn forces(ui: &mut Ui, o: &reference::Ours, a: &reference::Answer) {
         }
     });
     ui.monospace(format!("max |ΔF| {:.4} ({}) · RMS {:.4}", dev.max, atom(&o.z, dev.worst), dev.rms));
-    if let Some(n) = partial_note(o.ts) {
+    if let Some(n) = partial_note(o.ts, o.model_answer) {
         ui.horizontal_wrapped(|ui| {
             theme::light(ui, AMBER);
             ui.label(RichText::new(n).size(11.5).color(AMBER));
@@ -297,7 +302,7 @@ fn dipole(ui: &mut Ui, o: &reference::Ours, a: &reference::Answer, done: bool) {
         theme::note(ui, "ours: valence density + ion charges Z_v (a frozen core is a neutral charge on its nucleus)");
     }
     // every scene is Fermi–Dirac now (spec 2026-11-13 §6.1), all-electron too
-    if partial_note(o.ts).is_some() {
+    if !o.model_answer && partial_note(o.ts, false).is_some() {
         theme::note(
             ui,
             "open-shell fragments (O, OH, CH₃ …) differ by construction: ours are Fermi–Dirac ensembles at T_el, a degenerate shell's electrons partly occupying each of its levels, while PySCF takes one integer, symmetry-broken state — their forces and dipoles differ for that reason too",
@@ -399,9 +404,19 @@ mod tests {
     #[test]
     fn compare_note_when_partial() {
         let want = "ours is at T_el = 1579 K with partly occupied levels; PySCF's is integer-occupied";
-        assert_eq!(partial_note(1e-6).as_deref(), Some(want));
-        assert_eq!(partial_note(9.5477e-3).as_deref(), Some(want));
-        assert_eq!(partial_note(9e-7), None);
-        assert_eq!(partial_note(0.0), None);
+        assert_eq!(partial_note(1e-6, false).as_deref(), Some(want));
+        assert_eq!(partial_note(9.5477e-3, false).as_deref(), Some(want));
+        assert_eq!(partial_note(9e-7, false), None);
+        assert_eq!(partial_note(0.0, false), None);
+    }
+
+    /// Task 12 review I1: a model answer has no TS in its breakdown (0), so its note never depends on it — an
+    /// estimated-solver Compare on linear OH or a lone O keeps its honesty note in the model's words.
+    #[test]
+    fn compare_note_for_a_model_answer() {
+        let want = "the model learned F at T_el = 1579 K; open-shell fragments are Fermi–Dirac ensembles, PySCF's integer-occupied";
+        assert_eq!(partial_note(0.0, true).as_deref(), Some(want));
+        assert_eq!(partial_note(9.5477e-3, true).as_deref(), Some(want));
+        assert!(want.contains(&format!("T_el = {} K", crate::ui::pseudo::t_el_kelvin())));
     }
 }
