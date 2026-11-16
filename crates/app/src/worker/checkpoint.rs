@@ -11,6 +11,16 @@
 //! loads the samples file and resumes the checkpoint on the pass's own scene (the viewer sets it
 //! first, `Viewer::resume_training`). One folder, one interrupted pass: a new pass replaces it.
 //!
+//! # Paused passes (user request 2026-11-16)
+//! A pass the user paused (`DynCommand::PauseSampling`) is checkpointed in the round that publishes
+//! the pause, whatever [`CHECKPOINT_INTERVAL`] says: the files then hold exactly where it stands
+//! (the abandoned solve's job is back in its queue). Nothing is written while it stays paused.
+//! Cancel while paused removes the files as any Cancel does. A new scene while paused (a preset, a
+//! loaded scene, a charge, grid, σ or ionic change: `ReplaceScene`) ends the pass in the driver as
+//! it would a running one, but its files are **kept** — the worker lets go of them
+//! ([`Worker::set_aside_paused_pass`]) — so the pass is an interrupted one, which the Model tab
+//! offers to resume on its own scene; a solver switch or a shutdown keeps them as before.
+//!
 //! # Collection mode (M8a Task 4b; Task 4a review concern 6)
 //! A pass that learns into a shared collection has its samples saved by the collection as they are
 //! kept, so only [`CHECKPOINT_FILE`] is written (a stale [`MODEL_FILE`] is removed). Its provenance
@@ -40,11 +50,14 @@ pub(super) struct Checkpoints {
     owns: bool,
     /// A write failed: said once.
     failed: bool,
+    /// The running pass is paused and its checkpoint was written at the pause (module doc,
+    /// "Paused passes").
+    pause_written: bool,
 }
 
 impl Checkpoints {
     pub(super) fn new(dir: PathBuf) -> Checkpoints {
-        Checkpoints { dir, written: None, owns: false, failed: false }
+        Checkpoints { dir, written: None, owns: false, failed: false, pause_written: false }
     }
 
     /// The checkpoint folder.
@@ -77,20 +90,26 @@ impl Worker {
     /// After a round (module doc): a running pass is checkpointed when it moved since the last
     /// checkpoint and [`CHECKPOINT_INTERVAL`] has passed; an ended pass's files are removed.
     pub(super) fn checkpoint_round(&mut self, snap: &DynSnapshot) {
-        let Some(ck) = self.checkpoints.as_ref() else { return };
+        let Some(ck) = self.checkpoints.as_mut() else { return };
         let active = sampling_active(snap);
+        let paused = pass_paused(snap);
+        if !paused {
+            ck.pause_written = false;
+        }
         if !active {
             if ck.owns {
                 discard_interrupted_pass(&ck.dir);
-                let ck = self.checkpoints.as_mut().expect("checked");
                 (ck.owns, ck.written) = (false, None);
             }
             return;
         }
         let done = snap.sampling.as_ref().map_or(0, |p| p.done);
-        if ck.written.is_some_and(|(at, d)| d == done || at.elapsed() < CHECKPOINT_INTERVAL) {
+        // a pause is written at once, then nothing while it lasts (module doc, "Paused passes")
+        let at_pause = paused && !ck.pause_written;
+        if !at_pause && (paused || ck.written.is_some_and(|(at, d)| d == done || at.elapsed() < CHECKPOINT_INTERVAL)) {
             return;
         }
+        ck.pause_written = paused;
         let dir = ck.dir.clone();
         let result = self.write_checkpoint(&dir);
         let ck = self.checkpoints.as_mut().expect("checked");
@@ -136,6 +155,18 @@ impl Worker {
         std::fs::rename(tmp(&model), &model).map_err(|e| format!("{}: {e}", model.display()))?;
         std::fs::rename(tmp(&ckpt), &ckpt).map_err(|e| format!("{}: {e}", ckpt.display()))?;
         Ok(true)
+    }
+
+    /// A scene replacement ended a paused pass (module doc, "Paused passes"): its files, written
+    /// at the pause, are left in the folder as an interrupted pass — never removed by this worker —
+    /// and the Log says so. `was_paused`: the pass was paused before the replacement.
+    pub(super) fn set_aside_paused_pass(&mut self, was_paused: bool) {
+        if !was_paused || sampling_active(&self.dy.snapshot()) {
+            return;
+        }
+        let Some(ck) = self.checkpoints.as_mut().filter(|ck| ck.owns) else { return };
+        (ck.owns, ck.written, ck.pause_written) = (false, None, false);
+        self.dy.add_note("the paused training pass ended with the scene change: its checkpoint is kept — the Model tab offers to resume it on its own scene".into());
     }
 
     /// [`Command::ResumeTraining`] (module doc).

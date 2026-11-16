@@ -437,6 +437,16 @@ fn segment_card(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInpu
         });
 }
 
+/// A pass's Pause, or Resume while it is paused (user request 2026-11-16), probed as
+/// `<probe>-pause` / `<probe>-resume`.
+pub fn pause_button(ui: &mut egui::Ui, paused: bool, probe: &str, acts: &mut Vec<Action>) {
+    let (label, action) = crate::ui::activity::jobs::pause_control(paused);
+    let tip = if paused { crate::ui::activity::jobs::RESUME_PASS_TIP } else { crate::ui::activity::jobs::PAUSE_PASS_TIP };
+    if super::probed(&format!("{probe}-{}", label.to_lowercase()), ui.button(label)).on_hover_text(tip).clicked() {
+        acts.push(action);
+    }
+}
+
 /// Returns the card's top edge when it is shown.
 fn sampling_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInput<'_>, acts: &mut Vec<Action>) -> Option<f32> {
     let p = input.snapshot.and_then(|s| s.dynamics.sampling.as_ref()).filter(|_| input.sampling())?;
@@ -449,11 +459,12 @@ fn sampling_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInpu
             theme::card().show(ui, |ui| {
                 ui.set_width(520.0f32.min(view.width() - 40.0));
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Sampling pass").strong());
+                    ui.label(RichText::new(if p.paused { "Sampling pass · paused" } else { "Sampling pass" }).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Cancel").on_hover_text("end the pass now: what it sampled is kept; it is refitted only once there are enough samples to fit (Q′, the model's number of directions), else the Log says so and Sample more adds to them").clicked() {
                             acts.push(Action::CancelSampling);
                         }
+                        pause_button(ui, p.paused, "sampling-card", acts);
                     });
                 });
                 dock::progress(ui, p, input.model());

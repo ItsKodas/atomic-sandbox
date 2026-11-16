@@ -1679,7 +1679,7 @@ impl Viewer {
                 if s.dynamics.drag.is_none() && !self.tool.dragging {
                     self.drag_target = None;
                 }
-                let ghost = s.dynamics.ghost.as_ref().filter(|_| crate::sim::sampling_active(&s.dynamics));
+                let ghost = s.dynamics.ghost.as_ref().filter(|_| crate::sim::sampling_active(&s.dynamics) && !crate::sim::pass_paused(&s.dynamics));
                 self.ghost.follow(ghost, Instant::now());
                 // bonds from experience: a fresh graph is recorded, a stale one guessed over
                 // (only drawn, so only computed, when wanted: `guess_wanted`)
@@ -1688,7 +1688,13 @@ impl Viewer {
                 if let Some(note) = self.bond_exp.note.take() {
                     self.ui.log.push(ui::logbook::LogKind::Warning, note);
                 }
+                // a paused pass that ended without its Cancel (a new scene) left its checkpoint as an
+                // interrupted pass: the Model tab offers it now (a Cancel removed it: no offer)
+                let paused_pass_ended = self.snapshot.as_ref().is_some_and(|p| crate::sim::pass_paused(&p.dynamics)) && !crate::sim::sampling_active(&s.dynamics);
                 self.snapshot = Some(*s);
+                if paused_pass_ended {
+                    self.refresh_resume_offer();
+                }
                 self.record_trails();
             }
             SimEvent::Error(message) => {
@@ -2384,9 +2390,10 @@ impl Viewer {
 
     /// What the running sampling pass is solving, to be drawn instead of the scene (View ▸ Display
     /// aids ▸ show what training is solving; `crate::ghost`): `None` when the toggle is off, no pass
-    /// runs (it ended, was cancelled or failed) or the snapshot carries none.
+    /// runs (it ended, was cancelled or failed), the pass is paused (it solves nothing: the scene is
+    /// shown) or the snapshot carries none.
     pub fn ghost_now(&self) -> Option<&sim::PassGhost> {
-        let s = self.snapshot.as_ref().filter(|s| self.ui.show_ghost && crate::sim::sampling_active(&s.dynamics))?;
+        let s = self.snapshot.as_ref().filter(|s| self.ui.show_ghost && crate::sim::sampling_active(&s.dynamics) && !crate::sim::pass_paused(&s.dynamics))?;
         s.dynamics.ghost.as_ref()
     }
 
@@ -4459,7 +4466,7 @@ nucleus 1 {a} {} {}
     }
 
     fn pass_progress(done: usize, finished: bool, cancelled: bool) -> sim::SamplingProgress {
-        sim::SamplingProgress { done, total: 20, stage: "scans", last_energy: -1.1, cancelled, skipped: 0, failed: 0, finished, target: None }
+        sim::SamplingProgress { done, total: 20, stage: "scans", last_energy: -1.1, cancelled, skipped: 0, failed: 0, finished, target: None, paused: false }
     }
 
     fn ghost_snapshot(v: &Viewer, sampling: Option<sim::SamplingProgress>, ghost: Option<sim::PassGhost>) -> Snapshot {

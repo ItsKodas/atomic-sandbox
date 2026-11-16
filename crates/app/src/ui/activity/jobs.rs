@@ -69,6 +69,23 @@ pub struct JobRow {
     pub stage: Option<String>,
     /// The card's count line ("sample 40 of 144"); the detail otherwise.
     pub count: Option<String>,
+    /// A second control, drawn left of `control`: a pass's Pause, or Resume while it is paused
+    /// (user request 2026-11-16).
+    pub control2: Option<(String, Action)>,
+}
+
+/// The pass card's Pause hover.
+pub const PAUSE_PASS_TIP: &str = "pause the pass where it stands: the solve in progress is dropped (it is solved again on Resume) and nothing more is solved; the samples, the queue and its place are kept, and written to disk, so closing the app or switching scene keeps it resumable from the Model tab. The dynamics stay paused";
+/// The paused pass card's Resume hover.
+pub const RESUME_PASS_TIP: &str = "go on with the pass from where it was paused (the solve that was dropped is solved first)";
+
+/// A pass's Pause or Resume control (`control2`).
+pub fn pause_control(paused: bool) -> (String, Action) {
+    if paused {
+        ("Resume".into(), Action::ContinueSampling)
+    } else {
+        ("Pause".into(), Action::PauseSampling)
+    }
 }
 
 /// The running solve's line ("Δρ 3.2e-5 → 1e-6 · ΔE −2.1e-4 Ha · 85 ms/iteration") and, once
@@ -101,24 +118,28 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
     let m = input.model();
     if let Some(p) = d.and_then(|d| d.sampling.as_ref()).filter(|_| input.sampling()) {
         // a solver with nothing to report yet reads 0: say nothing rather than "iteration 0"
-        let running = probe.map(|p| p.main).filter(|s| s.running && (s.scf_step > 0 || s.live.is_some_and(|l| l.iteration > 0)));
+        let running = probe.map(|p| p.main).filter(|s| !p.paused && s.running && (s.scf_step > 0 || s.live.is_some_and(|l| l.iteration > 0)));
         let step = running.map(|s| format!(" · {}", iteration_text(s.live.as_ref(), s.scf_step))).unwrap_or_default();
+        // paused (user request 2026-11-16): "paused · sample 40 of 144", no time left (none passes)
+        let count = if p.paused { format!("paused · {}", sample_text(p.done, p.total).to_lowercase()) } else { sample_text(p.done, p.total).to_lowercase() };
         v.push(JobRow {
             key: JobKey::Pass,
             title: "Sampling pass".into(),
-            detail: format!("{} · {}{step}", super::words::pass_stage_of(p, d.and_then(|d| d.ghost.as_ref())), sample_text(p.done, p.total).to_lowercase()),
+            detail: format!("{} · {count}{step}", super::words::pass_stage_of(p, d.and_then(|d| d.ghost.as_ref()))),
             progress: JobProgress::Fraction { done: p.done, total: p.total },
             elapsed_s: None,
-            eta_s: m.and_then(|m| m.pass_eta_s),
+            eta_s: m.and_then(|m| m.pass_eta_s).filter(|_| !p.paused),
             control: Some(("Cancel".into(), Action::CancelSampling)),
             no_control_why: None,
             // kept between samples: the probe keeps the last solve's record until the next one
             // starts (user request 2026-10-17: the block hid between samples), so it stays on
-            // screen and is replaced, not blanked, as each sample begins
-            scf: probe.and_then(|p| p.main.live),
+            // screen and is replaced, not blanked, as each sample begins; paused, the dropped
+            // solve's record is not shown
+            scf: probe.and_then(|p| p.main.live).filter(|_| !p.paused),
             keeps_block: true,
             stage: Some(super::words::pass_stage_of(p, d.and_then(|d| d.ghost.as_ref()))),
-            count: Some(sample_text(p.done, p.total).to_lowercase()),
+            count: Some(count),
+            control2: Some(pause_control(p.paused)),
         });
     } else if let Some(pv) = probe.filter(|p| p.main.running) {
         let last = d.map(|d| d.eval.scf_steps as u32).filter(|&n| n > 0);
@@ -141,6 +162,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             keeps_block: !cpu,
             stage: None,
             count: None,
+            control2: None,
         });
     }
     match probe.and_then(|p| p.display) {
@@ -157,6 +179,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             keeps_block: false,
             stage: None,
             count: None,
+            control2: None,
         }),
         // an orbital display solve (live-orbitals spec §4.3): its own job, never a fallback, an
         // audit or a teacher solve
@@ -173,6 +196,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             keeps_block: false,
             stage: None,
             count: None,
+            control2: None,
         }),
         None => {}
     }
@@ -196,6 +220,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             stage: Some(format!("{n} samples · {}{more}", super::words::refit_eta_words(&r, true))),
             // "fit 4 of 12 · leave-one-out 1 of 5"
             count: Some(super::words::refit_stage_words(&r)),
+            control2: None,
         });
     }
     // the user's Forget / Restore waiting for their refit (no refit runs: else the row above says so)
@@ -214,6 +239,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             keeps_block: false,
             stage: None,
             count: None,
+            control2: None,
         });
     }
     if m.is_some_and(|m| m.audit_in_flight) {
@@ -234,6 +260,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             keeps_block: false,
             stage: None,
             count: None,
+            control2: None,
         });
     } else if let Some(p) = probe.filter(|p| p.side.running && d.and_then(|d| d.bond_reference).is_none()) {
         // the auditor's other jobs (spec A8): a density refresh or an isolated-atom density
@@ -250,6 +277,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             keeps_block: false,
             stage: None,
             count: None,
+            control2: None,
         });
     }
     if let Some(r) = d.and_then(|d| d.bond_reference) {
@@ -266,6 +294,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             keeps_block: false,
             stage: None,
             count: None,
+            control2: None,
         });
     }
     if let Some(r) = d.and_then(|d| d.relax.as_ref()).filter(|r| r.converged.is_none()) {
@@ -282,6 +311,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             keeps_block: false,
             stage: None,
             count: None,
+            control2: None,
         });
     }
     if let Some(o) = m.and_then(|m| m.pass_offer.as_ref()).filter(|_| !input.sampling()) {
@@ -298,6 +328,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             keeps_block: false,
             stage: None,
             count: None,
+            control2: None,
         });
     }
     v
@@ -575,25 +606,38 @@ pub fn card(ui: &mut Ui, r: &JobRow, tr: &Traces, bars: &[StripBar], acts: &mut 
 fn control_width(ui: &Ui, r: &JobRow) -> f32 {
     let w = |text: &str, size: f32| ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(size), theme::INK).size().x;
     let gap = ui.spacing().item_spacing.x;
-    match (&r.control, r.no_control_why) {
-        (Some((label, _)), _) => w(label, 13.0) + 2.0 * ui.spacing().button_padding.x + gap,
-        (None, Some(_)) => w("can't be cancelled", 10.5) + gap,
-        (None, None) => 0.0,
-    }
+    let second = r.control2.as_ref().map_or(0.0, |(label, _)| w(label, 13.0) + 2.0 * ui.spacing().button_padding.x + gap);
+    second
+        + match (&r.control, r.no_control_why) {
+            (Some((label, _)), _) => w(label, 13.0) + 2.0 * ui.spacing().button_padding.x + gap,
+            (None, Some(_)) => w("can't be cancelled", 10.5) + gap,
+            (None, None) => 0.0,
+        }
 }
 
-/// A row's control on the right ("Cancel", "Pause", …), or "can't be cancelled" with why.
+/// A row's control on the right ("Cancel", "Pause", …), or "can't be cancelled" with why; its
+/// second control left of it (a right-to-left layout: drawn after).
 fn control(ui: &mut Ui, r: &JobRow, acts: &mut Vec<Action>) {
-    match (&r.control, r.no_control_why) {
-        (Some((label, action)), _) => {
-            if crate::ui::probed(&format!("job-control-{}", label.to_lowercase().replace(' ', "-")), ui.button(label)).clicked() {
-                acts.push(action.clone());
-            }
+    let button = |ui: &mut Ui, label: &str, action: &Action, acts: &mut Vec<Action>| {
+        let b = crate::ui::probed(&format!("job-control-{}", label.to_lowercase().replace(' ', "-")), ui.button(label));
+        let b = match action {
+            Action::PauseSampling => b.on_hover_text(PAUSE_PASS_TIP),
+            Action::ContinueSampling => b.on_hover_text(RESUME_PASS_TIP),
+            _ => b,
+        };
+        if b.clicked() {
+            acts.push(action.clone());
         }
+    };
+    match (&r.control, r.no_control_why) {
+        (Some((label, action)), _) => button(ui, label, action, acts),
         (None, Some(why)) => {
             ui.label(RichText::new("can't be cancelled").size(10.5).color(theme::INK_FAINT)).on_hover_text(why);
         }
         (None, None) => {}
+    }
+    if let Some((label, action)) = &r.control2 {
+        button(ui, label, action, acts);
     }
 }
 

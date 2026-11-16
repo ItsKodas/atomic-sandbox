@@ -98,6 +98,14 @@ pub enum Action {
     /// than `sim::PASS_TARGET_S`, which needs a second click ("Start anyway").
     Sample { long: bool },
     CancelSampling,
+    /// The pass card's Pause (`DynCommand::PauseSampling`; user request 2026-11-16): the pass stops
+    /// where it stands — the solve in flight abandoned, its queue, samples and place kept, its
+    /// checkpoint written — until Resume or Cancel. Recorded and replayable ("pause-sampling").
+    PauseSampling,
+    /// The paused pass card's Resume (`DynCommand::ContinueSampling`): the pass goes on from its
+    /// queue. Recorded and replayable ("continue-sampling"). Not `ResumeTraining`, the Model tab's
+    /// resume of an interrupted pass from its checkpoint.
+    ContinueSampling,
     /// "Teach around N blockers": a teach-around pass (`DynCommand::StartTeaching`; the surrogate's
     /// "Teaching around the blockers"). Recorded like Sample, not replayable (it solves).
     TeachAroundBlockers,
@@ -629,6 +637,8 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             }
         }
         Action::CancelSampling => out.commands.push(dyn_(DynCommand::CancelSampling)),
+        Action::PauseSampling => out.commands.push(dyn_(DynCommand::PauseSampling)),
+        Action::ContinueSampling => out.commands.push(dyn_(DynCommand::ContinueSampling)),
         Action::TeachAroundBlockers => out.commands.push(dyn_(DynCommand::StartTeaching)),
         Action::RetryFit => out.commands.push(dyn_(DynCommand::RetryFit)),
         Action::StartOffered(plan) => out.commands.push(dyn_(DynCommand::StartSampling(plan))),
@@ -1205,6 +1215,8 @@ impl Action {
             ShowPartialCore(b) => format!("partial-core {b}"),
             Forget => "forget".into(),
             CancelSampling => "cancel-sampling".into(),
+            PauseSampling => "pause-sampling".into(),
+            ContinueSampling => "continue-sampling".into(),
             SetAudit(n) => format!("audit {n}"),
             VolumeMode(m) => format!("volume-mode {m}"),
             Walls { on: o, half_width } => format!("walls {} {half_width}", on(*o)),
@@ -1277,7 +1289,7 @@ impl Action {
             _ => Err(format!("action {head}: expected true/false (or on/off), got '{w}'")),
         };
         Ok(match head {
-            "toggle-play" | "play" | "pause" | "step" | "reverse-velocities" | "deselect" | "focus" | "forget" | "cancel-sampling" | "relax" | "stop-relax" | "orbital-include-reset" | "cancel-compare" => {
+            "toggle-play" | "play" | "pause" | "step" | "reverse-velocities" | "deselect" | "focus" | "forget" | "cancel-sampling" | "pause-sampling" | "continue-sampling" | "relax" | "stop-relax" | "orbital-include-reset" | "cancel-compare" => {
                 want(0)?;
                 match head {
                     "toggle-play" => TogglePlay,
@@ -1289,6 +1301,8 @@ impl Action {
                     "focus" => Focus,
                     "forget" => Forget,
                     "cancel-sampling" => CancelSampling,
+                    "pause-sampling" => PauseSampling,
+                    "continue-sampling" => ContinueSampling,
                     "relax" => Relax,
                     "refresh-bonds" => RefreshBonds,
                     "orbital-include-reset" => IncludeAllOccupied,

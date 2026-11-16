@@ -183,6 +183,8 @@ fn actions_parse_and_describe_symmetrically() {
         Action::SetSigma(None),
         Action::Forget,
         Action::CancelSampling,
+        Action::PauseSampling,
+        Action::ContinueSampling,
         Action::SetAudit(0),
         Action::VolumeMode(1),
         Action::Walls { on: true, half_width: 3.5 },

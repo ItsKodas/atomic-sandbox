@@ -339,6 +339,7 @@ impl Command {
                     | DynCommand::StartTeaching
                     | DynCommand::RetryFit
                     | DynCommand::CancelSampling
+                    | DynCommand::PauseSampling
                     | DynCommand::ForgetModel
                     | DynCommand::LoadModel(_)
                     | DynCommand::StopRelax
@@ -435,9 +436,12 @@ impl Worker {
         match c {
             Command::SetScene(s) => match s.to_sim() {
                 Ok(mut new) => {
-                    new.external_field = self.dy.snapshot().scene.external_field;
+                    let snap = self.dy.snapshot();
+                    new.external_field = snap.scene.external_field;
+                    let was_paused = pass_paused(&snap);
                     self.dy.apply(DynCommand::Pause);
                     self.dy.apply(DynCommand::ReplaceScene(new));
+                    self.set_aside_paused_pass(was_paused);
                     // the step count restarts: a new run (`worker::activity`, "Runs")
                     self.activity.new_run();
                     self.sync_collection();
@@ -581,10 +585,12 @@ impl Worker {
     /// Pause, then replace the scene by the driver's current one with `f` applied: a new run
     /// (`worker::activity`, "Runs").
     pub(super) fn replace(&mut self, f: impl FnOnce(&mut sim::Scene)) {
+        let was_paused = pass_paused(&self.dy.snapshot());
         self.dy.apply(DynCommand::Pause);
         let mut s = self.dy.snapshot().scene;
         f(&mut s);
         self.dy.apply(DynCommand::ReplaceScene(s));
+        self.set_aside_paused_pass(was_paused);
         self.activity.new_run();
         // a charge, multiplicity, h, σ or ionic policy change may leave or change the surface
         // (`model` module doc, "The shared collection")

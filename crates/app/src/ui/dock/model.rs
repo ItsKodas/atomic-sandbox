@@ -1616,13 +1616,12 @@ pub fn no_model_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec
 /// The running pass's progress bar and counts (also on the sampling card in the 3D view).
 pub fn progress(ui: &mut Ui, p: &sim::SamplingProgress, m: Option<&ModelStatus>) {
     let frac = if p.total > 0 { p.done as f32 / p.total as f32 } else { 0.0 };
-    let eta = m.and_then(|m| m.pass_eta_s).map_or(String::new(), |t| format!(" — about {} left", duration_label(t)));
-    ui.add(egui::ProgressBar::new(frac).show_percentage().text(format!("{} — {}/{}{eta}", crate::ui::activity::words::pass_stage(p), p.done, p.total)));
+    let eta = m.and_then(|m| m.pass_eta_s).filter(|_| !p.paused).map_or(String::new(), |t| format!(" — about {} left", duration_label(t)));
+    let paused = if p.paused { "paused · " } else { "" };
+    ui.add(egui::ProgressBar::new(frac).show_percentage().text(format!("{paused}{} — {}/{}{eta}", crate::ui::activity::words::pass_stage(p), p.done, p.total)));
     let e = if p.last_energy.is_finite() { format!("{:+.6} Ha", p.last_energy) } else { "—".into() };
-    ui.weak(format!(
-        "last teacher energy {e} · skipped {} · failed {} — the dynamics are paused; edits are allowed",
-        p.skipped, p.failed
-    ));
+    let state = if p.paused { "the pass is paused (Resume goes on, Cancel ends it); the dynamics stay paused, edits are allowed" } else { "the dynamics are paused; edits are allowed" };
+    ui.weak(format!("last teacher energy {e} · skipped {} · failed {} — {state}", p.skipped, p.failed));
 }
 
 /// The long first-pass offer and its "Start anyway" (also on the offer card in the 3D view).
@@ -1751,7 +1750,12 @@ fn sample_row(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut 
             ui.weak(c);
         }
         lone_note(ui, input, "lone-note");
-        // Cancel only while a pass runs (the mockup; before, it was drawn greyed)
+        // Cancel only while a pass runs (the mockup; before, it was drawn greyed); Pause / Resume
+        // beside it (user request 2026-11-16)
+        if sampling {
+            let paused = input.snapshot.and_then(|s| s.dynamics.sampling.as_ref()).is_some_and(|p| p.paused);
+            crate::ui::overlays::pause_button(ui, paused, "model-pass", acts);
+        }
         if sampling
             && ui
             .add(egui::Button::new("Cancel"))

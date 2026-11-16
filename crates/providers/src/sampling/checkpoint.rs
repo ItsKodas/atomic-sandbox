@@ -386,7 +386,7 @@ fn parse(text: &str) -> Result<(Sampler, CheckpointInfo), String> {
             restarts,
         },
         refs: ReferenceCache::default(),
-        progress: SamplingProgress { done: info.done, total, stage, last_energy: f64::NAN, cancelled: false, skipped, failed, finished: false, target: None },
+        progress: SamplingProgress { done: info.done, total, stage, last_energy: f64::NAN, cancelled: false, skipped, failed, finished: false, target: None, paused: false },
         notes: Vec::new(),
         added: c[1],
         boxed: c[2],
