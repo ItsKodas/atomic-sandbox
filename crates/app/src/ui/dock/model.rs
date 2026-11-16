@@ -31,7 +31,7 @@
 use super::super::actions::{expire_arming, forget_armed, sample_button, SampleButton};
 use super::super::sampling_presets as presets;
 use super::super::{
-    duration_label, probe_rect, search, source_colour, source_label, theme, trust, Action, PanelInput, TrustKind, UiState, AMBER, GREEN, RED, source_tip,
+    duration_label, keyed, probe_rect, search, source_colour, source_label, theme, trust, Action, PanelInput, TrustKind, UiState, AMBER, GREEN, RED, source_tip,
 };
 use crate::scene::model_path;
 use crate::sim::{last_fit_line, source_line_with, Backend, ModelStatus, FIT_VS_HELD_HELP, IMPORT_REFERENCES_NOTE};
@@ -813,8 +813,7 @@ fn audit_controls(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     ui.horizontal_wrapped(|ui| {
         ui.label("DFT audit every");
         let mut n = st.audit_every;
-        if ui
-            .add(egui::DragValue::new(&mut n).range(0..=1_000_000).speed(10.0))
+        if keyed(ui, "audit-every", |ui| ui.add(egui::DragValue::new(&mut n).range(0..=1_000_000).speed(10.0)))
             .on_hover_text("every n-th step the model answers, the DFT teacher checks it at that geometry and the gap is recorded (a failed audit untrusts the model until a refit). 2000 by default. With a GPU teacher the audit runs on a second teacher in the background while the model keeps stepping (ruling S14), so the cadence costs no speed: the check simply arrives a few hundred steps later. With the CPU teacher it runs in the step and sets the speed. 0 = never (unsafe: nothing checks the model while it answers).")
             .changed()
         {
@@ -1463,7 +1462,7 @@ fn forget_above(ui: &mut Ui, st: &mut UiState, m: &ModelStatus, sampling: bool, 
     let p = sim::knowledge::ForgetPreview::of(&map.molecules, &rule);
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Forget all above").size(11.5));
-        let r = super::super::probed("forget-above-value", ui.add(egui::DragValue::new(&mut st.forget_rule.above).range(0.0..=1e6).speed(0.1).max_decimals(1).suffix("×")));
+        let r = super::super::probed("forget-above-value", keyed(ui, "forget-above-value", |ui| ui.add(egui::DragValue::new(&mut st.forget_rule.above).range(0.0..=1e6).speed(0.1).max_decimals(1).suffix("×"))));
         if r.changed() {
             st.forget_rule.above_confirm = false;
         }
@@ -1873,19 +1872,19 @@ fn preset_row(ui: &mut Ui, plan: &mut SamplingPlan) {
 fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan, tu: super::super::TempUnits) {
     super::wide_grid(ui, "plan", 2).show(ui, |ui| {
         ui.label("perturbations");
-        ui.add(egui::DragValue::new(&mut plan.perturbations).range(0..=2000).speed(1.0))
+        keyed(ui, "plan-perturbations", |ui| ui.add(egui::DragValue::new(&mut plan.perturbations).range(0..=2000).speed(1.0)))
             .on_hover_text("random displacements of the scene, one teacher solve each");
         ui.end_row();
         ui.label("σ_r");
-        ui.add(egui::DragValue::new(&mut plan.perturbation_sigma).range(0.0..=0.5).speed(0.002).fixed_decimals(3).suffix(" Bohr"))
+        keyed(ui, "plan-sigma", |ui| ui.add(egui::DragValue::new(&mut plan.perturbation_sigma).range(0.0..=0.5).speed(0.002).fixed_decimals(3).suffix(" Bohr")))
             .on_hover_text("width of each coordinate's Gaussian displacement");
         ui.end_row();
         ui.label("hot burst");
         ui.horizontal(|ui| {
-            ui.add(egui::DragValue::new(&mut plan.hot_burst_steps).range(0..=5000).speed(1.0).suffix(" steps"));
+            keyed(ui, "plan-hot-steps", |ui| ui.add(egui::DragValue::new(&mut plan.hot_burst_steps).range(0..=5000).speed(1.0).suffix(" steps")));
             // typed in the chosen scale, kept in kelvin (clamped at absolute zero)
             let mut shown = tu.from_k(plan.hot_burst_t);
-            if ui.add(egui::DragValue::new(&mut shown).range(tu.range(0.0, 10000.0)).speed(10.0).max_decimals(2).suffix(tu.suffix())).changed() {
+            if keyed(ui, "plan-hot-t", |ui| ui.add(egui::DragValue::new(&mut shown).range(tu.range(0.0, 10000.0)).speed(10.0).max_decimals(2).suffix(tu.suffix()))).changed() {
                 plan.hot_burst_t = tu.to_k(shown);
             }
         })
@@ -1893,13 +1892,13 @@ fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan, tu: super::super::TempUnits
         .on_hover_text("a short thermostatted DFT-MD run from the scene (dt 0.25 fs, CSVR τ 5 fs); every step is a sample");
         ui.end_row();
         ui.label("scan points / pair");
-        ui.add(egui::DragValue::new(&mut plan.scan_points_per_pair).range(0..=200).speed(0.2)).on_hover_text(format!(
+        keyed(ui, "plan-scan-points", |ui| ui.add(egui::DragValue::new(&mut plan.scan_points_per_pair).range(0..=200).speed(0.2))).on_hover_text(format!(
             "each pair closer than the model's cutoff is scanned from {}× to {}× its current separation",
             plan.scan_range.0, plan.scan_range.1
         ));
         ui.end_row();
         ui.label("seed");
-        ui.add(egui::DragValue::new(&mut plan.seed).speed(0.2))
+        keyed(ui, "plan-seed", |ui| ui.add(egui::DragValue::new(&mut plan.seed).speed(0.2)))
             .on_hover_text("advances after each pass, so a second pass draws new geometries");
         ui.end_row();
     });

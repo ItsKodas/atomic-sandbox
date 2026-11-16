@@ -16,7 +16,7 @@
 use super::icons::{self, Icon};
 use super::menus::dt_field;
 use super::search;
-use super::{probe, probed, source_colour, source_label, source_tip, theme, trust, watchable_speed, TrustKind, Action, PanelInput, ToolMode, UiState, SPARK_E};
+use super::{keyed, probe, probed, source_colour, source_label, source_tip, theme, trust, watchable_speed, TrustKind, Action, PanelInput, ToolMode, UiState, SPARK_E};
 use crate::sim::Backend;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Align, Button, Color32, Direction, FontId, Frame, Label, Layout, Margin, RichText, Stroke, TextStyle, Ui, Vec2, WidgetText};
@@ -422,8 +422,8 @@ fn full_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         row(ui, |ui| {
             let mut speed = st.speed;
             ui.spacing_mut().slider_width = SLIDER_W;
-            let slid = ui.add(egui::Slider::new(&mut speed, 1..=MAX_SPEED).logarithmic(true).show_value(false)).on_hover_text(SPEED_TIP).changed();
-            let typed = field(ui, w.speed_field, |ui| probed("speed", ui.add(egui::DragValue::new(&mut speed).range(1..=MAX_SPEED))))
+            let slid = keyed(ui, "tb-speed-slider", |ui| ui.add(egui::Slider::new(&mut speed, 1..=MAX_SPEED).logarithmic(true).show_value(false))).on_hover_text(SPEED_TIP).changed();
+            let typed = field(ui, w.speed_field, |ui| probed("speed", keyed(ui, "speed", |ui| ui.add(egui::DragValue::new(&mut speed).range(1..=MAX_SPEED)))))
                 .on_hover_text(SPEED_TIP)
                 .changed();
             if slid | typed {
@@ -531,7 +531,7 @@ fn compact_bar(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut
     ui.separator();
     let r = slot(ui, w.c_speed, |ui| {
         let mut speed = st.speed;
-        if field(ui, w.c_speed_field, |ui| ui.add(egui::DragValue::new(&mut speed).range(1..=MAX_SPEED).prefix("×")))
+        if field(ui, w.c_speed_field, |ui| keyed(ui, "tb-c-speed", |ui| ui.add(egui::DragValue::new(&mut speed).range(1..=MAX_SPEED).prefix("×"))))
             .on_hover_text(SPEED_TIP)
             .changed()
         {
@@ -640,7 +640,7 @@ fn thermostat_controls(ui: &mut Ui, st: &UiState, slider: Option<f32>, field_w: 
     if let Some(len) = slider {
         let mut u = thermostat_travel(t);
         ui.spacing_mut().slider_width = len;
-        slid = probed("tb-thermostat-slider", ui.add(egui::Slider::new(&mut u, 0.0..=1.0).show_value(false)))
+        slid = probed("tb-thermostat-slider", keyed(ui, "tb-thermostat-slider", |ui| ui.add(egui::Slider::new(&mut u, 0.0..=1.0).show_value(false))))
             .on_hover_text(format!("{THERMOSTAT_T_TIP}; the slider spans 0–{} (most of its travel below 1000 K)", st.temp_units.show(THERMOSTAT_SLIDER_MAX_K, 0)))
             .changed();
         if slid {
@@ -653,7 +653,7 @@ fn thermostat_controls(ui: &mut Ui, st: &UiState, slider: Option<f32>, field_w: 
     let typed = field(ui, field_w, |ui| {
         probed(
             "tb-thermostat-t",
-            ui.add(egui::DragValue::new(&mut shown).range(tu.range(0.0, f64::INFINITY)).speed(1.0).max_decimals(1).suffix(tu.suffix())),
+            keyed(ui, "tb-thermostat-t", |ui| ui.add(egui::DragValue::new(&mut shown).range(tu.range(0.0, f64::INFINITY)).speed(1.0).max_decimals(1).suffix(tu.suffix()))),
         )
     })
     .on_hover_text(THERMOSTAT_T_TIP)

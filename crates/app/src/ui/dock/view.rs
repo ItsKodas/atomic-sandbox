@@ -23,7 +23,7 @@
 //! (render as, partial core, the cloud, the warp, bonds and labels, name style, smooth motion)
 //! still are — recorded, some of them sent — and the rest write `UiState` directly.
 use super::super::menus::{ANGLES_TIP, BONDS_TIP, HONEST_BONDS, NAME_STYLE_TIP};
-use super::super::{knowledge, probe_rect, probed, pseudo, rich, theme, Action, ShowMode, UiState, CHARGES_TIP, VOLUME_DOTS, VOLUME_ISO, VOLUME_VOLUME};
+use super::super::{keyed, knowledge, probe_rect, probed, pseudo, rich, theme, Action, ShowMode, UiState, CHARGES_TIP, VOLUME_DOTS, VOLUME_ISO, VOLUME_VOLUME};
 use crate::sim::Backend;
 use egui::{vec2, RichText, Sense, Stroke, Ui};
 
@@ -468,19 +468,19 @@ fn look_card(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
 fn main_controls(ui: &mut Ui, st: &mut UiState) {
     match st.volume_mode {
         VOLUME_VOLUME => {
-            probed("look-opacity", ui.add(egui::Slider::new(&mut st.opacity, 0.1..=20.0).logarithmic(true).text("opacity")));
-            probed("look-gamma", ui.add(egui::Slider::new(&mut st.gamma, 0.2..=1.0).text("gamma")));
+            probed("look-opacity", keyed(ui, "look-opacity", |ui| ui.add(egui::Slider::new(&mut st.opacity, 0.1..=20.0).logarithmic(true).text("opacity"))));
+            probed("look-gamma", keyed(ui, "look-gamma", |ui| ui.add(egui::Slider::new(&mut st.gamma, 0.2..=1.0).text("gamma"))));
         }
         VOLUME_ISO => {
-            probed("look-iso", ui.add(egui::Slider::new(&mut st.iso, 0.01..=0.9).logarithmic(true).text("iso (× ρ max)")));
+            probed("look-iso", keyed(ui, "look-iso", |ui| ui.add(egui::Slider::new(&mut st.iso, 0.01..=0.9).logarithmic(true).text("iso (× ρ max)"))));
             bloom_slider(ui, st);
         }
         _ => {
-            probed("look-amount", ui.add(egui::Slider::new(&mut st.dots_amount, 0.5..=6.0).text("amount"))).on_hover_text("how many dots: × the default count");
+            probed("look-amount", keyed(ui, "look-amount", |ui| ui.add(egui::Slider::new(&mut st.dots_amount, 0.5..=6.0).text("amount")))).on_hover_text("how many dots: × the default count");
             if st.dots_glow {
-                probed("look-brightness", ui.add(egui::Slider::new(&mut st.dots_brightness, 0.2..=4.0).logarithmic(true).text("brightness")));
+                probed("look-brightness", keyed(ui, "look-brightness", |ui| ui.add(egui::Slider::new(&mut st.dots_brightness, 0.2..=4.0).logarithmic(true).text("brightness"))));
             } else {
-                probed("look-size", ui.add(egui::Slider::new(&mut st.dots_size, 0.05..=3.0).logarithmic(true).text("dot size")));
+                probed("look-size", keyed(ui, "look-size", |ui| ui.add(egui::Slider::new(&mut st.dots_size, 0.05..=3.0).logarithmic(true).text("dot size"))));
             }
         }
     }
@@ -488,7 +488,7 @@ fn main_controls(ui: &mut Ui, st: &mut UiState) {
 
 /// Bloom: the bright parts glow (display only).
 fn bloom_slider(ui: &mut Ui, st: &mut UiState) {
-    probed("look-bloom", ui.add(egui::Slider::new(&mut st.bloom, 0.0..=1.5).fixed_decimals(2).text("bloom")))
+    probed("look-bloom", keyed(ui, "look-bloom", |ui| ui.add(egui::Slider::new(&mut st.bloom, 0.0..=1.5).fixed_decimals(2).text("bloom"))))
         .on_hover_text("a soft glow around the bright parts of the view — dense glowing dots, a hot density core, the Camera view's atoms (0 = off). Display only");
 }
 
@@ -502,22 +502,22 @@ fn fine_tune(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             ui.checkbox(&mut st.dots_glow, "glow").on_hover_text("soft dots whose light adds up: dense regions burn toward white");
         });
         if st.dots_float {
-            ui.add(egui::Slider::new(&mut st.dots_drift, 0.002..=1.5).logarithmic(true).text("drift")).on_hover_text("how far a floating dot wanders: grid cells per frame");
+            keyed(ui, "look-drift", |ui| ui.add(egui::Slider::new(&mut st.dots_drift, 0.002..=1.5).logarithmic(true).text("drift"))).on_hover_text("how far a floating dot wanders: grid cells per frame");
         }
         // the view switch's feather (`overlays::view_switch`), the same setting
         // clamped only when typed or dragged: drawing never rewrites a profile's value outside the range
-        ui.add(egui::Slider::new(&mut st.dots_feather, 0.0..=0.8).clamping(egui::SliderClamping::Edits).text("feather"))
+        keyed(ui, "look-feather", |ui| ui.add(egui::Slider::new(&mut st.dots_feather, 0.0..=0.8).clamping(egui::SliderClamping::Edits).text("feather")))
             .on_hover_text("fade out the faint outskirts: the dots where the field is low disappear softly, leaving the main lobes (0 = every dot)");
         if st.dots_glow {
-            ui.add(egui::Slider::new(&mut st.dots_size, 0.05..=3.0).logarithmic(true).text("dot size"));
+            keyed(ui, "look-size-glow", |ui| ui.add(egui::Slider::new(&mut st.dots_size, 0.05..=3.0).logarithmic(true).text("dot size")));
         }
-        ui.add(egui::Slider::new(&mut st.dots_blur, 0.0..=1.0).text("blur")).on_hover_text("0 crisp … 1 soft");
+        keyed(ui, "look-blur", |ui| ui.add(egui::Slider::new(&mut st.dots_blur, 0.0..=1.0).text("blur"))).on_hover_text("0 crisp … 1 soft");
     }
     if st.volume_mode != VOLUME_ISO {
         bloom_slider(ui, st);
     }
     if st.bloom > 0.0 {
-        ui.add(egui::Slider::new(&mut st.bloom_threshold, 0.1..=1.0).fixed_decimals(2).text("bloom from")).on_hover_text("how bright a part must be to glow (1 = only full white)");
+        keyed(ui, "look-bloom-from", |ui| ui.add(egui::Slider::new(&mut st.bloom_threshold, 0.1..=1.0).fixed_decimals(2).text("bloom from"))).on_hover_text("how bright a part must be to glow (1 = only full white)");
     }
     // M7: the pseudised species' partial core in the density shown (a display of the generator's model)
     let mut core = st.show_partial_core;
@@ -616,7 +616,7 @@ fn aids_card(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         }
         if let Some(s) = &mut st.nucleus_scale {
             // the profile and `--ui nuclei=` take any factor: drawing must not clamp it to the slider's range
-            probed("nucleus-scale", ui.add(egui::Slider::new(s, 0.1..=2.0).clamping(egui::SliderClamping::Edits).fixed_decimals(2).suffix("×").text("nucleus size")))
+            probed("nucleus-scale", keyed(ui, "nucleus-scale", |ui| ui.add(egui::Slider::new(s, 0.1..=2.0).clamping(egui::SliderClamping::Edits).fixed_decimals(2).suffix("×").text("nucleus size"))))
                 .on_hover_text("× each element's display radius");
         }
     });
@@ -635,14 +635,14 @@ fn trail_controls(ui: &mut Ui, st: &mut UiState) {
         .text("trail length")
         .custom_formatter(|v, _| trails::length_text(trails::slider_to_length(v)))
         .custom_parser(|s| trails::parse_length(s).map(trails::length_to_slider));
-    if probed("trail-length", ui.add(length))
+    if probed("trail-length", keyed(ui, "trail-length", |ui| ui.add(length)))
         .on_hover_text("how long a trail point stays visible, in SIMULATED time (5 fs – 10 ps, logarithmic): the trail covers the same motion at any play speed, whether the simulation runs at 1 or 10 000 steps per tick. Type a value like 250 or 2 ps")
         .changed()
     {
         st.trail_fs = trails::slider_to_length(x);
     }
     let mut pct = (st.trail_opacity * 100.0).round();
-    if probed("trail-opacity", ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).text("trail opacity").suffix(" %").fixed_decimals(0)))
+    if probed("trail-opacity", keyed(ui, "trail-opacity", |ui| ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).text("trail opacity").suffix(" %").fixed_decimals(0))))
         .on_hover_text("the newest end's opacity; the trail fades linearly to fully transparent at the chosen length")
         .changed()
     {
@@ -685,14 +685,14 @@ fn cloud_card(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
             }
         });
         if refresh {
-            changed |= probed("cloud-refresh-s", ui.add(egui::Slider::new(&mut every, 1.0..=10.0).suffix(" s").fixed_decimals(0).text("refresh every"))).changed();
+            changed |= probed("cloud-refresh-s", keyed(ui, "cloud-refresh-s", |ui| ui.add(egui::Slider::new(&mut every, 1.0..=10.0).suffix(" s").fixed_decimals(0).text("refresh every")))).changed();
         }
         if changed {
             acts.push(Action::Cloud { superposition: sup, refresh, refresh_s: every });
         }
         // the Harris display solves' cadence (`worker::harris`): beside the cloud's, never replacing it
         let mut orbitals = st.orbital_refresh_s;
-        if probed("orbital-refresh-s", ui.add(egui::Slider::new(&mut orbitals, 1.0..=10.0).suffix(" s").fixed_decimals(0).text("refresh orbitals every")))
+        if probed("orbital-refresh-s", keyed(ui, "orbital-refresh-s", |ui| ui.add(egui::Slider::new(&mut orbitals, 1.0..=10.0).suffix(" s").fixed_decimals(0).text("refresh orbitals every"))))
             .on_hover_text(ORBITAL_REFRESH_TIP)
             .changed()
         {
@@ -709,7 +709,7 @@ fn camera(ui: &mut Ui, st: &mut UiState) {
         let row = |ui: &mut Ui, name: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>, text: String, tip: &str| {
             ui.horizontal(|ui| {
                 ui.add_sized([72.0, 18.0], egui::Label::new(name));
-                ui.add(egui::Slider::new(v, range).show_value(false)).on_hover_text(tip);
+                keyed(ui, &format!("camera-{name}"), |ui| ui.add(egui::Slider::new(v, range).show_value(false))).on_hover_text(tip);
                 ui.label(text);
             });
         };
@@ -728,7 +728,7 @@ fn camera(ui: &mut Ui, st: &mut UiState) {
     }
     ui.horizontal(|ui| {
         ui.label("motion blur");
-        ui.add(egui::Slider::new(&mut st.motion_blur, 0.0..=1.0).show_value(false))
+        keyed(ui, "motion-blur", |ui| ui.add(egui::Slider::new(&mut st.motion_blur, 0.0..=1.0).show_value(false)))
             .on_hover_text("while playing, faint copies of each atom along the path its last steps took — a fast vibration smears instead of jittering. Shows when many steps run per frame (the estimated solver); 0 turns it off. Display only");
         ui.label(format!("{:.0} %", st.motion_blur * 100.0));
     });
@@ -803,7 +803,7 @@ fn bonds(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
     }
     ui.horizontal(|ui| {
         ui.label("label opacity");
-        ui.add(egui::Slider::new(&mut st.label_opacity, 0.0..=1.0).show_value(false))
+        keyed(ui, "label-opacity", |ui| ui.add(egui::Slider::new(&mut st.label_opacity, 0.0..=1.0).show_value(false)))
             .on_hover_text("the labels drawn in the 3D view: molecule names, bond lengths, angles and partial charges (display only)");
         ui.label(format!("{:.0} %", st.label_opacity * 100.0));
     });
