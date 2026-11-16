@@ -2758,6 +2758,52 @@ fn a_stale_side_payload_never_replaces_the_shown_one() {
     assert_eq!(shown(&d), Some(vec![51, 52]), "|ψ|² is not the phase view");
 }
 
+/// User report 2026-11-16 (estimated mode, live orbitals: a picked orbital switched to the HOMO
+/// about every 30 s): an audit's converged payload in play after a Harris one carries no
+/// unoccupied rows, and the producer leaves an unoccupied pick unresolved — `what` the request,
+/// no row with it (`providers::orbitals`, "The selection fallback"). It answers nothing, so it
+/// never replaces the Harris payload that shows the pick, not even as the converged payload at
+/// the same geometry; the next payload that shows the pick (renumbered: the selection fallback)
+/// does. A payload without rows (a refused view) still answers: it says why nothing is shown.
+#[test]
+fn an_unresolved_pick_never_replaces_a_payload_that_shows_it() {
+    use crate::provider::*;
+    let (mut d, log) = orbiting();
+    let side = |job: u64, kind: SideKind, track: u32, tracks: &[u32]| -> SideDisplay {
+        let rows = tracks.iter().enumerate().map(|(i, &t)| OrbitalInfo {
+            spin: Spin::Up, index: i, track: t, slot: 0, energy: -0.5, eps_range: (-0.5, -0.5), occupation: 1.0, label: OrbitalLabel::Index(i + 1),
+            cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false, shares: None,
+        }).collect();
+        let okind = if kind == SideKind::Harris { OrbitalKind::Harris { experience: None, rescale: 1.0, wall_s: 0.3 } } else { OrbitalKind::Converged };
+        let o = OrbitalDisplay {
+            cell: Cell { n: 33, h: 0.25 }, origin: [0.0; 3], positions: Vec::new(), rows, field: None, spin: SpinSummary::default(),
+            unoccupied: Some(UnoccupiedStatus { requested: 4, ..Default::default() }), notes: Vec::new(),
+            what: OrbitalRequest::Orbital { spin: Spin::Up, track, squared: false }, lone_atom: LoneAtomLabels::NotLoneAtom, share_z: None, kind: okind,
+        };
+        let display = (kind != SideKind::Harris).then(|| Display::Cpu { cell: Cell { n: 33, h: 0.25 }, origin: [0.0; 3], rho: Arc::new(Vec::new()), max: 0.0 });
+        SideDisplay { display, orbitals: Some(o), kind, job, positions: Vec::new() }
+    };
+    let shown = |d: &Dynamics| d.snapshot().orbitals.map(|o| o.rows.iter().map(|r| r.track).collect::<Vec<_>>());
+    let feed = |d: &mut Dynamics, sd: SideDisplay| {
+        {
+            let mut l = log.lock().unwrap();
+            l.jobs = l.jobs.max(sd.job);
+            l.side.push_back(sd);
+        }
+        let _ = d.tick(f64::INFINITY, &mut never());
+    };
+    let view = OrbitalViewRequest { unoccupied: 4, ..OrbitalViewRequest::new(OrbitalRequest::Orbital { spin: Spin::Up, track: 1, squared: false }) };
+    d.apply(DynCommand::SetOrbitalView(view));
+    feed(&mut d, side(2, SideKind::Harris, 1, &[0, 1]));
+    assert_eq!(shown(&d), Some(vec![0, 1]), "the Harris payload shows the pick");
+    feed(&mut d, side(3, SideKind::Audit, 1, &[0]));
+    assert_eq!(shown(&d), Some(vec![0, 1]), "the audit's unresolved payload does not replace it");
+    feed(&mut d, side(4, SideKind::Harris, 4, &[0, 4]));
+    assert_eq!(shown(&d), Some(vec![0, 4]), "the renumbered pick, shown");
+    feed(&mut d, side(5, SideKind::Audit, 1, &[]));
+    assert_eq!(shown(&d), Some(Vec::new()), "a payload without rows (a refused view) still answers");
+}
+
 // ---- Harris display orbitals (live-orbitals spec §4.2–4.3; Phase A Task 3) ----
 
 /// An orbital payload of `kind` at `positions` answering the spin-density view, its one row's
