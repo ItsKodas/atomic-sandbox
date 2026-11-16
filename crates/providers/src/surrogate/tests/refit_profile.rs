@@ -176,6 +176,16 @@ fn refit_profile() {
                     passes(&mut s, name);
                 }
             }
+            // the misfit-driven recovery: the cold attach with the energy tier at a third, so the
+            // training residuals fail and the recovery runs its cap retries and quarantine rounds
+            "recovery" => {
+                let mut pol = FallbackPolicy::default();
+                pol.energy_std_per_atom /= 3.0;
+                let mut s = SurrogateKs::new(Box::new(StubKsGpu), pol).with_teacher_tol(1e-6);
+                surrogate::prof::reset();
+                let wall = attach_timed(&mut s, open_copy());
+                dump("(r) cold attach, energy tier / 3 (misfit-driven recovery)", wall, &s);
+            }
             // the active set (rule 5e) alone on the standing fit, its sub-stages
             "active" => {
                 let mut s = provider();
