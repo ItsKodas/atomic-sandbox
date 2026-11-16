@@ -65,6 +65,9 @@ pub const TAUGHT: f64 = 0.9;
 /// The outline of a bin's "new, waiting for refit" segment (module doc, "live during training").
 pub const NEW_INK: Color32 = theme::INK;
 
+/// The fewest points that segment is tall, so it shows on a large bar (log scale).
+const NEW_MIN_PX: f32 = 2.0;
+
 /// The histogram legend's words for that segment.
 pub const NEW_WORDS: &str = "new (waiting for refit)";
 
@@ -1344,10 +1347,12 @@ fn histogram(
                 p.line_segment([pos2(x0, plot.bottom()), pos2(x1, plot.bottom())], Stroke::new(2.0, theme::INK_FAINT));
             }
         }
-        // new, waiting for the refit: an outline from the fitted bar's top to the stacked count's
+        // new, waiting for the refit: an outline from the fitted bar's top to the stacked count's,
+        // at least NEW_MIN_PX tall (a few new on a big bar barely move a log scale)
         if new(k) > 0 {
             let lo = if n > 0 { height(n) } else { 0.0 };
-            let seg = Rect::from_min_max(pos2(x0, plot.bottom() - height(n + new(k))), pos2(x1, plot.bottom() - lo));
+            let hi = height(n + new(k)).max(lo + NEW_MIN_PX);
+            let seg = Rect::from_min_max(pos2(x0, plot.bottom() - hi), pos2(x1, plot.bottom() - lo));
             p.rect_stroke(seg, 0.0, Stroke::new(1.0, NEW_INK.gamma_multiply(0.9)), egui::StrokeKind::Inside);
         }
     }

@@ -205,8 +205,9 @@ fn a_pair_whose_key_is_short_reads_thin() {
 /// the refit"): samples kept since the last refit are pending — counted per pair, in the fitted
 /// histogram's bins, by the same geometry rule, and per composition — and change nothing fitted:
 /// the sample counts, the histograms (so every bin's taught/thin class), the confidences and the
-/// elements stay the fitted samples'. A forgotten, a quarantined and a box-excluded sample is
-/// never pending; the refit takes the pending ones into the fit.
+/// elements stay the fitted samples'. A forgotten, a quarantined, a box-excluded and a
+/// box-affected sample (its face density over the box rule, not yet coded `Q_BOX`: that is done
+/// inside the next fit) is never pending, and reads as held; the refit takes the pending ones in.
 #[test]
 fn pending_samples_are_counted_apart_and_change_no_class() {
     let mut s = h2_and_ch4(120, 200);
@@ -243,18 +244,22 @@ fn pending_samples_are_counted_apart_and_change_no_class() {
     let ch4 = m.molecule(&Composition::of(&[6, 1, 1, 1, 1])).unwrap();
     assert_eq!((ch4.fitted, ch4.pending), (200, 4));
 
-    // forgotten, quarantined and box-excluded: never pending (the last three are CH₄)
+    // forgotten, quarantined, box-excluded and box-affected: never pending (the last four are CH₄)
     let n = s.samples();
     s.quarantine.resize(n, Q_NONE);
     for (k, q) in [Q_FORGOTTEN, Q_HELD, Q_BOX].into_iter().enumerate() {
         s.quarantine[n - 1 - k] = q;
     }
+    s.face.resize(n, f64::NAN);
+    s.face[n - 4] = 1.0;
+    assert!(s.is_box(n - 4) && !s.excluded(n - 4), "premise: box-affected, not yet coded");
     let m2 = s.knowledge_map().unwrap();
-    assert_eq!((m2.pending, s.pending_samples()), (7, 7));
+    assert_eq!((m2.pending, s.pending_samples()), (6, 6));
     let ch = m2.pair(1, 6).unwrap();
-    assert_eq!((ch.pending_samples, ch.pending.iter().sum::<u32>()), (1, 4));
-    assert_eq!(m2.pair(1, 1).unwrap().pending_samples, 7);
-    assert_eq!(m2.molecule(&Composition::of(&[6, 1, 1, 1, 1])).unwrap().pending, 1);
+    assert_eq!((ch.pending_samples, ch.pending.iter().sum::<u32>()), (0, 0));
+    assert_eq!(m2.pair(1, 1).unwrap().pending_samples, 6);
+    let ch4 = m2.molecule(&Composition::of(&[6, 1, 1, 1, 1])).unwrap();
+    assert_eq!((ch4.pending, ch4.waiting, ch4.held, ch4.forgotten), (0, 0, 3, 1), "the box-affected one reads held");
 
     // the refit: no longer pending, now fitted
     s.refit().unwrap();

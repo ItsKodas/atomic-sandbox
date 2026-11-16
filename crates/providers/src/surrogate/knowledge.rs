@@ -19,8 +19,10 @@
 //!
 //! **The pending samples** (2026-11-16, the live knowledge graph; `sim::knowledge`, "New samples,
 //! waiting for the refit"): the store's tail past the accumulated prefix without a quarantine code
-//! ([`SurrogateKs::pending_samples`]) — a forgotten, held, superseded, box-excluded, draft, lone
-//! or reference-waiting sample is never pending. Their atom pairs are binned by the fitted
+//! and not box-affected ([`SurrogateKs::is_pending`], one predicate for the map, the count and the
+//! rows) — a forgotten, held, superseded, box-excluded, draft, lone or reference-waiting sample is
+//! never pending, nor is a box-affected one, whose `Q_BOX` code is only set inside the next fit
+//! (`exclude_box_samples`): it reads as held. Their atom pairs are binned by the fitted
 //! samples' rule ([`each_pair`]) into each pair's `pending`, among the fitted species only; they
 //! enter no other count, so no class, confidence or first shell moves until the refit.
 //!
@@ -136,9 +138,7 @@ impl SurrogateKs {
         }
 
         // the pending samples: their atom pairs in the same bins, apart from every fitted count
-        let fitted_to = self.accumulated.min(store.len());
-        let pending: Vec<&Sample> =
-            store.samples[fitted_to..].iter().enumerate().filter(|(k, s)| !self.excluded(fitted_to + k) && s.z.len() == s.pos.len()).map(|(_, s)| s).collect();
+        let pending: Vec<&Sample> = store.samples.iter().enumerate().filter(|&(i, _)| self.is_pending(i)).map(|(_, s)| s).collect();
         let mut pending_pairs: BTreeMap<(u8, u8), (usize, Vec<u32>)> = BTreeMap::new();
         for s in &pending {
             let mut seen: BTreeSet<(u8, u8)> = BTreeSet::new();
@@ -196,19 +196,27 @@ impl SurrogateKs {
         })
     }
 
+    /// Whether stored sample `i` is pending (module doc, "The pending samples"): past the fitted
+    /// prefix, no quarantine code, not box-affected, and one Z per position.
+    pub(super) fn is_pending(&self, i: usize) -> bool {
+        let Some(s) = self.store.as_ref().and_then(|st| st.samples.get(i)) else { return false };
+        i >= self.accumulated && !self.excluded(i) && !self.is_box(i) && s.z.len() == s.pos.len()
+    }
+
     /// The stored samples kept since the last refit and in the next fit's codes (module doc, "The
-    /// pending samples"): of [`unfitted`](Self::unfitted), those with no quarantine code.
+    /// pending samples"): of [`unfitted`](Self::unfitted), those [`is_pending`](Self::is_pending).
     pub fn pending_samples(&self) -> usize {
         let n = self.samples();
-        (self.accumulated.min(n)..n).filter(|&i| !self.excluded(i)).count()
+        (self.accumulated.min(n)..n).filter(|&i| self.is_pending(i)).count()
     }
 
     /// Every stored sample as the molecules and a Forget rule see it (`sim::knowledge`,
     /// "Molecules"), in store order: its composition, its scene (the shared
     /// collection's record; empty for a session-only sample or a model file's), its status — fitted
     /// as the map counts it (the accumulated prefix in the fit's codes, not in the misfit set),
-    /// pending (in the fit's codes past that prefix: kept since the last refit), waiting (in the
-    /// fit's codes otherwise: the misfit set), forgotten, or held — and its leave-one-out ratio from
+    /// pending ([`is_pending`](Self::is_pending): kept since the last refit), waiting (in the fit's
+    /// codes otherwise: the misfit set), forgotten, or held (a box-affected sample past the prefix
+    /// too: the next fit excludes it) — and its leave-one-out ratio from
     /// the standing fit's cache when it is in the fit's codes (as `sample_suspects` reads it).
     pub(super) fn sample_rows(&self) -> Vec<SampleRow> {
         let Some(store) = self.store.as_ref() else { return Vec::new() };
@@ -224,7 +232,7 @@ impl SurrogateKs {
                 } else if self.excluded(i) {
                     RowStatus::Held
                 } else if i >= fitted_to {
-                    RowStatus::Pending
+                    if self.is_pending(i) { RowStatus::Pending } else { RowStatus::Held }
                 } else if !self.in_misfit(i) {
                     RowStatus::Fitted
                 } else {
