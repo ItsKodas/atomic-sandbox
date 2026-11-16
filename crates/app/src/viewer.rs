@@ -696,6 +696,7 @@ impl Viewer {
         self.busy = true; // the worker evaluates the scene at once
         self.edits_sent = 0;
         self.commands_sent = 0;
+        self.ui.relax_pending = None; // a new worker counts its commands afresh
         self.playing = false;
         self.drag_target = None;
         self.tool.dragging = false;
@@ -819,6 +820,7 @@ impl Viewer {
         self.busy = true;
         self.edits_sent = 0;
         self.commands_sent = 0;
+        self.ui.relax_pending = None; // a new worker counts its commands afresh
         self.playing = false;
     }
 
@@ -917,6 +919,12 @@ impl Viewer {
         }
         if let Some(sim) = &self.sim {
             self.commands_sent += 1;
+            // the Relax / Stop button's spinner ends once a snapshot has seen this command
+            if matches!(cmd, Command::Dyn(DynCommand::Relax | DynCommand::StopRelax)) {
+                if let Some(p) = &mut self.ui.relax_pending {
+                    p.sent = Some(self.commands_sent);
+                }
+            }
             sim.send(cmd);
         }
     }

@@ -913,7 +913,7 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
     });
     ui.separator();
     // Q8 of Appendix B (M6): relax (FIRE); also in the toolbar's Time group
-    anchored(ui, st, "m-relax", |ui, _| relax_controls(ui, input, acts));
+    anchored(ui, st, "m-relax", |ui, st| relax_controls(ui, st.relax_pending.as_ref(), input, acts));
     ui.separator();
     // the reference comparison (PySCF out of process; Readouts ▸ Compare with reference)
     anchored(ui, st, "m-compare", |ui, st| {
@@ -927,12 +927,12 @@ fn physics_menu(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
 }
 
 /// Physics ▸ Relax geometry: the button (Stop while running), the readout and the note.
-fn relax_controls(ui: &mut Ui, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
+fn relax_controls(ui: &mut Ui, pending: Option<&super::RelaxPending>, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     ui.horizontal(|ui| {
         theme::section(ui, "Relax geometry (FIRE)");
         theme::info(ui, super::RELAX_TIP);
     });
-    ui.horizontal(|ui| super::relax_toggle(ui, input, Vec2::ZERO, ("m-relax", "m-relax-stop"), acts));
+    ui.horizontal(|ui| super::relax_toggle(ui, input, pending, Vec2::ZERO, ("m-relax", "m-relax-stop"), acts));
     match input.snapshot.and_then(|s| s.dynamics.relax.as_ref()) {
         Some(r) => {
             for l in super::relax_lines(r) {

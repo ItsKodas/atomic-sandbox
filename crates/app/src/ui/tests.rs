@@ -2534,6 +2534,112 @@ fn clicking_the_m6_controls_sends_their_commands() {
     assert_eq!((st.element, st.isotope), (1, Some(2)));
 }
 
+/// A Relax / Stop click shows at once (user request 2026-11-16): pending from the click until the
+/// snapshot shows the clicked state, a snapshot has seen the command, or the safety timeout.
+#[test]
+fn relax_pending_settles_whichever_comes_first() {
+    let t0 = Instant::now();
+    let at = |s: f64| t0 + Duration::from_secs_f64(s);
+    // Relax clicked while not relaxing: Stop with a spinner at once
+    let p = RelaxPending::new(false, false, t0);
+    assert_eq!(RelaxButton::of(false, Some(&p)), RelaxButton::Starting);
+    assert!(!p.settled(false, None, at(0.1)), "pending right after the click");
+    assert!(!p.settled(false, Some(7), at(0.1)), "not sent yet: no count to compare against");
+    assert!(p.settled(true, None, at(0.1)), "the snapshot reports the relax running");
+    let sent = RelaxPending { sent: Some(5), ..p };
+    assert!(!sent.settled(false, Some(4), at(1.0)), "a snapshot taken before the worker saw it");
+    assert!(sent.settled(false, Some(5), at(1.0)), "seen, not relaxing: already at a minimum, or refused");
+    assert!(sent.settled(false, Some(9), at(1.0)));
+    assert!(!p.settled(false, None, at(9.9)));
+    assert!(p.settled(false, None, at(10.0)), "the safety timeout");
+    // Stop clicked while relaxing: Relax back at once, disabled with a spinner
+    let s = RelaxPending::new(true, true, t0);
+    assert_eq!(RelaxButton::of(true, Some(&s)), RelaxButton::Stopping);
+    assert!(!s.settled(true, None, at(0.1)), "still relaxing");
+    assert!(s.settled(false, None, at(0.1)), "the snapshot reports the relax ended");
+    assert!(RelaxPending { sent: Some(3), ..s }.settled(true, Some(3), at(0.1)), "seen (a later Relax runs)");
+    assert!(s.settled(true, None, at(10.0)), "the safety timeout");
+    // Stop while its Relax was itself pending: "not relaxing" is the old state, not an answer
+    let s2 = RelaxPending::new(true, false, t0);
+    assert!(!s2.settled(false, None, at(0.1)));
+    assert!(!RelaxPending { sent: Some(6), ..s2 }.settled(false, Some(5), at(0.1)));
+    assert!(RelaxPending { sent: Some(6), ..s2 }.settled(false, Some(6), at(0.1)));
+    assert!(s2.settled(false, None, at(10.0)));
+    // nothing pending: the snapshot's state
+    assert_eq!(RelaxButton::of(true, None), RelaxButton::Stop);
+    assert_eq!(RelaxButton::of(false, None), RelaxButton::Relax);
+}
+
+/// Clicked as a user would: the toolbar's Relax turns into Stop with a spinner in the click's own
+/// frames, Stop works while pending, Stop turns it back into a disabled Relax with a spinner, and
+/// each settles on the snapshot's state or the worker's command count. Physics ▸ Relax likewise.
+#[test]
+fn relax_click_shows_at_once() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let mut idle = snapshot(&scene, Backend::Gpu, None);
+    idle.commands = 3;
+    let mut relaxing = snapshot(&scene, Backend::Gpu, None);
+    relaxing.dynamics.relax = Some(relax_progress(None));
+    relaxing.commands = 4;
+    let inp = input(&scene, Some(&idle), &cam);
+    let inp_r = input(&scene, Some(&relaxing), &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    let spinning = |ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, name: &str| {
+        PROBES.with(|p| p.borrow_mut().clear());
+        frame(ctx, st, inp, WIDE, vec![]);
+        PROBES.with(|p| p.borrow().contains_key(name))
+    };
+    // Relax: Stop with a spinner while the snapshot still says idle
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, WIDE, "relax", 0.0));
+    assert!(matches!(c.as_slice(), [DynCommand::Relax]), "{c:?}");
+    assert!(st.relax_pending.is_some_and(|p| !p.stop && p.sent.is_none()), "pending right after the click");
+    assert!(spinning(&ctx, &mut st, &inp, "relax-pending"), "the spinner beside Stop");
+    // Stop works while pending; it shows Relax again at once, disabled with a spinner
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp, WIDE, "relax", 0.0));
+    assert!(matches!(c.as_slice(), [DynCommand::StopRelax]), "{c:?}");
+    assert!(st.relax_pending.is_some_and(|p| p.stop));
+    assert!(spinning(&ctx, &mut st, &inp, "relax-pending"));
+    assert!(dyn_commands(&press_widget_w(&ctx, &mut st, &inp, WIDE, "relax", 0.0)).is_empty(), "disabled: a quick re-click cannot race");
+    // the worker has seen the Stop (the viewer numbers it as it sends it): settled, Relax again
+    st.relax_pending.as_mut().unwrap().sent = Some(3);
+    assert!(!spinning(&ctx, &mut st, &inp, "relax-pending"));
+    assert!(st.relax_pending.is_none(), "cleared when the command is seen");
+    // Relax, then the snapshot reports the relax: the plain Stop, no spinner
+    press_widget_w(&ctx, &mut st, &inp, WIDE, "relax", 0.0);
+    assert!(st.relax_pending.is_some_and(|p| !p.stop));
+    assert!(!spinning(&ctx, &mut st, &inp_r, "relax-pending"));
+    assert!(st.relax_pending.is_none(), "cleared when relaxing");
+    // Stop from a running relax, then the snapshot reports it ended
+    let c = dyn_commands(&press_widget_w(&ctx, &mut st, &inp_r, WIDE, "relax", 0.0));
+    assert!(matches!(c.as_slice(), [DynCommand::StopRelax]), "{c:?}");
+    assert!(spinning(&ctx, &mut st, &inp_r, "relax-pending"), "Stop pending while the snapshot still relaxes");
+    assert!(!spinning(&ctx, &mut st, &inp, "relax-pending"));
+    assert!(st.relax_pending.is_none(), "Stop pending, then cleared");
+    // Relax that the worker answers with nothing to do (at a minimum already): seen, not relaxing
+    press_widget_w(&ctx, &mut st, &inp, WIDE, "relax", 0.0);
+    st.relax_pending.as_mut().unwrap().sent = Some(3);
+    assert!(!spinning(&ctx, &mut st, &inp, "relax-pending"));
+    assert!(st.relax_pending.is_none(), "cleared when seen without relaxing");
+    // the timeout: a click no snapshot ever answers
+    press_widget_w(&ctx, &mut st, &inp, WIDE, "relax", 0.0);
+    st.relax_pending.as_mut().unwrap().since -= RELAX_PENDING_TIMEOUT;
+    assert!(!spinning(&ctx, &mut st, &inp, "relax-pending"));
+    assert!(st.relax_pending.is_none(), "cleared by the timeout");
+    // Physics ▸ Relax geometry gets the same: Stop with a spinner after its Relax
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "m-relax"));
+    assert!(matches!(c.as_slice(), [DynCommand::Relax]), "{c:?}");
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    assert!(spinning(&ctx, &mut st, &inp, "m-relax-pending"));
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Physics));
+    let c = dyn_commands(&click_widget(&ctx, &mut st, &inp, "m-relax-stop"));
+    assert!(matches!(c.as_slice(), [DynCommand::StopRelax]), "{c:?}");
+    egui::Popup::close_all(&ctx);
+}
+
 fn relax_progress(converged: Option<bool>) -> sim::RelaxProgress {
     sim::RelaxProgress {
         steps: 42,
