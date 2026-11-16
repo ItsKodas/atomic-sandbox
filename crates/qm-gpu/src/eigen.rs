@@ -306,9 +306,6 @@ pub struct EigenStats {
     /// lost a level — an error on the SCF path, a note on the display paths.
     pub restores: usize,
     pub restores_exhausted: bool,
-    /// The solve ended on `lobpcg_guarded`'s loose stop (Task 9c (d)): the head at its tol, the loose columns wherever
-    /// they were when their density bound and the witness were met (their residuals can be above the guard tolerance).
-    pub loose_stop: bool,
 }
 
 /// Model of the f32 residual floor ‖(H − λ)δx‖ for ‖x‖ = 1 (module doc): the RMS rounding of
@@ -633,7 +630,7 @@ pub(crate) fn lobpcg_split(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reduc
     assert!(head <= checked && checked <= x.len() && checked > 0, "lobpcg_split: need 0 < head ≤ checked ≤ {} (head {head}, checked {checked})", x.len());
     assert!(residuals.as_ref().is_none_or(|r| r.len() == x.len()), "lobpcg_split: one residual slot per column");
     lobpcg_core(ctx, k, g, r, h, x, evals, work, tol, tol, max_iter, ALPHA_MAX, ALPHA_RESIDUAL_FRACTION, Some((head, tail_tol, checked)), false, residuals,
-                should_abort, None)
+                should_abort)
 }
 
 /// The SCF's Fermi–Dirac channel solve (module doc, "Guarded columns and locking"; plan 2026-11-13 Task 9b): the
@@ -643,20 +640,16 @@ pub(crate) fn lobpcg_split(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reduc
 /// iterate; else the whole block iterates. `residuals[i]` receives every returned column's true residual (the witness
 /// test's lower bound θ − r). `EigenStats::head_kept` says whether the head came back bitwise. `should_abort` is
 /// polled once per iteration (`Stop::Aborted`, the current iterate in `x`: the SCF's pause and cancel, Task 9c).
-/// `loose_stop(θ, r)` (Task 9c (d), `qm::occupations` "The loose stop"), over the tested columns' Rayleigh quotients
-/// and true residuals, is asked once the head meets its tol (or is locked) and the regular test has not stopped: true
-/// ends the solve as `Stop::Converged` with the loose columns wherever they are.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lobpcg_guarded(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuHamiltonian, x: &mut [Field], evals: &mut [f64],
                              work: &mut LobpcgWork, tol: f64, guess_tol: f64, head: usize, tail_tol: f64, checked: usize, max_iter: usize,
-                             residuals: &mut [f64], should_abort: Option<&mut dyn FnMut() -> bool>,
-                             loose_stop: Option<&mut dyn FnMut(&[f64], &[f64]) -> bool>) -> Result<EigenStats, QmError> {
+                             residuals: &mut [f64], should_abort: Option<&mut dyn FnMut() -> bool>) -> Result<EigenStats, QmError> {
     assert!(guess_tol >= tol, "lobpcg_guarded: guess_tol {guess_tol} must not be below tol {tol}");
     assert!(tail_tol >= tol, "lobpcg_guarded: tail_tol {tail_tol} must not be below tol {tol}");
     assert!(head <= checked && checked <= x.len() && checked > 0 && residuals.len() == x.len(),
             "lobpcg_guarded: head {head}, checked {checked}, {} residual slots for {} columns", residuals.len(), x.len());
     lobpcg_core(ctx, k, g, r, h, x, evals, work, tol, guess_tol, max_iter, ALPHA_MAX, ALPHA_RESIDUAL_FRACTION, Some((head, tail_tol, checked)), true,
-                Some(residuals), should_abort, loose_stop)
+                Some(residuals), should_abort)
 }
 
 /// `lobpcg` with the guard's two constants as parameters (tests force the fallback with 0, 0) and the
@@ -666,7 +659,7 @@ pub(crate) fn lobpcg_guarded(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Red
 pub(crate) fn lobpcg_with(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuHamiltonian, x: &mut [Field], evals: &mut [f64],
                           work: &mut LobpcgWork, tol: f64, guess_tol: f64, max_iter: usize, alpha_max: f64, alpha_fraction: f64,
                           tail: Option<(usize, f64, usize)>, should_abort: Option<&mut dyn FnMut() -> bool>) -> Result<EigenStats, QmError> {
-    lobpcg_core(ctx, k, g, r, h, x, evals, work, tol, guess_tol, max_iter, alpha_max, alpha_fraction, tail, false, None, should_abort, None)
+    lobpcg_core(ctx, k, g, r, h, x, evals, work, tol, guess_tol, max_iter, alpha_max, alpha_fraction, tail, false, None, should_abort)
 }
 
 /// Rayleigh–Ritz in the B-orthogonal complement of the first `locked` columns of S (module doc, "Guarded columns and
@@ -692,8 +685,7 @@ fn rayleigh_ritz_locked(a: &DMatrix<f64>, b: &DMatrix<f64>, locked: usize, na: u
 fn lobpcg_core(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuHamiltonian, x: &mut [Field], evals: &mut [f64],
                work: &mut LobpcgWork, tol: f64, guess_tol: f64, max_iter: usize, alpha_max: f64, alpha_fraction: f64,
                tail: Option<(usize, f64, usize)>, lock: bool, mut residuals: Option<&mut [f64]>,
-               mut should_abort: Option<&mut dyn FnMut() -> bool>, mut loose_stop: Option<&mut dyn FnMut(&[f64], &[f64]) -> bool>)
-               -> Result<EigenStats, QmError> {
+               mut should_abort: Option<&mut dyn FnMut() -> bool>) -> Result<EigenStats, QmError> {
     let nk = x.len();
     assert!(nk > 0, "lobpcg: no eigenpairs requested");
     assert!(nk <= work.k, "lobpcg: work was built for k = {}, called with {nk} vectors", work.k);
@@ -832,26 +824,15 @@ fn lobpcg_core(ctx: &GpuContext, k: &Kernels, g: &GpuGrid, r: &Reducer, h: &GpuH
         // own tier — the witness test reads that column's true residual, θ − r, so the bound stays honest; holding the
         // floor diagnosis until the loose tier is met was tried in task 9b fix round 1 and turned those exits into
         // 200-iteration grinds on box states)
-        let mut stop = classify(stop_res, tol, iterations, max_iter, best_it, floor, guess_tol);
-        let mut loose_stopped = false;
-        if stop.is_none() || stop == Some(Stop::MaxIter) {
-            // the loose stop (Task 9c (d)): the head at its tol, the loose columns' density bound and the witness met
-            if let (Some(f), Some((_, _, checked))) = (loose_stop.as_mut(), tail) {
-                if (locked > 0 || head_res < tol) && f(&evals[..checked], &col_res[..checked]) {
-                    stop = Some(Stop::Converged);
-                    loose_stopped = true;
-                }
-            }
-        }
-        if let Some(stop) = stop {
+        if let Some(stop) = classify(stop_res, tol, iterations, max_iter, best_it, floor, guess_tol) {
             stats = EigenStats { iterations, max_residual: max_res, stop, readbacks, dispatches: b.dispatches() + gram_dispatches, fallbacks, alpha_worst, split_residual,
-                                 head_kept: iterations == 0 || locked > 0, restores, restores_exhausted, loose_stop: loose_stopped };
+                                 head_kept: iterations == 0 || locked > 0, restores, restores_exhausted };
             break;
         }
         if let Some(abort) = should_abort.as_mut() {
             if abort() {
                 stats = EigenStats { iterations, max_residual: max_res, stop: Stop::Aborted, readbacks, dispatches: b.dispatches() + gram_dispatches, fallbacks, alpha_worst, split_residual,
-                                     head_kept: iterations == 0 || locked > 0, restores, restores_exhausted, loose_stop: false };
+                                     head_kept: iterations == 0 || locked > 0, restores, restores_exhausted };
                 break;
             }
         }
@@ -1154,7 +1135,7 @@ mod tests {
         // (a)
         let before = read(&x);
         let mut res = vec![0.0; 5];
-        let a = lobpcg_guarded(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, 1.5 * tol, head, guard, 5, 500, &mut res, None, None).unwrap();
+        let a = lobpcg_guarded(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, 1.5 * tol, head, guard, 5, 500, &mut res, None).unwrap();
         println!("(a) {a:?} residuals {res:?}");
         assert_eq!((a.iterations, a.head_kept), (0, true));
         assert_eq!(read(&x), before);
@@ -1163,7 +1144,7 @@ mod tests {
         let top: Vec<f64> = before[4].iter().zip(&seed).map(|(&a, b)| a as f64 + 3e-6 * b).collect();
         x[4].upload_interior(&rig.ctx, &rig.g, &top);
         let before = read(&x);
-        let a2 = lobpcg_guarded(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, 1.5 * tol, head, guard, 5, 500, &mut res, None, None).unwrap();
+        let a2 = lobpcg_guarded(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, 1.5 * tol, head, guard, 5, 500, &mut res, None).unwrap();
         println!("(a) the fifth column at {:.1e}: {a2:?}", res[4]);
         assert!(res[4] > 1.5 * tol && res[4] < guard, "the blend lands between the tiers: {res:?}");
         assert_eq!((a2.iterations, a2.head_kept), (0, true), "a witness-tier residual never forces an iteration");
@@ -1175,7 +1156,7 @@ mod tests {
         // (b)
         x[4].upload_interior(&rig.ctx, &rig.g, &seed);
         let before = read(&x);
-        let b = lobpcg_guarded(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, 1.5 * tol, head, guard, 5, 500, &mut res, None, None).unwrap();
+        let b = lobpcg_guarded(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, 1.5 * tol, head, guard, 5, 500, &mut res, None).unwrap();
         println!("(b) {b:?} evals {e:?} residuals {res:?}");
         assert!(b.iterations > 0 && b.head_kept, "{b:?}");
         assert_eq!(read(&x)[..head], before[..head], "the locked head is returned bitwise");
@@ -1186,7 +1167,7 @@ mod tests {
         // (c)
         let pert: Vec<f64> = before[0].iter().zip(&seed).map(|(&a, b)| a as f64 + 1e-2 * b).collect();
         x[0].upload_interior(&rig.ctx, &rig.g, &pert);
-        let c = lobpcg_guarded(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, 1.5 * tol, head, guard, 5, 500, &mut res, None, None).unwrap();
+        let c = lobpcg_guarded(&rig.ctx, &rig.k, &rig.g, &rig.r, &h, &mut x, &mut e, &mut work, tol, 1.5 * tol, head, guard, 5, 500, &mut res, None).unwrap();
         println!("(c) {c:?}");
         assert!(c.iterations > 0 && !c.head_kept, "{c:?}");
         // a `Floor` exit (the scaled split residual stalled in the floor band) may leave the loose column above its tier;

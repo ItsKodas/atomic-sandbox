@@ -202,13 +202,16 @@
 //!   Gaussian σ so that the core screens the smeared nucleus as the grid sees it; the σ = 1 blobs put the first steps'
 //!   μ in the box continuum (−0.003 Ha with the unsmeared free atoms, whose 1s sits inside σ = h: every level of the
 //!   first potential then lay above −0.04 Ha). (b) A loosened step's witness tail is tied to its accuracy
-//!   (`qm::step_tail_kt`). (c) The block's top column is an untested buffer (`Channel::solve_fd`). (d) The loose
-//!   columns stop once their ∫|δρ| bound and the witness are met (`qm::occupations` "The loose stop"). Measured: 11
-//!   steps, peak block 13 (a 7–8 extra-vector peak, from the first step's 36 kT window); the 14 Bohr box of the app's
-//!   177³ VRAM case (run at 167³ × 0.0848): 17 steps, peak block 9 (4 extra vectors per spin, the buffer included).
-//! - **Pause and cancel inside an eigensolve** (Task 9c): `solve_with`'s `should_abort` also reaches the FD channels'
-//!   LOBPCG (polled once per iteration); an aborted eigensolve abandons the solve like an abort before a step, parking
-//!   the iterate as the next warm start (occupations 1 on each channel's lowest N_σ levels, so the warm guard accepts it).
+//!   (`qm::step_tail_kt`). (c) The block's top column is an untested buffer (`Channel::solve_fd`), which decides the
+//!   witness itself when its own lower bound passes (one vector is then added as the next buffer, instead of doubling
+//!   the extras: without that the buffer cost the 97³ solve a 13 → 21 doubling). (d), a loose stop at the per-column
+//!   density bound, was measured and not adopted (`qm::occupations` "No loose stop"). Measured: 11 steps, 11 s, peak
+//!   block 14 (9 extra vectors per spin, the buffer included; the step-1 36 kT window); the 14 Bohr box of the app's
+//!   177³ VRAM case (run at 167³ × 0.0848): 14 steps, 36 s, peak block 8 (3 extra vectors per spin), no growth.
+//! - **Pause and cancel inside an eigensolve** (Task 9c): `solve_polled`'s second poll reaches the FD channels' LOBPCG
+//!   (once per iteration; `solve_with`/`solve_observed` keep their one poll per step, which callers count as steps —
+//!   the Activity probe); an aborted eigensolve abandons the solve like an abort before a step, parking the iterate as
+//!   the next warm start (occupations 1 on each channel's lowest N_σ levels, so the warm guard accepts it).
 //! - **Frozen means the tight columns did not move** (plan 2026-11-13 Task 9b, task 9 review C1). Both of LOBPCG's stop
 //!   decisions read the split (the tol stop and the 1.5·tol guess acceptance), and a step whose head came back bitwise in
 //!   every call (`EigenStats::head_kept`: a 0-iteration accept, or the head locked while only the witness columns
@@ -302,7 +305,7 @@ use nalgebra::{DMatrix, DVector};
 use qm::ionic::{core_overlaps, IonicSetup, CORE_OVERLAP_WARNING};
 use qm::nuclear::{centres, deposit_centres, deposit_charge, free_atom_density, ionic_repulsion, nuclear_repulsion, Centre};
 use qm::scf::{ascending, decide, degenerate_shell_occupations, initial_orbitals, shared_runs, FractionalShell, MAX_WITNESS_GROWTH};
-use qm::{fermi_dirac, grown_extras, loose_bound, partial_levels, step_tail_kt, LOOSE_STOP_FACTOR, tight_columns, tight_start, witness_bound_reached_tail, witness_keep_tail, FdOccupations, PartialLevel, WITNESS_GAP,
+use qm::{fermi_dirac, grown_extras, partial_levels, step_tail_kt, tight_columns, tight_start, witness_bound_reached_tail, witness_keep_tail, FdOccupations, PartialLevel, WITNESS_GAP,
          WITNESS_GUARD_TOL, WITNESS_TAIL_KT};
 use qm::{Energy, Occupations, QmError, ScfProgress, ScfSettings, ScfStats, StallWatch, System};
 
@@ -452,12 +455,9 @@ pub struct SolveProfile {
     /// `FermiDirac`: the largest block (vectors, witness columns and the buffer included) any channel solved with — the
     /// solve's peak witness allocation is `peak_block − n_σ` extra vectors (Task 9c's VRAM measurement).
     pub peak_block: usize,
-    /// `FermiDirac`: the channel solves that ended on the loose stop (`qm::occupations` "The loose stop", Task 9c (d))
-    /// and the largest loose-column density bound (`qm::loose_bound`) any of them ended with (< `LOOSE_STOP_FACTOR`·tol
-    /// by construction). Their loose residuals are not in `ScfStats::max_guard_residual`, which keeps the guard tier's
-    /// meaning (the calls that met the guard tolerance or ended on the floor or the cap).
-    pub loose_stops: usize,
-    pub loose_stop_bound: f64,
+    /// `FermiDirac`: the channel solves decided by the buffer's own lower bound (`Channel::solve_fd`; each then adds one
+    /// vector, the next buffer).
+    pub buffer_witnesses: usize,
     /// Δρ of every step in order (the convergence history; `eig_tol_steps` is its partner).
     pub delta_rho_steps: Vec<f64>,
     /// The warm start's input density was extrapolated, ρ_in = 2ρ_t − ρ_{t−1}
@@ -639,7 +639,6 @@ impl Inner {
         // the residual of the columns the density rests on: all of them, or under a split stop (`lobpcg_guarded`, plan
         // 2026-11-13 Task 9b) the tight head; the loose witness columns go to `guard_residual`
         let (tight, guard) = s.split_residual.unwrap_or((s.max_residual, 0.0));
-        let guard = if s.loose_stop { 0.0 } else { guard }; // a loose stop's columns answer to their bound (`SolveProfile`)
         // `ScfStats::max_eigen_residual` keeps its M1/M3 meaning — the worst residual among the
         // solves at the tight tol, the ones the final state rests on (review I2); the loosened
         // early steps only go into the profile's any-step worst
@@ -845,8 +844,8 @@ impl Channel<'_> {
     /// untested buffers; `residuals` gets every column's exit residual. `None`: `should_abort` stopped it.
     #[allow(clippy::too_many_arguments)]
     fn solve_guarded(&self, orbs: &mut [Field], evals: &mut [f64], head: usize, checked: usize, guard_tol: f64, residuals: &mut [f64], work: &mut Option<LobpcgWork>,
-                     work_k: &mut usize, inner: &mut Inner, should_abort: &mut dyn FnMut() -> bool,
-                     loose_stop: Option<&mut dyn FnMut(&[f64], &[f64]) -> bool>) -> Result<Option<EigenStats>, QmError> {
+                     work_k: &mut usize, inner: &mut Inner, should_abort: Option<&mut (dyn FnMut() -> bool + '_)>)
+                     -> Result<Option<EigenStats>, QmError> {
         if work.is_none() || *work_k < orbs.len() {
             *work = Some(LobpcgWork::new(self.ctx, self.g, orbs.len()));
             *work_k = orbs.len();
@@ -854,7 +853,7 @@ impl Channel<'_> {
         let t = Instant::now();
         let es = lobpcg_guarded(self.ctx, self.k, self.g, self.r, &self.h, orbs, evals, work.as_mut().expect("work sized above"),
                                 self.step_tol, if self.guess_band { EIG_GUESS_FACTOR } else { 1.0 } * self.step_tol, head, guard_tol, checked, EIGEN_MAX_ITER,
-                                residuals, Some(should_abort), loose_stop)
+                                residuals, should_abort.map(|f| f as &mut dyn FnMut() -> bool))
             .map_err(|e| take_device_error().unwrap_or(e))?;
         if let Some(e) = take_device_error() { return Err(e); }
         inner.eigen(es, t.elapsed());
@@ -878,7 +877,7 @@ impl Channel<'_> {
     /// S = 0.
     #[allow(clippy::too_many_arguments)]
     fn solve_fd(&self, orbs: &mut Vec<Field>, evals: &mut Vec<f64>, kt: f64, tight: &mut usize, work: &mut Option<LobpcgWork>, work_k: &mut usize,
-                pool: &mut Pool, inner: &mut Inner, should_abort: &mut dyn FnMut() -> bool) -> Result<Option<(FdOccupations, bool)>, QmError> {
+                pool: &mut Pool, inner: &mut Inner, mut should_abort: Option<&mut (dyn FnMut() -> bool + '_)>) -> Result<Option<(FdOccupations, bool)>, QmError> {
         if self.n == 0 { return Ok(Some((fermi_dirac(evals, 0, kt)?, true))); }
         let guard_tol = WITNESS_GUARD_TOL.max(self.step_tol);
         let mut residuals = vec![0.0; orbs.len()];
@@ -893,27 +892,12 @@ impl Channel<'_> {
             let t_call = Instant::now();
             inner.profile.peak_block = inner.profile.peak_block.max(orbs.len());
             let tail_kt = self.loosened_delta.map_or(WITNESS_TAIL_KT, |d| step_tail_kt(orbs.len(), d));
-            // the loose stop (`qm::occupations` "The loose stop", Task 9c (d)): no class raise needed, the loose columns'
-            // ∫|δρ| bound under LOOSE_STOP_FACTOR·tol, and the witness on θ − r
-            let (n, scf_tol) = (self.n, self.scf_tol);
-            let mut loose_stop = |ev: &[f64], res: &[f64]| -> bool {
-                let Ok(Some(mu)) = fermi_dirac(ev, n, kt).map(|o| o.mu) else { return false };
-                tight_columns(ev, res, Some(mu), kt, scf_tol) <= head && loose_bound(ev, res, head, mu, kt) < LOOSE_STOP_FACTOR * scf_tol
-                    && witness_bound_reached_tail(ev, res, n, mu, kt, tail_kt)
-            };
-            let Some(es) = self.solve_guarded(orbs, evals, head, checked, guard_tol, &mut residuals, work, work_k, inner, should_abort, Some(&mut loose_stop))?
+            let Some(es) = self.solve_guarded(orbs, evals, head, checked, guard_tol, &mut residuals, work, work_k, inner, should_abort.as_deref_mut())?
             else { return Ok(None) };
             if checked < orbs.len() { buffer_last(orbs, evals, &mut residuals); }
-            if es.loose_stop {
-                inner.profile.loose_stops += 1;
-                if let Ok(Some(mu)) = fermi_dirac(&evals[..checked], self.n, kt).map(|o| o.mu) {
-                    let b = loose_bound(&evals[..checked], &residuals[..checked], head, mu, kt);
-                    inner.profile.loose_stop_bound = nan_max(inner.profile.loose_stop_bound, b);
-                }
-            }
             if std::env::var_os("SCF_TRACE").is_some() {
-                eprintln!("  spin {} block {} head {head} tested {checked}: {} it ({:?}{}, head kept {}, {} readbacks, {} fallbacks, α {:.1}) in {:.2} s, residual tight / guard {:?}, top tested θ {:.4}",
-                          self.spin, orbs.len(), es.iterations, es.stop, if es.loose_stop { " loose stop" } else { "" }, es.head_kept, es.readbacks, es.fallbacks,
+                eprintln!("  spin {} block {} head {head} tested {checked}: {} it ({:?}, head kept {}, {} readbacks, {} fallbacks, α {:.1}) in {:.2} s, residual tight / guard {:?}, top tested θ {:.4}",
+                          self.spin, orbs.len(), es.iterations, es.stop, es.head_kept, es.readbacks, es.fallbacks,
                           es.alpha_worst, t_call.elapsed().as_secs_f64(), es.split_residual,
                           evals[..checked].iter().copied().fold(f64::NEG_INFINITY, f64::max));
             }
@@ -953,6 +937,17 @@ impl Channel<'_> {
                     let worst = (0..checked).filter(|&i| occ.f[i] >= qm::PARTIAL_OCCUPATION_MIN).map(|i| res[i]).fold(0.0, nan_max);
                     inner.profile.eigen_occupied_residual = nan_max(inner.profile.eigen_occupied_residual, worst);
                 }
+                return Ok(Some((occ, kept)));
+            }
+            // the buffer as the witness (Task 9c (c)): its lower bound θ − r is a bound at any residual, so when it passes
+            // both arms the step is decided (its f = 0 < e^{−36}, as every level above a witness) and one fresh vector
+            // becomes the next step's buffer — one vector more, where doubling the extras for a tested witness would
+            // overshoot (measured on the cold all-electron H₂O 97³: a block of 13 doubled to 21 for this)
+            if checked < orbs.len() && witness_bound_reached_tail(evals, &residuals, self.n, mu, kt, tail_kt) {
+                let mut occ = occ;
+                occ.f.resize(orbs.len(), 0.0);
+                inner.profile.buffer_witnesses += 1;
+                if orbs.len() - self.n < self.cap { self.grow(orbs, evals, pool); occ.f.push(0.0); }
                 return Ok(Some((occ, kept)));
             }
             if std::env::var_os("SCF_TRACE").is_some() {
@@ -1159,14 +1154,25 @@ impl GpuSolver {
     /// changes no number of the solve.
     pub fn solve_observed(&mut self, system: &System, settings: &ScfSettings, warm: bool, should_abort: &mut dyn FnMut() -> bool,
                           observe: Option<&mut dyn FnMut(&ScfProgress)>) -> Result<Option<(&GpuState, ScfStats)>, QmError> {
-        match self.run(system, settings, warm, should_abort, observe)? {
+        self.solve_polled(system, settings, warm, should_abort, None, observe)
+    }
+
+    /// `solve_observed` with a second cancellation point (plan 2026-11-13 Task 9c): `inner_abort`, when given, is also
+    /// polled once per LOBPCG iteration of the `FermiDirac` channels' eigensolves, so an abort lands within one
+    /// iteration instead of one SCF step (a cold all-electron step can take seconds). `should_abort` keeps its one call
+    /// before every step (callers count those as steps). An abort inside an eigensolve abandons the solve as one before
+    /// a step does: the iterate is parked as the next warm start and the profile notes the step it stopped in.
+    pub fn solve_polled(&mut self, system: &System, settings: &ScfSettings, warm: bool, should_abort: &mut dyn FnMut() -> bool,
+                        inner_abort: Option<&mut dyn FnMut() -> bool>, observe: Option<&mut dyn FnMut(&ScfProgress)>)
+                        -> Result<Option<(&GpuState, ScfStats)>, QmError> {
+        match self.run(system, settings, warm, should_abort, inner_abort, observe)? {
             Some(stats) => Ok(Some((self.warm.as_ref().expect("run stores the converged state"), stats))),
             None => Ok(None),
         }
     }
 
     fn run(&mut self, system: &System, settings: &ScfSettings, warm: bool, should_abort: &mut dyn FnMut() -> bool,
-           mut observe: Option<&mut dyn FnMut(&ScfProgress)>) -> Result<Option<ScfStats>, QmError> {
+           mut inner_abort: Option<&mut (dyn FnMut() -> bool + '_)>, mut observe: Option<&mut dyn FnMut(&ScfProgress)>) -> Result<Option<ScfStats>, QmError> {
         let t0 = Instant::now();
         clear_readback_fault(); // a fault latched by an earlier, unrelated readback is not this solve's
         // spec §5.7 (module doc "Ionic species and occupations (M7)"): τ of DegenerateShells; kT of FermiDirac (module
@@ -1327,7 +1333,7 @@ impl GpuSolver {
         let mut iterations = 0;
         let mut delta_rho = f64::INFINITY;
         let mut abandoned = false;
-        let mut aborted_in_step = false; // `should_abort` stopped an FD channel's eigensolve (Task 9c)
+        let mut aborted_in_step = false; // `inner_abort` stopped an FD channel's eigensolve (Task 9c)
         // the stall stop (`qm::scf` module doc, "The stall stop"): the same rule as the CPU's
         let mut watch = StallWatch::for_solve(settings, system);
         let mut stalled = false;
@@ -1375,7 +1381,7 @@ impl GpuSolver {
                                            scf_tol: settings.tol, cap: witness_cap, cap_note: witness_note,
                                            guess_band: delta_rho_prev < test_tol_prev,
                                            loosened_delta: (step_tol > eig_tol).then_some(delta_rho_prev) };
-                        match ch.solve_fd(orbs, evals, kt, t, work, work_k, pool, &mut inner, &mut *should_abort) {
+                        match ch.solve_fd(orbs, evals, kt, t, work, work_k, pool, &mut inner, inner_abort.as_deref_mut()) {
                             Ok(Some((o, kept))) => { occ[spin as usize] = Some(o); step_kept &= kept; }
                             Ok(None) => { aborted = true; break; }
                             Err(e) => { err = Some(e); break; }
@@ -1554,7 +1560,7 @@ impl GpuSolver {
             prof.steps = iterations;
             prof.readbacks += prof.poisson_readbacks + prof.eigen_readbacks;
             prof.wall = t0.elapsed();
-            prof.notes.push(if aborted_in_step { format!("abandoned in SCF step {}'s eigensolve (should_abort)", iterations + 1) }
+            prof.notes.push(if aborted_in_step { format!("abandoned in SCF step {}'s eigensolve (inner_abort)", iterations + 1) }
                             else { format!("abandoned before SCF step {} (should_abort)", iterations + 1) });
             *profile = prof;
             for f in [rho_out_up, rho_out_dn, v_up, v_dn, exc, xc_up, xc_dn] { pool.give(f); }
@@ -1963,16 +1969,12 @@ mod tests {
         let wall = t.elapsed().as_secs_f64();
         let p = s.profile().clone();
         let state = s.state().unwrap();
-        println!("H₃⁺ 1.6 r₀ 49³ FD cold: {} steps ({wall:.1} s), F {:+.10}, TS {:.2e}, tol_used {:e}; DIIS resets {}, frozen steps {}, locked calls {},                   class raises {}, witness growths {}, loose stops {} (bound {:.1e}); blocks {}/{}; residual tight {:.2e} guard {:.2e}; Δρ {:?}",
+        println!("H₃⁺ 1.6 r₀ 49³ FD cold: {} steps ({wall:.1} s), F {:+.10}, TS {:.2e}, tol_used {:e}; DIIS resets {}, frozen steps {}, locked calls {},                   class raises {}, witness growths {}; blocks {}/{}; residual tight {:.2e} guard {:.2e}; Δρ {:?}",
                  a.iterations, a.energy.total, a.energy.ts, a.tol_used, p.diis_resets, p.frozen_steps, p.locked_calls, p.class_raises,
-                 p.witness_growths, p.loose_stops, p.loose_stop_bound, state.orbitals_up.len(), state.orbitals_dn.len(), a.max_eigen_residual, a.max_guard_residual, p.delta_rho_steps.iter().map(|d| format!("{d:.1e}")).collect::<Vec<_>>());
+                 p.witness_growths, state.orbitals_up.len(), state.orbitals_dn.len(), a.max_eigen_residual, a.max_guard_residual, p.delta_rho_steps.iter().map(|d| format!("{d:.1e}")).collect::<Vec<_>>());
         assert!(a.iterations <= 20, "{} steps (measured 13; Aufbau converges in 13)", a.iterations);
         assert!(p.diis_resets <= 1, "{} DIIS resets (measured 0)", p.diis_resets);
-        // Task 9c (d): a channel solve ends either at the guard tier (the loose columns at ≤ 1.5 g, a guess accepted
-        // within its band) or on the loose stop (their density bound under LOOSE_STOP_FACTOR·tol, whatever r)
-        assert!(a.max_guard_residual <= EIG_GUESS_FACTOR * WITNESS_GUARD_TOL, "the guard-tier calls' witness columns: {:.2e}", a.max_guard_residual);
-        assert!(p.loose_stops == 0 || p.loose_stop_bound < qm::LOOSE_STOP_FACTOR * settings.tol,
-                "{} loose stops, bound {:.2e} against {:.2e}", p.loose_stops, p.loose_stop_bound, qm::LOOSE_STOP_FACTOR * settings.tol);
+        assert!(a.max_guard_residual <= EIG_GUESS_FACTOR * WITNESS_GUARD_TOL, "the witness columns at the guard tier (a guess accepted within its 1.5× band): {:.2e}", a.max_guard_residual);
         let (_, b) = s.solve(&sys, &settings, false).unwrap();
         assert_eq!((a.energy.total.to_bits(), a.delta_rho.to_bits(), a.iterations), (b.energy.total.to_bits(), b.delta_rho.to_bits(), b.iterations),
                    "cold solves are bitwise reproducible");
@@ -2073,7 +2075,7 @@ mod tests {
     #[test]
     fn lobpcg_cap_warns_only_on_the_final_step() {
         let tol = 1e-6;
-        let es = |stop: EigenStop, res: f64| EigenStats { iterations: 7, max_residual: res, stop, readbacks: 15, dispatches: 80, fallbacks: 0, alpha_worst: 1.0, split_residual: None, loose_stop: false,
+        let es = |stop: EigenStop, res: f64| EigenStats { iterations: 7, max_residual: res, stop, readbacks: 15, dispatches: 80, fallbacks: 0, alpha_worst: 1.0, split_residual: None,
                                                           head_kept: false, restores: 0, restores_exhausted: false };
         let ms = Duration::from_millis(1);
         // early cap hit, final step converged: note, no warning
@@ -2362,14 +2364,13 @@ mod tests {
         let Some((mut s, _, settings)) = solver(33) else { return };
         let sys = h2(0.0);
         let (_, cold) = s.solve(&sys, &settings, false).unwrap();
-        // abort after steps 1–5 (a 5-step head start: the step count of a cold H₂ solve scatters by ±2 between
-        // rounding-level solver variants, module doc, so a 2-step head start would make "fewer steps than cold" a coin
-        // flip). The steps are counted by `observe`: since Task 9c `should_abort` is also polled inside the FD channels'
-        // eigensolves, so its call count is no step count
-        let done = std::cell::Cell::new(0usize);
-        let out = s.solve_observed(&sys, &settings, false, &mut || done.get() >= 5, Some(&mut |_: &ScfProgress| done.set(done.get() + 1))).unwrap();
+        // abort when asked the 6th time: after steps 1–5 (a 5-step head start: the step count of
+        // a cold H₂ solve scatters by ±2 between rounding-level solver variants, module doc, so a
+        // 2-step head start would make "fewer steps than cold" a coin flip)
+        let mut asked = 0;
+        let out = s.solve_with(&sys, &settings, false, &mut || { asked += 1; asked == 6 }).unwrap();
         assert!(out.is_none(), "an aborted solve must not return a state");
-        assert_eq!(done.get(), 5);
+        assert_eq!(asked, 6);
         assert!(s.state().is_none(), "a parked (unconverged) state must not be exposed");
         let p = s.profile().clone();
         assert_eq!(p.steps, 5, "{p:?}");
@@ -2389,11 +2390,11 @@ mod tests {
         assert!(s.solve_with(&sys, &settings, true, &mut || true).unwrap().is_none());
         assert_eq!(s.profile().steps, 0);
         assert!(s.state().is_none());
-        // Task 9c: an abort inside step 1's eigensolve (the 3rd poll: once before the step, then per LOBPCG iteration)
-        // abandons the solve with no step completed, parks the iterate, and a warm resume converges to the cold energy
-        let mut polls = 0;
-        assert!(s.solve_with(&sys, &settings, false, &mut || { polls += 1; polls == 3 }).unwrap().is_none());
-        assert_eq!((polls, s.profile().steps), (3, 0));
+        // Task 9c: `solve_polled`'s inner poll, asked once per LOBPCG iteration — true on its 3rd call stops step 1's
+        // eigensolve: no step completed, the step poll asked once, the iterate parked, a warm resume reaches the cold E
+        let (mut steps, mut polls) = (0, 0);
+        assert!(s.solve_polled(&sys, &settings, false, &mut || { steps += 1; false }, Some(&mut || { polls += 1; polls == 3 }), None).unwrap().is_none());
+        assert_eq!((steps, polls, s.profile().steps), (1, 3, 0));
         assert!(s.profile().notes.iter().any(|n| n.contains("abandoned in SCF step 1's eigensolve")), "{:?}", s.profile().notes);
         assert!(s.state().is_none());
         let (_, resumed) = s.solve(&sys, &settings, true).unwrap();
@@ -2694,13 +2695,13 @@ mod tests {
     // converged point inside Δρ < 1e-6 (F second order, F_x0 first order in it).
     // fix round 1 of Task 9b (the checked dense eigensolve, `qm::eigen::sym_eigen`; Aufbau and FD H₂ bits unchanged):
     // LiH was −5.219911088140 / −0.022678551517.
-    // Re-pinned in plan Task 9c (the σ-smeared free-atom cold guess, the untested buffer column, the loose stop: a
+    // Re-pinned in plan Task 9c (the σ-smeared free-atom cold guess, the untested buffer column: a
     // different path to Δρ < 1e-6, inside the f32 path scatter): H₂ −0.952449097836 / +0.128756929542, LiH
     // −5.219910980861 / −0.022678652955 before it.
-    const GPU_FD_H2_E: u64 = 0xbfee7a7695c18b65; // -0.952449123852 (Aufbau −0.952449164522: +4.1e-8; TS 4.3e-20)
-    const GPU_FD_H2_FX: u64 = 0x3fc07b1b2a049724; // +0.128756900326 (Aufbau +0.128753746201: +3.2e-6)
-    const GPU_FD_LIH_E: u64 = 0xc014e1305edfc4aa; // -5.219911081703 (Aufbau −5.219911953896: +8.7e-7, inside the f32 path scatter; TS 1.59e-7)
-    const GPU_FD_LIH_FX: u64 = 0xbf9739a07893b840; // -0.022680766448 (Aufbau −0.022675900853: −4.9e-6)
+    const GPU_FD_H2_E: u64 = 0xbfee7a76841de0c9; // -0.952449090996 (Aufbau −0.952449164522: +7.4e-8; TS 4.3e-20)
+    const GPU_FD_H2_FX: u64 = 0x3fc07b1d3d73bcd8; // +0.128757147795 (Aufbau +0.128753746201: +3.4e-6)
+    const GPU_FD_LIH_E: u64 = 0xc014e13054657be9; // -5.219910925573 (Aufbau −5.219911953896: +1.0e-6, inside the f32 path scatter; TS 1.59e-7)
+    const GPU_FD_LIH_FX: u64 = 0xbf97399553722c40; // -0.022680600374 (Aufbau −0.022675900853: −4.7e-6)
 
     /// M7 Task 8a: `IonicPolicy::None` (no setup, `Aufbau`) is today's GPU solver bit for bit — the energy and F_x of
     /// nucleus 0 of H₂ and LiH equal the bits measured on the code before the pseudopotential path (driver-specific:

@@ -5264,15 +5264,18 @@ Each extra vector costs 12 fields (8 `LobpcgWork` slots, the orbital, its kineti
 
 ### The cold-start window (plan 2026-11-13 Task 9c, 2026-11-17, release, RX 7900 XTX)
 
-What changed (derivations in `qm::occupations` "The step-accuracy tail" / "The loose stop", `qm::nuclear::free_atom_density`,
+What changed (derivations in `qm::occupations` "The step-accuracy tail" / "No loose stop", `qm::nuclear::free_atom_density`,
 `qm_gpu::scf` "The cold-start window"): (a) the FermiDirac cold density is the superposition of the free atoms'
 LSDA densities (`qm::radial`, Z only) convolved with the nuclear Gaussian σ and rescaled per atom to Z on the grid
 (pseudised centres keep the σ = 1 blobs); (b) a loosened GPU step's witness tail is X = ln(n_w/(1e-3·Δρ_prev)) kT,
 clamped to [6, 36] (tight steps keep 36 kT), with a DIIS reset when a widened window grew the block; (c) the GPU block's
-top column is an untested buffer (f = 0, outside the witness test; none at the cap); (d) the GPU's loose columns stop
-once Σ_L (2 + 2r_j/kT)·f̂_j < 1e-2·tol, no class raise is needed and the witness passes (`SolveProfile::loose_stops`;
-those calls' residuals leave `max_guard_residual`); and `should_abort` reaches the FD channels' LOBPCG (pause/cancel
-inside an eigensolve, the iterate parked as the warm start). (e), a chunked witness tail, was not needed.
+top column is an untested buffer (f = 0; none at the cap) that decides the witness itself when its own θ − r passes
+(then one vector is added as the next buffer instead of doubling); `GpuSolver::solve_polled`'s inner poll reaches the
+FD channels' LOBPCG (pause/cancel within an iteration; `providers::GpuKs` passes the same abort to both polls, the
+Activity probe counting only the per-step one). (d), a loose stop at Σ_L (2 + 2r/kT)·f̂ < 1e-2·tol, was measured and
+not adopted: it cut the 97³ solve's LOBPCG iterations by a quarter, but the stretched H₂ of
+`the_level_gated_stall_stop_on_the_measured_cases` took 43 / 102 / 41 steps (stop on every step / on loosened and first
+steps / first step only; gate ≤ 30) against 11 and 25 without it. (e), a chunked witness tail, was not needed.
 
 **Why the free atoms are smeared.** Unsmeared, the O 1s (⟨r⟩ ≈ 0.19 Bohr) sits inside the σ = h = 0.25 nucleus and
 over-screens it: on all-electron H₂O 97³ × 0.25 every first-step level lay above −0.04 Ha (μ −0.003 Ha; no witness in
@@ -5280,28 +5283,37 @@ over-screens it: on all-electron H₂O 97³ × 0.25 every first-step level lay a
 above +0.39 Ha). Smeared and rescaled, the first step's μ is −0.127 Ha (converged −0.138).
 
 **All-electron H₂O 97³ × 0.25 cold** (`providers` `cold_all_electron_h2o_at_97_converges`, 1e-5; 9b: 22 steps, 123 s,
-peak 20 extra vectors per spin): **11 steps, 7.3 s** (uncontended), peak block 13 (8 extra vectors per spin, the buffer
-included, all on step 1's 36 kT window), 6 growths, 1 DIIS reset; F −37.530159 (9b −37.530154: the f32 path scatter at
-Δρ < 1e-5). Measured on the way (the user's app on 43 % of the GPU): (a)+(b) alone 11 steps / 38.2 s, peak 12–13; with
-(c) the eigen iterations fell from 2474 to 1581, with (d) to 1175.
-`timing_table` (`gpu_vs_cpu`, 1e-6, CPU references alongside): **H₂O 97³ cold 13.5 s**, 13 steps (9b 114.5 s; target
-5 s still missed, reported), warm 5.0 s / 11 steps; H₂ 97³ cold 0.54 s / 11 steps, warm 0.55 s / 9.
+peak 20 extra vectors per spin): **11 steps, 11 s**, peak block 14 (9 extra vectors per spin, the buffer included, on
+step 1's 36 kT window), 1 DIIS reset; F −37.5301554 (9b −37.5301542: the f32 path scatter at Δρ < 1e-5). On the way:
+(a)+(b) alone 11 steps, peak 12–13 (38 s with the user's app on 43 % of the GPU); the buffer without the buffer witness
+doubled 13 → 21.
 
 **The app's 177³ VRAM case** (`providers` `cold_all_electron_h2o_at_177_peak`, `#[ignore]`d measurement): the
 all-electron H₂O at the app's 14.08 Bohr box, run at 167³ × 0.0848 — 177³ does not run on the solver's device: the
 Poisson boundary table (`ghost_fill`'s binding 3) is 147 MB at 177³, over wgpu's default 128 MiB
-`max_storage_buffer_binding_size`, which `gpu::GpuContext` keeps — **17 steps, 152 s (contended), peak block 9: 4 extra
-vectors per spin** (3 tested + the buffer), 2 growths. The scene guard's estimate still counts `WITNESS_GROWTH_COUNTED`
-= 16, so the app test still reads 21.58 GB (estimated mode, 2 solvers). At a counted w the estimate is 9.91 + 0.729·w
-GB: w = 4 (the measured peak) 12.83 GB, under this card's 12.88 GB budget (half its 25.76 GB) but over the 12.0 GB
-default the test pins; w ≤ 2 fits 12.0 GB. Not re-pinned: the count is the 9b ruling's acceptance number (open).
+`max_storage_buffer_binding_size`, which `gpu::GpuContext` keeps — **14 steps, 36 s, peak block 8: 3 extra vectors per
+spin** (the buffer included), no growth (17 steps / peak 9 with the buffer but no buffer witness). The scene guard's
+estimate still counts `WITNESS_GROWTH_COUNTED` = 16, so the app test still reads 21.58 GB (estimated mode, 2 solvers).
+At a counted w the estimate is 9.91 + 0.729·w GB: w = 3 (the measured peak) 12.10 GB, under this card's 12.88 GB budget
+(half its 25.76 GB) but over the 12.0 GB default the test pins; w ≤ 2 fits 12.0 GB. Not re-pinned: the count is the 9b
+ruling's acceptance number (open).
 
-**The gates after 9c.** CPU loose vs all-tight (`fd_guard_tier_matches_all_tight`, the six gated cases): H₂O ΔF
-+7.8e-12 (|ΔF_I| 1.1e-10), LiH −7.0e-13, Li +1.0e-12, H₄ −1.4e-12, pseudo-O M = 1 −4.3e-12, M = 3 −1.1e-11 Ha (all
-|ΔF_I| ≤ 1.1e-10); the off-site record −5.4e-10 / 2.0e-9 inside its derived bounds (1.47e-9, 2e-8). GPU H₃⁺ 1.6 r₀:
-**12 steps, 0 DIIS resets**, 10 loose stops (worst bound 1.0e-9 against 1e-2·tol = 1e-8), the guard-tier calls ≤ 8.3e-4.
-`gpu_vs_cpu` 12 passed in 7.6 min. Re-pinned with reasons: the CPU and GPU FD pins of `none_policy` (the start moved;
-Aufbau bits unchanged), the frozen-density stall test's anchor (the frozen first Δρ, 0.077 from the free-atom H).
+**The gates after 9c.** CPU loose vs all-tight (`fd_guard_tier_matches_all_tight`, the six gated cases; the CPU path
+has (a) only): H₂O ΔF +7.8e-12 (|ΔF_I| 1.1e-10), LiH −7.0e-13, Li +1.0e-12, H₄ −1.4e-12, pseudo-O M = 1 −4.3e-12,
+M = 3 −1.1e-11 Ha (all |ΔF_I| ≤ 1.1e-10); the off-site record −5.4e-10 / 2.0e-9 inside its derived bounds (1.47e-9,
+2e-8). GPU H₃⁺ 1.6 r₀: **14 steps, 1 DIIS reset** (gates ≤ 20, ≤ 1; 9b 13 / 0). Stretched H₂ 65³ R 6 / 107³ R 5.75:
+18 / 12 steps (9b 17 / printed); the water O–H 1.8 r₀ point 17 steps (16). Re-pinned with reasons: the CPU and GPU FD
+pins of `none_policy` (Aufbau bits unchanged), the frozen-density stall test's anchor (the frozen first Δρ, 0.077 from
+the free-atom H), the water point's count.
+
+**Open after 9c: `providers` `gpu_provider_matches_cpu_provider_at_fixed_sigma` fails "warm 10 > cold 9 steps"** (H₂
+33³, the third, extrapolated solve; 9b: cold 11, extrapolated 7). Measured cause (DIIS trace): after two unfrozen
+steps the orbitals freeze (0-iteration accepts, the head just under the f32-floor tol 5.42e-6) and the DIIS keeps the
+two pre-freeze entries at coefficients ≈ −2.3 / +3.3; their extrapolation, clamped at 0, is a fixed point the frozen
+map cannot leave, so Δρ sits at 7.0–7.2e-6 for five steps until the old entries age out of the 6-entry history. 9b's
+trace shows the same plateau (7.3, 7.4, 5.6, 3.9e-6), shorter; the free-atom start took the cold solve from 11 to 9
+steps. A DIIS reset on entering a frozen step fixes this case (6 steps) but sends the stretched H₂ to 55 (gate ≤ 30):
+the frozen/unfrozen alternation of a head at the floor. Not fixed; needs its own task (the freeze rule at the f32 floor).
 
 ## Live orbitals (Harris display; spec 2026-11-14)
 

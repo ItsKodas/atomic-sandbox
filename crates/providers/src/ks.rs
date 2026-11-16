@@ -1464,12 +1464,16 @@ impl GpuKs {
         // every exit; one step per poll of `solve_with` (it polls before every SCF step)
         let probe = self.probe.clone();
         let _busy = probe.as_ref().map(|(p, s)| p.busy(*s));
+        // the same abort for both of `solve_polled`'s polls: before every step (counted by the probe) and inside the
+        // FD eigensolves (plan 2026-11-13 Task 9c: Pause/Cancel within one LOBPCG iteration; not counted)
+        let abort = std::cell::RefCell::new(should_abort);
         let mut polled = || {
             if let Some((p, s)) = &probe {
                 p.scf_step(*s);
             }
-            should_abort()
+            (abort.borrow_mut())()
         };
+        let mut inner_polled = || (abort.borrow_mut())();
         // the probe's per-iteration record (Activity view): rides on the SCF's own Δρ readback
         let mut observe = |p: &qm::ScfProgress| {
             if let Some((pr, slot)) = &probe {
@@ -1493,7 +1497,7 @@ impl GpuKs {
                 solver.set_density_extrapolation(false);
             }
             let observer: Option<&mut dyn FnMut(&qm::ScfProgress)> = if probe.is_some() { Some(&mut observe) } else { None };
-            solver.solve_observed(&system, &settings, w, &mut polled, observer).map(|r| r.map(|(_, stats)| stats))
+            solver.solve_polled(&system, &settings, w, &mut polled, Some(&mut inner_polled), observer).map(|r| r.map(|(_, stats)| stats))
         });
         solver.set_density_extrapolation(self.extrapolate);
         // ...except the coincident-nuclei error, which keeps the old state as the warm start:
@@ -2396,17 +2400,15 @@ pub(crate) mod tests {
         // cold, so the solve outlasts the third poll (a warm start at the converged geometry
         // can finish in one or two steps)
         p.reset();
-        let mut n = 0;
-        let mut abort_third = || {
-            n += 1;
-            n > 3
-        };
+        // abort at the poll before step 3: steps 1 and 2 ran. (Since plan 2026-11-13 Task 9c the same `should_abort` is
+        // also polled inside the FD eigensolves, uncounted, so the step is read off the probe, not a call count.) That
+        // poll is counted, so the idle count reads the step being solved when it stopped.
+        let watch = probe.clone();
+        let mut pre_solve = true; // `evaluate`'s own pre-solve check reads the last solve's count: never abort there
+        let mut abort_third = || !std::mem::take(&mut pre_solve) && watch.view().main.scf_step >= 3;
         assert!(matches!(p.evaluate(&scene, &mut abort_third), Err(ProviderError::Cancelled)));
         let v = probe.view();
         assert!(!v.main.running);
-        // polls 2–4 are inside `solve_with` (poll 1 is `evaluate`'s pre-solve check): steps 1
-        // and 2 ran and the poll before step 3 aborted. That poll is counted, so the idle count
-        // reads the step being solved when it stopped.
         assert_eq!((v.main.scf_step, v.main.solves), (3, 2));
         let mut bad = scene.clone();
         bad.nuclei[1].pos = bad.nuclei[0].pos; // coincident nuclei: an error
@@ -3706,7 +3708,8 @@ pub(crate) mod tests {
         let r = s.solve(&system, &settings, false).map(|(_, st)| st.iterations);
         println!("water O–H 1.8 r₀ (stop on): {r:?} after {:.1} s", t.elapsed().as_secs_f64());
         // re-pinned in plan 2026-11-13 Task 9 (was an early `ScfStalled`): under FD the point converges
-        assert_eq!(r.ok(), Some(16), "the water point converges under Fermi–Dirac");
+        // re-pinned in plan 2026-11-13 Task 9c (the GPU's buffer column changes the path; 16 before)
+        assert_eq!(r.ok(), Some(17), "the water point converges under Fermi–Dirac");
     }
 
     /// Physics review S3 (stall stop): the shell-release path. The OH radical at 3.5 Bohr (`CoresOnly`: pseudo-O, an
