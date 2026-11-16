@@ -268,3 +268,51 @@ fn pending_samples_are_counted_apart_and_change_no_class() {
     assert!(m3.pairs.iter().all(|p| p.pending_samples == 0 && p.pending.iter().all(|&n| n == 0)));
     assert!(m3.samples > m0.samples, "the refit fitted them: {} vs {}", m3.samples, m0.samples);
 }
+
+/// The live Teach next (2026-11-16): the pending samples are counted per environment key and per
+/// class the way the per-key verdict counts its fitted samples — so the refit that takes them in
+/// raises every key's and class's fitted count by exactly its pending count — and a forgotten or
+/// box-affected sample counts toward no key.
+#[test]
+fn pending_samples_are_counted_per_key_like_the_fitted_ones() {
+    let mut s = h2_and_ch4(120, 200);
+    let m0 = s.knowledge_map().unwrap();
+    assert!(m0.pending_keys.is_empty() && m0.pending_classes.is_empty());
+    let before: BTreeMap<(&str, u8, Vec<u8>), usize> = s.class_loo().iter().flat_map(|c| c.species.iter().map(move |v| ((c.class, v.z, v.neighbours.clone()), v.samples))).collect();
+    let class_before: BTreeMap<&str, usize> = s.class_loo().iter().map(|c| (c.class, c.samples)).collect();
+    // six H₂ and four CH₄ kept, then a fifth CH₄ forgotten and a sixth box-affected
+    let mut rng = StdRng::seed_from_u64(0x7ea);
+    for _ in 0..6 {
+        let sc = in_cell_65(dimer(1.45, unit_vector(&mut rng), [0.0; 3], 1, 1));
+        s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    }
+    for _ in 0..6 {
+        let sc = random_ch4(&mut rng);
+        s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    }
+    let n = s.samples();
+    s.quarantine.resize(n, Q_NONE);
+    s.quarantine[n - 1] = Q_FORGOTTEN;
+    s.face.resize(n, f64::NAN);
+    s.face[n - 2] = 1.0;
+    let m = s.knowledge_map().unwrap();
+    println!("pending keys {:?}; classes {:?}", m.pending_keys, m.pending_classes);
+    assert_eq!(m.pending, 10);
+    assert_eq!(m.pending_key("many-body", 6, &[1]), 4, "C with H: the four kept CH₄");
+    assert_eq!(m.pending_key("many-body", 1, &[1, 6]), 4, "H with H, C: their hydrogens");
+    assert_eq!(m.pending_keys.iter().map(|k| k.samples).sum::<usize>(), 6 + 4 + 4, "each sample once per key it holds");
+    assert_eq!(m.pending_key("pair", 1, &[1]), 6, "H with H: the six H₂");
+    assert_eq!((m.pending_class("many-body"), m.pending_class("pair")), (4, 6));
+    // the refit takes them in: every fitted count rises by its pending count (the box-affected
+    // sample is forgotten too here, so the fit's own box rule, which waits for the trust floor,
+    // cannot take it in)
+    (s.face[n - 2], s.quarantine[n - 2]) = (f64::NAN, Q_FORGOTTEN);
+    s.refit().unwrap();
+    for c in s.class_loo() {
+        assert_eq!(c.samples, class_before.get(c.class).copied().unwrap_or(0) + m.pending_class(c.class), "class {}", c.class);
+        for v in &c.species {
+            let was = before.get(&(c.class, v.z, v.neighbours.clone())).copied().unwrap_or(0);
+            assert_eq!(v.samples, was + m.pending_key(c.class, v.z, &v.neighbours), "{} {}", c.class, v.words());
+        }
+    }
+}

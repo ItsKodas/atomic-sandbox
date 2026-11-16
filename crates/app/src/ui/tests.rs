@@ -11364,7 +11364,7 @@ mod updates {
 /// Teach next, Health, then the folds — order, default folds, the verdict's words, the gaps, the
 /// Details rows, the profile, the narrow panel.
 mod model_panel {
-    use super::super::dock::model::{gaps, surface_chip, verdict, Section, Sections, Tone};
+    use super::super::dock::model::{gaps, gaps_with, surface_chip, verdict, Section, Sections, Tone};
     use super::*;
 
     /// The text of every text shape the chrome draws in one frame (after two settling frames).
@@ -11533,6 +11533,45 @@ mod model_panel {
         let mut st = state("h2", &h2);
         let t = texts(&ctx, &mut st, &input(&h2, Some(&snap), &cam));
         assert!(t.contains("Everything this scene needs is learned") && !t.contains("other gaps"), "{t}");
+    }
+
+    /// The live Teach next (2026-11-16, the live knowledge graph's design): samples kept since the
+    /// last refit that count toward a gap read "12 +7 / 60" (the knowledge map's per-key pending
+    /// count), a gap measured by its fit error "fit 2.5× · +3 new"; the fill, the order and "N to
+    /// learn here" stay the fitted samples'; with no map or nothing pending the rows are as before.
+    #[test]
+    fn teach_next_counts_new_samples_waiting_for_the_refit() {
+        use sim::knowledge::PendingKey;
+        let cam = camera();
+        let h2s = Scene::preset("h2s").unwrap();
+        let mut map = knowledge::fixture_map();
+        map.pending = 9;
+        map.pending_keys = vec![PendingKey { class: "pair", z: 16, neighbours: vec![1], samples: 7 }, PendingKey { class: "pair", z: 1, neighbours: vec![16], samples: 7 }];
+        map.pending_classes = vec![("pair", 9)];
+        let g = gaps_with(&gappy(), &[1, 1, 16], Some(&map));
+        let rows: Vec<(&str, &str, usize, usize, usize)> = g.iter().map(|g| (g.label.as_str(), g.right.as_str(), g.have, g.new, g.need)).collect();
+        assert_eq!(rows, vec![("pair S–H", "12 +7 / 60", 12, 7, 60), ("pair O–S", "5 / 29", 5, 0, 29)]);
+        assert_eq!(gaps_with(&gappy(), &[1, 1, 16], None), gaps(&gappy(), &[1, 1, 16]), "no map: as before");
+        assert!(gaps(&gappy(), &[1, 1, 16]).iter().all(|g| g.new == 0 && !g.right.contains('+')));
+        // a gap held back by its fit error, and a class with no keys
+        let mut m = gappy();
+        m.class_loo[0].species[0].refusal = Some((sim::ClassKey::Force, 2.5, 1.0));
+        m.class_loo.push(sim::ClassLoo { class: "many-body", species: Vec::new(), samples: 40, refusal: Some((sim::ClassKey::Samples, 40.0, 74.0)), trusted: false, ..m.class_loo[0].clone() });
+        map.pending_classes.push(("many-body", 3));
+        let g = gaps_with(&m, &[1, 1, 16], Some(&map));
+        assert_eq!(g[0].right, "fit 2.5× · +7 new");
+        let mb = g.iter().find(|g| g.label == "many-body").unwrap();
+        assert_eq!((mb.right.as_str(), mb.have, mb.new), ("40 +3 / 74", 40, 3));
+        // on screen: the row, and the fold's summary unchanged
+        let mut snap = est(&h2s, gappy(), sim::Source::Fallback);
+        snap.activity.knowledge = Some(std::sync::Arc::new(map));
+        let inp = input(&h2s, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = state("h2s", &h2s);
+        st.activity.absorb(&snap);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("pair S–H") && t.contains("12 +7 / 60") && t.contains("1 to learn here") && t.contains("other gaps (1)"), "{t}");
     }
 
     /// Sample more (moved up into Teach next) emits the same `Action::Sample` as before; the audits

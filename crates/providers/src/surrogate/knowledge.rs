@@ -23,8 +23,12 @@
 //! rows) — a forgotten, held, superseded, box-excluded, draft, lone or reference-waiting sample is
 //! never pending, nor is a box-affected one, whose `Q_BOX` code is only set inside the next fit
 //! (`exclude_box_samples`): it reads as held. Their atom pairs are binned by the fitted
-//! samples' rule ([`each_pair`]) into each pair's `pending`, among the fitted species only; they
-//! enter no other count, so no class, confidence or first shell moves until the refit.
+//! samples' rule ([`each_pair`]) into each pair's `pending`, among the fitted species only, and
+//! counted per environment key and class (`pending_keys`, `pending_classes`: the Model tab's
+//! Teach next) by the per-key verdict's own rule — a sample once per key a trained atom of it
+//! holds (`trust::trained_keys` over `env_keys` at the same r_cut, as `trust::key_column_counts`
+//! counts the fitted ones; a key's basis columns are not needed to count it). They enter no other
+//! count, so no class, confidence or first shell moves until the refit.
 //!
 //! **r_cut** is the model's cutoff ([`SurrogateKs::cutoff`]: its basis's — a shared collection's
 //! reach or a per-scene basis's), the cutoff the verdict's keys are formed with.
@@ -38,7 +42,7 @@
 //! neighbours), plus one verdict lookup per key, and one distance pass over the pending samples.
 //! No prediction, no teacher.
 use super::*;
-use sim::knowledge::{angle_bin, first_shell, molecules, Composition, ElementKnowledge, KnowledgeMap, PairHistogram, PairKnowledge, RowStatus, SampleRow, StoredSample, ANGLE_BINS, BIN};
+use sim::knowledge::{angle_bin, first_shell, molecules, Composition, ElementKnowledge, KnowledgeMap, PairHistogram, PairKnowledge, PendingKey, RowStatus, SampleRow, StoredSample, ANGLE_BINS, BIN};
 use sim::Confidence;
 use std::collections::BTreeSet;
 
@@ -151,6 +155,24 @@ impl SurrogateKs {
                 pending_pairs.get_mut(&key).expect("a seen pair has a histogram").0 += 1;
             }
         }
+        // ... and per environment key and class, each sample once (module doc, "The pending samples")
+        let mut pending_keys: BTreeMap<surrogate::EnvKey, usize> = BTreeMap::new();
+        let mut pending_classes = [0usize; ENV_CLASSES.len()];
+        for s in &pending {
+            let keys: BTreeSet<surrogate::EnvKey> = super::trust::trained_keys(s, env_keys(&s.pos, &s.z, rc2)).into_iter().flatten().collect();
+            let classes: BTreeSet<u8> = keys.iter().map(|k| k.class).collect();
+            for c in classes.into_iter().filter_map(|c| (c as usize).checked_sub(1)).filter(|&c| c < ENV_CLASSES.len()) {
+                pending_classes[c] += 1;
+            }
+            for k in keys {
+                *pending_keys.entry(k).or_default() += 1;
+            }
+        }
+        let pending_keys: Vec<PendingKey> = pending_keys
+            .into_iter()
+            .filter_map(|(k, samples)| Some(PendingKey { class: *ENV_CLASSES.get((k.class as usize).checked_sub(1)?)?, z: k.z, neighbours: k.neighbours, samples }))
+            .collect();
+        let pending_classes: Vec<(&'static str, usize)> = ENV_CLASSES.iter().zip(pending_classes).filter(|(_, n)| *n > 0).map(|(&c, n)| (c, n)).collect();
 
         // the confidence: the model's trust rule, then every key the pair is met in (module doc)
         let model_trusted = self.trusted();
@@ -193,6 +215,8 @@ impl SurrogateKs {
             r_cut,
             molecules,
             pending: pending.len(),
+            pending_keys,
+            pending_classes,
         })
     }
 

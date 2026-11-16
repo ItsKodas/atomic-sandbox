@@ -66,7 +66,7 @@ pub const TAUGHT: f64 = 0.9;
 pub const NEW_INK: Color32 = theme::INK;
 
 /// The fewest points that segment is tall, so it shows on a large bar (log scale).
-const NEW_MIN_PX: f32 = 2.0;
+pub const NEW_MIN_PX: f32 = 2.0;
 
 /// The histogram legend's words for that segment.
 pub const NEW_WORDS: &str = "new (waiting for refit)";
@@ -1468,5 +1468,7 @@ pub(crate) fn fixture_map() -> KnowledgeMap {
         r_cut: 6.0,
         molecules: Vec::new(),
         pending: 0,
+        pending_keys: Vec::new(),
+        pending_classes: Vec::new(),
     }
 }

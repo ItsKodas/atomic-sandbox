@@ -89,6 +89,13 @@
 //! as a separate "new, waiting for refit" segment, which the refit turns into fitted counts. Only
 //! the pairs of the fitted species carry them (a species no fitted sample holds has no node or
 //! pair yet; its samples show in the molecules' counts until the refit).
+//!
+//! The Model tab's **Teach next** gaps read them too (2026-11-16, the same design):
+//! [`KnowledgeMap::pending_keys`] counts the pending samples holding a trained atom of each
+//! environment key (class, central Z, its neighbours' species within r_cut — the key the per-key
+//! verdict counts its fitted samples by) and [`KnowledgeMap::pending_classes`] those holding one
+//! of each class, each sample once per key or class, as the fitted counts are; no verdict reads
+//! them.
 
 /// Pair-distance histogram bin (Bohr): the training views' (`TrainingViews::pairs`).
 pub const BIN: f64 = 0.1;
@@ -124,6 +131,22 @@ pub struct KnowledgeMap {
     /// The stored samples kept since the last refit and in the next fit's codes (module doc, "New
     /// samples, waiting for the refit"); not in `samples`.
     pub pending: usize,
+    /// Per environment key, the pending samples holding a trained atom of it (module doc), in the
+    /// key's order.
+    pub pending_keys: Vec<PendingKey>,
+    /// Per environment class ("pair", "many-body"), the pending samples holding a trained atom of it.
+    pub pending_classes: Vec<(&'static str, usize)>,
+}
+
+/// The pending samples of one environment key (module doc, "New samples, waiting for the refit"):
+/// its class's name, central Z and neighbour species (ascending, distinct), as
+/// `sim::SpeciesVerdict` names a key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingKey {
+    pub class: &'static str,
+    pub z: u8,
+    pub neighbours: Vec<u8>,
+    pub samples: usize,
 }
 
 /// One element's coverage (module doc).
@@ -178,6 +201,16 @@ impl KnowledgeMap {
     /// The composition `c`'s entry.
     pub fn molecule(&self, c: &Composition) -> Option<&MoleculeKnowledge> {
         self.molecules.iter().find(|m| &m.composition == c)
+    }
+
+    /// The pending samples of the key (class, z, neighbours); 0 for a key none holds.
+    pub fn pending_key(&self, class: &str, z: u8, neighbours: &[u8]) -> usize {
+        self.pending_keys.iter().find(|k| k.class == class && k.z == z && k.neighbours == neighbours).map_or(0, |k| k.samples)
+    }
+
+    /// The pending samples of the class; 0 for a class none holds.
+    pub fn pending_class(&self, class: &str) -> usize {
+        self.pending_classes.iter().find(|c| c.0 == class).map_or(0, |c| c.1)
     }
 }
 
@@ -631,7 +664,17 @@ mod tests {
             r_cut: 6.0,
             molecules: Vec::new(),
             pending: 0,
+            pending_keys: vec![PendingKey { class: "many-body", z: 1, neighbours: vec![1, 15], samples: 12 }],
+            pending_classes: vec![("many-body", 12)],
         }
+    }
+
+    #[test]
+    fn pending_keys_are_looked_up_by_class_and_key() {
+        let m = map();
+        assert_eq!(m.pending_key("many-body", 1, &[1, 15]), 12);
+        assert_eq!((m.pending_key("pair", 1, &[1, 15]), m.pending_key("many-body", 1, &[1]), m.pending_key("many-body", 15, &[1, 15])), (0, 0, 0));
+        assert_eq!((m.pending_class("many-body"), m.pending_class("pair")), (12, 0));
     }
 
     /// The plan's `atom_coverage_is_low_for_an_unseen_pair`: on a map that knows H–H and C–H but
