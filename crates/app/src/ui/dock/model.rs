@@ -1338,6 +1338,12 @@ impl ForgetTool {
             RuleKind::Scene => self.scene.clone().map(R::Scene),
         }
     }
+
+    /// Opens the tool on exactly composition `c` (the Knowledge panel's "Forget these…": a
+    /// pre-fill only — its confirmation still applies). The threshold is kept.
+    pub fn prefill(&mut self, c: sim::knowledge::Composition) {
+        *self = ForgetTool { open: true, kind: RuleKind::Composition, composition: Some(c), above: self.above, ..ForgetTool::default() };
+    }
 }
 
 /// A composition as a formula (`crate::names::formula`: "PH₃", "H₂O").

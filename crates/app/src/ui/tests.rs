@@ -7902,6 +7902,60 @@ mod knowledge_map {
         snap
     }
 
+    /// 2026-11-16, "Molecules trained": every composition with its fitted count, most fitted first;
+    /// the held-out and forgotten ones are not in the fitted count but shown as a faint suffix, the
+    /// scenes on hover; a click picks one (its distances and the angle histogram of its own
+    /// samples), and **Forget these…** only pre-fills the Model tab's "Forget samples…" with exactly
+    /// that composition (the tab shown, nothing sent: its confirmation still applies).
+    #[test]
+    fn molecules_trained_lists_compositions_and_prefills_the_forget_tool() {
+        use sim::knowledge::{Composition, PairRange, ANGLE_BINS};
+        let scene = chain();
+        let cam = camera();
+        let mut map = forget_rule_map();
+        let ph3 = Composition::of(&[15, 1, 1, 1]);
+        {
+            let m = map.molecules.iter_mut().find(|m| m.composition == ph3).unwrap();
+            m.pairs = vec![PairRange { z: (1, 1), min: 3.4, max: 3.7, count: 594 }, PairRange { z: (1, 15), min: 2.5, max: 2.9, count: 594 }];
+            let mut h = vec![0u32; ANGLE_BINS];
+            h[sim::knowledge::angle_bin(93.5)] = 594;
+            m.angles = vec![(1, vec![0; ANGLE_BINS]), (15, h)];
+        }
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        snap.activity.knowledge = Some(Arc::new(map.clone()));
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.backend = Backend::Estimated;
+        st.activity.absorb(&snap);
+        // a wide leaf: the list and the card side by side, on screen
+        st.workspace.set_node(super::super::workspace::layout::parse("H(0.3,3D,[Knowledge*])").unwrap());
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("MOLECULES TRAINED"), "{t}");
+        assert!(t.contains("H₂ 961\n") && t.contains("PH₃ 198 · 3 held out · 9 forgotten") && t.contains("PH₅ 16"), "fitted counts, the rest faint: {t}");
+        assert!(t.contains(knowledge::MOLECULES_NOTE), "{t}");
+        let mols = &map.molecules;
+        assert_eq!(knowledge::molecule_scenes(&mols[0]), "H₂: 961 samples, 961 fitted — from h2 (960), (no scene recorded) (1). Click for its distances and angles");
+        assert_eq!(knowledge::molecule_suffix(&mols[0]), "");
+        // the pick: the card of the composition
+        let outs = click_widget(&ctx, &mut st, &inp, &knowledge::molecule_probe(&ph3));
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display only");
+        assert_eq!((st.knowledge.pick, st.knowledge.molecule.clone()), (Pick::Molecule, Some(ph3.clone())));
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("198 fitted samples · 3 held out · 9 forgotten") && t.contains("P–H") && t.contains("2.50–2.90 Bohr") && t.contains("BOND ANGLES AT P"), "{t}");
+        assert!(!t.contains("BOND ANGLES AT H"), "an element with no angle in it has no histogram: {t}");
+        assert!(probed_rect("knowledge-molecule-angles-15").width() > 0.0);
+        // Forget these…: a pre-fill only
+        assert!(!st.forget_rule.open);
+        let outs = click_widget(&ctx, &mut st, &inp, "knowledge-molecule-forget");
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "nothing forgotten by the click");
+        let f = &st.forget_rule;
+        assert!(f.open && f.kind == super::super::dock::model::RuleKind::Composition && f.composition.as_ref() == Some(&ph3) && !f.confirm && !f.above_confirm, "{f:?}");
+        assert_eq!(f.rule(), Some(sim::knowledge::ForgetRule::Composition(ph3.clone())));
+        assert!(st.tab_shown(DockTab::Model), "the Model tab is shown");
+    }
+
     #[test]
     fn the_knowledge_tab_draws_the_map_and_picks_by_click() {
         let scene = chain();

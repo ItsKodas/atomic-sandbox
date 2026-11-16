@@ -14,7 +14,14 @@
 //!   on its line does) and the card of the picked pair ([`pair_sentence`], its distance histogram
 //!   with [`bar_colours`] and a "now 1.45" marker at the open scene's distances, Teach this — the
 //!   Model tab's Sample more —, and the "Why thin?" fold, [`Sections`]) or element (its neighbour
-//!   counts and bond angles).
+//!   counts and bond angles) or composition;
+//! - **"Molecules trained"** (2026-11-16, user request: H₃ was nowhere to be seen): every
+//!   composition of the stored samples (`sim::KnowledgeMap::molecules`, the multiset of Z as a
+//!   formula), its fitted count, the held-out, forgotten and not-yet-fitted ones as a faint suffix
+//!   and its scenes on hover; a click picks it and the card shows its pair-distance ranges, its
+//!   bond-angle histograms (the element card's drawing and colours, over that composition's fitted
+//!   samples only) and **Forget these…**, which pre-fills the Model tab's "Forget samples…" with
+//!   exactly that composition and reveals it (its confirmation still applies);
 //!   The graph zooms (wheel, about the cursor), pans (drag) and fits (its Fit button, a
 //!   double-click on empty space, by itself when an element joins); its text keeps its size and
 //!   its pair labels sit beside their lines, clear of the nodes and their counts ([`graph`]).
@@ -26,7 +33,8 @@
 //!   0.5 thin → green 1 well known, the graph's colours) with a legend card ([`legend`]).
 //!
 //! All of it is display state (`UiState::show_knowledge`, [`KnowledgeView`],
-//! `UiState::knowledge_sections`) but Teach this, which emits the Model tab's `Action::Sample`. It decides nothing: the verdicts are the provider's
+//! `UiState::knowledge_sections`) but Teach this, which emits the Model tab's `Action::Sample`
+//! (Forget these… only fills the Model tab's tool: its confirmation emits the Action). It decides nothing: the verdicts are the provider's
 //! (`sim::knowledge` module doc, "Confidence"). Distances in Bohr, angles in degrees.
 //!
 //! **Bins and asked distances** are judged by the same count the overlay uses
@@ -55,6 +63,8 @@ pub enum Pick {
     /// (min Z, max Z).
     Pair(u8, u8),
     Element(u8),
+    /// A composition of "Molecules trained" ([`KnowledgeView::molecule`]).
+    Molecule,
 }
 
 /// The map's own view state (display only, not an `Action`, not recorded): the pick, and the
@@ -62,6 +72,8 @@ pub enum Pick {
 #[derive(Clone, Debug, PartialEq)]
 pub struct KnowledgeView {
     pub pick: Pick,
+    /// The composition [`Pick::Molecule`] shows.
+    pub molecule: Option<sim::knowledge::Composition>,
     /// × the base layout, [`ZOOM_MIN`]–[`ZOOM_MAX`]; about the map's centre, then `pan` (points).
     pub zoom: f32,
     pub pan: Vec2,
@@ -73,14 +85,14 @@ pub struct KnowledgeView {
 
 impl Default for KnowledgeView {
     fn default() -> Self {
-        KnowledgeView { pick: Pick::None, zoom: 1.0, pan: Vec2::ZERO, fitted: None, fit_zoom: 1.0 }
+        KnowledgeView { pick: Pick::None, molecule: None, zoom: 1.0, pan: Vec2::ZERO, fitted: None, fit_zoom: 1.0 }
     }
 }
 
 impl KnowledgeView {
     /// A new scene: the graph fits itself again on its next frame (the pick is kept).
     pub fn reset_view(&mut self) {
-        *self = KnowledgeView { pick: self.pick, ..Default::default() };
+        *self = KnowledgeView { pick: self.pick, molecule: self.molecule.take(), ..Default::default() };
     }
 }
 
@@ -334,6 +346,7 @@ pub fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, wide: bool, a
                 ui.set_width(460.0);
                 graph(ui, st, map, vec2(450.0, 360.0));
                 scene_asks(ui, st, map, &asks);
+                molecules(ui, st, map);
             });
             ui.add_space(14.0);
             ui.vertical(|ui| {
@@ -345,6 +358,7 @@ pub fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, wide: bool, a
         let w = ui.available_width().max(240.0);
         graph(ui, st, map, vec2(w, (w * 0.58).clamp(150.0, 280.0)));
         scene_asks(ui, st, map, &asks);
+        molecules(ui, st, map);
         detail(ui, st, map, &asks, input, acts);
     }
 }
@@ -729,12 +743,12 @@ fn graph(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, size: Vec2) {
 }
 
 /// The pair the card shows: the one picked, else (nothing picked) the weakest the scene asks; none
-/// while an element is picked.
+/// while an element or a composition is picked.
 fn shown_pair(st: &UiState, map: &KnowledgeMap, asks: &BTreeMap<(u8, u8), Vec<f64>>) -> Option<(u8, u8)> {
     match st.knowledge.pick {
         Pick::Pair(a, b) => Some((a, b)),
         Pick::None => default_pair(map, asks),
-        Pick::Element(_) => None,
+        Pick::Element(_) | Pick::Molecule => None,
     }
 }
 
@@ -779,10 +793,140 @@ fn scene_asks(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, asks: &BTreeMap
     });
 }
 
+/// The probe of a composition's row: `knowledge-molecule-1-1-1-15` (its Z ascending).
+pub fn molecule_probe(c: &sim::knowledge::Composition) -> String {
+    format!("knowledge-molecule-{}", c.0.iter().map(u8::to_string).collect::<Vec<_>>().join("-"))
+}
+
+/// A composition's faint suffix: what of it is out of the fit — "3 held out · 9 forgotten · 2 not
+/// fitted yet" — empty when every sample is fitted.
+pub fn molecule_suffix(m: &sim::knowledge::MoleculeKnowledge) -> String {
+    let mut w = Vec::new();
+    if m.held > 0 {
+        w.push(format!("{} held out", m.held));
+    }
+    if m.forgotten > 0 {
+        w.push(format!("{} forgotten", m.forgotten));
+    }
+    if m.waiting > 0 {
+        w.push(format!("{} not fitted yet", m.waiting));
+    }
+    w.join(" · ")
+}
+
+/// A composition's hover: the scenes its samples came from, most first.
+pub fn molecule_scenes(m: &sim::knowledge::MoleculeKnowledge) -> String {
+    let mut sc: Vec<&sim::knowledge::SceneCount> = m.scenes.iter().collect();
+    sc.sort_by(|a, b| (b.open + b.held + b.forgotten).cmp(&(a.open + a.held + a.forgotten)).then_with(|| a.name.cmp(&b.name)));
+    let rows: Vec<String> = sc.iter().map(|s| format!("{} ({})", super::dock::model::scene_words(&s.name), s.open + s.held + s.forgotten)).collect();
+    format!("{}: {} samples, {} fitted — from {}. Click for its distances and angles", super::dock::model::composition_words(&m.composition), m.total(), m.fitted, rows.join(", "))
+}
+
+/// The honesty line under "Molecules trained".
+pub const MOLECULES_NOTE: &str = "a composition is a sample's atoms as one formula (an H₂ beside a far H reads H₃). Charged scenes train per-scene models, so their molecules appear only in that model's list, not the shared collection's";
+
+/// "Molecules trained": every composition of the stored samples as a chip — its formula and fitted
+/// count, most fitted first, what is out of the fit as a faint suffix, the scenes on hover; a click
+/// picks it ([`Pick::Molecule`]).
+fn molecules(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap) {
+    ui.add_space(6.0);
+    theme::section(ui, "Molecules trained");
+    if map.molecules.is_empty() {
+        theme::note(ui, "no stored sample yet");
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(5.0, 5.0);
+        for m in &map.molecules {
+            let on = st.knowledge.pick == Pick::Molecule && st.knowledge.molecule.as_ref() == Some(&m.composition);
+            let ink = if m.fitted > 0 { theme::INK } else { theme::INK_FAINT };
+            let mut job = egui::text::LayoutJob::default();
+            let font = FontId::proportional(11.5);
+            job.append(&super::dock::model::composition_words(&m.composition), 0.0, egui::TextFormat { font_id: font.clone(), color: ink, ..Default::default() });
+            job.append(&format!(" {}", m.fitted), 0.0, egui::TextFormat { font_id: FontId::monospace(11.0), color: theme::INK_DIM, ..Default::default() });
+            let suffix = molecule_suffix(m);
+            if !suffix.is_empty() {
+                job.append(&format!(" · {suffix}"), 0.0, egui::TextFormat { font_id: FontId::proportional(10.5), color: theme::INK_FAINT, ..Default::default() });
+            }
+            let b = egui::Button::new(job)
+                .fill(theme::ACCENT.gamma_multiply(if on { 0.22 } else { 0.0 }))
+                .stroke(if on { Stroke::new(1.5, theme::ACCENT) } else { Stroke::new(1.0, theme::INK_FAINT.gamma_multiply(0.35)) })
+                .corner_radius(255);
+            let r = ui.add(b).on_hover_text(molecule_scenes(m));
+            super::probe(&molecule_probe(&m.composition), &r);
+            if r.clicked() {
+                st.knowledge.pick = Pick::Molecule;
+                st.knowledge.molecule = Some(m.composition.clone());
+            }
+        }
+    });
+    ui.add(egui::Label::new(RichText::new(MOLECULES_NOTE).size(10.5).color(theme::INK_FAINT)).wrap());
+}
+
+/// A composition's card: its formula and counts, the distances of each species pair within it,
+/// the bond-angle histogram at each element (the element card's drawing, over this composition's
+/// fitted samples), and **Forget these…** — the Model tab's "Forget samples…" pre-filled with
+/// exactly this composition, the tab shown and the tool revealed (display state: the tool's
+/// confirmation emits the Action).
+fn molecule_detail(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, m: &sim::knowledge::MoleculeKnowledge) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(super::dock::model::composition_words(&m.composition)).strong().size(14.0));
+        theme::pill(ui, "composition", theme::INK_DIM);
+        let suffix = molecule_suffix(m);
+        let more = if suffix.is_empty() { String::new() } else { format!(" · {suffix}") };
+        ui.label(RichText::new(format!("{} fitted samples{more}", m.fitted)).size(10.5).color(theme::INK_FAINT));
+    });
+    if m.fitted == 0 {
+        theme::note(ui, "no fitted sample of it: nothing it teaches yet");
+    } else {
+        theme::section(ui, &format!("Distances within {:.1} Bohr", map.r_cut));
+        egui::Grid::new(ui.id().with(("knowledge-molecule-pairs", &m.composition.0))).num_columns(3).spacing(vec2(10.0, 2.0)).show(ui, |ui| {
+            for p in &m.pairs {
+                ui.label(RichText::new(pair_name(p.z.0, p.z.1)).monospace().size(11.5));
+                ui.label(RichText::new(format!("{:.2}–{:.2} Bohr", p.min, p.max)).size(11.5));
+                ui.label(RichText::new(format!("{} distances", p.count)).size(10.5).color(theme::INK_DIM));
+                ui.end_row();
+            }
+        });
+        for (z, h) in m.angles.iter().filter(|(_, h)| h.iter().any(|&n| n > 0)) {
+            theme::section(ui, &format!("Bond angles at {} · {ANGLE_BIN_DEG:.0}° bins", sym(*z)));
+            let colour_of = |k: usize| -> Option<Color32> { h.get(k).filter(|&&n| n > 0).map(|&n| Taught::of(n).colour()) };
+            let labels: Vec<(f64, String)> = (0..=6).map(|k| (k as f64 * 30.0, (k * 30).to_string())).collect();
+            let w = ui.available_width().clamp(200.0, 640.0);
+            let r = histogram(ui, h, ANGLE_BIN_DEG, ANGLE_BINS as f64 * ANGLE_BIN_DEG, &colour_of, &[], &|a| format!("{a:.0}°"), &labels, ("", "bond angle, degrees"), vec2(w, if w > 400.0 { 110.0 } else { 86.0 }), None);
+            super::probe(&format!("knowledge-molecule-angles-{z}"), &r);
+        }
+        if m.angles.iter().all(|(_, h)| h.iter().all(|&n| n == 0)) {
+            theme::note(ui, "no atom of it had two first-shell neighbours: no bond angle taught");
+        }
+    }
+    let r = ui.add_enabled(m.open() > 0, egui::Button::new("Forget these…")).on_hover_text("open the Model tab's Forget samples… with exactly this composition: a preview and an inline confirmation follow, nothing is forgotten until you confirm").on_disabled_hover_text("none of its samples is in the fit");
+    super::probe("knowledge-molecule-forget", &r);
+    if r.clicked() {
+        st.forget_rule.prefill(m.composition.clone());
+        st.open_tab(super::DockTab::Model);
+        st.model_sections.set(super::dock::model::Section::Suspects, true);
+        st.search.reveal = Some(("d-suspects", std::time::Instant::now(), false));
+    }
+}
+
 /// The card of the pick (or of the weakest pair the scene asks).
 fn detail(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, asks: &BTreeMap<(u8, u8), Vec<f64>>, input: &PanelInput<'_>, acts: &mut Vec<super::Action>) {
     ui.add_space(6.0);
     match st.knowledge.pick {
+        Pick::Molecule => match st.knowledge.molecule.as_ref().and_then(|c| map.molecule(c)) {
+            Some(m) => {
+                let m = m.clone();
+                let r = theme::panel_card(ui, theme::panel_card_frame(), |ui| {
+                    ui.set_width(ui.available_width());
+                    molecule_detail(ui, st, map, &m);
+                });
+                super::probe("knowledge-card", &r.response);
+            }
+            None => {
+                theme::note(ui, "that composition is no longer among the stored samples");
+            }
+        },
         Pick::Element(z) => match map.element(z) {
             Some(e) => card(ui, "knowledge-card", |ui| element_detail(ui, map, e, input)),
             None => {
