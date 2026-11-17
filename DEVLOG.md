@@ -1137,6 +1137,31 @@ class lost trust; main had the same cost.
   the knowledge graph) was ruled out by the user's own observations before the profile found the real
   cost.
 
+### The three-atom coverage map (2026-11-17, merge triple-map)
+
+The pair graph shows which distances the model was taught. It cannot show which angles were. Phase A
+adds a **Three-atom arrangements** fold to the Knowledge panel. It reads the fitted samples' arrangements
+around each training centre (a neighbour–centre–neighbour triple within the 6 Bohr cutoff) and bins them
+in r₁, r₂ and cos θ. Each cell is drawn as taught, thin, or missing within reach. The map has a 2D slice
+view and a 3D voxel cloud. It was built in 11 tasks, each with its own review, followed by a whole-branch
+review: 0 Critical, 0 Important, 8 Minor, all fixed. The app gate passes 795 tests.
+
+- The reach rule decides which empty cells count as gaps, so only arrangements the model could plausibly
+  meet are shown as missing:
+  - both distances lie inside their pairs' taught ranges;
+  - the neighbour–neighbour side, from the law of cosines, is no shorter than that pair was ever taught.
+- The map is a count. The README and the cell card both say so: green is not the model's trust, and the
+  model's 4-body terms are not drawn.
+- The map costs 0.45 ms to build cold and 0.016 ms to update on the user's collection. The final review
+  found the UI re-summarising every type several times a frame. Those summaries are now memoised per map,
+  and a counter test pins it.
+- Screenshots and layout:
+  - Screenshot mode cannot attach the shared collection, so the README shots show a fresh one-pass water
+    model.
+  - The shots also exposed a layout bug older than the branch. Between 760 and 894 pt, the Knowledge
+    panel's right column ran off its edge. It now switches to two columns only once both fit.
+- Phase B ("Teach this cell") waits for targeted teach.
+
 ### Process wins
 
 - An input-replay harness (M6 Task 8) that found a real app bug on its first scripts: a running relax
