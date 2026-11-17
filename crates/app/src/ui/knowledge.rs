@@ -128,7 +128,8 @@ pub struct TripleView {
     /// no triple picked, the section shows that centre's type with the most gaps.
     pub want_centre: Option<u8>,
     /// The shown type's classes and extent, computed once per (map, type) (spec §6.4 "UI cost";
-    /// [`triples::sync`]). Derived: a new scene drops it.
+    /// [`triples::sync`]). Keyed on the map, not the scene: a new scene keeps it, so the
+    /// type-change reset still applies after it.
     pub cache: Option<triples::ClassCache>,
 }
 
@@ -164,10 +165,10 @@ impl Default for KnowledgeView {
 
 impl KnowledgeView {
     /// A new scene: the graph fits itself again on its next frame (the pick and the three-atom
-    /// view are kept, but not an entry link's centre: the new scene has its own default; nor the
-    /// class cache, rebuilt on the next frame).
+    /// view are kept, with its class cache, but not an entry link's centre: the new scene has its
+    /// own default).
     pub fn reset_view(&mut self) {
-        let triple = TripleView { want_centre: None, cache: None, ..std::mem::take(&mut self.triple) };
+        let triple = TripleView { want_centre: None, ..std::mem::take(&mut self.triple) };
         *self = KnowledgeView { pick: self.pick, molecule: self.molecule.take(), triple, ..Default::default() };
     }
 

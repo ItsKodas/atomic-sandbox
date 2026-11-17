@@ -893,6 +893,48 @@ fn frame(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, w: f32, ev
     frame_sized(ctx, st, inp, egui::vec2(w, 900.0), events)
 }
 
+/// One frame in a window of `size` at `time` (seconds): every text shape with its top.
+fn frame_texts_sized(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, size: egui::Vec2, events: Vec<egui::Event>, time: f64) -> Vec<(String, f32)> {
+    fn walk(s: &egui::epaint::Shape, out: &mut Vec<(String, f32)>) {
+        match s {
+            egui::epaint::Shape::Text(t) => out.push((t.galley.text().to_string(), t.pos.y)),
+            egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), events, time: Some(time), ..Default::default() };
+    let mut full = ctx.run_ui(raw, |root| {
+        show(root, st, inp);
+    });
+    full.textures_delta.clear();
+    let mut out = Vec::new();
+    full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+    out
+}
+
+/// Everything that is on screen once the pointer has rested on the probed widget long enough
+/// for its tooltip: the widget's own hover text, as the user reads it (1400 × 900).
+fn hover_text(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, probe: &str) -> String {
+    hover_text_sized(ctx, st, inp, egui::vec2(1400.0, 900.0), probe)
+}
+
+/// [`hover_text`] in a window of `size`.
+fn hover_text_sized(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, size: egui::Vec2, probe: &str) -> String {
+    for _ in 0..3 {
+        frame_sized(ctx, st, inp, size, vec![]);
+    }
+    let c = probed_rect(probe).center();
+    let mut all = String::new();
+    for k in 0..8 {
+        let events = if k == 0 { vec![egui::Event::PointerMoved(c)] } else { vec![] };
+        for (s, _) in frame_texts_sized(ctx, st, inp, size, events, 10.0 + 0.3 * k as f64) {
+            all += &s;
+            all += "\n";
+        }
+    }
+    all
+}
+
 fn frame_sized(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, size: egui::Vec2, events: Vec<egui::Event>) -> PanelOutput {
     let raw = egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
@@ -4345,44 +4387,7 @@ mod orbital_viewer {
 
     /// Every text of the frame with its y: the galleys of the text shapes, nested shapes included.
     fn frame_texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, events: Vec<egui::Event>, time: f64) -> Vec<(String, f32)> {
-        fn walk(s: &egui::epaint::Shape, out: &mut Vec<(String, f32)>) {
-            match s {
-                egui::epaint::Shape::Text(t) => out.push((t.galley.text().to_string(), t.pos.y)),
-                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
-                _ => {}
-            }
-        }
-        let raw = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))),
-            events,
-            time: Some(time),
-            ..Default::default()
-        };
-        let mut full = ctx.run_ui(raw, |root| {
-            show(root, st, inp);
-        });
-        full.textures_delta.clear();
-        let mut out = Vec::new();
-        full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
-        out
-    }
-
-    /// Everything that is on screen once the pointer has rested on the probed widget long enough
-    /// for its tooltip: the widget's own hover text, as the user reads it.
-    fn hover_text(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, probe: &str) -> String {
-        for _ in 0..3 {
-            frame(ctx, st, inp, 1400.0, vec![]);
-        }
-        let c = probed_rect(probe).center();
-        let mut all = String::new();
-        for k in 0..8 {
-            let events = if k == 0 { vec![egui::Event::PointerMoved(c)] } else { vec![] };
-            for (s, _) in frame_texts(ctx, st, inp, events, 10.0 + 0.3 * k as f64) {
-                all += &s;
-                all += "\n";
-            }
-        }
-        all
+        frame_texts_sized(ctx, st, inp, egui::vec2(1400.0, 900.0), events, time)
     }
 
     /// The pinned honesty strings are in the text the widgets show on hover (not just in the
@@ -8665,6 +8670,7 @@ mod knowledge_map {
                 // the three-atom section open, its picker and the picked type's card
                 st.activity.triples = Some(Arc::new(knowledge::fixture_triples()));
                 st.knowledge_sections.triples = true;
+                st.knowledge.triple.cell = Some((6, 6, 6)); // its card and band too
             }
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 3000.0));
             let mut shapes = Vec::new();
@@ -8685,7 +8691,7 @@ mod knowledge_map {
                 parts.extend(["knowledge-teach", "knowledge-histogram"]);
             }
             if triple {
-                parts.extend(["knowledge-triple-fold", "knowledge-triple-row-1-8-1", "knowledge-triple-row-1-1-8", "knowledge-triple-view"]);
+                parts.extend(["knowledge-triple-fold", "knowledge-triple-row-1-8-1", "knowledge-triple-row-1-1-8", "knowledge-triple-view", "knowledge-triple-plot", "knowledge-triple-cell-card", "knowledge-triple-band"]);
             }
             for p in &parts {
                 let r = probed_rect(p);
@@ -9034,13 +9040,13 @@ mod triple_map {
         v.reset_view();
         assert_eq!((v.triple.mode, v.triple.slice), (TripleMode::Cloud, Some(4)), "kept across a new scene");
         assert_eq!(v.triple.want_centre, None, "an entry link's centre is not");
-        // the class cache is a derived value: a new scene drops it (Task 7)
-        let map = knowledge::fixture_triples();
+        // the class cache is keyed on the map, not the scene: a new scene keeps it (fix round 1)
+        let map = Arc::new(knowledge::fixture_triples());
         let tk = map.get(TripleType::new(8, 1, 1)).unwrap();
-        let classes = triples::class_table(&map, tk);
-        v.triple.cache = Some(triples::ClassCache { map: 1, t: tk.t, extent: triples::extent(&map, tk, &classes), classes });
+        let cache = triples::ClassCache::of(&map, tk);
+        v.triple.cache = Some(cache.clone());
         v.reset_view();
-        assert_eq!(v.triple.cache, None);
+        assert_eq!(v.triple.cache, Some(cache));
     }
 
     /// Spec U1: rows cropped to reach ∪ filled, the fold read, markers in the right cell.
@@ -9091,6 +9097,13 @@ mod triple_map {
         b4.basis.body3 = false;
         assert_eq!(triples::band_lines(&b4)[1], "this model's basis has no three-atom terms: it does not learn the angle");
         assert!(band.iter().all(|l| !l.contains("Teach")), "Phase A: the band says nothing about teaching");
+        // a cell drawn only for its new samples, outside the reach (H–O–O: no O–O span)
+        let hoo = map.get(TripleType::new(8, 1, 8)).unwrap();
+        let c = map.grid.index(false, 6, 6, 6);
+        assert_eq!(sim::knowledge::cell_class(&map, hoo, c), sim::knowledge::CellClass::OutOfReach);
+        assert!(triples::drawn(hoo, sim::knowledge::CellClass::OutOfReach, c), "new: drawn (dashed)");
+        assert_eq!(triples::cell_hover(&map, hoo, c), "r₁ 1.8–2.1 · r₂ 1.8–2.1 Bohr · θ 102–114° · n 0 (+3 new) · outside reach");
+        assert_eq!(triples::cell_card_line(&map, hoo, c), "O–O–H · r₁ 1.8–2.1, r₂ 1.8–2.1 Bohr, θ 102–114° · 0 arrangements · outside reach · +3 new");
     }
 
     /// Review Focus 1: the map changes under the view (a Forget, a refit, a reach change): the
@@ -9171,7 +9184,65 @@ mod triple_map {
         assert!(outs.iter().all(|o| o.actions.is_empty()));
         // the cache follows the map and the type
         let cache = st.knowledge.triple.cache.as_ref().unwrap();
-        assert_eq!((cache.map, cache.t), (Arc::as_ptr(st.activity.triples.as_ref().unwrap()) as usize, hoh));
+        assert!(Arc::ptr_eq(&cache.map, st.activity.triples.as_ref().unwrap()) && cache.t == hoh);
+    }
+
+    /// Fix round 1, I1: the cache holds its map, so a later map can never take its freed address
+    /// and pass for it (the fold closed while maps keep arriving): a new map of the same grid is
+    /// recounted.
+    #[test]
+    fn the_class_cache_recounts_a_new_map_of_the_same_size() {
+        let hoh = TripleType::new(8, 1, 1);
+        let mut view = knowledge::TripleView::default();
+        let a = Arc::new(knowledge::fixture_triples());
+        triples::sync(&mut view, &a, a.get(hoh).unwrap());
+        let old = Arc::as_ptr(&a);
+        let before = view.cache.as_ref().unwrap().classes.clone();
+        drop(a); // the caller's other handle: only the cache holds the first map now
+        // the next map: the same grid, (6, 6, 6) forgotten (taught → missing within reach)
+        let mut m = knowledge::fixture_triples();
+        let c = m.grid.index(true, 6, 6, 6);
+        let k = m.types.iter_mut().find(|k| k.t == hoh).unwrap();
+        let mut counts = k.counts.to_vec();
+        counts[c] = 0;
+        k.counts = counts.into();
+        let b = Arc::new(m);
+        assert_ne!(Arc::as_ptr(&b), old, "the held map's address is not reused");
+        assert!(!view.cache.as_ref().unwrap().holds(&b, hoh));
+        triples::sync(&mut view, &b, b.get(hoh).unwrap());
+        let cache = view.cache.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&cache.map, &b), "recomputed for the new map");
+        assert_eq!(cache.classes, triples::class_table(&b, b.get(hoh).unwrap()));
+        assert_eq!((before[c], cache.classes[c]), (sim::knowledge::CellClass::Taught, sim::knowledge::CellClass::Missing));
+        assert_eq!(cache.top, 10, "the fullest fitted cell left: (6, 6, 5)");
+        assert_eq!(cache.fullest, triples::fullest_slice(&b, b.get(hoh).unwrap()));
+        // the same map again: kept, not recounted
+        let kept = cache.clone();
+        triples::sync(&mut view, &b, b.get(hoh).unwrap());
+        assert!(Arc::ptr_eq(&view.cache.as_ref().unwrap().map, &kept.map));
+    }
+
+    /// Fix round 1, minor 3: the hover on screen reads the cell's words and the scene's marker.
+    #[test]
+    fn hovering_a_cell_reads_its_counts_and_the_scene_marker() {
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = state(&scene, &snap);
+        let map = knowledge::fixture_triples();
+        let hoh = TripleType::new(8, 1, 1);
+        st.activity.triples = Some(Arc::new(map.clone()));
+        st.knowledge_sections.triples = true;
+        st.knowledge.set_pick(Pick::Triple(hoh));
+        let c = map.grid.index(true, 6, 6, 6);
+        let t = hover_text_sized(&ctx, &mut st, &inp, TALL, &format!("knowledge-triple-cell-{c}"));
+        assert!(t.contains(&triples::cell_hover(&map, map.get(hoh).unwrap(), c)), "{t}");
+        assert!(t.contains("now: the open scene's arrangement here"), "{t}");
+        assert!(!t.contains("in other slices"), "water has one H–O–H, on this slice: {t}");
+        assert_eq!(st.knowledge.triple.cell, None, "a hover picks nothing");
     }
 }
 

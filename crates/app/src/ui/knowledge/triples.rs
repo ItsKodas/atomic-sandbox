@@ -377,16 +377,57 @@ pub fn element_links(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, z: u
 // ---- the 2D slice (Task 7) ----
 
 /// A type's classes and drawn extent for one map (spec §6.4 "UI cost": computed once per (map
-/// `Arc` pointer, type), kept in `TripleView::cache`).
-#[derive(Clone, Debug, PartialEq)]
+/// `Arc`, type), kept in `TripleView::cache`), with the two per-type scans the slice would
+/// otherwise repeat every frame.
+#[derive(Clone)]
 pub struct ClassCache {
-    /// `Arc::as_ptr` of the map, as an address.
-    pub map: usize,
+    /// The map they were computed from, held (fix round 1, I1): a held `Arc` keeps its address
+    /// from being reused by a later map, so `Arc::ptr_eq` cannot match a different map.
+    pub map: Arc<TripleMap>,
     pub t: TripleType,
     /// Per cell of the map's grid ([`class_table`]).
     pub classes: Vec<CellClass>,
     /// [`extent`].
     pub extent: Option<(Range<usize>, Range<usize>)>,
+    /// The type's fullest slice ([`fullest_slice`]): the default slice without a scene instance.
+    pub fullest: usize,
+    /// The type's fullest fitted cell's count: the fill opacity's scale.
+    pub top: u32,
+}
+
+impl ClassCache {
+    /// The cache of `tk` (a type of `map`).
+    pub fn of(map: &Arc<TripleMap>, tk: &TripleKnowledge) -> ClassCache {
+        let classes = class_table(map, tk);
+        let extent = extent(map, tk, &classes);
+        ClassCache { map: map.clone(), t: tk.t, classes, extent, fullest: fullest_slice(map, tk), top: tk.counts.iter().copied().max().unwrap_or(0) }
+    }
+
+    /// Computed from this very map (`Arc::ptr_eq`) for type `t`.
+    pub fn holds(&self, map: &Arc<TripleMap>, t: TripleType) -> bool {
+        Arc::ptr_eq(&self.map, map) && self.t == t
+    }
+}
+
+/// The map compared by pointer (it is a key, not a value).
+impl PartialEq for ClassCache {
+    fn eq(&self, o: &Self) -> bool {
+        Arc::ptr_eq(&self.map, &o.map) && self.t == o.t && self.classes == o.classes && self.extent == o.extent && self.fullest == o.fullest && self.top == o.top
+    }
+}
+
+/// The map shown as its pointer.
+impl std::fmt::Debug for ClassCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClassCache")
+            .field("map", &Arc::as_ptr(&self.map))
+            .field("t", &self.t)
+            .field("classes", &self.classes.len())
+            .field("extent", &self.extent)
+            .field("fullest", &self.fullest)
+            .field("top", &self.top)
+            .finish()
+    }
 }
 
 /// Every cell's class (`sim::knowledge::cell_class`), indexed by cell.
@@ -452,12 +493,17 @@ pub fn chosen_instance(instances: &[Triple], selected: Option<usize>) -> Option<
 }
 
 /// The slice shown when none was chosen: the chosen instance's r₂ bin, else the type's fullest
-/// slice (fitted + new, as the slice draws them; the lowest on a tie), else 0.
+/// slice ([`fullest_slice`]). The slice itself reads the cached `ClassCache::fullest`; this is
+/// the same rule uncached, for the tests and the `--ui` keys.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn default_slice(map: &TripleMap, tk: &TripleKnowledge, chosen: Option<&Triple>) -> usize {
+    chosen.and_then(|x| map.grid.r_bin_of(x.r2)).unwrap_or_else(|| fullest_slice(map, tk))
+}
+
+/// The type's fullest slice: fitted + new, as the slice draws them (a folded cell {k₁, k₂} in
+/// both slices), the lowest on a tie; 0 with nothing filled.
+pub fn fullest_slice(map: &TripleMap, tk: &TripleKnowledge) -> usize {
     let g = &map.grid;
-    if let Some(k2) = chosen.and_then(|x| g.r_bin_of(x.r2)) {
-        return k2;
-    }
     let mut fill = vec![0u64; g.n_r];
     for c in 0..g.cells() {
         let n = tk.counts.get(c).copied().unwrap_or(0) as u64 + tk.pending.get(c).copied().unwrap_or(0) as u64;
@@ -555,21 +601,17 @@ pub fn band_lines(map: &TripleMap) -> Vec<String> {
 }
 
 /// Brings the view up to date with the map shown (Review Focus 1): the class cache recomputed
-/// when the map (`Arc` pointer) or the type changed — another type resets the slice and the
+/// when the map (`Arc::ptr_eq`) or the type changed — another type resets the slice and the
 /// cell —, the slice clamped into the extent's slices, and a picked cell past the grid or no
 /// longer drawn dropped (a kept one is normalised to its stored (k₁, k₂, q)).
 pub fn sync(view: &mut TripleView, map: &Arc<TripleMap>, tk: &TripleKnowledge) {
-    let key = Arc::as_ptr(map) as usize;
     let g = &map.grid;
-    let fresh = view.cache.as_ref().is_some_and(|c| c.map == key && c.t == tk.t && c.classes.len() == g.cells());
-    if !fresh {
+    if !view.cache.as_ref().is_some_and(|c| c.holds(map, tk.t)) {
         if view.cache.as_ref().is_some_and(|c| c.t != tk.t) {
             view.slice = None;
             view.cell = None;
         }
-        let classes = class_table(map, tk);
-        let extent = extent(map, tk, &classes);
-        view.cache = Some(ClassCache { map: key, t: tk.t, classes, extent });
+        view.cache = Some(ClassCache::of(map, tk));
     }
     let cache = view.cache.as_ref().expect("filled above");
     if let (Some(s), Some((_, slices))) = (view.slice, &cache.extent) {
@@ -614,7 +656,7 @@ fn flat(ui: &mut Ui, view: &mut TripleView, cache: &ClassCache, input: &PanelInp
     let (g, folded) = (&map.grid, t.folded());
     let instances = scene_instances(&input.scene.nuclei, t, map.r_cut);
     let chosen = chosen_instance(&instances, input.selected);
-    let mut s = view.slice.unwrap_or_else(|| default_slice(map, tk, chosen.as_ref())).clamp(slices.start, slices.end - 1);
+    let mut s = view.slice.or_else(|| chosen.and_then(|x| g.r_bin_of(x.r2))).unwrap_or(cache.fullest).clamp(slices.start, slices.end - 1);
     // the slice control: a slider over the extent's r₂ bins, and the bin's range
     ui.horizontal_wrapped(|ui| {
         let mut k = s;
@@ -645,7 +687,7 @@ fn flat(ui: &mut Ui, view: &mut TripleView, cache: &ClassCache, input: &PanelInp
         plot.contains(pos).then(|| (rows.start + (((plot.bottom() - pos.y) / rh) as usize).min(rows.len() - 1), (((pos.x - plot.left()) / cw) as usize).min(COS_BINS - 1)))
     };
     let shown = |row: usize, q: usize| Some(cells[row - rows.start][q]).filter(|&c| drawn(tk, cache.classes[c], c));
-    let top = tk.counts.iter().copied().max().unwrap_or(0);
+    let top = cache.top;
     let opacity = |n: u32| 0.3 + 0.7 * ((1.0 + n as f32).ln() / (1.0 + top as f32).ln().max(1e-6)).min(1.0);
     for row in rows.clone() {
         for q in 0..COS_BINS {
