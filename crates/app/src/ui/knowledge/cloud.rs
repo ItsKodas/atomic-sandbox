@@ -11,8 +11,9 @@
 //!   faces that face the viewer filled in its class's colour, shaded by [`SHADES`] (θ-face,
 //!   r₁-face, r₂-face) and drawn back to front ([`project`]: a painter's sort on the rotated
 //!   centre's depth, equal depths by ascending cell). A missing cell within reach is a small
-//!   `INK_FAINT` outlined square at its centre (the "missing" checkbox hides them); a new cell
-//!   (pending > 0) a dashed square; the open scene's arrangements of the type white crosses.
+//!   `INK_FAINT` outlined square at its centre (the "missing" checkbox hides them, and unpicks a
+//!   hidden one); a new cell (pending > 0) a dashed square; the open scene's arrangements of the
+//!   type white crosses ([`cross_at`]: those outside the extent faint, clamped to its faces).
 //! - **Input.** A drag rotates ([`rotate`], pitch held within ±[`PITCH_LIMIT_DEG`]), the wheel
 //!   zooms (over the cloud only; elsewhere the panel scrolls), a double-click or Reset returns to
 //!   the default angles ([`reset`]). A click picks the front-most cell whose projected outline
@@ -25,7 +26,7 @@
 //! The camera (`TripleView::yaw_deg`, `pitch_deg`, `zoom`, `show_missing`) is display state, not
 //! recorded; nothing here emits an `Action`. Distances in Bohr; degrees only in the labels.
 use super::triples::{cell_card, cell_hover, drawn, nothing_drawn, scene_instances, ClassCache};
-use super::{pair_name, sym, TripleView, NEW_INK, WHEEL_STEP};
+use super::{pair_name, sym, wheel_lines, TripleView, NEW_INK, WHEEL_STEP};
 use crate::ui::{keyed, probe, probe_rect, theme, PanelInput, AMBER, GREEN};
 use egui::{pos2, vec2, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui, Vec2};
 use sim::knowledge::{CellClass, TripleGrid, TripleKnowledge, TripleMap};
@@ -322,25 +323,19 @@ fn shaded(c: Color32, shade: f32) -> Color32 {
     Color32::from_rgba_premultiplied(f(r), f(g), f(b), a)
 }
 
-/// The wheel's lines this frame (a pixel wheel's 50 points count as one), taken from the panel's
-/// scroll.
-fn wheel_lines(ui: &Ui) -> f32 {
-    ui.input_mut(|i| {
-        let lines = i
-            .events
-            .iter()
-            .map(|e| match e {
-                egui::Event::MouseWheel { unit, delta, .. } => match unit {
-                    egui::MouseWheelUnit::Line => delta.y,
-                    egui::MouseWheelUnit::Point => delta.y / 50.0,
-                    egui::MouseWheelUnit::Page => delta.y * 10.0,
-                },
-                _ => 0.0,
-            })
-            .sum();
-        i.smooth_scroll_delta = Vec2::ZERO;
-        lines
-    })
+/// The zoom after `lines` wheel lines ([`WHEEL_STEP`] each), held within [`ZOOM_MIN`]–[`ZOOM_MAX`].
+pub fn zoom_by(zoom: f32, lines: f32) -> f32 {
+    (zoom * WHEEL_STEP.powf(lines)).clamp(ZOOM_MIN, ZOOM_MAX)
+}
+
+/// A scene arrangement's place in the cloud: (r₁, θ, r₂) normalised over the extent as the voxels
+/// are, r₁ and r₂ clamped into it (as the 2D slice clamps its rings to the plot), and whether it
+/// lay outside (then drawn faint).
+pub fn cross_at(grid: &TripleGrid, extent: &(Range<usize>, Range<usize>), r1: f64, r2: f64, u: f64) -> ([f32; 3], bool) {
+    let norm = |r: f64, span: &Range<usize>| ((r / grid.r_bin) as f32 - span.start as f32) / span.len().max(1) as f32 - 0.5;
+    let (x, z) = (norm(r1, &extent.0), norm(r2, &extent.1));
+    let outside = !(x.abs() <= 0.5 && z.abs() <= 0.5);
+    ([x.clamp(-0.5, 0.5), (-u.clamp(-1.0, 1.0) / 2.0) as f32, z.clamp(-0.5, 0.5)], outside)
 }
 
 /// The 3D view of the shown type (module doc): its controls, the cloud with its input, the caption
@@ -377,7 +372,7 @@ pub fn show(ui: &mut Ui, view: &mut TripleView, cache: &mut ClassCache, input: &
     if ui.rect_contains_pointer(rect) {
         let lines = wheel_lines(ui);
         if lines != 0.0 {
-            view.zoom = (view.zoom * WHEEL_STEP.powf(lines)).clamp(ZOOM_MIN, ZOOM_MAX);
+            view.zoom = zoom_by(view.zoom, lines);
         }
     }
     if resp.dragged() {
@@ -389,6 +384,10 @@ pub fn show(ui: &mut Ui, view: &mut TripleView, cache: &mut ClassCache, input: &
     let classes = &cache.classes;
     let pending = |c: usize| tk.pending.get(c).copied().unwrap_or(0);
     let missing = |c: usize| classes[c] == CellClass::Missing && pending(c) == 0;
+    // a picked cell the unticked "missing" hides is no longer picked (it shows no outline)
+    if !view.show_missing && view.cell.is_some_and(|(k1, k2, q)| missing(g.index(folded, k1, k2, q))) {
+        view.cell = None;
+    }
     let cloud = cache.cloud.get_or_insert_with(|| Cloud::of(g, tk, classes, &extent));
     let key = Key { yaw_deg: view.yaw_deg, pitch_deg: view.pitch_deg, zoom: view.zoom, rect, show_missing: view.show_missing };
     cloud.update(key, |c| view.show_missing || !missing(c));
@@ -438,23 +437,22 @@ pub fn show(ui: &mut Ui, view: &mut TripleView, cache: &mut ClassCache, input: &
             p.extend(Shape::dashed_line(&[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()], Stroke::new(1.0, NEW_INK), 2.0, 2.0));
         }
     }
-    // the open scene's arrangements: white crosses (those inside the extent)
+    // the open scene's arrangements: white crosses; those outside the extent faint, clamped to
+    // its faces (as the 2D slice clamps its rings to the plot), under the others
     let (rows, slices) = &extent;
     let instances = scene_instances(&input.scene.nuclei, t, map.r_cut);
-    let norm = |r: f64, span: &Range<usize>| ((r / g.r_bin) as f32 - span.start as f32) / span.len() as f32 - 0.5;
+    let crosses: Vec<([f32; 3], bool)> = instances.iter().map(|i| cross_at(g, &extent, i.r1, i.r2, i.u)).collect();
     let mut first = true;
-    for inst in &instances {
-        let q = [norm(inst.r1, rows), (-inst.u / 2.0) as f32, norm(inst.r2, slices)];
-        if !(q[0].abs() <= 0.5 && q[2].abs() <= 0.5) {
-            continue;
-        }
-        let x = at(q);
-        let stroke = Stroke::new(1.5, Color32::WHITE);
-        p.line_segment([x + vec2(-4.0, -4.0), x + vec2(4.0, 4.0)], stroke);
-        p.line_segment([x + vec2(-4.0, 4.0), x + vec2(4.0, -4.0)], stroke);
-        if first {
-            probe_rect("knowledge-triple-cross", Rect::from_center_size(x, vec2(8.0, 8.0)));
-            first = false;
+    for faint in [true, false] {
+        for &(q, outside) in crosses.iter().filter(|c| c.1 == faint) {
+            let x = at(q);
+            let stroke = if outside { Stroke::new(1.0, Color32::from_white_alpha(90)) } else { Stroke::new(1.5, Color32::WHITE) };
+            p.line_segment([x + vec2(-4.0, -4.0), x + vec2(4.0, 4.0)], stroke);
+            p.line_segment([x + vec2(-4.0, 4.0), x + vec2(4.0, -4.0)], stroke);
+            if first && !outside {
+                probe_rect("knowledge-triple-cross", Rect::from_center_size(x, vec2(8.0, 8.0)));
+                first = false;
+            }
         }
     }
     // the picked cell and the hovered one, outlined over the rest
@@ -477,7 +475,8 @@ pub fn show(ui: &mut Ui, view: &mut TripleView, cache: &mut ClassCache, input: &
         }
         None => resp,
     };
-    if resp.clicked() {
+    // a double-click's second click resets the view (above): it does not pick again under it
+    if resp.clicked() && !resp.double_clicked() {
         view.cell = resp.interact_pointer_pos().and_then(|at| hit(drawn, at)).map(|c| g.coords(c));
     }
     let ((a1, b1), (a2, b2)) = ((g.r_edges(rows.start).0, g.r_edges(rows.end - 1).1), (g.r_edges(slices.start).0, g.r_edges(slices.end - 1).1));
@@ -517,5 +516,40 @@ mod tests {
         assert_eq!(view.pitch_deg.abs(), PITCH_LIMIT_DEG);
         reset(&mut view);
         assert_eq!((view.yaw_deg, view.pitch_deg, view.zoom), (DEFAULT_YAW_DEG, DEFAULT_PITCH_DEG, 1.0));
+    }
+
+    /// Task 8 review minor 3: a missing cell's square is picked at its centre in front of a cube,
+    /// and not behind one.
+    #[test]
+    fn the_hit_test_picks_a_square_in_front_and_not_behind() {
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 400.0));
+        let front = [Voxel { cell: 4, at: [0.0, 0.0, -0.3], cube: false }, Voxel { cell: 8, at: [0.0, 0.0, 0.3], cube: true }];
+        let d = project(&front, 0.0, 0.0, 1.0, rect);
+        assert!(d.iter().find(|x| x.cell == 4).is_some_and(|x| x.faces.is_empty() && x.hull.len() == 4), "a square");
+        assert_eq!(hit(&d, rect.center()), Some(4), "the square in front");
+        let behind = [Voxel { cell: 4, at: [0.0, 0.0, 0.3], cube: false }, Voxel { cell: 8, at: [0.0, 0.0, -0.3], cube: true }];
+        assert_eq!(hit(&project(&behind, 0.0, 0.0, 1.0, rect), rect.center()), Some(8), "the cube in front of it");
+    }
+
+    /// Task 8 review minor 4: the wheel's zoom is held within 0.5–6.
+    #[test]
+    fn the_zoom_is_clamped() {
+        assert_eq!((zoom_by(1.0, -100.0), zoom_by(1.0, 100.0), zoom_by(1.0, 0.0)), (ZOOM_MIN, ZOOM_MAX, 1.0));
+        assert_eq!((ZOOM_MIN, ZOOM_MAX), (0.5, 6.0));
+    }
+
+    /// Task 8 review minor 2: a scene arrangement outside the cropped extent is clamped to its
+    /// faces and marked faint; one inside is where its cell's voxel is.
+    #[test]
+    fn a_cross_outside_the_extent_is_clamped_and_faint() {
+        let g = TripleGrid::new(6.0);
+        let extent = (5..8, 6..7);
+        // 1.95 Bohr: bin 6, the middle row of 5..8 and the only slice
+        let (q, outside) = cross_at(&g, &extent, 1.95, 1.95, 0.0);
+        assert!(!outside);
+        assert!(q[0].abs() < 1e-5 && q[2].abs() < 1e-5 && q[1] == 0.0, "{q:?}");
+        let (q, outside) = cross_at(&g, &extent, 4.0, 1.0, -1.0);
+        assert!(outside);
+        assert_eq!((q[0], q[1], q[2]), (0.5, 0.5, -0.5));
     }
 }

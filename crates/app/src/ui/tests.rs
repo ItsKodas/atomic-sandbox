@@ -9423,6 +9423,18 @@ mod triple_map {
         assert_eq!(st.knowledge.triple.mode, TripleMode::Flat);
         run(&ctx, &mut st, &inp);
         assert!(probed("knowledge-triple-plot") && !probed("knowledge-triple-cloud"));
+        // Task 8 review minor 6: a picked missing cell is unpicked when "missing" hides it
+        outs.extend(click(&ctx, &mut st, &inp, "knowledge-triple-mode-3d"));
+        outs.extend(click(&ctx, &mut st, &inp, "knowledge-triple-missing"));
+        assert!(st.knowledge.triple.show_missing);
+        let gap = map.grid.coords(all.iter().copied().find(|&c| missing(c)).unwrap());
+        st.knowledge.triple.cell = Some(gap);
+        run(&ctx, &mut st, &inp);
+        assert_eq!(st.knowledge.triple.cell, Some(gap), "shown: kept");
+        outs.extend(click(&ctx, &mut st, &inp, "knowledge-triple-missing"));
+        run(&ctx, &mut st, &inp);
+        assert_eq!((st.knowledge.triple.show_missing, st.knowledge.triple.cell), (false, None), "hidden: unpicked");
+        assert!(!probed("knowledge-triple-cell-card"));
         assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display only");
     }
 }

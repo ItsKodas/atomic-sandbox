@@ -564,6 +564,28 @@ pub const ZOOM_MIN: f32 = 0.25;
 pub const ZOOM_MAX: f32 = 8.0;
 /// The zoom factor per wheel line (a pixel wheel's 50 points count as a line).
 const WHEEL_STEP: f32 = 1.2;
+
+/// The wheel's lines this frame (a pixel wheel's 50 points count as one, a page as ten), taken
+/// from the panel's scroll: the graph's and the 3D cloud's zoom read it over their own rect.
+pub(super) fn wheel_lines(ui: &Ui) -> f32 {
+    ui.input_mut(|i| {
+        let lines = i
+            .events
+            .iter()
+            .map(|e| match e {
+                egui::Event::MouseWheel { unit, delta, .. } => match unit {
+                    egui::MouseWheelUnit::Line => delta.y,
+                    egui::MouseWheelUnit::Point => delta.y / 50.0,
+                    egui::MouseWheelUnit::Page => delta.y * 10.0,
+                },
+                _ => 0.0,
+            })
+            .sum();
+        i.smooth_scroll_delta = Vec2::ZERO;
+        lines
+    })
+}
+
 /// Room (points) Fit leaves round the nodes, and right of them for their atom counts.
 const FIT_MARGIN: f32 = 14.0;
 const FIT_BESIDE: f32 = 26.0;
@@ -687,23 +709,8 @@ fn graph(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, size: Vec2) {
     }
     // the wheel, over the map only (taken from the panel's scroll then)
     if ui.rect_contains_pointer(rect) {
-        let (lines, at) = ui.input_mut(|i| {
-            let lines: f32 = i
-                .events
-                .iter()
-                .map(|e| match e {
-                    egui::Event::MouseWheel { unit, delta, .. } => match unit {
-                        egui::MouseWheelUnit::Line => delta.y,
-                        egui::MouseWheelUnit::Point => delta.y / 50.0,
-                        egui::MouseWheelUnit::Page => delta.y * 10.0,
-                    },
-                    _ => 0.0,
-                })
-                .sum();
-            i.smooth_scroll_delta = Vec2::ZERO;
-            (lines, i.pointer.hover_pos())
-        });
-        if let (true, Some(at)) = (lines != 0.0, at) {
+        let lines = wheel_lines(ui);
+        if let (true, Some(at)) = (lines != 0.0, ui.input(|i| i.pointer.hover_pos())) {
             zoom_about(&mut st.knowledge, o, at, WHEEL_STEP.powf(lines));
         }
     }
