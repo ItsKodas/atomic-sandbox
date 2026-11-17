@@ -2,18 +2,24 @@
 //! (installer spec, "The manifest", "Downgrades" and the builder-check ruling on scenes and
 //! profiles).
 //!
-//! Every number is read from the code's own version constant, never typed here:
+//! Every number is read from the code's own version constant, never typed here (the tests pin the
+//! current values, so a bump is seen):
 //!
 //! | key | constant | on disk |
 //! |---|---|---|
-//! | `collection` | `surrogate::collection::RECORD_VERSION` | each record of `models/collections/<key>/samples.bin` |
-//! | `sidecar` | the newest model-file version the reader takes: `surrogate::sidecar::MAGICS.len()` | the magic of `models/*.model`, `training/pass.model` |
+//! | `collection` | `surrogate::collection::RECORD_VERSION` (the reader takes every version up to it) | each record of `models/collections/<key>/samples.bin` |
+//! | `sidecar` | the newest model-file version the reader takes: `surrogate::sidecar::MAGICS.len()` (the writers use the newest magic only; its header names the older body it carries) | the magic of `models/*.model`, `training/pass.model` |
 //! | `history` | `surrogate::history::MAGIC` (`ASAUDIT1`) | the magic of `models/collections/<key>/history.bin` |
 //! | `replay` | `crate::replay::HEADER` | a replay script's first line (wherever the user keeps it) |
 //! | `pseudo_cache` | `providers::pseudo::DISK_MAGIC` | `cache/pseudo` (a cache: rebuilt, never lost) |
 //! | `checkpoint` | `providers::sampling::CHECKPOINT_MAGIC` | the first line of `training/pass.ckpt` |
 //! | `scene` | `crate::scene::SCENE_FORMAT` (code-only) | none: scene files carry no version |
 //! | `profile` | `crate::ui::profile::PROFILE_FORMAT` (code-only) | none |
+//!
+//! The Fermi–Dirac switch (plan 2026-11-13 Task 13) moved `collection` and `sidecar` on by one each:
+//! its collections and model files hold free energies on a new solver surface, so a build before it
+//! refuses them as a newer format, and the collections it wrote stay in their own folders, untouched
+//! (`surrogate::collection`, "Record versions"; `surrogate::sidecar`, "Version 9").
 //!
 //! Choosing a downgrade never changes a file: [`downgrade_warnings`] only reads the headers of the
 //! files under the per-user root to say which of them the older version won't open, and where the
@@ -305,13 +311,14 @@ mod tests {
         let f = current_formats();
         let want: Formats = [
             ("checkpoint", 1),
-            ("collection", 1),
+            // 2 and 9 since the Fermi–Dirac switch (plan 2026-11-13 Task 13; F1: main's 1 and 8, plus one)
+            ("collection", 2),
             ("history", 1),
             ("profile", 1),
             ("pseudo_cache", 1),
             ("replay", 1),
             ("scene", 1),
-            ("sidecar", 8),
+            ("sidecar", 9),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -328,13 +335,16 @@ mod tests {
 
     /// The tripwire for the model-file number (review I2): the sidecar reader itself must refuse
     /// the version after the manifest's as "newer than this build", and must not refuse the
-    /// manifest's own so. A V9 reader added to `surrogate::sidecar` without `MAGICS` (and so the
-    /// manifest) moving on fails here.
+    /// manifest's own so. A reader of a newer version added to `surrogate::sidecar` without
+    /// `MAGICS` (and so the manifest) moving on fails here. Version 9 (the Fermi–Dirac switch) is the
+    /// last an `ASMODEL<digit>` magic holds: at 9 there is no one-digit version after the manifest's
+    /// to probe, so the test checks that every one-digit version reads as this build's, and a
+    /// version 10 needs a new magic layout and a probe of it here.
     #[test]
     fn the_sidecar_number_is_the_newest_the_reader_takes() {
         let root = Root::new("sidecar-tripwire");
         let n = current_formats()[SIDECAR];
-        assert!(n < 9, "a version {} magic no longer fits `ASMODEL<digit>`: this test needs the new layout", n + 1);
+        assert!(n <= 9, "a version {n} magic no longer fits `ASMODEL<digit>`: this test needs the new layout");
         let probe = |ver: u32| {
             let p = root.0.join(format!("probe-v{ver}.model"));
             let mut bytes = format!("ASMODEL{ver}").into_bytes();
@@ -343,10 +353,14 @@ mod tests {
             std::fs::write(&p, bytes).unwrap();
             surrogate::sidecar::read_provenance(&p).expect_err("a header without provenance never reads").to_string()
         };
-        let next = probe(n + 1);
-        assert!(next.contains("newer than this build"), "the reader takes version {}: {next}", n + 1);
-        let this = probe(n);
-        assert!(!this.contains("newer than this build"), "the reader refuses its own newest version {n}: {this}");
+        if n < 9 {
+            let next = probe(n + 1);
+            assert!(next.contains("newer than this build"), "the reader takes version {}: {next}", n + 1);
+        }
+        for ver in 1..=n {
+            let this = probe(ver);
+            assert!(!this.contains("newer than this build"), "the reader refuses version {ver} of its own (newest {n}): {this}");
+        }
     }
 
     /// The collection walk holds each record to the reader's tests (review M4): a bad CRC, a length
@@ -392,7 +406,8 @@ mod tests {
         let root = Root::new("newer-coll");
         let mut current = current_formats();
         current.insert(COLLECTION.into(), 2);
-        let target = current_formats(); // collection 1
+        let mut target = current_formats();
+        target.insert(COLLECTION.into(), 1);
         collection(&root.0, "h-new", &[2, 2]);
         collection(&root.0, "h-old", &[1, 1, 1]);
         collection(&root.0, "h-appended", &[1, 1, 2]); // an older collection a newer build appended to
@@ -455,7 +470,9 @@ mod tests {
         let mut current = current_formats();
         current.insert(COLLECTION.into(), 2);
         current.insert(HISTORY.into(), 2);
-        let target = current_formats(); // collection 1, history 1
+        let mut target = current_formats();
+        target.insert(COLLECTION.into(), 1);
+        target.insert(HISTORY.into(), 1);
         let hist = |slug: &str| std::fs::write(root.0.join("models").join("collections").join(slug).join("history.bin"), b"ASAUDIT2").unwrap();
         collection(&root.0, "h-both", &[2]); // won't open: named as refused only
         hist("h-both");

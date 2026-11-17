@@ -592,7 +592,9 @@ fn a_saved_model_reloads_through_dynamics_and_a_foreign_provenance_is_refused() 
     // (a samples-only file since 2026-10-20 — before, an unfitted state could not be saved)
     d.apply(DynCommand::SaveModel(path.clone()));
     assert_eq!(d.snapshot().last_rejection, None);
-    assert_eq!(&std::fs::read(&path).unwrap()[..8], surrogate::sidecar::MAGIC_V6);
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(&bytes[..8], surrogate::sidecar::MAGIC_V9, "the current format");
+    assert!(String::from_utf8_lossy(&bytes[16..64]).starts_with("{\"format\":\"ASMODEL9\",\"body\":6,"), "a samples-only file (body 6)");
     d.apply(DynCommand::StartSampling(SamplingPlan { perturbations: 30, hot_burst_steps: 20, scan_points_per_pair: 12, ..SamplingPlan::default() }));
     while !d.tick(f64::INFINITY, &mut never()).sampling.unwrap().finished {}
     d.apply(DynCommand::SaveModel(path.clone()));

@@ -1518,7 +1518,8 @@ fn the_autosave_keeps_samples_taught_before_a_fit_formed() {
     assert!(!model(&s).retry_fit, "too few samples: a pass, not the Retry, is the remedy");
     assert!(w.retire(Duration::from_secs(30)), "the worker did not retire");
     let bytes = std::fs::read(&path).expect("the autosave was written, not removed");
-    assert_eq!(&bytes[..8], surrogate::sidecar::MAGIC_V6, "a samples-only file");
+    assert_eq!(&bytes[..8], surrogate::sidecar::MAGIC_V9, "the current format");
+    assert!(String::from_utf8_lossy(&bytes[16..64]).starts_with("{\"format\":\"ASMODEL9\",\"body\":6,"), "a samples-only file (body 6)");
     // the next worker restores them
     let w = SimWorker::spawn_with(h2_41(), Backend::Estimated, Some(ctx), Vec::new(), Some(path.clone()));
     idle(&w);

@@ -7319,7 +7319,8 @@ fn installed_from(path: &std::path::Path) -> (SurrogateKs, sim::IonicPolicy, Pro
 }
 
 /// The coordinator's requirement (2026-10-18): a model file of the current format (ASMODEL5 since
-/// the shell fence's pair, final review I2, ASMODEL7 since the audit history; no new sample codes: a store of plain pass and fallback
+/// the shell fence's pair, final review I2, ASMODEL7 since the audit history, ASMODEL9 carrying body 7
+/// since the Fermi–Dirac switch; no new sample codes: a store of plain pass and fallback
 /// samples, as every file written before the trust
 /// fixes) is re-judged from its stored samples when it is installed — the per-atom classes, the
 /// fenced outliers and the class verdicts recomputed from the geometries and labels, no teacher
@@ -7344,7 +7345,8 @@ fn a_saved_model_is_rejudged_from_its_samples_on_load() {
     let path = std::env::temp_dir().join(format!("trust-fix-rejudge-{}.model", std::process::id()));
     s.save_sidecar(&path).unwrap();
     let magic = std::fs::read(&path).unwrap();
-    assert_eq!(&magic[..8], surrogate::sidecar::MAGIC_V7, "the current format (no new sample codes; version 7 since the audit history, M8a Task 1)");
+    assert_eq!(&magic[..8], surrogate::sidecar::MAGIC_V9, "the current format (no new sample codes; version 9 since the Fermi–Dirac switch)");
+    assert!(String::from_utf8_lossy(&magic[16..64]).starts_with("{\"format\":\"ASMODEL9\",\"body\":7,"), "body 7 (the audit history's, M8a Task 1)");
     let (back, _, _) = installed_from(&path);
     let _ = std::fs::remove_file(&path);
     println!("re-judged on load: {:?}", back.class_loo());
@@ -8270,7 +8272,8 @@ fn a_shell_fence_is_never_lifted_by_a_refit_or_an_install() {
     let path = std::env::temp_dir().join(format!("shell-fence-stands-{}.model", std::process::id()));
     s.save_sidecar(&path).unwrap();
     let magic = std::fs::read(&path).unwrap();
-    assert_eq!(&magic[..8], surrogate::sidecar::MAGIC_V7, "the fence's pair needs format 5 or later (7 since the audit history)");
+    assert_eq!(&magic[..8], surrogate::sidecar::MAGIC_V9, "the fence's pair needs format 5 or later (9 since the Fermi–Dirac switch)");
+    assert!(String::from_utf8_lossy(&magic[16..64]).starts_with("{\"format\":\"ASMODEL9\",\"body\":7,"), "body 7 (5 or later)");
     let (back, _, _) = installed_from(&path);
     let _ = std::fs::remove_file(&path);
     assert_eq!(shell_fences(&back), 1);
