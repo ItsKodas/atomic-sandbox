@@ -63,9 +63,12 @@
 //! moved: a sample's `energy` is the Mermin free energy F on a Fermi–Dirac surface, and a status
 //! record may carry code 9. The reader takes every version from 1 to [`RECORD_VERSION`], record by
 //! record. A version-2 record is only ever written into a folder of a new solver surface (the
-//! ionic tag of the key changed with the switch, so every older folder is a migration's
-//! predecessor, opened read-only, below), so no file mixes versions in practice; the reader would
-//! take one that did. An older build refuses the first version-2 record (next paragraph).
+//! ionic tag of the key changed with the switch, so every folder of a released older build is a
+//! migration's predecessor, opened read-only, below). The preview builds of the Fermi–Dirac branch
+//! (its plan's Tasks 9–12) did compute the new key and wrote **version-1** records into such
+//! folders: this build appends version-2 records after them, so those files mix versions, and the
+//! reader takes the mix. An older build — such a preview included — refuses the first version-2
+//! record (next paragraph), the file untouched.
 //!
 //! A record whose checksum holds but whose kind, version or flags
 //! this build does not know was written by a newer build: the open is refused with that reason and
@@ -391,6 +394,12 @@ pub struct ReadOnlyCollection {
     /// A damaged tail (a crash mid-append) that was not read, said for people; `None` when every
     /// byte was a whole record. The file is never cut.
     pub damaged_tail: Option<String>,
+    /// The length and the hash of the `samples.bin` bytes that were parsed
+    /// ([`crate::migration::fingerprint_bytes`]; F3: what `migration.txt` records at a pass's start,
+    /// taken from the very bytes read — no second read of a file that might change in between).
+    /// `(0, the hash of no bytes)` when there is no `samples.bin`.
+    pub source_len: u64,
+    pub source_hash: u64,
 }
 
 /// Why [`Collection::open_read_only`] read nothing.
@@ -402,7 +411,8 @@ pub enum ReadOnlyError {
     /// The folder is not a readable collection (no or a bad `key.txt`, a `samples.bin` that is not
     /// a collection or of another surface, an I/O error), with the reason.
     Unreadable(String),
-    /// A record of `samples.bin` was written by a newer build: its version byte.
+    /// A record of `samples.bin` was written by a newer build: its version byte (a newer version,
+    /// or a version this build reads holding a kind, flag or tag code it does not know).
     NewerFormat(u8),
 }
 
@@ -411,7 +421,7 @@ impl std::fmt::Display for ReadOnlyError {
         match self {
             ReadOnlyError::LiveWriter { pid } => write!(f, "another copy of the app (process {pid}) has this collection open: reading it now would be reading a store that is still being appended to — close it first"),
             ReadOnlyError::Unreadable(why) => write!(f, "the collection can't be read: {why}"),
-            ReadOnlyError::NewerFormat(v) => write!(f, "the collection holds a record of version {v}, written by a newer build; this build reads versions 1 to {RECORD_VERSION}"),
+            ReadOnlyError::NewerFormat(v) => write!(f, "the collection holds a record written by a newer build (record version {v}; this build reads versions 1 to {RECORD_VERSION} and only the record kinds and fields they define)"),
         }
     }
 }
@@ -1237,12 +1247,15 @@ impl Collection {
             Err(e) => return Err(unreadable(&ref_path, &e)),
         }
         live_writer(dir)?;
+        let (source_len, source_hash) = crate::migration::fingerprint_bytes(&bytes);
         Ok(ReadOnlyCollection {
             key,
             samples: parsed.samples,
             codes: parsed.quarantine,
             references: references.into_iter().map(|((z, n), r)| (z, n, r)).collect(),
             damaged_tail,
+            source_len,
+            source_hash,
         })
     }
 
@@ -2750,6 +2763,10 @@ mod tests {
         assert_eq!(r.references, f.references);
         assert_eq!(r.references.len(), 3);
         assert_eq!(r.damaged_tail, None);
+        // F3: the fingerprint of the bytes parsed, the same as the file's
+        let samples = f.folder.join("samples.bin");
+        assert_eq!((r.source_len, r.source_hash), crate::migration::source_fingerprint(&samples).unwrap());
+        assert_eq!(r.source_len, std::fs::metadata(&samples).unwrap().len());
         // twice: still nothing written
         let again = Collection::open_read_only(&f.folder).unwrap();
         assert_eq!((again.samples, again.codes), (r.samples, r.codes));
@@ -2784,6 +2801,7 @@ mod tests {
         assert_eq!(r.codes, f.codes);
         let note = r.damaged_tail.as_deref().expect("the damaged tail is reported");
         assert!(note.contains("damaged tail"), "{note}");
+        assert_eq!((r.source_len, r.source_hash), crate::migration::source_fingerprint(&path).unwrap(), "the whole file, its damaged tail included");
         assert_eq!(snapshot(&f.folder), before, "nothing cut, nothing set aside");
         assert!(!before.keys().any(|k| k.starts_with("samples.bin.dropped")));
     }
@@ -2888,6 +2906,20 @@ mod tests {
         }
         assert!(ReadOnlyError::NewerFormat(newer_version).to_string().contains("newer build"));
         assert_eq!(std::fs::read(&path).unwrap(), newer, "untouched");
+        // a kind this build does not know, at a version it reads: refused the same way, by its version
+        let mut unknown_kind = bytes.clone();
+        let payload = [9u8, RECORD_VERSION, 0, 0];
+        unknown_kind.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        unknown_kind.extend_from_slice(&crc32(&payload).to_le_bytes());
+        unknown_kind.extend_from_slice(&payload);
+        std::fs::write(&path, &unknown_kind).unwrap();
+        match Collection::open_read_only(&dir.join(key.slug())) {
+            Err(ReadOnlyError::NewerFormat(v)) => assert_eq!(v, RECORD_VERSION),
+            other => panic!("expected NewerFormat, got {other:?}"),
+        }
+        let said = ReadOnlyError::NewerFormat(RECORD_VERSION).to_string();
+        assert!(said.contains("written by a newer build") && said.contains("kinds"), "{said}");
+        assert_eq!(std::fs::read(&path).unwrap(), unknown_kind, "untouched");
         // version 0 was never written: not a format, never read
         std::fs::write(&path, with_version(&bytes, 4, 0)).unwrap();
         assert!(Collection::open(&dir, &key).is_err());

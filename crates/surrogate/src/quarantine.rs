@@ -106,9 +106,12 @@ pub fn is_forgotten_code(code: u8) -> bool {
 /// merged `main` of this plan's Task 2): it never does.
 /// - **a shared collection**: code 9 is written only by this build, only as a status record of
 ///   record version 2 ([`crate::collection::RECORD_VERSION`], the Fermi–Dirac bump), and only into a
-///   collection of the new solver surface, whose folder an older build never computes. Pointed at
-///   it, that build's `Collection::open` refuses the first version-2 record as "written by a newer
-///   build" and leaves the file untouched — before any status is read.
+///   collection of the new solver surface. A released older build never computes that folder's key;
+///   a preview build of the Fermi–Dirac branch (its plan's Tasks 9–12) does, and may have written
+///   version-1 records there itself. Either, pointed at it, refuses the first version-2 record
+///   with `Collection::open` ("written by a newer build") and leaves the file untouched; a code 9
+///   only ever sits in a version-2 status record, which comes after that first one, so it is
+///   never read.
 /// - **a model file**: none holds a 9 (the writers leave such samples out). Were one to, every
 ///   earlier build refuses it whole: its `sample_quarantine` reader takes 0–3, 7 and 8 at most, and the
 ///   file is version 9 ([`crate::sidecar::MAGIC_V9`]), which those builds refuse as "newer than this

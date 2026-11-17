@@ -16,6 +16,15 @@
 //! (end of file — trailing bytes are an error)
 //! ```
 //!
+//! **The magic** names the version: `ASMODEL1` … `ASMODEL9` for versions 1 to 9, and — the
+//! eight bytes holding no two-digit `ASMODEL` — `ASMOD` followed by three decimal digits for
+//! version 10 on (`ASMOD010`, … `ASMOD999`; [`magic_version`]). The layout was fixed with version 9
+//! (plan 2026-11-13 Task 13 fix round 1) so that this build, and every build after it, refuses a
+//! later file as "format version N is newer than this build" — by its number — and treats any other
+//! `ASMOD…` magic it does not know as newer too, never as "not a model sidecar". (A build before
+//! version 9 knows only `ASMODEL<digit>`: it calls an `ASMOD010` file "not a model sidecar" — a
+//! refusal all the same, the file untouched.)
+//!
 //! The header is one JSON object with the keys `format` (the magic as a string), `created_by`
 //! (string), `provenance` {grid_n, h, sigma, tol, charge, multiplicity (int or null), teacher;
 //! from version 3 also `masses`: [[Z, A], …], the recorded isotope set, sorted unique — a record,
@@ -292,8 +301,25 @@ pub const MAGIC_V9: &[u8; 8] = b"ASMODEL9";
 /// Every magic this build reads, oldest first (version = index + 1). Its length is the model-file
 /// format a release manifest records (`app::update::formats`): a new version's magic goes here
 /// with its reader in `parse_header`. `ASMODEL9` is the last version an `ASMODEL<digit>` magic
-/// holds: the next bump needs a new magic layout (and the app's tripwire test a new probe).
+/// holds: from 10 on the magic is `ASMOD<three digits>` (module doc, "The magic"; [`magic_version`]),
+/// which this build already refuses as newer, by number.
 pub const MAGICS: [&[u8; 8]; 9] = [MAGIC, MAGIC_V2, MAGIC_V3, MAGIC_V4, MAGIC_V5, MAGIC_V6, MAGIC_V7, MAGIC_V8, MAGIC_V9];
+/// The version an 8-byte sidecar magic names under the magic layout (module doc, "The magic"):
+/// `ASMODEL<d>` is version d (1 to 9), `ASMOD<ddd>` — three decimal digits — version ddd (10 to 999);
+/// `None` for anything else (`ASMOD009`, `ASMODEL0`, another file's magic). Whether this build reads
+/// that version is [`MAGICS`]'s; `app::update::formats` reads a file's model version with it.
+pub fn magic_version(magic: &[u8]) -> Option<u32> {
+    let m = magic.get(..8)?;
+    if &m[..7] == b"ASMODEL" && (b'1'..=b'9').contains(&m[7]) {
+        return Some(u32::from(m[7] - b'0'));
+    }
+    if &m[..5] == b"ASMOD" && m[5..].iter().all(u8::is_ascii_digit) {
+        let v = m[5..].iter().fold(0u32, |a, &d| 10 * a + u32::from(d - b'0'));
+        return (v >= 10).then_some(v);
+    }
+    None
+}
+
 /// The bodies a version-9 file may carry (ruling R11's old-body set: every body the reader took
 /// from version 6 up; `purge-forgotten` added none): samples without a fit (6), a fitted model (7),
 /// a fitted model with a body-4 basis (8).
@@ -1163,12 +1189,17 @@ fn parse_header(bytes: &[u8]) -> Result<(u8, Json), String> {
     let newest = MAGICS.len();
     let version = match MAGICS.iter().position(|m| &bytes[..8] == *m) {
         Some(i) => i as u8 + 1,
-        // unreachable while every `ASMODEL<digit>` is in `MAGICS` (version 9 on); kept for a build
-        // whose list is shorter
-        None if &bytes[..7] == b"ASMODEL" && bytes[7].is_ascii_digit() => {
-            return Err(format!("format version {} is newer than this build (it reads versions 1 to {newest})", bytes[7] as char));
+        // the magic layout (module doc, "The magic"): a later version says so, by number when the
+        // layout gives one, and so does any other `ASMOD…` magic — never "not a model sidecar"
+        None => {
+            return Err(match magic_version(&bytes[..8]) {
+                Some(v) => format!("format version {v} is newer than this build (it reads versions 1 to {newest})"),
+                None if bytes.starts_with(b"ASMOD") => {
+                    format!("format {:?} is newer than this build (it reads versions 1 to {newest})", String::from_utf8_lossy(&bytes[..8]))
+                }
+                None => format!("not a model sidecar (magic is not ASMODEL1 … ASMODEL{newest})"),
+            });
         }
-        None => return Err(format!("not a model sidecar (magic is not ASMODEL1 … ASMODEL{newest})")),
     };
     let header_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
     let header_end = usize::try_from(header_len)
@@ -2772,6 +2803,32 @@ pub(crate) mod tests {
         assert_eq!(written_body(bytes), Some(body), "{}", &header_of(bytes)[..60.min(header_of(bytes).len())]);
     }
 
+    /// Task 13 fix round 1 (module doc, "The magic"): `ASMODEL<d>` names 1 to 9 and `ASMOD<ddd>` 10 to
+    /// 999; the reader takes exactly `MAGICS`, refuses a later version as newer by its number, any
+    /// other `ASMOD…` magic as newer, and anything else as not a sidecar.
+    #[test]
+    fn the_magic_layout_names_every_version() {
+        for (i, m) in MAGICS.iter().enumerate() {
+            assert_eq!(magic_version(&m[..]), Some(i as u32 + 1));
+        }
+        for (m, v) in [(b"ASMOD010", Some(10)), (b"ASMOD999", Some(999)), (b"ASMOD123", Some(123)), (b"ASMOD009", None), (b"ASMODEL0", None), (b"ASMODELX", None), (b"ASAUDIT1", None), (b"ASMOD01x", None)] {
+            assert_eq!(magic_version(&m[..]), v, "{}", String::from_utf8_lossy(m));
+        }
+        assert_eq!(magic_version(b"ASMOD01"), None, "short");
+        let refusal = |m: &[u8; 8]| {
+            let mut bytes = m.to_vec();
+            bytes.extend_from_slice(&2u64.to_le_bytes());
+            bytes.extend_from_slice(b"{}");
+            parse_header(&bytes).expect_err("no such version, or no provenance")
+        };
+        assert!(refusal(b"ASMOD010").contains("format version 10 is newer than this build (it reads versions 1 to 9)"), "{}", refusal(b"ASMOD010"));
+        assert!(refusal(b"ASMOD999").contains("format version 999 is newer"));
+        assert!(refusal(b"ASMODELX").contains("\"ASMODELX\" is newer than this build"), "{}", refusal(b"ASMODELX"));
+        assert!(refusal(b"ASMOD009").contains("is newer than this build"));
+        assert!(refusal(b"NOTAMODL").contains("not a model sidecar"));
+        assert!(!refusal(MAGIC_V9).contains("newer"), "this build's own");
+    }
+
     /// Fermi–Dirac plan Task 13 (spec §7.7, ruling R11, F1): one new magic, `ASMODEL<K + 1>` with
     /// K = 8 = Task 2's `MAGICS.len()`, carries every body this build writes — R11's old-body set
     /// {6, 7, 8} (`purge-forgotten` added no body) — and names it in the header. Each round-trips
@@ -3512,6 +3569,10 @@ pub(crate) mod tests {
         std::fs::write(&p, [MAGIC_V9.as_slice(), &good[8..]].concat()).unwrap();
         let e = read(&p).unwrap_err();
         assert!(e.to_string().contains("does not match the file's version 9"), "{e}");
+        // a later version (the `ASMOD<ddd>` layout, module doc "The magic") says so, by number
+        std::fs::write(&p, [b"ASMOD010".as_slice(), &good[8..]].concat()).unwrap();
+        let e = read(&p).unwrap_err();
+        assert!(e.to_string().contains("format version 10 is newer than this build"), "{e}");
         // body-3 corruptions: a v1 format string under the v3 magic, an unsupported l_max, a
         // body-2 header over a body-3 body, a terms list that does not match the layout (two
         // swapped)

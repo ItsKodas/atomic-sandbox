@@ -119,7 +119,13 @@ pub struct MigrationLog {
 /// [`MigrationLog::source_len`] and [`MigrationLog::source_hash`] record, and what a resume compares).
 pub fn source_fingerprint(samples: &Path) -> Result<(u64, u64), String> {
     let bytes = std::fs::read(samples).map_err(|e| format!("{}: {e}", samples.display()))?;
-    Ok((bytes.len() as u64, crate::model::fnv1a64(&bytes)))
+    Ok(fingerprint_bytes(&bytes))
+}
+
+/// [`source_fingerprint`] of bytes already read (`Collection::open_read_only` fingerprints the very
+/// bytes it parsed).
+pub fn fingerprint_bytes(bytes: &[u8]) -> (u64, u64) {
+    (bytes.len() as u64, crate::model::fnv1a64(bytes))
 }
 
 /// `s` escaped onto one line (module doc).

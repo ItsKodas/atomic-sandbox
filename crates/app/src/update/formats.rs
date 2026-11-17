@@ -107,10 +107,15 @@ fn collection_version(samples: &Path) -> Option<u32> {
     }
 }
 
-/// The version digit of an 8-byte magic `<prefix><digit>` (`ASMODEL8`, `ASAUDIT1`).
+/// The version of an 8-byte magic `<prefix><digit>` (`ASAUDIT1`); for a model file (`prefix`
+/// `ASMODEL`) the sidecar's magic layout, `ASMODEL<d>` or from version 10 on `ASMOD<ddd>`
+/// (`surrogate::sidecar::magic_version`).
 fn magic_version(path: &Path, prefix: &[u8; 7]) -> Option<u32> {
     let mut magic = [0u8; 8];
     std::fs::File::open(path).ok()?.read_exact(&mut magic).ok()?;
+    if prefix == b"ASMODEL" {
+        return surrogate::sidecar::magic_version(&magic);
+    }
     (&magic[..7] == prefix && magic[7].is_ascii_digit()).then(|| u32::from(magic[7] - b'0'))
 }
 
@@ -336,31 +341,32 @@ mod tests {
     /// The tripwire for the model-file number (review I2): the sidecar reader itself must refuse
     /// the version after the manifest's as "newer than this build", and must not refuse the
     /// manifest's own so. A reader of a newer version added to `surrogate::sidecar` without
-    /// `MAGICS` (and so the manifest) moving on fails here. Version 9 (the Fermi–Dirac switch) is the
-    /// last an `ASMODEL<digit>` magic holds: at 9 there is no one-digit version after the manifest's
-    /// to probe, so the test checks that every one-digit version reads as this build's, and a
-    /// version 10 needs a new magic layout and a probe of it here.
+    /// `MAGICS` (and so the manifest) moving on fails here. The magic is `ASMODEL<d>` up to 9 and
+    /// `ASMOD<ddd>` from 10 on (`surrogate::sidecar` "The magic", Task 13 fix round 1); the
+    /// downgrade scan reads both.
     #[test]
     fn the_sidecar_number_is_the_newest_the_reader_takes() {
         let root = Root::new("sidecar-tripwire");
         let n = current_formats()[SIDECAR];
-        assert!(n <= 9, "a version {n} magic no longer fits `ASMODEL<digit>`: this test needs the new layout");
+        assert!(n < 999, "a version {} magic no longer fits `ASMOD<ddd>`: this test needs the new layout", n + 1);
+        let magic = |ver: u32| if ver <= 9 { format!("ASMODEL{ver}") } else { format!("ASMOD{ver:03}") };
         let probe = |ver: u32| {
             let p = root.0.join(format!("probe-v{ver}.model"));
-            let mut bytes = format!("ASMODEL{ver}").into_bytes();
+            let mut bytes = magic(ver).into_bytes();
             bytes.extend_from_slice(&2u64.to_le_bytes());
             bytes.extend_from_slice(b"{}");
             std::fs::write(&p, bytes).unwrap();
+            assert_eq!(magic_version(&p, b"ASMODEL"), Some(ver), "the downgrade scan reads {}", magic(ver));
             surrogate::sidecar::read_provenance(&p).expect_err("a header without provenance never reads").to_string()
         };
-        if n < 9 {
-            let next = probe(n + 1);
-            assert!(next.contains("newer than this build"), "the reader takes version {}: {next}", n + 1);
-        }
+        let next = probe(n + 1);
+        assert!(next.contains("newer than this build"), "the reader takes version {}: {next}", n + 1);
+        assert!(next.contains(&format!("format version {}", n + 1)), "by its number: {next}");
         for ver in 1..=n {
             let this = probe(ver);
             assert!(!this.contains("newer than this build"), "the reader refuses version {ver} of its own (newest {n}): {this}");
         }
+        assert_eq!(probe(10).contains("newer than this build"), n < 10);
     }
 
     /// The collection walk holds each record to the reader's tests (review M4): a bad CRC, a length
