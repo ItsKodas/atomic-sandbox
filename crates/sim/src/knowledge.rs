@@ -96,6 +96,48 @@
 //! verdict counts its fitted samples by) and [`KnowledgeMap::pending_classes`] those holding one
 //! of each class, each sample once per key or class, as the fitted counts are; no verdict reads
 //! them.
+//!
+//! # Three-atom arrangements (2026-11-17: the three-atom coverage map, spec §6.1–§6.3)
+//!
+//! The pair graph shows each distance's 1-D shadow; [`triples`] counts the arrangements the
+//! model's body-3 terms actually sum. Plain data and geometry, Bohr throughout, nothing per
+//! element beyond Z.
+//!
+//! - **What is counted.** A triple type a–c–b ([`TripleType`]: centre species c, neighbour species
+//!   a ≤ b). A triple (i, {j, k}) counts when centre i trains, j ≠ k are both within r_cut of i
+//!   (0 < r_ij, r_ik < r_cut) and their species are {a, b}. The j–k distance may be anything,
+//!   beyond r_cut too, and each unordered {j, k} counts once: exactly the neighbour pairs body-3
+//!   sums (`surrogate::descriptor`, "Body-3 features"), without its j = k terms, which are body-2
+//!   functions, not arrangements. The neighbour set is every neighbour within r_cut, **not** the
+//!   first shell of the element card's angles, which stays a chemistry-like view. One enumeration,
+//!   [`each_triple`], serves the builder, the planner and the scene's markers; a coincident
+//!   (r = 0) neighbour is skipped, so no NaN reaches a bin.
+//! - **Axes and cells.** r₁ = r_ij to the species-a neighbour, r₂ = r_ik to the species-b one, u =
+//!   cos θ_jik, the angle at the centre. Distances in [`TRIPLE_BIN`] = 0.3 Bohr bins from 0 (the
+//!   pair rule's three-bin window), ⌈r_cut/0.3⌉ of them; u in [`COS_BINS`] = 10 bins of 0.2, θ
+//!   increasing with the bin (edges 0, 37, 53, 66, 78, 90, 102, 114, 127, 143, 180°).
+//! - **Why cos θ.** Body-3 sees the angle only through P_l(cos θ), l ≤ l_max = 3: a cubic in u, so
+//!   equal widths in u are equal spans of what the descriptor resolves. Equal θ bins would split
+//!   near-linear arrangements it cannot tell apart (cos 170° = −0.985, cos 180° = −1). The edges
+//!   fall where they fall; none is placed to suit a molecule.
+//! - **The fold.** For a = b the type is symmetric under r₁ ↔ r₂: r₁ = min, r₂ = max (the nearer
+//!   neighbour is j; a tie goes to the lower index), and only cells with k₁ ≤ k₂ are stored.
+//! - **Classes** ([`cell_class`]): the cell is its own window. Taught when its fitted count n
+//!   [`reads_taught`] (n ≥ [`taught_count`] = 10, the pair rule's threshold); thin for 1 ≤ n < 10;
+//!   missing when n = 0 and the cell is in the type's reach; otherwise not drawn.
+//! - **The reach** ([`reach`]), judged at the cell's centre: r₁ in the c–a pair's taught range
+//!   ([`taught_range`]) and r₂ in the c–b pair's, both ≤ the pair scan's limit 5/6·r_cut (supplied
+//!   by the builder, `providers::SCAN_CUTOFF_FRACTION`), and the third side
+//!   r_ab = √(r₁² + r₂² − 2r₁r₂u) at least the a–b pair's shortest fitted distance (r_cut when it
+//!   has none). In reach means every edge length was taught on the pair graphs but this
+//!   arrangement never was: the gap the pair graph cannot show.
+//! - **Fitted versus pending.** Fitted counts come from the knowledge map's sample rule, pending
+//!   ones from the samples waiting for the refit; pending counts are kept apart ("new, waiting for
+//!   refit") and never move a class.
+//! - **What it does not say.** A count of arrangements, not the model's trust or accuracy: body-3 is
+//!   smooth in the distances and in u (its radial structure, degree ≤ D = 4, is far coarser than
+//!   0.3 Bohr), so it may interpolate across a missing cell, and a taught cell can still be wrong.
+//!   Four-atom (body-4) arrangements are learned too and not counted here.
 
 /// Pair-distance histogram bin (Bohr): the training views' (`TrainingViews::pairs`).
 pub const BIN: f64 = 0.1;

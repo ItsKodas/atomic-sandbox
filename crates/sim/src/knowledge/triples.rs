@@ -1,7 +1,7 @@
 //! The three-atom coverage map's counting core (spec 2026-11-17 §6.1–§6.3; the module doc of
 //! [`super`], "Three-atom arrangements").
 
-use super::{Composition, BIN};
+use super::{reads_taught, taught_range, Composition, PairHistogram, BIN};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -253,9 +253,212 @@ impl TripleTally {
     }
 }
 
+/// A fitted pair's taught distances (Bohr; [`super::taught_range`]): `lo` the lower edge of its
+/// first filled bin, the shortest it was taught; `hi` the upper edge of its last.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PairSpan {
+    /// (min Z, max Z).
+    pub z: (u8, u8),
+    pub lo: f64,
+    pub hi: f64,
+}
+
+impl PairSpan {
+    /// The span of a fitted pair histogram; `None` when it holds no distance.
+    pub fn of(h: &PairHistogram) -> Option<PairSpan> {
+        let (lo, hi) = taught_range(h)?;
+        Some(PairSpan { z: (h.z.0.min(h.z.1), h.z.0.max(h.z.1)), lo, hi })
+    }
+}
+
+/// What the model's basis holds, for the panel's honest-limits band (spec §6.7): body-3 and
+/// body-4 terms, the total-degree cap D and the angular l_max.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TripleBasis {
+    pub body3: bool,
+    pub body4: bool,
+    pub degree_cap: usize,
+    pub l_max: usize,
+}
+
+/// One triple type in the map (spec §6.1): fitted and pending counts on the map's grid.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TripleKnowledge {
+    pub t: TripleType,
+    /// The fitted samples holding it.
+    pub samples: usize,
+    /// Its fitted triples.
+    pub triples: u64,
+    /// Fitted counts per cell (the fitted block's, shared, not copied): the classes read these alone.
+    pub counts: Arc<[u32]>,
+    /// Pending counts per cell ("new, waiting for refit"): they enter no class.
+    pub pending: Vec<u32>,
+    /// The pending samples holding it.
+    pub pending_samples: usize,
+    /// The top three fitted compositions holding it, most first.
+    pub compositions: Vec<(Composition, usize)>,
+}
+
+/// The three-atom coverage map (spec §6.1–§6.3): per triple type of the fitted or pending samples,
+/// ascending, its counts; the fitted pairs' spans the reach is judged from.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TripleMap {
+    pub grid: TripleGrid,
+    /// The model's cutoff (Bohr).
+    pub r_cut: f64,
+    /// The pair scan's limit (Bohr), 5/6·r_cut (`providers::SCAN_CUTOFF_FRACTION`, supplied by the
+    /// builder; `sim` keeps no copy): the reach ends there.
+    pub reach_limit: f64,
+    pub basis: TripleBasis,
+    /// Every fitted pair with a taught distance, z normalised to (min, max).
+    pub spans: Vec<PairSpan>,
+    pub types: Vec<TripleKnowledge>,
+}
+
+impl TripleMap {
+    /// The map from the fitted and the pending blocks (each on `TripleGrid::new(r_cut)`): one entry
+    /// per type of either, ascending. `counts` is the fitted block's `Arc`, cloned (zeros for a
+    /// pending-only type); `pending` the pending block's counts (zeros for none).
+    pub fn assemble(r_cut: f64, reach_limit: f64, basis: TripleBasis, spans: Vec<PairSpan>, fitted: &[TripleBlock], pending: &[TripleBlock]) -> TripleMap {
+        let grid = TripleGrid::new(r_cut);
+        let cells = grid.cells();
+        let spans = spans.into_iter().map(|s| PairSpan { z: (s.z.0.min(s.z.1), s.z.0.max(s.z.1)), ..s }).collect();
+        let mut by: BTreeMap<TripleType, (Option<&TripleBlock>, Option<&TripleBlock>)> = BTreeMap::new();
+        for b in fitted {
+            by.entry(b.t).or_default().0 = Some(b);
+        }
+        for b in pending {
+            by.entry(b.t).or_default().1 = Some(b);
+        }
+        let zeros: Arc<[u32]> = vec![0; cells].into();
+        let types = by
+            .into_iter()
+            .map(|(t, (f, p))| {
+                debug_assert!(f.is_none_or(|b| b.counts.len() == cells) && p.is_none_or(|b| b.counts.len() == cells), "a block off the map's grid");
+                let mut pend = p.map_or_else(Vec::new, |b| b.counts.to_vec());
+                pend.resize(cells, 0);
+                TripleKnowledge {
+                    t,
+                    samples: f.map_or(0, |b| b.samples),
+                    triples: f.map_or(0, |b| b.triples),
+                    counts: f.map_or_else(|| zeros.clone(), |b| b.counts.clone()),
+                    pending: pend,
+                    pending_samples: p.map_or(0, |b| b.samples),
+                    compositions: f.map_or_else(Vec::new, |b| b.compositions.clone()),
+                }
+            })
+            .collect();
+        TripleMap { grid, r_cut, reach_limit, basis, spans, types }
+    }
+
+    /// The type `t`'s entry.
+    pub fn get(&self, t: TripleType) -> Option<&TripleKnowledge> {
+        self.types.iter().find(|k| k.t == t)
+    }
+
+    /// The span of the pair (a, b), either order.
+    pub fn span(&self, a: u8, b: u8) -> Option<&PairSpan> {
+        let z = (a.min(b), a.max(b));
+        self.spans.iter().find(|s| s.z == z)
+    }
+}
+
+/// A cell's class (spec §6.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellClass {
+    /// Fitted count n with [`reads_taught`] (n ≥ `taught_count()` = 10).
+    Taught,
+    /// 1 ≤ n < 10.
+    Thin,
+    /// n = 0, in the type's reach.
+    Missing,
+    /// n = 0 outside the reach (not drawn), a folded type's k₁ > k₂ half, or no cell of the grid.
+    OutOfReach,
+}
+
+/// The cell is in the type's reach (spec §6.3), judged at its centre (r₁, r₂, u):
+/// 1. r₁ in the c–a pair's taught span and r₁ ≤ `reach_limit`;
+/// 2. r₂ in the c–b pair's taught span and r₂ ≤ `reach_limit`;
+/// 3. r_ab = √(r₁² + r₂² − 2r₁r₂u) (the law of cosines: the a–b side opposite the angle at c) at
+///    least the a–b pair's shortest fitted distance, or r_cut when a–b has none within r_cut.
+///
+/// False for a folded type's k₁ > k₂ half and an index past the grid.
+pub fn reach(map: &TripleMap, t: TripleType, cell: usize) -> bool {
+    let g = &map.grid;
+    if cell >= g.cells() {
+        return false;
+    }
+    let (k1, k2, _) = g.coords(cell);
+    if t.folded() && k1 > k2 {
+        return false;
+    }
+    let (r1, r2, u) = g.centre(cell);
+    let (Some(ca), Some(cb)) = (map.span(t.centre, t.a), map.span(t.centre, t.b)) else {
+        return false;
+    };
+    let within = |s: &PairSpan, r: f64| s.lo <= r && r <= s.hi && r <= map.reach_limit;
+    if !(within(ca, r1) && within(cb, r2)) {
+        return false;
+    }
+    let r_ab = (r1 * r1 + r2 * r2 - 2.0 * r1 * r2 * u).max(0.0).sqrt();
+    r_ab >= map.span(t.a, t.b).map_or(map.r_cut, |s| s.lo)
+}
+
+/// The cell's class (spec §6.3), from the fitted count alone: pending counts move nothing.
+pub fn cell_class(map: &TripleMap, tk: &TripleKnowledge, cell: usize) -> CellClass {
+    let g = &map.grid;
+    if cell >= g.cells() {
+        return CellClass::OutOfReach;
+    }
+    let (k1, k2, _) = g.coords(cell);
+    if tk.t.folded() && k1 > k2 {
+        return CellClass::OutOfReach;
+    }
+    match tk.counts.get(cell).copied().unwrap_or(0) {
+        0 if reach(map, tk.t, cell) => CellClass::Missing,
+        0 => CellClass::OutOfReach,
+        n if reads_taught(n) => CellClass::Taught,
+        _ => CellClass::Thin,
+    }
+}
+
+/// A type's cells by class (spec §6.3): `taught` and `thin` over every filled cell, `missing` over
+/// the empty cells in reach; `gaps` (the picker's order) the cells in reach that are not taught,
+/// thin or missing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct TripleSummary {
+    pub taught: usize,
+    pub thin: usize,
+    pub missing: usize,
+    pub gaps: usize,
+}
+
+/// The type's [`TripleSummary`].
+pub fn summary(map: &TripleMap, tk: &TripleKnowledge) -> TripleSummary {
+    let mut s = TripleSummary::default();
+    for c in 0..map.grid.cells() {
+        match cell_class(map, tk, c) {
+            CellClass::Taught => s.taught += 1,
+            CellClass::Thin => {
+                s.thin += 1;
+                if reach(map, tk.t, c) {
+                    s.gaps += 1;
+                }
+            }
+            CellClass::Missing => {
+                s.missing += 1;
+                s.gaps += 1;
+            }
+            CellClass::OutOfReach => {}
+        }
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::knowledge::taught_count;
 
     #[test]
     fn the_grid_spans_r_cut_in_0_3_bohr_bins() {
@@ -395,5 +598,85 @@ mod tests {
         let mut tally = TripleTally::new(6.0);
         tally.add(&z, &pos, |_| true);
         assert_eq!(tally.finish().iter().map(|b| b.triples).sum::<u64>(), 1);
+    }
+
+    const BASIS: TripleBasis = TripleBasis { body3: true, body4: false, degree_cap: 4, l_max: 3 };
+
+    fn span(z: (u8, u8), lo: f64, hi: f64) -> PairSpan {
+        PairSpan { z, lo, hi }
+    }
+
+    /// A block on the r_cut-6 grid with these cell counts, one sample, no compositions.
+    fn block(t: TripleType, cells: &[(usize, u32)]) -> TripleBlock {
+        let mut counts = vec![0u32; TripleGrid::new(6.0).cells()];
+        for &(c, n) in cells {
+            counts[c] += n;
+        }
+        TripleBlock { t, counts: counts.into(), samples: 1, triples: cells.iter().map(|&(_, n)| n as u64).sum(), compositions: Vec::new() }
+    }
+
+    /// Spec M4.
+    #[test]
+    fn a_cell_is_taught_at_taught_count_and_pending_moves_nothing() {
+        let g = TripleGrid::new(6.0);
+        let (t, only_new) = (TripleType::new(8, 1, 1), TripleType::new(8, 1, 8));
+        let (thin, taught, empty) = (g.index(true, 6, 6, 6), g.index(true, 6, 6, 5), g.index(true, 6, 6, 7));
+        let spans = vec![span((1, 1), 2.6, 3.2), span((1, 8), 1.6, 2.2)];
+        let fitted = block(t, &[(thin, taught_count() - 1), (taught, taught_count())]);
+        let m0 = TripleMap::assemble(6.0, 5.0, BASIS, spans.clone(), &[fitted.clone()], &[]);
+        let tk = m0.get(t).unwrap();
+        assert_eq!([thin, taught, empty].map(|c| cell_class(&m0, tk, c)), [CellClass::Thin, CellClass::Taught, CellClass::Missing]);
+        assert_eq!(cell_class(&m0, tk, g.index(false, 7, 6, 6)), CellClass::OutOfReach, "a folded type's k₁ > k₂ half is never a cell");
+        let m1 = TripleMap::assemble(6.0, 5.0, BASIS, spans, &[fitted], &[block(t, &[(thin, 50), (empty, 50)]), block(only_new, &[(thin, 3)])]);
+        let tk1 = m1.get(t).unwrap();
+        assert_eq!([thin, taught, empty].map(|c| cell_class(&m1, tk1, c)), [CellClass::Thin, CellClass::Taught, CellClass::Missing], "pending never moves a class");
+        assert!(Arc::ptr_eq(&tk.counts, &tk1.counts) && tk1.pending[empty] == 50);
+        let n = m1.get(only_new).unwrap();
+        assert_eq!((n.samples, n.triples, n.counts.iter().sum::<u32>(), n.pending_samples), (0, 0, 0, 1), "a type only pending samples hold");
+        let s = summary(&m0, tk);
+        let brute = (0..g.cells()).filter(|&c| cell_class(&m0, tk, c) == CellClass::Missing).count();
+        assert_eq!(s, TripleSummary { taught: 1, thin: 1, missing: brute, gaps: brute + 1 });
+    }
+
+    /// Spec M5.
+    #[test]
+    fn reach_follows_the_three_pair_spans() {
+        let g = TripleGrid::new(6.0);
+        let hoh = TripleType::new(8, 1, 1);
+        let m = TripleMap::assemble(6.0, 5.0, BASIS, vec![span((1, 1), 2.8, 4.0), span((1, 8), 1.5, 2.4)], &[], &[]);
+        // 1 and 2: both distances in O–H's taught range, judged at the bin centre (1.65 in, 1.35 and 2.55 out)
+        assert!(reach(&m, hoh, g.index(true, 5, 7, 9)));
+        assert!(!reach(&m, hoh, g.index(true, 4, 6, 9)) && !reach(&m, hoh, g.index(true, 6, 8, 9)));
+        // 3: r_ab ≥ H–H's shortest fitted distance 2.8 — at r₁ = r₂ = 1.95, cos −0.1 gives 2.89 (in), cos 0.1 gives 2.62 (out)
+        assert!(reach(&m, hoh, g.index(true, 6, 6, 5)) && !reach(&m, hoh, g.index(true, 6, 6, 4)));
+        // a–b never fitted within r_cut: the bound is r_cut, so no water-sized cell is in reach
+        let no_hh = TripleMap::assemble(6.0, 5.0, BASIS, vec![span((1, 8), 1.5, 2.4)], &[], &[]);
+        assert!((0..g.cells()).all(|c| !reach(&no_hh, hoh, c)));
+        // the scan's limit: r ≤ reach_limit even inside the taught range (4.95 in, 5.25 out)
+        let far = TripleMap::assemble(6.0, 5.0, BASIS, vec![span((1, 1), 0.5, 6.0), span((1, 8), 1.5, 5.8)], &[], &[]);
+        assert!(reach(&far, hoh, g.index(true, 16, 16, 9)) && !reach(&far, hoh, g.index(true, 16, 17, 9)));
+        // no c–a span: nothing
+        assert!((0..g.cells()).all(|c| !reach(&m, TripleType::new(6, 1, 1), c)));
+    }
+
+    /// A mixed type reads its spans by species, c–a for r₁ and c–b for r₂; a span is found in either
+    /// order; PairSpan::of is the pair's taught range; a cell index past the grid is out of reach.
+    #[test]
+    fn a_mixed_type_reads_c_a_for_r1_and_c_b_for_r2() {
+        let g = TripleGrid::new(6.0);
+        let t = TripleType::new(6, 1, 8); // H–C–O: r₁ to H, r₂ to O
+        let spans = vec![span((1, 6), 1.8, 2.4), span((6, 8), 2.4, 3.0), span((1, 8), 2.0, 6.0)];
+        let m = TripleMap::assemble(6.0, 5.0, BASIS, spans, &[], &[]);
+        assert!(m.span(8, 6).is_some_and(|s| s.z == (6, 8)));
+        // r₁ 1.95 (C–H in), r₂ 2.55 (C–O in), cos −0.5: r_ab ≈ 3.91 ≥ 2.0
+        assert!(reach(&m, t, g.index(false, 6, 8, 7)));
+        assert!(!reach(&m, t, g.index(false, 8, 6, 7)), "the swap: r₁ 2.55 is past C–H's 2.4");
+        assert!(!reach(&m, t, g.cells()) && !reach(&m, t, usize::MAX));
+        let tk = TripleKnowledge { t, samples: 0, triples: 0, counts: vec![0; g.cells()].into(), pending: vec![0; g.cells()], pending_samples: 0, compositions: Vec::new() };
+        assert_eq!(cell_class(&m, &tk, g.cells()), CellClass::OutOfReach);
+        let h = PairHistogram { z: (1, 6), bin: BIN, counts: vec![0, 0, 3, 0, 5, 0] };
+        let s = PairSpan::of(&h).unwrap();
+        assert!(s.z == (1, 6) && (s.lo - 0.2).abs() < 1e-12 && (s.hi - 0.5).abs() < 1e-12);
+        assert_eq!(PairSpan::of(&PairHistogram { z: (1, 1), bin: BIN, counts: vec![0; 4] }), None);
     }
 }
