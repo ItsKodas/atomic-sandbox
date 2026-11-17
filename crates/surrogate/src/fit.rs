@@ -3693,9 +3693,68 @@ mod tests {
         }
     }
 
+    /// Review M3: a start far from the optimum (λ × 1e3, σ_E × 10, σ_F × 0.1), a start taken from a
+    /// fit on another basis (the degree cap toggled, as a recovery's step 3 passes one), and a start
+    /// on a fit without energy rows (s_E pinned at `SIGMA_E_WITHOUT_ENERGY_ROWS`, which overrides the
+    /// start's): each search meets the cold search's stopping test, within 3e-3 of its optimum.
+    #[test]
+    fn a_start_far_off_or_from_another_basis_still_reaches_the_cold_optimum() {
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        let samples = morse_bend_noisy(&mut StdRng::seed_from_u64(83), 200, 1e-4, 2e-3);
+        let fit_on = |basis: &Basis, samples: &[Sample], start: Option<SearchStart>| {
+            let mut acc = Accumulator::new(basis);
+            for s in samples {
+                acc.add(s, basis, &refs, &opts).unwrap();
+            }
+            let (_, r) = acc.refit_from(&opts, &provenance(), &refs, start).unwrap();
+            let rounds = match acc.last_refit() {
+                RefitKind::Spectral { rounds, from_start, .. } => {
+                    assert_eq!(from_start, start.is_some());
+                    rounds
+                }
+                k => panic!("expected a spectral search, got {k:?}"),
+            };
+            (r, rounds)
+        };
+        let close = |label: &str, a: &FitReport, b: &FitReport| {
+            eprintln!("{label}: λ {:.1e} s_E² {:.1e} s_F² {:.1e}", rel_change(a.lambda, b.lambda), rel_change(a.sigma_e.powi(2), b.sigma_e.powi(2)), rel_change(a.sigma_f.powi(2), b.sigma_f.powi(2)));
+            assert!(a.converged && b.converged, "{label}");
+            for (what, x, y) in [("λ", a.lambda, b.lambda), ("s_E²", a.sigma_e.powi(2), b.sigma_e.powi(2)), ("s_F²", a.sigma_f.powi(2), b.sigma_f.powi(2))] {
+                assert!(rel_change(x, y) < 3e-3, "{label} {what}: cold {x:e} vs started {y:e}");
+            }
+        };
+        // far from the optimum
+        let basis = small_body4_basis();
+        let (cold, cold_rounds) = fit_on(&basis, &samples, None);
+        let s0 = cold.search_start();
+        let far = SearchStart { lambda: 1e3 * s0.lambda, sigma_e: 10.0 * s0.sigma_e, sigma_f: 0.1 * s0.sigma_f };
+        let (r, rounds) = fit_on(&basis, &samples, Some(far));
+        eprintln!("far start: {rounds} rounds (cold {cold_rounds})");
+        close("far start", &cold, &r);
+        // from another basis's fit: the degree cap toggled
+        let mut capped = small_body4_basis();
+        capped.degree_cap = 2;
+        assert_ne!(capped, basis);
+        let (other, _) = fit_on(&capped, &samples, None);
+        let (r, rounds) = fit_on(&basis, &samples, Some(other.search_start()));
+        eprintln!("start from the degree-cap-2 fit (λ {:.3e} σ_E {:.3e} σ_F {:.3e}): {rounds} rounds", other.lambda, other.sigma_e, other.sigma_f);
+        close("another basis", &cold, &r);
+        // no energy rows: s_E is the pin whatever the start says
+        let force_only: Vec<Sample> = samples.iter().cloned().map(masked).collect();
+        let (cold_f, _) = fit_on(&basis, &force_only, None);
+        let (r, _) = fit_on(&basis, &force_only, Some(SearchStart { sigma_e: 0.37 * s0.sigma_e, ..s0 }));
+        assert_eq!((cold_f.sigma_e, r.sigma_e), (SIGMA_E_WITHOUT_ENERGY_ROWS, SIGMA_E_WITHOUT_ENERGY_ROWS));
+        close("no energy rows", &cold_f, &r);
+    }
+
     /// `refit_from(.., None)` is `refit`, bit for bit: on a body-4 basis (the spectral search, then
     /// a warm refit) and on a basis without body-4 (`solve`), where a start has no hook and a
-    /// started refit is the plain one.
+    /// started refit is the plain one. `refit` is defined as `refit_from(.., None)`, so on this
+    /// branch the first comparison guards the delegation only; the evidence that a refit with no
+    /// start is main's, bit for bit, is the `refit_golden` compare against a main record
+    /// (`references.md` "Warm-started recovery trials": 0 differences in three cases, every search's
+    /// round count included) and the unchanged pinned tests of this module (review M2).
     #[test]
     fn no_start_is_todays_refit() {
         let mut rng = StdRng::seed_from_u64(82);

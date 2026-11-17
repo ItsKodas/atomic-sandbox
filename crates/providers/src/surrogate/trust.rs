@@ -1750,6 +1750,10 @@ impl SurrogateKs {
     /// A trust failure the recovery (degree cap, quarantine) can act on: the training residuals
     /// or the force noise.
     pub(super) fn recoverable_fail(&self) -> bool {
+        #[cfg(test)]
+        if self.forced_fail_gen == Some(self.model_gen) {
+            return true; // the `confirm_fail` seam's fit (`tests/recovery_warm.rs`)
+        }
         self.residuals_fail() || self.noise_fails()
     }
 
@@ -1866,12 +1870,12 @@ impl SurrogateKs {
     /// solve error, is in place). A fit that is not a trial (already cold, the dense path, a
     /// restored one) is judged as it is, at no cost.
     pub(super) fn confirm_cold(&mut self, accept: impl Fn(&Self) -> bool) -> Option<FitReport> {
+        #[cfg(test)]
+        let (call, before, refitted) = {
+            self.confirm_calls += 1;
+            (self.confirm_calls - 1, (self.quarantine.clone(), self.degree_cap, self.recovery.clone(), self.species_dirty), self.trial_fit)
+        };
         if self.trial_fit {
-            #[cfg(test)]
-            if self.confirm_fail == Some(ConfirmFail::Outright) {
-                self.confirm_fail = None;
-                return None;
-            }
             // the trial's own null space is never needed: the cold fit replaces the trial
             // (`fit_store_with` would compute it first on its incremental path, O(Q′³))
             let pending = std::mem::replace(&mut self.null_space_pending, false);
@@ -1880,11 +1884,19 @@ impl SurrogateKs {
                 self.null_space_pending = pending;
                 return None;
             }
-            #[cfg(test)]
-            if self.confirm_fail == Some(ConfirmFail::Cold) {
-                self.confirm_fail = None;
-                return None;
-            }
+        }
+        #[cfg(test)]
+        if self.confirm_fail == Some(call) {
+            self.forced_fail_gen = Some(self.model_gen);
+            self.confirm_failed = Some(ConfirmFailed {
+                before,
+                after: (self.quarantine.clone(), self.degree_cap, self.recovery.clone(), self.species_dirty),
+                refitted,
+                trial_fit: self.trial_fit,
+                report: self.report.clone(),
+                model: self.model.clone(),
+            });
+            return None;
         }
         if accept(self) {
             self.report.clone()

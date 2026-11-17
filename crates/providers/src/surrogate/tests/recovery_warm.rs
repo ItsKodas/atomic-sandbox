@@ -1,6 +1,6 @@
 //! Spec `2026-11-17-recovery-warm-start-design.md` (option B): a trust recovery's trial fits are
 //! searched from the previous fit's hyperparameters (`fit_trial`, `surrogate::Accumulator::refit_from`),
-//! and a trial that would stand is searched again from the data (`confirm_cold`) and judged on
+//! and a trial that would stand or end the rounds is searched again from the data (`confirm_cold`) and judged on
 //! that fit. Every fit that stands is the cold search of its store state — what a reopened
 //! collection computes — and a trial that fails cold is a failed trial.
 //!
@@ -9,8 +9,7 @@
 //! a DFT-like scatter, and one H₂ whose energy label is 0.05 Ha off — the training residuals fail,
 //! step 1's degree-cap retry cannot fit the glitch, and the quarantine rounds hold it. Measured: the
 //! recovery's searches (from a start?, rounds) are the entry fit (no, 3), the cap trial (no, 3),
-//! the leave-one-out round (yes, 5) and its confirmation (no, 5); with the first confirmation
-//! failed, the training ranking's round (yes, 5) and its confirmation (no, 5) follow.
+//! the leave-one-out round (yes, 5) and its confirmation at the rounds' stop test (no, 5).
 use super::*;
 
 /// The glitch's store index in [`glitch_collection`].
@@ -142,39 +141,99 @@ fn a_recoverys_standing_fit_is_a_cold_search() {
     assert_eq!(s.model().unwrap().coeffs, t.model().unwrap().coeffs);
 }
 
-/// Spec "Acceptance" (a trial that fails cold): with the first confirmation forced to fail after
-/// its cold refit (`confirm_fail` = `Cold`), the recovery ends exactly as when that trial fails
-/// its check outright (`Outright`: no cold refit) — the codes, the degree cap, the note, the fit
-/// and its report — so a failed confirmation leaves no half-installed state. Both differ from the
-/// recovery without the seam only by the path (here: the training ranking's result stands where the
-/// leave-one-out one did).
+/// A fresh provider's cold fit of the fixture at `codes` and `cap` (the reopen reference).
+fn fresh_cold_fit(tag: &str, codes: &[u8], cap: Option<usize>) -> (FitReport, surrogate::Model) {
+    let dir = collection_root(tag);
+    let mut t = glitch_collection(&dir);
+    t.quarantine = codes.to_vec();
+    t.degree_cap = cap;
+    t.species_dirty = true;
+    t.fit_store().unwrap();
+    (t.report().unwrap().clone(), t.model().unwrap().clone())
+}
+
+/// The fit in place equals the fresh cold fit, bit for bit (report, coefficients, factor).
+fn assert_cold(label: &str, report: &FitReport, model: &surrogate::Model, fresh: &(FitReport, surrogate::Model)) {
+    assert_eq!(report, &fresh.0, "{label}: the report is the fresh cold fit's");
+    assert_eq!(model.coeffs, fresh.1.coeffs, "{label}: the coefficients");
+    assert_eq!(model.sigma_inv_chol, fresh.1.sigma_inv_chol, "{label}: the posterior factor");
+}
+
+/// The fixture's recovery with the confirmation of index `k` forced to fail (`confirm_fail`):
+/// the provider after the refit and what the seam saw. Without a forced failure the recovery makes
+/// three confirmations: the leave-one-out rounds' stop test on the round that held the glitch (a
+/// warm trial: refitted cold), the rankings' choice and the keep (both on that cold fit).
+fn recovery_failing(k: Option<usize>, tag: &str) -> (SurrogateKs, Option<ConfirmFailed>) {
+    let dir = collection_root(tag);
+    let mut s = glitch_collection(&dir);
+    s.confirm_fail = k;
+    s.refit().unwrap();
+    println!(
+        "{tag} (confirmation {k:?} fails): {} confirmations; trusted {}, held {:?}, cap {:?}, note {:?}; searches {:?}",
+        s.confirm_calls,
+        s.trusted(),
+        (0..s.samples()).filter(|&i| s.is_quarantined(i)).collect::<Vec<_>>(),
+        s.degree_cap,
+        s.recovery_note(),
+        searches(&s)
+    );
+    assert!(!s.trial_fit);
+    let seen = s.confirm_failed.take();
+    assert_eq!(seen.is_some(), k.is_some(), "the seam fired");
+    (s, seen)
+}
+
+/// What a failed confirmation leaves (review I2): the codes, the degree cap, the note and
+/// `species_dirty` exactly as on entry to it, `trial_fit` false, and in place the cold fit of
+/// that state — a fresh provider's fit of the same codes and cap, bit for bit.
+fn assert_clean_failure(label: &str, seen: &ConfirmFailed) {
+    assert_eq!(seen.after, seen.before, "{label}: codes, cap, note and species_dirty untouched");
+    assert!(!seen.trial_fit, "{label}: no trial in place");
+    let fresh = fresh_cold_fit(&format!("{label}-fresh"), &seen.after.0, seen.after.1);
+    assert_cold(label, seen.report.as_ref().unwrap(), seen.model.as_ref().unwrap(), &fresh);
+}
+
+/// Review I1 and I2: the rounds' stop test is judged on the cold fit. The leave-one-out round that
+/// holds the glitch passes warm; its confirmation (index 0, a refit of the trial) is forced to fail
+/// and that cold fit to fail its checks while it is in place — a trial that passes warm and fails
+/// cold. The state right after it is clean (`assert_clean_failure`), and the rounds go on from
+/// that cold fit as main's would — measured: its leave-one-out offender #73 is held next (a warm
+/// trial of 2 rounds, confirmed in 4), and that result stands; whatever stands is a cold fit of its
+/// own state.
 #[test]
-fn a_trial_that_fails_cold_is_a_failed_trial() {
-    let run = |fail: Option<ConfirmFail>, tag: &str| {
-        let dir = collection_root(tag);
-        let mut s = glitch_collection(&dir);
-        s.confirm_fail = fail;
-        s.refit().unwrap();
-        assert!(s.confirm_fail.is_none(), "{fail:?}: the seam fired");
-        println!(
-            "{fail:?}: trusted {}, held {:?}, cap {:?}, note {:?}; searches {:?}",
-            s.trusted(),
-            (0..s.samples()).filter(|&i| s.is_quarantined(i)).collect::<Vec<_>>(),
-            s.degree_cap,
-            s.recovery_note(),
-            searches(&s)
-        );
-        assert!(!s.trial_fit);
-        let model = s.model().unwrap().clone();
-        (codes(&s), s.degree_cap, s.recovery_note().map(str::to_string), s.report().unwrap().clone(), model.coeffs, model.sigma_inv_chol, s.species_dirty)
-    };
-    let cold = run(Some(ConfirmFail::Cold), "warm-fail-cold");
-    let outright = run(Some(ConfirmFail::Outright), "warm-fail-outright");
-    assert_eq!(cold.0, outright.0, "the codes");
-    assert_eq!(cold.1, outright.1, "the degree cap");
-    assert_eq!(cold.2, outright.2, "the note");
-    assert_eq!(cold.3, outright.3, "the report");
-    assert_eq!(cold.4, outright.4, "the coefficients");
-    assert_eq!(cold.5, outright.5, "the posterior factor");
-    assert_eq!(cold.6, outright.6, "species_dirty");
+fn a_trial_that_fails_cold_at_the_rounds_stop_goes_on_from_the_cold_fit() {
+    let (plain, _) = recovery_failing(None, "warm-fail-none");
+    assert_eq!(plain.confirm_calls, 3, "the premise: stop test, rankings' choice, keep");
+    let (s, seen) = recovery_failing(Some(0), "warm-fail-stop");
+    let seen = seen.unwrap();
+    assert!(seen.refitted, "the stop test's confirmation refitted the warm trial");
+    assert_eq!(seen.before.0[GLITCH], Q_HELD, "the round that held the glitch");
+    assert_clean_failure("stop", &seen);
+    assert!(s.confirm_calls > 1, "the recovery went on after the failed confirmation");
+    let codes = codes(&s);
+    let fresh = fresh_cold_fit("warm-fail-stop-end", &codes, s.degree_cap);
+    assert_cold("standing", s.report().unwrap(), s.model().unwrap(), &fresh);
+}
+
+/// Review I2, the keep path (`recover_trust`'s "passes the residuals" keep): its confirmation (the
+/// last of the three, on the already cold fit) forced to fail leaves a clean state, and the
+/// recovery ends exactly as main's does when the keep's check fails — the entry state restored:
+/// no sample held, no cap, the failed recovery's note (settled: the entry fit is trusted with the
+/// glitch in its misfit set), the entry fit (a cold fit of the entry codes).
+#[test]
+fn a_keep_that_fails_cold_restores_the_entry_state() {
+    let (plain, _) = recovery_failing(None, "warm-keep-none");
+    let keep = plain.confirm_calls - 1;
+    let (s, seen) = recovery_failing(Some(keep), "warm-keep-fail");
+    let seen = seen.unwrap();
+    assert!(!seen.refitted, "the keep judges the cold fit the rounds confirmed");
+    assert_clean_failure("keep", &seen);
+    let codes = codes(&s);
+    assert!(codes.iter().all(|&c| c == Q_NONE), "the holds given back: {codes:?}");
+    assert_eq!(s.degree_cap, None);
+    // the failed recovery's note, settled by the refit (`settle_recovery_note`): the entry fit is
+    // trusted with the glitch as its one unreproducible sample (the misfit set M within its limit)
+    assert_eq!(s.recovery_note(), Some("recovery did not restore the training residuals; no samples held; 1 samples the model cannot reproduce stay in the fit"));
+    let fresh = fresh_cold_fit("warm-keep-entry", &codes, None);
+    assert_cold("entry", s.report().unwrap(), s.model().unwrap(), &fresh);
 }

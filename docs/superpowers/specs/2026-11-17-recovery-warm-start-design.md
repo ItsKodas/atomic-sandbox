@@ -25,8 +25,9 @@ A trust recovery (`SurrogateKs::recover_trust`: the degree-cap retry, the defaul
   - A refit with no start is bit for bit today's.
   - A warm-started search converges to the same stopping test as a cold one (λ, s_E², s_F² each within the search's 1e-3), and is marked as warm-started in its `RefitKind`.
 - **Trials.** The quarantine's trials — every round of both rankings, on the standing basis (step 2) and in step 3 (its default-basis fit and its rounds) — are searched from the hyperparameters of the most recent fit in the chain. A basis change (cap on or off) still passes the start: the search filters a non-finite start and converges from any positive one.
-  - **Fix round 1 (the coordinator, 2026-11-17: option B must never make a refit slower than main).** The cap retries, steps 1 and 1b, are searched cold directly, with no start and nothing to confirm: they are single trials that usually stand, and a warm trial that stands pays its confirmation on top (measured +4 / +5 rounds on the golden's cold-attach and append cases before this round). Their result is exactly main's.
-- **Acceptance.** At every point where a warm trial would stand, the trial is refitted cold on the same state and the same check is re-run on the cold fit. This covers step 3's acceptance, the rankings' choice and the "passes the residuals" keep (steps 1 and 1b are cold already).
+  - **Fix round 1 (the coordinator, 2026-11-17).** The cap retries, steps 1 and 1b, are searched cold directly, with no start and nothing to confirm: they are single trials that usually stand, and a warm trial that stands pays its confirmation on top (measured +4 / +5 rounds on the golden's cold-attach and append cases before this round). Their result and cost are exactly main's.
+  - **The ruling on a single standing quarantine round (the coordinator, 2026-11-17: option (b)).** A recovery that stands after one quarantine round pays that round's warm search on top of the cold confirmation: +2 rounds (≈ 0.5 s) on the golden's append-20 case. Accepted, because misfit-driven recoveries save about 26 % of their search rounds; searching each ranking's first round cold instead (option (a)) would give back much of that saving.
+- **Acceptance.** At every point where a warm trial would stand or end the quarantine rounds, the trial is refitted cold on the same state and the same check is re-run on the cold fit. This covers the rounds' stop test (fix round 2, review I1: a round that passes warm and fails cold goes on from the cold fit, ranking its offenders, as main's rounds do), step 3's acceptance, the rankings' choice and the "passes the residuals" keep (steps 1 and 1b are cold already).
   - Only if the cold fit passes does the trial stand.
   - If the cold fit fails, the trial counts as failed, and the recovery continues exactly as it does today after a failed trial.
   - Restoring the entry state needs no re-search: that fit was already cold.
@@ -36,7 +37,7 @@ A trust recovery (`SurrogateKs::recover_trust`: the degree-cap retry, the defaul
 - Cold refits and the non-recovery paths are bit for bit unchanged. The existing goldens and `fit.rs` tests still pass.
 - A recovery's standing fit equals a cold refit of the same store state bit for bit (the reopen property).
 - `refit_golden` compare, all three cases, against a record made on main 7e420ad with the same collection copy: every verdict identical, within the ruling-2026-11-17 bars.
-- The recovery case's wall time is measured before and after, together with the search rounds per trial, and recorded in `crates/validate/references.md`.
+- Round counts are the metric (the coordinator's ruling, 2026-11-17): they are deterministic, and the machine was never quiet enough for a wall-time A/B. The search rounds per trial, before and after, are recorded in `crates/validate/references.md`.
 - Gates: `cargo test -p surrogate --release`, `cargo test -p providers --release`, `cargo test -p validate --release --test surrogate`.
 
 ## Left to the builder

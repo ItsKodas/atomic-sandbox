@@ -262,15 +262,19 @@ pub(super) enum Ranking {
     Training,
 }
 
-/// Tests only: how the next confirmation of a recovery trial fails (`confirm_fail`,
-/// [`SurrogateKs::confirm_cold`]; `tests/recovery_warm.rs`).
+/// Tests only: the state around a confirmation the `confirm_fail` seam failed
+/// ([`SurrogateKs::confirm_cold`]; `tests/recovery_warm.rs`): (codes, degree cap, note,
+/// `species_dirty`) on entry to the confirmation and right after it, whether it refitted a trial,
+/// `trial_fit` after it, and the fit in place after it.
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ConfirmFail {
-    /// After its cold refit, as if the cold fit failed the check.
-    Cold,
-    /// Without a cold refit, as if the trial had failed its check outright.
-    Outright,
+#[derive(Clone, Debug)]
+pub(super) struct ConfirmFailed {
+    pub(super) before: (Vec<u8>, Option<usize>, Option<String>, bool),
+    pub(super) after: (Vec<u8>, Option<usize>, Option<String>, bool),
+    pub(super) refitted: bool,
+    pub(super) trial_fit: bool,
+    pub(super) report: Option<FitReport>,
+    pub(super) model: Option<surrogate::Model>,
 }
 
 /// What a round's worst ratio was measured against, for the note ([`Held`]).
@@ -639,11 +643,14 @@ impl SurrogateKs {
     /// **Warm-started trials** (spec 2026-11-17, option B, fix round 1): the trials of the
     /// quarantine — each round of both rankings, on the standing basis (step 2) and step 3's
     /// default-basis fit and rounds — are searched from the most recent fit's hyperparameters
-    /// ([`fit_trial`](Self::fit_trial)), and at every point where one would stand — step 3's
-    /// acceptance, the rankings' choice in [`quarantine_rounds`](Self::quarantine_rounds), the
-    /// "passes the residuals" keep — it is searched again from the data and the same check judged
-    /// on that cold fit ([`confirm_cold`](Self::confirm_cold)). A trial that fails cold is a failed
-    /// trial. The cap retries (steps 1 and 1b) are single trials that usually stand: they are
+    /// ([`fit_trial`](Self::fit_trial)), and at every point where one would stand or end the
+    /// rounds — the rounds' stop test in `rounds_by` (a round that passes: failing cold, the rounds
+    /// go on from the cold fit, as main's), step 3's acceptance, the rankings' choice in
+    /// [`quarantine_rounds`](Self::quarantine_rounds), the "passes the residuals" keep — it is
+    /// searched again from the data and the same check judged on that cold fit
+    /// ([`confirm_cold`](Self::confirm_cold)). A trial that fails cold is a failed trial. Every
+    /// decision on a passing fit is therefore taken on the cold fit, as main takes it; only the
+    /// offender rankings of rounds that fail are read off warm trials. The cap retries (steps 1 and 1b) are single trials that usually stand: they are
     /// searched from the data directly, as before, with nothing to confirm. So every
     /// fit that stands is the cold search of its store state, what a reopened collection
     /// computes; only the path to it can differ from a cold-only recovery's (a check or an
@@ -651,10 +658,18 @@ impl SurrogateKs {
     pub(super) fn recover_trust(&mut self, report: FitReport) -> FitReport {
         let _prof = surrogate::prof::span("P2 recover_trust");
         self.refit_stage(sim::RefitStage::Recovery);
-        let r = self.recovery_steps(report);
-        // every exit confirms its fit cold or restores the entry state (a fit already cold)
+        let mut r = self.recovery_steps(report);
+        // every exit confirms its fit cold or restores the entry state (a fit already cold): a
+        // warm trial standing here is a bug (review M5) — loud in tests and debug builds, and in a
+        // release build replaced by its cold search, so the reopen property holds regardless
         #[cfg(test)]
         assert!(!self.trial_fit, "a recovery trial's warm-started fit stands");
+        debug_assert!(!self.trial_fit, "a recovery trial's warm-started fit stands");
+        if self.trial_fit {
+            if let Some(c) = self.confirm_cold(|_| true) {
+                r = c;
+            }
+        }
         r
     }
 
@@ -804,10 +819,11 @@ impl SurrogateKs {
     /// needs the fallback (leave-one-out 47 held, 1.60×; training 38 held, trusted), a
     /// high-leverage outlier the first (`tests/recovery_loo.rs`). Returns the report that stands,
     /// what its rounds held ([`Held`]) and the ranking whose result stands. Each round's fit is a
-    /// warm-started trial, and a ranking's result is chosen (recovered, or the training result
-    /// passing where the leave-one-out one fails) only on its cold fit ([`confirm_cold`](Self::confirm_cold));
-    /// the leave-one-out result returned as the fallback may still be a trial — `recover_trust`
-    /// confirms it before it stands.
+    /// warm-started trial; a ranking's rounds stop on a passing fit only once its cold fit passes
+    /// (`rounds_by`), so a ranking's result is chosen (recovered, or the training result passing
+    /// where the leave-one-out one fails) on its cold fit ([`confirm_cold`](Self::confirm_cold),
+    /// re-judged here at no cost); a result whose rounds ran out while failing may still be a warm
+    /// trial — `recover_trust` confirms it before it could stand.
     pub(super) fn quarantine_rounds(&mut self, report: FitReport) -> (FitReport, Held, Ranking) {
         let _prof = surrogate::prof::span("P3 quarantine_rounds");
         // tests: the training ranking alone, the recovery before spec R1
@@ -858,8 +874,22 @@ impl SurrogateKs {
         let mut held = Held::NONE;
         let n_store = self.samples();
         for _ in 0..QUARANTINE_ROUNDS {
+            // the rounds stop on a fit that passes — judged on its cold fit (review I1): a warm
+            // trial that passes is searched again from the data, and one that fails cold goes on
+            // as main's rounds would, ranking that cold fit's offenders. Should the fit in place
+            // still pass after a failed confirmation (a cold solve error), the rounds stop on it
+            // (the trial never stands: every exit of `recover_trust` confirms again)
             if !self.recoverable_fail() {
-                break;
+                if let Some(c) = self.confirm_cold(|s| !s.recoverable_fail()) {
+                    report = c;
+                    break;
+                }
+                if !self.recoverable_fail() {
+                    break;
+                }
+                if let Some(r) = self.report.clone() {
+                    report = r;
+                }
             }
             // the bound both rankings rank against this round (their own `absolute` switch) and,
             // in the noise-only mode, the channel that attains the worst ratio (re-review N1; the
