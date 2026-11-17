@@ -11345,6 +11345,10 @@ mod lone;
 /// Spec 2026-11-12 R1: the recovery ranks offenders by their leave-one-out ratio (`recovery_loo.rs`).
 mod recovery_loo;
 
+/// Spec 2026-11-17 (option B): warm-started recovery trials, every standing fit a cold search
+/// (`recovery_warm.rs`).
+mod recovery_warm;
+
 /// Spec 2026-11-12 R2: forget and restore one sample, the Model tab's worst-fitting list (`forget.rs`).
 mod forget;
 

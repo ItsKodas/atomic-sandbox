@@ -153,6 +153,9 @@ fn run_cases(cases: &str) -> Vec<String> {
             other => panic!("unknown case {other}"),
         }
         println!("case {case}: {:.1} s; κ₂(A) {:.2e}; recovery {:?}; last solve {:?}", t.elapsed().as_secs_f64(), s.report().map_or(f64::NAN, |r| r.condition_estimate), s.recovery_note(), s.accumulator.as_ref().map(|a| a.last_refit()));
+        // the case's fits, as solved (`fit_log`: a search's rounds, and whether it started from a
+        // recovery trial's start)
+        println!("case {case}: fits {:?}", s.fit_log);
         out.extend(record(&mut s, &probes).into_iter().map(|l| format!("{case} {l}")));
     }
     out
