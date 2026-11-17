@@ -1344,6 +1344,17 @@ pub struct SurrogateKs {
     /// from takes new rows), like the class pass and the active set (2026-11-17: an O(Q′³)
     /// eigendecomposition per intermediate fit, 3.6 s at Q′ 2 460). Nothing reads it meanwhile.
     null_space_pending: bool,
+    /// The fit in place is a trust recovery's trial, searched from the previous fit's
+    /// hyperparameters (`fit_trial`; spec 2026-11-17, option B): it never stands as it is —
+    /// [`confirm_cold`](SurrogateKs::confirm_cold) searches it again from the data first. Saved
+    /// and restored with the fit (`FitState`).
+    trial_fit: bool,
+    /// Tests only: every fit's solve (`Accumulator::last_refit`), in order (`fit_store_with`).
+    #[cfg(test)]
+    fit_log: Vec<surrogate::RefitKind>,
+    /// Tests only: the next confirmation of a trial fails ([`ConfirmFail`]), once.
+    #[cfg(test)]
+    confirm_fail: Option<ConfirmFail>,
     /// The extrapolation grade's MaxVol active sets (rule 5e, `surrogate::grade`).
     active_set: Option<ActiveSet>,
     training_residuals: Option<TrainingResiduals>,
@@ -1734,6 +1745,11 @@ impl SurrogateKs {
             envelope: None,
             null_space: None,
             null_space_pending: false,
+            trial_fit: false,
+            #[cfg(test)]
+            fit_log: Vec::new(),
+            #[cfg(test)]
+            confirm_fail: None,
             active_set: None,
             training_residuals: None,
             misfit: None,

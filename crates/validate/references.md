@@ -4925,3 +4925,23 @@ The second refit with nothing new: 192.6 → 10.6 s. What is left: `NullSpace::o
 
   (σ_F: the force std and its epistemic part, per atom.) The relative 3.4e-3 of the first report was a value of 3.7e-6 moving by 1.3e-8: the absolute differences are at most 0.4 % of a tier.
 - **Across machines.** faer picks its SIMD kernels at run time (AVX-512 here, AVX2 elsewhere), so a refit on a CPU with another instruction set differs from this one by the same ~κε spread — never in a verdict measured here, but a golden compares bit for bit only on the same ISA (the thread count never matters: `dense::SPLIT`).
+
+## Warm-started recovery trials (2026-11-17; branch `recovery-warm`, spec `2026-11-17-recovery-warm-start-design.md`, option B; `providers` `surrogate::tests::refit_golden` with its `fit_log` line, `#[ignore]`d; release, Ryzen 7 9800X3D, other agents' test binaries running throughout)
+
+A trust recovery's trial fits (the cap retries, each quarantine round, step 3's default-basis fit) are searched from the most recent fit's (s_E, s_F) (`Accumulator::refit_from`; λ is searched over its whole grid every round, so it needs no start); a trial that would stand is searched again from the data and judged on that fit (`confirm_cold`). Every standing fit is the cold search of its store state.
+
+**Unit tests.** `surrogate` `a_started_search_reaches_the_cold_stopping_point`: from the cold optimum perturbed (λ × 1.5, σ's × 0.8) the search lands within 6.6e-4 (λ, s_E², s_F² relative) of the cold one in 2 rounds instead of 8 on a DFT-like scatter, 9.2e-4 in 6 instead of 10 near noise-free. `providers` `recovery_warm`: on a small body-4 collection the recovery's standing fit equals a fresh provider's cold fit bit for bit (and a warm refit continuing from it); a trial whose cold confirmation is forced to fail ends the recovery exactly as when it fails outright.
+
+**Golden** (the user's BEST collection copy, 1 588 samples, H/O/P, the three cases against a record made on main 7e420ad with the same copy): **0 differences of any kind** — every hyperparameter, prediction, variance, LOO number, grade and novelty bit for bit, every exact item (codes, verdicts, M, active sets, null space, the search's round count) identical. Each standing fit is the cold search a cold-only recovery reached by the same path, so the ruling-2026-11-17 bars are met with nothing to spare.
+
+**Search rounds per fit** (deterministic; `s` = from a start, `c` = cold confirmation):
+
+| case | main 7e420ad | this branch |
+|---|---|---|
+| misfit recovery (energy tier ÷ 3) | entry 8; trials 5, 7, 6, 6, 6, 6, 7, 6, 6, 6 — 11 searches, 61 rounds after the entry | entry 8; trials 4s, 3s, 3s, 3s, 5s, 4s, 2s, 5s, 4s, 5s, then 6c — 12 searches, 44 rounds after the entry (−28 %) |
+| cold attach (step 1's cap trial stands) | 8; 5 | 8; 4s, 5c (+4 rounds) |
+| append-20 | attach 9, 8, 5; refit warm, 7, 5 | attach 9, 8, 4s, 5c; refit warm, 6s, 2s, 5c (+5 rounds) |
+
+The confirmation repeats the standing trial's cold search (6 rounds in the recovery, the same 6 main's last trial took), so a recovery saves the warm rounds of the trials that do not stand and pays one cold search for the one that does; where step 1's first trial already stands (the cold attach) or a recovery has two short trials (append) it costs a few rounds more than before.
+
+**Wall** (the whole case: attach, cold refit and recovery): main 91.3 / 64.4 s, this branch 42.5 / 61.1 s, alternated back to back under other agents' CPU and GPU jobs (main's first record run took 218.7 s under heavier load) — too noisy to quote a ratio. At the quiet refit-speed-up measurement's per-round cost (one spectrum ≈ 0.145 s and one `solve_large` ≈ 0.091 s at Q′ 2 460: 10.0 s / 69 and 7.29 s / 80, "Refit speed-up" above) the 17 rounds saved are ≈ 4 s of the recovery's 31.3 s, ≈ 13 % — below the spec's 20–40 % estimate, which assumed the warm trials would converge in one or two rounds; on this collection a quarantine round moves the noise levels enough that a trial still takes 2–5.

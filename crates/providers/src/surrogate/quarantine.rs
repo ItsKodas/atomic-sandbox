@@ -262,6 +262,17 @@ pub(super) enum Ranking {
     Training,
 }
 
+/// Tests only: how the next confirmation of a recovery trial fails (`confirm_fail`,
+/// [`SurrogateKs::confirm_cold`]; `tests/recovery_warm.rs`).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ConfirmFail {
+    /// After its cold refit, as if the cold fit failed the check.
+    Cold,
+    /// Without a cold refit, as if the trial had failed its check outright.
+    Outright,
+}
+
 /// What a round's worst ratio was measured against, for the note ([`Held`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Bound {
@@ -624,9 +635,29 @@ impl SurrogateKs {
     /// its rounds named stayed held and the next refit's rounds started from them, up to the 10 %
     /// cap), so the collection gets no status record from it either (`sync_collection_status`
     /// finds no code changed). The entry report is returned, the note says so.
+    ///
+    /// **Warm-started trials** (spec 2026-11-17, option B): every trial fit — the cap retries, each
+    /// quarantine round, step 3's default-basis fit — is searched from the most recent fit's
+    /// hyperparameters ([`fit_trial`](Self::fit_trial)), and at every point where a trial would
+    /// stand — steps 1 and 1b, step 3's acceptance, the rankings' choice in
+    /// [`quarantine_rounds`](Self::quarantine_rounds), the "passes the residuals" keep — it is
+    /// searched again from the data and the same check judged on that cold fit
+    /// ([`confirm_cold`](Self::confirm_cold)). A trial that fails cold is a failed trial. So every
+    /// fit that stands is the cold search of its store state, what a reopened collection
+    /// computes; only the path to it can differ from a cold-only recovery's (a check or an
+    /// offender ranking read off a warm trial: hyperparameters at the 1e-3 level).
     pub(super) fn recover_trust(&mut self, report: FitReport) -> FitReport {
         let _prof = surrogate::prof::span("P2 recover_trust");
         self.refit_stage(sim::RefitStage::Recovery);
+        let r = self.recovery_steps(report);
+        // every exit confirms its fit cold or restores the entry state (a fit already cold)
+        #[cfg(test)]
+        assert!(!self.trial_fit, "a recovery trial's warm-started fit stands");
+        r
+    }
+
+    /// [`recover_trust`](Self::recover_trust)'s steps.
+    fn recovery_steps(&mut self, report: FitReport) -> FitReport {
         let body3 = self.basis().is_some_and(|b| b.body3);
         // the state on entry: what a recovery that does not restore the residuals returns to
         let (entry_state, entry_flags, entry_dirty) = (self.save_state(), self.quarantine.clone(), self.species_dirty);
@@ -641,13 +672,13 @@ impl SurrogateKs {
                 // failure for a sample shortfall (Q′ grows with the cap: 176 → 344 for H/O) is not a
                 // recovery — the 2026-10-18 water session's E1(e): one H 0.9 Bohr from O took the
                 // model to n 333 < Q′ 344, every step DFT, then rule 4b by that one sample
-                match self.fit_store_deferred() {
-                    Ok(r) if !self.recoverable_fail() && !self.trust_needs_samples() => {
+                if self.fit_trial().is_ok() && self.recovered() {
+                    if let Some(r) = self.confirm_cold(Self::recovered) {
                         self.recovery = Some(format!("refit with degree_cap {RECOVERY_DEGREE_CAP} (the bent-molecule setting) restored the training residuals"));
                         return r;
                     }
-                    _ => self.restore_state(saved),
                 }
+                self.restore_state(saved);
             }
         }
         // 1b. a cap set by an earlier recovery is not kept for good (M8a user-test fix, module doc
@@ -658,15 +689,15 @@ impl SurrogateKs {
             let saved = self.save_state();
             self.degree_cap = None;
             self.species_dirty = true;
-            match self.fit_store_deferred() {
-                Ok(r) if !self.recoverable_fail() && !self.trust_needs_samples() => {
+            if self.fit_trial().is_ok() && self.recovered() {
+                if let Some(r) = self.confirm_cold(Self::recovered) {
                     self.recovery = Some(format!(
                         "refit with the default basis restored the training residuals (the degree_cap {RECOVERY_DEGREE_CAP} an earlier recovery set no longer did)"
                     ));
                     return r;
                 }
-                _ => self.restore_state(saved),
             }
+            self.restore_state(saved);
         }
         // 2. quarantine the worst offenders on the standing basis, round by round (the
         // leave-one-out ranking first, the training-residual ranking its fallback: spec
@@ -674,7 +705,7 @@ impl SurrogateKs {
         let before = self.quarantined();
         // step 3's start (the state on entry: step 1 does not run under a cap, 1b restored its own)
         let pre_rounds = recapped.then(|| self.save_state());
-        let (rounds, worst, ranking) = self.quarantine_rounds(report.clone());
+        let (_, worst, ranking) = self.quarantine_rounds(report.clone());
         // 3. the capped basis's quarantine could not recover (a misfit the capped fit spreads over
         // the whole store names no offender: the user's H collection, `references.md` "M8a stuck
         // collection"): the same quarantine from the default basis, from the state on entry; it
@@ -686,16 +717,16 @@ impl SurrogateKs {
         // the default-basis retry, or option A's leave-one-out-first order could be worse than
         // the ranking before it
         if let Some(saved) = pre_rounds.filter(|_| !self.recovered()) {
-            let capped = (self.save_state(), self.quarantine.clone(), rounds.clone(), self.species_dirty, self.recovery.clone());
+            let capped = (self.save_state(), self.quarantine.clone(), self.species_dirty, self.recovery.clone());
             self.restore_state(saved);
             self.quarantine = entry_flags.clone();
             self.species_dirty = entry_dirty;
             let entry_held = self.quarantined();
             self.degree_cap = None;
             self.species_dirty = true;
-            if let Ok(r) = self.fit_store_deferred() {
-                let (r, worst, ranking) = self.quarantine_rounds(r);
-                if self.recovered() {
+            if let Ok(r) = self.fit_trial() {
+                let (_, worst, ranking) = self.quarantine_rounds(r);
+                if let Some(r) = self.recovered().then(|| self.confirm_cold(Self::recovered)).flatten() {
                     self.recovery = Some(format!(
                         "back to the default basis (the degree_cap {RECOVERY_DEGREE_CAP} an earlier recovery set could not be recovered by quarantine): {}",
                         quarantine_words(self.quarantined(), self.quarantined() - entry_held, worst, ranking, Outcome::Recovers)
@@ -703,16 +734,16 @@ impl SurrogateKs {
                     return r;
                 }
             }
-            let (state, q, rep, d, note) = capped;
+            let (state, q, d, note) = capped;
             self.restore_state(state);
             self.quarantine = q;
             self.species_dirty = d;
             self.recovery = note;
-            if !self.recoverable_fail() {
-                return self.note_quarantined(before, rep, worst, ranking);
-            }
-        } else if !self.recoverable_fail() {
-            return self.note_quarantined(before, rounds, worst, ranking);
+        }
+        // step 2's result (the capped one when step 3 ran and did not recover) kept when it passes
+        // the residuals and noise — judged on its cold fit
+        if let Some(r) = (!self.recoverable_fail()).then(|| self.confirm_cold(|s| !s.recoverable_fail())).flatten() {
+            return self.note_quarantined(before, r, worst, ranking);
         }
         // no step restored the residuals (step 2 by both rankings, and step 3 when it ran): back
         // to the state on entry (no ratchet, spec 2026-11-13 §4.2) — the codes (a forgotten
@@ -767,7 +798,11 @@ impl SurrogateKs {
     /// step 3 gated on "not recovered", fix round 2). Measured: the stuck-H collection's step 3
     /// needs the fallback (leave-one-out 47 held, 1.60×; training 38 held, trusted), a
     /// high-leverage outlier the first (`tests/recovery_loo.rs`). Returns the report that stands,
-    /// what its rounds held ([`Held`]) and the ranking whose result stands.
+    /// what its rounds held ([`Held`]) and the ranking whose result stands. Each round's fit is a
+    /// warm-started trial, and a ranking's result is chosen (recovered, or the training result
+    /// passing where the leave-one-out one fails) only on its cold fit ([`confirm_cold`](Self::confirm_cold));
+    /// the leave-one-out result returned as the fallback may still be a trial — `recover_trust`
+    /// confirms it before it stands.
     pub(super) fn quarantine_rounds(&mut self, report: FitReport) -> (FitReport, Held, Ranking) {
         let _prof = surrogate::prof::span("P3 quarantine_rounds");
         // tests: the training ranking alone, the recovery before spec R1
@@ -777,9 +812,14 @@ impl SurrogateKs {
             return (r, w, Ranking::Training);
         }
         let entry = (self.save_state(), self.quarantine.clone(), self.species_dirty, self.recovery.clone(), report.clone());
-        let (r, w) = self.rounds_by(report, Ranking::LeaveOneOut);
+        let (mut r, w) = self.rounds_by(report, Ranking::LeaveOneOut);
+        // a result that would stand is judged on its cold fit (`recover_trust`, "Warm-started
+        // trials"); one that fails cold is a result that did not recover, its cold fit in place
         if self.recovered() {
-            return (r, w, Ranking::LeaveOneOut);
+            match self.confirm_cold(Self::recovered) {
+                Some(c) => return (c, w, Ranking::LeaveOneOut),
+                None => r = self.report.clone().unwrap_or(r),
+            }
         }
         let loo_fails = self.recoverable_fail();
         let loo = (self.save_state(), self.quarantine.clone(), self.species_dirty, self.recovery.clone(), r, w);
@@ -788,9 +828,10 @@ impl SurrogateKs {
         self.quarantine = flags;
         self.species_dirty = dirty;
         self.recovery = note;
-        let (r, w) = self.rounds_by(report, Ranking::Training);
-        if self.recovered() || (loo_fails && !self.recoverable_fail()) {
-            return (r, w, Ranking::Training);
+        let (_, w) = self.rounds_by(report, Ranking::Training);
+        let stands = |s: &Self| s.recovered() || (loo_fails && !s.recoverable_fail());
+        if let Some(c) = stands(self).then(|| self.confirm_cold(stands)).flatten() {
+            return (c, w, Ranking::Training);
         }
         let (state, flags, dirty, note, r, w) = loo;
         self.restore_state(state);
@@ -843,7 +884,8 @@ impl SurrogateKs {
                 self.quarantine[i] = Q_HELD;
             }
             self.species_dirty = true; // rebuild without them
-            match self.fit_store_deferred() {
+            // a trial, searched from the previous round's fit (`recover_trust`, "Warm-started trials")
+            match self.fit_trial() {
                 Ok(r) => {
                     report = r;
                     for (ratio, bound) in measured {
