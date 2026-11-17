@@ -106,6 +106,11 @@
 //!   1e-6. Measured 5.8e-6 Bohr on this adapter, i.e. an effective δF ≈ 1.7e-7 between the two
 //!   passes. Bound `REWIND_BOUND` = 5e-5 (brief 1e-4; the margin is adapter-pinned, see the
 //!   constant).
+//! - V5 (Fermi–Dirac, spec 2026-11-13 §9; plan Task 11; `references.md` "V5"):
+//!   `work_integral_matches_free_energy_change` (CPU f64: the forces' work over 0.2 Bohr is −ΔF, not −ΔE) and
+//!   `fd_nve_conserves_f_plus_k_through_the_ts_swing` (GPU: CO₂⁺'s bend through a 6.4 mHa TS swing conserves F + K).
+//!   Both fail their pre-registered bounds as of 2026-11-17, each diagnosed to a term the bound lacks; a spec decision
+//!   is pending (their docs). They add ≈ 15 min (CPU) and ≈ 17 min (GPU) to the suite.
 //!
 //! The GPU work of concurrently running tests is serialised through `GPU`, one evaluation at a
 //! time, so the per-solve times in the timing rows are uncontended while the tests interleave.
@@ -554,6 +559,143 @@ fn rewind_retraces_on_the_gpu() {
     assert!(dr <= REWIND_BOUND, "rewind missed the start by {dr:.3e} Bohr (bound {REWIND_BOUND:.0e})");
 }
 
+// ---- V5: the work integral (spec 2026-11-13 §9 "V5 new tests" 1; plan Task 11; ruling R10) ----
+//
+// Derivation (atomic units: Ha, Bohr, Ha/Bohr). `qm::forces` returns F_x = −dF/dx of the Mermin free energy
+// F = E − TS (stationary in ψ and f; `qm::forces` module doc, V3 confirms it on this geometry). Along a path x ∈ [0, L]
+// of one coordinate, the work the forces do is W = ∫₀ᴸ F_x dx = −[F(L) − F(0)], so
+//   ΔF + W = 0   and   ΔE + W = ΔE − ΔF = Δ(TS),
+// nonzero wherever a partly occupied level's f moves (ruling R10: W is the work the forces do, +∫F·dx; the spec's
+// "W = −∫F_HF·dx" written with "|W + ΔF|" is inconsistent, and `branch_jump` checks the same physics as
+// |ΔF − (−∫F·dR)|).
+// Quadrature: x_i = iΔ, Δ = L/40, i = 0 … 40. W₄₀ = composite Simpson on the 41 points, W₂₀ = Simpson on the 21 even
+// points (spacing 2Δ). Simpson's error is −L(Δ⁴/180)F_x⁗ + O(Δ⁶), so W₄₀ − W_exact ≈ (W₂₀ − W₄₀)/15 in magnitude: the
+// estimate |W₄₀ − W₂₀|/15.
+// Noise: each solve's F_x carries a path scatter σ_F and F a scatter σ_E (warm vs cold at the start point, measured
+// here). W₄₀ = Σ w_i F_x(x_i) with w_i > 0 and Σ w_i = L, so its noise is at most L·σ_F (fully correlated, the worst
+// case); ΔF = F(L) − F(0) carries √2·σ_E. Bound (spec §9 V5 1, re-review R-SHOULD-C, the brief's verbatim form):
+//   bound = |W₄₀ − W₂₀|/15 + 3·(L·σ_F + √2·σ_E),   |ΔF + W₄₀| ≤ bound,   |ΔE + W₄₀| ≥ 5·bound.
+// The second line tells F's derivative from E's: Δ(TS) = −5.6 mHa over this path (measured: TS 10.42 → 4.83 mHa as
+// the pinned pair's split widens; V3: d(TS)/dx ≈ −2.2e-2 Ha/Bohr at x = 0).
+
+/// The work integral's path: atom 0 of `common::v3_h4()` moved along x (toward atom 1) from its V3 position by 0 … L,
+/// L = 0.2 Bohr, in 40 steps (41 points). x ∈ [0, 0.2] widens the pinned pair's split from 12.9 mHa (u = 0.65, V3's
+/// certified point) away from the square, where the broken-symmetry branch competes (spec §4.7(e)).
+const WORK_PATH: f64 = 0.2;
+const WORK_POINTS: usize = 41;
+/// SCF and eigensolver tolerances of the work integral's CPU solves (plan Task 11: tol = eig_tol = 1e-9; `qm` asks its
+/// Poisson solves for 1e-12 at this tol).
+const WORK_TOL: f64 = 1e-9;
+const WORK_EIG_TOL: f64 = 1e-9;
+
+/// Neumaier-compensated sum (CLAUDE.md rule 4: energy reductions are compensated).
+fn neumaier(terms: impl Iterator<Item = f64>) -> f64 {
+    let (mut sum, mut c) = (0.0f64, 0.0f64);
+    for x in terms {
+        let t = sum + x;
+        c += if sum.abs() >= x.abs() { (sum - t) + x } else { (x - t) + sum };
+        sum = t;
+    }
+    sum + c
+}
+
+/// Composite Simpson on equally spaced samples `y` (odd count ≥ 3) at spacing `h`: (h/3)[y₀ + 4y₁ + 2y₂ + … + 4y_{n−1} + y_n].
+fn simpson(y: &[f64], h: f64) -> f64 {
+    assert!(y.len() >= 3 && y.len() % 2 == 1, "Simpson needs an odd number ≥ 3 of samples, got {}", y.len());
+    let n = y.len() - 1;
+    h / 3.0 * neumaier(y.iter().enumerate().map(|(i, &v)| v * if i == 0 || i == n { 1.0 } else if i % 2 == 1 { 4.0 } else { 2.0 }))
+}
+
+/// `f` over `items` on at most 4 threads (`qm` is single-threaded; the machine is shared), results in input order.
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out: Vec<Mutex<Option<R>>> = items.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|sc| {
+        for _ in 0..4.min(items.len()) {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if i >= items.len() { break; }
+                *out[i].lock().unwrap() = Some(f(&items[i]));
+            });
+        }
+    });
+    out.into_iter().map(|m| m.into_inner().unwrap().expect("every item ran")).collect()
+}
+
+/// One work-integral solve: x, F (`total`), E (`internal`), TS, F_x on the moved atom, SCF steps, final Δρ, face density.
+struct WorkPoint { x: f64, f: f64, e: f64, ts: f64, force: f64, iterations: usize, delta_rho: f64, face: f64 }
+
+/// V5 work integral [MUST-6] (spec 2026-11-13 §9 "V5 new tests" 1; plan Task 11; the derivation above): on V3's pinned
+/// H₄ (`common::v3_h4()`, CPU f64, 41³ × 0.30, σ = h, tol = eig_tol = 1e-9, `FermiDirac { kt: ELECTRON_KT }`), the work
+/// the Hellmann–Feynman forces do over 0.2 Bohr is −ΔF, and not −ΔE. 41 cold solves along the path (4 threads), the
+/// start re-solved warm from x₁ (σ_F, σ_E: its warm − cold) and the end re-solved warm from x₃₉ (reported). Every solve
+/// must converge with no warning but the box warning (V3's: the same Dirichlet box at every x, part of the discrete
+/// problem). Asserted, verbatim from the brief: |ΔF + W₄₀| ≤ bound and |ΔE + W₄₀| ≥ 5·bound,
+/// bound = |W₄₀ − W₂₀|/15 + 3·(0.2·σ_F + √2·σ_E). Numbers: `references.md` "V5".
+/// **Run of record 2026-11-17: FAILS as pre-registered** — ΔF + W₄₀ = +7.97e-8 Ha against a bound of 2.03e-10, while
+/// ΔE + W₄₀ = Δ(TS) = −5.59e-3 passes. The residual is the discrete force's box offset b = HF − (−dF/dx) (V3's +2.09e-7
+/// Ha/Bohr at x = 0; +2.2 … +6.1e-7 along the path; 16× smaller in a 15 Bohr box, present on gapped H₂), for which the
+/// bound has no term. Not re-bounded: a spec decision (`references.md` "V5", Step 3).
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test dynamics")]
+fn work_integral_matches_free_energy_change() {
+    use qm::{forces, scf, KsState, Occupations, ScfSettings, System, ELECTRON_KT};
+    let t_test = Instant::now();
+    let (g, sys, atom, axis) = common::v3_h4();
+    let mut set = ScfSettings::for_grid(&g);
+    (set.tol, set.eig_tol, set.occupations) = (WORK_TOL, WORK_EIG_TOL, Occupations::FermiDirac { kt: ELECTRON_KT });
+    let dx = WORK_PATH / (WORK_POINTS - 1) as f64;
+    let xs: Vec<f64> = (0..WORK_POINTS).map(|i| i as f64 * dx).collect();
+    let moved = |x: f64| {
+        let mut nuclei = sys.nuclei.clone();
+        nuclei[atom].pos[axis] += x;
+        System { nuclei, n_up: sys.n_up, n_dn: sys.n_dn, ionic: None }
+    };
+    let point = |x: f64, warm: Option<&KsState>| -> (KsState, WorkPoint) {
+        let m = moved(x);
+        let (st, stats) = scf(&g, &m, &set, warm).unwrap_or_else(|e| panic!("work integral x = {x} ({}): {e}", if warm.is_some() { "warm" } else { "cold" }));
+        let is_box = |w: &String| w.starts_with("density on box faces is ") && w.ends_with(": box too small");
+        assert!(stats.warnings.iter().all(is_box) && stats.warnings.len() <= 1, "work integral x = {x}: {:?}", stats.warnings);
+        let force = forces(&g, &st, &m.nuclei, set.sigma).unwrap()[atom][axis];
+        let p = WorkPoint { x, f: stats.energy.total, e: stats.energy.internal, ts: stats.energy.ts, force, iterations: stats.iterations, delta_rho: stats.delta_rho, face: stats.boundary_density };
+        (st, p)
+    };
+    let solved = par_map(&xs, |&x| point(x, None));
+    let (start_warm, end_warm) = std::thread::scope(|sc| {
+        let a = sc.spawn(|| point(xs[0], Some(&solved[1].0)).1);
+        let b = sc.spawn(|| point(xs[WORK_POINTS - 1], Some(&solved[WORK_POINTS - 2].0)).1);
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    let pts: Vec<&WorkPoint> = solved.iter().map(|(_, p)| p).collect();
+    let fx: Vec<f64> = pts.iter().map(|p| p.force).collect();
+    let fx_even: Vec<f64> = fx.iter().step_by(2).copied().collect();
+    let w40 = simpson(&fx, dx);
+    let w20 = simpson(&fx_even, 2.0 * dx);
+    let (first, last) = (pts[0], pts[WORK_POINTS - 1]);
+    let (d_f, d_e, d_ts) = (last.f - first.f, last.e - first.e, last.ts - first.ts);
+    let sigma_f = (start_warm.force - first.force).abs();
+    let sigma_e = (start_warm.f - first.f).abs();
+    let simpson_err = (w40 - w20).abs() / 15.0;
+    let noise = 3.0 * (WORK_PATH * sigma_f + 2f64.sqrt() * sigma_e);
+    let bound = simpson_err + noise;
+    let wall = t_test.elapsed().as_secs_f64();
+    let mut out = String::new();
+    let _ = writeln!(out, "V5 work integral: H₄ 1.8 × 1.95 (`v3_h4`), atom {atom} along axis {axis}, x ∈ [0, {WORK_PATH}] in {} steps; 41³ × 0.30, σ = h, CPU f64, tol {WORK_TOL:.0e}, eig_tol {WORK_EIG_TOL:.0e}, FD kT {ELECTRON_KT}; wall {wall:.0} s", WORK_POINTS - 1);
+    for p in &pts {
+        let _ = writeln!(out, "  x {:.3}  F {:+.12}  E {:+.12}  TS {:.9e}  F_x {:+.10}  {} steps  Δρ {:.1e}  face {:.2e}", p.x, p.f, p.e, p.ts, p.force, p.iterations, p.delta_rho, p.face);
+    }
+    let _ = writeln!(out, "  start warm (from x₁) − cold: F {:+.3e}, E {:+.3e}, F_x {:+.3e} ({} steps); end warm (from x₃₉) − cold: F {:+.3e}, E {:+.3e}, F_x {:+.3e} ({} steps)",
+                     start_warm.f - first.f, start_warm.e - first.e, start_warm.force - first.force, start_warm.iterations,
+                     end_warm.f - last.f, end_warm.e - last.e, end_warm.force - last.force, end_warm.iterations);
+    let _ = writeln!(out, "  W₄₀ {w40:+.12e}  W₂₀ {w20:+.12e}  |W₄₀ − W₂₀|/15 {simpson_err:.3e}");
+    let _ = writeln!(out, "  ΔF {d_f:+.12e}  ΔE {d_e:+.12e}  Δ(TS) {d_ts:+.6e}");
+    let _ = writeln!(out, "  ΔF + W₄₀ {:+.3e} (≤ bound {bound:.3e} = {simpson_err:.2e} + 3·({WORK_PATH}·σ_F {sigma_f:.2e} + √2·σ_E {sigma_e:.2e}) = {simpson_err:.2e} + {noise:.2e})", d_f + w40);
+    let _ = writeln!(out, "  ΔE + W₄₀ {:+.6e} (≥ 5·bound {:.3e}); ΔF + W₂₀ {:+.3e}", d_e + w40, 5.0 * bound, d_f + w20);
+    println!("{out}");
+    assert!((d_f + w40).abs() <= bound, "|ΔF + W₄₀| = {:.3e} > bound {bound:.3e}: the forces' work is not −ΔF", (d_f + w40).abs());
+    assert!((d_e + w40).abs() >= 5.0 * bound, "|ΔE + W₄₀| = {:.3e} < 5 × bound {bound:.3e}: the test does not tell F from E here", (d_e + w40).abs());
+}
+
 // ---- V5: Fermi–Dirac NVE through the TS swing (spec 2026-11-13 §9 "V5 new tests" 2; plan Task 11) ----
 /// CO₂⁺'s grid (A1 note §2.3): 71³ × 0.20 = a 14 Bohr box, h_req of pseudo-O; the origin is a grid node.
 const CO2_N: usize = 71;
@@ -564,6 +706,18 @@ const CO2_BETA_DEG: f64 = 70.0;
 /// The SCF tolerance asked of the GPU (the suite's); every solve along this trajectory has a partly occupied ↓ π level,
 /// so the GPU stops at `qm::GPU_PARTIAL_TOL` = 1e-5 (spec §5.1) whatever is asked — `scf_tol_used` records it.
 const CO2_TOL: f64 = TOL_H2;
+/// Verlet steps of the NVE run (pre-registered, `references.md` "V5" Step 1): 600 × 0.25 fs = 150 fs ≥ 2 bend periods
+/// (harmonic 260 steps; measured 292 with the bend–stretch exchange, so 2.05 periods — the design guard holds, thinly),
+/// at 1.35–1.7 s per warm step inside one 15-min GPU batch.
+const CO2_NVE_STEPS: usize = 600;
+/// The bend's harmonic frequency (a.u.) and the energy the start puts in it, F(70°) − F(0°) (Ha): A1 note §2.2.
+const CO2_OMEGA_B: f64 = 2.335e-3;
+const CO2_E_MODE: f64 = 98.75e-3;
+/// σ_path of F at the start under the 1e-5 partial-level stop (Ha): the largest |F_warm − F_cold| of five repeats
+/// (2.154e-6), rounded up to two digits (`v5_co2_plus_cost_and_path_scatter`, `references.md` "V5" Step 1).
+const CO2_PATH_SCATTER: f64 = 2.2e-6;
+/// max TS − min TS along the run must reach this (Ha; spec §9 V5 2): the trajectory crosses the TS swing.
+const TS_SWING_MIN: f64 = 1e-3;
 
 /// CO₂⁺ (charge +1, auto multiplicity = doublet, `Accepted`: pseudised C and O) bent by `beta_deg` from linear with both
 /// bonds `r`: C at the origin (a grid node), the O at (∓r sin(θ/2), −r cos(θ/2), 0) with θ = 180° − β the bond angle.
@@ -644,4 +798,155 @@ fn v5_co2_plus_cost_and_path_scatter() {
     let mean = walls.iter().sum::<f64>() / walls.len() as f64;
     println!("  warm MD step: mean {mean:.2} s over 20 (max {:.2}); ⇒ 600 steps ≈ {:.1} min", walls.iter().fold(0.0f64, |m, &x| m.max(x)), 600.0 * mean / 60.0);
     println!("  {}", log.lock().unwrap().summary());
+}
+
+/// V5 NVE [MUST-6] (spec 2026-11-13 §9 "V5 new tests" 2; plan Task 11; bounds pre-registered in `references.md` "V5"
+/// before this test existed). Under Fermi–Dirac occupations the forces are −dF/dR (F = E − TS, `qm::forces`), so
+/// velocity Verlet conserves F + K, not E + K (E + K = (F + K) + TS moves with TS). CO₂⁺ (linear ²Π_g: at linearity the
+/// ↓ π pair holds one hole and TS = 2kT ln 2 = 6.93 mHa; bending splits the pair and TS falls toward 0), started at
+/// rest bent by 70° (TS 0.51 mHa), swings through linear and back, so TS sweeps its whole range twice per bend period.
+/// `CO2_NVE_STEPS` velocity-Verlet steps at dt = 0.25 fs through `Integrator::step` on the GPU teacher. Asserted:
+/// - the drift of F + K (least-squares slope) ≤ `DRIFT_BOUND` = 2e-4 Ha/ps (the suite's; this trajectory's budget,
+///   ≤ 1.0e-4 Ha/ps, is in `references.md`);
+/// - the peak-to-peak residual of F + K about that line ≤ FLUCT_MARGIN × (h_b²/4·E_mode + 2σ_path), h_b = ω_b·dt,
+///   E_mode = 98.75 mHa and ω_b = 2.335e-3 from A1, σ_path = `CO2_PATH_SCATTER` (`nve_energy_drift_is_bounded`'s rule;
+///   never scaled per atom);
+/// - max TS − min TS ≥ `TS_SWING_MIN` = 1 mHa;
+/// - the face density ≤ `providers::box_affected_face_density(0.20)` at every evaluation;
+/// - the run covers ≥ 2 bend periods (a design guard on the step count: the period from the zero crossings of the
+///   signed bend coordinate ȳ_O − y_C).
+/// Recorded, not asserted (Task 8 amendment I1): the `branch_jump` flag count (expected 0) and the largest m/b, from a
+/// replica of the provider's guard fed the same evaluations (its flags must equal the provider's). Printed, not
+/// asserted: the shadow Hamiltonian H̃ (below), which separates the Verlet swing from force/energy inconsistency.
+/// **Run of record 2026-11-17: FAILS the fluctuation bound as pre-registered** — 7.92e-5 Ha against 5.63e-5 (drift
+/// +4.5e-6 Ha/ps, TS swing 6.42e-3, face 1.75e-6, 2.05 periods, 0 `branch_jump` flags, largest m/b 0.34: all pass).
+/// H̃ keeps a 4.9e-5 slow wave: the GPU pseudo forces are −dF/dR only to ≈ 3e-5 Ha over the 70° bend (gapped neutral
+/// CO₂ the same), and the bend–stretch exchange puts ≈ 40 mHa into the stiffer stretch; the pre-registered formula has
+/// neither. Not re-bounded: a spec decision (`references.md` "V5", Step 3).
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test dynamics")]
+fn fd_nve_conserves_f_plus_k_through_the_ts_swing() {
+    use providers::branch_jump::{noise_tier, BranchJumpGuard, Evaluation};
+    let Some(ctx) = gpu() else { return };
+    let t_test = Instant::now();
+    let (mut p, log) = Locked::new(ctx.clone(), CO2_TOL);
+    let integ = Integrator::new_fs(DT_FS);
+    let h_b = CO2_OMEGA_B * integ.dt;
+    let verlet_swing = h_b * h_b / 4.0 * CO2_E_MODE;
+    let fluct_bound = FLUCT_MARGIN * (verlet_swing + 2.0 * CO2_PATH_SCATTER);
+    let face_rule = providers::box_affected_face_density(CO2_H);
+    let origin = qm::Grid::cube(CO2_N, CO2_H).origin;
+    let z: Vec<u8> = co2_plus(CO2_BETA_DEG, CO2_R).nuclei.iter().map(|n| n.z).collect();
+    // the replica of the provider's `branch_jump` guard (`providers::ks::judge_branch`: the same inputs; N↑ ≠ N↓, so no spin measure)
+    let mut guard = BranchJumpGuard::new();
+    let mut judge = |s: &Scene, forces: &[[f64; 3]], stats: &sim::EvalStats| {
+        let positions: Vec<[f64; 3]> = s.nuclei.iter().map(|n| n.pos).collect();
+        let tol_used = stats.scf_tol_used.expect("a Kohn-Sham evaluation records its stop");
+        guard.judge(&Evaluation { z: &z, positions: &positions, forces, energy: stats.energy.total, cell: s.cell.clone(), origin, spin_abs: None,
+                                  tier: noise_tier(false, tol_used, stats.energy.total) })
+    };
+    // the signed bend coordinate: mean O height minus C height (negative at the start, 0 at linear)
+    let bend_y = |s: &Scene| 0.5 * (s.nuclei[1].pos[1] + s.nuclei[2].pos[1]) - s.nuclei[0].pos[1];
+
+    let mut s = co2_plus(CO2_BETA_DEG, CO2_R);
+    let r0 = solve(&mut p, &s, "CO₂⁺ NVE start");
+    let j0 = judge(&s, &r0.forces, &r0.stats);
+    assert!(!j0.judged && r0.stats.branch_jump.is_none());
+    let mut f = r0.forces.clone();
+    // per evaluation: velocities and forces, for the shadow-Hamiltonian diagnostic below (reported, never asserted)
+    let (mut vels, mut frcs) = (vec![s.nuclei.iter().map(|n| n.vel).collect::<Vec<_>>()], vec![f.clone()]);
+    let masses: Vec<f64> = s.nuclei.iter().map(|n| n.mass).collect();
+    let mut shape = vec![(CO2_BETA_DEG, CO2_R)];
+    let (mut t, mut total, mut ts, mut e_int, mut y) = (vec![0.0], vec![r0.energy], vec![r0.stats.energy.ts], vec![r0.stats.energy.internal], vec![bend_y(&s)]);
+    let (mut face_max, mut tol_max, mut iters) = (r0.stats.face_density.unwrap_or(f64::NAN), r0.stats.scf_tol_used.unwrap_or(f64::NAN), vec![r0.stats.scf_steps]);
+    let (mut flags, mut judged, mut worst) = (0usize, 0usize, (0.0f64, 0usize, 0.0f64, 0.0f64));
+    let (mut beta_lo, mut beta_hi, mut r_lo, mut r_hi) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+    let t_md = Instant::now();
+    for i in 1..=CO2_NVE_STEPS {
+        let (f_new, st) = integ.step(&mut s, &f, &mut p, &mut no_augment(), &mut never()).unwrap_or_else(|e| panic!("CO₂⁺ NVE step {i}: {e}"));
+        f = f_new;
+        let j = judge(&s, &f, &st.eval);
+        assert_eq!(j.flagged, st.eval.branch_jump.is_some(), "step {i}: the replica guard disagrees with the provider's ({j:?} vs {:?})", st.eval.branch_jump);
+        if j.judged {
+            judged += 1;
+            if j.mismatch / j.bound > worst.0 { worst = (j.mismatch / j.bound, i, j.mismatch, j.bound); }
+        }
+        flags += st.eval.branch_jump.is_some() as usize;
+        t.push(i as f64 * integ.dt);
+        total.push(st.total);
+        ts.push(st.eval.energy.ts);
+        e_int.push(st.eval.energy.internal);
+        y.push(bend_y(&s));
+        iters.push(st.eval.scf_steps);
+        vels.push(s.nuclei.iter().map(|n| n.vel).collect());
+        frcs.push(f.clone());
+        face_max = face_max.max(st.eval.face_density.unwrap_or(f64::NAN));
+        tol_max = tol_max.max(st.eval.scf_tol_used.unwrap_or(f64::NAN));
+        let (beta, ra, rb) = co2_shape(&s);
+        shape.push((beta, 0.5 * (ra + rb)));
+        (beta_lo, beta_hi) = (beta_lo.min(beta), beta_hi.max(beta));
+        (r_lo, r_hi) = (r_lo.min(ra.min(rb)), r_hi.max(ra.max(rb)));
+        if i % 50 == 0 {
+            println!("  step {i}: F + K {:+.9}, TS {:.4e}, β {beta:.2}°, R {ra:.4}/{rb:.4}, {} SCF steps, face {:.2e}", st.total, st.eval.energy.ts, st.eval.scf_steps,
+                     st.eval.face_density.unwrap_or(f64::NAN));
+        }
+    }
+    let md_wall = t_md.elapsed();
+    let (slope_au, fluct, mean) = fit_line(&t, &total);
+    let drift = slope_au * au_per_ps();
+    let (e_lo, e_hi) = total.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+    let (ts_lo, ts_hi) = ts.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+    // E + K = (F + K) + TS: the quantity that is *not* conserved, for contrast
+    let ek: Vec<f64> = total.iter().zip(&ts).map(|(a, b)| a + b).collect();
+    let (_, ek_fluct, _) = fit_line(&t, &ek);
+    // the bend period from every zero crossing of the signed bend coordinate (half a period apart)
+    let mut crossings = Vec::new();
+    for k in 1..y.len() {
+        if (y[k - 1] < 0.0) != (y[k] < 0.0) { crossings.push(t[k - 1] + (t[k] - t[k - 1]) * y[k - 1] / (y[k - 1] - y[k])); }
+    }
+    assert!(crossings.len() >= 2, "the bend crossed linear only {} times", crossings.len());
+    let period = 2.0 * (crossings[crossings.len() - 1] - crossings[0]) / (crossings.len() - 1) as f64;
+    // Diagnostic (reported, never asserted): velocity Verlet conserves the shadow Hamiltonian
+    //   H̃ = H + dt²[(1/12)·vᵀV″v − (1/24)·Σ_I |F_I|²/m_I] + O(dt⁴)
+    // (Hairer, Lubich & Wanner, Geometric Numerical Integration, 2nd ed., §IX.8; up to a multiple of H, which is
+    // conserved to the same order), not H = F + K, which swings about it by h²/4 of each mode's energy. With
+    // dF/dt = −V″v, vᵀV″v ≈ −v_n·(F_{n+1} − F_{n−1})/(2dt). What H̃ still does — its drift and its detrended peak to
+    // peak — is the force and energy error of the solves, the Verlet swing removed to O(dt⁴).
+    let dt = integ.dt;
+    let shadow: Vec<f64> = (1..total.len() - 1).map(|n| {
+        let vf: f64 = (0..masses.len()).flat_map(|i| (0..3).map(move |k| (i, k))).map(|(i, k)| vels[n][i][k] * (frcs[n + 1][i][k] - frcs[n - 1][i][k])).sum();
+        let ff: f64 = (0..masses.len()).map(|i| frcs[n][i].iter().map(|c| c * c).sum::<f64>() / masses[i]).sum();
+        total[n] + dt * dt * (-vf / (2.0 * dt) / 12.0 - ff / 24.0)
+    }).collect();
+    let (sh_slope, sh_fluct, _) = fit_line(&t[1..t.len() - 1], &shadow);
+    let mut series = String::from("  step: F + K − start, H̃ − H̃₁ (µHa); TS (mHa); β (°); R (Bohr)
+");
+    for n in (1..total.len() - 1).step_by(20) {
+        let _ = writeln!(series, "    {n:4}: {:+8.2} {:+8.2}  {:.3}  {:6.2}  {:.4}", (total[n] - total[0]) * 1e6, (shadow[n - 1] - shadow[0]) * 1e6, ts[n] * 1e3, shape[n].0, shape[n].1);
+    }
+    let periods = t[t.len() - 1] / period;
+    let log = log.lock().unwrap().clone();
+    let mut out = String::new();
+    let _ = writeln!(out, "CO₂⁺ FD NVE, {CO2_N}³ × {CO2_H}, `Accepted`, charge +1, tol asked {CO2_TOL:.0e} (stopped at ≤ {tol_max:.0e}), dt = {DT_FS} fs, {CO2_NVE_STEPS} steps from β = {CO2_BETA_DEG}°, R = {CO2_R} at rest");
+    let _ = writeln!(out, "  F + K: start {:+.9}, mean {mean:+.9}, end {:+.9}; drift {drift:+.3e} Ha/ps (bound {DRIFT_BOUND:.0e})", total[0], total[total.len() - 1]);
+    let _ = writeln!(out, "  fluctuation: detrended peak-to-peak {fluct:.3e} Ha (pre-registered bound {fluct_bound:.3e} = {FLUCT_MARGIN} × (h_b²/4·E_mode {verlet_swing:.3e} + 2 × {CO2_PATH_SCATTER:.1e}), h_b = {h_b:.5}); raw {:.3e}; E + K for contrast: detrended {ek_fluct:.3e}",
+                     e_hi - e_lo);
+    out += &series;
+    let _ = writeln!(out, "  shadow Hamiltonian H̃ (diagnostic, Verlet swing removed to O(dt⁴)): drift {:+.3e} Ha/ps, detrended peak-to-peak {sh_fluct:.3e} Ha", sh_slope * au_per_ps());
+    let _ = writeln!(out, "  TS ∈ [{ts_lo:.6e}, {ts_hi:.6e}] (swing {:.3e}, needs ≥ {TS_SWING_MIN:.0e}); E ∈ [{:+.9}, {:+.9}]", ts_hi - ts_lo,
+                     e_int.iter().fold(f64::INFINITY, |m, &v| m.min(v)), e_int.iter().fold(f64::NEG_INFINITY, |m, &v| m.max(v)));
+    let _ = writeln!(out, "  bend: β ∈ [{beta_lo:.2}°, {beta_hi:.2}°], R ∈ [{r_lo:.4}, {r_hi:.4}]; {} linear crossings, period {:.0} a.u. = {:.1} fs = {:.0} steps ⇒ {periods:.2} periods",
+                     crossings.len(), period, units::au_time_to_fs(period), period / integ.dt);
+    let _ = writeln!(out, "  face density max {face_max:.2e} (rule {face_rule:.2e}); SCF steps per solve {}–{} (mean {:.1})", iters.iter().min().unwrap(), iters.iter().max().unwrap(),
+                     iters.iter().sum::<usize>() as f64 / iters.len() as f64);
+    let _ = writeln!(out, "  branch_jump: {flags} flagged of {judged} judged; largest m/b {:.3} at step {} (m {:.3e}, b {:.3e})", worst.0, worst.1, worst.2, worst.3);
+    let _ = writeln!(out, "  {}; MD wall {:.1} s ({:.0} ms/step); test wall {:.1} s", log.summary(), md_wall.as_secs_f64(), ms(md_wall) / CO2_NVE_STEPS as f64, t_test.elapsed().as_secs_f64());
+    println!("{out}");
+    let result = format!("drift {drift:+.2e} Ha/ps, fluct {fluct:.2e} Ha (bound {fluct_bound:.1e}), TS swing {:.2e}, {flags} branch_jump", ts_hi - ts_lo);
+    record(&ctx, timing_row("fd_nve_co2_plus", "CO₂⁺", CO2_N, CO2_TOL, &log, t_test.elapsed(), &result));
+    assert!(face_max <= face_rule, "face density {face_max:.3e} above the box rule {face_rule:.3e}");
+    assert!(periods >= 2.0, "test design: {CO2_NVE_STEPS} steps cover {periods:.2} bend periods (< 2)");
+    assert!(ts_hi - ts_lo >= TS_SWING_MIN, "TS swing {:.3e} Ha < {TS_SWING_MIN:.0e}: the trajectory did not cross the TS swing", ts_hi - ts_lo);
+    assert!(drift.abs() <= DRIFT_BOUND, "F + K drift {drift:+.3e} Ha/ps (bound {DRIFT_BOUND:.0e})");
+    assert!(fluct <= fluct_bound, "F + K fluctuation {fluct:.3e} Ha (pre-registered bound {fluct_bound:.3e})");
 }
