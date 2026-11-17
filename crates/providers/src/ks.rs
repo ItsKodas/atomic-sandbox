@@ -3798,6 +3798,10 @@ pub(crate) mod tests {
         assert_eq!((p.z, p.z_v), (8, 6.0));
         assert!(p.h_req.is_some_and(|h| h >= 0.20) && p.r_c_max > 0.5 && p.record.contains("recipe"), "{p:?}");
         assert_eq!(r.stats.partial.len(), 3, "the minority 2p: three partly occupied levels {:?}", r.stats.partial);
+        // |f − 1/3| ≤ 1e-6 (was 1e-12 under the shared-shell rule, whose equal shares were exact; bcd1463, solver-half review
+        // M4): under Fermi–Dirac the three ↓ p levels share by f = 1/(1 + e^{(ε − μ)/kT}), so a level spread δε moves each
+        // f by |Δf| ≤ f(1 − f)/kT·δε = (2/9)/(5e-3 Ha)·δε ≈ 44·δε; the lattice-split, eigensolver-limited spread at a grid
+        // point is δε ≲ 1e-9 Ha (Ritz values are second order in the residual), so |Δf| ≲ 4e-8 — the bound is 25× that
         assert!(r.stats.partial.iter().all(|p| p.spin == 1 && (p.f - 1.0 / 3.0).abs() < 1e-6), "{:?}", r.stats.partial);
         // the closed form of three exactly degenerate levels at f = 1/3: kT·3·s(1/3), s(f) = −f ln f − (1 − f) ln(1 − f)
         let s3 = 3.0 * (-(1.0f64 / 3.0) * (1.0f64 / 3.0).ln() - (2.0 / 3.0) * (2.0f64 / 3.0).ln());
@@ -3816,7 +3820,7 @@ pub(crate) mod tests {
         assert!((total - 6.0).abs() < 1e-9, "sum f = the 6 valence electrons, got {total}");
         let dn_frac: Vec<f64> = o.rows.iter().filter(|r| r.spin == Spin::Down && r.occupation > 1e-6 && r.occupation < 1.0 - 1e-6).map(|r| r.occupation).collect();
         assert_eq!(dn_frac.len(), 3, "three down p levels share the electron");
-        assert!(dn_frac.iter().all(|f| (f - 1.0 / 3.0).abs() < 1e-6), "{dn_frac:?}");
+        assert!(dn_frac.iter().all(|f| (f - 1.0 / 3.0).abs() < 1e-6), "{dn_frac:?}"); // the same |Δf| ≲ 4e-8 bound as above
         assert!(o.rows.iter().filter(|r| r.spin == Spin::Up).all(|r| r.occupation < 1e-6 || r.occupation > 1.0 - 1e-6), "up is closed");
         assert_eq!((o.spin.n_up, o.spin.n_dn), (4, 2), "electrons per channel (the stored gap witnesses are not electrons)");
     }

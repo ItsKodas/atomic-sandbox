@@ -105,7 +105,9 @@
 //!   under the premise that the spectral weight below θ_j − r_j is negligible (≤ r_j²/D²), i.e. the block holds the
 //!   lowest k levels and no level below the block's top was missed. That holds for columns converged to r ≤ g (hidden
 //!   weight ≲ 3e-5 at g = 1e-3 against the window's D ≈ 0.18 Ha), which is why an untested column (the GPU's buffer)
-//!   is a witness only at r ≤ g. The GPU solver checks the rest the way it can: a Rayleigh–Ritz step whose formed
+//!   is a witness only at r ≤ g. Both solvers let the top tested level decide a (tight) step only at
+//!   r ≤ 1.5 g and otherwise grow the block by one vector (`qm-gpu` `solve_fd`; the CPU's `scf::solve_fd` since plan
+//!   2026-11-13 Task 11 fix round 1, solver-half review M5, `WITNESS_RESIDUAL_FACTOR`). The GPU solver checks the rest the way it can: a Rayleigh–Ritz step whose formed
 //!   vectors do not reproduce their Ritz values (a lost column, `qm_gpu::eigen` "Ritz vectors that do not match their
 //!   Ritz values") is undone; one it cannot undo is an error on the SCF path.
 //! - **Growth** (`grown_extras`): when the witness fails the block grows by its current extra count (the extra block

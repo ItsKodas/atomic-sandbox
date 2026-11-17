@@ -835,7 +835,22 @@ fn solve_fd(grid: &Grid, v_eff: &[f64], nl: Option<&NonlocalOp>, orbitals: &mut 
             CLASS_RAISES.with(|c| c.set(c.get() + 1));
             continue; // a column held loose needs the eigen tol: re-solve with it tight
         }
-        if witness_bound_reached(evals, &residuals, n, mu, kt) {
+        let extras = orbitals.len() - n;
+        // the witness's residual (plan 2026-11-13 Task 11 fix round 1, solver-half review M5; the GPU's rule, `qm-gpu`
+        // `solve_fd`): θ − r is a lower bound of the top level under premise M2 only at r ≲ g (the guard tolerance), and
+        // a column can leave the eigensolver above g (its iteration cap) — so the top level decides only at
+        // r ≤ WITNESS_RESIDUAL_FACTOR·g; above that the block grows by one vector and is re-solved; at the cap the bound is
+        // θ − r as read. On the CPU the eigensolver normally meets g, so this binds only after an eigensolver cap.
+        let top_r = ascending(evals).last().map_or(0.0, |&i| residuals[i]);
+        let witness = witness_bound_reached(evals, &residuals, n, mu, kt);
+        if witness && top_r > WITNESS_RESIDUAL_FACTOR * guard_tol && extras < cap {
+            orbitals.extend(initial_orbitals(grid, nuclei, 1, 1000 + 2 * orbitals.len() as u64 + spin as u64));
+            evals.push(*evals.last().expect("n > 0 vectors"));
+            #[cfg(test)]
+            WITNESS_RESIDUAL_GROWTHS.with(|c| c.set(c.get() + 1));
+            continue;
+        }
+        if witness {
             // the trim (`occupations` module doc): drop the overshoot of a doubled block above the lowest witness
             let keep = witness_keep(evals, &residuals, n, mu, kt);
             if keep >= orbitals.len() { return Ok(occ); }
@@ -845,7 +860,6 @@ fn solve_fd(grid: &Grid, v_eff: &[f64], nl: Option<&NonlocalOp>, orbitals: &mut 
             for i in dropped { orbitals.remove(i); evals.remove(i); }
             return fermi_dirac(evals, n, kt);
         }
-        let extras = orbitals.len() - n;
         if extras >= cap {
             return Err(QmError::Numerical(format!("no gap witness within {cap} extra levels of spin {spin} \
                                                    (WITNESS_GAP = {WITNESS_GAP} Ha above ε_N and {WITNESS_TAIL_KT} kT above μ, on the lower bound θ − r)")));
@@ -855,6 +869,16 @@ fn solve_fd(grid: &Grid, v_eff: &[f64], nl: Option<&NonlocalOp>, orbitals: &mut 
             evals.push(*evals.last().expect("n > 0 vectors"));
         }
     }
+}
+
+/// The witness's residual factor (solver-half review M5; `qm-gpu`'s `EIG_GUESS_FACTOR`, the same 1.5): the top level is a
+/// witness only at r ≤ this × the guard tolerance (`solve_fd`).
+pub const WITNESS_RESIDUAL_FACTOR: f64 = 1.5;
+
+#[cfg(test)]
+thread_local! {
+    /// `solve_fd`'s one-vector growths for a witness above `WITNESS_RESIDUAL_FACTOR`·g on this thread.
+    static WITNESS_RESIDUAL_GROWTHS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -2087,8 +2111,11 @@ mod tests {
         let tight_near = tight_start(Some(&near.occ_up), 1, s.tol);
         assert_eq!(tight_near, 1, "σ_u is loose at R = 1.4: f {:?}", near.occ_up);
         CLASS_RAISES.with(|c| c.set(0));
+        WITNESS_RESIDUAL_GROWTHS.with(|c| c.set(0));
         let (far, stats) = scf(&g, &h2_sys(4.0), &s, Some(&near)).unwrap();
         let raises = CLASS_RAISES.with(|c| c.get());
+        // review M5: the CPU eigensolver meets the guard tolerance, so the witness-residual growth does not bind here
+        assert_eq!(WITNESS_RESIDUAL_GROWTHS.with(|c| c.get()), 0, "a witness left the eigensolver above 1.5 g");
         let (_, all) = scf_all_tight(&g, &h2_sys(4.0), &s, Some(&near)).unwrap();
         let res = state_residuals(&g, &far, 0);
         let order = ascending(&far.evals_up);
