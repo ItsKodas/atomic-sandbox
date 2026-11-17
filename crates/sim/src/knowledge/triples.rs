@@ -150,8 +150,8 @@ pub struct Triple {
 /// Every triple of a geometry (spec §6.1), the pairs body-3 sums: for each centre i with
 /// `trains(i)`, every unordered pair {j, k}, j ≠ k, of its neighbours with 0 < r < `r_cut` (Bohr),
 /// whatever the j–k distance. A coincident (r = 0) or non-finite neighbour is skipped. Atoms past
-/// min(z.len(), pos.len()) are ignored. The one definition: the builder, the planner and the
-/// scene markers all call it.
+/// min(z.len(), pos.len()) are ignored. The one definition: the builder and the scene markers
+/// call it (and Phase B's planner will).
 pub fn each_triple(z: &[u8], pos: &[[f64; 3]], r_cut: f64, trains: impl Fn(usize) -> bool, mut f: impl FnMut(Triple)) {
     let n = z.len().min(pos.len());
     let mut nb: Vec<([f64; 3], f64, usize)> = Vec::new();

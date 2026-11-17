@@ -110,8 +110,8 @@
 //!   sums (`surrogate::descriptor`, "Body-3 features"), without its j = k terms, which are body-2
 //!   functions, not arrangements. The neighbour set is every neighbour within r_cut, **not** the
 //!   first shell of the element card's angles, which stays a chemistry-like view. One enumeration,
-//!   [`each_triple`], serves the builder, the planner and the scene's markers; a coincident
-//!   (r = 0) neighbour is skipped, so no NaN reaches a bin.
+//!   [`each_triple`]: the builder and the scene markers call it (and Phase B's planner will); a
+//!   coincident (r = 0) neighbour is skipped, so no NaN reaches a bin.
 //! - **Axes and cells.** r₁ = r_ij to the species-a neighbour, r₂ = r_ik to the species-b one, u =
 //!   cos θ_jik, the angle at the centre. Distances in [`TRIPLE_BIN`] = 0.3 Bohr bins from 0 (the
 //!   pair rule's three-bin window), ⌈r_cut/0.3⌉ of them; u in [`COS_BINS`] = 10 bins of 0.2, θ
@@ -137,7 +137,8 @@
 //! - **What it does not say.** A count of arrangements, not the model's trust or accuracy: body-3 is
 //!   smooth in the distances and in u (its radial structure, degree ≤ D = 4, is far coarser than
 //!   0.3 Bohr), so it may interpolate across a missing cell, and a taught cell can still be wrong.
-//!   Four-atom (body-4) arrangements are learned too and not counted here.
+//!   Four-atom (body-4) arrangements, learned when the basis has them (a shared collection's
+//!   model), are not counted here.
 
 /// Pair-distance histogram bin (Bohr): the training views' (`TrainingViews::pairs`).
 pub const BIN: f64 = 0.1;
