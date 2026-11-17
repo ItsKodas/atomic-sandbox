@@ -1415,10 +1415,14 @@ pub struct SurrogateKs {
     /// ([`grown_body4_degree`](Self::grown_body4_degree)), and the two must not evict each other.
     fit_floor_cache: std::sync::Mutex<BTreeMap<usize, (u64, usize)>>,
     /// The teach offer's richer-basis words (`richer_basis_floor`), keyed by a fingerprint of all
-    /// they read — the fitted samples (count, energies, species, positions, masks, held-out codes),
+    /// they read — the fitted samples (count, species, positions, force masks, held-out codes),
     /// the richer basis and the standing degree: the status asks every snapshot, and the count is a
     /// descriptor pass over every fitted sample in the degree-6 basis (60–77 ms on a 1590-sample
     /// collection, 2026-11-17). A changed input changes the key, so no mutating path clears it.
+    /// The fingerprint itself hashes every fitted atom's position, O(Σ atoms) per read (0.22 ms at
+    /// 1 621 samples); should collections grow far beyond that, a cheaper first-level key —
+    /// (`model_gen`, `accumulated`, the store length, the quarantine codes' hash) — could gate it,
+    /// the full fingerprint hashed only when that key moves.
     richer_floor_cache: std::sync::Mutex<Option<(u64, Option<String>)>>,
     /// Tests only: the richer-basis key counts `richer_basis_floor` ran (`status_cache` tests).
     #[cfg(test)]

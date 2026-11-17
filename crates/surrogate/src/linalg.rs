@@ -720,7 +720,7 @@ mod tests {
     #[test]
     fn batched_quad_forms_are_the_single_ones_bit_for_bit() {
         let mut rng = StdRng::seed_from_u64(17);
-        for n in [1, 3, 4, 5, 9, 37, 64] {
+        for n in [1, 2, 3, 4, 5, 6, 9, 37, 64, 66] {
             let a: Vec<f64> = (0..n * n).map(|_| rng.gen_range(-1.0..1.0)).collect();
             let mut g = vec![0.0; n * n];
             for i in 0..n {
@@ -736,6 +736,20 @@ mod tests {
                 for (v, q) in vs.iter().zip(&got) {
                     let want = cholesky_quad_form(&g, n, &mut v.clone());
                     assert_eq!(q.to_bits(), want.to_bits(), "n {n} m {m}: {q:e} vs {want:e}");
+                }
+                // the portable kernel itself, whatever the CPU (the dispatch takes AVX2 when present)
+                if m <= QUAD_LANES {
+                    let mut x = vec![[0.0f64; QUAD_LANES]; n];
+                    for (k, xk) in x.iter_mut().enumerate() {
+                        for (r, v) in vs.iter().enumerate() {
+                            xk[r] = v[k];
+                        }
+                    }
+                    forward_substitute_lanes_kernel(&g, n, &mut x);
+                    for (r, q) in got.iter().enumerate() {
+                        let portable: f64 = x.iter().map(|xk| xk[r] * xk[r]).sum();
+                        assert_eq!(portable.to_bits(), q.to_bits(), "portable kernel, n {n} m {m}");
+                    }
                 }
             }
         }

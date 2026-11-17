@@ -134,6 +134,10 @@ impl NullSpace {
 
     /// Unspanned direction `v` (length Q′).
     pub fn vector(&self, v: usize) -> Vec<f64> {
+        debug_assert!(v < self.dim, "direction {v} of {}", self.dim);
+        if self.dim == 0 {
+            return Vec::new();
+        }
         self.columns.iter().skip(v).step_by(self.dim).copied().collect()
     }
 
@@ -146,6 +150,11 @@ impl NullSpace {
     /// of a zero one, gone in the square.
     fn nu_rows(&self, rows: &[&[f64]]) -> Vec<f64> {
         let dim = self.dim;
+        // the callers return ν = 0 before asking when nothing is unspanned
+        debug_assert!(dim > 0, "nu_rows without unspanned directions");
+        if dim == 0 {
+            return Vec::new();
+        }
         let q = self.d.len();
         let mut dots = vec![0.0f64; rows.len() * dim];
         for k in 0..q {
