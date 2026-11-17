@@ -47,8 +47,8 @@ use crate::scene::SceneNucleus;
 use crate::sim::Backend;
 use crate::ui::{activity::words::thousands, dock, keyed, probe, probe_rect, theme, DockTab, PanelInput, UiState, AMBER, GREEN};
 use egui::{pos2, vec2, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui};
-use sim::knowledge::{cell_class, cos_bin, cos_edges_deg, each_triple, summary, taught_count, CellClass, Triple, TripleGrid, TripleKnowledge, TripleMap, TripleType, COS_BINS, TRIPLE_BIN};
-use std::collections::BTreeSet;
+use sim::knowledge::{cell_class, cos_bin, cos_edges_deg, each_triple, summary, taught_count, CellClass, Triple, TripleGrid, TripleKnowledge, TripleMap, TripleSummary, TripleType, COS_BINS, TRIPLE_BIN};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -100,16 +100,111 @@ fn link_probe(t: TripleType) -> String {
     format!("knowledge-triple-link-{}-{}-{}", t.a, t.centre, t.b)
 }
 
-/// The types the open scene has: every atom a centre, every pair of its neighbours within `r_cut`
-/// (`each_triple`, the map's own definition).
-pub fn scene_types(nuclei: &[SceneNucleus], r_cut: f64) -> BTreeSet<TripleType> {
-    let z: Vec<u8> = nuclei.iter().map(|n| n.z).collect();
-    let pos: Vec<[f64; 3]> = nuclei.iter().map(|n| n.pos).collect();
-    let mut out = BTreeSet::new();
-    each_triple(&z, &pos, r_cut, |_| true, |t| {
-        out.insert(t.t);
-    });
-    out
+#[cfg(test)]
+thread_local! {
+    /// Tests only: the [`type_summaries`] passes and [`SceneTriples::of`] enumerations this thread
+    /// ran (final review Minor 1: a frame on the same map and scene runs neither).
+    pub static SUMMARY_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static SCENE_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The open scene's arrangements, by type: every atom a centre, every pair of its neighbours
+/// within `r_cut` (`each_triple`, the map's own definition, so a marker sits in the cell its
+/// arrangement would be counted in). Kept in `TripleView::scene` and enumerated again only when
+/// the geometry (each nucleus's Z and position, bit for bit) or `r_cut` changes ([`scene_memo`]):
+/// a scene is Σ C(k_i, 2) arrangements, too many to redo every frame.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SceneTriples {
+    r_cut: u64,
+    geometry: Vec<(u8, [u64; 3])>,
+    by_type: BTreeMap<TripleType, Vec<Triple>>,
+}
+
+impl SceneTriples {
+    pub fn of(nuclei: &[SceneNucleus], r_cut: f64) -> SceneTriples {
+        #[cfg(test)]
+        SCENE_PASSES.with(|n| n.set(n.get() + 1));
+        let z: Vec<u8> = nuclei.iter().map(|n| n.z).collect();
+        let pos: Vec<[f64; 3]> = nuclei.iter().map(|n| n.pos).collect();
+        let mut by_type: BTreeMap<TripleType, Vec<Triple>> = BTreeMap::new();
+        each_triple(&z, &pos, r_cut, |_| true, |x| by_type.entry(x.t).or_default().push(x));
+        let geometry = nuclei.iter().map(|n| (n.z, n.pos.map(f64::to_bits))).collect();
+        SceneTriples { r_cut: r_cut.to_bits(), geometry, by_type }
+    }
+
+    /// Enumerated from this very geometry and cutoff.
+    pub fn holds(&self, nuclei: &[SceneNucleus], r_cut: f64) -> bool {
+        self.r_cut == r_cut.to_bits() && self.geometry.len() == nuclei.len() && self.geometry.iter().zip(nuclei).all(|(g, n)| g.0 == n.z && g.1 == n.pos.map(f64::to_bits))
+    }
+
+    /// The types the scene has.
+    pub fn types(&self) -> BTreeSet<TripleType> {
+        self.by_type.keys().copied().collect()
+    }
+
+    /// The scene's arrangements of type `t`.
+    pub fn instances(&self, t: TripleType) -> &[Triple] {
+        self.by_type.get(&t).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// The view's [`SceneTriples`] of this geometry and cutoff, enumerated again only when either
+/// changed.
+pub fn scene_memo<'a>(view: &'a mut TripleView, nuclei: &[SceneNucleus], r_cut: f64) -> &'a SceneTriples {
+    if !view.scene.as_ref().is_some_and(|s| s.holds(nuclei, r_cut)) {
+        view.scene = Some(SceneTriples::of(nuclei, r_cut));
+    }
+    view.scene.as_ref().expect("filled above")
+}
+
+/// Each type with fitted or new samples and its [`summary`], in the map's order: every cell's
+/// class and reach, so computed once per map ([`SummaryCache`], spec §6.4 "UI cost").
+pub fn type_summaries(map: &TripleMap) -> Vec<(TripleType, TripleSummary)> {
+    #[cfg(test)]
+    SUMMARY_PASSES.with(|n| n.set(n.get() + 1));
+    map.types.iter().filter(|k| k.samples > 0 || k.pending_samples > 0).map(|k| (k.t, summary(map, k))).collect()
+}
+
+/// [`type_summaries`] of one map, held as `ClassCache` holds its map (`Arc::ptr_eq` cannot match
+/// a later map at a reused address): the picker's gaps and the card head's counts read it, so a
+/// repaint with the same map summarises nothing (final review Minor 1).
+#[derive(Clone)]
+pub struct SummaryCache {
+    pub map: Arc<TripleMap>,
+    pub sums: Vec<(TripleType, TripleSummary)>,
+}
+
+impl SummaryCache {
+    /// Computed from this very map.
+    pub fn holds(&self, map: &Arc<TripleMap>) -> bool {
+        Arc::ptr_eq(&self.map, map)
+    }
+
+    /// Type `t`'s summary (`None`: no fitted or new samples hold it).
+    pub fn get(&self, t: TripleType) -> Option<TripleSummary> {
+        self.sums.iter().find(|(x, _)| *x == t).map(|(_, s)| *s)
+    }
+}
+
+impl PartialEq for SummaryCache {
+    fn eq(&self, o: &Self) -> bool {
+        Arc::ptr_eq(&self.map, &o.map) && self.sums == o.sums
+    }
+}
+
+/// The map shown as its pointer.
+impl std::fmt::Debug for SummaryCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SummaryCache").field("map", &Arc::as_ptr(&self.map)).field("sums", &self.sums).finish()
+    }
+}
+
+/// The view's [`SummaryCache`] of `map`, summarised again only for another map.
+pub fn summaries<'a>(view: &'a mut TripleView, map: &Arc<TripleMap>) -> &'a SummaryCache {
+    if !view.summaries.as_ref().is_some_and(|c| c.holds(map)) {
+        view.summaries = Some(SummaryCache { map: map.clone(), sums: type_summaries(map) });
+    }
+    view.summaries.as_ref().expect("filled above")
 }
 
 /// One row of the picker.
@@ -128,13 +223,12 @@ pub struct PickerRow {
     pub in_scene: bool,
 }
 
-/// The picker's rows: the types with fitted or new samples, in [`order`].
-pub fn picker_rows(map: &TripleMap, scene: &BTreeSet<TripleType>) -> Vec<PickerRow> {
-    let mut rows: Vec<PickerRow> = map
-        .types
+/// The picker's rows: the types with fitted or new samples (`sums`, [`type_summaries`] of `map`),
+/// in [`order`].
+pub fn picker_rows(map: &TripleMap, sums: &[(TripleType, TripleSummary)], scene: &BTreeSet<TripleType>) -> Vec<PickerRow> {
+    let mut rows: Vec<PickerRow> = sums
         .iter()
-        .filter(|k| k.samples > 0 || k.pending_samples > 0)
-        .map(|k| PickerRow { t: k.t, gaps: summary(map, k).gaps, triples: k.triples, samples: k.samples, pending: k.pending_samples, in_scene: scene.contains(&k.t) })
+        .filter_map(|(t, s)| map.get(*t).map(|k| PickerRow { t: k.t, gaps: s.gaps, triples: k.triples, samples: k.samples, pending: k.pending_samples, in_scene: scene.contains(&k.t) }))
         .collect();
     order(&mut rows);
     rows
@@ -154,28 +248,28 @@ pub fn row_text(r: &PickerRow) -> String {
 
 /// The type the section shows: the picked one while the map holds it; else the most-gaps type
 /// centred on an entry link's element (`want_centre`); else the open scene's most-gaps type; else
-/// the picker's first row. `None` only for a map without a type.
-pub fn shown_type(view: &KnowledgeView, map: &TripleMap, scene: &BTreeSet<TripleType>) -> Option<TripleType> {
+/// the picker's first row (`rows`: [`picker_rows`] of `map`). `None` only for a map without a
+/// type.
+pub fn shown_type(view: &KnowledgeView, map: &TripleMap, rows: &[PickerRow]) -> Option<TripleType> {
     if let Pick::Triple(t) = view.pick {
         if map.get(t).is_some_and(|k| k.samples > 0 || k.pending_samples > 0) {
             return Some(t);
         }
     }
-    let rows = picker_rows(map, scene);
     let first = |f: &dyn Fn(&PickerRow) -> bool| rows.iter().find(|r| f(r)).map(|r| r.t);
     view.triple.want_centre.and_then(|c| first(&|r| r.t.centre == c)).or_else(|| first(&|r| r.in_scene)).or_else(|| rows.first().map(|r| r.t))
 }
 
 /// The card's sentence: "2,140 arrangements of H–O–H in 610 samples (13 cells taught, 9 thin, 14
 /// missing within reach) · +12 new since the last refit." Without three-atom terms in the basis
-/// the classes are left out ([`NO_BODY3`] says why).
-pub fn head_sentence(map: &TripleMap, tk: &TripleKnowledge) -> String {
+/// the classes are left out ([`NO_BODY3`] says why). `s` is the type's [`summary`] (the view's
+/// [`SummaryCache`]).
+pub fn head_sentence(map: &TripleMap, tk: &TripleKnowledge, s: TripleSummary) -> String {
     let new = new_since(tk.pending_samples);
     let head = format!("{} arrangements of {} in {} samples", thousands(tk.triples), triple_name(tk.t), thousands(tk.samples as u64));
     if !map.basis.body3 {
         return format!("{head}{new}.");
     }
-    let s = summary(map, tk);
     format!("{head} ({} cells taught, {} thin, {} missing within reach){new}.", s.taught, s.thin, s.missing)
 }
 
@@ -212,13 +306,14 @@ pub fn verdict_line(keys: &[(&str, &sim::SpeciesVerdict)]) -> Option<String> {
 
 /// The card head: the type, the sentence, the basis note when it has no three-atom terms, and the
 /// verdict line (a click shows the Model tab's Learned fold, as "Forget these…" reveals Suspects).
-pub fn card_head(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, map: &TripleMap, tk: &TripleKnowledge) {
+pub fn card_head(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, map: &Arc<TripleMap>, tk: &TripleKnowledge) {
+    let s = summaries(&mut st.knowledge.triple, map).get(tk.t).unwrap_or_default();
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(triple_name(tk.t)).strong().size(14.0));
         theme::pill(ui, "three-atom", theme::INK_DIM);
         ui.label(RichText::new(format!("arrangements around {}", sym(tk.t.centre))).size(10.5).color(theme::INK_FAINT));
     });
-    let s = ui.add(egui::Label::new(RichText::new(head_sentence(map, tk)).size(12.0).color(theme::INK)).wrap());
+    let s = ui.add(egui::Label::new(RichText::new(head_sentence(map, tk, s)).size(12.0).color(theme::INK)).wrap());
     probe("knowledge-triple-sentence", &s);
     if !map.basis.body3 {
         ui.add(egui::Label::new(RichText::new(NO_BODY3).size(11.5).color(AMBER)).wrap());
@@ -270,13 +365,15 @@ pub fn section(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, r_cut: f64
         theme::note(ui, BUILDING);
         return;
     };
-    let scene = scene_types(&input.scene.nuclei, map.r_cut);
-    let rows = picker_rows(&map, &scene);
+    // once per frame, from the view's memos: the scene's types and the map's summaries (Minor 1)
+    let scene = scene_memo(&mut st.knowledge.triple, &input.scene.nuclei, map.r_cut).types();
+    let sums = summaries(&mut st.knowledge.triple, &map).sums.clone();
+    let rows = picker_rows(&map, &sums, &scene);
     if rows.is_empty() {
         ui.add(egui::Label::new(RichText::new(no_types(map.r_cut)).size(11.0).color(theme::INK_DIM)).wrap());
         return;
     }
-    let shown = shown_type(&st.knowledge, &map, &scene);
+    let shown = shown_type(&st.knowledge, &map, &rows);
     picker(ui, st, &rows, shown);
     let Some(tk) = shown.and_then(|t| map.get(t)) else { return };
     if st.knowledge.pick != Pick::Triple(tk.t) {
@@ -504,20 +601,6 @@ pub fn slice_cells(grid: &TripleGrid, folded: bool, rows: Range<usize>, s: usize
     rows.map(|k1| std::array::from_fn(|q| grid.index(folded, k1, s, q))).collect()
 }
 
-/// The open scene's arrangements of type `t`: `each_triple` with every atom a centre (the map's
-/// own definition, so a marker sits in the cell its arrangement would be counted in).
-pub fn scene_instances(nuclei: &[SceneNucleus], t: TripleType, r_cut: f64) -> Vec<Triple> {
-    let z: Vec<u8> = nuclei.iter().map(|n| n.z).collect();
-    let pos: Vec<[f64; 3]> = nuclei.iter().map(|n| n.pos).collect();
-    let mut out = Vec::new();
-    each_triple(&z, &pos, r_cut, |_| true, |x| {
-        if x.t == t {
-            out.push(x);
-        }
-    });
-    out
-}
-
 /// The instance the default slice follows: with a selected atom that centres one, its least
 /// r₁ + r₂ (a tie: the lowest (centre, j, k)); else the lowest (centre, j, k).
 pub fn chosen_instance(instances: &[Triple], selected: Option<usize>) -> Option<Triple> {
@@ -729,7 +812,7 @@ fn flat(ui: &mut Ui, view: &mut TripleView, cache: &ClassCache, input: &PanelInp
         return;
     };
     let (g, folded) = (&map.grid, t.folded());
-    let instances = scene_instances(&input.scene.nuclei, t, map.r_cut);
+    let instances = scene_memo(view, &input.scene.nuclei, map.r_cut).instances(t).to_vec();
     let chosen = chosen_instance(&instances, input.selected);
     let mut s = view.slice.unwrap_or_else(|| default_slice(g, chosen.as_ref(), cache.fullest)).clamp(slices.start, slices.end - 1);
     // the slice control: a slider over the extent's r₂ bins, and the bin's range

@@ -25,7 +25,7 @@
 //!
 //! The camera (`TripleView::yaw_deg`, `pitch_deg`, `zoom`, `show_missing`) is display state, not
 //! recorded; nothing here emits an `Action`. Distances in Bohr; degrees only in the labels.
-use super::triples::{cell_card, cell_hover, drawn, nothing_drawn, scene_instances, ClassCache};
+use super::triples::{cell_card, cell_hover, drawn, nothing_drawn, scene_memo, ClassCache};
 use super::{pair_name, sym, wheel_lines, TripleView, NEW_INK, WHEEL_STEP};
 use crate::ui::{keyed, probe, probe_rect, theme, PanelInput, AMBER, GREEN};
 use egui::{pos2, vec2, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui, Vec2};
@@ -127,9 +127,10 @@ pub fn to_screen(p: [f32; 3], yaw_deg: f32, pitch_deg: f32, zoom: f32, rect: Rec
     pos2(rect.center().x + q[0] * s, rect.center().y - q[1] * s)
 }
 
-/// The voxels' own cell size per axis: the smallest gap between two of their centres along it (a
-/// single layer fills its axis). [`project`] uses it; the panel knows the extent and passes
-/// [`cell_size`] to [`project_sized`].
+/// Tests only (final review Minor 7): the voxels' own cell size per axis, the smallest gap between
+/// two of their centres along it (a single layer fills its axis), for [`project`]; the panel knows
+/// the extent and passes [`cell_size`] to [`project_sized`].
+#[cfg(test)]
 fn lattice(voxels: &[Voxel]) -> [f32; 3] {
     std::array::from_fn(|a| {
         let mut xs: Vec<f32> = voxels.iter().map(|v| v.at[a]).collect();
@@ -138,13 +139,14 @@ fn lattice(voxels: &[Voxel]) -> [f32; 3] {
     })
 }
 
-/// The cloud drawn back to front (equal depth: ascending cell), each cube at [`CUBE_FILL`] of the
-/// voxels' own spacing ([`project_sized`] with their lattice).
+/// Tests only (final review Minor 7): [`project_sized`] at the voxels' own spacing.
+#[cfg(test)]
 pub fn project(voxels: &[Voxel], yaw_deg: f32, pitch_deg: f32, zoom: f32, rect: Rect) -> Vec<Drawn> {
     project_sized(voxels, lattice(voxels), yaw_deg, pitch_deg, zoom, rect)
 }
 
-/// [`project`] with the cell's size per axis given (normalised units, [`cell_size`]).
+/// The cloud drawn back to front (equal depth: ascending cell), each cube at [`CUBE_FILL`] of the
+/// cell's size per axis given (normalised units, [`cell_size`]).
 pub fn project_sized(voxels: &[Voxel], size: [f32; 3], yaw_deg: f32, pitch_deg: f32, zoom: f32, rect: Rect) -> Vec<Drawn> {
     let rot = Rot::new(yaw_deg, pitch_deg);
     let s = scale(rect, zoom);
@@ -381,6 +383,8 @@ pub fn show(ui: &mut Ui, view: &mut TripleView, cache: &mut ClassCache, input: &
     if resp.double_clicked() {
         reset(view);
     }
+    // the open scene's arrangements of the type (the view's memo, before `at` borrows the view)
+    let instances = scene_memo(view, &input.scene.nuclei, map.r_cut).instances(t).to_vec();
     let classes = &cache.classes;
     let pending = |c: usize| tk.pending.get(c).copied().unwrap_or(0);
     let missing = |c: usize| classes[c] == CellClass::Missing && pending(c) == 0;
@@ -440,7 +444,6 @@ pub fn show(ui: &mut Ui, view: &mut TripleView, cache: &mut ClassCache, input: &
     // the open scene's arrangements: white crosses; those outside the extent faint, clamped to
     // its faces (as the 2D slice clamps its rings to the plot), under the others
     let (rows, slices) = &extent;
-    let instances = scene_instances(&input.scene.nuclei, t, map.r_cut);
     let crosses: Vec<([f32; 3], bool)> = instances.iter().map(|i| cross_at(g, &extent, i.r1, i.r2, i.u)).collect();
     let mut first = true;
     for faint in [true, false] {

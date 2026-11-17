@@ -137,6 +137,12 @@ pub struct TripleView {
     /// [`triples::sync`]). Keyed on the map, not the scene: a new scene keeps it, so the
     /// type-change reset still applies after it.
     pub cache: Option<triples::ClassCache>,
+    /// Every held type's summary (the picker's gaps, the card head's counts), computed once per
+    /// map ([`triples::summaries`]; final review Minor 1).
+    pub summaries: Option<triples::SummaryCache>,
+    /// The open scene's arrangements by type, enumerated once per geometry and cutoff
+    /// ([`triples::scene_memo`]): the picker's dots, the slice's rings, the cloud's crosses.
+    pub scene: Option<triples::SceneTriples>,
 }
 
 impl Default for TripleView {
@@ -152,6 +158,8 @@ impl Default for TripleView {
             want_centre: None,
             pose: None,
             cache: None,
+            summaries: None,
+            scene: None,
         }
     }
 }
@@ -376,8 +384,11 @@ pub fn peek(st: &UiState) -> String {
 /// recorded; kept in the profile).
 pub const OVERLAY_TIP: &str = "tints each atom by how well the estimated solver's model knows its surroundings: 0 never seen (grey) … 0.5 thin (amber) … 1 well known (green), the knowledge map's colours. Per atom it is its least-known neighbour within the model's cutoff — that pair's verdict and how many distances like this one were taught. Needs the estimated solver's map (the Knowledge panel). Display only, not recorded";
 
-/// The panel at least this wide draws the map in two columns (the old pop-out window's layout).
-const WIDE: f32 = 760.0;
+/// The panel at least this wide draws the map in two columns (the old pop-out window's layout):
+/// the left column's 460, the gap's 14 and the right column's 420, so the card, the picker and the
+/// slice never get less than 420 pt (final review Minor 6; it was 760, which left the right column
+/// ≈ 286 pt and narrower than the single column just below it).
+pub const WIDE: f32 = 460.0 + 14.0 + 420.0;
 
 /// The Knowledge panel's folds that are open (`UiState::knowledge_sections`, the profile's
 /// `knowledge_sections`): "Why thin?" under the pair card and "Three-atom arrangements" under the
@@ -455,9 +466,10 @@ pub fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, wide: bool, a
             });
             ui.add_space(14.0);
             ui.vertical(|ui| {
-                // 420 at most what is left of the panel: two columns start at `WIDE`, short of
-                // 460 + 14 + 420, and a wider column ran past the panel's edge, clipping the card
-                // and the three-atom section (seen in the Task 11 screenshot at an 870-pt leaf)
+                // 420 at most what is left of the panel: `WIDE` leaves exactly that, and a column
+                // wider than the space left would run past the panel's edge, clipping the card and
+                // the three-atom section (seen in the Task 11 screenshot at an 870-pt leaf, when
+                // `WIDE` was 760)
                 ui.set_min_width(420.0f32.min(ui.available_width()));
                 detail(ui, st, map, &asks, input, acts);
                 triples::section(ui, st, input, map.r_cut);

@@ -8728,6 +8728,108 @@ mod knowledge_map {
         }
     }
 
+    /// Final review Minor 6: two columns only where the right one gets its 420 pt (`WIDE` = 894 of
+    /// the panel's content width): one column at 880 pt and at 900 pt (its content is ≈ 883 pt
+    /// inside the panel's margins), two at 920, and either way the pair's card, the three-atom view
+    /// and the cell card lie inside the panel.
+    #[test]
+    fn the_knowledge_panel_takes_two_columns_only_where_both_fit() {
+        assert_eq!(knowledge::WIDE, 894.0);
+        let scene = chain();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let map = Arc::new(knowledge::fixture_triples());
+        for (width, two) in [(880.0f32, false), (900.0, false), (920.0, true)] {
+            let mut st = UiState::new("h2o", &scene);
+            st.backend = Backend::Estimated;
+            st.activity.absorb(&snap);
+            let frac = (1400.0 - width) / 1400.0;
+            st.workspace.set_node(super::super::workspace::layout::parse(&format!("H({frac:.6},3D,[Knowledge*])")).unwrap());
+            st.knowledge.pick = Pick::Pair(1, 1);
+            st.activity.triples = Some(map.clone());
+            st.knowledge_sections.triples = true;
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 3000.0));
+            let frames = |st: &mut UiState| {
+                for _ in 0..3 {
+                    let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+                    let mut full = ctx.run_ui(raw, |root| {
+                        show(root, st, &inp);
+                    });
+                    full.textures_delta.clear();
+                }
+            };
+            frames(&mut st);
+            // a filled cell of the shown type, so its card shows too
+            let cache = st.knowledge.triple.cache.as_ref().expect("the open section shows a type");
+            let c = (0..map.grid.cells()).find(|&c| matches!(cache.classes[c], sim::knowledge::CellClass::Taught | sim::knowledge::CellClass::Thin)).expect("a filled cell");
+            st.knowledge.triple.cell = Some(map.grid.coords(c));
+            PROBES.with(|p| p.borrow_mut().clear());
+            frames(&mut st);
+            let panel = probed_rect("knowledge-panel");
+            assert!((panel.width() - width).abs() < 24.0, "{width}: {panel:?}");
+            for p in ["knowledge-card", "knowledge-triple-view", "knowledge-triple-cell-card"] {
+                let r = probed_rect(p);
+                assert!(r.left() >= panel.left() - 1.0 && r.right() <= panel.right() + 1.0 && r.top() >= panel.top() - 1.0 && r.bottom() <= panel.bottom() + 1.0, "{width}: {p} {r:?} outside {panel:?}");
+            }
+            let (graph, card) = (probed_rect("knowledge-map"), probed_rect("knowledge-card"));
+            assert_eq!(card.left() >= graph.right(), two, "{width}: the card beside the graph ({graph:?}, {card:?})");
+            assert_eq!(card.top() >= graph.bottom(), !two, "{width}: the card under the graph");
+            if two {
+                assert!(card.width() >= 420.0 - 1.0, "{width}: the right column keeps its 420 pt: {card:?}");
+            }
+        }
+    }
+
+    /// Final review Minor 1: a repaint with the same map `Arc` and the same scene summarises no type
+    /// and enumerates no scene arrangement; another map summarises once, a moved atom enumerates once.
+    #[test]
+    fn a_repaint_with_the_same_map_and_scene_recomputes_nothing() {
+        let scene = chain();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2o", &scene);
+        st.backend = Backend::Estimated;
+        st.activity.absorb(&snap);
+        st.workspace.set_node(super::super::workspace::layout::parse("H(0.7714,3D,[Knowledge*])").unwrap());
+        st.knowledge.pick = Pick::Triple(sim::knowledge::TripleType::new(8, 1, 1));
+        st.activity.triples = Some(Arc::new(knowledge::fixture_triples()));
+        st.knowledge_sections.triples = true;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 3000.0));
+        let frame = |st: &mut UiState, scene: &Scene| {
+            let inp = input(scene, Some(&snap), &cam);
+            let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let mut full = ctx.run_ui(raw, |root| {
+                show(root, st, &inp);
+            });
+            full.textures_delta.clear();
+        };
+        let passes = || (crate::ui::knowledge::triples::SUMMARY_PASSES.with(|n| n.get()), crate::ui::knowledge::triples::SCENE_PASSES.with(|n| n.get()));
+        frame(&mut st, &scene);
+        let first = passes();
+        assert!(first.0 >= 1 && first.1 >= 1, "the first frame summarises and enumerates: {first:?}");
+        assert!(PROBES.with(|p| p.borrow().contains_key("knowledge-triple-head") && p.borrow().contains_key("knowledge-triple-view")), "the card head and the view drawn");
+        for _ in 0..3 {
+            frame(&mut st, &scene);
+        }
+        assert_eq!(passes(), first, "three repaints, the same map and scene: nothing recomputed");
+        // the same content in a new `Arc` (a rebuild): one summary pass, no scene pass
+        st.activity.triples = Some(Arc::new(knowledge::fixture_triples()));
+        frame(&mut st, &scene);
+        frame(&mut st, &scene);
+        assert_eq!(passes(), (first.0 + 1, first.1), "a new map: summarised once");
+        // a moved atom: one scene pass, no summary pass
+        let mut moved = scene.clone();
+        moved.nuclei[0].pos[0] += 0.1;
+        frame(&mut st, &moved);
+        frame(&mut st, &moved);
+        assert_eq!(passes(), (first.0 + 1, first.1 + 1), "a moved atom: enumerated once");
+    }
+
 }
 
 /// The three-atom coverage map's section (spec 2026-11-17 §6.5, Phase A Task 6): the fold, the
@@ -8825,14 +8927,14 @@ mod triple_map {
         assert_eq!(triples::row_text(&rows[1]), "H–O–H · 14 gaps · 2,140 arrangements in 610 samples · +12 new");
         assert_eq!(triples::row_text(&rows[0]), "O–H–H · 14 gaps · 900 arrangements in 610 samples");
         let map = knowledge::fixture_triples();
-        let listed: Vec<TripleType> = triples::picker_rows(&map, &BTreeSet::new()).iter().map(|r| r.t).collect();
+        let listed: Vec<TripleType> = triples::picker_rows(&map, &triples::type_summaries(&map), &BTreeSet::new()).iter().map(|r| r.t).collect();
         assert_eq!(listed.iter().copied().collect::<BTreeSet<_>>(), map.types.iter().map(|k| k.t).collect(), "only the held types, the pending-only one included");
         assert_eq!(triples::triple_name(TripleType::new(1, 1, 8)), "O–H–H");
         // the picker's own order, and the scene's dot
         let water = Scene::preset("h2o").unwrap();
-        let scene = triples::scene_types(&water.nuclei, map.r_cut);
+        let scene = triples::SceneTriples::of(&water.nuclei, map.r_cut).types();
         assert_eq!(scene, BTreeSet::from([TripleType::new(8, 1, 1), TripleType::new(1, 1, 8)]), "every atom a centre");
-        let rows = triples::picker_rows(&map, &scene);
+        let rows = triples::picker_rows(&map, &triples::type_summaries(&map), &scene);
         let mut sorted = rows.clone();
         triples::order(&mut sorted);
         assert_eq!(rows, sorted, "listed in order");
@@ -8921,7 +9023,7 @@ mod triple_map {
         st.knowledge.pick = Pick::Triple(TripleType::new(6, 1, 1));
         let (t, _) = run(&ctx, &mut st, &inp);
         assert!(t.contains("H–C–H is no longer in the model's fitted or new samples"), "{t}");
-        let shown = triples::shown_type(&st.knowledge, &map, &triples::scene_types(&scene.nuclei, map.r_cut)).unwrap();
+        let shown = triples::shown_type(&st.knowledge, &map, &triples::picker_rows(&map, &triples::type_summaries(&map), &triples::SceneTriples::of(&scene.nuclei, map.r_cut).types())).unwrap();
         assert!(map.get(shown).is_some());
         assert!(t.contains(&format!("arrangements of {} in", triples::triple_name(shown))), "the default type's head: {t}");
         assert!(probed("knowledge-triple-head") && probed("knowledge-triple-view"));
@@ -8933,7 +9035,7 @@ mod triple_map {
         let tk = map.get(TripleType::new(8, 1, 1)).unwrap();
         let s = sim::knowledge::summary(&map, tk);
         assert_eq!(
-            triples::head_sentence(&map, tk),
+            triples::head_sentence(&map, tk, s),
             format!("2,140 arrangements of H–O–H in 610 samples ({} cells taught, {} thin, {} missing within reach) · +12 new since the last refit.", s.taught, s.thin, s.missing)
         );
         let ok = key(8, vec![1], None, 967, 38);
@@ -8959,7 +9061,7 @@ mod triple_map {
         st.knowledge_sections.triples = true;
         st.knowledge.pick = Pick::Triple(TripleType::new(8, 1, 1));
         let (t, _) = run(&ctx, &mut st, &inp);
-        assert!(t.contains(&triples::head_sentence(&map, tk)) && t.contains("the model's many-body key around O, with H: trusted"), "{t}");
+        assert!(t.contains(&triples::head_sentence(&map, tk, sim::knowledge::summary(&map, tk))) && t.contains("the model's many-body key around O, with H: trusted"), "{t}");
         let outs = click(&ctx, &mut st, &inp, "knowledge-triple-verdict");
         assert!(outs.iter().all(|o| o.actions.is_empty()), "display only");
         assert!(st.tab_shown(DockTab::Model) && st.model_sections.is_open(super::super::dock::model::Section::Learned), "the Learned fold revealed");
@@ -8992,7 +9094,7 @@ mod triple_map {
         assert_eq!(triple_views(&outs), vec![true]);
         let map = knowledge::fixture_triples();
         st.activity.triples = Some(Arc::new(map.clone()));
-        let scene_t = triples::scene_types(&scene.nuclei, map.r_cut);
+        let scene_t = triples::picker_rows(&map, &triples::type_summaries(&map), &triples::SceneTriples::of(&scene.nuclei, map.r_cut).types());
         assert_eq!(triples::shown_type(&st.knowledge, &map, &scene_t), Some(TripleType::new(1, 1, 8)), "the H-centred type with the most gaps");
         let (t, _) = run(&ctx, &mut st, &inp);
         assert!(t.contains("arrangements of O–H–H in 140 samples"), "{t}");
@@ -9079,7 +9181,7 @@ mod triple_map {
         let cells = triples::slice_cells(&map.grid, true, rows.clone(), 5);
         assert_eq!(cells[6 - rows.start][3], map.grid.index(false, 5, 6, 3), "slice 5, row 6 reads the stored (5, 6) cell");
         let water = Scene::preset("h2o").unwrap();
-        let inst = triples::scene_instances(&water.nuclei, t, map.r_cut);
+        let inst = triples::SceneTriples::of(&water.nuclei, map.r_cut).instances(t).to_vec();
         assert_eq!(inst.len(), 1);
         let (k1, k2, _) = map.grid.coords(map.grid.cell(true, inst[0].r1, inst[0].r2, inst[0].u).unwrap());
         assert_eq!(triples::on_slice(&map.grid, &inst[0], k2), Some(k1));
