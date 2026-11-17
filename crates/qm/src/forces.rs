@@ -91,7 +91,9 @@
 //! 1e-9): HF − (−dE/dx) on H₄ (all-electron, h = 0.30) 6.7e-7 / 1.4e-7 / 2.6e-8 Ha/Bohr in 12 / 15 / 18 Bohr boxes; on
 //! pseudised neutral CO₂'s bend at 35° (h = 0.20) Q_β − (−dF/dβ) = 3.5e-5 Ha/rad in a 14 Bohr box (≈ 1.6e-5 Ha/Bohr
 //! per O: at, and a little over, this estimate's ceiling) and 2.9e-6 in an 18 Bohr box — a box term, falling with the
-//! box, larger for a heavier valence density near the walls than the estimate above assumed. The
+//! box. Its mechanism is not isolated, and it is not predicted by the face density (CO₂'s 2.3e-6 against
+//! H₄'s 2e-5, yet CO₂'s miss per Bohr is ≈ 25× larger); on CO₂ it exceeds the estimate above (1e-5) but
+//! stays within the M7 force-consistency gate of 1e-4 Ha/Bohr (rule 7: users of the forces should know). The
 //! test's 2e-3 Ha/Bohr bound is thus ~100× above the expected floor; the measured value and
 //! its δ-scaling are recorded in the Task 10 report and commit.
 //!

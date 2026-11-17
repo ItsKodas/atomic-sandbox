@@ -5716,8 +5716,9 @@ R = 2.226, `Accepted`, tol = eig_tol = 1e-9; the HF Q_β = Σ_I F_I·∂R_I/∂�
 FD(0.5°) − FD(1°) = 1.05e-5 at both grids, so Richardson is certified far below these numbers (F scatter at tol 1e-9
 ≲ 1e-11 Ha, ≲ 1e-9 Ha/rad in FD). The CPU f64 force misses −dF/dβ by the GPU's amount in the same box (the GPU bend
 work integrals give ≈ +3e-5 Ha/rad near 35°, the same sign), and the miss falls 12× when the box grows to 18 Bohr: it is
-the discrete force's box term (`qm::forces` (iii)), shared by both solvers, **not a GPU state or kernel error and not a
-pseudo force bug**. Per O it is ≈ 1.6e-5 Ha/Bohr (‖∂R/∂β‖ = 1.57 Bohr/rad), at (iii)'s estimated ceiling of 1e-5;
+the discrete force's box term (`qm::forces` (iii)), shared by both solvers, and **not a pseudo force bug**. The static
+part is the shared box term; a GPU share ≲ 1e-5 is not excluded (the kernel/state split and the 91³ GPU work integral
+were not run) and is the warm − cold remainder tracked below. Per O it is ≈ 1.6e-5 Ha/Bohr (‖∂R/∂β‖ = 1.57 Bohr/rad), at (iii)'s estimated ceiling of 1e-5;
 `qm::forces`' doc now records the measurement. **The bias is attributed**, so B_W takes the attributed form. The GPU
 kernel/state split was not run: the CPU f64 path already carries the bias, which settles that the GPU state is not its
 source (the 91³ GPU bend work integral, the revision's next step only if the CPU had not shown it, was not needed).
@@ -5756,11 +5757,14 @@ common steps (the pause changes nothing).
   per a.u. = **4.8e-5 Ha/ps**;
 - the work bias's wave (H̃'s, ≤ 5.1e-5 peak to peak, period ≈ the bend's, ω_b = 2.08e-3; x = 2.5π, so
   |sin x − x cos x| = 1 — the reason for ending at a turning point): as a sinusoid **1.3e-5 Ha/ps**;
-- sum 1.2e-4 Ha/ps, 1.6× under `DRIFT_BOUND`. Measured −5.9e-5, and H̃'s slope is the same −5.9e-5, so the measured
-  slope is the bias wave's, larger than its sinusoid estimate: the wave is not a sinusoid (near 0 at alternate turning
-  points, ≈ −40 µHa between). **Rule 7:** a bounded wave of peak to peak A can put up to 1.5·A/T into a least-squares
-  slope (4.2e-4 Ha/ps for A = 5.1e-5), so on this trajectory the drift assertion's margin (3.4×) rests on the wave's
-  measured shape, not on a worst-case derivation.
+- the sinusoid estimate of that wave term is wrong for this wave: measured −5.9e-5, and H̃'s slope is the same −5.9e-5,
+  so the measured slope is the bias wave's (not a sinusoid: near 0 at alternate turning points, ≈ −40 µHa between).
+  With the measured wave term the budget is 6.2e-5 + 4.8e-5 + 5.9e-5 = **1.7e-4 Ha/ps, 1.2× under `DRIFT_BOUND`**.
+  **Rule 7:** a bounded wave of peak to peak A can put up to 1.5·A/T into a least-squares slope (4.2e-4 Ha/ps for
+  A = 5.1e-5). The trajectory is deterministic, so this wave, of fixed shape, can hide at most its measured 5.9e-5 of a
+  real drift: the assertion's effective detection threshold is ≈ 2.6e-4 Ha/ps, and its margin rests on the wave's
+  measured shape, not on a worst-case derivation. (A follow-up option: fit the drift at the bend turning points only,
+  where the static wave is at its node.)
 
 **Tracked (rule 7; linked to Task 8a review item 1(c), the GPU stop criterion / LOBPCG floor).** The static part of the
 bend bias is explained (the box term, above). What is not: H̃'s wave is history-dependent (steps 441 and 581 have similar
