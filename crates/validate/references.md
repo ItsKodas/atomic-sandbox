@@ -4925,3 +4925,56 @@ The second refit with nothing new: 192.6 → 10.6 s. What is left: `NullSpace::o
 
   (σ_F: the force std and its epistemic part, per atom.) The relative 3.4e-3 of the first report was a value of 3.7e-6 moving by 1.3e-8: the absolute differences are at most 0.4 % of a tier.
 - **Across machines.** faer picks its SIMD kernels at run time (AVX-512 here, AVX2 elsewhere), so a refit on a CPU with another instruction set differs from this one by the same ~κε spread — never in a verdict measured here, but a golden compares bit for bit only on the same ISA (the thread count never matters: `dense::SPLIT`).
+
+## Status cache (2026-11-17; branch `status-cache`; `providers` `surrogate::tests::status_cache::status_cost_on_a_collection`, `#[ignore]`d measurement; release, Ryzen 7 9800X3D, the machine fully loaded by other agents' suites throughout)
+
+Estimated H₂ ran at 1.4 fs/s instead of ~14 on the user's collection: every worker round built `SurrogateKs::status()` twice (the publish, and `cloud_jobs` for its one bool `audits_background`), and each build counted the teach offer's richer-basis environment keys (`teach_offer` → `richer_basis_floor` → `trust::key_column_counts`, every fitted sample described in the degree-6 basis) afresh. The words are now cached on a fingerprint of everything they read (the fitted prefix, each sample's held-out flag, species, positions and force mask, the richer basis, the standing degree — a changed input recounts, nothing clears it by hand), and the worker reads `Trainable::audits_background` without a status. No verdict or word changes: the cached words equal a fresh count after every append, refit, forget, restore, policy change, degree cap, purge and installed background refit (`status_cache` unit tests).
+
+A copy of the user's collection (1 621 samples, H/O/P, degree cap unset, an offer with two notes present), the status at the last step's geometry after 20 Model-only steps (the worker's case), 10 builds each:
+
+| | `status()` mean (max) | per worker round |
+|---|---|---|
+| words counted afresh (before) | 124 ms (199) | 2 builds ≈ 250 ms |
+| words from the cache (after) | **1.05 ms (1.57)** | 1 build ≈ 1 ms |
+
+At a geometry the last step did not evaluate, `readiness` judges the strict policy afresh (`first_refusal`: the variance prediction and rule 5d's novelty) — 96 ms of a 94–207 ms status; the worker's snapshot is at the evaluated geometry, so it does not pay this. The teach offer itself with the cached words: 0.47 ms (the diagnosis 0.26 ms, the cache key 0.22 ms). Not changed here: the variance step every `variance_cadence`-th consultation (`predict(…, true)` and the novelty, 20–37 ms in the diagnosis).
+
+### The variance step (2026-11-17; same branch, the next commit; `providers` `surrogate::tests::step_cost::step_cost_on_a_collection`, `#[ignore]`d measurement; `refit_golden` for the equivalence; release, Ryzen 7 9800X3D, the same collection copy: Q′ 1 902, null-space dimension 1 717)
+
+Every `variance_cadence`-th Model-only step evaluates `predict(…, true)` and rule 5d's novelty; they held the mean step at 5–10 ms. Both are now **the same arithmetic, scheduled differently** — every number bit for bit, so no threshold, tier or verdict moved:
+- **Novelty** (`surrogate::NullSpace`): the null directions are stored by component (`columns[k·dim + v]`) and every row's dots are accumulated one query entry at a time over all directions at once; an entry that is exactly zero (a species block or neighbour channel the query does not touch — most of them for H₂ in an H/O/P basis) is skipped: its products are ±0, which leave a nonzero partial sum unchanged and at most flip the sign of a zero one, gone in the square. Each dot is still summed over k in order. (The complement form ‖φ‖² − ‖Rᵀφ‖² over the 185 spanned directions was not needed and is not exact: its cancellation is O(Q′ε‖φ‖²) absolute against ν's threshold N_null·τ.)
+- **Predictive variance** (`surrogate::linalg::cholesky_quad_forms`): the 1 + 3N rows of a step substituted together through the fit's Cholesky factor — eight right-hand sides as lanes, four rows of L at a time, AVX2 when the CPU has it (no FMA; Rust never contracts) — each lane subtracting the same products in the same order as `forward_substitute`, its squares summed as before.
+
+Unit tests: `linalg::batched_quad_forms_are_the_single_ones_bit_for_bit`, `novelty::batched_nu_is_the_row_by_row_form_bit_for_bit` (random factors and rows with zeros, every batch size around the lane and row widths). **`refit_golden`** recorded on the status-cache commit and compared on this one, cases cold, append-20 and misfit recovery (6 193 items: every prediction and std at the 398 probes, ν and its atom at every probe, every `would_answer` verdict, codes, class and key verdicts, LOO, grades): **0 items differ, every relative difference 0.00e0**.
+
+H₂ near 1.4 Bohr, 400 Model-only steps (draft on, audits off), 100 of them variance steps; the pieces at 1.41 Bohr (ν = 2.15e-9 before and after). Before: the machine fully loaded by other agents' suites; after: lightly loaded — the pieces' ratios are the kernels', the step means are indicative.
+
+| | before | after |
+|---|---|---|
+| `evaluate`, every step (mean) | 12.6 ms | **1.28 ms** |
+| `evaluate`, variance step (mean / max) | 47.7 / 80.9 ms | **2.92 / 4.57 ms** |
+| `evaluate`, other steps (mean) | 0.90 ms | 0.73 ms |
+| `predict(…, true)` | 15.6 ms | **1.50 ms** |
+| `novelty` | 21.5 ms | **0.18 ms** |
+
+The batched substitution alone (`quad_forms_speed`, `#[ignore]`d: 7 rows at n = 1 902): 27.5 ms one at a time → 1.70 ms. The status's `readiness` at a geometry the last step did not evaluate (96 ms in "Status cache" above) runs the same two pieces, and so do the training views' `predict(…, true)` per curve point.
+
+## Warm-started recovery trials (2026-11-17; branch `recovery-warm`, spec `2026-11-17-recovery-warm-start-design.md`, option B; `providers` `surrogate::tests::refit_golden` with its `fit_log` line, `#[ignore]`d; release, Ryzen 7 9800X3D, other agents' test binaries running throughout)
+
+A trust recovery's quarantine trials (each round of both rankings, on the standing basis and in step 3, and step 3's default-basis fit; not the cap retries of steps 1 and 1b since fix round 1) are searched from the most recent fit's (s_E, s_F) (`Accumulator::refit_from`; λ is searched over its whole grid every round, so it needs no start); a trial that would stand or end the rounds is searched again from the data and judged on that fit (`confirm_cold`; the rounds' stop test since fix round 2, review I1: a round that passes warm and fails cold goes on from the cold fit, as main's rounds would). Every standing fit is the cold search of its store state.
+
+**Unit tests.** `surrogate` `a_started_search_reaches_the_cold_stopping_point`: from the cold optimum perturbed (λ × 1.5, σ's × 0.8) the search lands within 6.6e-4 (λ, s_E², s_F² relative) of the cold one in 2 rounds instead of 8 on a DFT-like scatter, 9.2e-4 in 6 instead of 10 near noise-free. `providers` `recovery_warm`: on a small body-4 collection the recovery's standing fit equals a fresh provider's cold fit bit for bit (and a warm refit continuing from it); a trial whose cold confirmation is forced to fail ends the recovery exactly as when it fails outright.
+
+**Golden** (the user's BEST collection copy, 1 588 samples, H/O/P, the three cases against a record made on main 7e420ad with the same copy): **0 differences of any kind** — every hyperparameter, prediction, variance, LOO number, grade and novelty bit for bit, every exact item (codes, verdicts, M, active sets, null space, the search's round count) identical. Each standing fit is the cold search a cold-only recovery reached by the same path, so the ruling-2026-11-17 bars are met with nothing to spare.
+
+**Search rounds per fit** (deterministic; `s` = from a start, `c` = cold confirmation). Fix round 1 (the coordinator: option B must never make a refit slower than main): the cap retries of steps 1 and 1b are searched cold directly, with no start and nothing to confirm; only the quarantine's trials are warm-started. Before it, step 1's cap trial took 4s + 5c where main took 5 (+4 rounds on the cold attach, +5 on append-20). After it:
+
+| case | main 7e420ad | this branch |
+|---|---|---|
+| misfit recovery (energy tier ÷ 3) | entry 8; cap trial 5; quarantine trials 7, 6, 6, 6, 6, 7, 6, 6, 6 — 11 searches, 61 rounds after the entry | entry 8; cap trial 5; quarantine trials 3s, 3s, 3s, 5s, 4s, 2s, 5s, 4s, 5s, then 6c — 12 searches, 45 rounds after the entry (−26 %) |
+| cold attach (step 1's cap trial stands) | 8; 5 | 8; 5 — equal |
+| append-20 | attach 9, 8, 5; refit warm, 7 (step 1b), 5 (one leave-one-out round, stands) | attach 9, 8, 5; refit warm, 7, 2s, 5c (+2 rounds) |
+
+The confirmation repeats the standing trial's cold search (6 rounds in the recovery, the same 6 main's last trial took), so a recovery saves the warm rounds of the quarantine trials that do not stand and pays the warm rounds of the one that does on top of its cold search. Where a single quarantine round stands (append-20) that is a net cost — here 2 rounds, ≈ 0.5 s; the golden compare after fix round 1, and again after fix round 2 (the rounds' stop test confirmed cold), is 0 differences of any kind in all three cases, with the same rounds per fit (on this collection every round that passed warm passed cold).
+
+**Wall** (the whole case: attach, cold refit and recovery; measured before fix round 1, not re-measured — the machine was not quiet): main 91.3 / 64.4 s, this branch 42.5 / 61.1 s, alternated back to back under other agents' CPU and GPU jobs (main's first record run took 218.7 s under heavier load) — too noisy to quote a ratio. At the quiet refit-speed-up measurement's per-round cost (one spectrum ≈ 0.145 s and one `solve_large` ≈ 0.091 s at Q′ 2 460: 10.0 s / 69 and 7.29 s / 80, "Refit speed-up" above) the 16 rounds saved are ≈ 4 s of the recovery's 31.3 s, ≈ 12 % — below the spec's 20–40 % estimate, which assumed the warm trials would converge in one or two rounds; on this collection a quarantine round moves the noise levels enough that a trial still takes 2–5.

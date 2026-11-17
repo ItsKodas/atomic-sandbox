@@ -499,6 +499,10 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         Trainable::pending_refit(&*self.lock())
     }
 
+    fn audits_background(&self) -> bool {
+        Trainable::audits_background(&*self.lock())
+    }
+
     fn set_audit_every(&mut self, n: usize) {
         self.lock().set_audit_every(n)
     }

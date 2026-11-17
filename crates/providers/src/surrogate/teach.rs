@@ -465,24 +465,55 @@ impl SurrogateKs {
     /// may still take it, the sample floor the richer basis would set and the environment keys it
     /// would leave short — each key's own floor in that basis (M8a user-fix 3,
     /// `trust::key_column_counts`), counted over the fitted samples, no estimate.
-    fn richer_basis_floor(&self) -> Option<String> {
+    ///
+    /// Cached (`richer_floor_cache`, 2026-11-17): the status asks every snapshot, and the count is
+    /// a descriptor pass over every fitted sample in the degree-6 basis. The key is a fingerprint
+    /// of everything the count and the words read — the fitted prefix's length, each sample's
+    /// held-out flag and (when fitted) its species, positions and force mask, the richer basis and
+    /// the standing degree — so a changed input recounts and nothing else has to clear it.
+    pub(super) fn richer_basis_floor(&self) -> Option<String> {
+        use std::hash::{Hash, Hasher};
         let rich = self.richer_basis()?;
-        let b = &self.model.as_ref()?.basis;
+        let degree = self.model.as_ref()?.basis.degree_cap;
         let store = self.store.as_ref()?;
-        let fitted = store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s);
+        let end = self.accumulated.min(store.len());
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        end.hash(&mut h);
+        for (i, s) in store.samples[..end].iter().enumerate() {
+            let out = self.excluded(i);
+            out.hash(&mut h);
+            if out {
+                continue;
+            }
+            (&s.z, &s.force_mask, s.pos.len()).hash(&mut h);
+            for x in s.pos.iter().flatten() {
+                x.to_bits().hash(&mut h);
+            }
+        }
+        (&rich.species, rich.n_max, rich.l_max, rich.degree_cap, rich.body3, rich.body4, rich.body4_degree, rich.r_cut.to_bits(), degree).hash(&mut h);
+        let key = h.finish();
+        if let Some((k, words)) = self.richer_floor_cache.lock().unwrap().as_ref() {
+            if *k == key {
+                return words.clone();
+            }
+        }
+        let fitted = store.samples[..end].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s);
+        #[cfg(test)]
+        self.richer_floor_counts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let short: Vec<String> = super::trust::key_column_counts(&rich, fitted)
             .per_key
             .into_iter()
             .filter(|(_, (n, q))| n < q)
             .map(|(k, (n, q))| format!("{} {} has {n} of {q}", ENV_CLASSES[(k.class - 1) as usize], sim::key_words(k.z, &k.neighbours)))
             .collect();
-        (!short.is_empty()).then(|| {
+        let words = (!short.is_empty()).then(|| {
             format!(
-                "if the new samples need the richer basis (degree {} → {RECOVERY_DEGREE_CAP}), each kind of environment needs as many samples as the model columns its atoms touch: {} — a sampling pass would then be needed as well",
-                b.degree_cap,
+                "if the new samples need the richer basis (degree {degree} → {RECOVERY_DEGREE_CAP}), each kind of environment needs as many samples as the model columns its atoms touch: {} — a sampling pass would then be needed as well",
                 short.join(", ")
             )
-        })
+        });
+        *self.richer_floor_cache.lock().unwrap() = Some((key, words.clone()));
+        words
     }
 
     /// A pair blocker's defining pair against the cutoff (SHOULD-T5; informational, decides

@@ -98,7 +98,7 @@
 
 use crate::descriptor::{describe, gaunt, pair_geometry, t4_channels, AtomicBasisScratch, Basis, Body4Term, DescribeError, Gaunt};
 use crate::basis::radial;
-use crate::linalg::cholesky_quad_form;
+use crate::linalg::cholesky_quad_forms;
 use std::sync::OnceLock;
 
 /// Settings the training data were produced with; a model is only valid for a scene solved with
@@ -477,13 +477,6 @@ impl Model {
             }
         }
         restrict(&mut reduced, rep, &phi);
-        let epistemic_e = cholesky_quad_form(l, qr, &mut reduced);
-        let floor_e = if self.energy_per_atom {
-            (n as f64 * self.sigma_e).powi(2)
-        } else {
-            self.sigma_e.powi(2)
-        };
-        let energy_std = (floor_e + epistemic_e).sqrt();
 
         // Forces: g̃_{j,a} = −Σ_i ∂B̃_i/∂r_{j,a}, gathered from every centre's gradient list.
         let mut rows = vec![vec![0.0; q]; 3 * n];
@@ -499,14 +492,29 @@ impl Model {
                 }
             }
         }
+        // every quadratic form of the step in one batched substitution (`cholesky_quad_forms`: bit
+        // for bit the one-at-a-time values, L read once per eight rows; 2026-11-17)
+        let mut restricted = Vec::with_capacity(1 + 3 * n);
+        restricted.push(reduced);
+        for row in &rows {
+            let mut r = vec![0.0; qr];
+            restrict(&mut r, rep, row);
+            restricted.push(r);
+        }
+        let quad = cholesky_quad_forms(l, qr, &restricted.iter().map(|v| &v[..]).collect::<Vec<_>>());
+        let floor_e = if self.energy_per_atom {
+            (n as f64 * self.sigma_e).powi(2)
+        } else {
+            self.sigma_e.powi(2)
+        };
+        let energy_std = (floor_e + quad[0]).sqrt();
         let mut force_std = Vec::with_capacity(n);
         let mut force_std_epistemic = Vec::with_capacity(n);
         for j in 0..n {
             // the epistemic sum alone, then the aleatoric 3σ_f² added once: the split is exact
             let mut epistemic = 0.0;
             for a in 0..3 {
-                restrict(&mut reduced, rep, &rows[3 * j + a]);
-                epistemic += cholesky_quad_form(l, qr, &mut reduced);
+                epistemic += quad[1 + 3 * j + a];
             }
             force_std.push((3.0 * self.sigma_f * self.sigma_f + epistemic).sqrt());
             force_std_epistemic.push(epistemic.sqrt());
