@@ -8658,7 +8658,9 @@ mod knowledge_map {
         let inp = input(&scene, Some(&snap), &cam);
         let ctx = egui::Context::default();
         apply_theme(&ctx);
-        for pick in [Pick::Pair(1, 1), Pick::Pair(6, 6), Pick::Element(6), Pick::Triple(sim::knowledge::TripleType::new(8, 1, 1))] {
+        let hoh = Pick::Triple(sim::knowledge::TripleType::new(8, 1, 1));
+        let (flat, cloud) = (knowledge::TripleMode::Flat, knowledge::TripleMode::Cloud);
+        for (pick, mode) in [(Pick::Pair(1, 1), flat), (Pick::Pair(6, 6), flat), (Pick::Element(6), flat), (hoh, flat), (hoh, cloud)] {
             let mut st = UiState::new("h2o", &scene);
             st.backend = Backend::Estimated;
             st.activity.absorb(&snap);
@@ -8671,6 +8673,7 @@ mod knowledge_map {
                 st.activity.triples = Some(Arc::new(knowledge::fixture_triples()));
                 st.knowledge_sections.triples = true;
                 st.knowledge.triple.cell = Some((6, 6, 6)); // its card and band too
+                st.knowledge.triple.mode = mode; // the slice, or the 3D cloud (Task 8)
             }
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 3000.0));
             let mut shapes = Vec::new();
@@ -8691,13 +8694,19 @@ mod knowledge_map {
                 parts.extend(["knowledge-teach", "knowledge-histogram"]);
             }
             if triple {
-                parts.extend(["knowledge-triple-fold", "knowledge-triple-row-1-8-1", "knowledge-triple-row-1-1-8", "knowledge-triple-view", "knowledge-triple-plot", "knowledge-triple-cell-card", "knowledge-triple-band"]);
+                parts.extend(["knowledge-triple-fold", "knowledge-triple-row-1-8-1", "knowledge-triple-row-1-1-8", "knowledge-triple-view", "knowledge-triple-cell-card", "knowledge-triple-band"]);
+                parts.extend(["knowledge-triple-mode-2d", "knowledge-triple-mode-3d"]);
+                if mode == cloud {
+                    parts.extend(["knowledge-triple-cloud", "knowledge-triple-missing", "knowledge-triple-reset"]);
+                } else {
+                    parts.push("knowledge-triple-plot");
+                }
             }
             for p in &parts {
                 let r = probed_rect(p);
-                assert!(r.right() <= panel.right() + 1.0 && r.left() >= panel.left() - 1.0, "{pick:?} {p}: {r:?} outside {panel:?}");
+                assert!(r.right() <= panel.right() + 1.0 && r.left() >= panel.left() - 1.0, "{pick:?} {mode:?} {p}: {r:?} outside {panel:?}");
             }
-            assert!(probed_rect("knowledge-map").bottom() <= probed_rect("knowledge-ask-6-6").top() && probed_rect("knowledge-ask-6-6").bottom() <= probed_rect(card).top(), "{pick:?}: stacked");
+            assert!(probed_rect("knowledge-map").bottom() <= probed_rect("knowledge-ask-6-6").top() && probed_rect("knowledge-ask-6-6").bottom() <= probed_rect(card).top(), "{pick:?} {mode:?}: stacked");
             fn each_text(s: &egui::epaint::Shape, f: &mut dyn FnMut(&egui::epaint::TextShape)) {
                 match s {
                     egui::epaint::Shape::Text(t) => f(t),
@@ -8711,7 +8720,7 @@ mod knowledge_map {
                     let r = t.galley.rect.translate(t.pos.to_vec2());
                     if r.width() > 0.0 && r.left() >= panel.left() - 1.0 {
                         checked += 1;
-                        assert!(r.right() <= panel.right() + 1.0, "{pick:?}: {:?} runs past the panel ({r:?}, {panel:?})", t.galley.text());
+                        assert!(r.right() <= panel.right() + 1.0, "{pick:?} {mode:?}: {:?} runs past the panel ({r:?}, {panel:?})", t.galley.text());
                     }
                 });
             }
@@ -9074,7 +9083,9 @@ mod triple_map {
         assert_eq!(inst.len(), 1);
         let (k1, k2, _) = map.grid.coords(map.grid.cell(true, inst[0].r1, inst[0].r2, inst[0].u).unwrap());
         assert_eq!(triples::on_slice(&map.grid, &inst[0], k2), Some(k1));
-        assert_eq!(triples::default_slice(&map, tk, inst.first()), k2);
+        let fullest = triples::fullest_slice(&map, tk);
+        assert_eq!(triples::default_slice(&map.grid, inst.first(), fullest), k2);
+        assert_eq!(triples::default_slice(&map.grid, None, fullest), fullest, "no instance: the fullest slice");
         assert_eq!(triples::chosen_instance(&inst, None), inst.first().copied());
     }
 
@@ -9185,6 +9196,35 @@ mod triple_map {
         // the cache follows the map and the type
         let cache = st.knowledge.triple.cache.as_ref().unwrap();
         assert!(Arc::ptr_eq(&cache.map, st.activity.triples.as_ref().unwrap()) && cache.t == hoh);
+        // Task 7 re-review N2: with nothing picked, a new scene whose default type differs resets
+        // the slice and the cell (they named the old type's bins)
+        st.activity.triples = Some(Arc::new(map.clone()));
+        st.knowledge.set_pick(Pick::None);
+        run(&ctx, &mut st, &inp);
+        let before = st.knowledge.triple.cache.as_ref().unwrap().t;
+        assert_ne!(before, hoo_type(), "water's default type");
+        // a drawn cell of it and its slice
+        let tkb = map.get(before).unwrap();
+        let cb = triples::class_table(&map, tkb);
+        let cell = map.grid.coords((0..map.grid.cells()).find(|&c| tkb.counts[c] > 0 && triples::drawn(tkb, cb[c], c)).unwrap());
+        st.knowledge.triple.slice = Some(cell.1);
+        st.knowledge.triple.cell = Some(cell);
+        run(&ctx, &mut st, &inp);
+        assert_eq!((st.knowledge.triple.slice, st.knowledge.triple.cell), (Some(cell.1), Some(cell)), "kept while the type is");
+        // H–O–O: each O centres an O–O–H arrangement; the H centres O–H–O, which the map lacks
+        let n = |z: u8, pos: [f64; 3]| crate::scene::SceneNucleus { z, a: None, pos, vel: [0.0; 3] };
+        let peroxide = Scene { nuclei: vec![n(8, [0.0, 0.0, 0.0]), n(8, [2.8, 0.0, 0.0]), n(1, [-0.6, 1.7, 0.0])], ..Scene::preset("h2o").unwrap() };
+        st.adopt(&peroxide);
+        let inp2 = input(&peroxide, Some(&snap), &cam);
+        let (_, outs) = run(&ctx, &mut st, &inp2);
+        assert_eq!(st.knowledge.triple.cache.as_ref().unwrap().t, hoo_type(), "the new scene's default type");
+        assert_eq!((st.knowledge.triple.slice, st.knowledge.triple.cell), (None, None), "reset with the type");
+        assert!(outs.iter().all(|o| o.actions.is_empty()));
+    }
+
+    /// The fixture's pending-only type, O centred with H and O (`fixture_triples`).
+    fn hoo_type() -> TripleType {
+        TripleType::new(8, 1, 8)
     }
 
     /// Fix round 1, I1: the cache holds its map, so a later map can never take its freed address
@@ -9243,6 +9283,93 @@ mod triple_map {
         assert!(t.contains("now: the open scene's arrangement here"), "{t}");
         assert!(!t.contains("in other slices"), "water has one H–O–H, on this slice: {t}");
         assert_eq!(st.knowledge.triple.cell, None, "a hover picks nothing");
+    }
+
+    /// The cloud's projection as last drawn (the class cache's memo).
+    fn cloud_drawn(st: &UiState) -> Vec<knowledge::cloud::Drawn> {
+        st.knowledge.triple.cache.as_ref().and_then(|c| c.cloud.as_ref()).map(|c| c.drawn.clone()).unwrap_or_default()
+    }
+
+    /// Task 8 (spec §6.5 "The 3D view", §6.8): the `2D | 3D` switch draws the cloud in place of
+    /// the slice; a drag rotates, Reset puts the default angles back, the "missing" checkbox hides
+    /// the missing cells, a click picks the front-most cube and opens its card — all display
+    /// state, no `Action` and no command.
+    #[test]
+    fn the_3d_switch_draws_the_cloud_and_emits_nothing() {
+        use knowledge::cloud;
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = state(&scene, &snap);
+        let map = knowledge::fixture_triples();
+        let hoh = TripleType::new(8, 1, 1);
+        let tk = map.get(hoh).unwrap();
+        st.activity.triples = Some(Arc::new(map.clone()));
+        st.knowledge_sections.triples = true;
+        st.knowledge.set_pick(Pick::Triple(hoh));
+        run(&ctx, &mut st, &inp); // its first frame sends SetTripleView(true)
+        let mut outs = Vec::new();
+        assert_eq!(st.knowledge.triple.mode, TripleMode::Flat, "2D is the default");
+        assert!(probed("knowledge-triple-mode-2d") && probed("knowledge-triple-plot") && !probed("knowledge-triple-cloud"));
+        outs.extend(click(&ctx, &mut st, &inp, "knowledge-triple-mode-3d"));
+        assert_eq!(st.knowledge.triple.mode, TripleMode::Cloud);
+        let (t, more) = run(&ctx, &mut st, &inp);
+        outs.extend(more);
+        assert!(probed_rect("knowledge-triple-cloud").width() > 0.0 && probed_rect("knowledge-triple-cloud").height() > 0.0);
+        assert!(!probed("knowledge-triple-plot"), "the cloud replaces the slice");
+        assert!(t.contains("drag rotates"), "{t}");
+        // the drawn cells: the 2D views' rule, every one of the type's in the extent
+        let classes = triples::class_table(&map, tk);
+        let all: BTreeSet<usize> = (0..map.grid.cells()).filter(|&c| triples::drawn(tk, classes[c], c)).collect();
+        let shown: BTreeSet<usize> = cloud_drawn(&st).iter().map(|d| d.cell).collect();
+        assert_eq!(shown, all, "missing shown by default");
+        assert!(st.knowledge.triple.show_missing);
+        // a drag rotates; Reset puts the default angles back
+        let c = probed_rect("knowledge-triple-cloud").center();
+        outs.push(frame_sized(&ctx, &mut st, &inp, TALL, vec![egui::Event::PointerMoved(c), pointer(c, true)]));
+        for k in 1..=4 {
+            outs.push(frame_sized(&ctx, &mut st, &inp, TALL, vec![egui::Event::PointerMoved(c + egui::vec2(10.0 * k as f32, 6.0 * k as f32))]));
+        }
+        outs.push(frame_sized(&ctx, &mut st, &inp, TALL, vec![pointer(c + egui::vec2(40.0, 24.0), false)]));
+        outs.push(frame_sized(&ctx, &mut st, &inp, TALL, vec![egui::Event::PointerGone]));
+        let v = &st.knowledge.triple;
+        assert!(v.yaw_deg != cloud::DEFAULT_YAW_DEG && v.pitch_deg != cloud::DEFAULT_PITCH_DEG, "rotated: {} {}", v.yaw_deg, v.pitch_deg);
+        assert_eq!(st.knowledge.triple.cell, None, "a drag picks nothing");
+        outs.extend(click(&ctx, &mut st, &inp, "knowledge-triple-reset"));
+        let v = &st.knowledge.triple;
+        assert_eq!((v.yaw_deg, v.pitch_deg, v.zoom), (cloud::DEFAULT_YAW_DEG, cloud::DEFAULT_PITCH_DEG, 1.0));
+        // "missing" off hides the missing cells (not a new one's dashed square)
+        outs.extend(click(&ctx, &mut st, &inp, "knowledge-triple-missing"));
+        assert!(!st.knowledge.triple.show_missing);
+        run(&ctx, &mut st, &inp);
+        let hidden = cloud_drawn(&st);
+        assert!(hidden.len() < all.len(), "{} of {}", hidden.len(), all.len());
+        let missing = |c: usize| classes[c] == sim::knowledge::CellClass::Missing && tk.pending[c] == 0;
+        assert!(hidden.iter().all(|d| !missing(d.cell)));
+        assert_eq!(hidden.iter().map(|d| d.cell).collect::<BTreeSet<_>>(), all.iter().copied().filter(|&c| !missing(c)).collect());
+        // a click picks the front-most cube under the pointer, and its card opens
+        let front = hidden.iter().rev().find(|d| !d.faces.is_empty()).unwrap().clone();
+        let at = egui::Rect::from_points(&front.hull).center();
+        assert_eq!(cloud::hit(&hidden, at), Some(front.cell));
+        for _ in 0..3 {
+            frame_sized(&ctx, &mut st, &inp, TALL, vec![]);
+        }
+        outs.push(frame_sized(&ctx, &mut st, &inp, TALL, vec![egui::Event::PointerMoved(at), pointer(at, true)]));
+        outs.push(frame_sized(&ctx, &mut st, &inp, TALL, vec![pointer(at, false)]));
+        outs.push(frame_sized(&ctx, &mut st, &inp, TALL, vec![egui::Event::PointerGone]));
+        assert_eq!(st.knowledge.triple.cell, Some(map.grid.coords(front.cell)));
+        let (t, more) = run(&ctx, &mut st, &inp);
+        outs.extend(more);
+        assert!(probed("knowledge-triple-cell-card") && t.contains(&triples::cell_card_line(&map, tk, front.cell)), "{t}");
+        // back to 2D: the slice again, the pick kept
+        outs.extend(click(&ctx, &mut st, &inp, "knowledge-triple-mode-2d"));
+        assert_eq!(st.knowledge.triple.mode, TripleMode::Flat);
+        run(&ctx, &mut st, &inp);
+        assert!(probed("knowledge-triple-plot") && !probed("knowledge-triple-cloud"));
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "display only");
     }
 }
 

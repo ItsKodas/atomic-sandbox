@@ -39,7 +39,8 @@
 //!   the pick holding the triple types' picker and the card of the one shown ([`Pick::Triple`]);
 //!   the map (`ActivityDelta::triples`) is built only while the fold is open and the panel shown
 //!   (`Command::SetTripleView`); the element card links to its centre's types and the pair card to
-//!   the arrangements around a short many-body key's centre;
+//!   the arrangements around a short many-body key's centre; its view is a 2D slice or, by its
+//!   `2D | 3D` switch, a rotatable voxel cloud ([`cloud`]);
 //! - the **3D overlay** (the View panel's Display aids ▸ knowledge overlay, [`OVERLAY_TIP`]): each atom
 //!   tinted by `sim::atom_coverage` ([`overlay_coverage`], [`tint_srgb`]: grey 0 never seen → amber
 //!   0.5 thin → green 1 well known, the graph's colours) with a legend card ([`legend`]).
@@ -64,6 +65,7 @@ use sim::knowledge::{angle_bin, first_shell, reads_taught, ElementKnowledge, Kno
 use sim::Confidence;
 use std::collections::BTreeMap;
 
+pub mod cloud;
 pub mod triples;
 
 /// The occupancy (1 − e^(−n/`COVERAGE_COUNT`), the overlay's) at which a distance reads taught:
@@ -100,7 +102,8 @@ pub enum Pick {
     Triple(sim::knowledge::TripleType),
 }
 
-/// The three-atom map's view: the 2D slice (default) or the 3D cloud (spec 2026-11-17 §6.5).
+/// The three-atom map's view: the 2D slice (default) or the 3D cloud ([`cloud`]; spec 2026-11-17
+/// §6.5), switched by the section's `2D | 3D`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TripleMode {
     #[default]
@@ -118,7 +121,7 @@ pub struct TripleView {
     /// The picked cell (k₁, k₂, q): the bins are 0.3 Bohr at every r_cut, so a pick survives a
     /// reach change.
     pub cell: Option<(usize, usize, usize)>,
-    /// The 3D cloud's rotation (degrees) and zoom.
+    /// The 3D cloud's rotation (degrees; [`cloud::rotate`], [`cloud::reset`]) and zoom.
     pub yaw_deg: f32,
     pub pitch_deg: f32,
     pub zoom: f32,
@@ -135,7 +138,17 @@ pub struct TripleView {
 
 impl Default for TripleView {
     fn default() -> Self {
-        TripleView { mode: TripleMode::Flat, slice: None, cell: None, yaw_deg: 35.0, pitch_deg: 20.0, zoom: 1.0, show_missing: true, want_centre: None, cache: None }
+        TripleView {
+            mode: TripleMode::Flat,
+            slice: None,
+            cell: None,
+            yaw_deg: cloud::DEFAULT_YAW_DEG,
+            pitch_deg: cloud::DEFAULT_PITCH_DEG,
+            zoom: 1.0,
+            show_missing: true,
+            want_centre: None,
+            cache: None,
+        }
     }
 }
 

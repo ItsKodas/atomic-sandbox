@@ -32,6 +32,9 @@
 //!   those in other slices. Hover reads [`cell_hover`]; a click picks a drawn cell (empty space
 //!   clears it) and its card shows [`cell_card_line`] and the honest-limits band
 //!   ([`band_lines`], §6.7 items 1–3).
+//! - **The `2D | 3D` switch** (Task 8, [`mode_switch`]; `TripleView::mode`, 2D by default): 3D
+//!   draws the same cells as a rotatable voxel cloud ([`super::cloud`]) with the same hover, cell
+//!   pick and card ([`cell_card`]).
 //! - **Stale state** (Review Focus 1, [`sync`]): the classes and extent are computed once per
 //!   (map `Arc`, type) into `TripleView::cache`; each frame a slice outside the extent is clamped
 //!   into it and a picked cell past the grid or no longer drawn is dropped. Showing another type
@@ -39,7 +42,7 @@
 //!
 //! Display state only (`KnowledgeView::triple`, the pick, the fold): nothing here emits an
 //! `Action`. Distances in Bohr; degrees only in the labels.
-use super::{new_since, pair_name, sym, KnowledgeView, Pick, TripleView, NEW_INK};
+use super::{cloud, new_since, pair_name, sym, KnowledgeView, Pick, TripleMode, TripleView, NEW_INK};
 use crate::scene::SceneNucleus;
 use crate::sim::Backend;
 use crate::ui::{activity::words::thousands, dock, keyed, probe, probe_rect, theme, DockTab, PanelInput, UiState, AMBER, GREEN};
@@ -280,14 +283,38 @@ pub fn section(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, r_cut: f64
         ui.add_space(4.0);
         super::card(ui, "knowledge-triple-head", |ui| card_head(ui, st, input, &map, tk));
     }
-    // the slice (the cloud, Task 8, draws here too)
+    // the view: the slice, or the 3D cloud (Task 8)
     ui.add_space(6.0);
     let view = &mut st.knowledge.triple;
+    mode_switch(ui, view);
     sync(view, &map, tk);
-    let cache = view.cache.take().expect("sync fills it");
-    let r = ui.scope(|ui| flat(ui, view, &cache, input, &map, tk)).response;
+    let mut cache = view.cache.take().expect("sync fills it");
+    let r = ui
+        .scope(|ui| match view.mode {
+            TripleMode::Flat => flat(ui, view, &cache, input, &map, tk),
+            TripleMode::Cloud => cloud::show(ui, view, &mut cache, input, &map, tk),
+        })
+        .response;
     view.cache = Some(cache);
     probe("knowledge-triple-view", &r);
+}
+
+/// The `2D | 3D` switch (display state, not recorded).
+fn mode_switch(ui: &mut Ui, view: &mut TripleView) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let modes = [
+            (TripleMode::Flat, "2D", "knowledge-triple-mode-2d", "one slice: the angle against r₁ at one r₂"),
+            (TripleMode::Cloud, "3D", "knowledge-triple-mode-3d", "every cell at once: r₁, r₂ and the angle as a cloud you can turn"),
+        ];
+        for (mode, label, name, tip) in modes {
+            let r = keyed(ui, name, |ui| ui.add(theme::choice_button(view.mode == mode, RichText::new(label).size(11.0)))).on_hover_text(tip);
+            probe(name, &r);
+            if r.clicked() {
+                view.mode = mode;
+            }
+        }
+    });
 }
 
 /// The picker: one row per type, the shown one outlined, a dot for the scene's types.
@@ -393,6 +420,9 @@ pub struct ClassCache {
     pub fullest: usize,
     /// The type's fullest fitted cell's count: the fill opacity's scale.
     pub top: u32,
+    /// The 3D view's voxels and last projection (Task 8), made on its first frame: a memo of the
+    /// fields above and the camera, so not compared.
+    pub cloud: Option<cloud::Cloud>,
 }
 
 impl ClassCache {
@@ -400,7 +430,7 @@ impl ClassCache {
     pub fn of(map: &Arc<TripleMap>, tk: &TripleKnowledge) -> ClassCache {
         let classes = class_table(map, tk);
         let extent = extent(map, tk, &classes);
-        ClassCache { map: map.clone(), t: tk.t, classes, extent, fullest: fullest_slice(map, tk), top: tk.counts.iter().copied().max().unwrap_or(0) }
+        ClassCache { map: map.clone(), t: tk.t, classes, extent, fullest: fullest_slice(map, tk), top: tk.counts.iter().copied().max().unwrap_or(0), cloud: None }
     }
 
     /// Computed from this very map (`Arc::ptr_eq`) for type `t`.
@@ -409,7 +439,7 @@ impl ClassCache {
     }
 }
 
-/// The map compared by pointer (it is a key, not a value).
+/// The map compared by pointer (it is a key, not a value); the cloud, a memo, is not compared.
 impl PartialEq for ClassCache {
     fn eq(&self, o: &Self) -> bool {
         Arc::ptr_eq(&self.map, &o.map) && self.t == o.t && self.classes == o.classes && self.extent == o.extent && self.fullest == o.fullest && self.top == o.top
@@ -426,6 +456,7 @@ impl std::fmt::Debug for ClassCache {
             .field("extent", &self.extent)
             .field("fullest", &self.fullest)
             .field("top", &self.top)
+            .field("cloud", &self.cloud.as_ref().map(|c| (c.voxels.len(), c.drawn.len())))
             .finish()
     }
 }
@@ -492,12 +523,10 @@ pub fn chosen_instance(instances: &[Triple], selected: Option<usize>) -> Option<
         .copied()
 }
 
-/// The slice shown when none was chosen: the chosen instance's r₂ bin, else the type's fullest
-/// slice ([`fullest_slice`]). The slice itself reads the cached `ClassCache::fullest`; this is
-/// the same rule uncached, for the tests and the `--ui` keys.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn default_slice(map: &TripleMap, tk: &TripleKnowledge, chosen: Option<&Triple>) -> usize {
-    chosen.and_then(|x| map.grid.r_bin_of(x.r2)).unwrap_or_else(|| fullest_slice(map, tk))
+/// The slice shown when none was chosen: the chosen instance's r₂ bin, else `fullest`, the
+/// type's fullest slice ([`fullest_slice`], cached as `ClassCache::fullest`).
+pub fn default_slice(grid: &TripleGrid, chosen: Option<&Triple>, fullest: usize) -> usize {
+    chosen.and_then(|x| grid.r_bin_of(x.r2)).unwrap_or(fullest)
 }
 
 /// The type's fullest slice: fitted + new, as the slice draws them (a folded cell {k₁, k₂} in
@@ -650,13 +679,13 @@ type Marker = (usize, usize, Pos2, Triple);
 fn flat(ui: &mut Ui, view: &mut TripleView, cache: &ClassCache, input: &PanelInput<'_>, map: &TripleMap, tk: &TripleKnowledge) {
     let t = tk.t;
     let Some((rows, slices)) = cache.extent.clone() else {
-        ui.add(egui::Label::new(RichText::new(format!("nothing to draw: no cell of {} is filled or within reach", triple_name(t))).size(11.0).color(theme::INK_DIM)).wrap());
+        nothing_drawn(ui, t);
         return;
     };
     let (g, folded) = (&map.grid, t.folded());
     let instances = scene_instances(&input.scene.nuclei, t, map.r_cut);
     let chosen = chosen_instance(&instances, input.selected);
-    let mut s = view.slice.or_else(|| chosen.and_then(|x| g.r_bin_of(x.r2))).unwrap_or(cache.fullest).clamp(slices.start, slices.end - 1);
+    let mut s = view.slice.unwrap_or_else(|| default_slice(g, chosen.as_ref(), cache.fullest)).clamp(slices.start, slices.end - 1);
     // the slice control: a slider over the extent's r₂ bins, and the bin's range
     ui.horizontal_wrapped(|ui| {
         let mut k = s;
@@ -788,9 +817,18 @@ fn flat(ui: &mut Ui, view: &mut TripleView, cache: &ClassCache, input: &PanelInp
         view.cell = resp.interact_pointer_pos().and_then(at).and_then(|(row, q)| shown(row, q)).map(|c| g.coords(c));
     }
     ui.label(RichText::new(format!("angle at {} (cos θ bins)", sym(t.centre))).size(10.0).color(theme::INK_FAINT));
-    // the picked cell's card (no Teach in Phase A)
+    cell_card(ui, view, map, tk);
+}
+
+/// A type without a drawn cell: one plain line in place of the view.
+pub fn nothing_drawn(ui: &mut Ui, t: TripleType) {
+    ui.add(egui::Label::new(RichText::new(format!("nothing to draw: no cell of {} is filled or within reach", triple_name(t))).size(11.0).color(theme::INK_DIM)).wrap());
+}
+
+/// The picked cell's card, under either view (no Teach in Phase A): its line and the band.
+pub fn cell_card(ui: &mut Ui, view: &TripleView, map: &TripleMap, tk: &TripleKnowledge) {
     if let Some((k1, k2, q)) = view.cell {
-        let c = g.index(folded, k1, k2, q);
+        let c = map.grid.index(tk.t.folded(), k1, k2, q);
         ui.add_space(4.0);
         super::card(ui, "knowledge-triple-cell-card", |ui| {
             ui.add(egui::Label::new(RichText::new(cell_card_line(map, tk, c)).size(11.5).color(theme::INK)).wrap());
