@@ -114,6 +114,11 @@
 //! into the store as attach would load it — the collection's code, its box's references, no face density. A duplicate
 //! (the same answer stored — a crash between an append and the cursor write) is counted as done, its status written
 //! when it is missing (the stored code still 0). The predecessor is only ever opened read-only.
+//!
+//! **The source is never read from `migration.txt` as a path** (Task 14 security review): its `source_slug` must equal
+//! the predecessor's slug recomputed from the attached key (`predecessor_slug`) and be one plain folder name; any other
+//! value — a separator, `..`, an absolute, drive or UNC path, another folder — makes the log stale: no migration, a note,
+//! the file left as it is. The path used is the recomputed one under the collections root.
 
 use super::*;
 use crate::sampling::migrate::{prior_solve_s, MigratedAppend, Migrator};
@@ -1268,10 +1273,22 @@ pub(crate) fn legacy_tag_for(tag: &str) -> Option<String> {
 /// matched exactly (every field, as every open matches); `None` when there is none or `key` is not this build's surface.
 pub fn predecessor_of(root: &Path, key: &SurfaceKey) -> Option<PathBuf> {
     let old = SurfaceKey { ionic: legacy_tag_for(&key.ionic)?, ..key.clone() };
-    let dir = root.join(old.slug());
+    let dir = root.join(predecessor_slug(key)?);
     let text = std::fs::read_to_string(dir.join("key.txt")).ok()?;
     let theirs = SurfaceKey::from_text(&text).ok()?;
     old.difference(&theirs).is_none().then_some(dir)
+}
+
+/// The folder name (slug) of `key`'s predecessor ([`predecessor_of`]), computed from the key alone — never read from a
+/// file; `None` when `key` is not this build's surface.
+pub(crate) fn predecessor_slug(key: &SurfaceKey) -> Option<String> {
+    Some(SurfaceKey { ionic: legacy_tag_for(&key.ionic)?, ..key.clone() }.slug())
+}
+
+/// Whether `name` is one plain path component (no separator, no `.`/`..`, no root, drive or UNC prefix).
+fn plain_component(name: &str) -> bool {
+    let mut parts = Path::new(name).components();
+    matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(c)), None) if c == std::ffi::OsStr::new(name)) && !name.contains(['/', '\\', ':'])
 }
 
 /// The attached collection's migration (module doc, "The migration"): its predecessor folder, what was read of it, and
@@ -1319,7 +1336,20 @@ impl SurrogateKs {
             }
         };
         let source = match &log {
-            Some(l) => root.join(&l.source_slug),
+            // the source is never the log's word for a path (security review, Task 14): the predecessor's slug is
+            // recomputed from the attached key and must be the log's, a plain folder name under the same root
+            Some(l) => match predecessor_slug(&sh.coll.key) {
+                Some(want) if want == l.source_slug && plain_component(&l.source_slug) => root.join(want),
+                want => {
+                    self.user_notes.push(format!(
+                        "shared collection {slug}: its {} names the source folder {:?}, not this collection's predecessor ({}) — it is ignored, and the re-solve for the new solver is not offered",
+                        surrogate::migration::MIGRATION_FILE,
+                        l.source_slug,
+                        want.unwrap_or_else(|| "none for this surface".into())
+                    ));
+                    return;
+                }
+            },
             None => match predecessor_of(&root, &sh.coll.key) {
                 Some(d) => d,
                 None => return,

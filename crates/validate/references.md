@@ -5807,7 +5807,9 @@ another worktree's `providers` suite, timings only):
 `samples.bin` byte-identical to an uninterrupted run's), `failed_resolve_is_listed_not_migrated`,
 `masked_sample_compared_on_all_atoms_and_carried`, `references_resolved_not_carried`, `not_offered_when_complete`,
 `source_change_restarts_from_zero` (F3; byte-identical to an uninterrupted run on the changed source),
-`purge_refused_while_migration_runs`, `old_pass_checkpoint_resume_refused`, `migration_is_a_pass_through_dynamics`. Six
+`purge_refused_while_migration_runs`, `old_pass_checkpoint_resume_refused`, `migration_is_a_pass_through_dynamics`,
+`a_crafted_source_slug_never_leaves_the_collections_root` (security review: a `migration.txt` whose `source_slug` is not
+the predecessor recomputed from the key — `..\other`, an absolute, drive or UNC path, a separator — is ignored). Six
 mutations of the engine (the (8, S) code, the duplicate rule, the fingerprint restart, the warning check, the purge
 refusal, an all-atom force comparison cut to one atom) each fail their test.
 

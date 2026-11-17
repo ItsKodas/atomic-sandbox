@@ -3311,4 +3311,54 @@ mod migration {
         assert_eq!((st.state, st.done, st.counts), (sim::MigrationPhase::Complete, 4, [2, 1, 1, 0]));
         assert!(!Trainable::pass_active(&*s));
     }
+
+    /// Security review (Task 14): `migration.txt`'s `source_slug` is never used as a path. A crafted log naming a folder
+    /// outside the collections root (`..\other`, an absolute path, a separator) — or any folder but the predecessor
+    /// recomputed from the attached key — is ignored with a note: nothing is offered or migrated, nothing is read there.
+    #[test]
+    fn a_crafted_source_slug_never_leaves_the_collections_root() {
+        let (samples, tw) = mixed();
+        for crafted in ["..\\other", "../other", "C:\\Users\\other", "\\\\server\\share", "sub/dir", "..", "unrelated-folder"] {
+            let root = root("crafted");
+            old_folder(&root, &samples, &[]);
+            // a collection outside the root that the crafted slug would point at
+            let outside = root.parent().unwrap().join(format!("other-{}", std::process::id()));
+            let (c, _) = Collection::open(&outside, &old_key()).unwrap();
+            drop(c);
+            let (c, _) = Collection::open(&root, &new_key()).unwrap();
+            let dir = c.folder().to_path_buf();
+            drop(c);
+            let log = MigrationLog {
+                source_slug: crafted.into(),
+                source_key: old_key().to_text(),
+                build: "x".into(),
+                date: "2026-11-17".into(),
+                source_len: 0,
+                source_hash: 0,
+                cursor: 0,
+                state: MigrationState::Running,
+                counts: [0; 4],
+                not_migrated: Vec::new(),
+                references: Vec::new(),
+                class_u_max: (0.0, 0.0),
+                review: Vec::new(),
+            };
+            surrogate::write_migration(&dir, &log).unwrap();
+            let before = files(&dir);
+            let (mut s, solves) = student(tw.clone());
+            s.attach_collection(&root, &h2_at(1.4)).unwrap();
+            let notes = Trainable::take_notes(&mut s);
+            assert!(notes.iter().any(|n| n.contains("not this collection's predecessor") && n.contains("is ignored")), "{crafted}: {notes:?}");
+            assert_eq!(s.migration(), None, "{crafted}: no migration");
+            assert!(s.start_migration().is_err(), "{crafted}: nothing starts");
+            assert!(!Trainable::pass_active(&s));
+            assert_eq!(solves.load(Ordering::SeqCst), 0);
+            drop(s);
+            let after = files(&dir);
+            for f in ["migration.txt", "samples.bin"] {
+                assert_eq!(after.get(f), before.get(f), "{crafted}: {f} untouched (the log is left as it is, nothing appended)");
+            }
+            let _ = std::fs::remove_dir_all(&outside);
+        }
+    }
 }
