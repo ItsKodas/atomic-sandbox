@@ -677,6 +677,9 @@ impl Viewer {
         self.ui.activity.views = None;
         self.ui.activity.views_at = None;
         self.ui.activity.knowledge = None; // the new worker ships its own model's map
+        // ... and was told nothing of the three-atom view (Review Focus 5: the next frame resends it)
+        self.ui.activity.triples_sent = false;
+        self.ui.activity.triples = None;
         let mut settings = self.ui.run_settings();
         // a resumed session's clock goes to its first driver only (a later solver switch restarts it)
         if let Some(t) = self.resume_clock.take() {

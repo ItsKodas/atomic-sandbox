@@ -5572,6 +5572,25 @@ mod activity_tab {
         assert!(st.views.is_none(), "no model at all");
     }
 
+    /// The three-atom map (spec 2026-11-17 §6.4) is kept like the knowledge map: `Some` is kept, a
+    /// later `None` (no new build) keeps it, a snapshot with no fitted model drops it.
+    #[test]
+    fn the_triple_map_is_kept_like_the_knowledge_map() {
+        use sim::knowledge::{TripleBasis, TripleMap};
+        let scene = Scene::preset("h2").unwrap();
+        let mut st = activity::ActivityState::new();
+        let mut s = snapshot(&scene, Backend::Estimated, Some(model()));
+        let basis = TripleBasis { body3: true, body4: false, degree_cap: 0, l_max: 0 };
+        s.activity.triples = Some(Arc::new(TripleMap::assemble(6.0, 5.0, basis, Vec::new(), &[], &[])));
+        st.absorb(&s);
+        assert!(st.triples.is_some(), "kept from the snapshot");
+        s.activity.triples = None;
+        st.absorb(&s);
+        assert!(st.triples.is_some(), "None = no new build");
+        st.absorb(&snapshot(&scene, Backend::Estimated, Some(ModelStatus { fitted: false, ..model() })));
+        assert!(st.triples.is_none(), "no fitted model: dropped");
+    }
+
     /// Task 5 review M2: the run divider goes by event time. An old-run event carried by the
     /// snapshot that announces the new run is placed before the divider, the new run's after it.
     #[test]

@@ -68,6 +68,21 @@
 //! its own last build ([`knowledge_build`]: the views' 2 s floor and duty backstop); a deferred
 //! rebuild wakes the worker like a deferred view build ([`Worker::views_wake`]). Any other change
 //! — a refit, a Forget or Restore, a re-judged verdict — rebuilds at once, as before.
+//!
+//! # The three-atom map (spec 2026-11-17 §6.4)
+//! `sim::knowledge::TripleMap` (`Trainable::triple_map`) is built only while the UI shows the
+//! arrangements ([`Command::SetTripleView`], a display-visibility command like `SetActivityViews`)
+//! and the model is fitted, on the knowledge map's schedule ([`knowledge_build`]) over its own key,
+//! [`KnowledgeKey::triple_part`]: the knowledge key without the per-key verdicts and the trust rule,
+//! which count nothing (a re-judge rebuilds no triple map). A fit change (a refit, a Forget or
+//! Restore, a policy change) builds at once; a pending-only change at most once per
+//! [`views_interval`] of the last build, deferred with the same wake ([`Worker::views_wake`]).
+//! Turning the view on forgets the last key, so the next publish builds; turning it off drops a
+//! deferred wake. When both maps build in one publish, the triple build's wall time is added to the
+//! knowledge map's last build (and the triple map's own record holds the sum too), so the duty
+//! backstop covers both and the two pending-only cadences stay in step. Shipped as
+//! `ActivityDelta::triples`, `None` = no new build, kept and dropped by the UI exactly as
+//! `knowledge`; a new worker starts with none (`Viewer::start` resets `triples_sent`).
 use super::*;
 
 /// The fewest seconds between two training-view builds (spec §6).
@@ -112,6 +127,9 @@ pub struct ActivityDelta {
     /// The knowledge map, when rebuilt for this snapshot (module doc, "The knowledge map"); `None`
     /// = no new build, as `views`.
     pub knowledge: Option<Arc<sim::KnowledgeMap>>,
+    /// The three-atom map, when rebuilt for this snapshot (module doc, "The three-atom map"); built
+    /// only while shown; `None` = no new build, as `knowledge`.
+    pub triples: Option<Arc<sim::knowledge::TripleMap>>,
     /// This worker's activity bookkeeping and teacher time so far (ms; spec §6): the drains, the
     /// fit history and the view builds, against the events' `solve_ms`.
     pub activity_ms: f64,
@@ -178,6 +196,12 @@ impl KnowledgeKey {
     fn same_fit(&self, o: &KnowledgeKey) -> bool {
         KnowledgeKey { pending: 0, ..self.clone() } == KnowledgeKey { pending: 0, ..o.clone() }
     }
+
+    /// The part the three-atom map depends on (module doc, "The three-atom map"): the verdicts
+    /// emptied and the trust rule false, since neither moves a count — a re-judge rebuilds nothing.
+    fn triple_part(&self) -> KnowledgeKey {
+        KnowledgeKey { verdicts: Vec::new(), trusted: false, ..self.clone() }
+    }
 }
 
 /// Whether to rebuild the knowledge map now (module doc, "The live graph").
@@ -234,6 +258,13 @@ pub(super) struct ActivityWork {
     knowledge_key: Option<KnowledgeKey>,
     knowledge_built: Option<(Instant, f64)>,
     knowledge_due_at: Option<Instant>,
+    /// The UI shows the three-atom map ([`Command::SetTripleView`]); what its last build showed
+    /// ([`KnowledgeKey::triple_part`], `None` after the view was turned on again), when it ended
+    /// and its wall time (ms), and when a deferred rebuild is due (module doc, "The three-atom map").
+    triples_on: bool,
+    triples_key: Option<KnowledgeKey>,
+    triples_built: Option<(Instant, f64)>,
+    triples_due_at: Option<Instant>,
     /// A build deferred by the interval is due at this instant (module doc; [`Worker::views_wake`]).
     views_due_at: Option<Instant>,
     /// The latest run start not yet published, and the current run's start (module doc, "Runs").
@@ -270,6 +301,19 @@ impl ActivityWork {
         }
     }
 
+    /// [`Command::SetTripleView`]: turning the view on again forgets what the last build showed
+    /// (the UI may have dropped it), so the next publish builds; turning it off drops a deferred
+    /// wake.
+    pub(super) fn set_triples(&mut self, on: bool) {
+        if on && !self.triples_on {
+            self.triples_key = None;
+        }
+        self.triples_on = on;
+        if !on {
+            self.triples_due_at = None;
+        }
+    }
+
     /// A new run starts (module doc, "Runs"): a scene replacement or a panic recovery.
     pub(super) fn new_run(&mut self) {
         let now = Instant::now();
@@ -283,7 +327,7 @@ impl Worker {
     /// doc; the loop waits until then instead of blocking for a command).
     pub(super) fn views_wake(&self) -> Option<Instant> {
         let a = &self.activity;
-        [a.views_due_at.filter(|_| a.views_on), a.knowledge_due_at].into_iter().flatten().min()
+        [a.views_due_at.filter(|_| a.views_on), a.knowledge_due_at, a.triples_due_at.filter(|_| a.triples_on)].into_iter().flatten().min()
     }
 
     /// Moves the driver's teaching events into the pending list (module doc, "The events");
@@ -329,6 +373,7 @@ impl Worker {
         // set again below while a build waits for its interval
         self.activity.views_due_at = None;
         self.activity.knowledge_due_at = None;
+        self.activity.triples_due_at = None;
         if let Some(m) = model.filter(|m| m.fitted) {
             if let Some((n, q, e, f)) = m.fit {
                 let key = (m.epoch, (n, q, e.to_bits(), f.to_bits()));
@@ -338,16 +383,40 @@ impl Worker {
                 }
             }
             let kkey = KnowledgeKey::of(m);
+            let mut knowledge_now = false;
             match knowledge_build(self.activity.knowledge_key.as_ref(), self.activity.knowledge_built, &kkey, Instant::now()) {
                 KnowledgeBuild::Skip => {}
                 // deferred: the loop wakes an idle worker then (module doc, "The live graph")
                 KnowledgeBuild::At(due) => self.activity.knowledge_due_at = Some(due),
                 KnowledgeBuild::Now => {
                     // a refused build records its key too: no retry until something changes
-                    self.activity.knowledge_key = Some(kkey);
+                    self.activity.knowledge_key = Some(kkey.clone());
                     let tb = Instant::now();
                     d.knowledge = trainable(&mut self.dy).and_then(|s| s.knowledge_map()).map(Arc::new);
                     self.activity.knowledge_built = Some((Instant::now(), tb.elapsed().as_secs_f64() * 1e3));
+                    knowledge_now = true;
+                }
+            }
+            if self.activity.triples_on {
+                let tkey = kkey.triple_part();
+                match knowledge_build(self.activity.triples_key.as_ref(), self.activity.triples_built, &tkey, Instant::now()) {
+                    KnowledgeBuild::Skip => {}
+                    // deferred: the loop wakes an idle worker then (module doc, "The three-atom map")
+                    KnowledgeBuild::At(due) => self.activity.triples_due_at = Some(due),
+                    KnowledgeBuild::Now => {
+                        // a refused build records its key too: no retry until something changes
+                        self.activity.triples_key = Some(tkey);
+                        let tb = Instant::now();
+                        d.triples = trainable(&mut self.dy).and_then(|s| s.triple_map()).map(Arc::new);
+                        let mut ms = tb.elapsed().as_secs_f64() * 1e3;
+                        // both built in this publish: one duty backstop over both (spec §6.4)
+                        if let Some((at, k_ms)) = self.activity.knowledge_built.as_mut().filter(|_| knowledge_now) {
+                            *k_ms += ms;
+                            *at = Instant::now();
+                            ms = *k_ms;
+                        }
+                        self.activity.triples_built = Some((Instant::now(), ms));
+                    }
                 }
             }
             let key = ViewKey::of(m);
@@ -439,5 +508,22 @@ mod schedule_tests {
         for k in [&refit, &forget] {
             assert_eq!(knowledge_build(Some(&k0), built, k, t + Duration::from_millis(1)), KnowledgeBuild::Now, "{k:?}: at once");
         }
+    }
+
+    /// The three-atom map (spec 2026-11-17 §6.4): its key is the knowledge map's without the
+    /// verdicts and the trust rule — a re-judge changes no count — and a pending-only change is
+    /// still `same_fit` (rate-limited by `knowledge_build`).
+    #[test]
+    fn the_triple_key_ignores_verdicts_and_trust() {
+        let m = crate::ui::tests::model();
+        let mut judged = m.clone();
+        judged.trusted = !m.trusted;
+        if let Some(c) = judged.class_loo.first_mut() {
+            c.trusted = !c.trusted;
+        }
+        assert_ne!(KnowledgeKey::of(&m), KnowledgeKey::of(&judged), "premise: the knowledge map rebuilds");
+        assert_eq!(KnowledgeKey::of(&m).triple_part(), KnowledgeKey::of(&judged).triple_part(), "a re-judge changes no count");
+        let new = KnowledgeKey::of(&ModelStatus { pending: 3, ..m.clone() }).triple_part();
+        assert!(new != KnowledgeKey::of(&m).triple_part() && new.same_fit(&KnowledgeKey::of(&m).triple_part()), "pending-only: rate-limited");
     }
 }
