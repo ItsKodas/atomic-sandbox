@@ -8,7 +8,7 @@
 //! the spectral search runs; H alone keeps Q′ small) of [`SpeciesMorse`]'s H₂ and H₃ answers with
 //! a DFT-like scatter, and one H₂ whose energy label is 0.05 Ha off — the training residuals fail,
 //! step 1's degree-cap retry cannot fit the glitch, and the quarantine rounds hold it. Measured: the
-//! recovery's searches (from a start?, rounds) are the entry fit (no, 3), the cap trial (yes, 2),
+//! recovery's searches (from a start?, rounds) are the entry fit (no, 3), the cap trial (no, 3),
 //! the leave-one-out round (yes, 5) and its confirmation (no, 5); with the first confirmation
 //! failed, the training ranking's round (yes, 5) and its confirmation (no, 5) follow.
 use super::*;
@@ -50,11 +50,31 @@ fn glitch_collection(dir: &CollectionRoot) -> SurrogateKs {
 fn searches(s: &SurrogateKs) -> Vec<(bool, usize)> {
     s.fit_log
         .iter()
-        .filter_map(|k| match *k {
+        .filter_map(|k| match k.0 {
             surrogate::RefitKind::Spectral { rounds, from_start, .. } => Some((from_start, rounds)),
             _ => None,
         })
         .collect()
+}
+
+/// Fix round 1 (the coordinator's ruling: option B never makes a refit slower than main): the cap
+/// retry of step 1 is searched from the data, not from a start — a single trial that usually stands
+/// would pay a confirmation on top — while the quarantine rounds after it are warm-started. On the
+/// fixture step 1's cap-6 fit fails (the glitch) and the leave-one-out round holds the glitch.
+#[test]
+fn the_cap_trial_is_searched_from_the_data() {
+    let dir = collection_root("warm-cap-trial");
+    let mut s = glitch_collection(&dir);
+    s.refit().unwrap();
+    println!("fits (solve, degree cap): {:?}", s.fit_log);
+    let capped: Vec<&(surrogate::RefitKind, usize)> = s.fit_log.iter().filter(|f| f.1 == RECOVERY_DEGREE_CAP).collect();
+    assert!(!capped.is_empty(), "the premise: step 1 ran its cap retry");
+    for f in &capped {
+        assert!(matches!(f.0, surrogate::RefitKind::Spectral { from_start: false, .. }), "step 1's fit is a search from the data: {:?}", f.0);
+    }
+    assert!(searches(&s).iter().any(|x| x.0), "the quarantine round after it was searched from a start");
+    assert_eq!(s.degree_cap, None, "step 1's cap did not stand");
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
 }
 
 /// The codes of every stored sample.

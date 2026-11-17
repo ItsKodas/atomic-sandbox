@@ -1840,8 +1840,9 @@ impl SurrogateKs {
         false
     }
 
-    /// A trust recovery's trial ([`fit_store_deferred`](Self::fit_store_deferred) after the trial's
-    /// codes or degree cap are set; spec 2026-11-17, option B): its hyperparameter search starts
+    /// A trust recovery's quarantine trial ([`fit_store_deferred`](Self::fit_store_deferred) after
+    /// the trial's codes are set, or step 3's degree cap; spec 2026-11-17, option B — not the cap
+    /// retries of steps 1 and 1b, fix round 1): its hyperparameter search starts
     /// from the most recent fit's (λ, s_E, s_F) — the fit in place, `report` — instead of the
     /// data's own levels (`surrogate::Accumulator::refit_from`). The fit in place may be on another
     /// basis (a cap toggled, the entry fit restored): the noise levels are physical, and the search
@@ -1979,7 +1980,7 @@ impl SurrogateKs {
         // a search from a start is a recovery trial's, which never stands as it is (`confirm_cold`)
         self.trial_fit = matches!(acc.last_refit(), surrogate::RefitKind::Spectral { from_start: true, .. });
         #[cfg(test)]
-        self.fit_log.push(acc.last_refit());
+        self.fit_log.push((acc.last_refit(), acc.basis.degree_cap));
         // the null space with the trust passes: now, or once for the fit that stands
         // (`ensure_null_space`; the accumulator and the model below are what it is built from)
         if trust_passes {

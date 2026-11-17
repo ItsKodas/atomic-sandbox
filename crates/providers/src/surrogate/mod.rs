@@ -1349,9 +1349,10 @@ pub struct SurrogateKs {
     /// [`confirm_cold`](SurrogateKs::confirm_cold) searches it again from the data first. Saved
     /// and restored with the fit (`FitState`).
     trial_fit: bool,
-    /// Tests only: every fit's solve (`Accumulator::last_refit`), in order (`fit_store_with`).
+    /// Tests only: every fit's solve (`Accumulator::last_refit`) and its basis's degree cap, in
+    /// order (`fit_store_with`).
     #[cfg(test)]
-    fit_log: Vec<surrogate::RefitKind>,
+    fit_log: Vec<(surrogate::RefitKind, usize)>,
     /// Tests only: the next confirmation of a trial fails ([`ConfirmFail`]), once.
     #[cfg(test)]
     confirm_fail: Option<ConfirmFail>,

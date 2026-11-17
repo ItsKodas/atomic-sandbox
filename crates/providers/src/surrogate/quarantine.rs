@@ -636,13 +636,15 @@ impl SurrogateKs {
     /// cap), so the collection gets no status record from it either (`sync_collection_status`
     /// finds no code changed). The entry report is returned, the note says so.
     ///
-    /// **Warm-started trials** (spec 2026-11-17, option B): every trial fit — the cap retries, each
-    /// quarantine round, step 3's default-basis fit — is searched from the most recent fit's
-    /// hyperparameters ([`fit_trial`](Self::fit_trial)), and at every point where a trial would
-    /// stand — steps 1 and 1b, step 3's acceptance, the rankings' choice in
-    /// [`quarantine_rounds`](Self::quarantine_rounds), the "passes the residuals" keep — it is
-    /// searched again from the data and the same check judged on that cold fit
-    /// ([`confirm_cold`](Self::confirm_cold)). A trial that fails cold is a failed trial. So every
+    /// **Warm-started trials** (spec 2026-11-17, option B, fix round 1): the trials of the
+    /// quarantine — each round of both rankings, on the standing basis (step 2) and step 3's
+    /// default-basis fit and rounds — are searched from the most recent fit's hyperparameters
+    /// ([`fit_trial`](Self::fit_trial)), and at every point where one would stand — step 3's
+    /// acceptance, the rankings' choice in [`quarantine_rounds`](Self::quarantine_rounds), the
+    /// "passes the residuals" keep — it is searched again from the data and the same check judged
+    /// on that cold fit ([`confirm_cold`](Self::confirm_cold)). A trial that fails cold is a failed
+    /// trial. The cap retries (steps 1 and 1b) are single trials that usually stand: they are
+    /// searched from the data directly, as before, with nothing to confirm. So every
     /// fit that stands is the cold search of its store state, what a reopened collection
     /// computes; only the path to it can differ from a cold-only recovery's (a check or an
     /// offender ranking read off a warm trial: hyperparameters at the 1e-3 level).
@@ -671,33 +673,36 @@ impl SurrogateKs {
                 // kept only if the trust rule's counts then hold too: a retry that trades a residual
                 // failure for a sample shortfall (Q′ grows with the cap: 176 → 344 for H/O) is not a
                 // recovery — the 2026-10-18 water session's E1(e): one H 0.9 Bohr from O took the
-                // model to n 333 < Q′ 344, every step DFT, then rule 4b by that one sample
-                if self.fit_trial().is_ok() && self.recovered() {
-                    if let Some(r) = self.confirm_cold(Self::recovered) {
+                // model to n 333 < Q′ 344, every step DFT, then rule 4b by that one sample. A cold
+                // fit, not a warm-started trial (fix round 1): a single trial that usually stands
+                // would pay a confirmation on top
+                match self.fit_store_deferred() {
+                    Ok(r) if self.recovered() => {
                         self.recovery = Some(format!("refit with degree_cap {RECOVERY_DEGREE_CAP} (the bent-molecule setting) restored the training residuals"));
                         return r;
                     }
+                    _ => self.restore_state(saved),
                 }
-                self.restore_state(saved);
             }
         }
         // 1b. a cap set by an earlier recovery is not kept for good (M8a user-test fix, module doc
         // "Trust recovery"): when the capped fit fails, the default basis is tried as step 1 tried
-        // the cap — kept if it alone restores the residuals with the trust rule's counts
+        // the cap — kept if it alone restores the residuals with the trust rule's counts (a cold
+        // fit, as step 1's)
         let recapped = body3 && self.degree_cap.is_some();
         if recapped {
             let saved = self.save_state();
             self.degree_cap = None;
             self.species_dirty = true;
-            if self.fit_trial().is_ok() && self.recovered() {
-                if let Some(r) = self.confirm_cold(Self::recovered) {
+            match self.fit_store_deferred() {
+                Ok(r) if self.recovered() => {
                     self.recovery = Some(format!(
                         "refit with the default basis restored the training residuals (the degree_cap {RECOVERY_DEGREE_CAP} an earlier recovery set no longer did)"
                     ));
                     return r;
                 }
+                _ => self.restore_state(saved),
             }
-            self.restore_state(saved);
         }
         // 2. quarantine the worst offenders on the standing basis, round by round (the
         // leave-one-out ranking first, the training-residual ranking its fallback: spec
