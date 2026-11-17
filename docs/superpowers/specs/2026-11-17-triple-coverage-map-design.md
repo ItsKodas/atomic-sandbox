@@ -265,9 +265,12 @@ windows. Revisit only if a measured frame cost says so.
   build.
   - It is built only while the arrangements view is shown: `Command::SetTripleView(bool)`, sent on a change, as
     `SetActivityViews` is (`ui/mod.rs:1446-1450`).
-  - It follows the knowledge map's schedule: `knowledge_build` on the same `KnowledgeKey`, at once on a fit change,
-    and at most once per `views_interval` on a pending-only change, with the deferred wake.
-  - Its wall time adds to the knowledge build's ms, so the duty backstop covers both.
+  - It follows the knowledge map's schedule: `knowledge_build` on the `KnowledgeKey` without the verdicts and trust
+    (`triple_part`), at once on a fit change, and at most once per `views_interval` on a pending-only change, with
+    the deferred wake. A pending-only rebuild that would wait builds anyway beside a knowledge build in the same
+    publish, so the two cadences fall back into step.
+  - When both maps build in one publish, its wall time adds to the knowledge build's ms, so the duty backstop covers
+    both; a triple build alone records its own ms.
   - Turning the view on builds once on the next publish.
 - **Cost.**
   - Per sample, Σ over training centres of C(k_i, 2), where k_i is the neighbours within r_cut, and each triple costs

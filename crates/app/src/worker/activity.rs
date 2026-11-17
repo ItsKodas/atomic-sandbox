@@ -78,9 +78,12 @@
 //! Restore, a policy change) builds at once; a pending-only change at most once per
 //! [`views_interval`] of the last build, deferred with the same wake ([`Worker::views_wake`]).
 //! Turning the view on forgets the last key, so the next publish builds; turning it off drops a
-//! deferred wake. When both maps build in one publish, the triple build's wall time is added to the
-//! knowledge map's last build (and the triple map's own record holds the sum too), so the duty
-//! backstop covers both and the two pending-only cadences stay in step. Shipped as
+//! deferred wake. A pending-only rebuild that would wait for its interval builds anyway when the
+//! knowledge map builds in the same publish, so the two cadences fall back into step after a
+//! re-judge (which rebuilds only the knowledge map) or after the view turns on. When both maps
+//! build in one publish, the triple build's wall time is added to the knowledge map's last build
+//! (and the triple map's own record holds the sum too), so the duty backstop covers both and the
+//! two pending-only cadences stay in step. Shipped as
 //! `ActivityDelta::triples`, `None` = no new build, kept and dropped by the UI exactly as
 //! `knowledge`; a new worker starts with none (`Viewer::start` resets `triples_sent`).
 use super::*;
@@ -399,7 +402,14 @@ impl Worker {
             }
             if self.activity.triples_on {
                 let tkey = kkey.triple_part();
-                match knowledge_build(self.activity.triples_key.as_ref(), self.activity.triples_built, &tkey, Instant::now()) {
+                // a pending-only rebuild that would wait builds anyway beside a knowledge build in this
+                // publish, so the two cadences fall back into step (after a re-judge or the view
+                // turning on)
+                let build = match knowledge_build(self.activity.triples_key.as_ref(), self.activity.triples_built, &tkey, Instant::now()) {
+                    KnowledgeBuild::At(_) if knowledge_now => KnowledgeBuild::Now,
+                    b => b,
+                };
+                match build {
                     KnowledgeBuild::Skip => {}
                     // deferred: the loop wakes an idle worker then (module doc, "The three-atom map")
                     KnowledgeBuild::At(due) => self.activity.triples_due_at = Some(due),
@@ -525,5 +535,22 @@ mod schedule_tests {
         assert_eq!(KnowledgeKey::of(&m).triple_part(), KnowledgeKey::of(&judged).triple_part(), "a re-judge changes no count");
         let new = KnowledgeKey::of(&ModelStatus { pending: 3, ..m.clone() }).triple_part();
         assert!(new != KnowledgeKey::of(&m).triple_part() && new.same_fit(&KnowledgeKey::of(&m).triple_part()), "pending-only: rate-limited");
+    }
+
+    /// `Command::SetTripleView`: turning the view on again after off forgets the last key (the UI
+    /// may have dropped the map), so the next publish builds; turning it off drops a deferred wake.
+    #[test]
+    fn the_triple_view_switch_forgets_the_key_and_the_wake() {
+        let key = KnowledgeKey::of(&crate::ui::tests::model()).triple_part();
+        let mut a = ActivityWork::default();
+        a.set_triples(true);
+        (a.triples_key, a.triples_due_at) = (Some(key.clone()), Some(Instant::now()));
+        a.set_triples(true);
+        assert_eq!(a.triples_key.as_ref(), Some(&key), "on while on: the key is kept");
+        a.set_triples(false);
+        assert!(a.triples_on == false && a.triples_due_at.is_none(), "off: no deferred wake");
+        assert_eq!(a.triples_key.as_ref(), Some(&key), "off alone keeps the key");
+        a.set_triples(true);
+        assert!(a.triples_on && a.triples_key.is_none(), "on again after off: the next publish builds");
     }
 }

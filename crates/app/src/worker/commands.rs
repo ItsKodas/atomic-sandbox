@@ -301,7 +301,7 @@ impl Command {
 
     /// Whether the command is handed to the driver (which may refuse it: `last_rejection`); the
     /// worker's own settings (audit cadence, draft mode, the cloud, the model's first teaching, the
-    /// Activity view's training views) and Shutdown are not.
+    /// Activity view's training views, the three-atom view) and Shutdown are not.
     pub(super) fn reaches_driver(&self) -> bool {
         !matches!(
             self,

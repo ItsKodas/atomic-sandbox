@@ -122,16 +122,23 @@ fn a_pending_only_rebuild_reuses_the_fitted_block() {
 }
 
 /// A sample excluded inside the fitted prefix (a `Q_FORGOTTEN` code on a fitted CH₄, no refit
-/// since) is counted nowhere: the map is the brute count of the fitted samples without it.
+/// since) is counted nowhere: the map is the brute count of the fitted samples without it. A
+/// forgotten pending CH₄ is not counted as pending either.
 #[test]
 fn a_sample_excluded_inside_the_fitted_prefix_is_not_counted() {
     let mut s = h2_and_ch4(120, 200);
     let fitted: Vec<usize> = (0..s.accumulated).filter(|&i| !s.excluded(i) && !s.in_misfit(i)).collect();
     let gone = *fitted.iter().rev().find(|&&i| s.store.as_ref().unwrap().samples[i].z.len() == 5).expect("a fitted CH₄");
-    assert!(gone < s.accumulated, "premise: inside the fitted prefix");
+    // two CH₄ kept since the refit, the second one forgotten
+    let mut rng = StdRng::seed_from_u64(0xf09);
+    for _ in 0..2 {
+        let sc = random_ch4(&mut rng);
+        s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    }
     let n = s.samples();
     s.quarantine.resize(n, Q_NONE);
     s.quarantine[gone] = Q_FORGOTTEN;
+    s.quarantine[n - 1] = Q_FORGOTTEN;
     let m = s.triple_map().expect("a fitted model");
     let kept: Vec<usize> = fitted.iter().copied().filter(|&i| i != gone).collect();
     let bf = brute(&s, &kept);
@@ -139,8 +146,9 @@ fn a_sample_excluded_inside_the_fitted_prefix_is_not_counted() {
     for k in &m.types {
         let (fc, fs) = bf.get(&k.t).cloned().unwrap();
         assert_eq!((&k.counts[..], k.samples), (&fc[..], fs), "fitted {:?}", k.t);
-        assert_eq!(k.pending_samples, 0, "an excluded sample is not pending either");
     }
+    let hch = m.get(TripleType::new(6, 1, 1)).unwrap();
+    assert_eq!((hch.pending_samples, hch.pending.iter().sum::<u32>()), (1, 6), "the forgotten pending CH₄ is not counted");
 }
 
 /// A Forget (a fitted sample set to `Q_FORGOTTEN`) changes the fitted indices, so the cached
