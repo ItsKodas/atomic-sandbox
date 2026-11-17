@@ -1615,6 +1615,9 @@ pub struct SurrogateKs {
     /// Tests only: the next migrated append stops after its sample record (`shared`, the status window).
     #[cfg(test)]
     status_window_crash: bool,
+    /// Tests only: the next migrated append fails before it writes anything.
+    #[cfg(test)]
+    migrated_append_fails: bool,
     /// Tests only: the body-4 degree every fit takes instead of the growth rule's
     /// ([`grown_body4_degree`](Self::grown_body4_degree)), in collection mode.
     #[cfg(test)]
@@ -1847,6 +1850,8 @@ impl SurrogateKs {
             body4_off: false,
             #[cfg(test)]
             status_window_crash: false,
+            #[cfg(test)]
+            migrated_append_fails: false,
             #[cfg(test)]
             body4_force: None,
             #[cfg(test)]

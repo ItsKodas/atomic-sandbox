@@ -24,7 +24,8 @@
 //!   the code of the sample being appended, written before its append whenever its code is not 0
 //!   and cleared by the cursor write. A status record can only follow its sample record, so a crash
 //!   between the two would leave the sample at code 0 (in the fit); the next attach applies the
-//!   pending code first;
+//!   pending code first — only to the sample it names: its energy's bits and [`answer_print`] of its
+//!   atoms, positions and forces must match (fix round 2), so a stale entry never lands on another;
 //! - the superseded samples left without their superseder (fix round 1, M4): source indices of
 //!   migrated code-2 samples whose likely superseder was not migrated.
 //!
@@ -48,7 +49,7 @@
 //! not_migrated <source index> <reason>              (zero or more, in order)
 //! reference <Z> <n> <old | -> <new | ->             (zero or more, in order)
 //! review <new index> <ratio> released | kept        (zero or more, in order)
-//! pending <new index> <code>                        (at most one)
+//! pending <new index> <code> <energy bits> <print> (at most one; both 16 hex digits)
 //! orphaned <source index>                           (zero or more, in order)
 //! end
 //! ```
@@ -122,10 +123,45 @@ pub struct MigrationLog {
     pub class_u_max: (f64, f64),
     /// The review log: (the sample's index in the new file, its leave-one-out ratio, released).
     pub review: Vec<(usize, f64, bool)>,
-    /// The status of the sample being appended (index in the new file, code ≠ 0), cleared by the cursor write.
-    pub pending: Option<(usize, u8)>,
+    /// The status of the sample being appended (code ≠ 0), cleared by the cursor write.
+    pub pending: Option<PendingStatus>,
     /// Source indices of migrated superseded (code 2) samples whose likely superseder was not migrated.
     pub orphaned: Vec<usize>,
+}
+
+/// The status of a migrated sample being appended ([`MigrationLog::pending`]): its index in the new file, its code, and
+/// its identity — the energy's bits and [`answer_print`] — so it is applied to that sample only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingStatus {
+    pub index: usize,
+    pub code: u8,
+    pub energy_bits: u64,
+    pub print: u64,
+}
+
+impl PendingStatus {
+    /// The pending status of `s` at `index` with `code`.
+    pub fn of(index: usize, code: u8, s: &crate::fit::Sample) -> PendingStatus {
+        PendingStatus { index, code, energy_bits: s.energy.to_bits(), print: answer_print(s) }
+    }
+
+    /// Whether `s` is the sample this status names (its energy's bits and its [`answer_print`]).
+    pub fn names(&self, s: &crate::fit::Sample) -> bool {
+        s.energy.to_bits() == self.energy_bits && answer_print(s) == self.print
+    }
+}
+
+/// FNV-1a 64 of a sample's atoms and the bits of its positions and forces: with the energy's bits, the identity of a
+/// teacher answer (the collection's duplicate rule compares the same fields).
+pub fn answer_print(s: &crate::fit::Sample) -> u64 {
+    let mut b = Vec::with_capacity(s.z.len() * 49);
+    b.extend_from_slice(&s.z);
+    for v in s.pos.iter().chain(&s.forces) {
+        for c in v {
+            b.extend_from_slice(&c.to_bits().to_le_bytes());
+        }
+    }
+    crate::model::fnv1a64(&b)
 }
 
 /// The length and the hash (64-bit FNV-1a of every byte) of a source `samples.bin` (F3: what
@@ -207,8 +243,8 @@ fn encode(log: &MigrationLog) -> String {
     for &(i, ratio, released) in &log.review {
         t.push_str(&format!("review {i} {ratio:?} {}\n", if released { "released" } else { "kept" }));
     }
-    if let Some((k, code)) = log.pending {
-        t.push_str(&format!("pending {k} {code}\n"));
+    if let Some(p) = log.pending {
+        t.push_str(&format!("pending {} {} {:016x} {:016x}\n", p.index, p.code, p.energy_bits, p.print));
     }
     for i in &log.orphaned {
         t.push_str(&format!("orphaned {i}\n"));
@@ -344,8 +380,10 @@ fn decode(text: &str) -> Result<MigrationLog, String> {
             }
             "pending" => {
                 once(pending.is_some(), name).map_err(at)?;
-                let [k, code] = fields[..] else { return Err(at("a pending status is 'index code'".into())) };
-                pending = Some((num::<usize>(k, "a sample index").map_err(at)?, num::<u8>(code, "a status code").map_err(at)?));
+                let [k, code, e, print] = fields[..] else { return Err(at("a pending status is 'index code energy-bits print'".into())) };
+                let hex = |w: &str| if w.len() == 16 { u64::from_str_radix(w, 16).ok() } else { None };
+                let (Some(energy_bits), Some(print)) = (hex(e), hex(print)) else { return Err(at("a pending status's energy bits and print are 16 hex digits".into())) };
+                pending = Some(PendingStatus { index: num::<usize>(k, "a sample index").map_err(at)?, code: num::<u8>(code, "a status code").map_err(at)?, energy_bits, print });
             }
             "orphaned" => orphaned.push(num::<usize>(value, "a sample index").map_err(at)?),
             "end" if value.is_empty() => ended = true,
@@ -453,7 +491,7 @@ mod tests {
             references: vec![(1, 57, Some(-0.478_123_456_789_012_3), Some(-0.479)), (8, 57, None, Some(-15.9)), (8, 81, Some(-15.8), None)],
             class_u_max: (9.876_543_210_987_654e-6, -0.0),
             review: vec![(1700, 0.25, true), (1701, 3.5, false), (2400, 1.0, true)],
-            pending: Some((1702, 9)),
+            pending: Some(PendingStatus { index: 1702, code: 9, energy_bits: (-2.25f64).to_bits(), print: 0x0123_4567_89ab_cdef }),
             orphaned: vec![3, 17],
         }
     }
@@ -482,7 +520,7 @@ mod tests {
         // readable: one line per field, the key's lines as they are in key.txt
         write_migration(&d.0, &log()).unwrap();
         let text = std::fs::read_to_string(d.0.join(MIGRATION_FILE)).unwrap();
-        for line in ["state running", "cursor 412", "functional lsda", "not_migrated 7 stalled", "pending 1702 9", "orphaned 17"] {
+        for line in ["state running", "cursor 412", "functional lsda", "not_migrated 7 stalled", "pending 1702 9 c002000000000000 0123456789abcdef", "orphaned 17"] {
             assert!(text.lines().any(|l| l.trim_start() == line), "{line:?} in\n{text}");
         }
         // a damaged file is an error, never a silent default

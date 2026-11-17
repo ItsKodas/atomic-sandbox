@@ -41,7 +41,7 @@ pub use fit::{
 };
 pub use model::{energy_and_forces, Model, Prediction, Provenance, SurfaceKey};
 pub use collection::{Collection, CollectionReference, REFIT_TIMES_FILE, CollectionSample, ImportReport, OpenReport, PurgeOutcome, ReadOnlyCollection, ReadOnlyError, ReferenceOutcome};
-pub use migration::{read_migration, write_migration, MigrationLog, MigrationState};
+pub use migration::{read_migration, write_migration, MigrationLog, MigrationState, PendingStatus};
 pub use grade::ActiveSet;
 pub use history::{AuditHistory, AuditPoint, EnvKey, HISTORY_CAP};
 pub use novelty::NullSpace;

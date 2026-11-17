@@ -5781,7 +5781,10 @@ resume; spec §7.2–7.5). **Thresholds** (spec §7.4; fix round 1, physics revi
 5σ_E) and ε_F = 3σ_F with σ from `branch_jump::noise_tier(all-electron, scf_tol_used, E_old)` ("The branch_jump guard":
 the tiers and σ_E = max(tier, c·|E|), c = 9e-8 pseudo, 1.0e-7 all-electron). Values: pseudo sample tier below ≈ 22 Ha
 1e-5 / 1.5e-4 (3 × `PSEUDO_FORCE_NOISE`); pseudo 35 Ha 1.58e-5, 70 Ha 3.15e-5; pseudo partial stop (`GPU_PARTIAL_TOL`,
-the app tier) ε_F 2.7e-4; all-electron sample tier 2.7e-5 / 7.2e-5 up to 54 Ha, 70 Ha 3.5e-5. The floor 1e-5 is 5× the
+the app tier) ε_F 2.7e-4; all-electron sample tier 2.7e-5 / 7.2e-5 up to 54 Ha, 70 Ha 3.5e-5. **All-electron ε_F is
+7.2e-5 at either tier** (fix round 2): the all-electron app tier's σ_F = 1.4e-5 was measured on gapped H₂O only — the
+noise of an all-electron partial-level stop is **unmeasured** — so the all-electron surface takes the larger σ_F of its
+two tiers (2.4e-5). The floor 1e-5 is 5× the
 pseudo-H₂O warm-vs-cold 1.87e-6. U: |F_new − E_old| ≤ ε_E and every |ΔF| ≤ ε_F; T: not U, |E_new − E_old| ≤ ε_E (the
 internal energy) and every |ΔF| ≤ ε_F; S otherwise (NaN is S). V7's classes are the same under these thresholds: H₂ is
 on the sample tier at 1e-5 / 1.5e-4 (|ΔE| 7.6e-8); OH is a partial stop, ε_E 1e-5, ε_F 2.7e-4 (|ΔE_internal| 7.3e-7,
@@ -5818,7 +5821,8 @@ the predecessor recomputed from the key — `..\other`, an absolute, drive or UN
 1: `a_crash_in_the_status_window_is_healed_at_attach` (I1: the `pending` code applied at attach for an S and a U of an 8,
 then byte-identical to an uninterrupted run), `a_reference_with_an_unsolved_multiplicity_is_retried_not_offered` (M2),
 `a_superseded_sample_without_its_superseder_is_listed` (M4), `classify_thresholds` with the large-|E| and partial-stop
-cases (I2). Six
+cases (I2); fix round 2: `a_stale_pending_status_never_lands_on_a_live_sample` (the pending entry carries the sample's
+energy bits and an FNV-1a print of its atoms, positions and forces, and an append that writes nothing drops it). Six
 mutations of the engine (the (8, S) code, the duplicate rule, the fingerprint restart, the warning check, the purge
 refusal, an all-atom force comparison cut to one atom) each fail their test.
 

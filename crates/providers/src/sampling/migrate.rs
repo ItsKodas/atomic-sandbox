@@ -44,7 +44,9 @@
 //!   sample tier up to |E| = 54 Ha (2.35e-5 at the app tier up to 47 Ha), then 5c|E| — 70 Ha → 3.5e-5.
 //! - ε_F = [`MIGRATION_EPS_F_SIGMAS`] = 3 × σ_F: pseudo sample tier 1.5e-4 Ha/Bohr ([`MIGRATION_EPS_F`], 3 ×
 //!   `PSEUDO_FORCE_NOISE`), pseudo partial stop (every GPU solve with a partly occupied level stops at
-//!   `qm::GPU_PARTIAL_TOL` = 1e-5: the app tier) 2.7e-4, all-electron sample tier 7.2e-5, all-electron app tier 4.2e-5.
+//!   `qm::GPU_PARTIAL_TOL` = 1e-5: the app tier) 2.7e-4; all-electron 7.2e-5 at either tier — the larger σ_F of its two
+//!   tiers, because the all-electron app tier's 1.4e-5 was measured on gapped H₂O only and a partial-level stop on that
+//!   surface is unmeasured (fix round 2).
 //! - Derived from the documented noise model, not chosen to make a case pass. A fixed 1e-5 was 1.6σ_E at 70 Ha (about a
 //!   quarter of gapped samples falsely S) and below 2σ_F for a partial-stop solve.
 //! - Both errors are safe: a false S costs a review (and, for a misfit hold or a lifted fence, re-judges it); a false U
@@ -70,8 +72,10 @@
 //!    done: its status is written if it is missing.
 //!    **The status window** (fix round 1, I1): a status record can only follow its sample record, so a crash between
 //!    the two would leave a sample with a non-zero code (any S, a U or T of a held, forgotten or superseded sample) at
-//!    0 — in the fit. So before such an append the log records `pending <index> <code>` (through the temporary file);
-//!    the next attach applies it before anything is fitted (`SurrogateKs::find_migration`), and the cursor write clears it.
+//!    0 — in the fit. So before such an append the log records `pending <index> <code>` with the sample's identity (its
+//!    energy's bits and `surrogate::migration::answer_print`; through the temporary file); the next attach applies it,
+//!    to that sample only, before anything is fitted (`SurrogateKs::find_migration`), and the cursor write clears it.
+//!    An append that fails before writing anything drops it at once (fix round 2): it names no record.
 //! 5. The cursor is rewritten (`surrogate::write_migration`, through a temporary file).
 //!
 //! **Spin** (M1): the cold solve's ∫|ρ↑ − ρ↓| is not on its `ForceResult` (`EvalStats::spin_change` is a difference
@@ -120,8 +124,12 @@ pub struct MigrationEps {
 /// The thresholds of a sample whose old energy is `e_old` (Ha), re-solved on the all-electron surface or not, by a solve
 /// that stopped at `scf_tol_used` (module doc, "The thresholds"; `crate::branch_jump::noise_tier`).
 pub fn migration_eps(all_electron: bool, scf_tol_used: f64, e_old: f64) -> MigrationEps {
+    use crate::branch_jump::{ALL_ELECTRON_APP_TIER, ALL_ELECTRON_SAMPLE_TIER};
     let t = crate::branch_jump::noise_tier(all_electron, scf_tol_used, e_old);
-    MigrationEps { e: MIGRATION_EPS_E.max(MIGRATION_EPS_E_SIGMAS * t.sigma_e), f: MIGRATION_EPS_F_SIGMAS * t.sigma_f }
+    // the all-electron app tier's σ_F was measured on gapped H₂O only; a partial-level stop there is unmeasured, so the
+    // all-electron surface takes the larger σ_F of its two tiers (fix round 2)
+    let sigma_f = if all_electron { ALL_ELECTRON_SAMPLE_TIER.sigma_f.max(ALL_ELECTRON_APP_TIER.sigma_f) } else { t.sigma_f };
+    MigrationEps { e: MIGRATION_EPS_E.max(MIGRATION_EPS_E_SIGMAS * t.sigma_e), f: MIGRATION_EPS_F_SIGMAS * sigma_f }
 }
 /// The time estimate uses the median of the pass's own sample solves once it has made this many (spec §7.3, "Cost").
 pub const MIGRATION_ETA_SOLVES: usize = 20;
@@ -266,6 +274,9 @@ pub struct Migrator {
     /// record, before its status record and the cursor are written — a crash in the status window.
     #[cfg(test)]
     pub(crate) crash_in_window: Option<usize>,
+    /// Test hook (fix round 2): sample `k`'s append fails before anything is written.
+    #[cfg(test)]
+    pub(crate) fail_append: Option<usize>,
 }
 
 impl Migrator {
@@ -344,6 +355,8 @@ impl Migrator {
             notes,
             #[cfg(test)]
             crash_in_window: None,
+            #[cfg(test)]
+            fail_append: None,
         })
     }
 
@@ -557,16 +570,31 @@ impl Migrator {
             cs.sample.forces = r.forces.clone();
         }
         let new_code = migrated_code(code, class);
-        // the status window (module doc, 4.): the code is on disk before the sample record that needs it
+        // the status window (module doc, 4.): the code — and the identity of the sample it is for — is on disk before
+        // the sample record that needs it
+        let len = surrogate.collection().map_or(0, |c| c.samples.len());
         if new_code != 0 {
-            self.log.pending = Some((surrogate.collection().map_or(0, |c| c.samples.len()), new_code));
+            self.log.pending = Some(::surrogate::PendingStatus::of(len, new_code, &cs.sample));
             self.write_log()?;
         }
         #[cfg(test)]
-        if self.crash_in_window == Some(i) {
-            surrogate.arm_status_window_crash();
+        {
+            if self.crash_in_window == Some(i) {
+                surrogate.arm_status_window_crash();
+            }
+            if self.fail_append == Some(i) {
+                surrogate.arm_migrated_append_failure();
+            }
         }
-        surrogate.take_migrated(cs, new_code).map_err(|e| ProviderError::Invalid(format!("re-solving: the new collection could not be written ({e}) — the pass stops; it resumes from sample {i}")))?;
+        if let Err(e) = surrogate.take_migrated(cs, new_code) {
+            // nothing appended: the pending status names no record and is dropped, in memory and on disk (fix round 2);
+            // a record appended without its status keeps it — the next attach applies it, to that record only
+            if self.log.pending.is_some() && surrogate.collection().is_some_and(|c| c.samples.len() == len) {
+                self.log.pending = None;
+                let _ = self.write_log();
+            }
+            return Err(ProviderError::Invalid(format!("re-solving: the new collection could not be written ({e}) — the pass stops; it resumes from sample {i}")));
+        }
         if class == MigrationClass::Unchanged {
             let (e, f) = self.log.class_u_max;
             self.log.class_u_max = ((r.energy - old.sample.energy).abs().max(e), max_force_diff(&old.sample.forces, &r.forces).max(f));

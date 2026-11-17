@@ -2883,6 +2883,9 @@ mod migration {
         // all-electron, small |E|: the tier's own σ_E (5.4e-6) is above the floor; its σ_F is 2.4e-5
         let ae = migration_eps(true, 1e-6, e);
         assert!(close(ae.e, 5.0 * 5.4e-6) && close(ae.f, 3.0 * 2.4e-5), "{ae:?}");
+        // fix round 2: the all-electron partial stop is unmeasured (its app tier's σ_F is gapped H₂O's) — the larger σ_F
+        let ae_partial = migration_eps(true, qm::GPU_PARTIAL_TOL, e);
+        assert!(close(ae_partial.f, 3.0 * 2.4e-5) && close(ae_partial.e, 5.0 * 4.7e-6), "{ae_partial:?}");
         // a partial-level stop (every GPU solve with a partly occupied level stops at GPU_PARTIAL_TOL = 1e-5: the app tier)
         let oh = -16.78;
         let partial = migration_eps(false, qm::GPU_PARTIAL_TOL, oh);
@@ -3062,7 +3065,7 @@ mod migration {
         assert!(e.to_string().contains("injected crash"), "{e}");
         assert_eq!(steps, 2, "samples 0 and 1 made it");
         let log = log_of(&s);
-        assert_eq!((log.cursor, log.counts, log.state, log.pending), (2, [1, 1, 0, 0], MigrationState::Running, Some((2, Q_RESOLVED))), "the cursor before the crashed sample, its code pending");
+        assert_eq!((log.cursor, log.counts, log.state, log.pending.map(|p| (p.index, p.code))), (2, [1, 1, 0, 0], MigrationState::Running, Some((2, Q_RESOLVED))), "the cursor before the crashed sample, its code pending");
         assert_eq!(s.collection().unwrap().samples.len(), 3, "its record is in the new file");
         assert_eq!(s.collection().unwrap().quarantine[2], Q_NONE, "without its status record");
         assert_eq!(s.migration().unwrap().state, sim::MigrationPhase::Paused);
@@ -3429,7 +3432,9 @@ mod migration {
                 }
             };
             assert!(e.to_string().contains("injected crash"), "{e}");
-            assert_eq!(log_of(&s).pending, Some((k, code)), "sample {k}: its code recorded before its append");
+            let p = log_of(&s).pending.expect("pending");
+            assert_eq!((p.index, p.code), (k, code), "sample {k}: its code recorded before its append");
+            assert!(p.names(&s.collection().unwrap().samples[k].sample), "sample {k}: and its identity");
             assert_eq!(s.collection().unwrap().quarantine[k], Q_NONE, "sample {k}: the record without its status");
             drop(s);
             // the next start: the code is on the sample before any fit sees it
@@ -3491,5 +3496,54 @@ mod migration {
         assert_eq!(s.collection().unwrap().quarantine, vec![Q_SUPERSEDED, Q_SUPERSEDED, Q_NONE], "both stay 2");
         let text = std::fs::read_to_string(s.collection().unwrap().folder().join("migration.txt")).unwrap();
         assert!(text.lines().any(|l| l == "orphaned 0"), "{text}");
+    }
+
+    /// Fix round 2 (re-review Important): a pending status never lands on another sample. (i) An append that fails before
+    /// writing anything drops its pending entry at once — on disk too; (ii) a stale entry that survived anyway (written
+    /// here by hand) names a record by its identity, so the live sample later appended at that index keeps code 0 at the
+    /// next attach, and the stale entry is cleared.
+    #[test]
+    fn a_stale_pending_status_never_lands_on_a_live_sample() {
+        let (samples, tw) = mixed();
+        let root = root("stale-pending");
+        old_folder(&root, &samples, &[]);
+        let (mut s, _) = student(tw.clone());
+        s.attach_collection(&root, &h2_at(1.4)).unwrap();
+        s.start_migration().unwrap();
+        // the S sample (code 9): its append fails before anything is written
+        s.migration_fail_append(2);
+        let e = loop {
+            match Trainable::pass_step(&mut s, &mut never()) {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("the failure stops the pass"),
+                Err(e) => break e,
+            }
+        };
+        assert!(e.to_string().contains("injected append failure"), "{e}");
+        let log = log_of(&s);
+        assert_eq!((log.cursor, log.pending), (2, None), "nothing appended: the pending entry is dropped on disk");
+        assert_eq!(s.collection().unwrap().samples.len(), 2);
+        // a live answer is kept at index 2, code 0
+        let r = s.evaluate(&h2_at(1.9), &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
+        let c = s.collection().unwrap();
+        assert_eq!((c.samples.len(), c.quarantine[2]), (3, Q_NONE), "the live sample at index 2");
+        let dir = c.folder().to_path_buf();
+        let live = c.samples[2].sample.clone();
+        // a stale entry for index 2 that names the S sample's answer (as an older crash could have left)
+        let mut stale = log_of(&s);
+        let mut other = old_sample(1.40).sample;
+        other.energy += 2e-3;
+        stale.pending = Some(::surrogate::PendingStatus::of(2, Q_RESOLVED, &other));
+        assert!(!stale.pending.unwrap().names(&live));
+        drop(s);
+        surrogate::write_migration(&dir, &stale).unwrap();
+        let (mut s, _) = student(tw);
+        s.attach_collection(&root, &h2_at(1.4)).unwrap();
+        assert_eq!(s.collection().unwrap().quarantine[2], Q_NONE, "the live sample keeps code 0");
+        assert_ne!(s.code_of(2), Q_RESOLVED, "and the store never takes the stale code (it waits for its box reference, provider-only)");
+        assert_eq!(log_of(&s).pending, None, "the stale entry is cleared");
+        let (on_disk, _) = Collection::open(&root, &new_key()).unwrap();
+        assert_eq!(on_disk.quarantine[2], Q_NONE);
     }
 }

@@ -789,6 +789,7 @@ tier), and σ_E = max(the tier's, c·|E_old|), c = 9e-8 pseudo, 1.0e-7 all-elect
 | pseudo, partial stop (app tier) | as the sample tier's (its σ_E 1.6e-6 is below the floor) | 2.7e-4 |
 | all-electron, sample tier, \|E\| ≤ 54 Ha | 2.7e-5 | 7.2e-5 |
 | all-electron, 70 Ha | 3.5e-5 | 7.2e-5 |
+| all-electron, partial stop (app tier) | as for its \|E\| (2.35e-5 up to 47 Ha) | 7.2e-5: the larger σ_F of the two tiers (the app tier's 1.4e-5 is gapped H₂O's; an all-electron partial stop is unmeasured) |
 
 A fixed 1e-5 was 1.6σ_E at 70 Ha (about a quarter of gapped samples falsely S) and below 2σ_F of a partial stop. The
 classes decide the review only: a T or S label is always the new solve's.
