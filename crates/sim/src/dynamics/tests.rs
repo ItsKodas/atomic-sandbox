@@ -2354,6 +2354,9 @@ impl crate::provider::Trainable for Teaching {
     fn pending_refit(&self) -> bool {
         false
     }
+    fn audits_background(&self) -> bool {
+        false
+    }
     fn set_audit_every(&mut self, _n: usize) {}
     fn force_teacher_next(&mut self) {}
     fn take_teach_events(&mut self) -> Vec<crate::activity::TeachEvent> {

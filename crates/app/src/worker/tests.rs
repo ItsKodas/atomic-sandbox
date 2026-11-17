@@ -3118,6 +3118,9 @@ impl Trainable for HarrisFake {
     fn pending_refit(&self) -> bool {
         false
     }
+    fn audits_background(&self) -> bool {
+        true
+    }
     fn set_audit_every(&mut self, _n: usize) {}
     fn force_teacher_next(&mut self) {}
     fn request_display(&mut self, scene: &sim::Scene) -> bool {

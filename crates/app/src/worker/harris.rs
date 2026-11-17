@@ -244,7 +244,7 @@ impl HarrisSchedule {
 
 impl Worker {
     /// The estimated solver on the GPU teacher: its provider audits on a background teacher
-    /// (`TrainableStatus::audits_background`, read by `cloud_jobs` every round and at start-up —
+    /// (`Trainable::audits_background`, read by `cloud_jobs` every round and at start-up —
     /// the GPU teacher's auditor; never a backend label, so a test's stand-in provider qualifies).
     pub(super) fn estimated_gpu(&self) -> bool {
         self.background_auditor

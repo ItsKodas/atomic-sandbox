@@ -147,6 +147,113 @@ pub fn cholesky_quad_form(l: &[f64], n: usize, v: &mut [f64]) -> f64 {
     v.iter().map(|x| x * x).sum()
 }
 
+/// [`cholesky_quad_form`] of every vector in `vs` (each of length n), bit for bit the one-at-a-time
+/// values: each vector's forward substitution subtracts the same products in the same order as
+/// [`forward_substitute`] (Rust never fuses a multiply and an add), and its squares are summed as
+/// there. What changes is only how the arithmetic is scheduled — up to [`QUAD_LANES`] vectors side
+/// by side and [`QUAD_ROWS`] rows of L at a time, so L is read once per lane group and the
+/// independent subtraction chains overlap their latencies (the predictive variance's 1 + 3N rows
+/// per step, 2026-11-17: 7 serial substitutions of Q′ 1 902 cost 6–7 ms).
+pub fn cholesky_quad_forms(l: &[f64], n: usize, vs: &[&[f64]]) -> Vec<f64> {
+    debug_assert_eq!(l.len(), n * n);
+    let mut out = Vec::with_capacity(vs.len());
+    let mut x = vec![[0.0f64; QUAD_LANES]; n];
+    for group in vs.chunks(QUAD_LANES) {
+        // the vectors interleaved, lane r = vector r of the group; unused lanes stay zero (their
+        // substitution gives zeros, read by nobody)
+        for (k, xk) in x.iter_mut().enumerate() {
+            *xk = [0.0; QUAD_LANES];
+            for (r, v) in group.iter().enumerate() {
+                debug_assert_eq!(v.len(), n);
+                xk[r] = v[k];
+            }
+        }
+        forward_substitute_lanes(l, n, &mut x);
+        for r in 0..group.len() {
+            out.push(x.iter().map(|xk| xk[r] * xk[r]).sum());
+        }
+    }
+    out
+}
+
+/// Vectors substituted side by side in [`cholesky_quad_forms`].
+pub const QUAD_LANES: usize = 8;
+/// Rows of L substituted together in [`cholesky_quad_forms`].
+pub const QUAD_ROWS: usize = 4;
+
+/// [`forward_substitute`] of `QUAD_LANES` interleaved right-hand sides (`x[k][r]`), each lane's
+/// arithmetic exactly the single solve's: row i's sum starts at b_i and subtracts l_ik·x_k for
+/// k = 0, 1, …, i − 1 in that order, then divides by l_ii. `QUAD_ROWS` rows go together: their
+/// subtractions over the solved prefix k < i₀ are independent of each other, and the block's own
+/// corner (k = i₀ … i − 1) follows in order.
+fn forward_substitute_lanes(l: &[f64], n: usize, x: &mut [[f64; QUAD_LANES]]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the CPU has AVX2 (checked just now). The kernel is the same Rust with wider
+            // registers: separate multiplies and subtractions (no FMA is enabled, and Rust never
+            // contracts), so every lane's numbers are the portable kernel's bit for bit.
+            unsafe { forward_substitute_lanes_avx2(l, n, x) };
+            return;
+        }
+    }
+    forward_substitute_lanes_kernel(l, n, x)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn forward_substitute_lanes_avx2(l: &[f64], n: usize, x: &mut [[f64; QUAD_LANES]]) {
+    forward_substitute_lanes_kernel(l, n, x)
+}
+
+#[inline(always)]
+fn forward_substitute_lanes_kernel(l: &[f64], n: usize, x: &mut [[f64; QUAD_LANES]]) {
+    let mut i0 = 0;
+    while i0 < n {
+        let h = (n - i0).min(QUAD_ROWS);
+        let mut s = [[0.0f64; QUAD_LANES]; QUAD_ROWS];
+        s[..h].copy_from_slice(&x[i0..i0 + h]);
+        if h == QUAD_ROWS {
+            let row = |j: usize| &l[(i0 + j) * n..(i0 + j) * n + i0];
+            let [mut s0, mut s1, mut s2, mut s3] = s;
+            for ((((a, b), c), d), xk) in row(0).iter().zip(row(1)).zip(row(2)).zip(row(3)).zip(&x[..i0]) {
+                for r in 0..QUAD_LANES {
+                    s0[r] -= a * xk[r];
+                    s1[r] -= b * xk[r];
+                    s2[r] -= c * xk[r];
+                    s3[r] -= d * xk[r];
+                }
+            }
+            s = [s0, s1, s2, s3];
+        } else {
+            for (j, sj) in s[..h].iter_mut().enumerate() {
+                let row = &l[(i0 + j) * n..(i0 + j) * n + i0];
+                for (lk, xk) in row.iter().zip(&x[..i0]) {
+                    for r in 0..QUAD_LANES {
+                        sj[r] -= lk * xk[r];
+                    }
+                }
+            }
+        }
+        for j in 0..h {
+            let i = i0 + j;
+            let mut sj = s[j];
+            for k in i0..i {
+                let lk = l[i * n + k];
+                let xk = x[k];
+                for r in 0..QUAD_LANES {
+                    sj[r] -= lk * xk[r];
+                }
+            }
+            let d = l[i * n + i];
+            for r in 0..QUAD_LANES {
+                x[i][r] = sj[r] / d;
+            }
+        }
+        i0 += h;
+    }
+}
+
 /// y = A x for a row-major n×n matrix.
 pub fn mat_vec(a: &[f64], n: usize, x: &[f64], y: &mut [f64]) {
     debug_assert_eq!(a.len(), n * n);
@@ -571,6 +678,82 @@ mod tests {
     use super::*;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
+
+    /// The batched quadratic forms' speed at the collection's size (Q′ 1 902, the 7 rows of an H₂
+    /// variance step) against one substitution per row; reported, bit-equality asserted.
+    /// `cargo test -p surrogate --release --lib quad_forms_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a measurement"]
+    fn quad_forms_speed() {
+        let mut rng = StdRng::seed_from_u64(3);
+        let n = 1902;
+        // a well-conditioned lower factor with a positive diagonal
+        let mut l = vec![0.0; n * n];
+        for i in 0..n {
+            for k in 0..i {
+                l[i * n + k] = rng.gen_range(-1.0..1.0) / n as f64;
+            }
+            l[i * n + i] = 1.0 + rng.gen_range(0.0..1.0);
+        }
+        let vs: Vec<Vec<f64>> = (0..7).map(|_| (0..n).map(|k| if k < 634 { rng.gen_range(-1.0..1.0) } else { 0.0 }).collect()).collect();
+        let refs: Vec<&[f64]> = vs.iter().map(|v| &v[..]).collect();
+        let reps = 20;
+        let t = std::time::Instant::now();
+        let mut one = Vec::new();
+        for _ in 0..reps {
+            one = vs.iter().map(|v| cholesky_quad_form(&l, n, &mut v.clone())).collect();
+        }
+        let t_one = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+        let t = std::time::Instant::now();
+        let mut many = Vec::new();
+        for _ in 0..reps {
+            many = cholesky_quad_forms(&l, n, &refs);
+        }
+        let t_many = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+        println!("7 quadratic forms at n = {n}: one at a time {t_one:.3} ms, batched {t_many:.3} ms (avx2 {})", std::arch::is_x86_feature_detected!("avx2"));
+        assert!(one.iter().zip(&many).all(|(a, b)| a.to_bits() == b.to_bits()));
+    }
+
+    /// The batched quadratic forms are the one-at-a-time ones bit for bit, for every batch size
+    /// around the lane and row widths and with zero entries in the vectors (the query rows'
+    /// untouched species blocks).
+    #[test]
+    fn batched_quad_forms_are_the_single_ones_bit_for_bit() {
+        let mut rng = StdRng::seed_from_u64(17);
+        for n in [1, 2, 3, 4, 5, 6, 9, 37, 64, 66] {
+            let a: Vec<f64> = (0..n * n).map(|_| rng.gen_range(-1.0..1.0)).collect();
+            let mut g = vec![0.0; n * n];
+            for i in 0..n {
+                for j in 0..n {
+                    g[i * n + j] = (0..n).map(|k| a[i * n + k] * a[j * n + k]).sum::<f64>() + if i == j { 0.1 } else { 0.0 };
+                }
+            }
+            cholesky_in_place(&mut g, n).unwrap();
+            for m in [1, 2, 7, 8, 9, 17] {
+                let vs: Vec<Vec<f64>> = (0..m).map(|_| (0..n).map(|_| if rng.gen_bool(0.3) { 0.0 } else { rng.gen_range(-3.0..3.0) }).collect()).collect();
+                let refs: Vec<&[f64]> = vs.iter().map(|v| &v[..]).collect();
+                let got = cholesky_quad_forms(&g, n, &refs);
+                for (v, q) in vs.iter().zip(&got) {
+                    let want = cholesky_quad_form(&g, n, &mut v.clone());
+                    assert_eq!(q.to_bits(), want.to_bits(), "n {n} m {m}: {q:e} vs {want:e}");
+                }
+                // the portable kernel itself, whatever the CPU (the dispatch takes AVX2 when present)
+                if m <= QUAD_LANES {
+                    let mut x = vec![[0.0f64; QUAD_LANES]; n];
+                    for (k, xk) in x.iter_mut().enumerate() {
+                        for (r, v) in vs.iter().enumerate() {
+                            xk[r] = v[k];
+                        }
+                    }
+                    forward_substitute_lanes_kernel(&g, n, &mut x);
+                    for (r, q) in got.iter().enumerate() {
+                        let portable: f64 = x.iter().map(|xk| xk[r] * xk[r]).sum();
+                        assert_eq!(portable.to_bits(), q.to_bits(), "portable kernel, n {n} m {m}");
+                    }
+                }
+            }
+        }
+    }
 
     /// Jacobi on a random symmetric matrix and on a rank-deficient Gram: A v = λ v to rounding,
     /// V orthonormal, the null eigenvalues of a rank-r Gram at the ε·‖A‖ level.
