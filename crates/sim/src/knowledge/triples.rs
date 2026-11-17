@@ -1,7 +1,9 @@
 //! The three-atom coverage map's counting core (spec 2026-11-17 §6.1–§6.3; the module doc of
 //! [`super`], "Three-atom arrangements").
 
-use super::BIN;
+use super::{Composition, BIN};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// The map's distance bin (Bohr): three pair bins, the pair rule's 0.3 Bohr window (spec §6.2).
 pub const TRIPLE_BIN: f64 = 3.0 * BIN;
@@ -126,6 +128,131 @@ pub fn cos_edges_deg(q: usize) -> (f64, f64) {
     (theta(q), theta(q + 1))
 }
 
+/// One three-atom arrangement (spec §6.1): centre i = `centre`, neighbours `j` (species `t.a`, at
+/// r₁ = |R_j − R_i|) and `k` (species `t.b`, at r₂); for a folded type j is the nearer (a tie: the
+/// lower index). u = cos θ_jik, the angle at the centre, in [−1, 1].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Triple {
+    pub t: TripleType,
+    pub centre: usize,
+    pub j: usize,
+    pub k: usize,
+    pub r1: f64,
+    pub r2: f64,
+    pub u: f64,
+}
+
+/// Every triple of a geometry (spec §6.1), the pairs body-3 sums: for each centre i with
+/// `trains(i)`, every unordered pair {j, k}, j ≠ k, of its neighbours with 0 < r < `r_cut` (Bohr),
+/// whatever the j–k distance. A coincident (r = 0) or non-finite neighbour is skipped. Atoms past
+/// min(z.len(), pos.len()) are ignored. The one definition: the builder, the planner and the
+/// scene markers all call it.
+pub fn each_triple(z: &[u8], pos: &[[f64; 3]], r_cut: f64, trains: impl Fn(usize) -> bool, mut f: impl FnMut(Triple)) {
+    let n = z.len().min(pos.len());
+    let mut nb: Vec<([f64; 3], f64, usize)> = Vec::new();
+    for i in (0..n).filter(|&i| trains(i)) {
+        nb.clear();
+        for j in (0..n).filter(|&j| j != i) {
+            let d: [f64; 3] = std::array::from_fn(|a| pos[j][a] - pos[i][a]);
+            let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            if r > 0.0 && r < r_cut {
+                nb.push((d.map(|x| x / r), r, j));
+            }
+        }
+        for (p, &(uj, rj, j)) in nb.iter().enumerate() {
+            for &(uk, rk, k) in &nb[p + 1..] {
+                let t = TripleType::new(z[i], z[j], z[k]);
+                // j is listed before k (lower index): it stays first unless k is the species-a
+                // neighbour of a mixed pair, or the strictly nearer of a folded one
+                let swap = if t.folded() { rk < rj } else { z[j] != t.a };
+                let u = (uj[0] * uk[0] + uj[1] * uk[1] + uj[2] * uk[2]).clamp(-1.0, 1.0);
+                f(if swap {
+                    Triple { t, centre: i, j: k, k: j, r1: rk, r2: rj, u }
+                } else {
+                    Triple { t, centre: i, j, k, r1: rj, r2: rk, u }
+                });
+            }
+        }
+    }
+}
+
+/// One triple type's counts over a set of samples ([`TripleTally::finish`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TripleBlock {
+    pub t: TripleType,
+    /// Per cell of the tally's [`TripleGrid`], the triples counted there.
+    pub counts: Arc<[u32]>,
+    /// The samples holding at least one triple of the type.
+    pub samples: usize,
+    /// Its triples.
+    pub triples: u64,
+    /// The top three compositions holding it, by samples: most first, then by composition.
+    pub compositions: Vec<(Composition, usize)>,
+}
+
+#[derive(Default)]
+struct TallyEntry {
+    counts: Vec<u32>,
+    samples: usize,
+    triples: u64,
+    compositions: BTreeMap<Composition, usize>,
+}
+
+/// Counts the triples of samples, per type, on the grid of one r_cut (spec §6.1, §6.4).
+pub struct TripleTally {
+    grid: TripleGrid,
+    r_cut: f64,
+    types: BTreeMap<TripleType, TallyEntry>,
+}
+
+impl TripleTally {
+    /// An empty tally for the model's cutoff `r_cut` (Bohr).
+    pub fn new(r_cut: f64) -> TripleTally {
+        TripleTally { grid: TripleGrid::new(r_cut), r_cut, types: BTreeMap::new() }
+    }
+
+    /// Counts one sample: each triple of [`each_triple`] in its cell, the sample once per type it
+    /// holds, under its composition.
+    pub fn add(&mut self, z: &[u8], pos: &[[f64; 3]], trains: impl Fn(usize) -> bool) {
+        let (grid, cells) = (self.grid, self.grid.cells());
+        let types = &mut self.types;
+        let mut held: BTreeSet<TripleType> = BTreeSet::new();
+        each_triple(z, pos, self.r_cut, trains, |t| {
+            // 0 < r < r_cut always has a bin (TripleGrid::new) and u is finite: never None
+            let Some(c) = grid.cell(t.t.folded(), t.r1, t.r2, t.u) else { return };
+            let e = types.entry(t.t).or_default();
+            if e.counts.is_empty() {
+                e.counts = vec![0; cells];
+            }
+            e.counts[c] += 1;
+            e.triples += 1;
+            held.insert(t.t);
+        });
+        if held.is_empty() {
+            return;
+        }
+        let comp = Composition::of(&z[..z.len().min(pos.len())]);
+        for t in held {
+            let e = types.get_mut(&t).expect("counted above");
+            e.samples += 1;
+            *e.compositions.entry(comp.clone()).or_default() += 1;
+        }
+    }
+
+    /// The blocks, ascending type.
+    pub fn finish(self) -> Vec<TripleBlock> {
+        self.types
+            .into_iter()
+            .map(|(t, e)| {
+                let mut compositions: Vec<(Composition, usize)> = e.compositions.into_iter().collect();
+                compositions.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                compositions.truncate(3);
+                TripleBlock { t, counts: e.counts.into(), samples: e.samples, triples: e.triples, compositions }
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +316,84 @@ mod tests {
         assert_eq!(g.cell(false, 1.8, 1.9, f64::NAN), None);
         assert_eq!(TripleType::new(1, 8, 1), TripleType { centre: 1, a: 1, b: 8 });
         assert!(TripleType::new(8, 1, 1).folded() && !TripleType::new(1, 8, 1).folded());
+    }
+
+    /// Spec M1: three bent H₂O (104.5°) and one linear; in the fourth, O does not train.
+    #[test]
+    fn each_triple_counts_every_neighbour_pair_of_a_training_centre() {
+        let bent = |r: f64| {
+            let t = 104.5f64.to_radians() / 2.0;
+            vec![[0.0; 3], [r * t.sin(), r * t.cos(), 0.0], [-r * t.sin(), r * t.cos(), 0.0]]
+        };
+        let lin = |r: f64| vec![[0.0; 3], [r, 0.0, 0.0], [-r, 0.0, 0.0]];
+        let z = [8u8, 1, 1];
+        let mut tally = TripleTally::new(6.0);
+        for g in [bent(1.81), bent(1.85), lin(1.81)] {
+            tally.add(&z, &g, |_| true);
+        }
+        tally.add(&z, &bent(1.83), |a| a != 0);
+        let blocks = tally.finish();
+        let g = TripleGrid::new(6.0);
+        let (hoh, ohh) = (TripleType::new(8, 1, 1), TripleType::new(1, 8, 1));
+        assert_eq!(blocks.iter().map(|b| b.t).collect::<Vec<_>>(), vec![ohh, hoh]);
+        let w = &blocks[1];
+        assert_eq!((w.samples, w.triples), (3, 3), "a non-training centre adds nothing");
+        assert_eq!((w.counts[g.index(true, 6, 6, 6)], w.counts[g.index(true, 6, 6, 9)]), (2, 1), "bent at cos −0.25 (bin 6), linear (bin 9)");
+        assert_eq!(w.counts.iter().sum::<u32>(), 3);
+        let h = &blocks[0];
+        assert_eq!((h.samples, h.triples), (4, 8), "two H centres per water");
+        assert_eq!(h.counts[g.index(false, 9, 6, 1)], 6, "r₁ to H 2.86–2.93 (bin 9), r₂ to O (bin 6), 37.75° (bin 1)");
+        assert_eq!(h.counts[g.index(false, 12, 6, 0)], 2, "linear: r₁ 3.62 (bin 12), 0°");
+        assert_eq!(w.compositions, vec![(Composition::of(&z), 3)]);
+        // j–k beyond r_cut still counts; j = k never; a dimer has none
+        let mut t3 = TripleTally::new(3.0);
+        t3.add(&z, &lin(1.81), |_| true);
+        t3.add(&[1, 1], &[[0.0; 3], [1.4, 0.0, 0.0]], |_| true);
+        let b3 = t3.finish();
+        assert_eq!(b3.iter().map(|b| (b.t, b.triples)).collect::<Vec<_>>(), vec![(hoh, 1)], "H–H 3.62 > r_cut: no H-centred triple, H–O–H still counted");
+    }
+
+    /// The axes (spec §6.1): r₁ is the species-a neighbour's distance whatever the atom order; a
+    /// folded triple puts the nearer neighbour first (a tie: the lower index); u is the angle at the
+    /// centre; atoms past min(z.len(), pos.len()) are ignored.
+    #[test]
+    fn the_axes_follow_the_species_and_the_fold() {
+        // C at the origin, H at 2.0 on x, O at 3.0 on y: 90° at C; the O listed before the H
+        let (z, pos) = ([6u8, 8, 1], [[0.0; 3], [0.0, 3.0, 0.0], [2.0, 0.0, 0.0]]);
+        let mut seen = Vec::new();
+        each_triple(&z, &pos, 6.0, |i| i == 0, |t| seen.push(t));
+        assert_eq!(seen.len(), 1);
+        let t = seen[0];
+        assert_eq!((t.t, t.centre, t.j, t.k), (TripleType::new(6, 1, 8), 0, 2, 1));
+        assert!((t.r1 - 2.0).abs() < 1e-12 && (t.r2 - 3.0).abs() < 1e-12 && t.u.abs() < 1e-12, "{t:?}");
+        // folded: two H at 2.5 (index 1) and 1.5 (index 2) from an O, 60° apart: j is the nearer
+        let s = 60f64.to_radians();
+        let (z, pos) = ([8u8, 1, 1], [[0.0; 3], [2.5, 0.0, 0.0], [1.5 * s.cos(), 1.5 * s.sin(), 0.0]]);
+        let mut seen = Vec::new();
+        each_triple(&z, &pos, 6.0, |i| i == 0, |t| seen.push(t));
+        assert_eq!((seen[0].j, seen[0].k), (2, 1));
+        assert!((seen[0].r1 - 1.5).abs() < 1e-12 && (seen[0].r2 - 2.5).abs() < 1e-12 && (seen[0].u - 0.5).abs() < 1e-12);
+        // a tie: the lower index first
+        let (z, pos) = ([8u8, 1, 1], [[0.0; 3], [2.0, 0.0, 0.0], [0.0, 2.0, 0.0]]);
+        let mut seen = Vec::new();
+        each_triple(&z, &pos, 6.0, |i| i == 0, |t| seen.push(t));
+        assert_eq!((seen[0].j, seen[0].k), (1, 2));
+        // a fourth Z without a position is ignored
+        let mut n = 0;
+        each_triple(&[8, 1, 1, 1], &pos, 6.0, |_| true, |_| n += 1);
+        assert_eq!(n, 3, "one per centre of the three placed atoms");
+    }
+
+    /// Review Focus 3.
+    #[test]
+    fn coincident_atoms_make_no_triple_and_no_nan() {
+        let (z, pos) = ([8u8, 1, 1], [[0.0; 3], [0.0; 3], [1.8, 0.0, 0.0]]);
+        let mut seen = Vec::new();
+        each_triple(&z, &pos, 6.0, |_| true, |t| seen.push(t));
+        assert_eq!(seen.len(), 1, "only at the far H, whose two neighbours coincide: {seen:?}");
+        assert!(seen.iter().all(|t| t.r1 > 0.0 && t.r2 > 0.0 && (-1.0..=1.0).contains(&t.u)));
+        let mut tally = TripleTally::new(6.0);
+        tally.add(&z, &pos, |_| true);
+        assert_eq!(tally.finish().iter().map(|b| b.triples).sum::<u64>(), 1);
     }
 }
