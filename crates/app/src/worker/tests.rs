@@ -557,8 +557,10 @@ fn taught(scene: Scene, ctx: GpuContext, autosave: Option<PathBuf>) -> (SimWorke
     let t = Instant::now();
     w.send(Command::EnsureModel { autoload: None, plan: test_plan(), auto_pass: true });
     snapshot_until(&w, "a running pass", |s| sampling_active(&s.dynamics));
+    // (`!working`: a refit the pass's round made due runs in the background — quiet refits fix
+    // round 1 — and lands before the caller reads the model)
     let s = snapshot_until(&w, "the end of the pass", |s| {
-        s.dynamics.sampling.as_ref().is_some_and(|p| p.finished)
+        s.dynamics.sampling.as_ref().is_some_and(|p| p.finished) && !s.working
     });
     let wall = t.elapsed();
     let m = model(&s);
