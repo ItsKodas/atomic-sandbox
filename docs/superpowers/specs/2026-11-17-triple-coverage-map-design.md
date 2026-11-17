@@ -532,6 +532,14 @@ There are no oracles, because there is no solver change.
 
 ## 8. Order
 
+**Phasing (user, 2026-11-17).** The map is built in two phases, and the order below applies to Phase B only.
+- **Phase A is built now, ahead of targeted teach.** It holds everything that does not need targeted teach: the triple
+  cell counts (§6.1–§6.4), the 2D map with the 3D switch, the picker ordered by gaps, cell hover and the readouts, the
+  live update during training, the docs and the README. It has no Teach controls at all (absent, not disabled), and
+  its band holds only items 1–3 of §6.7. Its plan is `docs/superpowers/plans/2026-11-17-triple-coverage-map-phase-a.md`.
+- **Phase B (Teach) comes after targeted teach**: Teach this cell, the 2D drag-select region and its Teach, and the
+  `RangePlan` → `TargetRuns` refactor with the cell scan (§6.6, §6.7 items 4–7, §6.8's `teach-cells` and `region=`).
+
 - **After targeted teach**, which itself follows smearing and long-reach phase 1. This feature extends its request,
   planner, pass kind, band, keys and replay, and refactors its sampler entry (§6.6). Building first would mean
   inventing all of that twice.
