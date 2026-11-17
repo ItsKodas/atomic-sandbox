@@ -1098,6 +1098,24 @@ Every trust verdict is identical. The largest absolute difference is 0.38 % of a
 1e-9 bar was unreachable: at κ ≈ 1e13, the old kernels differ from themselves by κε when reordered. One
 side finding: the active set's τ sits in no spectral gap on this collection (recorded in references.md).
 
+### Warm-started recovery trials (2026-11-17, merge d16b5cf)
+
+The user approved one of two follow-ups from the refit profile: start a recovery's trial fits from the
+previous fit's noise levels. They chose option B, which keeps the property that a reopened collection
+reproduces its fit bit for bit. A trial is searched from the last fit, and when it would stand it is
+re-searched cold and judged on that cold fit. They declined skipping a recovery that already failed on the
+same samples.
+
+- Misfit-driven recovery on the user's collection: 61 search rounds → 45 (−26 %); every verdict, note and
+  fit identical to main on the golden.
+- Two review rounds: the cap retries (steps 1 and 1b) went back to cold, so an ordinary refit costs what
+  it did; and a warm pass that fails its cold check now continues the quarantine rounds as main does.
+- Accepted cost: a recovery that stands after one quarantine round pays that round's warm search, about
+  0.5 s.
+- The measured saving was about 13 % of a recovery's wall time, not the estimated 20–40 %: on this
+  collection each quarantine round moves the noise levels far enough that warm trials still need 2–5
+  rounds.
+
 ### Process wins
 
 - An input-replay harness (M6 Task 8) that found a real app bug on its first scripts: a running relax
