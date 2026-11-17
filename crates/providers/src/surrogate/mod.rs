@@ -1346,6 +1346,27 @@ pub struct SurrogateKs {
     /// from takes new rows), like the class pass and the active set (2026-11-17: an O(Q′³)
     /// eigendecomposition per intermediate fit, 3.6 s at Q′ 2 460). Nothing reads it meanwhile.
     null_space_pending: bool,
+    /// The fit in place is a trust recovery's trial, searched from the previous fit's
+    /// hyperparameters (`fit_trial`; spec 2026-11-17, option B): it never stands as it is —
+    /// [`confirm_cold`](SurrogateKs::confirm_cold) searches it again from the data first. Saved
+    /// and restored with the fit (`FitState`).
+    trial_fit: bool,
+    /// Tests only: every fit's solve (`Accumulator::last_refit`) and its basis's degree cap, in
+    /// order (`fit_store_with`).
+    #[cfg(test)]
+    fit_log: Vec<(surrogate::RefitKind, usize)>,
+    /// Tests only: the confirmation with this index (0-based, over every `confirm_cold` call) fails
+    /// after its cold refit, and that fit then fails `recoverable_fail` as long as it is in place
+    /// (`forced_fail_gen`: a trial that passes warm and fails cold); `confirm_failed` keeps the
+    /// state around it.
+    #[cfg(test)]
+    confirm_fail: Option<usize>,
+    #[cfg(test)]
+    confirm_calls: usize,
+    #[cfg(test)]
+    forced_fail_gen: Option<u64>,
+    #[cfg(test)]
+    confirm_failed: Option<ConfirmFailed>,
     /// The extrapolation grade's MaxVol active sets (rule 5e, `surrogate::grade`).
     active_set: Option<ActiveSet>,
     training_residuals: Option<TrainingResiduals>,
@@ -1419,6 +1440,19 @@ pub struct SurrogateKs {
     /// The three-atom coverage map's fitted block, keyed per fit (`triples` module doc, "The
     /// cache"); `triple_map` takes `&self`, as `fit_floor` does.
     triple_cache: std::sync::Mutex<Option<triples::TripleCache>>,
+    /// The teach offer's richer-basis words (`richer_basis_floor`), keyed by a fingerprint of all
+    /// they read — the fitted samples (count, species, positions, force masks, held-out codes),
+    /// the richer basis and the standing degree: the status asks every snapshot, and the count is a
+    /// descriptor pass over every fitted sample in the degree-6 basis (60–77 ms on a 1590-sample
+    /// collection, 2026-11-17). A changed input changes the key, so no mutating path clears it.
+    /// The fingerprint itself hashes every fitted atom's position, O(Σ atoms) per read (0.22 ms at
+    /// 1 621 samples); should collections grow far beyond that, a cheaper first-level key —
+    /// (`model_gen`, `accumulated`, the store length, the quarantine codes' hash) — could gate it,
+    /// the full fingerprint hashed only when that key moves.
+    richer_floor_cache: std::sync::Mutex<Option<(u64, Option<String>)>>,
+    /// Tests only: the richer-basis key counts `richer_basis_floor` ran (`status_cache` tests).
+    #[cfg(test)]
+    richer_floor_counts: std::sync::atomic::AtomicUsize,
     /// Variance evaluations so far (readout; the cadence test).
     variance_checks: u64,
     /// Steps the model answered or would have answered (the audit counter).
@@ -1739,6 +1773,17 @@ impl SurrogateKs {
             envelope: None,
             null_space: None,
             null_space_pending: false,
+            trial_fit: false,
+            #[cfg(test)]
+            fit_log: Vec::new(),
+            #[cfg(test)]
+            confirm_fail: None,
+            #[cfg(test)]
+            confirm_calls: 0,
+            #[cfg(test)]
+            forced_fail_gen: None,
+            #[cfg(test)]
+            confirm_failed: None,
             active_set: None,
             training_residuals: None,
             misfit: None,
@@ -1760,6 +1805,9 @@ impl SurrogateKs {
             last_variance: None,
             fit_floor_cache: std::sync::Mutex::new(BTreeMap::new()),
             triple_cache: std::sync::Mutex::new(None),
+            richer_floor_cache: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            richer_floor_counts: std::sync::atomic::AtomicUsize::new(0),
             variance_checks: 0,
             answered: 0,
             quarantine: Vec::new(),
@@ -3428,6 +3476,10 @@ impl Trainable for SurrogateKs {
 
     fn pending_refit(&self) -> bool {
         SurrogateKs::pending_refit(self)
+    }
+
+    fn audits_background(&self) -> bool {
+        self.audits_asynchronous()
     }
 
     fn forget_sample(&mut self, id: sim::SampleId) -> Result<(), String> {

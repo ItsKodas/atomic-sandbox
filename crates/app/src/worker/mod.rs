@@ -734,8 +734,9 @@ struct Worker {
     harris_seen_seq: u64,
     harris_atoms: Option<(Arc<Vec<AtomProfile>>, Vec<u8>, Arc<sim::HarrisAtoms>)>,
     harris_note: Option<&'static str>,
-    /// The provider audits on a background teacher (`TrainableStatus::audits_background`: the
-    /// estimated solver on the GPU teacher) — Harris display solves need it.
+    /// The provider audits on a background teacher (`Trainable::audits_background`, the status's
+    /// field without building the status: the estimated solver on the GPU teacher) — Harris
+    /// display solves need it.
     background_auditor: bool,
 }
 
@@ -941,7 +942,7 @@ fn worker(
         w.dy.apply(c);
     }
     let first = w.dy.snapshot();
-    w.background_auditor = trainable(&mut w.dy).is_some_and(|t| t.status(&first.scene, &first.forces).audits_background);
+    w.background_auditor = trainable(&mut w.dy).is_some_and(|t| t.audits_background());
     w.publish(first);
     let mut inbox = Inbox {
         rx,
@@ -1130,7 +1131,7 @@ impl Worker {
             self.background_auditor = false;
             return;
         };
-        self.background_auditor = s.status(&snap.scene, &snap.forces).audits_background;
+        self.background_auditor = s.audits_background();
         if !self.background_auditor {
             return;
         }

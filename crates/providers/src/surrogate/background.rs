@@ -176,6 +176,7 @@ impl SurrogateKs {
         f.envelope = self.envelope.clone();
         f.null_space = self.null_space.clone();
         f.null_space_pending = self.null_space_pending;
+        f.trial_fit = self.trial_fit;
         f.active_set = self.active_set.clone();
         f.training_residuals = self.training_residuals;
         f.misfit = self.misfit.clone();
@@ -415,6 +416,8 @@ impl SurrogateKs {
         self.envelope = f.envelope.take();
         self.null_space = f.null_space.take();
         self.null_space_pending = f.null_space_pending;
+        // false after any refit (every recovery exit confirms or restores: `confirm_cold`)
+        self.trial_fit = f.trial_fit;
         self.active_set = f.active_set.take();
         self.training_residuals = f.training_residuals;
         self.misfit = f.misfit.take();

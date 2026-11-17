@@ -1098,6 +1098,45 @@ Every trust verdict is identical. The largest absolute difference is 0.38 % of a
 1e-9 bar was unreachable: at κ ≈ 1e13, the old kernels differ from themselves by κε when reordered. One
 side finding: the active set's τ sits in no spectral gap on this collection (recorded in references.md).
 
+### Warm-started recovery trials (2026-11-17, merge d16b5cf)
+
+The user approved one of two follow-ups from the refit profile: start a recovery's trial fits from the
+previous fit's noise levels. They chose option B, which keeps the property that a reopened collection
+reproduces its fit bit for bit. A trial is searched from the last fit, and when it would stand it is
+re-searched cold and judged on that cold fit. They declined skipping a recovery that already failed on the
+same samples.
+
+- Misfit-driven recovery on the user's collection: 61 search rounds → 45 (−26 %); every verdict, note and
+  fit identical to main on the golden.
+- Two review rounds: the cap retries (steps 1 and 1b) went back to cold, so an ordinary refit costs what
+  it did; and a warm pass that fails its cold check now continues the quarantine rounds as main does.
+- Accepted cost: a recovery that stands after one quarantine round pays that round's warm search, about
+  0.5 s.
+- The measured saving was about 13 % of a recovery's wall time, not the estimated 20–40 %: on this
+  collection each quarantine round moves the noise levels far enough that warm trials still need 2–5
+  rounds.
+
+### Estimated mode is fast again (2026-11-17, merge status-cache)
+
+The user reported that H₂ in estimated mode had dropped from 14 fs/s to 1.4. A diagnosis on a copy of
+their collection found the step was not the cost. The worker read `status()` twice per round, and
+each read spent about 70 ms recounting environment keys for the teach offer's "richer basis" note.
+That note exists only while a class is untrusted, which is why the slowdown appeared once the many-body
+class lost trust; main had the same cost.
+
+- The note is now cached on a fingerprint of everything it reads, and the worker reads
+  `audits_background` directly. `status()` went from 124 ms to 1.05 ms.
+- The every-4th-step variance check was rescheduled with the same arithmetic in the same order:
+  - novelty uses component-major null directions and skips exact zeros;
+  - `predict(var)` runs 8 rows at once through the Cholesky factor (AVX2, no FMA).
+- Results, under uneven load: novelty 21.5 → 0.18 ms, `predict(var)` 15.6 → 1.5 ms, mean step
+  12.6 → 1.3 ms.
+- Exactness: the golden shows 0 differences in 6,193 items, and an independent reviewer's scratch check
+  found 61,740 quadratic forms bit-equal, including ±0, denormals, NaN and inf.
+- Lesson: profile the worker round, not only the provider step. Each per-step suspect (refits, panels,
+  the knowledge graph) was ruled out by the user's own observations before the profile found the real
+  cost.
+
 ### Process wins
 
 - An input-replay harness (M6 Task 8) that found a real app bug on its first scripts: a running relax
