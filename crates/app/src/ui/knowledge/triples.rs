@@ -20,16 +20,33 @@
 //!   many-body key.
 //! - **Empty states** (Review Focus 4): no map yet, no type, no three-atom terms in the basis, and
 //!   a picked type the map no longer holds each read as one plain sentence.
+//! - **The 2D slice** (Task 7, spec §6.5 and U1; [`flat`]): x the angle at the centre in the 10
+//!   cos θ bins ([`angle_labels`] at their edges), y r₁ over the rows [`extent`] crops to the
+//!   drawn cells ([`drawn`]: filled, new, or missing within reach), one r₂ bin per slice (a
+//!   slider; a folded type's slice s reads the stored cell {k₁, s}, [`slice_cells`]). Fill
+//!   [`GREEN`] taught / [`AMBER`] thin, its opacity rising with ln(1 + n) over the type's fullest
+//!   cell; missing an `INK_FAINT` outline; new (pending > 0) a dashed [`NEW_INK`] outline; the
+//!   picked cell an accent outline. The open scene's arrangements of the type
+//!   ([`scene_instances`], the map's own `each_triple`) are white rings on their slice, "now" by
+//!   the chosen one ([`chosen_instance`]: the selected atom's, else the first), faint rings for
+//!   those in other slices. Hover reads [`cell_hover`]; a click picks a drawn cell (empty space
+//!   clears it) and its card shows [`cell_card_line`] and the honest-limits band
+//!   ([`band_lines`], §6.7 items 1–3).
+//! - **Stale state** (Review Focus 1, [`sync`]): the classes and extent are computed once per
+//!   (map `Arc`, type) into `TripleView::cache`; each frame a slice outside the extent is clamped
+//!   into it and a picked cell past the grid or no longer drawn is dropped. Showing another type
+//!   resets the slice and the cell (they named the old type's bins).
 //!
 //! Display state only (`KnowledgeView::triple`, the pick, the fold): nothing here emits an
-//! `Action`. Distances in Bohr.
-use super::{new_since, sym, KnowledgeView, Pick};
+//! `Action`. Distances in Bohr; degrees only in the labels.
+use super::{new_since, pair_name, sym, KnowledgeView, Pick, TripleView, NEW_INK};
 use crate::scene::SceneNucleus;
 use crate::sim::Backend;
 use crate::ui::{activity::words::thousands, dock, keyed, probe, probe_rect, theme, DockTab, PanelInput, UiState, AMBER, GREEN};
-use egui::{pos2, vec2, FontId, RichText, Sense, Stroke, Ui};
-use sim::knowledge::{each_triple, summary, TripleKnowledge, TripleMap, TripleType};
+use egui::{pos2, vec2, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui};
+use sim::knowledge::{cell_class, cos_bin, cos_edges_deg, each_triple, summary, taught_count, CellClass, Triple, TripleGrid, TripleKnowledge, TripleMap, TripleType, COS_BINS, TRIPLE_BIN};
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// Whether the worker should build the three-atom map: the Knowledge panel is shown and the
@@ -263,9 +280,14 @@ pub fn section(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, r_cut: f64
         ui.add_space(4.0);
         super::card(ui, "knowledge-triple-head", |ui| card_head(ui, st, input, &map, tk));
     }
-    // the slice and the cloud (Tasks 7–8) draw here
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-    probe_rect("knowledge-triple-view", rect);
+    // the slice (the cloud, Task 8, draws here too)
+    ui.add_space(6.0);
+    let view = &mut st.knowledge.triple;
+    sync(view, &map, tk);
+    let cache = view.cache.take().expect("sync fills it");
+    let r = ui.scope(|ui| flat(ui, view, &cache, input, &map, tk)).response;
+    view.cache = Some(cache);
+    probe("knowledge-triple-view", &r);
 }
 
 /// The picker: one row per type, the shown one outlined, a dot for the scene's types.
@@ -350,4 +372,394 @@ pub fn element_links(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, z: u
             }
         }
     });
+}
+
+// ---- the 2D slice (Task 7) ----
+
+/// A type's classes and drawn extent for one map (spec §6.4 "UI cost": computed once per (map
+/// `Arc` pointer, type), kept in `TripleView::cache`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClassCache {
+    /// `Arc::as_ptr` of the map, as an address.
+    pub map: usize,
+    pub t: TripleType,
+    /// Per cell of the map's grid ([`class_table`]).
+    pub classes: Vec<CellClass>,
+    /// [`extent`].
+    pub extent: Option<(Range<usize>, Range<usize>)>,
+}
+
+/// Every cell's class (`sim::knowledge::cell_class`), indexed by cell.
+pub fn class_table(map: &TripleMap, tk: &TripleKnowledge) -> Vec<CellClass> {
+    (0..map.grid.cells()).map(|c| cell_class(map, tk, c)).collect()
+}
+
+/// A cell the views draw: fitted > 0, new > 0, or missing within reach.
+pub fn drawn(tk: &TripleKnowledge, class: CellClass, cell: usize) -> bool {
+    class == CellClass::Missing || tk.counts.get(cell).is_some_and(|&n| n > 0) || tk.pending.get(cell).is_some_and(|&n| n > 0)
+}
+
+/// The drawn cells' extent: (the r₁ rows k₁, the r₂ slices k₂), each the contiguous range from the
+/// lowest drawn bin to the highest. A folded type's two ranges are one, the union of its k₁ and
+/// k₂ (its slice s shows every r₁). `None` with nothing drawn.
+pub fn extent(map: &TripleMap, tk: &TripleKnowledge, classes: &[CellClass]) -> Option<(Range<usize>, Range<usize>)> {
+    let g = &map.grid;
+    let grow = |span: &mut Option<(usize, usize)>, k: usize| *span = Some(span.map_or((k, k), |(lo, hi)| (lo.min(k), hi.max(k))));
+    let (mut r, mut s) = (None, None);
+    for (c, &class) in classes.iter().enumerate().take(g.cells()) {
+        if drawn(tk, class, c) {
+            let (k1, k2, _) = g.coords(c);
+            grow(&mut r, k1);
+            grow(&mut s, k2);
+        }
+    }
+    let ((r0, r1), (s0, s1)) = (r?, s?);
+    if tk.t.folded() {
+        let (lo, hi) = (r0.min(s0), r1.max(s1));
+        return Some((lo..hi + 1, lo..hi + 1));
+    }
+    Some((r0..r1 + 1, s0..s1 + 1))
+}
+
+/// Slice s's cells: per row k₁ in `rows`, the [`COS_BINS`] cell indices `grid.index(folded, k₁, s,
+/// q)` (a folded type reads the stored {k₁, s}).
+pub fn slice_cells(grid: &TripleGrid, folded: bool, rows: Range<usize>, s: usize) -> Vec<[usize; COS_BINS]> {
+    rows.map(|k1| std::array::from_fn(|q| grid.index(folded, k1, s, q))).collect()
+}
+
+/// The open scene's arrangements of type `t`: `each_triple` with every atom a centre (the map's
+/// own definition, so a marker sits in the cell its arrangement would be counted in).
+pub fn scene_instances(nuclei: &[SceneNucleus], t: TripleType, r_cut: f64) -> Vec<Triple> {
+    let z: Vec<u8> = nuclei.iter().map(|n| n.z).collect();
+    let pos: Vec<[f64; 3]> = nuclei.iter().map(|n| n.pos).collect();
+    let mut out = Vec::new();
+    each_triple(&z, &pos, r_cut, |_| true, |x| {
+        if x.t == t {
+            out.push(x);
+        }
+    });
+    out
+}
+
+/// The instance the default slice follows: with a selected atom that centres one, its least
+/// r₁ + r₂ (a tie: the lowest (centre, j, k)); else the lowest (centre, j, k).
+pub fn chosen_instance(instances: &[Triple], selected: Option<usize>) -> Option<Triple> {
+    let key = |x: &Triple| (x.centre, x.j, x.k);
+    selected
+        .and_then(|i| instances.iter().filter(|x| x.centre == i).min_by(|a, b| (a.r1 + a.r2).total_cmp(&(b.r1 + b.r2)).then_with(|| key(a).cmp(&key(b)))))
+        .or_else(|| instances.iter().min_by_key(|x| key(x)))
+        .copied()
+}
+
+/// The slice shown when none was chosen: the chosen instance's r₂ bin, else the type's fullest
+/// slice (fitted + new, as the slice draws them; the lowest on a tie), else 0.
+pub fn default_slice(map: &TripleMap, tk: &TripleKnowledge, chosen: Option<&Triple>) -> usize {
+    let g = &map.grid;
+    if let Some(k2) = chosen.and_then(|x| g.r_bin_of(x.r2)) {
+        return k2;
+    }
+    let mut fill = vec![0u64; g.n_r];
+    for c in 0..g.cells() {
+        let n = tk.counts.get(c).copied().unwrap_or(0) as u64 + tk.pending.get(c).copied().unwrap_or(0) as u64;
+        if n == 0 {
+            continue;
+        }
+        let (k1, k2, _) = g.coords(c);
+        fill[k2] += n;
+        // a folded cell {k₁, k₂} shows in slice k₁ too
+        if tk.t.folded() && k1 != k2 {
+            fill[k1] += n;
+        }
+    }
+    let best = fill.iter().copied().max().unwrap_or(0);
+    fill.iter().position(|&n| n == best && n > 0).unwrap_or(0)
+}
+
+/// The row an instance sits on in slice s: its k₁ when its k₂ = s; for a folded type also its k₂
+/// when its k₁ = s (the slice reads {row, s}). `None` off the slice or for a distance without a
+/// bin.
+pub fn on_slice(grid: &TripleGrid, inst: &Triple, s: usize) -> Option<usize> {
+    let (k1, k2) = (grid.r_bin_of(inst.r1)?, grid.r_bin_of(inst.r2)?);
+    if k2 == s {
+        Some(k1)
+    } else if inst.t.folded() && k1 == s {
+        Some(k2)
+    } else {
+        None
+    }
+}
+
+/// The angle axis' labels at the [`COS_BINS`] + 1 bin edges, in degrees: "0", "37", …, "180".
+pub fn angle_labels() -> Vec<String> {
+    (0..=COS_BINS).map(|q| if q < COS_BINS { cos_edges_deg(q).0 } else { cos_edges_deg(q - 1).1 }).map(|d| format!("{d:.0}")).collect()
+}
+
+/// A cell's class in words: "taught", "thin", "missing within reach"; a new-only cell outside the
+/// reach "outside reach".
+fn class_word(class: CellClass) -> &'static str {
+    match class {
+        CellClass::Taught => "taught",
+        CellClass::Thin => "thin",
+        CellClass::Missing => "missing within reach",
+        CellClass::OutOfReach => "outside reach",
+    }
+}
+
+/// (r₁ edges, r₂ edges, θ edges in degrees) of a cell, for its words.
+fn cell_edges(g: &TripleGrid, cell: usize) -> ((f64, f64), (f64, f64), (f64, f64)) {
+    let (k1, k2, q) = g.coords(cell);
+    (g.r_edges(k1), g.r_edges(k2), cos_edges_deg(q))
+}
+
+/// The hover: "r₁ 1.8–2.1 · r₂ 1.8–2.1 Bohr · θ 102–114° · n 342 (+12 new) · taught" (the
+/// parenthesis only with new arrangements).
+pub fn cell_hover(map: &TripleMap, tk: &TripleKnowledge, cell: usize) -> String {
+    let ((a1, b1), (a2, b2), (ta, tb)) = cell_edges(&map.grid, cell);
+    let n = tk.counts.get(cell).copied().unwrap_or(0);
+    let k = tk.pending.get(cell).copied().unwrap_or(0);
+    let new = if k > 0 { format!(" (+{k} new)") } else { String::new() };
+    format!("r₁ {a1:.1}–{b1:.1} · r₂ {a2:.1}–{b2:.1} Bohr · θ {ta:.0}–{tb:.0}° · n {}{new} · {}", thousands(n as u64), class_word(cell_class(map, tk, cell)))
+}
+
+/// The cell card's line: "H–O–H · r₁ 1.8–2.1, r₂ 1.8–2.1 Bohr, θ 102–114° · 342 arrangements ·
+/// taught · +12 new" (the last part only with new arrangements).
+pub fn cell_card_line(map: &TripleMap, tk: &TripleKnowledge, cell: usize) -> String {
+    let ((a1, b1), (a2, b2), (ta, tb)) = cell_edges(&map.grid, cell);
+    let n = tk.counts.get(cell).copied().unwrap_or(0);
+    let k = tk.pending.get(cell).copied().unwrap_or(0);
+    let new = if k > 0 { format!(" · +{k} new") } else { String::new() };
+    format!(
+        "{} · r₁ {a1:.1}–{b1:.1}, r₂ {a2:.1}–{b2:.1} Bohr, θ {ta:.0}–{tb:.0}° · {} arrangements · {}{new}",
+        triple_name(tk.t),
+        thousands(n as u64),
+        class_word(cell_class(map, tk, cell))
+    )
+}
+
+/// The cell card's honest-limits band (spec §6.7 items 1–3; Phase A has no Teach), one line each.
+pub fn band_lines(map: &TripleMap) -> Vec<String> {
+    let first = format!(
+        "Green counts arrangements in the cell ({} within {:.1} Bohr in each distance and {:.1} in cos θ); it is not the model's trust or accuracy.",
+        taught_count(),
+        TRIPLE_BIN,
+        2.0 / COS_BINS as f64
+    );
+    let second = if !map.basis.body3 {
+        NO_BODY3.to_string()
+    } else {
+        let four = if map.basis.body4 { " Four-atom arrangements (body-4) are learned too and not shown." } else { "" };
+        format!("Counts every pair of neighbours within {:.1} Bohr of the centre, as the model's three-atom terms do.{four}", map.r_cut)
+    };
+    let third = "The model's three-atom terms are smooth in the distances and in cos θ: it may interpolate across a missing cell, and a green cell can still be wrong.".to_string();
+    vec![first, second, third]
+}
+
+/// Brings the view up to date with the map shown (Review Focus 1): the class cache recomputed
+/// when the map (`Arc` pointer) or the type changed — another type resets the slice and the
+/// cell —, the slice clamped into the extent's slices, and a picked cell past the grid or no
+/// longer drawn dropped (a kept one is normalised to its stored (k₁, k₂, q)).
+pub fn sync(view: &mut TripleView, map: &Arc<TripleMap>, tk: &TripleKnowledge) {
+    let key = Arc::as_ptr(map) as usize;
+    let g = &map.grid;
+    let fresh = view.cache.as_ref().is_some_and(|c| c.map == key && c.t == tk.t && c.classes.len() == g.cells());
+    if !fresh {
+        if view.cache.as_ref().is_some_and(|c| c.t != tk.t) {
+            view.slice = None;
+            view.cell = None;
+        }
+        let classes = class_table(map, tk);
+        let extent = extent(map, tk, &classes);
+        view.cache = Some(ClassCache { map: key, t: tk.t, classes, extent });
+    }
+    let cache = view.cache.as_ref().expect("filled above");
+    if let (Some(s), Some((_, slices))) = (view.slice, &cache.extent) {
+        if !slices.contains(&s) {
+            view.slice = Some(s.clamp(slices.start, slices.end - 1));
+        }
+    }
+    view.cell = view.cell.and_then(|(k1, k2, q)| {
+        if k1 >= g.n_r || k2 >= g.n_r || q >= g.cos_bins {
+            return None;
+        }
+        let c = g.index(tk.t.folded(), k1, k2, q);
+        drawn(tk, cache.classes[c], c).then(|| g.coords(c))
+    });
+}
+
+/// The rows' height (points): together ≈ 180 pt, each 8–18.
+fn row_height(rows: usize) -> f32 {
+    (180.0 / rows.max(1) as f32).clamp(8.0, 18.0)
+}
+
+/// The plot's left gutter (the r₁ labels) and right margin (half the last angle label).
+const GUTTER: f32 = 26.0;
+const MARGIN: f32 = 10.0;
+
+/// A rectangle's outline, dashed (a new cell).
+fn dashed_rect(p: &egui::Painter, r: Rect, stroke: Stroke) {
+    p.extend(Shape::dashed_line(&[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()], stroke, 2.0, 2.0));
+}
+
+/// One marker of the open scene: its (row, q) on the plot, where it is drawn, the arrangement.
+type Marker = (usize, usize, Pos2, Triple);
+
+/// The 2D slice of the shown type (module doc): the slice control, the plot with its markers,
+/// hover and click, the caption, and the picked cell's card.
+fn flat(ui: &mut Ui, view: &mut TripleView, cache: &ClassCache, input: &PanelInput<'_>, map: &TripleMap, tk: &TripleKnowledge) {
+    let t = tk.t;
+    let Some((rows, slices)) = cache.extent.clone() else {
+        ui.add(egui::Label::new(RichText::new(format!("nothing to draw: no cell of {} is filled or within reach", triple_name(t))).size(11.0).color(theme::INK_DIM)).wrap());
+        return;
+    };
+    let (g, folded) = (&map.grid, t.folded());
+    let instances = scene_instances(&input.scene.nuclei, t, map.r_cut);
+    let chosen = chosen_instance(&instances, input.selected);
+    let mut s = view.slice.unwrap_or_else(|| default_slice(map, tk, chosen.as_ref())).clamp(slices.start, slices.end - 1);
+    // the slice control: a slider over the extent's r₂ bins, and the bin's range
+    ui.horizontal_wrapped(|ui| {
+        let mut k = s;
+        let r = keyed(ui, "knowledge-triple-slice", |ui| ui.add_enabled(slices.len() > 1, egui::Slider::new(&mut k, slices.start..=slices.end - 1).show_value(false)));
+        probe("knowledge-triple-slice", &r);
+        if r.changed() && k != s {
+            view.slice = Some(k);
+            s = k;
+        }
+        let (lo, hi) = g.r_edges(s);
+        ui.label(RichText::new(format!("r₂ ({}) {lo:.1}–{hi:.1} Bohr", pair_name(t.centre, t.b))).size(11.0).color(theme::INK_DIM));
+    });
+    ui.label(RichText::new(format!("r₁ ({}) Bohr", pair_name(t.centre, t.a))).size(10.0).color(theme::INK_FAINT));
+    // the plot
+    let rh = row_height(rows.len());
+    let size = vec2(ui.available_width(), rh * rows.len() as f32 + 14.0);
+    let resp = keyed(ui, "knowledge-triple-plot", |ui| ui.allocate_exact_size(size, Sense::click()).1);
+    probe("knowledge-triple-plot", &resp);
+    let rect = resp.rect;
+    let plot = Rect::from_min_max(rect.min + vec2(GUTTER, 0.0), pos2(rect.right() - MARGIN, rect.top() + rh * rows.len() as f32));
+    let cw = plot.width() / COS_BINS as f32;
+    let p = ui.painter_at(rect.expand(2.0));
+    p.rect_filled(plot, 0.0, Color32::from_black_alpha(64));
+    let cells = slice_cells(g, folded, rows.clone(), s);
+    let cell_rect = |row: usize, q: usize| Rect::from_min_size(pos2(plot.left() + q as f32 * cw, plot.bottom() - (row - rows.start + 1) as f32 * rh), vec2(cw, rh));
+    // (row, q) under a point of the plot
+    let at = |pos: Pos2| -> Option<(usize, usize)> {
+        plot.contains(pos).then(|| (rows.start + (((plot.bottom() - pos.y) / rh) as usize).min(rows.len() - 1), (((pos.x - plot.left()) / cw) as usize).min(COS_BINS - 1)))
+    };
+    let shown = |row: usize, q: usize| Some(cells[row - rows.start][q]).filter(|&c| drawn(tk, cache.classes[c], c));
+    let top = tk.counts.iter().copied().max().unwrap_or(0);
+    let opacity = |n: u32| 0.3 + 0.7 * ((1.0 + n as f32).ln() / (1.0 + top as f32).ln().max(1e-6)).min(1.0);
+    for row in rows.clone() {
+        for q in 0..COS_BINS {
+            let Some(c) = shown(row, q) else { continue };
+            let r = cell_rect(row, q).shrink(0.5);
+            let n = tk.counts.get(c).copied().unwrap_or(0);
+            match cache.classes[c] {
+                CellClass::Taught => {
+                    p.rect_filled(r, 0.0, GREEN.gamma_multiply(opacity(n)));
+                }
+                CellClass::Thin => {
+                    p.rect_filled(r, 0.0, AMBER.gamma_multiply(opacity(n)));
+                }
+                CellClass::Missing => {
+                    p.rect_stroke(r.shrink(0.5), 0.0, Stroke::new(1.0, theme::INK_FAINT), egui::StrokeKind::Inside);
+                }
+                CellClass::OutOfReach => {}
+            }
+            if tk.pending.get(c).is_some_and(|&k| k > 0) {
+                dashed_rect(&p, r.shrink(1.5), Stroke::new(1.0, NEW_INK));
+            }
+            if view.cell == Some(g.coords(c)) {
+                p.rect_stroke(r, 0.0, Stroke::new(2.0, theme::ACCENT), egui::StrokeKind::Inside);
+            }
+            if cfg!(test) {
+                probe_rect(&format!("knowledge-triple-cell-{c}"), r);
+            }
+        }
+    }
+    // the axes' labels: r₁ bin edges in the gutter (≥ 11 pt apart), the angle edges under the plot
+    let small = FontId::monospace(8.5);
+    let step = (11.0 / rh).ceil().max(1.0) as usize;
+    for k in (rows.start..=rows.end).filter(|k| (k - rows.start) % step == 0) {
+        let y = plot.bottom() - (k - rows.start) as f32 * rh;
+        p.text(pos2(plot.left() - 3.0, y), Align2::RIGHT_CENTER, format!("{:.1}", g.r_edges(k).0), small.clone(), theme::INK_FAINT);
+    }
+    for (q, l) in angle_labels().into_iter().enumerate() {
+        p.text(pos2(plot.left() + q as f32 * cw, plot.bottom() + 2.0), Align2::CENTER_TOP, l, small.clone(), theme::INK_FAINT);
+    }
+    // the open scene's arrangements: white rings on this slice ("now" by the chosen one), faint
+    // rings at their r₁ for those in other slices
+    let x_of = |u: f64| plot.left() + ((1.0 - u.clamp(-1.0, 1.0)) / 2.0) as f32 * plot.width();
+    let y_of = |r: f64| (plot.bottom() - ((r / g.r_bin) as f32 - rows.start as f32) * rh).clamp(plot.top(), plot.bottom());
+    let (mut here, mut elsewhere): (Vec<Marker>, Vec<Marker>) = (Vec::new(), Vec::new());
+    for inst in &instances {
+        let q = cos_bin(inst.u);
+        match on_slice(g, inst, s) {
+            Some(row) if rows.contains(&row) => {
+                // the row's own distance: r₁, or a folded type's r₂ when it is its r₁ that is on s
+                let r = if folded && g.r_bin_of(inst.r2) != Some(s) { inst.r2 } else { inst.r1 };
+                here.push((row, q, pos2(x_of(inst.u), y_of(r)), *inst));
+            }
+            Some(_) => {}
+            None => {
+                if let Some(row) = g.r_bin_of(inst.r1).filter(|k| rows.contains(k)) {
+                    elsewhere.push((row, q, pos2(x_of(inst.u), y_of(inst.r1)), *inst));
+                }
+            }
+        }
+    }
+    for &(_, _, c, _) in &elsewhere {
+        p.circle_stroke(c, 3.5, Stroke::new(1.0, Color32::from_white_alpha(90)));
+    }
+    for &(_, _, c, _) in &here {
+        p.circle_stroke(c, 4.0, Stroke::new(1.5, Color32::WHITE));
+    }
+    if let Some(&(_, _, c, _)) = here.iter().find(|h| Some(h.3) == chosen).or(here.first()) {
+        probe_rect("knowledge-triple-ring", Rect::from_center_size(c, vec2(8.0, 8.0)));
+        let galley = p.layout_no_wrap("now".into(), FontId::monospace(9.0), Color32::WHITE);
+        let left = if c.x + 6.0 + galley.size().x <= plot.right() { c.x + 6.0 } else { c.x - 6.0 - galley.size().x };
+        let at = pos2(left, (c.y - galley.size().y / 2.0).clamp(rect.top(), (plot.bottom() - galley.size().y).max(rect.top())));
+        probe_rect("knowledge-triple-now", Rect::from_min_size(at, galley.size()));
+        p.galley(at, galley, Color32::WHITE);
+    }
+    // hover and click
+    let hovered = resp.hover_pos().and_then(at).and_then(|(row, q)| shown(row, q).map(|c| (row, q, c)));
+    let resp = match hovered {
+        Some((row, q, c)) => {
+            p.rect_stroke(cell_rect(row, q), 0.0, Stroke::new(1.0, Color32::from_white_alpha(200)), egui::StrokeKind::Inside);
+            let off = instances.iter().filter(|i| on_slice(g, i, s).is_none()).count();
+            let mut text = cell_hover(map, tk, c);
+            let mine = here.iter().filter(|h| (h.0, h.1) == (row, q)).count();
+            if mine > 0 {
+                let what = if mine == 1 { "arrangement".to_string() } else { format!("{mine} arrangements") };
+                let more = if off > 0 { format!(" (+{off} in other slices)") } else { String::new() };
+                text.push_str(&format!("\nnow: the open scene's {what} here{more}"));
+            }
+            for e in elsewhere.iter().filter(|e| (e.0, e.1) == (row, q)) {
+                text.push_str(&format!("\nfaint ring: the open scene's arrangement at r₂ {:.2} Bohr, in another slice", e.3.r2));
+            }
+            resp.on_hover_ui_at_pointer(|ui| {
+                ui.label(RichText::new(text).size(11.0));
+            })
+        }
+        None => resp,
+    };
+    if resp.clicked() {
+        view.cell = resp.interact_pointer_pos().and_then(at).and_then(|(row, q)| shown(row, q)).map(|c| g.coords(c));
+    }
+    ui.label(RichText::new(format!("angle at {} (cos θ bins)", sym(t.centre))).size(10.0).color(theme::INK_FAINT));
+    // the picked cell's card (no Teach in Phase A)
+    if let Some((k1, k2, q)) = view.cell {
+        let c = g.index(folded, k1, k2, q);
+        ui.add_space(4.0);
+        super::card(ui, "knowledge-triple-cell-card", |ui| {
+            ui.add(egui::Label::new(RichText::new(cell_card_line(map, tk, c)).size(11.5).color(theme::INK)).wrap());
+            let b = ui
+                .vertical(|ui| {
+                    for l in band_lines(map) {
+                        ui.add(egui::Label::new(RichText::new(l).size(10.5).color(theme::INK_DIM)).wrap());
+                    }
+                })
+                .response;
+            probe("knowledge-triple-band", &b);
+        });
+    }
 }

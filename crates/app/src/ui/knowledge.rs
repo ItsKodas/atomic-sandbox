@@ -127,11 +127,14 @@ pub struct TripleView {
     /// An entry link's centre (the pair card's, or the element card's before a map arrived): with
     /// no triple picked, the section shows that centre's type with the most gaps.
     pub want_centre: Option<u8>,
+    /// The shown type's classes and extent, computed once per (map, type) (spec §6.4 "UI cost";
+    /// [`triples::sync`]). Derived: a new scene drops it.
+    pub cache: Option<triples::ClassCache>,
 }
 
 impl Default for TripleView {
     fn default() -> Self {
-        TripleView { mode: TripleMode::Flat, slice: None, cell: None, yaw_deg: 35.0, pitch_deg: 20.0, zoom: 1.0, show_missing: true, want_centre: None }
+        TripleView { mode: TripleMode::Flat, slice: None, cell: None, yaw_deg: 35.0, pitch_deg: 20.0, zoom: 1.0, show_missing: true, want_centre: None, cache: None }
     }
 }
 
@@ -161,9 +164,10 @@ impl Default for KnowledgeView {
 
 impl KnowledgeView {
     /// A new scene: the graph fits itself again on its next frame (the pick and the three-atom
-    /// view are kept, but not an entry link's centre: the new scene has its own default).
+    /// view are kept, but not an entry link's centre: the new scene has its own default; nor the
+    /// class cache, rebuilt on the next frame).
     pub fn reset_view(&mut self) {
-        let triple = TripleView { want_centre: None, ..std::mem::take(&mut self.triple) };
+        let triple = TripleView { want_centre: None, cache: None, ..std::mem::take(&mut self.triple) };
         *self = KnowledgeView { pick: self.pick, molecule: self.molecule.take(), triple, ..Default::default() };
     }
 

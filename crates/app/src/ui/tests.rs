@@ -9034,6 +9034,144 @@ mod triple_map {
         v.reset_view();
         assert_eq!((v.triple.mode, v.triple.slice), (TripleMode::Cloud, Some(4)), "kept across a new scene");
         assert_eq!(v.triple.want_centre, None, "an entry link's centre is not");
+        // the class cache is a derived value: a new scene drops it (Task 7)
+        let map = knowledge::fixture_triples();
+        let tk = map.get(TripleType::new(8, 1, 1)).unwrap();
+        let classes = triples::class_table(&map, tk);
+        v.triple.cache = Some(triples::ClassCache { map: 1, t: tk.t, extent: triples::extent(&map, tk, &classes), classes });
+        v.reset_view();
+        assert_eq!(v.triple.cache, None);
+    }
+
+    /// Spec U1: rows cropped to reach ∪ filled, the fold read, markers in the right cell.
+    #[test]
+    fn the_slice_model_crops_folds_and_marks() {
+        let map = knowledge::fixture_triples();
+        let t = TripleType::new(8, 1, 1);
+        let tk = map.get(t).unwrap();
+        let classes = triples::class_table(&map, tk);
+        let (rows, slices) = triples::extent(&map, tk, &classes).unwrap();
+        let want: Vec<usize> = (0..map.grid.cells())
+            .filter(|&c| triples::drawn(tk, classes[c], c))
+            .flat_map(|c| {
+                let (a, b, _) = map.grid.coords(c);
+                [a, b]
+            })
+            .collect();
+        assert_eq!((rows.start, rows.end), (*want.iter().min().unwrap(), want.iter().max().unwrap() + 1));
+        assert_eq!(rows, slices, "folded: one range for both");
+        assert!(rows.contains(&5) && rows.contains(&6), "the fixture's filled cells");
+        let cells = triples::slice_cells(&map.grid, true, rows.clone(), 5);
+        assert_eq!(cells[6 - rows.start][3], map.grid.index(false, 5, 6, 3), "slice 5, row 6 reads the stored (5, 6) cell");
+        let water = Scene::preset("h2o").unwrap();
+        let inst = triples::scene_instances(&water.nuclei, t, map.r_cut);
+        assert_eq!(inst.len(), 1);
+        let (k1, k2, _) = map.grid.coords(map.grid.cell(true, inst[0].r1, inst[0].r2, inst[0].u).unwrap());
+        assert_eq!(triples::on_slice(&map.grid, &inst[0], k2), Some(k1));
+        assert_eq!(triples::default_slice(&map, tk, inst.first()), k2);
+        assert_eq!(triples::chosen_instance(&inst, None), inst.first().copied());
+    }
+
+    #[test]
+    fn hover_card_and_band_read_the_spec_copy() {
+        let map = knowledge::fixture_triples();
+        let tk = map.get(TripleType::new(8, 1, 1)).unwrap();
+        let c = map.grid.index(true, 6, 6, 6);
+        assert_eq!(triples::angle_labels(), ["0", "37", "53", "66", "78", "90", "102", "114", "127", "143", "180"]);
+        assert_eq!(triples::cell_hover(&map, tk, c), "r₁ 1.8–2.1 · r₂ 1.8–2.1 Bohr · θ 102–114° · n 342 (+12 new) · taught");
+        assert_eq!(triples::cell_card_line(&map, tk, c), "H–O–H · r₁ 1.8–2.1, r₂ 1.8–2.1 Bohr, θ 102–114° · 342 arrangements · taught · +12 new");
+        assert!(triples::cell_hover(&map, tk, map.grid.index(true, 5, 6, 6)).ends_with("n 9 · thin"));
+        let band = triples::band_lines(&map);
+        assert_eq!(band[0], "Green counts arrangements in the cell (10 within 0.3 Bohr in each distance and 0.2 in cos θ); it is not the model's trust or accuracy.");
+        assert_eq!(band[1], "Counts every pair of neighbours within 6.0 Bohr of the centre, as the model's three-atom terms do.");
+        assert_eq!(band[2], "The model's three-atom terms are smooth in the distances and in cos θ: it may interpolate across a missing cell, and a green cell can still be wrong.");
+        let mut b4 = map.clone();
+        b4.basis.body4 = true;
+        assert!(triples::band_lines(&b4)[1].ends_with(" Four-atom arrangements (body-4) are learned too and not shown."));
+        b4.basis.body3 = false;
+        assert_eq!(triples::band_lines(&b4)[1], "this model's basis has no three-atom terms: it does not learn the angle");
+        assert!(band.iter().all(|l| !l.contains("Teach")), "Phase A: the band says nothing about teaching");
+    }
+
+    /// Review Focus 1: the map changes under the view (a Forget, a refit, a reach change): the
+    /// slice is clamped into the new extent and a picked cell past the grid or no longer drawn is
+    /// dropped, never a panic; a cell still drawn keeps its pick and reads the new map.
+    #[test]
+    fn stale_view_state_is_clamped_after_the_map_changes() {
+        use sim::knowledge::{PairSpan, TripleBlock, TripleGrid};
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = state(&scene, &snap);
+        let map = knowledge::fixture_triples();
+        let hoh = TripleType::new(8, 1, 1);
+        let tk = map.get(hoh).unwrap();
+        st.activity.triples = Some(Arc::new(map.clone()));
+        st.knowledge_sections.triples = true;
+        st.knowledge.set_pick(Pick::Triple(hoh));
+        st.knowledge.triple.slice = Some(30);
+        st.knowledge.triple.cell = Some((25, 25, 3));
+        let out = frame_sized(&ctx, &mut st, &inp, TALL, vec![]);
+        assert!(out.actions.is_empty());
+        let (_, slices) = triples::extent(&map, tk, &triples::class_table(&map, tk)).unwrap();
+        assert!(st.knowledge.triple.slice.is_some_and(|s| slices.contains(&s)), "{:?} clamped into {slices:?}", st.knowledge.triple.slice);
+        assert_eq!(st.knowledge.triple.cell, None, "past n_r 20");
+        assert!(!probed("knowledge-triple-cell-card"));
+        // a click on a drawn cell picks it and opens its card, display only
+        let c = map.grid.index(true, 6, 6, 6);
+        let outs = click(&ctx, &mut st, &inp, &format!("knowledge-triple-cell-{c}"));
+        assert!(outs.iter().all(|o| o.actions.is_empty() && o.commands.is_empty()), "a cell pick is display only");
+        assert_eq!(st.knowledge.triple.cell, Some((6, 6, 6)));
+        let (t, _) = run(&ctx, &mut st, &inp);
+        assert!(probed("knowledge-triple-cell-card") && probed("knowledge-triple-band"));
+        assert!(t.contains(&triples::cell_card_line(&map, tk, c)), "{t}");
+        assert!(triples::band_lines(&map).iter().all(|l| t.contains(l.as_str())), "{t}");
+        assert!(!t.contains("Teach this cell"), "no Teach in Phase A");
+        // the open water's H–O–H (1.81 Bohr, 104.5°) is marked "now" inside its own cell
+        assert!(t.contains("now") && probed("knowledge-triple-now"), "{t}");
+        assert!(t.contains("angle at O (cos θ bins)") && t.contains("r₂ (O–H) 1.8–2.1 Bohr") && t.contains("r₁ (O–H) Bohr") && t.contains("102"), "{t}");
+        assert!(probed("knowledge-triple-slice") && probed("knowledge-triple-plot"));
+        assert!(probed_rect(&format!("knowledge-triple-cell-{c}")).contains(probed_rect("knowledge-triple-ring").center()), "the ring sits in (6, 6, 6)");
+        // a reach change: the map at r_cut 10 (n_r 34), H–O–H at its own (6, 6, 6)
+        let at10 = |cells: &[((usize, usize, usize), u32)], o_h: (f64, f64)| {
+            let grid = TripleGrid::new(10.0);
+            let mut counts = vec![0u32; grid.cells()];
+            for &((k1, k2, q), n) in cells {
+                counts[grid.index(true, k1, k2, q)] = n;
+            }
+            let total = cells.iter().map(|c| c.1 as u64).sum();
+            let block = TripleBlock { t: hoh, counts: counts.into(), samples: 40, triples: total, compositions: Vec::new() };
+            let spans = vec![PairSpan { z: (1, 1), lo: 2.6, hi: 3.2 }, PairSpan { z: (1, 8), lo: o_h.0, hi: o_h.1 }];
+            TripleMap::assemble(10.0, 10.0 * 5.0 / 6.0, map.basis, spans, &[block], &[])
+        };
+        let ten = at10(&[((6, 6, 6), 50)], (1.6, 2.2));
+        assert_eq!(ten.grid.n_r, 34);
+        st.activity.triples = Some(Arc::new(ten.clone()));
+        let (t, _) = run(&ctx, &mut st, &inp);
+        assert_eq!(st.knowledge.triple.cell, Some((6, 6, 6)), "still drawn: the pick is kept");
+        let tk10 = ten.get(hoh).unwrap();
+        let line = triples::cell_card_line(&ten, tk10, ten.grid.index(true, 6, 6, 6));
+        assert!(line.contains("50 arrangements") && t.contains(&line), "the new map's count: {t}");
+        let (_, slices) = triples::extent(&ten, tk10, &triples::class_table(&ten, tk10)).unwrap();
+        assert!(st.knowledge.triple.slice.is_some_and(|s| slices.contains(&s)));
+        // (6, 6, 6) emptied and out of reach (O–H taught to 1.8 Bohr only): the cell pick drops
+        let gone = at10(&[((5, 5, 6), 20)], (1.6, 1.8));
+        assert_eq!(triples::class_table(&gone, gone.get(hoh).unwrap())[gone.grid.index(true, 6, 6, 6)], sim::knowledge::CellClass::OutOfReach);
+        st.activity.triples = Some(Arc::new(gone.clone()));
+        let (t, outs) = run(&ctx, &mut st, &inp);
+        assert_eq!(st.knowledge.triple.cell, None, "no longer drawn");
+        assert_eq!(st.knowledge.pick, Pick::Triple(hoh), "the type's pick stays");
+        assert!(!probed("knowledge-triple-cell-card") && !t.contains("50 arrangements"), "{t}");
+        let tkg = gone.get(hoh).unwrap();
+        let (_, slices) = triples::extent(&gone, tkg, &triples::class_table(&gone, tkg)).unwrap();
+        assert!(st.knowledge.triple.slice.is_some_and(|s| slices.contains(&s)), "{:?} in {slices:?}", st.knowledge.triple.slice);
+        assert!(outs.iter().all(|o| o.actions.is_empty()));
+        // the cache follows the map and the type
+        let cache = st.knowledge.triple.cache.as_ref().unwrap();
+        assert_eq!((cache.map, cache.t), (Arc::as_ptr(st.activity.triples.as_ref().unwrap()) as usize, hoh));
     }
 }
 
