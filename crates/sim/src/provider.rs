@@ -1318,6 +1318,12 @@ pub trait Trainable {
     fn knowledge_map(&self) -> Option<crate::knowledge::KnowledgeMap> {
         None
     }
+    /// The three-atom coverage map (`crate::knowledge::TripleMap`, spec 2026-11-17 §6.4): the
+    /// fitted samples' triples and the pending ones apart, built from what the provider holds
+    /// without a teacher solve; `None` without a fitted model.
+    fn triple_map(&self) -> Option<crate::knowledge::TripleMap> {
+        None
+    }
     /// Asks for a display-only Kohn-Sham solve at `scene` off the stepping path; it arrives as a
     /// `SideKind::Refresh` [`SideDisplay`] through [`ForceProvider::take_side_display`]. False
     /// when the provider has no background teacher.
