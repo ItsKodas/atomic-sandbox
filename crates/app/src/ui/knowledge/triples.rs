@@ -708,6 +708,9 @@ fn row_height(rows: usize) -> f32 {
 /// The plot's left gutter (the r₁ labels) and right margin (half the last angle label).
 const GUTTER: f32 = 26.0;
 const MARGIN: f32 = 10.0;
+/// Room above the slice for the top r₁ label, drawn centred on the plot's top edge (half of it
+/// was clipped by the plot's painter without it).
+const TOP_PAD: f32 = 6.0;
 
 /// A rectangle's outline, dashed (a new cell).
 fn dashed_rect(p: &egui::Painter, r: Rect, stroke: Stroke) {
@@ -744,11 +747,11 @@ fn flat(ui: &mut Ui, view: &mut TripleView, cache: &ClassCache, input: &PanelInp
     ui.label(RichText::new(format!("r₁ ({}) Bohr", pair_name(t.centre, t.a))).size(10.0).color(theme::INK_FAINT));
     // the plot
     let rh = row_height(rows.len());
-    let size = vec2(ui.available_width(), rh * rows.len() as f32 + 14.0);
+    let size = vec2(ui.available_width(), TOP_PAD + rh * rows.len() as f32 + 14.0);
     let resp = keyed(ui, "knowledge-triple-plot", |ui| ui.allocate_exact_size(size, Sense::click()).1);
     probe("knowledge-triple-plot", &resp);
     let rect = resp.rect;
-    let plot = Rect::from_min_max(rect.min + vec2(GUTTER, 0.0), pos2(rect.right() - MARGIN, rect.top() + rh * rows.len() as f32));
+    let plot = Rect::from_min_max(rect.min + vec2(GUTTER, TOP_PAD), pos2(rect.right() - MARGIN, rect.top() + TOP_PAD + rh * rows.len() as f32));
     let cw = plot.width() / COS_BINS as f32;
     let p = ui.painter_at(rect.expand(2.0));
     p.rect_filled(plot, 0.0, Color32::from_black_alpha(64));

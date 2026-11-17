@@ -455,7 +455,10 @@ pub fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, wide: bool, a
             });
             ui.add_space(14.0);
             ui.vertical(|ui| {
-                ui.set_min_width(420.0);
+                // 420 at most what is left of the panel: two columns start at `WIDE`, short of
+                // 460 + 14 + 420, and a wider column ran past the panel's edge, clipping the card
+                // and the three-atom section (seen in the Task 11 screenshot at an 870-pt leaf)
+                ui.set_min_width(420.0f32.min(ui.available_width()));
                 detail(ui, st, map, &asks, input, acts);
                 triples::section(ui, st, input, map.r_cut);
             });
