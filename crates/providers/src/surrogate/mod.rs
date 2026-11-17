@@ -1414,6 +1414,15 @@ pub struct SurrogateKs {
     /// body-4 degree: a refit asks for the floor at each degree it weighs
     /// ([`grown_body4_degree`](Self::grown_body4_degree)), and the two must not evict each other.
     fit_floor_cache: std::sync::Mutex<BTreeMap<usize, (u64, usize)>>,
+    /// The teach offer's richer-basis words (`richer_basis_floor`), keyed by a fingerprint of all
+    /// they read — the fitted samples (count, energies, species, positions, masks, held-out codes),
+    /// the richer basis and the standing degree: the status asks every snapshot, and the count is a
+    /// descriptor pass over every fitted sample in the degree-6 basis (60–77 ms on a 1590-sample
+    /// collection, 2026-11-17). A changed input changes the key, so no mutating path clears it.
+    richer_floor_cache: std::sync::Mutex<Option<(u64, Option<String>)>>,
+    /// Tests only: the richer-basis key counts `richer_basis_floor` ran (`status_cache` tests).
+    #[cfg(test)]
+    richer_floor_counts: std::sync::atomic::AtomicUsize,
     /// Variance evaluations so far (readout; the cadence test).
     variance_checks: u64,
     /// Steps the model answered or would have answered (the audit counter).
@@ -1754,6 +1763,9 @@ impl SurrogateKs {
             consults: 0,
             last_variance: None,
             fit_floor_cache: std::sync::Mutex::new(BTreeMap::new()),
+            richer_floor_cache: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            richer_floor_counts: std::sync::atomic::AtomicUsize::new(0),
             variance_checks: 0,
             answered: 0,
             quarantine: Vec::new(),
@@ -3422,6 +3434,10 @@ impl Trainable for SurrogateKs {
 
     fn pending_refit(&self) -> bool {
         SurrogateKs::pending_refit(self)
+    }
+
+    fn audits_background(&self) -> bool {
+        self.audits_asynchronous()
     }
 
     fn forget_sample(&mut self, id: sim::SampleId) -> Result<(), String> {

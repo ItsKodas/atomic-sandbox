@@ -4925,3 +4925,16 @@ The second refit with nothing new: 192.6 → 10.6 s. What is left: `NullSpace::o
 
   (σ_F: the force std and its epistemic part, per atom.) The relative 3.4e-3 of the first report was a value of 3.7e-6 moving by 1.3e-8: the absolute differences are at most 0.4 % of a tier.
 - **Across machines.** faer picks its SIMD kernels at run time (AVX-512 here, AVX2 elsewhere), so a refit on a CPU with another instruction set differs from this one by the same ~κε spread — never in a verdict measured here, but a golden compares bit for bit only on the same ISA (the thread count never matters: `dense::SPLIT`).
+
+## Status cache (2026-11-17; branch `status-cache`; `providers` `surrogate::tests::status_cache::status_cost_on_a_collection`, `#[ignore]`d measurement; release, Ryzen 7 9800X3D, the machine fully loaded by other agents' suites throughout)
+
+Estimated H₂ ran at 1.4 fs/s instead of ~14 on the user's collection: every worker round built `SurrogateKs::status()` twice (the publish, and `cloud_jobs` for its one bool `audits_background`), and each build counted the teach offer's richer-basis environment keys (`teach_offer` → `richer_basis_floor` → `trust::key_column_counts`, every fitted sample described in the degree-6 basis) afresh. The words are now cached on a fingerprint of everything they read (the fitted prefix, each sample's held-out flag, species, positions and force mask, the richer basis, the standing degree — a changed input recounts, nothing clears it by hand), and the worker reads `Trainable::audits_background` without a status. No verdict or word changes: the cached words equal a fresh count after every append, refit, forget, restore, policy change, degree cap, purge and installed background refit (`status_cache` unit tests).
+
+A copy of the user's collection (1 621 samples, H/O/P, degree cap unset, an offer with two notes present), the status at the last step's geometry after 20 Model-only steps (the worker's case), 10 builds each:
+
+| | `status()` mean (max) | per worker round |
+|---|---|---|
+| words counted afresh (before) | 124 ms (199) | 2 builds ≈ 250 ms |
+| words from the cache (after) | **1.05 ms (1.57)** | 1 build ≈ 1 ms |
+
+At a geometry the last step did not evaluate, `readiness` judges the strict policy afresh (`first_refusal`: the variance prediction and rule 5d's novelty) — 96 ms of a 94–207 ms status; the worker's snapshot is at the evaluated geometry, so it does not pay this. The teach offer itself with the cached words: 0.47 ms (the diagnosis 0.26 ms, the cache key 0.22 ms). Not changed here: the variance step every `variance_cadence`-th consultation (`predict(…, true)` and the novelty, 20–37 ms in the diagnosis).

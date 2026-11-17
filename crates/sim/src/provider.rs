@@ -1207,6 +1207,9 @@ pub trait Trainable {
     /// A sample was kept since the last refit (`status().pending_refit`, without building the
     /// readouts).
     fn pending_refit(&self) -> bool;
+    /// The audits run on a background teacher (`status().audits_background`, without building the
+    /// readouts: the worker reads it every round, and the status's teach offer can cost ms).
+    fn audits_background(&self) -> bool;
     /// The audit cadence (answered steps per audit; 0 disables).
     fn set_audit_every(&mut self, n: usize);
     /// **Forgets** stored sample `id` (the Model tab's "Worst-fitting samples" › Forget; spec
