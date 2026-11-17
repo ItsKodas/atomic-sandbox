@@ -1344,6 +1344,27 @@ pub struct SurrogateKs {
     /// from takes new rows), like the class pass and the active set (2026-11-17: an O(Q′³)
     /// eigendecomposition per intermediate fit, 3.6 s at Q′ 2 460). Nothing reads it meanwhile.
     null_space_pending: bool,
+    /// The fit in place is a trust recovery's trial, searched from the previous fit's
+    /// hyperparameters (`fit_trial`; spec 2026-11-17, option B): it never stands as it is —
+    /// [`confirm_cold`](SurrogateKs::confirm_cold) searches it again from the data first. Saved
+    /// and restored with the fit (`FitState`).
+    trial_fit: bool,
+    /// Tests only: every fit's solve (`Accumulator::last_refit`) and its basis's degree cap, in
+    /// order (`fit_store_with`).
+    #[cfg(test)]
+    fit_log: Vec<(surrogate::RefitKind, usize)>,
+    /// Tests only: the confirmation with this index (0-based, over every `confirm_cold` call) fails
+    /// after its cold refit, and that fit then fails `recoverable_fail` as long as it is in place
+    /// (`forced_fail_gen`: a trial that passes warm and fails cold); `confirm_failed` keeps the
+    /// state around it.
+    #[cfg(test)]
+    confirm_fail: Option<usize>,
+    #[cfg(test)]
+    confirm_calls: usize,
+    #[cfg(test)]
+    forced_fail_gen: Option<u64>,
+    #[cfg(test)]
+    confirm_failed: Option<ConfirmFailed>,
     /// The extrapolation grade's MaxVol active sets (rule 5e, `surrogate::grade`).
     active_set: Option<ActiveSet>,
     training_residuals: Option<TrainingResiduals>,
@@ -1747,6 +1768,17 @@ impl SurrogateKs {
             envelope: None,
             null_space: None,
             null_space_pending: false,
+            trial_fit: false,
+            #[cfg(test)]
+            fit_log: Vec::new(),
+            #[cfg(test)]
+            confirm_fail: None,
+            #[cfg(test)]
+            confirm_calls: 0,
+            #[cfg(test)]
+            forced_fail_gen: None,
+            #[cfg(test)]
+            confirm_failed: None,
             active_set: None,
             training_residuals: None,
             misfit: None,
