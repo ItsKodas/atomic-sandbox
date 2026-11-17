@@ -418,7 +418,7 @@ He 1398 s, the H₂ force 658 s, V3 395 s (V3 was FD already).
 
 ## Dynamics (M4 Task 7, `tests/dynamics.rs`, 2026-10-13, release, RX 7900 XTX)
 
-Run with `cargo test -p validate --release --test dynamics` (~6 min, four tests
+Run with `cargo test -p validate --release --test dynamics` (~6 min before V5, ~33 min with V5's two tests (plan 2026-11-13 Task 11; "V5" under "Fermi–Dirac migration"); four tests
 concurrent with their GPU evaluations serialised; skips without a GPU adapter; `--nocapture`
 prints every number; each test appends its row to the gitignored `last-run-dynamics.md`). Wall
 times are reported, never asserted (ruling R3).
@@ -5561,7 +5561,7 @@ pre-existing box term of the discrete force (`qm::forces` module doc, "Expected 
 Hartree map's asymmetry makes the KS fixed point first-order non-stationary for E_h, ≲ 1e-5 Ha/Bohr), not Fermi–Dirac.
 The pre-registered bound has no term for it, so no case on this solver can meet it at L = 0.2: even the 15 Bohr box
 gives L·b ≈ 3e-9, 13× the bound. V3 bounds the same quantity at |b| ≤ 1e-4 Ha/Bohr (the "M7 forces" Richardson bound).
-**Spec decision needed** (options, not applied): add 3·L·b_max with b_max = V3's 1e-4 (bound ≈ 6e-5; 5 × bound = 3e-4
+**Spec decision needed** (options, not applied; **superseded by "V5 fix round 1" below**): add 3·L·b_max with b_max = V3's 1e-4 (bound ≈ 6e-5; 5 × bound = 3e-4
 still ≪ |Δ(TS)| = 5.6e-3), or measure b in the test (a V3-style Richardson pair at both ends) and add its 3σ, or move
 the oracle to a box where b is negligible against the noise term (needs ≳ 20 Bohr; not measured).
 
@@ -5581,11 +5581,13 @@ the oracle to a box where b is negligible against the noise term (needs ≳ 20 B
 | cost | 1.70 s per step solo (8–51 SCF steps, mean 13.5; 599 extrapolated; no cold retry); 1023 s MD wall, 1061 s GPU |
 | **shadow Hamiltonian H̃** (diagnostic, Verlet swing removed to O(dt⁴), below) | drift −3.0e-6 Ha/ps, **detrended peak to peak 4.90e-5 Ha** |
 
-*Diagnosis, part 1: the Verlet swing is larger than h_b²/4·E_mode.* The bend and the symmetric stretch exchange energy
-(2ω_b ≈ ω_s: CO₂'s ν₁ ≈ 2ν₂ Fermi resonance): the stretch reaches ±0.19 Bohr, ≈ 40 mHa, and its h_s = 0.062 swings
-6.6× more per unit energy than the bend. The test now prints velocity Verlet's shadow Hamiltonian
+*Diagnosis, part 1: the Verlet swing is larger than h_b²/4·E_mode.* The bend feeds the symmetric stretch (the bent
+geometry's longer bond and the anharmonic coupling; not a resonance: ω_s/2ω_b = 1.29, solver-half review M6): the
+stretch reaches ±0.19 Bohr, E_s = ½k_R(0.192)² ≈ 39 mHa, and its h_s = 0.062 swings 6.6× more per unit energy than the
+bend. The test now prints velocity Verlet's shadow Hamiltonian
 H̃ = H + dt²[(1/12)vᵀV″v − (1/24)Σ|F_I|²/m_I] (vᵀV″v = −v·Ḟ by central differences of the recorded forces), which
-the integrator conserves to O(dt⁴) for an exactly conservative force: it removes the fast swing (e.g. steps 121/141:
+the integrator conserves to O(dt⁴) for an exactly conservative force (its offset from H is constant only to O(h⁴),
+≈ h_s⁴·E_mode = 1.5e-6 here; solver-half review M7): it removes the fast swing (e.g. steps 121/141:
 F + K −67/−20 µHa, H̃ −40/−39 µHa), and what is left is 4.90e-5.
 
 *Diagnosis, part 2: what H̃ still does is a GPU force/energy inconsistency along the bend.* H̃ sits near 0 at the turning
@@ -5602,13 +5604,15 @@ have similar geometries and differ by 33 µHa). Work integrals of the `GpuKs` fo
 | CO₂⁺ symmetric stretch R 2.05 → 2.45, β = 50°, warm | −2.4926e-2 | −3.2e-6 (noise level) |
 | CO₂⁺ symmetric stretch R 2.05 → 2.45, linear, warm | +5.476e-4 | −1.35e-5 |
 
-So the GPU pseudopotential forces are −dF/dβ to ≈ 3e-5 Ha over the 70° bend (2–3e-4 of ΔF; ≈ 1e-5 Ha/Bohr per O, inside
+So the GPU forces are −dF/dβ to ≈ 3e-5 Ha over the 70° bend (2–3e-4 of ΔF; ≈ 1e-5 Ha/Bohr per O, inside
 the "M7 forces" 1e-4 Ha/Bohr consistency bound and at the size of the measured σ_F = 1.3e-5), the same on gapped neutral
-CO₂ and on CO₂⁺: **a pre-existing property of the GPU pseudo force path, not of Fermi–Dirac.** The NVE run converts it
+CO₂ and on CO₂⁺: **a pre-existing property of the discrete pseudo force path on this 14 Bohr grid (GPU; CPU and box
+dependence not measured at the time), not of Fermi–Dirac** (wording per solver-half review I1; the attribution
+measurements are in "fix round 1" below). The NVE run converts it
 into F + K: H̃'s 4.9e-5 wave is the same size. The pre-registered formula has σ_path (a per-solve energy scatter,
 2.2e-6) but no term for a force bias integrated along the path, and its Verlet term misses the stretch. What the run does
 show: F + K does not drift (4.5e-6 Ha/ps), and it is conserved 88× better than E + K through a 6.4 mHa TS swing.
-**Spec decision needed** (options, not applied): a fluctuation bound that adds the path work bias (3 × the measured
+**Spec decision needed** (options, not applied; **superseded by "V5 fix round 1" below**): a fluctuation bound that adds the path work bias (3 × the measured
 \|ΔF + W\| along the bend, ≈ 9e-5) and the stiffest fed mode's swing (h_s²/4·E_mode = 9.5e-5, A1's own worst case) —
 3 × (9.5e-5 + 4.4e-6) + 9e-5 ≈ 3.9e-4 —; or an assertion on H̃ against the work-bias term alone; or a CPU f64 NVE (not
 costed). Not measured: the CPU f64 work integral along the bend (whether f32 or the pseudo force expressions carry the
@@ -5617,8 +5621,9 @@ costed). Not measured: the CPU f64 work integral along the bend (whether f32 or 
 ### V0's two accepted convergence misses on the CPU f64 path (plan 2026-11-13 Task 11 Step 4; 2026-11-17)
 
 V0 (the 2026-11-14 section of the V0 note) accepted two convergence misses against its ≤ 60-iteration rule on the GPU
-prototype: pseudo-S at M = 1 on Accurate (61 at the node) and all-electron O at M = 5 (not converged in 100 at 2 of 4
-sites on Balanced, 3 of 4 on Accurate, best Δρ ≈ 1.7e-5), and left the CPU f64 cross-check undone. Here both run cold
+prototype: pseudo-S at M = 1 on Accurate (61 at the node) and all-electron O at M = 5 (over 60 at 2 of 4 sites on
+Balanced and 3 of 4 on Accurate; not converged in 100 at 3 of the 8: Balanced centre and generic, Accurate node; best
+Δρ ≈ 1.7e-5; solver-half review M2), and left the CPU f64 cross-check undone. Here both run cold
 through `providers::ks::problem` exactly as the providers build them (FD at kT = 5 mHa, tol 1e-5, cap 100, V0's 14 Bohr
 box with odd n and V0's sites), on `qm::scf_observed` (CPU f64, one thread per case) and on today's `qm_gpu::GpuSolver`
 (post-Task 10: one FD path, the 1e-5 partial-level stop). Scratch harness, not committed; release, Ryzen 7 9800X3D /
@@ -5638,12 +5643,132 @@ RX 7900 XTX. F is `energy.total`; for a solve that did not converge, the last st
   iterations, and today's GPU in 10–12 at every site (the prototype's 61 at the node and its 30-step plateau are gone
   with the production path). CPU and GPU F agree to 3.2e-7 Ha at the node.
 - **All-electron O at M = 5 at the Balanced generic site fails on the CPU f64 path as well** (best Δρ 1.07e-5 against
-  the GPU's 1.03e-5; F steady to 1e-8 while Δρ oscillates by 4×): it is not f32 noise but a slow mode of that state's
-  SCF (the diffuse, triply degenerate ↑ level at f ≈ ⅓, which the generic site splits). Elsewhere the CPU converges where
+  the GPU's 1.03e-5; F steady to 1e-8 while Δρ oscillates by 4×): it is not f32 noise but a slow mode of the SCF map and mixer on this
+  state (solver-half review M1: its TS, 19.14 / 20.75 mHa, is ≈ 2× the three-level closed form 3kT·s(⅓) = 9.55 mHa, so
+  the partly filled ↑ set is a diffuse level manifold at ≈ −0.02 Ha among the box states, not one triply degenerate level). Elsewhere the CPU converges where
   the prototype did not (Balanced centre: 17 against ✗, today's GPU 50; Accurate node: 11 against ✗, today's GPU 12) and CPU and GPU F agree to 5.3e-7 Ha (Balanced centre) and 1.5e-6 Ha (Accurate node). Today's GPU
   converges at 7 of 8 all-electron O M = 5 sites, but 5 of them need 45–85 iterations, so the V0 ≤ 60 rule is still
-  missed at the Balanced generic (✗), Balanced face (85) and Accurate generic (64) sites. As in V0, the state is never a scan winner (it lies
+  missed at the Balanced generic (✗), Balanced face (85) and Accurate generic (64) sites. Where the CPU f64 converges in
+  11–17 the GPU's extra iterations are its f32 floor straddling the 1e-5 stop (V0 "D. The noise floor": this state's floor
+  median is 3.3–6.5e-6 with single steps to 1.5e-5, so the stop is met by a downward fluctuation, not a contraction;
+  solver-half review M3). As in V0, the state is never a scan winner (it lies
   ≈ 0.67 Ha above M = 1) and the scan leaves a failed multiplicity out.
+
+
+### V5 fix round 1 (2026-11-17; the V5 bound review `task-11-v5-bound-review.md` and its revision, the solver-half review)
+
+Both V5 bounds were re-derived from error sources documented before Task 11 that the pre-registered formulas left out.
+Each new term below says where it comes from (rule 7).
+
+**Work integral: the box term L·B_box.** The precondition (the review): b = HF − (−dF/dx) at the path's end must fall
+with the box if it is the box term of `qm::forces` (iii). `v5_work_integral_box_offset_probe` (CPU f64, tol = eig_tol =
+1e-9, h = 0.30, three warm solves 0.005 apart, Simpson):
+
+| box | x = 0 | x = 0.2 | face density at x = 0.2 |
+|---|---|---|---|
+| 41³ (12 Bohr, the test's) | +2.15e-7 | +6.66e-7 | 1.97e-5 |
+| 51³ (15 Bohr) | +1.3e-8 | +1.38e-7 | 2.37e-6 |
+| 61³ (18 Bohr) | not run | +2.59e-8 | 3.1e-7 |
+
+It falls 26× from 12 to 18 Bohr at x = 0.2 (16× from 12 to 15 at x = 0) and tracks the face density: the box term, not
+a Fermi–Dirac or force-expression error. B_box: the review's 1e-5 is (iii)'s estimated ceiling ("≲ 1e-5"), but the CO₂
+bend below measured the same box term at ≈ 1.6e-5 Ha/Bohr per O (14 Bohr box), at that ceiling; by the revision's rule
+B_box is therefore V3's bound on |HF − R_F|, **1e-4 Ha/Bohr** (the "M7 forces" Richardson bound), coefficient 1. σ_F and
+σ_E are now the larger warm − cold difference of the two ends (the start's, 2.56e-10 Ha/Bohr and 1.15e-11 Ha).
+bound = 8.7e-13 + 3·(0.2 × 2.56e-10 + √2 × 1.15e-11) + 0.2 × 1e-4 = **2.00e-5 Ha**: ΔF + W₄₀ = +7.97e-8 is 250× inside,
+and |ΔE + W₄₀| = 5.589e-3 is 56× above 5·bound. (With the review's 1e-5: 2.0e-6, 25× and 559×.)
+
+**The gate** (`cargo test -p validate --release --test dynamics -- --nocapture`, 2026-11-17 16:08–16:40, RX 7900 XTX /
+Ryzen 7 9800X3D, other agents' CPU jobs running): **6 passed, 0 failed, 5 ignored (the H₂O limitation and four `v5_*`
+measurements), 1948 s.** `work_integral_matches_free_energy_change`: ΔF + W₄₀ = +7.967e-8 ≤ 2.000e-5, ΔE + W₄₀ =
+−5.589e-3 ≥ 1.0e-4. `fd_nve_conserves_f_plus_k_through_the_ts_swing`: the numbers of the table below, bit for bit (GPU
+1303 s, wall 1610 s in-suite). The four existing tests as before: rewind 6.4e-7 Bohr, ω ratio −6.24e-4, H₂ NVE drift
+−6.1e-7 Ha/ps and fluctuation 1.66e-6, thermostat 335.1 K (+11.7 %).
+
+**NVE: the bounds split into F + K and the shadow Hamiltonian H̃, and 730 steps.**
+
+*Verlet swing (solver-half review M6: no resonance, ω_s/2ω_b = 1.29).* The test computes it from its own run:
+E_s = ½k_R((R_max − R_min)/2)² with k_R = 2.11 Ha/Bohr² (A1), the bend holding the rest of E_mode, swing =
+h_b²/4·(E_mode − E_s) + h_s²/4·E_s, capped at h_s²/4·E_mode = 9.52e-5 (h_s = ω_s·dt = 6.01e-3 × 10.335 = 0.0621, A1).
+This run: R ∈ [2.0629, 2.4465], E_s = 3.88e-2 Ha, swing = 8.7e-6 + 3.74e-5 = **4.62e-5 Ha**.
+
+*The work bias B_W.* `v5_co2_gpu_work_integrals` (committed `#[ignore]`d measurement, 71³ × 0.20, 41 points, Simpson;
+it reproduces the scratch numbers of Step 3 exactly):
+
+| path | ΔF (Ha) | ΔF + W (Ha) | \|W − W₂\|/15 |
+|---|---|---|---|
+| CO₂⁺ bend 0 → 70°, R 2.226, warm | +9.874839e-2 | **+3.998e-5** | 9.1e-8 |
+| the same, cold at every point | +9.874634e-2 | +2.952e-5 | 1.2e-7 |
+| the same reversed, 70 → 0°, warm | −9.874269e-2 | −3.107e-5 | 3.3e-8 |
+| neutral CO₂ bend 0 → 70°, cold | +1.662612e-1 | +3.086e-5 | 6.2e-7 |
+| CO₂⁺ stretch R 2.05 → 2.45, β = 50°, warm | −2.492635e-2 | −3.22e-6 | 1.1e-8 |
+| CO₂⁺ stretch R 2.05 → 2.45, linear, warm | +5.475671e-4 | **−1.354e-5** | 2.4e-8 |
+
+*Attribution (the revision's CPU discriminator; `v5_co2_bend_force_consistency_cpu`, CPU f64, neutral CO₂ at β = 35°,
+R = 2.226, `Accepted`, tol = eig_tol = 1e-9; the HF Q_β = Σ_I F_I·∂R_I/∂β of a cold solve against the Richardson
+−dF/dβ of solves at β ± 0.5°, ± 1°):*
+
+| grid | box | face density | HF Q_β (Ha/rad) | Richardson −dF/dβ | **HF − Richardson** | wall |
+|---|---|---|---|---|---|---|
+| 71³ × 0.20 (the NVE's) | 14 Bohr | 2.31e-6 | −0.1133735917 | −0.1134090324 | **+3.54e-5** | 85 min (centre 22 steps, displaced warm 18–26) |
+| 91³ × 0.20 (`V5_QBETA_N=91 V5_QBETA_COLD=1`) | 18 Bohr | 2.6e-8 | −0.1134006319 | −0.1134035636 | **+2.93e-6** (12× smaller) | 194 min (5 cold solves in parallel, 22–24 steps) |
+
+FD(0.5°) − FD(1°) = 1.05e-5 at both grids, so Richardson is certified far below these numbers (F scatter at tol 1e-9
+≲ 1e-11 Ha, ≲ 1e-9 Ha/rad in FD). The CPU f64 force misses −dF/dβ by the GPU's amount in the same box (the GPU bend
+work integrals give ≈ +3e-5 Ha/rad near 35°, the same sign), and the miss falls 12× when the box grows to 18 Bohr: it is
+the discrete force's box term (`qm::forces` (iii)), shared by both solvers, **not a GPU state or kernel error and not a
+pseudo force bug**. Per O it is ≈ 1.6e-5 Ha/Bohr (‖∂R/∂β‖ = 1.57 Bohr/rad), at (iii)'s estimated ceiling of 1e-5;
+`qm::forces`' doc now records the measurement. **The bias is attributed**, so B_W takes the attributed form. The GPU
+kernel/state split was not run: the CPU f64 path already carries the bias, which settles that the GPU state is not its
+source (the 91³ GPU bend work integral, the revision's next step only if the CPU had not shown it, was not needed).
+
+*The bounds* (the review's derivation; `fd_nve_conserves_f_plus_k_through_the_ts_swing` computes each term):
+- (A) F + K, detrended peak to peak ≤ 3·(swing + 2σ_path) + B_W;
+- (B) shadow H̃, detrended peak to peak ≤ 3·2σ_path + B_W + h_s⁴·E_mode (h_s⁴·E_mode = 1.47e-6, the O(h⁴) remainder H̃
+  leaves, solver-half review M7).
+- B_W attributed = 3·(3.998e-5 + 1.354e-5) = 1.61e-4 (the suite's 3× rule on the measured bend and stretch biases).
+- B_W gate-only (provisional, the revision's form while the bias is not attributed) = (1e-4 + 6e-5)·ℓ¹ + 2·E_BOUND_PSEUDO:
+  1e-4 Ha/Bohr the M7 HF-vs-Richardson consistency bound, 6e-5 `gpu_vs_cpu`'s `F_BOUND_PSEUDO`, 6e-6 its
+  `E_BOUND_PSEUDO`, ℓ¹ the trajectory's L1 diameter in configuration space max_{i,j} Σ_{I,k}|R_Ik(i) − R_Ik(j)| (a static
+  per-component bias δF changes H̃ between two geometries by at most δF·ℓ¹; the reversed bend scan's antisymmetry shows
+  the bias is static). This run: ℓ¹ = 3.676 Bohr, B_W,gate = 6.00e-4.
+
+*The run* (730 steps = 5 half-periods, two batches of 365 with a 180 s pause, the provider's warm state kept; GPU,
+2026-11-17 15:11; solo except other agents' CPU jobs). The trajectory is bit-identical to the 600-step runs over their
+common steps (the pause changes nothing).
+
+| quantity | value | bound (attributed / gate-only) |
+|---|---|---|
+| **(A) F + K detrended peak to peak** | **8.65e-5 Ha** (raw 7.97e-5) | **3.12e-4** (asserted) / 7.52e-4 |
+| **(B) H̃ detrended peak to peak** | **5.08e-5 Ha** | **1.75e-4** (asserted) / 6.15e-4 |
+| drift (F + K; H̃) | **−5.89e-5 Ha/ps**; −5.92e-5 | 2e-4 |
+| E + K detrended peak to peak (contrast) | 6.50e-3 Ha | (E + K is not conserved: 75× (A)) |
+| TS swing | 6.418e-3 | ≥ 1e-3 |
+| face density max | 1.76e-6 | ≤ 1.28e-5 |
+| periods | 2.50 (5 crossings, period 292 steps = 73.0 fs) | ≥ 2 |
+| `branch_jump` (I1) | 0 flagged of 730 judged; largest m/b 0.342 (step 138) | recorded |
+| cost | 2.83 s per step (13.6 SCF steps per solve; other agents' jobs on the CPU), MD 2066 s, test 2301 s | — |
+
+*The drift budget, re-derived for 730 steps* (the review: `DRIFT_BOUND` 2e-4 stays; T = 7545 a.u. = 0.1825 ps):
+- force-scatter random walk: √730 × 4.2e-7 Ha = 1.13e-5 Ha over 0.1825 ps = **6.2e-5 Ha/ps** (as Step 1, ≤ max speed);
+- the Verlet swing's leakage into the slope, a sinusoid of amplitude a = swing/2 = 2.3e-5 at 2ω_b (ω = 4.16e-3 with the
+  measured period; x = ωT/2 = 5π): 24a·|sin x − x cos x|/(ω²T³) = 24 × 2.3e-5 × 15.7/(1.73e-5 × 4.30e11) = 1.2e-9 Ha
+  per a.u. = **4.8e-5 Ha/ps**;
+- the work bias's wave (H̃'s, ≤ 5.1e-5 peak to peak, period ≈ the bend's, ω_b = 2.08e-3; x = 2.5π, so
+  |sin x − x cos x| = 1 — the reason for ending at a turning point): as a sinusoid **1.3e-5 Ha/ps**;
+- sum 1.2e-4 Ha/ps, 1.6× under `DRIFT_BOUND`. Measured −5.9e-5, and H̃'s slope is the same −5.9e-5, so the measured
+  slope is the bias wave's, larger than its sinusoid estimate: the wave is not a sinusoid (near 0 at alternate turning
+  points, ≈ −40 µHa between). **Rule 7:** a bounded wave of peak to peak A can put up to 1.5·A/T into a least-squares
+  slope (4.2e-4 Ha/ps for A = 5.1e-5), so on this trajectory the drift assertion's margin (3.4×) rests on the wave's
+  measured shape, not on a worst-case derivation.
+
+**Tracked (rule 7; linked to Task 8a review item 1(c), the GPU stop criterion / LOBPCG floor).** The static part of the
+bend bias is explained (the box term, above). What is not: H̃'s wave is history-dependent (steps 441 and 581 have similar
+geometries and H̃ 33 µHa apart), which a static, geometry-only bias cannot do, and the GPU's warm bend scan carries
++4.0e-5 where the cold one carries +2.95e-5. That ≈ 1e-5 Ha remainder is in the class of the GPU state error invisible to
+the f32 Δρ stop (`gpu_vs_cpu` "the GPU state", 0.9–4.3e-5 Ha/Bohr) and of the 1e-5 partial-level stop's warm − cold
+offset (Step 1: +0.4 … +2.2 µHa per solve, always positive); it is inside B_W (which uses the warm +4.0e-5) and is tracked
+with that item, not bounded separately.
 
 ## Live orbitals (Harris display; spec 2026-11-14)
 

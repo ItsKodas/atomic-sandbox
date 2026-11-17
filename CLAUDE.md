@@ -47,7 +47,7 @@ All heavy tests are release-only (`#[cfg_attr(debug_assertions, ignore)]`); run 
 |---|---|---|
 | any | `cargo test -p units -p qm -p sim -p surrogate --release`, `cargo test -p providers --release` | ~6.5 min + ~5.5 min |
 | solver (`qm`, `qm-gpu`) | `cargo test -p validate --release --test oracles` and `--test gpu_vs_cpu` | ~31 min, ~5.5 min |
-| dynamics | `cargo test -p validate --release --test dynamics` | ~6 min |
+| dynamics | `cargo test -p validate --release --test dynamics` | ~33 min (V5's CO₂⁺ NVE and CPU work integral, plan 2026-11-13 Task 11) |
 | surrogate / provider / policy | `cargo test -p validate --release --test surrogate` | ~12–17 min |
 | shared-model measurements (not gates) | `--test transfer`, `--test capping` (`#[ignore]`d; commands in `references.md`) | hours |
 | bonds / relax / isotopes | `cargo test -p validate --release --test tools` | ~3–10 min |

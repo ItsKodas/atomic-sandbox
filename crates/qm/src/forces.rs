@@ -86,7 +86,12 @@
 //! order in the Poisson residual (`scf::poisson_tol`: 1e-12 relative at tol 1e-9 ⇒ ≲ 1e-11 Ha), so ≲ 1e-8 Ha/Bohr; (iii) the
 //! first-order non-stationarity of the KS fixed point for E_h, if the discrete Hartree map
 //! ρ ↦ V_H (Dirichlet Laplacian + multipole boundary) is not exactly symmetric — of the order
-//! of the Poisson boundary error (3.5e-5 in V_H, Task 5) times ∫|∂ρ/∂R| ≈ 1, so ≲ 1e-5. The
+//! of the Poisson boundary error (3.5e-5 in V_H, Task 5) times ∫|∂ρ/∂R| ≈ 1, so ≲ 1e-5. Measured
+//! (plan 2026-11-13 Task 11 fix round 1, `validate` `references.md` "V5", fix round 1; CPU f64, tol = eig_tol =
+//! 1e-9): HF − (−dE/dx) on H₄ (all-electron, h = 0.30) 6.7e-7 / 1.4e-7 / 2.6e-8 Ha/Bohr in 12 / 15 / 18 Bohr boxes; on
+//! pseudised neutral CO₂'s bend at 35° (h = 0.20) Q_β − (−dF/dβ) = 3.5e-5 Ha/rad in a 14 Bohr box (≈ 1.6e-5 Ha/Bohr
+//! per O: at, and a little over, this estimate's ceiling) and 2.9e-6 in an 18 Bohr box — a box term, falling with the
+//! box, larger for a heavier valence density near the walls than the estimate above assumed. The
 //! test's 2e-3 Ha/Bohr bound is thus ~100× above the expected floor; the measured value and
 //! its δ-scaling are recorded in the Task 10 report and commit.
 //!

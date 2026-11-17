@@ -177,8 +177,8 @@ Here ε_{N_σ,σ} is the N_σ-th lowest level [MUST-1].
     M = 1, 3), 7–12 (Si and S at M = 3, P at every M, F and Cl at M = 4, O and all-electron O at M = 5, Si at M = 1, 5)
     and at most **15 of 16** (S at M = 5 on its h_req grid). The reach then lands at 40–82 kT, because a single added
     vector often jumps across a cluster of box states.
-  - **The margin is thin for the diffuse multiplicities** (the 4s-like ↑ level of S at M = 5 and Cl at M = 4, O's 3s
-    at M = 5). Box states scale as L³, so the same atom in a box a few per cent larger than 14 Bohr can exceed 16. A
+  - **The margin is thin for the diffuse multiplicities** (the 4s-like ↑ level of S at M = 5 and Cl at M = 4, O's 3s-like
+    level at M = 5; all-electron O at M = 5: a diffuse ↑ manifold among the box states, TS ≈ 2× the three-level closed form). Box states scale as L³, so the same atom in a box a few per cent larger than 14 Bohr can exceed 16. A
     failed multiplicity is left out of the scan (`sim::references::solve_atom`), so it cannot change the winner
     unless the winner fails, and every winner needs ≤ 10. The cap error is NOTE-6's risk, now reached by the 3p
     atoms' non-winning multiplicities as well as by anions.
@@ -531,7 +531,8 @@ residual Δρ is second order in it; the Hellmann–Feynman forces are first ord
 **What it does not fix.** For the M = 1-type states (O, C, Si, S at M = 1; N and P at M = 2; the O₂ singlet and NH at
 auto; all-electron O at M = 5) the f32 floor's median is 1e-6 to 2.8e-5, so 1e-5 is reached by a downward
 fluctuation rather than with a factor-3 margin (V0 note). They converge within 60 iterations at every site measured
-except S at M = 1 on Accurate (61, one site) and all-electron O at M = 5 (5 of 8 sites), and the spec's jitter rule
+except S at M = 1 on Accurate (61, one site) and all-electron O at M = 5 (over 60 at 5 of 8 sites, not converged in 100 at
+3 of them), and the spec's jitter rule
 (floor ≤ stop/3) fails for them; see section 9, V0.
 
 ## 6. Providers and consumers
@@ -1036,8 +1037,11 @@ Si, P, S, Cl, all-electron O (M = 1, 3, 5) and the molecules below:
 - **States, site spread, same winner: pass everywhere.** Winners B 2, C 3, N 4, O 3, F 2, Si 3, P 4, S 3, Cl 2,
   all-electron O 1, at every site on both grids, equal to the DS winners.
 - **Convergence (≤ 60 iterations): two misses.** S at M = 1 on Accurate (61 iterations at one site), and all-electron
-  O at M = 5 (2 of 4 sites on Balanced and 3 of 4 on Accurate do not converge in 100; a diffuse triply degenerate ↑
-  level at −0.02 Ha, TS 19–21 mHa, 670 mHa above the winner). Neither is a winner; the scan leaves a failed
+  O at M = 5 (over 60 iterations at 2 of 4 sites on Balanced and 3 of 4 on Accurate, 5 of 8; of them not converged in 100
+  at 3: Balanced centre and generic, Accurate node; a diffuse ↑ level manifold at ≈ −0.02 Ha among the box states,
+  TS 19–21 mHa ≈ 2× the three-level closed form 3kT·s(⅓) = 9.5 mHa, 670 mHa above the winner; plan Task 11's CPU f64
+  cross-check: the Balanced generic site does not converge in f64 either, a slow mode of the SCF map and mixer on this
+  state, not f32 noise; references.md "V0's two accepted convergence misses on the CPU f64 path"). Neither is a winner; the scan leaves a failed
   multiplicity out.
 - **Jitter (floor ≤ stop/3 = 3.3e-6): fails for the M = 1-type states** (O, C, S at M = 1 on both grids, Si at M = 1
   on Accurate, N and P at M = 2, all-electron O at M = 5, one Si M = 3 site, the O₂ singlet and NH at auto): medians
@@ -1220,6 +1224,15 @@ The two tests that replace it:
      `nve_energy_drift_is_bounded` method), not scaled per atom.
    - Assert F + K within those bounds, and max TS − min TS ≥ 1 mHa along the run, so the trajectory really crosses the
      TS swing.
+3. **[Task 11 fix round 1, 2026-11-17] Both pre-registered bounds failed and were re-derived** from error sources
+   documented before Task 11 (the V5 bound review and its revision; `references.md` "V5 fix round 1"):
+   - work integral: + L·B_box, the discrete force's box term (`qm::forces` (iii); it falls 26× from a 12 to an 18 Bohr
+     box), B_box = V3's 1e-4 Ha/Bohr because the CO₂ bend measured that term at ≈ 1.6e-5 Ha/Bohr, at (iii)'s ceiling;
+     σ_F, σ_E from the larger of the two ends;
+   - NVE: 730 steps (2.5 bend periods, two batches); (A) F + K ≤ 3·(swing + 2σ_path) + B_W and (B) the shadow Hamiltonian
+     H̃ ≤ 3·2σ_path + B_W + h_s⁴·E_mode, swing = h_b²/4·(E_mode − E_s) + h_s²/4·E_s from the run's stretch amplitude
+     (the bend feeds the stiffer stretch; no resonance), B_W = 3 × the measured GPU work bias along the bend and the
+     stretch, attributed to the same box term by the CPU f64 Q_β (14 → 18 Bohr: 12× smaller). The drift bound is kept.
 
 **Bitwise pins.** `gpu_none_policy_is_bitwise_today`, the stall-stop bitwise tests and every other pin of the old
 all-electron or DS bits are re-pinned in the same commit as the rule change. Each gets a one-line reason: "all-electron
