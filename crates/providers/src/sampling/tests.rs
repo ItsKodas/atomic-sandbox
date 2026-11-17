@@ -2646,3 +2646,669 @@ fn cancelling_a_paused_pass_ends_it() {
     // (the cached reference counts at once, then one solve)
     assert!(!p.paused && p.done >= 1, "{p:?}");
 }
+
+// ---- the collection migration's re-solve pass (plan 2026-11-13 Task 14; `migrate` module doc) ----
+
+mod migration {
+    use super::*;
+    use crate::sampling::migrate::{classify, migrated_code, MigrationClass, MIGRATION_EPS_E, MIGRATION_EPS_F};
+    use crate::surrogate::{predecessor_of, PASS_STARTED_WITH_PREVIOUS_SOLVER, PURGE_WAIT_MIGRATION};
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use surrogate::collection::CollectionReference;
+    use surrogate::quarantine::{Q_FORGOTTEN, Q_FORGOTTEN_UNFENCED, Q_HELD, Q_NONE, Q_RESOLVED, Q_SUPERSEDED};
+    use surrogate::{Collection, CollectionSample, MigrationLog, MigrationState, Sample, SurfaceKey};
+
+    /// The grid of every sample here (points per side; h = 0.25 from [`cell`]).
+    const N: usize = 41;
+    const TEACHER: &str = "pair morse (re-solve)";
+
+    /// What the re-solving teacher does differently at a geometry, keyed by the distance of atoms 0 and 1 (Bohr).
+    #[derive(Clone, Default)]
+    struct Tweaks {
+        /// F = E − TS with the internal energy E unchanged (an equal-share ensemble's entropy).
+        ts: Vec<(f64, f64)>,
+        /// E and F both shifted (another state).
+        shift: Vec<(f64, f64)>,
+        /// One force component moved: (r, atom, Δ on x).
+        kick: Vec<(f64, usize, f64)>,
+        /// The SCF stalls.
+        stall: Vec<f64>,
+        /// A solver warning.
+        warn: Vec<(f64, &'static str)>,
+        /// The face density reported (else 1e-7).
+        face: Vec<(f64, f64)>,
+        /// The multiplicity reported (else the electron count's parity: 1 or 2).
+        mult: Vec<(f64, u32)>,
+        /// Added to every isolated atom's energy (the old references differ from the new ones).
+        atom_shift: f64,
+    }
+
+    /// A pair-Morse teacher with the Fermi–Dirac breakdown (`EvalStats::energy`: internal E, TS, F) and scripted
+    /// differences from the old labels ([`Tweaks`]); every answer reports a face density and a multiplicity, as the
+    /// Kohn-Sham teachers do.
+    struct Resolver {
+        morse: PairMorse,
+        tw: Tweaks,
+        solves: Arc<AtomicUsize>,
+    }
+
+    fn at<T: Copy>(v: &[(f64, T)], r: f64) -> Option<T> {
+        v.iter().find(|(x, _)| (x - r).abs() < 1e-9).map(|&(_, t)| t)
+    }
+
+    impl ForceProvider for Resolver {
+        fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+            if should_abort() {
+                return Err(ProviderError::Cancelled);
+            }
+            self.solves.fetch_add(1, Ordering::SeqCst);
+            let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+            let mut stats = EvalStats::default();
+            stats.face_density = Some(1e-7);
+            if pos.len() == 1 {
+                let e = self.morse.e_atom + self.tw.atom_shift;
+                stats.multiplicity = scene.multiplicity;
+                stats.energy.internal = e;
+                stats.energy.total = e;
+                return Ok(ForceResult { energy: e, forces: vec![[0.0; 3]], stats, display: None, orbitals: None });
+            }
+            let (e, mut forces) = self.morse.energy_forces(&pos);
+            let d: [f64; 3] = std::array::from_fn(|a| pos[1][a] - pos[0][a]);
+            let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            if self.tw.stall.iter().any(|x| (x - r).abs() < 1e-9) {
+                return Err(ProviderError::Solver(sim::SolverError::ScfStalled { iterations: 63, best_delta_rho: 0.2, tol: 1e-6, window: 50, level: 5e-3 }));
+            }
+            let internal = e + at(&self.tw.shift, r).unwrap_or(0.0);
+            let ts = at(&self.tw.ts, r).unwrap_or(0.0);
+            for &(x, atom, dx) in &self.tw.kick {
+                if (x - r).abs() < 1e-9 {
+                    forces[atom][0] += dx;
+                }
+            }
+            if let Some(w) = at(&self.tw.warn, r) {
+                stats.warnings.push(w.to_string());
+            }
+            if let Some(f) = at(&self.tw.face, r) {
+                stats.face_density = Some(f);
+            }
+            let electrons: u32 = scene.nuclei.iter().map(|n| n.z as u32).sum();
+            stats.multiplicity = Some(at(&self.tw.mult, r).unwrap_or(if electrons % 2 == 0 { 1 } else { 2 }));
+            stats.energy.internal = internal;
+            stats.energy.ts = ts;
+            stats.energy.total = internal - ts;
+            Ok(ForceResult { energy: internal - ts, forces, stats, display: None, orbitals: None })
+        }
+
+        fn name(&self) -> &'static str {
+            TEACHER
+        }
+
+        fn reset(&mut self) {}
+    }
+
+    /// A surrogate over a [`Resolver`] with `tw` (tol 1e-6), and its solve counter.
+    fn student(tw: Tweaks) -> (SurrogateKs, Arc<AtomicUsize>) {
+        let solves = Arc::new(AtomicUsize::new(0));
+        let teacher = Resolver { morse: PairMorse::h2(), tw, solves: solves.clone() };
+        (SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6), solves)
+    }
+
+    /// H₂ at `r` on the x axis, centred, in the N³ cell (all-electron: the new key's tag is `all_electron_tag`, the
+    /// predecessor's `"none"`).
+    fn h2_at(r: f64) -> Scene {
+        pair(1, 1, r, cell(N))
+    }
+
+    /// The new surface's key (the attached collection's).
+    fn new_key() -> SurfaceKey {
+        student(Tweaks::default()).0.provenance_for(&h2_at(1.4)).surface_key()
+    }
+
+    /// The previous solver's key of the same surface.
+    fn old_key() -> SurfaceKey {
+        SurfaceKey { ionic: "none".into(), ..new_key() }
+    }
+
+    /// The old label of H₂ at `r`: the Morse energy and forces (what the re-solving teacher gives without a tweak, bit
+    /// for bit), multiplicity 1 recorded.
+    fn old_sample(r: f64) -> CollectionSample {
+        let pos: Vec<[f64; 3]> = h2_at(r).nuclei.iter().map(|n| n.pos).collect();
+        let (e, f) = PairMorse::h2().energy_forces(&pos);
+        CollectionSample { sample: Sample::new(pos, vec![1, 1], e, f, SampleTag::Perturbation, 1.0), grid_n: N, multiplicity_forced: false, multiplicity: Some(1), scene: "H2".into() }
+    }
+
+    /// A folder tree of its own, removed when dropped.
+    struct Root(PathBuf);
+    impl std::ops::Deref for Root {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn root(name: &str) -> Root {
+        let dir = std::env::temp_dir().join(format!("as-migrate-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Root(dir)
+    }
+
+    /// The predecessor folder under `root`: `samples` with their status codes, the references (Z, n, E) — its writer
+    /// closed (no live lock). Its path.
+    fn old_folder(root: &Path, samples: &[(CollectionSample, u8)], refs: &[(u8, usize, f64)]) -> PathBuf {
+        let (mut c, _) = Collection::open(root, &old_key()).unwrap();
+        for (k, (cs, code)) in samples.iter().enumerate() {
+            c.append(cs.clone()).unwrap();
+            if *code != Q_NONE {
+                c.set_status(k, *code).unwrap();
+            }
+        }
+        for &(z, n, e) in refs {
+            c.set_reference(z, CollectionReference { energy: e, grid_n: Some(n), face_density: Some(1e-7) }).unwrap();
+        }
+        c.folder().to_path_buf()
+    }
+
+    /// Every file of `dir` (not recursive), by name.
+    fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.path().is_file()).map(|e| (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).unwrap())).collect()
+    }
+
+    /// Steps the running pass to its end; the steps taken.
+    fn run(s: &mut SurrogateKs) -> usize {
+        let mut steps = 0;
+        loop {
+            match Trainable::pass_step(s, &mut never()) {
+                Ok(Some(_)) => steps += 1,
+                Ok(None) => return steps,
+                Err(e) => panic!("pass step {steps}: {e}"),
+            }
+            assert!(steps < 1000, "the pass ends");
+        }
+    }
+
+    /// The new folder's `migration.txt`.
+    fn log_of(s: &SurrogateKs) -> MigrationLog {
+        surrogate::read_migration(s.collection().unwrap().folder()).unwrap().expect("a migration.txt")
+    }
+
+    /// Spec §7.4's thresholds (F14: ε_F compared within 1e-18, it is 3 × `PSEUDO_FORCE_NOISE`).
+    #[test]
+    fn classify_thresholds() {
+        let f = vec![[0.012, -0.021, 0.003], [-0.012, 0.021, -0.003]];
+        let e = -1.17;
+        assert_eq!(classify(e, &f, e + 0.99e-5, e + 0.99e-5, &f), MigrationClass::Unchanged, "ΔE = 0.99e-5, forces within");
+        assert_eq!(classify(e, &f, e - 0.99e-5, e, &f), MigrationClass::Unchanged, "|F − E_old| ≤ ε_E either sign");
+        let two_kt_ln2 = 2.0 * qm::ELECTRON_KT * 2f64.ln();
+        assert_eq!(classify(e, &f, e - two_kt_ln2, e, &f), MigrationClass::EntropyOnly, "F moved by −2 kT ln 2, internal equal");
+        assert_eq!(classify(e, &f, e - two_kt_ln2, e + 0.99e-5, &f), MigrationClass::EntropyOnly, "internal within ε_E");
+        assert_eq!(classify(e, &f, e + 2e-5, e + 2e-5, &f), MigrationClass::StateChanged, "internal moved by 2e-5");
+        assert_eq!(classify(e, &f, e - two_kt_ln2, e + 2e-5, &f), MigrationClass::StateChanged, "−TS and the internal energy moved");
+        let mut g = f.clone();
+        g[1][2] += 1.6e-4;
+        assert_eq!(classify(e, &f, e, e, &g), MigrationClass::StateChanged, "one force component off by 1.6e-4");
+        assert_eq!(classify(e, &f, e - two_kt_ln2, e, &g), MigrationClass::StateChanged, "−TS with a force off is not T");
+        g[1][2] = f[1][2] + 1.4e-4;
+        assert_eq!(classify(e, &f, e, e, &g), MigrationClass::Unchanged, "1.4e-4 is within ε_F");
+        assert_eq!(classify(e, &f, f64::NAN, f64::NAN, &f), MigrationClass::StateChanged, "a non-finite label is never carried");
+        assert_eq!(classify(e, &f, e, e, &f[..1]), MigrationClass::StateChanged, "another atom count");
+        assert!((MIGRATION_EPS_F - 1.5e-4).abs() <= 1e-18, "ε_F = {MIGRATION_EPS_F:e}");
+        assert_eq!(MIGRATION_EPS_E, 1e-5);
+    }
+
+    /// Spec §7.5 with F2: U and T keep the code; S goes to 9 except a forgotten sample (7 → 7, 8 → 7) and a superseded
+    /// one (2 → 2); a held one (1) goes to review.
+    #[test]
+    fn migrated_code_table() {
+        use MigrationClass::*;
+        for (old, class, new) in [
+            (Q_NONE, StateChanged, Q_RESOLVED),
+            (Q_HELD, StateChanged, Q_RESOLVED),
+            (Q_SUPERSEDED, StateChanged, Q_SUPERSEDED),
+            (Q_FORGOTTEN, StateChanged, Q_FORGOTTEN),
+            (Q_FORGOTTEN_UNFENCED, StateChanged, Q_FORGOTTEN),
+            (Q_FORGOTTEN_UNFENCED, Unchanged, Q_FORGOTTEN_UNFENCED),
+            (Q_FORGOTTEN_UNFENCED, EntropyOnly, Q_FORGOTTEN_UNFENCED),
+            (Q_HELD, Unchanged, Q_HELD),
+            (Q_HELD, EntropyOnly, Q_HELD),
+            (Q_NONE, EntropyOnly, Q_NONE),
+            (Q_NONE, Unchanged, Q_NONE),
+        ] {
+            assert_eq!(migrated_code(old, class), new, "({old}, {class:?})");
+        }
+        assert_eq!((Q_RESOLVED, Q_FORGOTTEN, Q_FORGOTTEN_UNFENCED, Q_SUPERSEDED, Q_HELD), (9, 7, 8, 2, 1));
+    }
+
+    /// Spec §7.2: the predecessor is the folder of the same key under the legacy tag, matched exactly against its
+    /// `key.txt`; any other field — or a tag this build does not write — finds none.
+    #[test]
+    fn predecessor_by_exact_key() {
+        let root = root("pred");
+        let key = new_key();
+        assert_eq!(key.ionic, crate::pseudo::all_electron_tag());
+        assert_eq!(predecessor_of(&root, &key), None, "no folder yet");
+        let old = old_key();
+        let (c, _) = Collection::open(&root, &old).unwrap();
+        let dir = c.folder().to_path_buf();
+        drop(c);
+        assert_eq!(predecessor_of(&root, &key), Some(dir.clone()), "key.txt matches with the legacy tag");
+        for other in [
+            SurfaceKey { h: 0.2, ..old.clone() },
+            SurfaceKey { sigma: 0.3, ..old.clone() },
+            SurfaceKey { tol: 1e-5, ..old.clone() },
+            SurfaceKey { teacher: "another teacher".into(), ..old.clone() },
+            SurfaceKey { functional: "pbe".into(), ..old.clone() },
+            SurfaceKey { ionic: "none/fd1e-3".into(), ..old.clone() },
+        ] {
+            std::fs::write(dir.join("key.txt"), other.to_text()).unwrap();
+            assert_eq!(predecessor_of(&root, &key), None, "{} at the slug's folder", other.describe());
+        }
+        std::fs::write(dir.join("key.txt"), old.to_text()).unwrap();
+        assert_eq!(predecessor_of(&root, &key), Some(dir));
+        assert_eq!(predecessor_of(&root, &SurfaceKey { h: 0.2, ..key.clone() }), None, "another h: another folder");
+        assert_eq!(predecessor_of(&root, &old), None, "the legacy key is not this build's: no predecessor");
+    }
+
+    /// The tweaks of a mixed source: 1.30 U, 1.35 T (−2 kT ln 2), 1.40 S (another state, held before), 1.45 U (forgotten).
+    fn mixed() -> (Vec<(CollectionSample, u8)>, Tweaks) {
+        let two_kt_ln2 = 2.0 * qm::ELECTRON_KT * 2f64.ln();
+        let tw = Tweaks { ts: vec![(1.35, two_kt_ln2)], shift: vec![(1.40, 2e-3)], ..Tweaks::default() };
+        (vec![(old_sample(1.30), Q_NONE), (old_sample(1.35), Q_NONE), (old_sample(1.40), Q_HELD), (old_sample(1.45), Q_FORGOTTEN_UNFENCED)], tw)
+    }
+
+    /// Spec §7.1, §7.5: the pass reads the old folder and never writes it — every file byte-identical afterwards (a stale
+    /// lock, a purge backup and the display file included); `bond_experience.txt` is copied, the history is not; the
+    /// classes and codes are the table's.
+    #[test]
+    fn old_folder_bytes_identical_after_pass() {
+        let root = root("bytes");
+        let (samples, tw) = mixed();
+        let old = old_folder(&root, &samples, &[(1, N, -0.47)]);
+        std::fs::write(old.join("bond_experience.txt"), "bond verdicts\n").unwrap();
+        std::fs::write(old.join("samples.bin.bak"), b"a purge's backup").unwrap();
+        std::fs::write(old.join("history.bin"), b"an audit history of the old teacher").unwrap();
+        std::fs::write(old.join(".lock"), "4294967290").unwrap(); // a stale lock (no such process)
+        let before = files(&old);
+        let (mut s, _) = student(tw);
+        s.attach_collection(&root, &h2_at(1.4)).unwrap();
+        let offer = s.migration().expect("offered");
+        assert_eq!((offer.state, offer.samples, offer.done, offer.counts), (sim::MigrationPhase::Offered, 4, 0, [0; 4]));
+        assert!(offer.eta_s.is_some_and(|t| t > 0.0), "{offer:?}");
+        s.start_migration().unwrap();
+        assert!(Trainable::pass_active(&s));
+        assert_eq!(s.migration().unwrap().state, sim::MigrationPhase::Running);
+        assert_eq!(run(&mut s), 5, "one reference solve and four samples");
+        assert_eq!(files(&old), before, "the old folder is byte-identical");
+        let log = log_of(&s);
+        assert_eq!((log.state, log.cursor, log.counts, log.source_slug.as_str()), (MigrationState::Complete, 4, [2, 1, 1, 0], old.file_name().unwrap().to_str().unwrap()));
+        assert_eq!(log.source_key, old_key().to_text());
+        let c = s.collection().unwrap();
+        assert_eq!(c.samples.len(), 4);
+        assert_eq!(c.quarantine, vec![Q_NONE, Q_NONE, Q_RESOLVED, Q_FORGOTTEN_UNFENCED], "U 0, T 0, S held → 9, U forgotten-unfenced keeps 8");
+        // U: the old record bit for bit; T and S: the new label with the old metadata
+        assert_eq!(c.samples[0], samples[0].0);
+        assert_eq!(c.samples[3], samples[3].0);
+        let two_kt_ln2 = 2.0 * qm::ELECTRON_KT * 2f64.ln();
+        assert_eq!(c.samples[1].sample.energy.to_bits(), (samples[1].0.sample.energy - two_kt_ln2).to_bits(), "T: F = E − TS");
+        assert_eq!(c.samples[2].sample.energy.to_bits(), (samples[2].0.sample.energy + 2e-3).to_bits(), "S: the new state's F");
+        for k in 1..3 {
+            let (a, b) = (&c.samples[k], &samples[k].0);
+            assert_eq!((&a.sample.pos, &a.sample.z, a.sample.tag, a.sample.weight, a.grid_n, a.multiplicity, &a.scene), (&b.sample.pos, &b.sample.z, b.sample.tag, b.sample.weight, b.grid_n, b.multiplicity, &b.scene));
+        }
+        let new_dir = c.folder().to_path_buf();
+        assert_eq!(std::fs::read(new_dir.join("bond_experience.txt")).unwrap(), b"bond verdicts\n", "copied");
+        assert_ne!(std::fs::read(new_dir.join("history.bin")).ok().as_deref(), Some(&b"an audit history of the old teacher"[..]), "not carried");
+        assert!(new_dir.join("README.txt").exists(), "regenerated");
+        assert_eq!(s.migration().unwrap().state, sim::MigrationPhase::Complete);
+        assert!(!Trainable::pass_active(&s));
+        // the store mirrors the collection: the U/T samples in the fit's codes, S out (code ≠ 0)
+        assert_eq!(s.samples(), 4);
+        drop(s);
+        assert_eq!(files(&old), before, "and after the provider let the new folder go");
+    }
+
+    /// Review Focus 4, spec §7.1: a live writer on the old folder (an older build appending to it) refuses the start with
+    /// the reason, nothing written; once it closes, the pass starts.
+    #[test]
+    fn refuses_while_old_folder_has_a_live_writer() {
+        let root = root("live");
+        let (samples, tw) = mixed();
+        old_folder(&root, &samples, &[]);
+        let (mut s, solves) = student(tw);
+        s.attach_collection(&root, &h2_at(1.4)).unwrap();
+        assert_eq!(s.migration().unwrap().state, sim::MigrationPhase::Offered);
+        let (writer, _) = Collection::open(&root, &old_key()).unwrap();
+        assert!(!writer.read_only, "this handle holds the old folder's lock (a live process)");
+        let e = s.start_migration().expect_err("refused while a live process holds the old folder");
+        assert!(e.contains("still being appended to"), "{e}");
+        assert!(!Trainable::pass_active(&s));
+        assert!(!s.collection().unwrap().folder().join("migration.txt").exists(), "nothing written");
+        assert_eq!(solves.load(Ordering::SeqCst), 0);
+        assert_eq!(s.migration().unwrap().state, sim::MigrationPhase::Offered, "still offered");
+        drop(writer);
+        s.start_migration().unwrap();
+        run(&mut s);
+        assert_eq!(log_of(&s).counts, [2, 1, 1, 0]);
+    }
+
+    /// Review Focus 4, spec §7.3 "Resume": a crash between a sample's append and the cursor write. The resumed pass
+    /// solves that sample again (cold: the same answer), its append is refused as a duplicate and counted as done; the
+    /// counts and the new `samples.bin` are an uninterrupted run's, byte for byte.
+    #[test]
+    fn resume_after_crash_between_append_and_cursor() {
+        let (samples, tw) = mixed();
+        let whole = root("resume-whole");
+        old_folder(&whole, &samples, &[]);
+        let (mut s, _) = student(tw.clone());
+        s.attach_collection(&whole, &h2_at(1.4)).unwrap();
+        s.start_migration().unwrap();
+        run(&mut s);
+        let want_log = log_of(&s);
+        let want_bin = std::fs::read(s.collection().unwrap().folder().join("samples.bin")).unwrap();
+        drop(s);
+
+        let crashed = root("resume-crash");
+        old_folder(&crashed, &samples, &[]);
+        let (mut s, _) = student(tw.clone());
+        s.attach_collection(&crashed, &h2_at(1.4)).unwrap();
+        s.start_migration().unwrap();
+        // the S sample: its append and its status record (code 9) are written, then the crash
+        s.migration_crash_after(2);
+        let mut steps = 0;
+        let e = loop {
+            match Trainable::pass_step(&mut s, &mut never()) {
+                Ok(Some(_)) => steps += 1,
+                Ok(None) => panic!("the crash stops the pass"),
+                Err(e) => break e,
+            }
+        };
+        assert!(e.to_string().contains("injected crash"), "{e}");
+        assert_eq!(steps, 2, "samples 0 and 1 made it");
+        let log = log_of(&s);
+        assert_eq!((log.cursor, log.counts, log.state), (2, [1, 1, 0, 0], MigrationState::Running), "the cursor before the crashed sample");
+        assert_eq!(s.collection().unwrap().samples.len(), 3, "its record is in the new file");
+        assert_eq!(s.migration().unwrap().state, sim::MigrationPhase::Paused);
+        drop(s);
+        // the next app start
+        let (mut s, solves) = student(tw);
+        s.attach_collection(&crashed, &h2_at(1.4)).unwrap();
+        let st = s.migration().unwrap();
+        assert_eq!((st.state, st.done, st.counts), (sim::MigrationPhase::Paused, 2, [1, 1, 0, 0]));
+        s.start_migration().unwrap();
+        run(&mut s);
+        assert_eq!(solves.load(Ordering::SeqCst), 2, "sample 2 solved again, then sample 3");
+        let got = log_of(&s);
+        assert_eq!((got.cursor, got.counts, got.state, &got.not_migrated), (want_log.cursor, want_log.counts, want_log.state, &want_log.not_migrated));
+        assert_eq!(std::fs::read(s.collection().unwrap().folder().join("samples.bin")).unwrap(), want_bin, "the new samples.bin is the uninterrupted run's");
+        assert_eq!(s.collection().unwrap().quarantine, vec![Q_NONE, Q_NONE, Q_RESOLVED, Q_FORGOTTEN_UNFENCED]);
+    }
+
+    /// Spec §7.3 step 2: a solve that stalls, warns, is box-affected or does not reproduce the recorded multiplicity is
+    /// not migrated — listed with its reason, never appended (its old label is never carried).
+    #[test]
+    fn failed_resolve_is_listed_not_migrated() {
+        let root = root("failed");
+        let rs = [1.30, 1.50, 1.60, 1.70, 1.80];
+        let tw = Tweaks {
+            stall: vec![1.50],
+            warn: vec![(1.60, "Poisson solve not converged")],
+            face: vec![(1.70, 1e-3)],
+            mult: vec![(1.80, 3)],
+            ..Tweaks::default()
+        };
+        let samples: Vec<(CollectionSample, u8)> = rs.iter().map(|&r| (old_sample(r), Q_NONE)).collect();
+        old_folder(&root, &samples, &[]);
+        let (mut s, _) = student(tw);
+        s.attach_collection(&root, &h2_at(1.4)).unwrap();
+        s.start_migration().unwrap();
+        run(&mut s);
+        let log = log_of(&s);
+        assert_eq!((log.counts, log.cursor, log.state), ([1, 0, 0, 4], 5, MigrationState::Complete));
+        let why: Vec<(usize, &str)> = log.not_migrated.iter().map(|(i, w)| (*i, w.as_str())).collect();
+        assert_eq!(why.iter().map(|w| w.0).collect::<Vec<_>>(), vec![1, 2, 3, 4], "{why:?}");
+        assert!(why[0].1.contains("cold solve failed") && why[0].1.contains("stalled"), "{}", why[0].1);
+        assert!(why[1].1.contains("warned: Poisson solve not converged"), "{}", why[1].1);
+        assert!(why[2].1.contains("box-affected"), "{}", why[2].1);
+        assert!(why[3].1.contains("solved at multiplicity 3, recorded 1"), "{}", why[3].1);
+        let c = s.collection().unwrap();
+        assert_eq!(c.samples.len(), 1, "only the migrated sample is appended");
+        for &r in &rs[1..] {
+            let pos: Vec<[f64; 3]> = h2_at(r).nuclei.iter().map(|n| n.pos).collect();
+            assert!(!c.holds_geometry(&[1, 1], &pos), "r = {r}: not in the new folder");
+        }
+        let st = s.migration().unwrap();
+        assert_eq!((st.counts, st.state), ([1, 0, 0, 4], sim::MigrationPhase::Complete));
+    }
+
+    /// Spec §7.4: a masked sample (a capped segment) is compared on all atoms — a force moved on its masked-out atom makes
+    /// it S — and its mask and energy-not-fitted flag are carried in every class.
+    #[test]
+    fn masked_sample_compared_on_all_atoms_and_carried() {
+        let root = root("masked");
+        let masked = |r: f64| {
+            let mut cs = old_sample(r);
+            cs.sample.force_mask = Some(vec![true, false]);
+            cs.sample.use_energy = false;
+            cs
+        };
+        let tw = Tweaks { kick: vec![(1.40, 1, 1e-3)], ..Tweaks::default() };
+        old_folder(&root, &[(masked(1.30), Q_NONE), (masked(1.40), Q_NONE)], &[]);
+        let (mut s, _) = student(tw);
+        s.attach_collection(&root, &h2_at(1.4)).unwrap();
+        s.start_migration().unwrap();
+        run(&mut s);
+        assert_eq!(log_of(&s).counts, [1, 0, 1, 0], "the masked-out atom's force decides: S");
+        let c = s.collection().unwrap();
+        assert_eq!(c.samples[0], masked(1.30), "U: carried bit for bit, mask and flag included");
+        assert_eq!(c.quarantine, vec![Q_NONE, Q_RESOLVED]);
+        let s1 = &c.samples[1].sample;
+        assert_eq!((s1.force_mask.as_deref(), s1.use_energy), (Some(&[true, false][..]), false), "S: mask and flag carried");
+        assert_eq!(s1.forces[1][0].to_bits(), (masked(1.40).sample.forces[1][0] + 1e-3).to_bits(), "the new forces");
+    }
+
+    /// Spec §7.3 "References", §7.5: every (species, box) of the old `references.txt` is re-solved by the scan and
+    /// offered; the new `references.txt` holds only re-solved values, the log the old and the new ones.
+    #[test]
+    fn references_resolved_not_carried() {
+        let root = root("refs");
+        let e_atom = PairMorse::h2().e_atom;
+        let tw = Tweaks { atom_shift: -0.003, ..Tweaks::default() };
+        old_folder(&root, &[(old_sample(1.30), Q_NONE)], &[(1, N, e_atom + 0.01), (1, 43, e_atom + 0.02)]);
+        let (mut s, solves) = student(tw);
+        s.attach_collection(&root, &h2_at(1.4)).unwrap();
+        s.start_migration().unwrap();
+        assert_eq!(run(&mut s), 3, "two reference solves (H: multiplicity 2 only), one sample");
+        assert_eq!(solves.load(Ordering::SeqCst), 3);
+        let new = e_atom - 0.003;
+        let c = s.collection().unwrap();
+        let refs: Vec<((u8, usize), f64)> = c.references.iter().map(|(&k, r)| (k, r.energy)).collect();
+        assert_eq!(refs, vec![((1, N), new), ((1, 43), new)], "only re-solved values");
+        let text = std::fs::read_to_string(c.folder().join("references.txt")).unwrap();
+        assert!(!text.contains(&format!("{:?}", e_atom + 0.01)) && !text.contains(&format!("{:?}", e_atom + 0.02)), "{text}");
+        assert_eq!(log_of(&s).references, vec![(1, N, Some(e_atom + 0.01), Some(new)), (1, 43, Some(e_atom + 0.02), Some(new))]);
+        assert_eq!(log_of(&s).counts, [1, 0, 0, 0]);
+    }
+
+    /// Spec §7.3: never re-offered once complete — a complete log reports Complete (no offer), a second start is
+    /// refused, and so is the offer of a predecessor without samples.
+    #[test]
+    fn not_offered_when_complete() {
+        let root = root("complete");
+        let (samples, tw) = mixed();
+        old_folder(&root, &samples, &[]);
+        let (mut s, _) = student(tw.clone());
+        s.attach_collection(&root, &h2_at(1.4)).unwrap();
+        s.start_migration().unwrap();
+        run(&mut s);
+        drop(s);
+        let (mut s, solves) = student(tw);
+        s.attach_collection(&root, &h2_at(1.4)).unwrap();
+        let st = s.migration().expect("the complete migration is reported");
+        assert_eq!((st.state, st.counts, st.done, st.eta_s), (sim::MigrationPhase::Complete, [2, 1, 1, 0], 4, None));
+        let e = s.start_migration().expect_err("never re-offered");
+        assert!(e.contains("already re-solved"), "{e}");
+        assert_eq!(solves.load(Ordering::SeqCst), 0);
+        // a predecessor without samples is no offer
+        let empty = self::root("complete-empty");
+        drop(Collection::open(&empty, &old_key()).unwrap());
+        let (mut s, _) = student(Tweaks::default());
+        s.attach_collection(&empty, &h2_at(1.4)).unwrap();
+        assert_eq!(s.migration(), None);
+        assert!(s.start_migration().is_err());
+    }
+
+    /// F3: the source `samples.bin` changed between a partial pass and its resume (an older build appended to it) → the
+    /// pass restarts at sample 0 and its counts — and the new `samples.bin` — are an uninterrupted run's on the changed
+    /// source (what was appended before counts as done by the duplicate rule).
+    #[test]
+    fn source_change_restarts_from_zero() {
+        let (mut samples, tw) = mixed();
+        let partial = root("source-partial");
+        old_folder(&partial, &samples, &[]);
+        let (mut s, _) = student(tw.clone());
+        s.attach_collection(&partial, &h2_at(1.4)).unwrap();
+        s.start_migration().unwrap();
+        for _ in 0..2 {
+            Trainable::pass_step(&mut s, &mut never()).unwrap().expect("a sample");
+        }
+        Trainable::cancel_pass(&mut s);
+        let log = log_of(&s);
+        assert_eq!((log.cursor, log.state), (2, MigrationState::Running));
+        assert_eq!(s.migration().unwrap().state, sim::MigrationPhase::Paused);
+        // an older build appends one more sample to the old folder
+        let (mut c, _) = Collection::open(&partial, &old_key()).unwrap();
+        c.append(old_sample(1.55)).unwrap();
+        drop(c);
+        let (len, _) = surrogate::migration::source_fingerprint(&partial.join(old_key().slug()).join("samples.bin")).unwrap();
+        assert_ne!(len, log.source_len);
+        s.start_migration().unwrap();
+        let resumed = log_of(&s);
+        assert_eq!((resumed.cursor, resumed.counts, resumed.source_len), (0, [0; 4], len), "restarted from 0 with the new fingerprint");
+        run(&mut s);
+        let got = log_of(&s);
+        let got_bin = std::fs::read(s.collection().unwrap().folder().join("samples.bin")).unwrap();
+        drop(s);
+        // an uninterrupted run on the changed source
+        samples.push((old_sample(1.55), Q_NONE));
+        let whole = root("source-whole");
+        old_folder(&whole, &samples, &[]);
+        let (mut s, _) = student(tw);
+        s.attach_collection(&whole, &h2_at(1.4)).unwrap();
+        s.start_migration().unwrap();
+        run(&mut s);
+        let want = log_of(&s);
+        assert_eq!((got.cursor, got.counts, got.state), (want.cursor, want.counts, want.state));
+        assert_eq!(got.counts, [3, 1, 1, 0]);
+        assert_eq!(got_bin, std::fs::read(s.collection().unwrap().folder().join("samples.bin")).unwrap(), "the same records");
+    }
+
+    /// F3: while the migration is running (its log at "running", paused or not), a purge of the new folder's forgotten
+    /// samples is refused with its reason and changes no byte.
+    #[test]
+    fn purge_refused_while_migration_runs() {
+        let root = root("purge");
+        let (samples, tw) = mixed();
+        old_folder(&root, &samples, &[]);
+        // the new folder already holds a forgotten sample (taught and forgotten before the migration started)
+        let (mut c, _) = Collection::open(&root, &new_key()).unwrap();
+        c.append(old_sample(1.9)).unwrap();
+        c.set_status(0, Q_FORGOTTEN).unwrap();
+        let dir = c.folder().to_path_buf();
+        drop(c);
+        let (mut s, _) = student(tw);
+        s.attach_collection(&root, &h2_at(1.4)).unwrap();
+        s.start_migration().unwrap();
+        Trainable::pass_step(&mut s, &mut never()).unwrap().expect("a sample");
+        Trainable::cancel_pass(&mut s);
+        assert_eq!(s.migration().unwrap().state, sim::MigrationPhase::Paused);
+        let before = files(&dir);
+        assert_eq!(Trainable::purge_refusal(&s).as_deref(), Some(PURGE_WAIT_MIGRATION));
+        let e = Trainable::purge_forgotten(&mut s).expect_err("refused");
+        assert_eq!(e, PURGE_WAIT_MIGRATION);
+        assert!(PURGE_WAIT_MIGRATION.starts_with("a re-solve pass is running"));
+        assert_eq!(files(&dir), before, "no byte changed");
+        // and while the pass steps
+        s.start_migration().unwrap();
+        assert_eq!(Trainable::purge_refusal(&s).as_deref(), Some(PURGE_WAIT_MIGRATION));
+        run(&mut s);
+        assert_ne!(Trainable::purge_refusal(&s).as_deref(), Some(PURGE_WAIT_MIGRATION), "complete: the purge's own rules again");
+    }
+
+    /// Spec §7.7: a `training/pass.ckpt` of a pass the previous solver started (its provenance carries the legacy tag)
+    /// is refused with the reason, and the file is left byte-identical.
+    #[test]
+    fn old_pass_checkpoint_resume_refused() {
+        let root = root("ckpt");
+        let scene = h2_at(1.4);
+        let (mut s, _) = student(Tweaks::default());
+        let plan = SamplingPlan { perturbations: 4, hot_burst_steps: 2, scan_points_per_pair: 3, seed: 3, ..SamplingPlan::default() };
+        let mut refs = AtomReferences::default();
+        Trainable::start_pass(&mut s, &scene, &plan, &mut refs).unwrap();
+        Trainable::pass_step(&mut s, &mut never()).unwrap();
+        let text = Trainable::pass_checkpoint(&s).expect("a checkpoint");
+        let tag = crate::pseudo::all_electron_tag();
+        assert!(text.contains(&format!(", ionic {tag}\n")), "{text}");
+        let legacy = text.replace(&format!(", ionic {tag}\n"), ", ionic none\n");
+        let path = root.join("training").join("pass.ckpt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &legacy).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let (mut fresh, solves) = student(Tweaks::default());
+        let read = std::fs::read_to_string(&path).unwrap();
+        let e = Trainable::resume_pass(&mut fresh, &scene, &read, &mut refs).expect_err("the previous solver's pass");
+        assert!(e.contains("started with the previous solver"), "{e}");
+        assert!(e.starts_with(PASS_STARTED_WITH_PREVIOUS_SOLVER));
+        assert!(!Trainable::pass_active(&fresh));
+        assert_eq!(solves.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "the file is left as it is");
+        // this build's own checkpoint still resumes
+        Trainable::resume_pass(&mut fresh, &scene, &text, &mut refs).unwrap();
+    }
+
+    /// The pass is the machinery's own kind (spec §7.3 "How"): `DynCommand::StartMigration` pauses the dynamics, a
+    /// zero budget makes one solve per tick, Pause holds it, Continue goes on, Cancel stops it at its cursor, and a
+    /// second start resumes there to completion.
+    #[test]
+    fn migration_is_a_pass_through_dynamics() {
+        let root = root("dynamics");
+        let (samples, tw) = mixed();
+        old_folder(&root, &samples, &[]);
+        let (mut s, solves) = student(tw);
+        s.attach_collection(&root, &h2_at(1.4)).unwrap();
+        let (p, h) = driven(s);
+        let mut d = Dynamics::new(h2_at(1.6), p, 0.25, 1);
+        let live = solves.load(Ordering::SeqCst);
+        d.apply(DynCommand::StartMigration);
+        let snap = d.snapshot();
+        assert_eq!(snap.last_rejection, None);
+        assert!(snap.paused, "the dynamics are paused");
+        d.apply(DynCommand::Play);
+        assert!(d.snapshot().last_rejection.is_some(), "Play is refused while the pass runs");
+        let snap = d.tick(0.0, &mut never());
+        assert_eq!(snap.sampling.as_ref().map(|p| (p.done, p.total, p.stage)), Some((1, 4, crate::sampling::migrate::MIGRATION_STAGE)));
+        d.apply(DynCommand::PauseSampling);
+        d.tick(0.0, &mut never());
+        assert_eq!(solves.load(Ordering::SeqCst), live + 1, "paused: nothing solved");
+        d.apply(DynCommand::ContinueSampling);
+        d.tick(0.0, &mut never());
+        assert_eq!(solves.load(Ordering::SeqCst), live + 2);
+        d.apply(DynCommand::CancelSampling);
+        {
+            let s = surrogate_of(&h);
+            let st = s.migration().unwrap();
+            assert_eq!((st.state, st.done), (sim::MigrationPhase::Paused, 2));
+        }
+        d.apply(DynCommand::StartMigration);
+        assert_eq!(d.snapshot().last_rejection, None);
+        d.tick(f64::INFINITY, &mut never());
+        let s = surrogate_of(&h);
+        let st = s.migration().unwrap();
+        assert_eq!((st.state, st.done, st.counts), (sim::MigrationPhase::Complete, 4, [2, 1, 1, 0]));
+        assert!(!Trainable::pass_active(&*s));
+    }
+}

@@ -183,6 +183,17 @@
 //! for an offer. The format and what it leaves out are the `checkpoint` module's doc. The caller
 //! keeps the surrogate's samples next to it (`SurrogateKs`'s `Trainable::resume_pass` refuses a
 //! checkpoint whose sample count or surface differs from what it holds).
+//! A checkpoint whose provenance carries the tag the previous solver wrote for the scene's surface (the last
+//! shared-shell build's, `pseudo::legacy_tag_of`) is refused with "the interrupted pass was started with the previous
+//! solver" and left as it is (Fermi–Dirac spec §7.7).
+//!
+//! # The collection migration (plan 2026-11-13 Task 14)
+//!
+//! [`Sampler::migration`] is a pass of its own kind: the re-solve of a predecessor collection's samples for the new
+//! solver ([`migrate`], its module doc: the cold solves, the U/T/S classification against ε_E and ε_F, what is appended,
+//! the references, the resume through `migration.txt`). It is stepped, paused and cancelled like any pass, so it shares
+//! the GPU with the live scene the same way; it has no checkpoint (its cursor is in `migration.txt`), no ghost, and is
+//! never rescaled.
 
 use sim::activity::{PassJob, ScfEnd, TeachEvent, TeachOrigin, TeachOutcome, TeachRule};
 use sim::sampling::{GhostAtom, GhostFinished, GhostJob, GhostOutcome, PassGhost};
@@ -198,6 +209,8 @@ use std::collections::VecDeque;
 use std::time::Instant;
 use surrogate::{Basis, Provenance, Sample, SampleTag};
 use units::isotopes::symbol;
+
+pub mod migrate;
 
 /// The hot burst's CSVR coupling time (fs).
 pub const HOT_BURST_TAU_FS: f64 = 5.0;
@@ -477,6 +490,8 @@ pub struct Sampler {
     time_limit_floor_s: f64,
     /// Sample solves given up in a row: each doubles the limit (module doc, "The time limit").
     timeouts_in_a_row: usize,
+    /// A collection migration's re-solve pass (`Sampler::migration`; the `migrate` module): every step is its step.
+    migration: Option<Box<migrate::Migrator>>,
 }
 
 /// Every nucleus at least [`CELL_MARGIN_H`]·h inside every face, finite (the providers' R12
@@ -668,6 +683,7 @@ impl Sampler {
             timed_out: None,
             time_limit_floor_s: TIME_LIMIT_FLOOR_S,
             timeouts_in_a_row: 0,
+            migration: None,
         })
     }
 
@@ -720,6 +736,7 @@ impl Sampler {
             timed_out: None,
             time_limit_floor_s: TIME_LIMIT_FLOOR_S,
             timeouts_in_a_row: 0,
+            migration: None,
         }
     }
 
@@ -752,6 +769,33 @@ impl Sampler {
         sampler.progress.target = None;
         sampler.references_only = true;
         Ok(sampler)
+    }
+
+    /// A collection migration's **re-solve pass** (the `migrate` module; Fermi–Dirac spec §7.3): a pass of its own kind —
+    /// stepped, paused, cancelled and refused like any other (`SurrogateKs`' one running pass) — whose every step is
+    /// [`migrate::Migrator::step`]. It has no scene, no checkpoint (it resumes from its `migration.txt`), no ghost and no
+    /// rescale.
+    pub fn migration(m: migrate::Migrator) -> Sampler {
+        let empty = Scene { nuclei: Vec::new(), cell: sim::Cell { n: 1, h: 1.0 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None, train_mask: None };
+        let mut sampler = Sampler::targeted(&empty, Vec::new());
+        sampler.progress = m.progress();
+        sampler.migration = Some(Box::new(m));
+        sampler
+    }
+
+    /// A collection migration's re-solve pass ([`migration`](Self::migration)).
+    pub fn is_migration(&self) -> bool {
+        self.migration.is_some()
+    }
+
+    /// The re-solve pass's state ([`migration`](Self::migration)).
+    pub fn migrator(&self) -> Option<&migrate::Migrator> {
+        self.migration.as_deref()
+    }
+
+    /// The re-solve pass's state, to change it (a test's injected crash).
+    pub fn migrator_mut(&mut self) -> Option<&mut migrate::Migrator> {
+        self.migration.as_deref_mut()
     }
 
     /// The species whose reference scan converged nothing in this pass, with how it failed (the
@@ -826,7 +870,10 @@ impl Sampler {
     }
 
     pub fn progress(&self) -> SamplingProgress {
-        self.progress.clone()
+        match &self.migration {
+            Some(m) => m.progress(),
+            None => self.progress.clone(),
+        }
     }
 
     /// The planned pair scans (as built: after a [`rescale`](Self::rescale) an evenly spaced
@@ -875,7 +922,11 @@ impl Sampler {
     /// Lines for the user (reference energies and their multiplicity, skipped pairs, failures);
     /// drained by the caller.
     pub fn take_notes(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.notes)
+        let mut notes = std::mem::take(&mut self.notes);
+        if let Some(m) = self.migration.as_mut() {
+            notes.extend(m.take_notes());
+        }
+        notes
     }
 
     /// Solves the queued jobs stand for (a reference job counts its multiplicities left).
@@ -903,7 +954,7 @@ impl Sampler {
     /// `SamplingProgress::total` follows. No-op on a finished pass.
     pub fn rescale(&mut self, plan: &SamplingPlan) {
         // a teach-around pass is its own fixed job list: never re-sized
-        if self.progress.finished || self.is_targeted() {
+        if self.progress.finished || self.is_targeted() || self.migration.is_some() {
             return;
         }
         let pairs = self.scans.len();
@@ -1020,7 +1071,7 @@ impl Sampler {
     /// evaluation, computed the way [`burst_step`](Self::burst_step) does (a half-kick and a drift
     /// from the last solved geometry; the thermostat's draws are untouched).
     pub fn ghost(&self, surrogate: &SurrogateKs) -> Option<PassGhost> {
-        if self.progress.finished {
+        if self.progress.finished || self.migration.is_some() {
             return None;
         }
         let base: Vec<[f64; 3]> = self.scene.nuclei.iter().map(|n| n.pos).collect();
@@ -1083,6 +1134,9 @@ impl Sampler {
 
     /// Ends the pass early: what was sampled stays in the surrogate.
     pub fn cancel(&mut self) {
+        if let Some(m) = self.migration.as_mut() {
+            m.cancel();
+        }
         if !self.progress.finished {
             self.progress.cancelled = true;
             self.progress.finished = true;
@@ -1134,6 +1188,9 @@ impl Sampler {
     }
 
     fn step_impl(&mut self, mut teacher: Option<&mut dyn ForceProvider>, surrogate: &mut SurrogateKs, should_abort: &mut dyn FnMut() -> bool) -> Result<Option<SamplingProgress>, ProviderError> {
+        if let Some(m) = self.migration.as_mut() {
+            return m.step(teacher, surrogate, should_abort);
+        }
         loop {
             if self.progress.finished {
                 return Ok(None);

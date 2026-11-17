@@ -1219,7 +1219,8 @@ mod policy;
 mod purge;
 mod quarantine;
 mod shared;
-pub use shared::COLLECTION_CHECKPOINT_PREFIX;
+pub use shared::{predecessor_of, COLLECTION_CHECKPOINT_PREFIX, PASS_STARTED_WITH_PREVIOUS_SOLVER};
+pub use purge::PURGE_WAIT_MIGRATION;
 mod store;
 mod teach;
 mod trust;
@@ -1604,6 +1605,9 @@ pub struct SurrogateKs {
     /// The shared collection this provider learns into (M8a Task 4a; `shared` module doc), if
     /// attached: the process's one writable handle of it.
     shared: Option<shared::SharedCollection>,
+    /// The attached collection's migration from its predecessor (`shared` module doc, "The migration"; plan 2026-11-13
+    /// Task 14): the offer, or the `migration.txt` it keeps. `None` without a collection or anything to migrate.
+    migration: Option<shared::MigrationSlot>,
     /// Tests only: a collection fitted without the body-4 block (the basis collections had before
     /// M8a Task 5 — the user's stuck collection's repro is pinned to it).
     #[cfg(test)]
@@ -1835,6 +1839,7 @@ impl SurrogateKs {
             pass_start: None,
             pass_coverage: None,
             shared: None,
+            migration: None,
             #[cfg(test)]
             body4_off: false,
             #[cfg(test)]
@@ -2740,6 +2745,9 @@ impl SurrogateKs {
     /// the worker thread inside a Cancel: the samples are kept and the refit waits; M6 Task 3
     /// fix round 2) — and the outcome noted (what `Dynamics` did before M6).
     fn finish_pass(&mut self, mut sampler: Sampler) {
+        if sampler.is_migration() {
+            return self.finish_migration(sampler);
+        }
         let progress = sampler.progress();
         // a teach-around pass is judged after its refit (`teach`)
         let teach = sampler.is_targeted().then(|| (sampler.targets().to_vec(), sampler.take_holdouts()));
@@ -3155,6 +3163,10 @@ impl Trainable for SurrogateKs {
             return Err("a pass is already running (cancel it first)".into());
         }
         let info = crate::sampling::checkpoint_info(checkpoint)?;
+        // a pass the previous solver started never goes on here (Fermi–Dirac spec §7.7)
+        if let Some(why) = self.legacy_checkpoint_refusal(scene, &info.provenance) {
+            return Err(why);
+        }
         let (want, _, _) = self.checkpoint_counts(scene);
         if info.provenance != want {
             return Err(format!("it was taught at {}, the scene is solved at {want}", info.provenance));
@@ -3210,6 +3222,14 @@ impl Trainable for SurrogateKs {
         if let Some(sampler) = &mut self.pass {
             sampler.rescale(plan);
         }
+    }
+
+    fn migration(&self) -> Option<sim::MigrationStatus> {
+        self.migration_status()
+    }
+
+    fn start_migration(&mut self) -> Result<(), String> {
+        self.start_migration_pass()
     }
 
     fn pass_active(&self) -> bool {

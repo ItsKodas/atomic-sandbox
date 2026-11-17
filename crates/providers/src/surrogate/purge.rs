@@ -42,7 +42,8 @@
 //!
 //! # When it is refused
 //!
-//! Nothing forgotten; a sampling pass running; a background refit running (its copy holds the old
+//! Nothing forgotten; a collection migration's re-solve pass not complete ([`PURGE_WAIT_MIGRATION`]: its
+//! `migration.txt` at "running", paused or not — Fermi–Dirac spec §7, F3); a sampling pass running; a background refit running (its copy holds the old
 //! indices); the refit after a Forget not run yet (the standing fit still holds a forgotten
 //! sample: purging it would change what the fit was built from); and, with forgotten samples in
 //! the collection, a collection handle without the lock — another copy of the app has it open — or
@@ -53,6 +54,10 @@
 use super::shared::Link;
 use super::*;
 
+/// The refusal while the attached collection's migration is running (its `migration.txt` at "running", whether a pass
+/// steps it now or it waits to be resumed; plan 2026-11-13 Task 14, F3): its review log and the duplicate rule name
+/// samples of this folder by index, and a purge renumbers them.
+pub const PURGE_WAIT_MIGRATION: &str = "a re-solve pass is running — purge once the collection's migration from the previous solver is complete";
 /// The refusal while the fit still holds a forgotten sample.
 pub const PURGE_WAIT_REFIT: &str = "Forget / Restore changes are pending — the refit after them has not run yet (the fit still holds a forgotten sample); purge once it has (Refit now starts it)";
 /// Why a purge waits while Forget / Restore changes no fit holds yet are pending (2026-11-14, the
@@ -79,6 +84,9 @@ impl SurrogateKs {
     pub fn purge_refusal(&self) -> Option<String> {
         if self.forgotten() == 0 {
             return Some("no forgotten samples".into());
+        }
+        if self.migration.as_ref().is_some_and(|m| m.log.as_ref().is_some_and(|l| l.state == surrogate::MigrationState::Running)) {
+            return Some(PURGE_WAIT_MIGRATION.into());
         }
         if self.pass.is_some() {
             return Some("a sampling pass is running — purge once it is done".into());

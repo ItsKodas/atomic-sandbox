@@ -740,6 +740,9 @@ file order:
    - A sample that fails is **not migrated**. It is listed with its reason in `migration.txt` and stays in the old
      folder.
    - Its old label is never carried: it belongs to the old surface.
+   - Refused without a solve (plan Task 14): a sample with no neighbour within the model's cutoff (lone atoms teach
+     nothing; an import refuses them too), a status code no collection holds, a forced multiplicity. A device error
+     ("GPU busy") is not the sample's: the cursor stays and the pass retries, or stops resumable.
 3. Classify it (section 7.4) and append it to the new folder (section 7.5).
 
 **References.** Every (species, box) in the old `references.txt` is re-solved by the multiplicity scan (lowest F;
@@ -788,6 +791,11 @@ Thresholds: ε_E = 1e-5 Ha per sample, and ε_F = 1.5e-4 Ha/Bohr per force compo
   judges against.
 - **Both errors are safe.** A false "changed" costs one review. A false "unchanged" keeps a label within 1e-5 Ha of the
   new one.
+- **Class S can replace a lower-F label** (rule 7; plan Task 10 review M4, V7). At V7's near-square H₄ (aspect 1.005)
+  the shared-shell rule released the e pair into the broken-symmetry integer state, E_DS = −2.028985 Ha; the cold
+  Fermi–Dirac solve reaches the symmetric ensemble, F = −2.014486 Ha, 14.5 mHa higher (section 4.7(e)). The new label is
+  the state the new teacher converges to from its cold start, not the lowest state at that geometry. V7 checks that its
+  TS is the symmetric ensemble's (within 3 % of the fixture's 1.3836e-2 Ha), so a broken-symmetry landing fails loudly.
 - **Masked samples** (capped segments) are compared on all atoms, which is conservative. Their mask and
   energy-not-fitted flag are carried over.
 - `migration.txt` reports the largest |ΔE| and |ΔF| seen in class U, so the thresholds' margin is visible on real

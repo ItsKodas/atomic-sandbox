@@ -181,6 +181,17 @@
 //!   exists, so every step is a teacher call (rule 1). The switch step is warned (`sim::branch_jump_warning`), its
 //!   note says "sample not kept", and its geometry is absent from the store; every step before and after it is kept.
 //!   CPU only (no GPU), milliseconds.
+//! - `migration_classifies_h2_oh_h4` (spec 2026-11-13 §9 V7; plan Task 14, F13): the collection migration on Task 10's
+//!   DS-era labels (`tests/fixtures/ds_era_labels.txt`: `Accepted`, 61³ × 0.20, σ = h, tol 1e-6). A predecessor folder
+//!   under the legacy tag holds H₂, linear OH and the near-square H₄ (aspect 1.005) as the shared-shell teacher labelled
+//!   them; the re-solve pass (`providers::sampling::migrate`) solves each cold on the GPU teacher. Asserted: H₂ class U
+//!   (the old record kept bit for bit), OH class T with F_new − E_DS = −2 kT ln 2 within 1e-5 Ha (the internal energy and
+//!   every force within ε_E = 1e-5, ε_F = 1.5e-4 — what T means), H₄ class S at code 9 with |ΔE| ≥ 3 ε_E; the H₄ label's
+//!   state is the fixture's symmetric ensemble — a second cold solve, bit-identical to the label, has TS within
+//!   `V7_TS_BAND` = 3 % of the fixture's `fd_ts` 1.3836e-2 (Task 10 review M4: a broken-symmetry landing has TS ≈ 0) —
+//!   and F_new > E_DS: **the migration replaces a lower-F label at this geometry** (rule 7; the shared-shell release
+//!   found the broken-symmetry integer state, 14.5 mHa lower, that the cold Fermi–Dirac solve does not reach, spec
+//!   §4.7(e)). The old folder hashes identical. Task 15 adds the code-9 review's assertions.
 //!
 //! The GPU work of concurrently running tests is serialised through `common::GPU` (the `Locked`
 //! teacher), one evaluation at a time, so the per-solve times in the timing rows are uncontended
@@ -2009,4 +2020,174 @@ fn branch_jump_step_is_not_trained_on() {
     let has = |r: f64| store.samples.iter().any(|x| (x.pos[1][0] - dir[0] * r).abs() < 1e-12);
     assert!(!has(1.6 + 0.02 * SWITCH as f64), "the switch geometry is not stored");
     assert!(has(1.6 + 0.02 * (SWITCH - 1) as f64) && has(1.6 + 0.02 * (SWITCH + 1) as f64), "the steps either side are");
+}
+
+// ---- V7: the collection migration on the DS-era labels (spec 2026-11-13 §9 V7, plan Task 14) ----
+
+/// One case of `tests/fixtures/ds_era_labels.txt` (Task 10 Step 1, F13): the shared-shell teacher's label and, for H₄,
+/// the Fermi–Dirac measurement of the same geometry.
+#[derive(Default)]
+struct DsCase {
+    name: String,
+    z: Vec<u8>,
+    pos: Vec<[f64; 3]>,
+    forces: Vec<[f64; 3]>,
+    multiplicity: u32,
+    e_ds: f64,
+    fd_ts: Option<f64>,
+}
+
+/// The fixture: its policy word, the legacy tag, the grid, the box and the tolerance, and the cases in file order.
+struct DsFixture {
+    policy: String,
+    legacy_tag: String,
+    grid_n: usize,
+    h: f64,
+    box_len: f64,
+    tol: f64,
+    cases: Vec<DsCase>,
+}
+
+fn read_ds_fixture() -> DsFixture {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ds_era_labels.txt");
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let num = |s: &str| s.parse::<f64>().unwrap_or_else(|_| panic!("{path}: '{s}' is not a number"));
+    let mut fx = DsFixture { policy: String::new(), legacy_tag: String::new(), grid_n: 0, h: f64::NAN, box_len: f64::NAN, tol: f64::NAN, cases: Vec::new() };
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let case = fx.cases.last_mut();
+        match (w[0], case) {
+            ("policy", _) => fx.policy = w[1].into(),
+            ("legacy_tag", _) => fx.legacy_tag = w[1].into(),
+            ("grid_n", _) => fx.grid_n = w[1].parse().unwrap(),
+            ("h", _) => fx.h = num(w[1]),
+            ("box", _) => fx.box_len = num(w[1]),
+            ("tol", _) => fx.tol = num(w[1]),
+            ("case", _) => fx.cases.push(DsCase { name: w[1].into(), ..DsCase::default() }),
+            ("atom", Some(c)) => {
+                assert_eq!((w.len(), w[5]), (9, "force"), "{path}: {line}");
+                c.z.push(w[1].parse().unwrap());
+                c.pos.push([num(w[2]), num(w[3]), num(w[4])]);
+                c.forces.push([num(w[6]), num(w[7]), num(w[8])]);
+            }
+            ("multiplicity", Some(c)) => c.multiplicity = w[1].parse().unwrap(),
+            ("e_ds", Some(c)) => c.e_ds = num(w[1]),
+            ("fd_ts", Some(c)) => c.fd_ts = Some(num(w[1])),
+            ("aspect" | "fd_internal" | "delta_e", Some(_)) => {}
+            (other, _) => panic!("{path}: unknown line '{other}'"),
+        }
+    }
+    fx
+}
+
+/// The relative band within which V7's H₄ re-solve must reproduce the fixture's TS (Task 10 review M4). The symmetric
+/// Fermi–Dirac ensemble at aspect 1.005 has TS = 1.3836e-2 Ha (close to 4 kT ln 2 = 1.3863e-2: two half-filled pairs);
+/// the broken-symmetry integer state the shared-shell rule released into has its frontier gap ≈ 0.03 Ha ≫ kT, so
+/// TS ≈ 4 kT·e^{−Δ/kT} ≈ 0 there. Any branch but the fixture's lands far outside a few per cent; the cold GPU solve is
+/// bit-reproducible, so the expected deviation is the fixture's own (the same teacher, measured on this branch).
+const V7_TS_BAND: f64 = 0.03;
+
+/// Spec §9 V7 (plan Task 14, F13): a predecessor folder built from Task 10's DS-era labels under the legacy tag
+/// (policy `Accepted`, 61³ × 0.20, σ = h, tol 1e-6 — the fixture's) is migrated by the real GPU teacher. H₂ → U, linear
+/// OH → T (ΔF = −2 kT ln 2 within 1e-5, E and forces within ε), the near-square H₄ → S at code 9 (|ΔE| ≥ 3 ε_E; its TS
+/// within a few % of the fixture's `fd_ts`, so a broken-symmetry landing fails loudly — review M4). The migration
+/// replaces a LOWER-F label at the H₄ geometry (rule 7; `providers::sampling::migrate` module doc). The old folder hashes
+/// identical. Task 15 adds the review's assertions.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn migration_classifies_h2_oh_h4() {
+    use providers::sampling::migrate::{MIGRATION_EPS_E, MIGRATION_EPS_F};
+    use sim::{IonicPolicy, Trainable};
+    use surrogate::quarantine::{Q_NONE, Q_RESOLVED};
+    use surrogate::{Collection, CollectionSample, SurfaceKey};
+    let Some(ctx) = gpu() else { return };
+    let t0 = Instant::now();
+    let fx = read_ds_fixture();
+    assert_eq!((fx.policy.as_str(), fx.grid_n, fx.tol), ("accepted", 61, 1e-6), "the fixture's settings (F13)");
+    assert!((fx.box_len - (fx.grid_n - 1) as f64 * fx.h).abs() < 1e-12, "box = (n − 1)·h");
+    assert_eq!(fx.cases.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["h2", "oh", "h4"]);
+    assert_eq!(fx.legacy_tag, providers::pseudo::legacy_tag_of(IonicPolicy::Accepted), "the fixture's tag is the previous solver's for its policy");
+    let (teacher, log) = Locked::new(ctx.clone(), fx.tol);
+    let root = std::env::temp_dir().join(format!("as-v7-migration-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let old_key = SurfaceKey { functional: surrogate::model::FUNCTIONAL_LSDA.into(), h: fx.h, sigma: fx.h, tol: fx.tol, teacher: teacher.name().into(), ionic: fx.legacy_tag.clone() };
+    let old_dir = {
+        let (mut c, _) = Collection::open(&root, &old_key).unwrap();
+        for case in &fx.cases {
+            let e = case.e_ds;
+            let s = surrogate::Sample::new(case.pos.clone(), case.z.clone(), e, case.forces.clone(), surrogate::SampleTag::Perturbation, 1.0);
+            c.append(CollectionSample { sample: s, grid_n: fx.grid_n, multiplicity_forced: false, multiplicity: Some(case.multiplicity), scene: case.name.clone() }).unwrap();
+        }
+        c.folder().to_path_buf()
+    };
+    let files = |dir: &std::path::Path| -> Vec<(String, Vec<u8>)> {
+        let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.path().is_file()).map(|e| (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).unwrap())).collect();
+        v.sort();
+        v
+    };
+    let before = files(&old_dir);
+    let scene_of = |c: &DsCase| Scene {
+        nuclei: c.z.iter().zip(&c.pos).map(|(&z, &p)| Nucleus::new(z, p)).collect(),
+        cell: sim::Cell { n: fx.grid_n, h: fx.h },
+        charge: 0,
+        multiplicity: None,
+        sigma: None,
+        external_field: [0.0; 3],
+        ionic: IonicPolicy::Accepted,
+        train_mask: None,
+    };
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(fx.tol);
+    s.attach_collection(&root, &scene_of(&fx.cases[0])).unwrap();
+    let new_dir = s.collection().unwrap().folder().to_path_buf();
+    assert_ne!(new_dir, old_dir);
+    let offer = s.migration().expect("the DS-era folder is the predecessor");
+    assert_eq!((offer.state, offer.samples), (sim::MigrationPhase::Offered, 3), "{offer:?}");
+    s.start_migration().unwrap();
+    let mut steps = 0;
+    loop {
+        match Trainable::pass_step(&mut s, &mut never()) {
+            Ok(Some(_)) => steps += 1,
+            Ok(None) => break,
+            Err(e) => panic!("re-solve step {steps}: {e}"),
+        }
+    }
+    let mlog = surrogate::read_migration(&new_dir).unwrap().expect("migration.txt");
+    println!("V7 migration: counts U/T/S/not {:?}, not migrated {:?}, class-U max |ΔE| {:.2e} Ha, |ΔF| {:.2e} Ha/Bohr; {} solves", mlog.counts, mlog.not_migrated, mlog.class_u_max.0, mlog.class_u_max.1, steps);
+    let c = s.collection().unwrap();
+    let (h2, oh, h4) = (&fx.cases[0], &fx.cases[1], &fx.cases[2]);
+    let max_df = |k: usize, old: &DsCase| c.samples[k].sample.forces.iter().zip(&old.forces).flat_map(|(a, b)| (0..3).map(move |i| (a[i] - b[i]).abs())).fold(0.0f64, f64::max);
+    for (k, case) in fx.cases.iter().enumerate() {
+        println!("  {}: E_old {:.10} → label {:.10} (Δ {:+.3e} Ha), max |ΔF| {:.2e} Ha/Bohr, code {}", case.name, case.e_ds, c.samples[k].sample.energy, c.samples[k].sample.energy - case.e_ds, max_df(k, case), c.quarantine[k]);
+    }
+    assert_eq!(mlog.counts, [1, 1, 1, 0], "H₂ U, OH T, H₄ S, none failed: {:?}", mlog.not_migrated);
+    assert_eq!(c.quarantine, vec![Q_NONE, Q_NONE, Q_RESOLVED], "U and T keep 0, S takes 9");
+    // H₂ (U): the old record, bit for bit
+    assert_eq!(c.samples[0].sample.energy.to_bits(), h2.e_ds.to_bits());
+    assert!(mlog.class_u_max.0 <= MIGRATION_EPS_E && mlog.class_u_max.1 <= MIGRATION_EPS_F);
+    // OH (T): the label moved by −2 kT ln 2 only
+    let two_kt_ln2 = 2.0 * qm::ELECTRON_KT * 2f64.ln();
+    let d_oh = c.samples[1].sample.energy - oh.e_ds;
+    assert!((d_oh + two_kt_ln2).abs() <= 1e-5, "OH: F_new − E_DS = {d_oh:.6e}, −2 kT ln 2 = {:.6e}", -two_kt_ln2);
+    assert!(max_df(1, oh) <= MIGRATION_EPS_F, "OH forces within ε_F: {:.2e}", max_df(1, oh));
+    // H₄ (S): another state, by the fixture's choice of aspect at least 3 ε_E away
+    let d_h4 = c.samples[2].sample.energy - h4.e_ds;
+    assert!(d_h4.abs() >= 3.0 * MIGRATION_EPS_E, "H₄: |F_new − E_DS| = {:.3e}", d_h4.abs());
+    // … and the state is the fixture's symmetric ensemble, not a broken-symmetry landing (review M4): the same cold
+    // solve (bit-reproducible) gives the label and its TS
+    let t = Trainable::teacher_mut(&mut s);
+    t.reset();
+    let r = t.evaluate(&scene_of(h4), &mut never()).expect("the H₄ cold solve");
+    let fd_ts = h4.fd_ts.expect("the fixture's H₄ fd_ts");
+    let c = s.collection().unwrap();
+    println!("  H₄ cold solve again: F {:.10}, E {:.10}, TS {:.6e} (fixture {fd_ts:.6e}, {:+.2} %), F_new − E_DS {d_h4:+.4e} Ha (a LOWER-F label replaced: rule 7)", r.energy, r.stats.energy.internal, r.stats.energy.ts, 100.0 * (r.stats.energy.ts / fd_ts - 1.0));
+    assert_eq!(r.energy.to_bits(), c.samples[2].sample.energy.to_bits(), "the cold solve is bit-reproducible: the migrated label");
+    assert!((r.stats.energy.ts / fd_ts - 1.0).abs() <= V7_TS_BAND, "H₄ TS {:.6e} vs the fixture's {fd_ts:.6e}", r.stats.energy.ts);
+    assert!(d_h4 > 0.0, "the DS label is the lower-F state at this geometry (fixture: +1.45e-2)");
+    drop(s);
+    assert_eq!(files(&old_dir), before, "the old folder is byte-identical");
+    let wall = t0.elapsed();
+    let _ = std::fs::remove_dir_all(&root);
+    let lg = log.lock().unwrap().clone();
+    record(&ctx, timing_row("migration_classifies_h2_oh_h4", "H₂, OH, H₄ (Accepted)", fx.grid_n, fx.tol, &lg, wall, "pass"));
 }

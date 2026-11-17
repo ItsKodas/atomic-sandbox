@@ -5774,6 +5774,43 @@ the f32 Δρ stop (`gpu_vs_cpu` "the GPU state", 0.9–4.3e-5 Ha/Bohr) and of th
 offset (Step 1: +0.4 … +2.2 µHa per solve, always positive); it is inside B_W (which uses the warm +4.0e-5) and is tracked
 with that item, not bounded separately.
 
+### Task 14: the collection migration engine and V7 (plan 2026-11-13 Task 14, 2026-11-17, release, RX 7900 XTX)
+
+The engine is `providers::sampling::migrate` (module doc: the cold re-solve, the checks, the classes, the writes, the
+resume; spec §7.2–7.5). **Thresholds** (spec §7.4): ε_E = 1e-5 Ha per sample = 5× the largest measured path scatter on
+the pseudo surface (1.87e-6 Ha, pseudo-H₂O warm vs cold, "SCF, GPU against CPU"), ≈ 2× all-electron H₂O's 5.4e-6;
+ε_F = 3 × `PSEUDO_FORCE_NOISE` = 1.5e-4 Ha/Bohr per component. U: |F_new − E_old| ≤ ε_E and every |ΔF| ≤ ε_F; T: not U,
+|E_new − E_old| ≤ ε_E (the internal energy) and every |ΔF| ≤ ε_F; S otherwise (NaN is S).
+
+**V7, `migration_classifies_h2_oh_h4`** (`tests/surrogate.rs`; the DS-era fixture `tests/fixtures/ds_era_labels.txt`:
+`Accepted`, 61³ × 0.20, σ = h, tol 1e-6; three cold GPU solves plus one repeat; the run of record shared the GPU with
+another worktree's `providers` suite, timings only):
+
+| case | E_old (DS) | new label | ΔE = label − E_old | max \|ΔF\| | class, code |
+|---|---|---|---|---|---|
+| H₂ R = 1.4 | −1.1359545439 | the old record (F_new − E_old = 7.57e-8) | 0 (kept bit for bit) | 5.87e-6 | U, 0 |
+| linear OH, 1.83 | −16.7774555166 | F −16.7843862554 | −6.93074e-3 (−2 kT ln 2 = −6.931472e-3; off by +7.3e-7) | 1.22e-5 | T, 0 |
+| H₄ 1.8 × 1.809 (aspect 1.005) | −2.0289850168 | F −2.0144863903 | **+1.4499e-2** | 5.00e-3 | S, 9 |
+
+- The OH and H₂ margins reproduce the fixture's fix-round-1 measurement (OH E_FD − E_DS = +7.3e-7, 14× inside ε_E; max
+  |ΔF_I| 1.22e-5, 12× inside ε_F; H₂ 7.6e-8 and 5.9e-6).
+- **H₄'s state** (Task 10 review M4): a second cold solve of the geometry gives F bit-identical to the migrated label,
+  E −2.0006504640 and **TS 1.383593e-2 = the fixture's `fd_ts` to +0.00 %** (`V7_TS_BAND` 3 %): the symmetric Fermi–Dirac
+  ensemble, not a broken-symmetry landing (TS ≈ 0 there). **Rule 7: the migration replaces a lower-F label at this
+  geometry** — the shared-shell release found the broken-symmetry integer state 14.5 mHa below the state the cold FD
+  solve reaches (spec §4.7(e)); the new label is the new teacher's converged state, not the lowest.
+- The old folder's files hash identical after the pass. The code-9 review is Task 15's.
+
+**The providers tests** (`sampling::tests::migration`, synthetic pair-Morse teacher with the FD breakdown, 14 tests,
+0.4 s): `classify_thresholds`, `migrated_code_table`, `predecessor_by_exact_key`, `old_folder_bytes_identical_after_pass`,
+`refuses_while_old_folder_has_a_live_writer`, `resume_after_crash_between_append_and_cursor` (counts and the new
+`samples.bin` byte-identical to an uninterrupted run's), `failed_resolve_is_listed_not_migrated`,
+`masked_sample_compared_on_all_atoms_and_carried`, `references_resolved_not_carried`, `not_offered_when_complete`,
+`source_change_restarts_from_zero` (F3; byte-identical to an uninterrupted run on the changed source),
+`purge_refused_while_migration_runs`, `old_pass_checkpoint_resume_refused`, `migration_is_a_pass_through_dynamics`. Six
+mutations of the engine (the (8, S) code, the duplicate rule, the fingerprint restart, the warning check, the purge
+refusal, an all-atom force comparison cut to one atom) each fail their test.
+
 ## Live orbitals (Harris display; spec 2026-11-14)
 
 `tests/harris.rs` (spec `docs/superpowers/specs/2026-11-14-live-orbitals-design.md` §7, V-A1–V-A3; V-A4, a record for §9 Q2, below). First measured 2026-11-14; **re-measured 2026-11-15 after the Harris LOBPCG change of task 8b** (the stop test reads the displayed levels at the SCF's tol, the guards at τ_c/100, the top level a buffer — `qm_gpu::harris` "Three roles"): the tables below are the 2026-11-15 numbers, with the 2026-11-14 ones where they changed. **Re-run 2026-11-16 after task 8b fix 1** (the block memory keeps the last call's need, not the split it ran with; the record's last vector tested, under a buffer, when it can change the shown rows — `qm_gpu::harris` "The record's edge"; the at-cap note prints the displayed and guard tiers' residuals): every gate passes, the changes are noted where they occur. Release, RX 7900 XTX (Vulkan) / Ryzen 7 9800X3D, BelowNormal, the user's app open (the GPU shared with an idle window), each test its own invocation (`--test harris va1`, `va2`, `va3`) with a 3-minute cool-down between them. All cases: σ = h = 0.15 Bohr (the app's Accurate grid), ionic `Accepted` (the app default: H, N and O pseudised; `DegenerateShells` occupations), SCF tol 1e-6 (the floor-aware GPU tol, `effective_gpu_tol`, stays 1e-6 for N ≤ 8), cold SCF on a fresh `GpuSolver`, then `GpuSolver::harris` on the same solver with a new `HarrisState` (m = 0).

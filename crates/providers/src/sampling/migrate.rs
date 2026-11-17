@@ -1,0 +1,543 @@
+//! The collection migration's re-solve pass (Fermi–Dirac spec
+//! `docs/superpowers/specs/2026-11-13-fermi-smearing-design.md` §7.3–7.5; plan 2026-11-13 Task 14): every sample of
+//! the **predecessor** folder (the same solver surface under the previous solver's ionic tag, `predecessor_of`) is
+//! solved again, cold, by the new teacher, compared with its old label, classified, and appended to the attached
+//! collection. A pass kind of the existing machinery ([`Sampler::migration`]): one solve per `step`, so it shares the GPU
+//! with the live scene, pauses, resumes and cancels like any pass. Atomic units throughout (Hartree, Bohr, Ha/Bohr).
+//!
+//! # What is compared (spec §7.4)
+//!
+//! The old label is (E_old, F_old): E_old the energy the previous solver stored — its total energy, with integer or
+//! equal-share ("degenerate shells") occupations, so no entropy term — and F_old_{Ia} = −∂E_old/∂R_{Ia} its forces. The
+//! new cold solve reports the Mermin free energy F = E − TS (`ForceResult::energy` = `EvalStats::energy.total`), its
+//! internal energy E (`EvalStats::energy.internal`; TS = E − F ≥ 0) and its forces −∂F/∂R. With ε_E = [`MIGRATION_EPS_E`]
+//! (Ha per sample) and ε_F = [`MIGRATION_EPS_F`] (Ha/Bohr per component), ΔF_{Ia} = F_new,{Ia} − F_old,{Ia}:
+//!
+//! - **U, unchanged:** |F − E_old| ≤ ε_E and max_{Ia} |ΔF_{Ia}| ≤ ε_F. A gapped state: TS ≈ 0, the same label within
+//!   solver noise. The old record is kept bit for bit.
+//! - **T, entropy only:** not U, |E − E_old| ≤ ε_E (the **internal** energy) and max |ΔF_{Ia}| ≤ ε_F. The same
+//!   electronic state (an equal-share ensemble before, the same occupations now); only the reported quantity moved, by
+//!   −TS (−2 kT ln 2 = −6.93 mHa for linear OH's ↓ π pair at kT = 5 mHa). The new F and forces are the label.
+//! - **S, state changed:** anything else — the old rule had a different state at this geometry (a released integer
+//!   pattern where Fermi–Dirac pins the frontier at μ, or another SCF branch). The new label is appended at code 9
+//!   ([`migrated_code`]) until the review (spec §7.6). It may replace a **lower-F** label: the near-square H₄ of the V7
+//!   fixture (aspect 1.005) had E_DS = −2.028985 Ha in the broken-symmetry integer state the shared-shell rule released
+//!   into, while the cold Fermi–Dirac solve reaches the symmetric ensemble, F = −2.014486 Ha (14.5 mHa above; spec
+//!   §4.7(e), CLAUDE.md rule 7): the new label is the state the new teacher converges to, not the lowest one.
+//!
+//! Every comparison is `|x| ≤ ε` and fails for NaN, so a non-finite number is class S, never a carried label. Masked
+//! samples (capped segments) are compared on **all** atoms (conservative); their mask and energy-not-fitted flag are
+//! carried. A sample's class never reads its old code.
+//!
+//! # The thresholds
+//!
+//! - ε_E = 1e-5 Ha: 5× the largest measured path scatter on the pseudo surface (1.87e-6 Ha, pseudo-H₂O warm vs cold,
+//!   `validate/references.md` "SCF, GPU against CPU"), about 2× all-electron H₂O's (5.4e-6), 100× below the model's
+//!   1 mHa/atom energy bound.
+//! - ε_F = 3 × `PSEUDO_FORCE_NOISE` = 1.5e-4 Ha/Bohr: the tier an audit already judges forces against.
+//! - Both errors are safe: a false S costs a review; a false U keeps a label within ε_E of the new one.
+//!
+//! # Per sample, in file order (spec §7.3)
+//!
+//! 1. Checks that need no solve: a status code a collection holds, a shared (unforced) multiplicity, Z in the isotope
+//!    table, a neighbour within the model's cutoff (a lone-atom sample teaches nothing; an import refuses it too).
+//! 2. The **cold** solve (`reset` before it): the attached key's h, σ and the teacher's tolerance, the sample's own box
+//!    (`grid_n`) and its stored positions bit for bit, multiplicity auto, the key's ionic policy; the scene's surface key
+//!    must be the attached collection's. A cold GPU solve is bit-reproducible (`sim::references`), so the outcome does
+//!    not depend on the order or on a resume.
+//! 3. The solve must have converged (a stall or the cap is an error), carry no solver warning and nothing
+//!    untrainable (overlapping cores, a branch jump), report a face density within the box rule
+//!    (`box_affected_face_density(h)`), and reproduce the recorded multiplicity when one is recorded. A sample that
+//!    fails is **not migrated**: listed in `migration.txt` with its reason, never appended — its old label belongs to
+//!    the old surface. A device error ("GPU busy") is not the sample's: the cursor stays and the provider retries.
+//! 4. Classify, then append (spec §7.5): U the old record as it was, plus a status record when its code is not 0; T the
+//!    new label with the old metadata and the old code; S the new label with [`migrated_code`]. An append refused as a
+//!    duplicate (`REFUSE_DUPLICATE`: the same answer is stored — a crash between the append and the cursor write) is
+//!    done: its status is written if it is missing.
+//! 5. The cursor is rewritten (`surrogate::write_migration`, through a temporary file).
+//!
+//! **References** come first: every (species, box) of the old `references.txt` is solved by the multiplicity scan
+//! (lowest F; `sim::references::AtomScan`) and offered through `Collection::offer_reference`; the log keeps the old and
+//! the new energy. A resume skips those already logged.
+//!
+//! **The source fingerprint (F3).** The pass records the source `samples.bin`'s length and hash when it starts. A resume
+//! whose source differs (purged, or appended to by an older build since) starts again from sample 0 with the counts
+//! reset; what was appended before is refused as a duplicate and counted as done, so the counts are an uninterrupted
+//! run's on the changed source.
+
+use super::*;
+use crate::surrogate::PSEUDO_FORCE_NOISE;
+use sim::IonicPolicy;
+use std::path::{Path, PathBuf};
+use surrogate::collection::CollectionReference;
+use surrogate::migration::MIGRATION_FILE;
+use surrogate::quarantine::{is_collection_code, Q_FORGOTTEN, Q_FORGOTTEN_UNFENCED, Q_RESOLVED, Q_SUPERSEDED};
+use surrogate::{Collection, CollectionSample, MigrationLog, MigrationState, SurfaceKey};
+
+/// ε_E (module doc, "The thresholds"): Hartree per sample.
+pub const MIGRATION_EPS_E: f64 = 1e-5;
+/// ε_F (module doc, "The thresholds"): Hartree/Bohr per force component, 3 × `PSEUDO_FORCE_NOISE` (1.5e-4).
+pub const MIGRATION_EPS_F: f64 = 3.0 * PSEUDO_FORCE_NOISE;
+/// The time estimate uses the median of the pass's own sample solves once it has made this many (spec §7.3, "Cost").
+pub const MIGRATION_ETA_SOLVES: usize = 20;
+/// The a-priori cost of one cold solve (s) at [`MIGRATION_PRIOR_GRID_N`]³ on the RX 7900 XTX: H₂O cold at 57³, 1.1 s
+/// (`validate/references.md`, quoted in spec §7.3 "Cost"); scaled by (n/57)³ for another box. An estimate for the offer,
+/// replaced by the measured median after [`MIGRATION_ETA_SOLVES`] solves.
+pub const MIGRATION_PRIOR_SOLVE_S: f64 = 1.1;
+/// The box of [`MIGRATION_PRIOR_SOLVE_S`] (grid points per side).
+pub const MIGRATION_PRIOR_GRID_N: usize = 57;
+/// The pass's progress stage while it re-solves samples (`SamplingProgress::stage`).
+pub const MIGRATION_STAGE: &str = "re-solving";
+
+/// A migrated sample's class (module doc, "What is compared").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MigrationClass {
+    /// U: the same label within solver noise.
+    Unchanged,
+    /// T: the same state; the label moved by −TS only.
+    EntropyOnly,
+    /// S: another state.
+    StateChanged,
+}
+
+impl MigrationClass {
+    /// Its slot in `MigrationLog::counts` (U, T, S; 3 is "not migrated").
+    pub fn index(self) -> usize {
+        match self {
+            MigrationClass::Unchanged => 0,
+            MigrationClass::EntropyOnly => 1,
+            MigrationClass::StateChanged => 2,
+        }
+    }
+}
+
+/// The largest |ΔF_{Ia}| between two force sets (Ha/Bohr); NaN — never within a bound — when the shapes differ or a
+/// component is not finite.
+fn max_force_diff(old_f: &[[f64; 3]], new_f: &[[f64; 3]]) -> f64 {
+    if old_f.len() != new_f.len() {
+        return f64::NAN;
+    }
+    let mut m = 0.0f64;
+    for (a, b) in old_f.iter().zip(new_f) {
+        for k in 0..3 {
+            let d = (b[k] - a[k]).abs();
+            if !d.is_finite() {
+                return f64::NAN;
+            }
+            m = m.max(d);
+        }
+    }
+    m
+}
+
+/// The class of a re-solved sample (module doc, "What is compared"): `old_e`, `old_f` the stored label (Ha, Ha/Bohr),
+/// `new_free` the new solve's F, `new_internal` its E, `new_f` its forces −∂F/∂R.
+pub fn classify(old_e: f64, old_f: &[[f64; 3]], new_free: f64, new_internal: f64, new_f: &[[f64; 3]]) -> MigrationClass {
+    let forces_within = max_force_diff(old_f, new_f) <= MIGRATION_EPS_F;
+    if (new_free - old_e).abs() <= MIGRATION_EPS_E && forces_within {
+        MigrationClass::Unchanged
+    } else if (new_internal - old_e).abs() <= MIGRATION_EPS_E && forces_within {
+        MigrationClass::EntropyOnly
+    } else {
+        MigrationClass::StateChanged
+    }
+}
+
+/// The status code a migrated sample takes in the new collection (spec §7.5): U and T keep `old` (it judged the same
+/// label: a forgotten-unfenced 8 stays 8); S takes [`Q_RESOLVED`] (9, awaiting review), except a forgotten sample, which
+/// stays forgotten — 7 stays 7 and 8 returns to 7 (the user's Forget survives, the fence returns: the lift judged the old
+/// label) — and a superseded one, which stays 2 (what superseded it is migrated too). A held sample (1) goes to review.
+pub fn migrated_code(old: u8, class: MigrationClass) -> u8 {
+    match class {
+        MigrationClass::Unchanged | MigrationClass::EntropyOnly => old,
+        MigrationClass::StateChanged => match old {
+            Q_FORGOTTEN | Q_FORGOTTEN_UNFENCED => Q_FORGOTTEN,
+            Q_SUPERSEDED => Q_SUPERSEDED,
+            _ => Q_RESOLVED,
+        },
+    }
+}
+
+/// What the provider did with a migrated sample (`SurrogateKs::take_migrated`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MigratedAppend {
+    /// Appended at this index of the new collection.
+    Appended(usize),
+    /// The same answer was stored already, at this index (module doc, 4.): counted as done.
+    Duplicate(usize),
+}
+
+/// The a-priori time of one cold solve on an n³ grid (s; [`MIGRATION_PRIOR_SOLVE_S`]).
+pub fn prior_solve_s(n: usize) -> f64 {
+    MIGRATION_PRIOR_SOLVE_S * (n as f64 / MIGRATION_PRIOR_GRID_N as f64).powi(3)
+}
+
+/// Today's date, YYYY-MM-DD (UTC), from the system clock (days since the epoch → the civil date; Howard Hinnant's
+/// algorithm, no date crate).
+fn today() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// One reference of the source to re-solve: its (Z, n), the old energy, and the scan once started.
+struct RefJob {
+    z: u8,
+    n: usize,
+    old: f64,
+    scan: Option<AtomScan>,
+}
+
+/// The pass (module doc): the source as read when it started, the log it keeps, and its progress.
+pub struct Migrator {
+    /// The new folder (where `migration.txt` is written).
+    dir: PathBuf,
+    source_samples: Vec<CollectionSample>,
+    source_codes: Vec<u8>,
+    refs: VecDeque<RefJob>,
+    log: MigrationLog,
+    /// The attached key's settings and the ionic policy its tag is.
+    h: f64,
+    sigma: f64,
+    policy: IonicPolicy,
+    /// The model's cutoff (Bohr): a sample without a neighbour within it is not migrated (module doc, 1.).
+    r_cut: f64,
+    /// Wall times (s) of this run's sample solves (the estimate's median).
+    walls: Vec<f64>,
+    progress: SamplingProgress,
+    notes: Vec<String>,
+    /// Test hook (Review Focus 4): stop with an error right after sample `k`'s append, before the cursor is written —
+    /// a crash there.
+    #[cfg(test)]
+    pub(crate) crash_after_append: Option<usize>,
+}
+
+impl Migrator {
+    /// Starts the pass from `source` into the collection folder `dir` of `key`, whose ionic tag is the policy `policy`;
+    /// `existing` is the folder's `migration.txt` when it has one (a resume). `Err` with the reason, nothing written:
+    /// the source cannot be read (a live writer holds it — spec §7.1 —, a newer format, not a collection), or the log
+    /// says the migration is complete. A fresh start (or a source whose fingerprint moved, F3) writes the log at once
+    /// with its fingerprint, and copies `bond_experience.txt` when the new folder has none (spec §7.5).
+    pub fn start(source: &Path, dir: &Path, key: &SurfaceKey, policy: IonicPolicy, r_cut: f64, existing: Option<MigrationLog>) -> Result<Migrator, String> {
+        let ro = Collection::open_read_only(source).map_err(|e| e.to_string())?;
+        let slug = source.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        let mut notes = Vec::new();
+        if let Some(why) = &ro.damaged_tail {
+            notes.push(format!("re-solving {slug}: {why}"));
+        }
+        let fresh = || MigrationLog {
+            source_slug: slug.clone(),
+            source_key: ro.key.to_text(),
+            build: env!("CARGO_PKG_VERSION").to_string(),
+            date: today(),
+            source_len: ro.source_len,
+            source_hash: ro.source_hash,
+            cursor: 0,
+            state: MigrationState::Running,
+            counts: [0; 4],
+            not_migrated: Vec::new(),
+            references: Vec::new(),
+            class_u_max: (0.0, 0.0),
+            review: Vec::new(),
+        };
+        let (log, new_start) = match existing {
+            Some(l) if l.state != MigrationState::Running => return Err(format!("the collection was already re-solved from {} ({})", l.source_slug, if l.state == MigrationState::Complete { "complete" } else { "reviewed" })),
+            Some(l) if (l.source_len, l.source_hash) != (ro.source_len, ro.source_hash) => {
+                notes.push(format!(
+                    "re-solving {slug}: its samples file changed since the pass started ({} → {} bytes; purged, or appended to by an older build) — the pass starts again from its first sample, and the samples already re-solved are counted as done",
+                    l.source_len, ro.source_len
+                ));
+                (fresh(), true)
+            }
+            Some(l) => (l, false),
+            None => (fresh(), true),
+        };
+        ::surrogate::write_migration(dir, &log)?;
+        if new_start {
+            let (from, to) = (source.join(BOND_EXPERIENCE_FILE), dir.join(BOND_EXPERIENCE_FILE));
+            if from.exists() && !to.exists() {
+                if let Err(e) = std::fs::copy(&from, &to) {
+                    notes.push(format!("re-solving {slug}: {BOND_EXPERIENCE_FILE} was not copied ({e}) — it is display only"));
+                }
+            }
+        }
+        let done: Vec<(u8, usize)> = log.references.iter().map(|r| (r.0, r.1)).collect();
+        let refs: VecDeque<RefJob> = ro.references.iter().filter(|(z, n, _)| !done.contains(&(*z, *n))).map(|&(z, n, r): &(u8, usize, CollectionReference)| RefJob { z, n, old: r.energy, scan: None }).collect();
+        let ref_solves: usize = refs.iter().map(|r| allowed_multiplicities(r.z as u32).len()).sum();
+        let total = ref_solves + ro.samples.len();
+        let done = log.cursor.min(ro.samples.len());
+        let stage = if !refs.is_empty() { "references" } else { MIGRATION_STAGE };
+        let progress = SamplingProgress { done, total, stage, target: None, last_energy: f64::NAN, cancelled: false, skipped: 0, failed: log.counts[3], finished: false, paused: false };
+        Ok(Migrator {
+            dir: dir.to_path_buf(),
+            source_samples: ro.samples,
+            source_codes: ro.codes,
+            refs,
+            log,
+            h: key.h,
+            sigma: key.sigma,
+            policy,
+            r_cut,
+            walls: Vec::new(),
+            progress,
+            notes,
+            #[cfg(test)]
+            crash_after_append: None,
+        })
+    }
+
+    /// The log as it stands (written after every sample).
+    pub fn log(&self) -> &MigrationLog {
+        &self.log
+    }
+
+    /// Samples in the source.
+    pub fn source_samples(&self) -> usize {
+        self.source_samples.len()
+    }
+
+    pub fn progress(&self) -> SamplingProgress {
+        self.progress.clone()
+    }
+
+    pub fn take_notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notes)
+    }
+
+    /// Ends the pass early (Cancel): the log stays at Running with its cursor, so a later start resumes there.
+    pub fn cancel(&mut self) {
+        if !self.progress.finished {
+            self.progress.cancelled = true;
+            self.progress.finished = true;
+            self.progress.stage = "cancelled";
+        }
+    }
+
+    /// The time left (s; spec §7.3 "Cost"): the a-priori [`prior_solve_s`] of every solve left, or — once the pass has
+    /// made [`MIGRATION_ETA_SOLVES`] sample solves — their median × the solves left.
+    pub fn eta_s(&self) -> f64 {
+        let left = &self.source_samples[self.log.cursor.min(self.source_samples.len())..];
+        let ref_solves = |r: &RefJob| r.scan.as_ref().map_or(allowed_multiplicities(r.z as u32).len(), |s| s.remaining().len());
+        if self.walls.len() >= MIGRATION_ETA_SOLVES {
+            let mut w = self.walls.clone();
+            w.sort_by(f64::total_cmp);
+            let solves = left.len() + self.refs.iter().map(ref_solves).sum::<usize>();
+            return w[w.len() / 2] * solves as f64;
+        }
+        left.iter().map(|s| prior_solve_s(s.grid_n)).sum::<f64>() + self.refs.iter().map(|r| ref_solves(r) as f64 * prior_solve_s(r.n)).sum::<f64>()
+    }
+
+    /// The isolated neutral atom's scene parts of a reference job, and the cold scan.
+    fn scan_for(&self, z: u8, n: usize) -> Option<AtomScan> {
+        let a = units::most_abundant_a(z)?;
+        let mass = sim::Nucleus::isotope(z, a, [0.0; 3]).ok()?.mass;
+        Some(AtomScan::new(&sim::Cell { n, h: self.h }, Some(self.sigma), self.policy, z, a, mass))
+    }
+
+    /// The cold solve's scene of a source sample (module doc, 2.): `Err` with the reason when a Z has no isotope.
+    fn scene_of(&self, s: &CollectionSample) -> Result<Scene, String> {
+        let mut nuclei = Vec::with_capacity(s.sample.z.len());
+        for (&z, &pos) in s.sample.z.iter().zip(&s.sample.pos) {
+            let a = units::most_abundant_a(z).ok_or_else(|| format!("Z = {z} has no isotope in the table"))?;
+            nuclei.push(sim::Nucleus::isotope(z, a, pos)?);
+        }
+        Ok(Scene { nuclei, cell: sim::Cell { n: s.grid_n, h: self.h }, charge: 0, multiplicity: None, sigma: Some(self.sigma), external_field: [0.0; 3], ionic: self.policy, train_mask: None })
+    }
+
+    fn write_log(&self) -> Result<(), ProviderError> {
+        ::surrogate::write_migration(&self.dir, &self.log).map_err(|e| ProviderError::Invalid(format!("re-solving: {MIGRATION_FILE} could not be written ({e}) — the pass stops; it resumes from sample {}", self.log.cursor)))
+    }
+
+    /// Sample `i` is not migrated, with `why` (module doc, 3.): listed, counted, the cursor moved on.
+    fn not_migrated(&mut self, i: usize, why: String) -> Result<Option<SamplingProgress>, ProviderError> {
+        self.notes.push(format!("re-solving {}: sample {i} not migrated ({why}) — it stays in the old collection", self.log.source_slug));
+        self.log.not_migrated.push((i, why));
+        self.log.counts[3] += 1;
+        self.log.cursor = i + 1;
+        self.write_log()?;
+        self.progress.done += 1;
+        self.progress.failed += 1;
+        Ok(Some(self.progress()))
+    }
+
+    /// One solve of the reference at the queue's head (module doc, "References"): when its scan is done, the lowest F is
+    /// offered to the collection (`SurrogateKs::set_reference_solved`) and logged with the old energy.
+    fn reference_step(&mut self, mut teacher: Option<&mut dyn ForceProvider>, surrogate: &mut SurrogateKs, should_abort: &mut dyn FnMut() -> bool) -> Result<Option<SamplingProgress>, ProviderError> {
+        let (z, n) = self.refs.front().map(|j| (j.z, j.n)).expect("a reference job");
+        if self.refs.front().is_some_and(|j| j.scan.is_none()) {
+            match self.scan_for(z, n) {
+                Some(scan) => self.refs.front_mut().expect("a reference job").scan = Some(scan),
+                None => {
+                    let job = self.refs.pop_front().expect("a reference job");
+                    self.log.references.push((z, n, Some(job.old), None));
+                    self.notes.push(format!("re-solving: the reference of Z = {z} has no isotope in the table — not re-solved"));
+                    self.write_log()?;
+                    return Ok(Some(self.progress()));
+                }
+            }
+        }
+        let scan = self.refs.front_mut().and_then(|j| j.scan.as_mut()).expect("a started scan");
+        let outcome = {
+            let t: &mut dyn ForceProvider = match &mut teacher {
+                Some(t) => &mut **t,
+                None => surrogate.teacher_mut(),
+            };
+            scan.step(t, should_abort)
+        };
+        if let Err(ProviderError::Cancelled) = outcome {
+            return Err(ProviderError::Cancelled);
+        }
+        self.progress.done += 1;
+        if !scan.is_done() {
+            return Ok(Some(self.progress()));
+        }
+        let job = self.refs.pop_front().expect("a reference job");
+        let scan = job.scan.expect("a started scan");
+        let failed: Vec<String> = scan.failed().iter().map(|(m, e)| format!("M = {m}: {e}")).collect();
+        let tol = surrogate.collection().map_or(f64::NAN, |c| c.key.tol);
+        let name = surrogate.teacher_mut().name().to_string();
+        match scan.finish(tol, &name) {
+            Some(r) => {
+                surrogate.set_reference_solved(z, r.energy, n, r.face_density);
+                self.log.references.push((z, n, Some(job.old), Some(r.energy)));
+                self.notes.push(format!("re-solving: reference {} (Z = {z}) of the {n}³ box, {:.6} Ha before, {:.6} Ha now (multiplicity {})", symbol(z), job.old, r.energy, r.multiplicity.unwrap_or(0)));
+            }
+            None => {
+                self.log.references.push((z, n, Some(job.old), None));
+                self.notes.push(format!("re-solving: reference {} (Z = {z}) of the {n}³ box did not solve ({}) — its samples wait for a reference from a later pass", symbol(z), failed.join("; ")));
+            }
+        }
+        self.write_log()?;
+        Ok(Some(self.progress()))
+    }
+
+    /// At most one solve (module doc): `Ok(Some(progress))` after it, `Ok(None)` when the pass is over (complete or
+    /// cancelled), `Err(Cancelled)` when the solve was abandoned (the job stays), any other `Err` ends the pass with the
+    /// log at its cursor (a device error the provider retries first).
+    pub fn step(&mut self, mut teacher: Option<&mut dyn ForceProvider>, surrogate: &mut SurrogateKs, should_abort: &mut dyn FnMut() -> bool) -> Result<Option<SamplingProgress>, ProviderError> {
+        if self.progress.finished {
+            return Ok(None);
+        }
+        // 0. the references (module doc)
+        if !self.refs.is_empty() {
+            self.progress.stage = "references";
+            return self.reference_step(teacher, surrogate, should_abort);
+        }
+        self.progress.stage = MIGRATION_STAGE;
+        // the end
+        let i = self.log.cursor;
+        if i >= self.source_samples.len() {
+            self.log.state = MigrationState::Complete;
+            self.write_log()?;
+            self.progress.finished = true;
+            self.progress.stage = "done";
+            return Ok(None);
+        }
+        let old = self.source_samples[i].clone();
+        let code = self.source_codes.get(i).copied().unwrap_or(0);
+        // 1. no solve needed to refuse
+        if !is_collection_code(code) {
+            return self.not_migrated(i, format!("its status code {code} is not one a collection holds"));
+        }
+        if old.multiplicity_forced {
+            return self.not_migrated(i, "its scene forced the multiplicity (never shared)".into());
+        }
+        if no_neighbours(&old.sample.pos, self.r_cut) {
+            return self.not_migrated(i, ::surrogate::collection::REFUSE_LONE.into());
+        }
+        let scene = match self.scene_of(&old) {
+            Ok(s) => s,
+            Err(why) => return self.not_migrated(i, why),
+        };
+        let want = surrogate.collection().map(|c| c.key.clone());
+        let got = surrogate.provenance_for(&scene).surface_key();
+        if want.as_ref() != Some(&got) {
+            let d = want.as_ref().and_then(|w| w.difference(&got)).unwrap_or_else(|| "no collection is attached".into());
+            return self.not_migrated(i, format!("its scene is not on the collection's surface ({d})"));
+        }
+        // 2. the cold solve
+        let started = Instant::now();
+        let r = {
+            let t: &mut dyn ForceProvider = match &mut teacher {
+                Some(t) => &mut **t,
+                None => surrogate.teacher_mut(),
+            };
+            t.reset();
+            t.evaluate(&scene, should_abort)
+        };
+        let r = match r {
+            Err(ProviderError::Cancelled) => return Err(ProviderError::Cancelled),
+            Err(e @ ProviderError::Solver(sim::SolverError::Device(_))) => return Err(e),
+            Err(e) => return self.not_migrated(i, format!("the cold solve failed: {e}")),
+            Ok(r) => r,
+        };
+        self.walls.push(started.elapsed().as_secs_f64());
+        self.progress.last_energy = r.energy;
+        // 3. the checks
+        if let Err(why) = check_solve(&r, old.sample.z.len(), self.h, old.multiplicity) {
+            return self.not_migrated(i, why);
+        }
+        // 4. classify, append
+        let class = classify(old.sample.energy, &old.sample.forces, r.energy, r.stats.energy.internal, &r.forces);
+        let mut cs = old.clone();
+        if class != MigrationClass::Unchanged {
+            cs.sample.energy = r.energy;
+            cs.sample.forces = r.forces.clone();
+        }
+        let new_code = migrated_code(code, class);
+        surrogate.take_migrated(cs, new_code).map_err(|e| ProviderError::Invalid(format!("re-solving: the new collection could not be written ({e}) — the pass stops; it resumes from sample {i}")))?;
+        #[cfg(test)]
+        if self.crash_after_append == Some(i) {
+            return Err(ProviderError::Invalid(format!("re-solving: injected crash after sample {i}'s append")));
+        }
+        if class == MigrationClass::Unchanged {
+            let (e, f) = self.log.class_u_max;
+            self.log.class_u_max = ((r.energy - old.sample.energy).abs().max(e), max_force_diff(&old.sample.forces, &r.forces).max(f));
+        }
+        self.log.counts[class.index()] += 1;
+        self.log.cursor = i + 1;
+        self.write_log()?;
+        self.progress.done += 1;
+        Ok(Some(self.progress()))
+    }
+}
+
+/// The display-only bond verdicts a collection folder may hold (`app::bond_experience::FILE_NAME`; spec §7.5: copied).
+pub const BOND_EXPERIENCE_FILE: &str = "bond_experience.txt";
+
+/// The checks of a cold solve (module doc, 3.): `Err` with the reason a sample is not migrated.
+fn check_solve(r: &ForceResult, n: usize, h: f64, recorded: Option<u32>) -> Result<(), String> {
+    if r.forces.len() != n {
+        return Err(format!("the solve returned {} forces for {n} nuclei", r.forces.len()));
+    }
+    if !r.energy.is_finite() || !r.stats.energy.internal.is_finite() || r.forces.iter().flatten().any(|x| !x.is_finite()) {
+        return Err("the solve returned a non-finite energy or force".into());
+    }
+    if let Some(why) = r.stats.untrainable() {
+        return Err(format!("the solve is not trained on ({why})"));
+    }
+    if !r.stats.warnings.is_empty() {
+        return Err(format!("the solve warned: {}", r.stats.warnings.join("; ")));
+    }
+    let limit = box_affected_face_density(h);
+    match r.stats.face_density {
+        None => return Err("box status unknown (the solve reported no face density)".into()),
+        Some(f) if !(f <= limit) => return Err(format!("box-affected: face density {f:.2e} e/Bohr³ above the box rule's {limit:.2e} at h = {h}")),
+        Some(_) => {}
+    }
+    if let Some(m) = recorded {
+        if r.stats.multiplicity != Some(m) {
+            let got = r.stats.multiplicity.map_or("an unreported multiplicity".to_string(), |g| format!("multiplicity {g}"));
+            return Err(format!("solved at {got}, recorded {m}"));
+        }
+    }
+    Ok(())
+}

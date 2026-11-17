@@ -1417,8 +1417,14 @@ impl Collection {
         }
     }
 
-    /// Records a later quarantine change of sample `index` (a status record; module doc).
+    /// Records a later quarantine change of sample `index` (a status record; module doc). Only a code a collection
+    /// may hold ([`crate::quarantine::is_collection_code`]: 0–3, 7, 8 and 9) is written; any other — the provider's own
+    /// 5 and 6, the draft code 4 that a sample's tag carries — is refused, nothing written (plan 2026-11-13 Task 14,
+    /// with the first code-9 writer).
     pub fn set_status(&mut self, index: usize, code: u8) -> Result<(), String> {
+        if !crate::quarantine::is_collection_code(code) {
+            return Err(format!("status code {code} is not one a collection holds (0–3, 7, 8 or 9)"));
+        }
         self.writable()?;
         if index >= self.samples.len() {
             return Err(format!("no sample {index} (the collection holds {})", self.samples.len()));
@@ -2038,6 +2044,31 @@ mod tests {
         drop((c, other));
         let (c, _) = Collection::open(&dir, &key).unwrap();
         assert_eq!(c.read_refit_times().as_deref(), Some("c\n"));
+    }
+
+    /// Plan 2026-11-13 Task 14 (with the first code-9 writer; Task 13 review concern 6): `set_status` writes only a
+    /// code a collection holds (`is_collection_code`: 0–3, 7, 8, 9) — the draft code 4 and the provider's own 5 and 6 are
+    /// refused with nothing written, and code 9 is written and read back.
+    #[test]
+    fn set_status_writes_collection_codes_only() {
+        let dir = root("status-guard");
+        let key = prov().surface_key();
+        {
+            let (mut c, _) = Collection::open(&dir, &key).unwrap();
+            for i in 0..2 {
+                c.append(cs(i)).unwrap();
+            }
+            let before = std::fs::read(dir.join(key.slug()).join("samples.bin")).unwrap();
+            for code in [Q_DRAFT, 5, 6, 10, 255] {
+                let e = c.set_status(1, code).expect_err("not a collection code");
+                assert!(e.contains(&format!("status code {code} is not one a collection holds")), "{e}");
+            }
+            assert_eq!(std::fs::read(dir.join(key.slug()).join("samples.bin")).unwrap(), before, "nothing written");
+            assert_eq!(c.quarantine, vec![Q_NONE, Q_NONE]);
+            c.set_status(1, crate::quarantine::Q_RESOLVED).unwrap();
+        }
+        let (c, _) = Collection::open(&dir, &key).unwrap();
+        assert_eq!(c.quarantine, vec![Q_NONE, crate::quarantine::Q_RESOLVED]);
     }
 
     /// Appends, status updates, references and the history survive a reopen bit-exactly.
