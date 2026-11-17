@@ -215,8 +215,11 @@ windows. Revisit only if a measured frame cost says so.
   - With the cell as its own window, "covered" = taught. The pair planner's extra "count ≥ 1" holds automatically.
   - The same N_T, `reads_taught` and `taught_count` are reused. There is no new constant.
 - **Missing within reach** (grey outline): n = 0, and the cell lies in the type's **reach**. The reach is derived from
-  the map's own fitted pair histograms; no table, no constant beyond r_cut and `SCAN_CUTOFF_FRACTION`. A cell
-  (r₁, r₂, u), judged at its centre, is in reach when:
+  the map's own fitted pair histograms; no table, no constant beyond r_cut and `SCAN_CUTOFF_FRACTION`. It reads a
+  span for every pair met with a training atom (each pair the fitted samples hold within r_cut where at least one of
+  the two atoms trains), a superset of the pair graph's rows, equal on those: so a neighbour species that only ever
+  appears capped can be in reach without having a pair-graph row. A cell (r₁, r₂, u), judged at its centre, is in
+  reach when:
   1. r₁ lies in the c–a pair's taught range (`taught_range`: from the first filled bin to the last) and
      r₁ ≤ 5/6·r_cut;
   2. r₂ lies in the c–b pair's taught range and r₂ ≤ 5/6·r_cut;

@@ -120,3 +120,44 @@ fn a_pending_only_rebuild_reuses_the_fitted_block() {
     assert!(m2.types.iter().all(|k| k.pending_samples == 0));
     assert!(SurrogateKs::new(Box::new(PairMorse(MorseDimer::h2())), FallbackPolicy::default()).triple_map().is_none(), "no model, no map");
 }
+
+/// A sample excluded inside the fitted prefix (a `Q_FORGOTTEN` code on a fitted CH₄, no refit
+/// since) is counted nowhere: the map is the brute count of the fitted samples without it.
+#[test]
+fn a_sample_excluded_inside_the_fitted_prefix_is_not_counted() {
+    let mut s = h2_and_ch4(120, 200);
+    let fitted: Vec<usize> = (0..s.accumulated).filter(|&i| !s.excluded(i) && !s.in_misfit(i)).collect();
+    let gone = *fitted.iter().rev().find(|&&i| s.store.as_ref().unwrap().samples[i].z.len() == 5).expect("a fitted CH₄");
+    assert!(gone < s.accumulated, "premise: inside the fitted prefix");
+    let n = s.samples();
+    s.quarantine.resize(n, Q_NONE);
+    s.quarantine[gone] = Q_FORGOTTEN;
+    let m = s.triple_map().expect("a fitted model");
+    let kept: Vec<usize> = fitted.iter().copied().filter(|&i| i != gone).collect();
+    let bf = brute(&s, &kept);
+    assert_eq!(m.types.iter().map(|k| k.t).collect::<BTreeSet<_>>(), bf.keys().copied().collect());
+    for k in &m.types {
+        let (fc, fs) = bf.get(&k.t).cloned().unwrap();
+        assert_eq!((&k.counts[..], k.samples), (&fc[..], fs), "fitted {:?}", k.t);
+        assert_eq!(k.pending_samples, 0, "an excluded sample is not pending either");
+    }
+}
+
+/// A Forget (a fitted sample set to `Q_FORGOTTEN`) changes the fitted indices, so the cached
+/// fitted block is dropped and recounted without it.
+#[test]
+fn a_forget_invalidates_the_cached_fitted_block() {
+    let mut s = h2_and_ch4(120, 200);
+    let t = TripleType::new(6, 1, 1);
+    let m0 = s.triple_map().unwrap();
+    let fitted: Vec<usize> = (0..s.accumulated).filter(|&i| !s.excluded(i) && !s.in_misfit(i)).collect();
+    let gone = *fitted.iter().find(|&&i| s.store.as_ref().unwrap().samples[i].z.len() == 5).expect("a fitted CH₄");
+    let n = s.samples();
+    s.quarantine.resize(n, Q_NONE);
+    s.quarantine[gone] = Q_FORGOTTEN;
+    let m1 = s.triple_map().unwrap();
+    let (k0, k1) = (m0.get(t).unwrap(), m1.get(t).unwrap());
+    assert!(!Arc::ptr_eq(&k0.counts, &k1.counts), "a Forget recounts the fitted block");
+    assert!(k1.triples < k0.triples, "fewer H–C–H triples: {} → {}", k0.triples, k1.triples);
+    assert_eq!((k0.triples - k1.triples, k0.samples - k1.samples), (6, 1), "one CH₄'s six H–C–H");
+}
