@@ -475,8 +475,9 @@ pub fn show(ui: &mut Ui, view: &mut TripleView, cache: &mut ClassCache, input: &
         }
         None => resp,
     };
-    // a double-click's second click resets the view (above): it does not pick again under it
-    if resp.clicked() && !resp.double_clicked() {
+    // a double-click's second click resets the view (above): it does not pick again under it, nor
+    // does a third quick click (egui reports that one as a triple click) under the reset view
+    if resp.clicked() && !resp.double_clicked() && !resp.triple_clicked() {
         view.cell = resp.interact_pointer_pos().and_then(|at| hit(drawn, at)).map(|c| g.coords(c));
     }
     let ((a1, b1), (a2, b2)) = ((g.r_edges(rows.start).0, g.r_edges(rows.end - 1).1), (g.r_edges(slices.start).0, g.r_edges(slices.end - 1).1));

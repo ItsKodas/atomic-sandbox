@@ -761,7 +761,7 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
         let mut last_side = None;
         while Instant::now() < end {
             let left = end.saturating_duration_since(Instant::now());
-            if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_timeout(left) {
+            if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_or_gone(left)? {
                 viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
                 if let Some(s) = viewer.snapshot.as_ref().filter(|s| !s.dynamics.paused) {
                     let d = &s.dynamics;
@@ -904,7 +904,7 @@ fn wait_for_orbitals(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) 
         if left.is_zero() {
             return Err("no orbital payload answering the view within 600 s".into());
         }
-        if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_timeout(left.min(Duration::from_secs(1))) {
+        if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_or_gone(left.min(Duration::from_secs(1)))? {
             viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
         }
         if let Some(l) = viewer.orbitals.label(&viewer.ui, viewer.snapshot.as_ref()).filter(|l| l == crate::viewer::ORBITALS_CPU_TEACHER || l == crate::viewer::ORBITALS_NO_ELECTRONS) {
@@ -927,7 +927,7 @@ fn wait_for_relax(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> 
         if left.is_zero() {
             return Err("the relax did not end within 1800 s".into());
         }
-        if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_timeout(left.min(Duration::from_secs(1))) {
+        if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_or_gone(left.min(Duration::from_secs(1)))? {
             viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
         }
     }
@@ -977,7 +977,7 @@ fn wait_for_bonds(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> 
         if left.is_zero() {
             return Err("no bond graph within 600 s".into());
         }
-        if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_timeout(left.min(Duration::from_secs(1))) {
+        if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_or_gone(left.min(Duration::from_secs(1)))? {
             viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
         }
     }
@@ -994,7 +994,7 @@ pub fn wait_for_first_solve(
             .sim
             .as_ref()
             .ok_or("no worker")?
-            .recv_timeout(Duration::from_secs(600))
+            .recv_or_gone(Duration::from_secs(600))?
             .ok_or("no solve within 600 s")?;
         let done = matches!(ev, SimEvent::Busy(false));
         viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
@@ -1029,7 +1029,7 @@ fn wait_for_sampling(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter, 
             .sim
             .as_ref()
             .ok_or("no worker")?
-            .recv_timeout(Duration::from_secs(600))
+            .recv_or_gone(Duration::from_secs(600))?
             .ok_or("no sampling pass within 600 s")?;
         viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
         if viewer.snapshot.as_ref().is_some_and(|s| s.backend != Backend::Estimated) {
@@ -1048,7 +1048,7 @@ fn wait_for_fitted(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) ->
             eprintln!("model fitted: {} samples, trusted {}{}", m.samples, m.trusted, m.untrusted_reason.as_deref().map_or(String::new(), |r| format!(" ({r})")));
             return Ok(());
         }
-        let ev = viewer.sim.as_ref().ok_or("no worker")?.recv_timeout(Duration::from_secs(900)).ok_or("no sampling progress within 900 s")?;
+        let ev = viewer.sim.as_ref().ok_or("no worker")?.recv_or_gone(Duration::from_secs(900))?.ok_or("no sampling progress within 900 s")?;
         viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
         if viewer.snapshot.as_ref().is_some_and(|s| s.backend != Backend::Estimated) {
             return Err("wait=model needs the estimated solver (--estimated)".into());
@@ -1095,7 +1095,7 @@ fn wait_for_model(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> 
             .sim
             .as_ref()
             .ok_or("no worker")?
-            .recv_timeout(Duration::from_secs(600))
+            .recv_or_gone(Duration::from_secs(600))?
             .ok_or("no sampling progress within 600 s")?;
         viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
         if viewer.snapshot.as_ref().is_some_and(|s| s.backend != Backend::Estimated) {

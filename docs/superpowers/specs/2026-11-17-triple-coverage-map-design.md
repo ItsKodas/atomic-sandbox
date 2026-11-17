@@ -337,8 +337,9 @@ windows. Revisit only if a measured frame cost says so.
   - A click hit-tests front to back on each cube's projected hull and picks the front-most cell, which opens the cell
     card with its count and **Teach this cell**: the mockup the user saw.
   - The cloud is drawn with `egui::Painter` shapes only (§5 D).
-- **The cell card** reads, for example: "H–O–H · r₁ 1.8–2.1, r₂ 1.8–2.1 Bohr, θ 102–114° · 342 arrangements in 120
-  samples · taught · +12 new". It then shows Teach this cell, or "Teach 6 cells …" when a 2D selection exists, and the
+- **The cell card** reads, for example: "H–O–H · r₁ 1.8–2.1, r₂ 1.8–2.1 Bohr, θ 102–114° · 342 arrangements ·
+  taught · +12 new" — no per-cell sample count (that would need a second dense array with per-sample deduplication); the
+  section's head keeps the type's sample count (plan, "Spec questions settled" 5). It then shows Teach this cell, or "Teach 6 cells …" when a 2D selection exists, and the
   band (§6.7).
 
 ### 6.6 Teach: what is reused from targeted teach, and what is new
