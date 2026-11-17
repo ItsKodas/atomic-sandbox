@@ -1132,9 +1132,20 @@ pub trait Trainable {
     fn first_fit_ready(&self) -> bool {
         false
     }
+    /// The Retry of a model whose fit did not form, when every reference is in (a fit can form from
+    /// the samples held): instead of [`retry_fit`](Self::retry_fit)'s fit in place, the provider
+    /// leaves it to the caller, who starts it in the background — `true`, and
+    /// [`first_fit_ready`](Self::first_fit_ready) says so from now on. `false` (nothing changed):
+    /// not that case — a reference missing, too few samples, a model, a pass or refit running —
+    /// and `retry_fit` decides. The default: never.
+    fn request_first_fit(&mut self) -> bool {
+        false
+    }
     /// A background refit's state; `Done` once it is installed, with [`refit`](Self::refit)'s
-    /// outcome; `Discarded` when what changed while it ran was more than appended data (it is due
-    /// again). Default: `Idle`.
+    /// outcome; `Discarded` when what changed while it ran was more than appended data. The
+    /// provider calls a discarded refit due again (`pending_refit`); the worker then makes **one**
+    /// more attempt on the same data and otherwise waits for new data (`app::worker`, "Refits").
+    /// Default: `Idle`.
     fn poll_refit_background(&mut self) -> RefitPoll {
         RefitPoll::Idle
     }

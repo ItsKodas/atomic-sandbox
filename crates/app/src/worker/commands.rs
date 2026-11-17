@@ -494,8 +494,16 @@ impl Worker {
                     // the automatic pass's sizing is for that pass only
                     self.sizing = None;
                 }
-                self.dy.apply(c);
-                if takes_over && self.dy.snapshot().last_rejection.is_none() && trainable(&mut self.dy).is_some() {
+                // the Retry of a fit whose references are all in: the first fit, in the background
+                // (`refit_if_pending`), never in place on this thread (quiet refits, fix round 1)
+                let background_retry = matches!(c, DynCommand::RetryFit) && trainable(&mut self.dy).is_some_and(|t| t.request_first_fit());
+                if background_retry {
+                    (self.refit_done_gen, self.refit_discarded_gen) = (None, None);
+                    self.dy.add_note("retry: the fit runs in the background — Play once it lands".into());
+                } else {
+                    self.dy.apply(c);
+                }
+                if takes_over && (background_retry || self.dy.snapshot().last_rejection.is_none()) && trainable(&mut self.dy).is_some() {
                     if leaves_collection {
                         self.use_collection = false;
                     }

@@ -1941,7 +1941,25 @@ impl SurrogateKs {
     /// (`first_fit_background`), no model formed yet, no pass or refit runs, and a fit can form
     /// from the samples held (the "No model yet" state whose Retry would fit at once).
     pub fn first_fit_ready(&self) -> bool {
-        self.first_fit_due && self.model.is_none() && self.pass.is_none() && self.background.is_none() && self.no_model().is_some_and(|nm| nm.retry && nm.missing.is_empty())
+        self.first_fit_due && self.first_fit_can_form()
+    }
+
+    /// No model, no pass or refit running, and a fit can form from the samples held now.
+    fn first_fit_can_form(&self) -> bool {
+        self.model.is_none() && self.pass.is_none() && self.background.is_none() && self.no_model().is_some_and(|nm| nm.retry && nm.missing.is_empty())
+    }
+
+    /// `Trainable::request_first_fit`: the Retry of a fit that can form now is left to the caller
+    /// (in the background) — `first_fit_due` — instead of [`retry_fit`](Self::retry_fit)'s fit in
+    /// place; `false`, nothing changed, otherwise.
+    pub fn request_first_fit(&mut self) -> bool {
+        if !self.first_fit_can_form() {
+            return false;
+        }
+        self.first_fit_due = true;
+        // due: the caller starts it (no change of what it fits — the caller counts the Retry)
+        self.pending_refit = true;
+        true
     }
 
     /// The user's Forget / Restore changes no fit holds yet (2026-11-14, the batched forget): made
@@ -3276,6 +3294,10 @@ impl Trainable for SurrogateKs {
         SurrogateKs::first_fit_ready(self)
     }
 
+    fn request_first_fit(&mut self) -> bool {
+        SurrogateKs::request_first_fit(self)
+    }
+
     fn poll_refit_background(&mut self) -> sim::RefitPoll {
         match self.poll_background_refit() {
             BackgroundPoll::Idle => sim::RefitPoll::Idle,
@@ -3699,6 +3721,10 @@ impl SurrogateKs {
                 missing,
             });
         }
+        // the first fit running in the background (quiet refits 2026-11-17): no Retry meanwhile
+        if self.background.is_some() {
+            return Some(NoModel { words: format!("no model yet: the first fit of the {n} samples is running in the background — Play once it lands"), retry: false, missing });
+        }
         let words = match &self.last_fit_error {
             Some(e) => format!("no model yet: the fit failed ({e}) — Retry fits the {n} samples again"),
             None => format!("no model yet: the {n} samples are not fitted — Retry fits them"),
@@ -3717,6 +3743,9 @@ impl SurrogateKs {
     pub fn retry_fit(&mut self, scene: &Scene, refs: &mut AtomReferences) -> Result<bool, String> {
         if self.pass.is_some() {
             return Err("a pass is already running (cancel it first)".into());
+        }
+        if self.background.is_some() {
+            return Err("the fit is running in the background — Play once it lands".into());
         }
         let Some(nm) = self.no_model() else {
             return Err(if self.model.is_some() { "the model is fitted".into() } else { "no samples yet: start sampling".into() });

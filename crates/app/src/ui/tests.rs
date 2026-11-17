@@ -1234,6 +1234,31 @@ fn clicking_the_model_tab_keeps_the_two_click_confirms() {
     assert_eq!(st.plan.seed, seed + 1);
 }
 
+/// Quiet refits fix round 1: while the first fit of an attached collection runs in the background
+/// (no model yet, a refit running) Play is refused with "the model's first fit is running — Play
+/// once it lands", not the no-model words; a plain no-model state keeps them.
+#[test]
+fn play_waits_for_the_first_fit() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let running = ModelStatus { fitted: false, trusted: false, fit: None, samples: 1627, refit_running: true, no_model: Some("no model yet: the first fit of the 1627 samples is running in the background — Play once it lands".into()), ..model() };
+    assert!(running.first_fit_running());
+    let snap = snapshot(&scene, Backend::Estimated, Some(running));
+    let inp = input(&scene, Some(&snap), &cam);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    let out = act(&mut st, &inp, Action::Play);
+    assert!(out.commands.is_empty(), "{:?}", out.commands);
+    assert_eq!(out.error.as_deref(), Some(crate::sim::FIRST_FIT_PLAY));
+    // no model and none coming: the old words
+    let none = ModelStatus { fitted: false, trusted: false, fit: None, samples: 0, ..model() };
+    assert!(!none.first_fit_running());
+    let snap = snapshot(&scene, Backend::Estimated, Some(none));
+    let inp = input(&scene, Some(&snap), &cam);
+    let out = act(&mut st, &inp, Action::Play);
+    assert!(out.error.as_deref().is_some_and(|e| e.contains("no model to play on")), "{:?}", out.error);
+}
+
 /// The 2026-10-20 PH₃ data loss: samples held but no model formed — the Model tab shows the reason
 /// and its Retry sends `RetryFit`, and so does the Activity tab's trust group.
 #[test]

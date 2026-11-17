@@ -407,6 +407,10 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         Trainable::first_fit_ready(&*self.lock())
     }
 
+    fn request_first_fit(&mut self) -> bool {
+        Trainable::request_first_fit(&mut *self.lock())
+    }
+
     fn forget(&mut self) {
         Trainable::forget(&mut *self.lock())
     }

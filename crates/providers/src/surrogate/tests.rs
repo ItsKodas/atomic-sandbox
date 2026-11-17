@@ -9668,6 +9668,9 @@ fn a_deferred_first_fit_runs_in_the_background_and_counts_no_change_of_its_own()
     let (g, n) = (s.fit_inputs_gen(), s.samples());
     assert!(s.begin_background_refit(), "the first fit starts in the background");
     assert!(!Trainable::first_fit_ready(&s) && !Trainable::status(&s, &h2(1.4), &[[0.0; 3]; 2]).retry_fit, "running: neither again nor a Retry");
+    assert!(s.no_model().is_some_and(|n| n.words.contains("first fit") && n.words.contains("is running") && !n.retry), "{:?}", s.no_model().map(|n| n.words));
+    let mut refs = sim::AtomReferences::default();
+    assert!(s.retry_fit(&h2(1.4), &mut refs).is_err_and(|e| e.contains("running in the background")), "an explicit Retry never fits in place meanwhile");
     let r = s.evaluate(&h2_at(1.45, &mut rng), &mut never()).unwrap();
     assert_eq!(r.stats.source, Source::Fallback, "no model yet: the teacher answers");
     assert_eq!((s.samples(), s.fit_inputs_gen()), (n + 1, g + 1), "kept: one change of what a refit fits");
@@ -9680,10 +9683,22 @@ fn a_deferred_first_fit_runs_in_the_background_and_counts_no_change_of_its_own()
     assert!(s.fitted() && s.pending_refit(), "installed; the sample kept meanwhile is the next refit's");
     assert_eq!(s.fit_inputs_gen(), g + 1, "the install is no change of what a refit fits");
     assert!(!Trainable::first_fit_ready(&s));
+    // the Retry route (`request_first_fit`): only with no model and a fit that can form
+    assert!(!Trainable::request_first_fit(&mut s), "a model stands: nothing to request");
     // without the switch: fitted in place by the attach, as before
     let (mut t, _) = pair_student();
     t.attach_collection(&dir, &h2(1.4)).unwrap();
     assert!(t.fitted() && !Trainable::first_fit_ready(&t), "{:?}", t.no_model().map(|n| n.words));
+    // a provider that attached without fitting and was not left the first fit (no switch, a fit
+    // that failed): the Retry hands it to the caller, in the background
+    let (mut u, _) = pair_student();
+    Trainable::set_first_fit_background(&mut u, true);
+    u.attach_collection(&dir, &h2(1.4)).unwrap();
+    u.first_fit_due = false;
+    assert!(!Trainable::first_fit_ready(&u));
+    assert!(Trainable::request_first_fit(&mut u) && Trainable::first_fit_ready(&u) && u.pending_refit());
+    assert!(u.begin_background_refit());
+    assert!(matches!(u.finish_background_refit(), BackgroundPoll::Installed(Ok(_))) && u.fitted());
 }
 
 // ---- the body-4 degree grown with the store (spec 2026-11-13 §4.1) ----

@@ -1479,7 +1479,8 @@ impl Viewer {
     /// Play ↔ Pause (the panel button and the Space key).
     pub fn toggle_play(&mut self) {
         if !self.playing && self.estimated_without_model() {
-            self.ui.set_status(NO_MODEL_PLAY.to_string());
+            let first_fit = self.snapshot.as_ref().and_then(|s| s.model.as_ref()).is_some_and(|m| m.first_fit_running());
+            self.ui.set_status(if first_fit { crate::sim::FIRST_FIT_PLAY } else { NO_MODEL_PLAY }.to_string());
             return;
         }
         let c = if self.playing {
@@ -1535,7 +1536,10 @@ impl Viewer {
             return;
         }
         let held = self.snapshot.as_ref().and_then(|s| s.model.as_ref()).is_some_and(|m| m.no_model.is_some());
-        let why = if self.estimated_without_model() && held {
+        let first_fit = self.snapshot.as_ref().and_then(|s| s.model.as_ref()).is_some_and(|m| m.first_fit_running());
+        let why = if self.estimated_without_model() && first_fit {
+            Some("paused: the model's first fit is running — Play once it lands")
+        } else if self.estimated_without_model() && held {
             // samples held, the fit did not form (a reference that did not solve): the tab says why
             Some("paused: the estimated solver has no model yet — the Model tab says why and offers Retry (the samples are kept)")
         } else if self.estimated_without_model() {

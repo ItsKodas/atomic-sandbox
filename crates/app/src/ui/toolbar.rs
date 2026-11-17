@@ -688,7 +688,9 @@ fn time_buttons(ui: &mut Ui, st: &UiState, input: &PanelInput<'_>, sampling: boo
     } else {
         icons::text_button(ui, icon, label, 84.0, true, play_ok).on_hover_text("Space")
     };
-    let busy_tip = if no_model && !sampling {
+    let busy_tip = if no_model && !sampling && input.model().is_some_and(|m| m.first_fit_running()) {
+        crate::sim::FIRST_FIT_PLAY
+    } else if no_model && !sampling {
         "the estimated solver has no model to play on: load one (File ▸ Open) or press Start sampling in the Model tab"
     } else if relaxing {
         RELAXING_TIP
