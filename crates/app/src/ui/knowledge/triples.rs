@@ -3,9 +3,10 @@
 //! shipped in `ActivityDelta::triples` and kept in `ActivityState::triples`).
 //!
 //! - **The fold** sits under the card of the pick, closed by default (`Sections::triples`, kept in
-//!   the profile). Open with the panel shown, the UI sends `Command::SetTripleView(true)` and the
-//!   worker builds the map on the knowledge map's schedule; hidden or folded, `false`, and the
-//!   map stops updating (`ui::show`, beside `SetActivityViews`).
+//!   the profile). With the panel shown and the fold open or a type picked (its card is live), the
+//!   UI sends `Command::SetTripleView(true)` and the worker builds the map on the knowledge map's
+//!   schedule; otherwise `false`, and the map stops updating ([`wanted`], sent by `ui::show`
+//!   beside `SetActivityViews`).
 //! - **The picker** lists the types the fitted or new samples hold ([`picker_rows`]): most gaps
 //!   first, then fewest arrangements, then by name ([`order`]); a dot marks the types the open
 //!   scene has ([`scene_types`]). A click picks the type ([`Pick::Triple`]); with nothing picked
@@ -30,6 +31,13 @@ use egui::{pos2, vec2, FontId, RichText, Sense, Stroke, Ui};
 use sim::knowledge::{each_triple, summary, TripleKnowledge, TripleMap, TripleType};
 use std::collections::BTreeSet;
 use std::sync::Arc;
+
+/// Whether the worker should build the three-atom map: the Knowledge panel is shown and the
+/// section is open or a picked type's card is (review I1: a picked card closed under its fold
+/// must not freeze).
+pub fn wanted(st: &UiState) -> bool {
+    st.tab_shown(DockTab::Knowledge) && (st.knowledge_sections.triples || matches!(st.knowledge.pick, Pick::Triple(_)))
+}
 
 /// The section's title.
 pub const TITLE: &str = "Three-atom arrangements";
@@ -176,7 +184,7 @@ pub fn verdict_line(keys: &[(&str, &sim::SpeciesVerdict)]) -> Option<String> {
     let state = match s.refusal {
         _ if s.trusted => "trusted".to_string(),
         Some((sim::ClassKey::Samples, n, q)) => format!("{n:.0} of {q:.0} samples — the per-environment sample floor, not this map"),
-        _ => "not yet trusted — its measured errors, not this map".to_string(),
+        _ => "not yet trusted — its error checks, not this map".to_string(),
     };
     let more = if keys.len() > 1 { format!(" (+ {} more)", keys.len() - 1) } else { String::new() };
     Some(format!("the model's {class} key {}: {state}{more}", s.words()))
@@ -214,8 +222,7 @@ pub fn card_head(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, map: &Tr
 /// The detail area's card for a picked type ([`Pick::Triple`]): its head, or a plain note.
 pub fn detail(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, t: TripleType) {
     let Some(map) = map_of(st, input) else {
-        let text = if st.knowledge_sections.triples { BUILDING } else { "the three-atom map is built while Three-atom arrangements (below) is open" };
-        theme::note(ui, text);
+        theme::note(ui, BUILDING);
         return;
     };
     match map.get(t).filter(|k| k.samples > 0 || k.pending_samples > 0) {
@@ -231,9 +238,8 @@ pub fn detail(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, t: TripleTy
 pub fn section(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, r_cut: f64) {
     ui.add_space(8.0);
     let open = st.knowledge_sections.triples;
-    let (h, _) = theme::fold_header(ui, TITLE, open, Some((format!("neighbours within {r_cut:.1} Bohr"), theme::INK_FAINT)), None, false);
+    let (h, _) = keyed(ui, "knowledge-triple-fold", |ui| theme::fold_header(ui, TITLE, open, Some((format!("neighbours within {r_cut:.1} Bohr"), theme::INK_FAINT)), None, false));
     probe("knowledge-triple-fold", &h);
-    let h = h.on_hover_text("which angles the model was taught: for each centre and two of its neighbours within the model's cutoff, the distances and the angle at the centre its samples held. Open, the worker builds the map (and keeps it current while it stays open)");
     if h.clicked() {
         st.knowledge_sections.triples = !open;
     }
@@ -270,8 +276,7 @@ fn picker(ui: &mut Ui, st: &mut UiState, rows: &[PickerRow], shown: Option<Tripl
         let resp = keyed(ui, &name, |ui| picker_row(ui, r, shown == Some(r.t)));
         probe(&name, &resp);
         if resp.clicked() {
-            st.knowledge.pick = Pick::Triple(r.t);
-            st.knowledge.triple.want_centre = None;
+            st.knowledge.set_pick(Pick::Triple(r.t));
         }
     }
 }
@@ -340,7 +345,7 @@ pub fn element_links(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, z: u
             let r = keyed(ui, &name, |ui| ui.link(RichText::new(triple_name(t)).monospace().size(11.5))).on_hover_text("its card, and Three-atom arrangements below");
             probe(&name, &r);
             if r.clicked() {
-                st.knowledge.pick = Pick::Triple(t);
+                st.knowledge.set_pick(Pick::Triple(t));
                 st.knowledge_sections.triples = true;
             }
         }

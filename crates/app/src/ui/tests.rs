@@ -8653,13 +8653,19 @@ mod knowledge_map {
         let inp = input(&scene, Some(&snap), &cam);
         let ctx = egui::Context::default();
         apply_theme(&ctx);
-        for pick in [Pick::Pair(1, 1), Pick::Pair(6, 6), Pick::Element(6)] {
+        for pick in [Pick::Pair(1, 1), Pick::Pair(6, 6), Pick::Element(6), Pick::Triple(sim::knowledge::TripleType::new(8, 1, 1))] {
             let mut st = UiState::new("h2o", &scene);
             st.backend = Backend::Estimated;
             st.activity.absorb(&snap);
             st.workspace.set_node(super::super::workspace::layout::parse("H(0.7714,3D,[Knowledge*])").unwrap());
             st.knowledge.pick = pick;
             st.knowledge_sections.why = true;
+            let triple = matches!(pick, Pick::Triple(_));
+            if triple {
+                // the three-atom section open, its picker and the picked type's card
+                st.activity.triples = Some(Arc::new(knowledge::fixture_triples()));
+                st.knowledge_sections.triples = true;
+            }
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 3000.0));
             let mut shapes = Vec::new();
             PROBES.with(|p| p.borrow_mut().clear());
@@ -8673,15 +8679,19 @@ mod knowledge_map {
             }
             let panel = probed_rect("knowledge-panel");
             assert!((panel.width() - 320.0).abs() < 24.0, "{panel:?}");
-            let mut parts = vec!["knowledge-chip", "knowledge-count-2", "knowledge-map", "knowledge-ask-6-6", "knowledge-card"];
+            let card = if triple { "knowledge-triple-head" } else { "knowledge-card" };
+            let mut parts = vec!["knowledge-chip", "knowledge-count-2", "knowledge-map", "knowledge-ask-6-6", card];
             if matches!(pick, Pick::Pair(..)) {
                 parts.extend(["knowledge-teach", "knowledge-histogram"]);
+            }
+            if triple {
+                parts.extend(["knowledge-triple-fold", "knowledge-triple-row-1-8-1", "knowledge-triple-row-1-1-8", "knowledge-triple-view"]);
             }
             for p in &parts {
                 let r = probed_rect(p);
                 assert!(r.right() <= panel.right() + 1.0 && r.left() >= panel.left() - 1.0, "{pick:?} {p}: {r:?} outside {panel:?}");
             }
-            assert!(probed_rect("knowledge-map").bottom() <= probed_rect("knowledge-ask-6-6").top() && probed_rect("knowledge-ask-6-6").bottom() <= probed_rect("knowledge-card").top(), "{pick:?}: stacked");
+            assert!(probed_rect("knowledge-map").bottom() <= probed_rect("knowledge-ask-6-6").top() && probed_rect("knowledge-ask-6-6").bottom() <= probed_rect(card).top(), "{pick:?}: stacked");
             fn each_text(s: &egui::epaint::Shape, f: &mut dyn FnMut(&egui::epaint::TextShape)) {
                 match s {
                     egui::epaint::Shape::Text(t) => f(t),
@@ -8852,10 +8862,13 @@ mod triple_map {
         st.knowledge.triple.cell = Some((9, 6, 1));
         let (_, more) = run(&ctx, &mut st, &inp);
         assert!(outs.iter().chain(&more).all(|o| o.actions.is_empty() && o.commands.is_empty()), "the mode and a cell are display only");
-        // closing the fold turns it off
+        // a picked type's card stays live with the fold closed (review I1) ...
         let outs = click(&ctx, &mut st, &inp, "knowledge-triple-fold");
         assert!(!st.knowledge_sections.triples);
-        assert_eq!(triple_views(&outs), vec![false]);
+        assert!(triple_views(&outs).is_empty() && st.activity.triples_sent, "the picked card still wants the map");
+        // ... and the map stops once nothing shows it
+        st.knowledge.pick = Pick::None;
+        assert!(matches!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.as_slice(), [Command::SetTripleView(false)]));
     }
 
     /// Review Focus 4: the section says plainly when there is nothing to show, and never panics.
@@ -8968,6 +8981,10 @@ mod triple_map {
         assert_eq!(triples::shown_type(&st.knowledge, &map, &scene_t), Some(TripleType::new(1, 1, 8)), "the H-centred type with the most gaps");
         let (t, _) = run(&ctx, &mut st, &inp);
         assert!(t.contains("arrangements of O–H–H in 140 samples"), "{t}");
+        // another centre moves the default: the O-centred type with the most gaps
+        let mut o = st.knowledge.clone();
+        o.triple.want_centre = Some(8);
+        assert_eq!(triples::shown_type(&o, &map, &scene_t), Some(TripleType::new(8, 1, 1)), "want_centre decides, not the scene's default");
         // the element card: one link per held type centred on it
         st.knowledge_sections.triples = false;
         st.knowledge.pick = Pick::Element(8);
@@ -8988,6 +9005,9 @@ mod triple_map {
         assert_eq!(st.knowledge.triple.want_centre, Some(8));
         assert!(st.knowledge_sections.triples);
         assert_eq!(st.knowledge.pick, Pick::Element(8), "the element card stays");
+        // any other pick forgets the link's centre (review minor 8)
+        click(&ctx, &mut st, &inp, "knowledge-element-1");
+        assert_eq!((st.knowledge.pick, st.knowledge.triple.want_centre), (Pick::Element(1), None));
     }
 
     /// The fold's state is kept in the profile beside "Why thin?"; a new scene keeps the view.
@@ -9010,8 +9030,10 @@ mod triple_map {
         let mut v = knowledge::KnowledgeView::default();
         v.triple.mode = TripleMode::Cloud;
         v.triple.slice = Some(4);
+        v.triple.want_centre = Some(8);
         v.reset_view();
         assert_eq!((v.triple.mode, v.triple.slice), (TripleMode::Cloud, Some(4)), "kept across a new scene");
+        assert_eq!(v.triple.want_centre, None, "an entry link's centre is not");
     }
 }
 

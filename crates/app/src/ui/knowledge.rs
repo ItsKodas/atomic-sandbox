@@ -161,10 +161,17 @@ impl Default for KnowledgeView {
 
 impl KnowledgeView {
     /// A new scene: the graph fits itself again on its next frame (the pick and the three-atom
-    /// view are kept).
+    /// view are kept, but not an entry link's centre: the new scene has its own default).
     pub fn reset_view(&mut self) {
-        let triple = std::mem::take(&mut self.triple);
+        let triple = TripleView { want_centre: None, ..std::mem::take(&mut self.triple) };
         *self = KnowledgeView { pick: self.pick, molecule: self.molecule.take(), triple, ..Default::default() };
+    }
+
+    /// A pick by the user (a line, a node, a chip, a row, a link): an entry link's centre
+    /// (`TripleView::want_centre`) is forgotten, so the section's default follows the new pick.
+    pub fn set_pick(&mut self, pick: Pick) {
+        self.pick = pick;
+        self.triple.want_centre = None;
     }
 }
 
@@ -797,7 +804,7 @@ fn graph(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, size: Vec2) {
     }
     for (pick, r) in &hits {
         if r.clicked() {
-            st.knowledge.pick = *pick;
+            st.knowledge.set_pick(*pick);
         }
     }
     // a click on a line itself (not its label); a double-click away from every line fits
@@ -817,7 +824,7 @@ fn graph(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, size: Vec2) {
     };
     if bg.clicked() {
         if let Some((_, a, b)) = bg.interact_pointer_pos().and_then(near_line) {
-            st.knowledge.pick = Pick::Pair(a, b);
+            st.knowledge.set_pick(Pick::Pair(a, b));
         }
     }
     // (a third quick click counts too: egui reports it as a triple)
@@ -871,7 +878,7 @@ fn scene_asks(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, asks: &BTreeMap
             let r = ui.add(b).on_hover_text(format!("{}: {} · asked now {} Bohr — click for its card", pair_name(z.0, z.1), confidence_word(c), words.join(" · ")));
             super::probe(&format!("knowledge-ask-{}-{}", z.0, z.1), &r);
             if r.clicked() {
-                st.knowledge.pick = Pick::Pair(z.0, z.1);
+                st.knowledge.set_pick(Pick::Pair(z.0, z.1));
             }
         }
     });
@@ -944,7 +951,7 @@ fn molecules(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap) {
             let r = ui.add(b).on_hover_text(molecule_scenes(m));
             super::probe(&molecule_probe(&m.composition), &r);
             if r.clicked() {
-                st.knowledge.pick = Pick::Molecule;
+                st.knowledge.set_pick(Pick::Molecule);
                 st.knowledge.molecule = Some(m.composition.clone());
             }
         }

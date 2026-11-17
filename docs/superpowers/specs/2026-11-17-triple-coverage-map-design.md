@@ -263,8 +263,10 @@ windows. Revisit only if a measured frame cost says so.
   does not rebuild the triple map.
 - **Shipped** as `ActivityDelta::triples: Option<Arc<TripleMap>>`, beside `knowledge`, where `None` means no new
   build.
-  - It is built only while the arrangements view is shown: `Command::SetTripleView(bool)`, sent on a change, as
-    `SetActivityViews` is (`ui/mod.rs:1446-1450`).
+  - It is built only while the arrangements are shown: the Knowledge panel is shown and the section is open or a
+    picked type's card (`Pick::Triple`) is, so a picked card stays live with the fold closed.
+    `Command::SetTripleView(bool)` is sent on a change, as `SetActivityViews` is (`ui::knowledge::triples::wanted`,
+    `ui/mod.rs`).
   - It follows the knowledge map's schedule: `knowledge_build` on the `KnowledgeKey` without the verdicts and trust
     (`triple_part`), at once on a fit change, and at most once per `views_interval` on a pending-only change, with
     the deferred wake. A pending-only rebuild that would wait builds anyway beside a knowledge build in the same

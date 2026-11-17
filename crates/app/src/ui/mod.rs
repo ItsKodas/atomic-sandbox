@@ -1448,8 +1448,9 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
         st.activity.views_sent = want;
         out.commands.push(Command::SetActivityViews(want));
     }
-    // the three-atom map is built only while its section is shown (spec 2026-11-17 §6.4)
-    let want = st.tab_shown(DockTab::Knowledge) && st.knowledge_sections.triples;
+    // the three-atom map is built only while its section or a picked type's card is shown
+    // (spec 2026-11-17 §6.4)
+    let want = knowledge::triples::wanted(st);
     if want != st.activity.triples_sent {
         st.activity.triples_sent = want;
         out.commands.push(Command::SetTripleView(want));

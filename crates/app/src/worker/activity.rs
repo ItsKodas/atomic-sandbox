@@ -231,6 +231,17 @@ pub(super) fn knowledge_build(last: Option<&KnowledgeKey>, built: Option<(Instan
     }
 }
 
+/// The three-atom map's schedule (module doc, "The three-atom map"): [`knowledge_build`] on its
+/// own key, except that a pending-only rebuild waiting for its interval builds now when the
+/// knowledge map builds in the same publish (`knowledge_now`), so the two cadences fall back into
+/// step after a re-judge or after the view turns on.
+pub(super) fn triple_build(last: Option<&KnowledgeKey>, built: Option<(Instant, f64)>, key: &KnowledgeKey, now: Instant, knowledge_now: bool) -> KnowledgeBuild {
+    match knowledge_build(last, built, key, now) {
+        KnowledgeBuild::At(_) if knowledge_now => KnowledgeBuild::Now,
+        b => b,
+    }
+}
+
 impl ViewKey {
     fn of(m: &ModelStatus) -> ViewKey {
         ViewKey {
@@ -402,14 +413,7 @@ impl Worker {
             }
             if self.activity.triples_on {
                 let tkey = kkey.triple_part();
-                // a pending-only rebuild that would wait builds anyway beside a knowledge build in this
-                // publish, so the two cadences fall back into step (after a re-judge or the view
-                // turning on)
-                let build = match knowledge_build(self.activity.triples_key.as_ref(), self.activity.triples_built, &tkey, Instant::now()) {
-                    KnowledgeBuild::At(_) if knowledge_now => KnowledgeBuild::Now,
-                    b => b,
-                };
-                match build {
+                match triple_build(self.activity.triples_key.as_ref(), self.activity.triples_built, &tkey, Instant::now(), knowledge_now) {
                     KnowledgeBuild::Skip => {}
                     // deferred: the loop wakes an idle worker then (module doc, "The three-atom map")
                     KnowledgeBuild::At(due) => self.activity.triples_due_at = Some(due),
@@ -537,6 +541,26 @@ mod schedule_tests {
         assert!(new != KnowledgeKey::of(&m).triple_part() && new.same_fit(&KnowledgeKey::of(&m).triple_part()), "pending-only: rate-limited");
     }
 
+    /// The triple map's cadence: `knowledge_build`'s, but a deferred pending-only rebuild builds
+    /// now beside a knowledge build in the same publish; nothing else changes.
+    #[test]
+    fn a_deferred_triple_rebuild_joins_a_knowledge_build() {
+        let m = crate::ui::tests::model();
+        let k0 = KnowledgeKey::of(&m).triple_part();
+        let k1 = KnowledgeKey::of(&ModelStatus { pending: 1, ..m.clone() }).triple_part();
+        let refit = KnowledgeKey::of(&ModelStatus { model_gen: m.model_gen + 1, ..m.clone() }).triple_part();
+        let t = Instant::now();
+        let built = Some((t, 3.0));
+        let soon = t + Duration::from_millis(500);
+        assert_eq!(triple_build(Some(&k0), built, &k1, soon, false), KnowledgeBuild::At(t + VIEWS_MIN_INTERVAL), "alone: deferred");
+        assert_eq!(triple_build(Some(&k0), built, &k1, soon, true), KnowledgeBuild::Now, "beside a knowledge build: now");
+        for knowledge_now in [false, true] {
+            assert_eq!(triple_build(Some(&k0), built, &k0, soon, knowledge_now), KnowledgeBuild::Skip, "nothing changed: never built");
+            assert_eq!(triple_build(Some(&k0), built, &refit, soon, knowledge_now), KnowledgeBuild::Now);
+            assert_eq!(triple_build(None, None, &k0, soon, knowledge_now), KnowledgeBuild::Now);
+        }
+    }
+
     /// `Command::SetTripleView`: turning the view on again after off forgets the last key (the UI
     /// may have dropped the map), so the next publish builds; turning it off drops a deferred wake.
     #[test]
@@ -548,7 +572,7 @@ mod schedule_tests {
         a.set_triples(true);
         assert_eq!(a.triples_key.as_ref(), Some(&key), "on while on: the key is kept");
         a.set_triples(false);
-        assert!(a.triples_on == false && a.triples_due_at.is_none(), "off: no deferred wake");
+        assert!(!a.triples_on && a.triples_due_at.is_none(), "off: no deferred wake");
         assert_eq!(a.triples_key.as_ref(), Some(&key), "off alone keeps the key");
         a.set_triples(true);
         assert!(a.triples_on && a.triples_key.is_none(), "on again after off: the next publish builds");
