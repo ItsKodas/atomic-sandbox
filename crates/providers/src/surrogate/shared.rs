@@ -337,8 +337,8 @@ impl SurrogateKs {
         self.user_notes.push(note);
         self.note_lone_held_out(&format!("shared collection {slug}"), lone, r_cut);
         if self.no_model().is_some_and(|nm| nm.missing.is_empty() && nm.retry) {
-            if self.first_fit_background {
-                // the caller fits it, in the background (`Trainable::set_first_fit_background`;
+            if self.fits_in_background {
+                // the caller fits it, in the background (`Trainable::set_fits_in_background`;
                 // quiet refits 2026-11-17: a collection's first fit took 2 min on the worker thread)
                 self.first_fit_due = true;
             } else if let Err(e) = SurrogateKs::refit(self) {

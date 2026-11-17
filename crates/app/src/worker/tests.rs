@@ -4001,6 +4001,9 @@ struct RefitState {
     /// A fit can form from the samples held (every reference in): a Retry leaves it to the worker
     /// (`Trainable::request_first_fit`).
     can_form: bool,
+    /// A pass's end left its fit to the worker (`first_fit_ready`, with or without a model; the
+    /// refit that begins carries it).
+    pass_fit: bool,
     /// Every evaluation keeps a sample (a fallback): appended, a refit due.
     keep: bool,
     /// The running background refit: the samples it started on; it lands once `release` is set.
@@ -4082,7 +4085,7 @@ impl Trainable for RefitFake {
         }
         let p = st.samples;
         st.started.push(("background", p));
-        (st.running, st.release) = (Some(p), false);
+        (st.running, st.release, st.pass_fit) = (Some(p), false, false);
         true
     }
     fn poll_refit_background(&mut self) -> sim::RefitPoll {
@@ -4111,7 +4114,7 @@ impl Trainable for RefitFake {
     }
     fn first_fit_ready(&self) -> bool {
         let st = self.lock();
-        st.first_fit && !st.fitted && st.running.is_none()
+        ((st.first_fit && !st.fitted) || st.pass_fit) && st.running.is_none()
     }
     fn request_first_fit(&mut self) -> bool {
         let mut st = self.lock();
@@ -4366,4 +4369,50 @@ fn retry_of_a_fit_that_can_form_runs_in_the_background() {
     assert_eq!(refits_started(&st), vec![("background", 1627)], "not in the tick");
     st.lock().unwrap().release = true;
     snapshot_until(&w, "installed", |s| model(s).fitted && !model(s).refit_running);
+}
+
+/// Quiet refits round 2: a pass's end fit is the worker's, in the background — under ⚠ Model only
+/// too (the user's own pass asked for it), once per pass. While it runs the worker answers a Step
+/// and publishes; it installs, and nothing more starts.
+#[test]
+fn a_pass_end_fit_runs_in_the_background_even_in_model_only() {
+    let (w, st) = refit_fake(RefitState { fitted: true, samples: 100, ..Default::default() });
+    idle(&w);
+    w.send(Command::SetModelOnly(true));
+    {
+        // the pass's end: its samples appended, its fit left to the worker
+        let mut s = st.lock().unwrap();
+        s.keep_one();
+        s.pass_fit = true;
+    }
+    w.send(Command::Dyn(DynCommand::SetSpeed(2)));
+    let s = snapshot_until(&w, "the pass's fit running", |s| model(s).refit_running);
+    assert_eq!(refits_started(&st), vec![("background", 101)], "in the background, in Model only");
+    let step = s.dynamics.step;
+    w.send(Command::Dyn(DynCommand::Step(1)));
+    let b = snapshot_until(&w, "a Step while the pass's fit runs", |s| s.dynamics.step == step + 1 && !s.dynamics.forces_stale);
+    assert!(model(&b).refit_running, "still fitting; the worker answered the Step");
+    st.lock().unwrap().release = true;
+    let s = snapshot_until(&w, "the pass's fit installed", |s| model(s).refits == 1 && !model(s).refit_running);
+    assert!(!model(&s).pending_refit && !s.working);
+    let _ = snapshots_for(&w, 1.0);
+    assert_eq!(refits_started(&st).len(), 1, "once per pass");
+}
+
+/// … with the real provider: an automatic pass on Morse H₂ ends, its fit is left to the worker and
+/// lands in the background (the refit's note says so), and the pass's outcome note — refit on N
+/// samples, trusted — follows the install, before the worker is idle.
+#[test]
+fn a_real_pass_end_fit_lands_in_the_background() {
+    let w = morse_estimated(h2_33());
+    idle(&w);
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default(), auto_pass: true });
+    let s = snapshot_until(&w, "the pass's fit landed", |s| pass_done(s) && s.model.as_ref().is_some_and(|m| m.fitted));
+    let notes: Vec<String> = s.dynamics.notes.iter().cloned().collect();
+    let deferred = notes.iter().position(|n| n.contains("the refit runs in the background — its outcome follows when it lands"));
+    let outcome = notes.iter().position(|n| n.contains("sampling pass finished") && n.contains("refit on"));
+    let refit = notes.iter().position(|n| n.contains(": refit #") && n.contains("(background)"));
+    assert!(deferred.is_some() && outcome.is_some() && refit.is_some(), "{notes:#?}");
+    assert!(deferred < outcome && outcome < refit, "deferred, then the outcome at the install, then the refit's note: {notes:#?}");
+    assert!(model(&s).trusted, "{:?}", model(&s).untrusted_reason);
 }

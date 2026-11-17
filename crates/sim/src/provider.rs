@@ -1120,15 +1120,19 @@ pub trait Trainable {
     fn fit_inputs_gen(&self) -> Option<u64> {
         None
     }
-    /// The caller starts the first fit of samples that have no model yet — an attached shared
-    /// collection's — itself, in the background ([`first_fit_ready`](Self::first_fit_ready),
-    /// [`begin_refit_background`](Self::begin_refit_background)), instead of
-    /// [`attach_collection`](Self::attach_collection) running it in place (minutes on a large
-    /// collection). Off by default. The default: nothing to defer.
-    fn set_first_fit_background(&mut self, _on: bool) {}
-    /// No model yet, but one can form from the samples held now (every reference in, enough
-    /// samples) and no pass or refit runs: [`begin_refit_background`](Self::begin_refit_background)
-    /// starts it. The default: never.
+    /// The caller runs the fits this provider would otherwise run in place itself, in the
+    /// background ([`first_fit_ready`](Self::first_fit_ready),
+    /// [`begin_refit_background`](Self::begin_refit_background)): the first fit of an attached
+    /// shared collection ([`attach_collection`](Self::attach_collection)) and a sampling pass's or
+    /// teach round's end fit, whose verdicts (the outcome note, the shell checks, the round's
+    /// judgement) then follow at the install — minutes in place on a large collection. Off by
+    /// default. The default: nothing to defer.
+    fn set_fits_in_background(&mut self, _on: bool) {}
+    /// A fit the provider left to the caller is due now and no pass or refit runs: the first fit
+    /// of samples with no model yet (every reference in, enough samples), or a pass's end fit
+    /// (with or without a model). [`begin_refit_background`](Self::begin_refit_background) starts
+    /// it; the caller runs it even when it would hold an automatic refit (the user's pass asked
+    /// for it). The default: never.
     fn first_fit_ready(&self) -> bool {
         false
     }

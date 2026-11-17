@@ -399,8 +399,8 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         Trainable::fit_inputs_gen(&*self.lock())
     }
 
-    fn set_first_fit_background(&mut self, on: bool) {
-        Trainable::set_first_fit_background(&mut *self.lock(), on)
+    fn set_fits_in_background(&mut self, on: bool) {
+        Trainable::set_fits_in_background(&mut *self.lock(), on)
     }
 
     fn first_fit_ready(&self) -> bool {

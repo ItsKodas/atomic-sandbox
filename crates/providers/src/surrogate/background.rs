@@ -63,6 +63,18 @@
 //! Conservative meanwhile: it can only refuse more (its geometry is fenced as forgotten anyway),
 //! never answer more. (Final whole-branch review M3, 2026-11-14; documented, not changed.)
 //!
+//! # A pass's fit
+//!
+//! With `fits_in_background` (the app's worker: `Trainable::set_fits_in_background`) a pass's end
+//! does not fit in place (quiet refits round 2: a collection's refit with its trust recovery froze
+//! the app for 30–160 s after every Sample more or Teach): `finish_pass` keeps the pass's tail —
+//! the outcome note, its coverage, the shell checks it solved, a teach-around round's judgement —
+//! and makes the fit due (`pass_fit_due`, `first_fit_ready`). The background refit that begins
+//! then carries it ([`BackgroundRefit::pass_fit`]) and the tail completes at its install
+//! (`complete_pass_tail`), reading the installed fit exactly as it read the in-place one. A
+//! discard makes it due once more; a second one completes the tail as dropped, its shell checks
+//! unjudged (said), as does a new pass started before it landed (whose own fit holds the samples).
+
 //! What a background refit changes is *when* the new model stands (a refit's wall later, as the
 //! refit throttle already delays it by up to `REFIT_INTERVAL`), never what any verdict is: the
 //! model that answers meanwhile is judged by its own verdicts, exactly as between two refits.
@@ -97,6 +109,9 @@ pub(super) struct BackgroundRefit {
     user_codes: BTreeMap<usize, u8>,
     /// The species of the samples it fits (its refit record, `sim::refit_eta`).
     species: usize,
+    /// It is a pass's end fit (`pass_fit_due` when it began): the pass's tail completes at its
+    /// install (module doc, "A pass's fit").
+    pub(super) pass_fit: bool,
 }
 
 impl BackgroundRefit {
@@ -263,7 +278,9 @@ impl SurrogateKs {
                 (Box::new(fork), r, t0.elapsed().as_secs_f64())
             })
             .expect("spawn the background refit");
-        self.background = Some(BackgroundRefit { handle: Some(handle), snap, cancel, probe, user_codes: BTreeMap::new(), species });
+        // a pass's end fit due: this refit is it (`complete_pass_tail` at the install)
+        let pass_fit = std::mem::take(&mut self.pass_fit_due) && self.pass_tail.is_some();
+        self.background = Some(BackgroundRefit { handle: Some(handle), snap, cancel, probe, user_codes: BTreeMap::new(), species, pass_fit });
         true
     }
 
@@ -313,11 +330,14 @@ impl SurrogateKs {
         let snap = std::mem::replace(&mut done.snap, Snapshot::empty());
         let user = std::mem::take(&mut done.user_codes);
         // `done` drops at the end: the probe's refit phase ends whatever the outcome
+        let pass_fit = done.pass_fit;
         let (fork, result, wall_s) = match handle.join() {
             Ok(x) => x,
             Err(_) => {
                 self.pending_refit = true;
-                return BackgroundPoll::Discarded("the background refit panicked; it is due again".into());
+                let why = "the background refit panicked; it is due again".to_string();
+                self.pass_fit_dropped(pass_fit, &why);
+                return BackgroundPoll::Discarded(why);
             }
         };
         // the refit history (`sim::refit_eta`): a refit that fitted took its time whether it is
@@ -327,10 +347,33 @@ impl SurrogateKs {
         }
         if let Some(why) = self.background_conflict(&snap, &user) {
             self.pending_refit = true;
+            self.pass_fit_dropped(pass_fit, &why);
             return BackgroundPoll::Discarded(why);
         }
         self.install_fork(*fork, &snap, result.is_ok(), &user);
+        // a pass's end fit: the pass's tail reads it now (module doc, "A pass's fit")
+        if pass_fit {
+            if let Some(tail) = self.pass_tail.take() {
+                self.complete_pass_tail(tail, PassFit::Fitted(result.clone()));
+            }
+        }
         BackgroundPoll::Installed(result)
+    }
+
+    /// A discarded refit that carried a pass's end fit (module doc, "A pass's fit"): due once
+    /// more; at the second discard the pass's tail completes, its shell checks unjudged.
+    fn pass_fit_dropped(&mut self, pass_fit: bool, why: &str) {
+        if !pass_fit {
+            return;
+        }
+        let Some(mut tail) = self.pass_tail.take() else { return };
+        tail.tries += 1;
+        if tail.tries < 2 {
+            self.pass_tail = Some(tail);
+            self.pass_fit_due = true;
+        } else {
+            self.complete_pass_tail(tail, PassFit::Dropped(format!("discarded twice: {why}")));
+        }
     }
 
     /// Waits for a running background refit and installs or discards it (tests; an operation that

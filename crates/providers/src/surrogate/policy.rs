@@ -335,12 +335,20 @@ impl SurrogateKs {
     }
 
     /// Replaces the policy; the variance cadence restarts and the training residuals are
-    /// re-judged against the new thresholds.
+    /// re-judged against the new thresholds — only when a threshold the judgement reads changed:
+    /// draft mode (`never_fallback`) and the audit cadence (`audit_every`) decide what answers and
+    /// when an audit runs, never a verdict, and ⚠ Model only toggles both (quiet refits round 2:
+    /// the class-wise leave-one-out took 0.8 s on a 1 630-sample collection, twice per toggle, on
+    /// the worker thread; skipping it leaves exactly the verdicts it would recompute).
     pub fn set_policy(&mut self, p: FallbackPolicy) {
+        let judged = FallbackPolicy { never_fallback: self.policy.never_fallback, audit_every: self.policy.audit_every, ..p } != self.policy;
         self.policy = p;
         self.model_gen += 1; // the views' cache key: the verdicts read the policy
         self.consults = 0;
         self.last_variance = None;
+        if !judged {
+            return;
+        }
         (self.training_residuals, self.misfit) = self.compute_residuals().unzip();
         self.refresh_class_loo();
         self.commit_class_memory();

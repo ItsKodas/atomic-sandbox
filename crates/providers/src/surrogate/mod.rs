@@ -1430,10 +1430,15 @@ pub struct SurrogateKs {
     /// attached — never by a refit's own outcome (a discard or a failure re-arms `pending_refit`
     /// without it).
     fit_inputs_gen: u64,
-    /// The worker starts the first fit of an attached collection itself, in the background
-    /// (`Trainable::set_first_fit_background`): the attach does not run it in place.
-    first_fit_background: bool,
-    /// An attach left its first fit to the worker (`first_fit_background`): until a model forms
+    /// The caller runs the fits this provider would run in place — an attached collection's first
+    /// fit, a pass's end fit — in the background (`Trainable::set_fits_in_background`).
+    fits_in_background: bool,
+    /// A pass's end left its fit to the caller (`fits_in_background`): due until a background
+    /// refit carries it (`first_fit_ready`; quiet refits round 2).
+    pass_fit_due: bool,
+    /// That pass's tail, completed when its fit lands (`complete_pass_tail`).
+    pass_tail: Option<PassTail>,
+    /// An attach left its first fit to the worker (`fits_in_background`): until a model forms
     /// (or `forget` clears it), [`first_fit_ready`](SurrogateKs::first_fit_ready) may say so. Only
     /// an attach sets it — a no-model session's kept fallback samples still wait for a pass
     /// (module doc, "No model yet").
@@ -1462,6 +1467,9 @@ pub struct SurrogateKs {
     /// Tests only: the richer-basis key counts `richer_basis_floor` ran (`status_cache` tests).
     #[cfg(test)]
     richer_floor_counts: std::sync::atomic::AtomicUsize,
+    /// Tests only: `refresh_class_loo` runs (a policy change that re-judges nothing skips it).
+    #[cfg(test)]
+    class_loo_refreshes: usize,
     /// Variance evaluations so far (readout; the cadence test).
     variance_checks: u64,
     /// Steps the model answered or would have answered (the audit counter).
@@ -1809,7 +1817,9 @@ impl SurrogateKs {
             epoch: 0,
             pending_refit: false,
             fit_inputs_gen: 0,
-            first_fit_background: false,
+            fits_in_background: false,
+            pass_fit_due: false,
+            pass_tail: None,
             first_fit_due: false,
             pending_jump: None,
             last: None,
@@ -1819,6 +1829,8 @@ impl SurrogateKs {
             richer_floor_cache: std::sync::Mutex::new(None),
             #[cfg(test)]
             richer_floor_counts: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            class_loo_refreshes: 0,
             variance_checks: 0,
             answered: 0,
             quarantine: Vec::new(),
@@ -1985,11 +1997,12 @@ impl SurrogateKs {
         self.fit_inputs_gen
     }
 
-    /// `Trainable::first_fit_ready`: an attach left its first fit to the caller
-    /// (`first_fit_background`), no model formed yet, no pass or refit runs, and a fit can form
-    /// from the samples held (the "No model yet" state whose Retry would fit at once).
+    /// `Trainable::first_fit_ready`: a fit this provider left to the caller is due now, no pass or
+    /// refit running — an attach's first fit (`fits_in_background`; no model yet and a fit can
+    /// form from the samples held, the "No model yet" state whose Retry would fit at once), or a
+    /// pass's end fit (`pass_fit_due`, quiet refits round 2: with or without a model).
     pub fn first_fit_ready(&self) -> bool {
-        self.first_fit_due && self.first_fit_can_form()
+        (self.first_fit_due && self.first_fit_can_form()) || (self.pass_fit_due && self.pass.is_none() && self.background.is_none())
     }
 
     /// No model, no pass or refit running, and a fit can form from the samples held now.
@@ -2818,6 +2831,31 @@ impl ForceProvider for SurrogateKs {
     }
 }
 
+/// A pass's end, waiting for its fit (`finish_pass` with `fits_in_background`; quiet refits round
+/// 2): everything `complete_pass_tail` does once the fit is in.
+pub(super) struct PassTail {
+    kind: &'static str,
+    how: &'static str,
+    added: usize,
+    progress: SamplingProgress,
+    shells: Vec<crate::sampling::ShellCheck>,
+    unrun: Vec<((u8, u8), f64)>,
+    teach: Option<(Vec<usize>, Vec<crate::sampling::Holdout>)>,
+    summary: Option<String>,
+    /// Background refits that carried it and were discarded (`background` module doc, "A pass's
+    /// fit"): one more is allowed, then the tail completes as [`PassFit::Dropped`].
+    pub(super) tries: u32,
+}
+
+/// How a pass's fit came out, for [`SurrogateKs::complete_pass_tail`].
+pub(super) enum PassFit {
+    NoSamples,
+    BelowFloor { fittable: usize, floor: usize, q_prime: usize },
+    Fitted(Result<FitReport, FitError>),
+    /// It never landed: the reason (discarded twice, a later pass, the samples forgotten).
+    Dropped(String),
+}
+
 // ---- the Trainable face (M6 Task 1): what the driver and the worker reach through
 // `ForceProvider::as_trainable` ----
 
@@ -2826,6 +2864,15 @@ impl SurrogateKs {
     /// the pass owns the display's turn, so the queued Harris job goes — the caller asks again
     /// after it (module doc, "Side densities").
     pub(super) fn begin_pass(&mut self, sampler: Sampler) {
+        // a pass's tail still waiting for its fit (quiet refits round 2): the new pass's fit at its
+        // end holds those samples too
+        if let Some(tail) = self.pass_tail.take() {
+            self.pass_fit_due = false;
+            if let Some(b) = self.background.as_mut() {
+                b.pass_fit = false;
+            }
+            self.complete_pass_tail(tail, PassFit::Dropped("a new pass started first — its fit at its end holds these samples too".into()));
+        }
         self.pass = Some(sampler);
         self.harris_queued = None;
     }
@@ -2858,19 +2905,17 @@ impl SurrogateKs {
             "sampling pass"
         };
         self.teacher.discontinuity();
+        let summary = self.take_collection_summary(sampler.collection_skipped());
+        // an earlier pass's tail still waiting for its fit: this pass's fit holds its samples too
+        if let Some(old) = self.pass_tail.take() {
+            self.pass_fit_due = false;
+            self.complete_pass_tail(old, PassFit::Dropped("a later pass ended first — its fit holds these samples too".into()));
+        }
+        let tail = PassTail { kind, how, added, progress, shells, unrun, teach, summary, tries: 0 };
         let (fittable, floor, q_prime) = self.fittable_and_floor();
-        // the shell checks are judged against this pass's own refit only (final review M2): with
-        // no refit the model standing is none or an earlier fit, whose verdict on the shell is
-        // not this pass's measurement
-        let mut unjudged: Option<String> = None;
-        // a check judged against a fit that is not trusted, or holds none of this pass's samples, says so (physics review
-        // of the M7 leftovers, Minor 2): its fence is kept (the safe side) but may be the fit's error, not the cutoff's
-        let mut caveat: Option<&'static str> = None;
-        let msg = if self.samples() == 0 {
-            unjudged = Some("the pass fitted no model".into());
-            format!("{kind} {how}: no samples to fit")
+        if self.samples() == 0 {
+            self.complete_pass_tail(tail, PassFit::NoSamples);
         } else if fittable < floor {
-            unjudged = Some(format!("the pass's refit did not run: {fittable} samples, below the {floor} model columns their atoms touch"));
             // below the floor the model cannot earn trust (the trust rule needs n ≥ |∪ S_k|,
             // `sample_floor`), and the fit with its trust recovery costs seconds on the worker
             // thread (Task 3 fix round 2): keep the samples, skip the refit until there are
@@ -2878,45 +2923,87 @@ impl SurrogateKs {
             // user-fix 3, the controller's ruling on concern 2): a new species in a large
             // collection raises Q′ by its own block, and N₂ trained into a 1200-sample water
             // store would otherwise never refit
-            format!("{kind} {how}: {fittable} samples kept — not enough to fit ({floor} model columns their atoms touch; Q′ {q_prime}); sample more to train")
+            self.complete_pass_tail(tail, PassFit::BelowFloor { fittable, floor, q_prime });
+        } else if self.fits_in_background {
+            // the caller fits it in the background (`Trainable::set_fits_in_background`; quiet
+            // refits round 2: a collection's pass-end fit froze the app for 30–160 s): the fit is
+            // due (`first_fit_ready`), and the tail — the outcome, the shell checks, a teach-around
+            // round's judgement — waits for its install (`complete_pass_tail`)
+            self.user_notes.push(format!(
+                "{kind} {how}: {added} samples added ({} skipped, {} failed); the refit runs in the background — its outcome follows when it lands",
+                tail.progress.skipped, tail.progress.failed
+            ));
+            self.pass_tail = Some(tail);
+            self.pass_fit_due = true;
+            self.arm_refit();
         } else {
-            match SurrogateKs::refit(self) {
-                Ok(r) => {
-                    let coverage = self.compute_pass_coverage();
-                    let trust = match (self.untrusted_reason(), coverage.as_ref()) {
-                        (Some(why), _) => {
-                            caveat = Some("judged against a fit that is not trusted");
-                            format!("untrusted ({why})")
-                        }
-                        // fix (e): never "trusted" for a scene whose own pass is not in the fit
-                        (None, Some(c)) if c.fitted == 0 && c.total > 0 => {
-                            caveat = Some("judged against a fit that holds none of this pass's samples");
-                            "trusted elsewhere, but NOT for this scene: none of its pass samples is in the fit".to_string()
-                        }
-                        (None, _) => "trusted".to_string(),
-                    };
-                    format!(
-                        "{kind} {how}: {added} samples added ({} skipped, {} failed); refit on {} samples, rmse {:.1e} Ha/atom, {:.1e} Ha/Bohr — {trust}{}",
-                        progress.skipped,
-                        progress.failed,
-                        r.n_samples,
-                        r.rmse_energy_per_atom,
-                        r.rmse_force,
-                        coverage.as_ref().and_then(PassCoverage::words).map_or(String::new(), |w| format!(". {w}"))
-                    )
-                }
-                Err(e) => {
-                    unjudged = Some(format!("the pass's refit failed ({e})"));
-                    if self.model.is_none() {
-                        self.last_fit_error = Some(e.to_string());
+            let r = SurrogateKs::refit(self);
+            self.complete_pass_tail(tail, PassFit::Fitted(r));
+        }
+    }
+
+    /// What `finish_pass` does once its fit is in (`PassFit`; in place, or at the install of the
+    /// background refit that carried it — `background` module doc, "A pass's fit"): the outcome
+    /// noted, the pass's coverage, its collection summary, its shell checks judged against this
+    /// fit (or left unjudged, said), the shell checks it did not run, and a teach-around round
+    /// judged (a regular pass restarts the round count instead, SHOULD-T6).
+    pub(super) fn complete_pass_tail(&mut self, tail: PassTail, fit: PassFit) {
+        let PassTail { kind, how, added, progress, shells, unrun, teach, summary, .. } = tail;
+        // the shell checks are judged against this pass's own refit only (final review M2): with
+        // no refit the model standing is none or an earlier fit, whose verdict on the shell is
+        // not this pass's measurement
+        let mut unjudged: Option<String> = None;
+        // a check judged against a fit that is not trusted, or holds none of this pass's samples, says so (physics review
+        // of the M7 leftovers, Minor 2): its fence is kept (the safe side) but may be the fit's error, not the cutoff's
+        let mut caveat: Option<&'static str> = None;
+        let msg = match fit {
+            PassFit::NoSamples => {
+                unjudged = Some("the pass fitted no model".into());
+                format!("{kind} {how}: no samples to fit")
+            }
+            PassFit::BelowFloor { fittable, floor, q_prime } => {
+                unjudged = Some(format!("the pass's refit did not run: {fittable} samples, below the {floor} model columns their atoms touch"));
+                format!("{kind} {how}: {fittable} samples kept — not enough to fit ({floor} model columns their atoms touch; Q′ {q_prime}); sample more to train")
+            }
+            PassFit::Fitted(Ok(r)) => {
+                let coverage = self.compute_pass_coverage();
+                let trust = match (self.untrusted_reason(), coverage.as_ref()) {
+                    (Some(why), _) => {
+                        caveat = Some("judged against a fit that is not trusted");
+                        format!("untrusted ({why})")
                     }
-                    format!("{kind} {how}: {added} samples added; the refit failed ({e})")
+                    // fix (e): never "trusted" for a scene whose own pass is not in the fit
+                    (None, Some(c)) if c.fitted == 0 && c.total > 0 => {
+                        caveat = Some("judged against a fit that holds none of this pass's samples");
+                        "trusted elsewhere, but NOT for this scene: none of its pass samples is in the fit".to_string()
+                    }
+                    (None, _) => "trusted".to_string(),
+                };
+                format!(
+                    "{kind} {how}: {added} samples added ({} skipped, {} failed); refit on {} samples, rmse {:.1e} Ha/atom, {:.1e} Ha/Bohr — {trust}{}",
+                    progress.skipped,
+                    progress.failed,
+                    r.n_samples,
+                    r.rmse_energy_per_atom,
+                    r.rmse_force,
+                    coverage.as_ref().and_then(PassCoverage::words).map_or(String::new(), |w| format!(". {w}"))
+                )
+            }
+            PassFit::Fitted(Err(e)) => {
+                unjudged = Some(format!("the pass's refit failed ({e})"));
+                if self.model.is_none() {
+                    self.last_fit_error = Some(e.to_string());
                 }
+                format!("{kind} {how}: {added} samples added; the refit failed ({e})")
+            }
+            PassFit::Dropped(why) => {
+                unjudged = Some(format!("the pass's refit did not land ({why})"));
+                format!("{kind} {how}: the refit of its {added} samples did not land ({why}) — Refit now fits them")
             }
         };
         self.pass_coverage = self.compute_pass_coverage();
         self.user_notes.push(msg);
-        if let Some(summary) = self.take_collection_summary(sampler.collection_skipped()) {
+        if let Some(summary) = summary {
             self.user_notes.push(summary);
         }
         match unjudged {
@@ -3323,6 +3410,11 @@ impl Trainable for SurrogateKs {
 
     fn refit(&mut self) -> Result<String, String> {
         let r = SurrogateKs::refit(self);
+        // a pass's tail waiting for its fit (a caller that refits in place after all): this is it
+        if let Some(tail) = self.pass_tail.take() {
+            self.pass_fit_due = false;
+            self.complete_pass_tail(tail, PassFit::Fitted(r.clone()));
+        }
         self.refit_summary(r)
     }
 
@@ -3334,8 +3426,8 @@ impl Trainable for SurrogateKs {
         Some(SurrogateKs::fit_inputs_gen(self))
     }
 
-    fn set_first_fit_background(&mut self, on: bool) {
-        self.first_fit_background = on;
+    fn set_fits_in_background(&mut self, on: bool) {
+        self.fits_in_background = on;
     }
 
     fn first_fit_ready(&self) -> bool {

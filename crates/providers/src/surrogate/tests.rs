@@ -8636,6 +8636,55 @@ fn a_pass_reports_its_shell_check_after_the_refit() {
     }));
 }
 
+/// Quiet refits round 2: with `fits_in_background` (the app's worker) the same pass ends without
+/// fitting in place — its fit is due (`first_fit_ready`), its outcome and shell-check verdict not
+/// yet said — and the background refit that begins carries it: at its install the outcome note
+/// ("refit on N samples") and the shell check's verdict follow, judged against the installed fit,
+/// and nothing more is due. A second pass ending first, or one starting, completes a waiting tail
+/// as not landed, its shell checks unjudged.
+#[test]
+fn a_pass_end_fit_in_the_background_completes_the_pass_at_its_install() {
+    let teacher = Shared::new(MorseDimer::h2());
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    Trainable::set_fits_in_background(&mut s, true);
+    let scene = in_big_cell(h2(3.3));
+    let prov = s.provenance_for(&scene);
+    let mut refs = sim::AtomReferences::default();
+    refs.seed_energy(crate::sampling::atom_key(&prov, 1), MorseDimer::h2().e_atom, None, prov.tol, &prov.teacher);
+    let plan = SamplingPlan { perturbations: 60, hot_burst_steps: 0, scan_points_per_pair: 12, seed: 3, ..SamplingPlan::default() };
+    Trainable::start_pass(&mut s, &scene, &plan, &mut refs).unwrap();
+    let g0 = s.fit_inputs_gen();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    let notes = Trainable::take_notes(&mut s);
+    assert!(s.model().is_none() && s.pending_refit() && Trainable::first_fit_ready(&s), "not fitted in place: {notes:?}");
+    assert!(s.fit_inputs_gen() > g0, "the pass's samples are new data");
+    assert!(notes.iter().any(|n| n.contains("the refit runs in the background")), "{notes:?}");
+    assert!(!notes.iter().any(|n| n.contains("refit on") || n.contains("still interacts at r =") || n.contains("cutoff holds for")), "nothing judged yet: {notes:?}");
+    assert!(s.begin_background_refit(), "the pass's fit starts in the background with no model");
+    assert!(!Trainable::first_fit_ready(&s), "carried by the running refit");
+    match s.finish_background_refit() {
+        BackgroundPoll::Installed(Ok(_)) => {}
+        BackgroundPoll::Installed(Err(e)) => panic!("the pass's fit failed: {e}"),
+        BackgroundPoll::Discarded(why) => panic!("discarded: {why}"),
+        _ => panic!("no background refit"),
+    }
+    let notes = Trainable::take_notes(&mut s);
+    assert!(s.model().is_some() && !s.pending_refit() && !Trainable::first_fit_ready(&s), "{notes:?}");
+    assert!(notes.iter().any(|n| n.starts_with("sampling pass finished") && n.contains("refit on")), "the outcome at the install: {notes:?}");
+    let shell: Vec<&String> = notes.iter().filter(|n| n.contains("still interacts at r =") || n.contains("cutoff holds for")).collect();
+    assert_eq!(shell.len(), 1, "the shell check judged at the install: {notes:?}");
+    // a pass that starts while another's fit is still due: that tail completes, not landed
+    Trainable::start_pass(&mut s, &scene, &SamplingPlan { perturbations: 30, hot_burst_steps: 0, scan_points_per_pair: 12, seed: 4, ..SamplingPlan::default() }, &mut refs).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    let _ = Trainable::take_notes(&mut s);
+    assert!(Trainable::first_fit_ready(&s), "the second pass's fit is due");
+    Trainable::start_pass(&mut s, &scene, &SamplingPlan { perturbations: 30, hot_burst_steps: 0, scan_points_per_pair: 0, seed: 5, ..SamplingPlan::default() }, &mut refs).unwrap();
+    let notes = Trainable::take_notes(&mut s);
+    assert!(notes.iter().any(|n| n.contains("did not land (a new pass started first")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("could not be judged (the pass's refit did not land")), "its shell check said unjudged: {notes:?}");
+    // without the switch: fitted in place at the pass's end, as before (`a_pass_reports_its_shell_check_after_the_refit`)
+}
+
 /// R3-2: a round over two blockers where one had no check judged near it is not accepted, and the
 /// outcome names it.
 #[test]
@@ -9641,7 +9690,7 @@ fn collection_mode_learns_across_scenes() {
     }
 }
 
-/// Quiet refits (2026-11-17; the app worker's "Refits"): with `set_first_fit_background` an attach
+/// Quiet refits (2026-11-17; the app worker's "Refits"): with `set_fits_in_background` an attach
 /// whose samples can be fitted leaves that first fit to the caller — no model, a refit due,
 /// `first_fit_ready` — and `begin_background_refit` runs it on a copy while the provider answers as
 /// with no model (a fallback, kept: one more change counted, `fit_inputs_gen`). The install counts
@@ -9661,7 +9710,7 @@ fn a_deferred_first_fit_runs_in_the_background_and_counts_no_change_of_its_own()
         assert_eq!(q.collection().unwrap().samples.len(), 60);
     }
     let (mut s, _) = pair_student();
-    Trainable::set_first_fit_background(&mut s, true);
+    Trainable::set_fits_in_background(&mut s, true);
     s.attach_collection(&dir, &h2(1.4)).unwrap();
     assert!(!s.fitted() && s.pending_refit() && Trainable::first_fit_ready(&s), "the attach fits nothing: {:?}", s.no_model().map(|n| n.words));
     assert!(Trainable::status(&s, &h2(1.4), &[[0.0; 3]; 2]).retry_fit, "the Retry, before it starts");
@@ -9692,13 +9741,38 @@ fn a_deferred_first_fit_runs_in_the_background_and_counts_no_change_of_its_own()
     // a provider that attached without fitting and was not left the first fit (no switch, a fit
     // that failed): the Retry hands it to the caller, in the background
     let (mut u, _) = pair_student();
-    Trainable::set_first_fit_background(&mut u, true);
+    Trainable::set_fits_in_background(&mut u, true);
     u.attach_collection(&dir, &h2(1.4)).unwrap();
     u.first_fit_due = false;
     assert!(!Trainable::first_fit_ready(&u));
     assert!(Trainable::request_first_fit(&mut u) && Trainable::first_fit_ready(&u) && u.pending_refit());
     assert!(u.begin_background_refit());
     assert!(matches!(u.finish_background_refit(), BackgroundPoll::Installed(Ok(_))) && u.fitted());
+}
+
+/// Quiet refits round 2: ⚠ Model only toggles draft mode and the audit cadence, which no verdict
+/// reads — `set_policy` re-judges nothing then (0.8 s of class-wise leave-one-out per change on a
+/// 1 630-sample collection, `policy_cost`), and every verdict is what a re-judge would give; a
+/// threshold change still re-judges.
+#[test]
+fn a_draft_or_audit_change_re_judges_nothing() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+    let before = (s.training_residuals, s.misfit.clone(), s.class_loo.clone(), s.trusted(), s.untrusted_reason());
+    let runs = s.class_loo_refreshes;
+    let gen = s.model_gen;
+    Trainable::set_draft(&mut s, true);
+    Trainable::set_audit_every(&mut s, 0);
+    assert_eq!(s.class_loo_refreshes, runs, "no leave-one-out for draft mode or the audit cadence");
+    assert!(s.model_gen > gen, "the views' key still moves");
+    assert_eq!((s.training_residuals, s.misfit.clone(), s.class_loo.clone(), s.trusted(), s.untrusted_reason()), before);
+    // what a re-judge would give: the same
+    (s.training_residuals, s.misfit) = s.compute_residuals().unzip();
+    s.refresh_class_loo();
+    assert_eq!((s.training_residuals, s.misfit.clone(), s.class_loo.clone(), s.trusted(), s.untrusted_reason()), before);
+    // a threshold the judgement reads: re-judged
+    let runs = s.class_loo_refreshes;
+    s.set_policy(FallbackPolicy { force_std_abs: 3e-3, ..*s.policy() });
+    assert_eq!(s.class_loo_refreshes, runs + 1);
 }
 
 // ---- the body-4 degree grown with the store (spec 2026-11-13 §4.1) ----
@@ -11431,6 +11505,9 @@ mod status_cache;
 
 /// 2026-11-17: the estimated step's cost on a collection, the variance step's pieces (`step_cost.rs`).
 mod step_cost;
+
+/// A policy change's cost on a collection (quiet refits round 2; a measurement).
+mod policy_cost;
 
 // ---- M8a Task 10: masked scenes (a capped segment teaches only its interior atoms) ----
 

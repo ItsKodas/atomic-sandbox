@@ -151,6 +151,8 @@ impl SurrogateKs {
         self.audit_fences.clear();
         self.pending_refit = false;
         self.first_fit_due = false;
+        self.pass_fit_due = false;
+        self.pass_tail = None;
         self.pending_jump = None;
         self.consults = 0;
         self.last_variance = None;

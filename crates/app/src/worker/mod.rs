@@ -88,7 +88,8 @@
 //!     1 600-sample collection: the window drew but every command waited. Only a provider that
 //!     cannot (the default `Trainable`) refits in the tick, and never a first fit or a retry.
 //!   - **The first fit of an attached collection** (no model yet) is the worker's too: the attach
-//!     leaves it (`Trainable::set_first_fit_background`, set before every attach) and it starts
+//!     leaves it (`Trainable::set_fits_in_background`, set on every driver the worker builds and
+//!     before every attach) and it starts
 //!     here in the background — paused or playing, in Model only too — once
 //!     `Trainable::first_fit_ready` (every reference in, enough samples); before, the attach ran it
 //!     on the worker thread (113 s for 1 627 samples: the "freeze" on opening). `EnsureModel`
@@ -99,6 +100,17 @@
 //!     which — every reference in — the worker turns into the same background first fit
 //!     (`Trainable::request_first_fit`) instead of the provider's fit in place. A no-model
 //!     session's kept fallbacks still wait for a sampling pass.
+//!   - **A pass's end fit** (round 2: a sampling pass, Sample more, a teach-around round, a
+//!     reference retry) is the worker's the same way: the provider ends the pass without fitting
+//!     in place (on a large collection a refit with its trust recovery, 30–160 s of frozen app
+//!     after every pass), makes the fit due (`Trainable::first_fit_ready`, with or without a
+//!     model) and keeps the pass's tail — its outcome note, its shell checks, a teach round's
+//!     judgement — for the install of the background refit that carries it
+//!     (`providers::surrogate` "background", "A pass's fit"); the worker drains the provider's
+//!     notes at that install, so they arrive with the refit's own. It is the result of the user's
+//!     own pass, so it starts at once — in Model only too, not throttled, not held by a Forget's
+//!     wait — once per pass (a discard makes it due once more). With a model the old one answers
+//!     meanwhile; without one Play waits as for the first fit.
 //!
 //!   The driver notices the new surface epoch and books the jump on its next tick. Every outcome
 //!   goes to the snapshot notes ("refit #k: rmse …, trusted: yes/no — reason", the recovery's
@@ -975,6 +987,11 @@ fn worker(
     for c in settings {
         w.dy.apply(c);
     }
+    // the fits the provider would run in place (an attach's first fit, a pass's end fit) are the
+    // worker's, in the background (module doc, "Refits")
+    if let Some(t) = trainable(&mut w.dy) {
+        t.set_fits_in_background(true);
+    }
     let first = w.dy.snapshot();
     w.background_auditor = trainable(&mut w.dy).is_some_and(|t| t.audits_background());
     w.publish(first);
@@ -1374,6 +1391,9 @@ impl Worker {
                 self.dy = d;
                 // a new provider: its changes are counted afresh, and the old one's refit is gone
                 (self.refit_started, self.refit_started_gen, self.refit_done_gen, self.refit_discarded_gen) = (None, None, None, None);
+                if let Some(t) = trainable(&mut self.dy) {
+                    t.set_fits_in_background(true);
+                }
                 self.apply_audit();
                 // a collection-mode model is not carried by the autosave: the collection holds it
                 self.sync_collection();

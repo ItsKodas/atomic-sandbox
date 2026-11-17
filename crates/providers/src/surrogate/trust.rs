@@ -740,6 +740,10 @@ impl SurrogateKs {
     /// "Class-wise trust", "Readiness"): one pass sets `class_loo` and `class_worst`.
     pub(super) fn refresh_class_loo(&mut self) {
         let _prof = surrogate::prof::span("P2 refresh_class_loo");
+        #[cfg(test)]
+        {
+            self.class_loo_refreshes += 1;
+        }
         self.refit_stage(sim::RefitStage::LeaveOneOut);
         let (loo, worst, blockers, ratios) = self.compute_class_loo_full();
         // the per-sample leave-one-out ratios of this fit (spec ruling R1b), keyed to it

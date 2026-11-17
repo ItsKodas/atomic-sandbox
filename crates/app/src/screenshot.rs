@@ -896,10 +896,11 @@ fn wait_for_sampling(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter, 
     }
 }
 
-/// Blocks until the pass has ended and a model is fitted, trusted or not (`wait=model`).
+/// Blocks until the pass has ended and a model is fitted, trusted or not, its end fit landed (it
+/// runs in the background: `worker` module doc, "Refits") (`wait=model`).
 fn wait_for_fitted(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> Result<(), String> {
     loop {
-        if let Some(m) = viewer.snapshot.as_ref().filter(|s| !crate::sim::sampling_active(&s.dynamics)).and_then(|s| s.model.as_ref()).filter(|m| m.fitted) {
+        if let Some(m) = viewer.snapshot.as_ref().filter(|s| !crate::sim::sampling_active(&s.dynamics)).and_then(|s| s.model.as_ref()).filter(|m| m.fitted && !m.refit_running) {
             eprintln!("model fitted: {} samples, trusted {}{}", m.samples, m.trusted, m.untrusted_reason.as_deref().map_or(String::new(), |r| format!(" ({r})")));
             return Ok(());
         }
