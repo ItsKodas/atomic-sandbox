@@ -455,6 +455,7 @@ impl SurrogateKs {
         }
         self.curve_cache = None;
         self.fit_floor_cache.lock().unwrap().clear();
+        *self.triple_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         // the failed audits and fences the copy judged, then the live ones added since
         let added_audits = self.failed_audits.split_off(snap.failed_audits.len());
         let added_fences = self.audit_fences.split_off(snap.audit_fences.len());

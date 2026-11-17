@@ -11334,8 +11334,12 @@ fn a_pass_bringing_a_new_species_into_a_large_store_refits() {
 
 /// M8a Task 9: the knowledge map's builder (`knowledge.rs`), on this module's fixtures.
 mod knowledge;
+/// The three-atom coverage map's builder (`triples.rs`), on the knowledge fixtures.
+mod triples;
 mod refit_cost;
 mod refit_profile;
+/// The triple map's build cost on a collection copy (`#[ignore]`d measurement).
+mod triple_cost;
 mod refit_golden;
 mod residual_diag;
 

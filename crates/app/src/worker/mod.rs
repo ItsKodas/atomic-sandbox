@@ -458,6 +458,16 @@ impl SimWorker {
         self.rx.recv_timeout(d).ok()
     }
 
+    /// [`Self::recv_timeout`] that tells a timeout (`Ok(None)`) from a worker that has exited
+    /// (`Err`, at once: its channel is closed), so a waiting loop does not spin on it.
+    pub fn recv_or_gone(&self, d: Duration) -> Result<Option<Event>, String> {
+        match self.rx.recv_timeout(d) {
+            Ok(ev) => Ok(Some(ev)),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => Err("the worker exited".into()),
+        }
+    }
+
     /// Stops the worker without waiting for it (switching backends): it exits at its next
     /// command check — at once when idle, at the next SCF step on the GPU, after the solve in
     /// flight on the CPU or in the driver's construction. Its remaining events are dropped with

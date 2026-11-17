@@ -1150,8 +1150,9 @@
 //!   fit left out.
 //! - **Envelope, active set (rule 5e), null space (rule 5d)**: interior atoms only (the envelope and
 //!   the null space from `Accumulator::add`'s rows; the active set filters the descriptor cache).
-//! - **Readouts** (the parity views, `inspect`, the knowledge map): interior atoms, no energy point
-//!   for a masked sample; a pair is knowledge when one of its atoms is interior.
+//! - **Readouts** (the parity views, `inspect`, the knowledge map, the triple map): interior atoms,
+//!   no energy point for a masked sample; a pair is knowledge when one of its atoms is interior, a
+//!   three-atom arrangement when its centre is.
 //!
 //! What the provider cannot check: the mask was computed at the cut geometry; a pass's perturbations,
 //! scans and hot bursts move atoms, and a cap can come within r_cut of an interior atom in a moved
@@ -1219,6 +1220,7 @@ mod shared;
 pub use shared::COLLECTION_CHECKPOINT_PREFIX;
 mod store;
 mod teach;
+mod triples;
 mod trust;
 mod views;
 
@@ -1435,6 +1437,9 @@ pub struct SurrogateKs {
     /// body-4 degree: a refit asks for the floor at each degree it weighs
     /// ([`grown_body4_degree`](Self::grown_body4_degree)), and the two must not evict each other.
     fit_floor_cache: std::sync::Mutex<BTreeMap<usize, (u64, usize)>>,
+    /// The three-atom coverage map's fitted block, keyed per fit (`triples` module doc, "The
+    /// cache"); `triple_map` takes `&self`, as `fit_floor` does.
+    triple_cache: std::sync::Mutex<Option<triples::TripleCache>>,
     /// The teach offer's richer-basis words (`richer_basis_floor`), keyed by a fingerprint of all
     /// they read — the fitted samples (count, species, positions, force masks, held-out codes),
     /// the richer basis and the standing degree: the status asks every snapshot, and the count is a
@@ -1799,6 +1804,7 @@ impl SurrogateKs {
             consults: 0,
             last_variance: None,
             fit_floor_cache: std::sync::Mutex::new(BTreeMap::new()),
+            triple_cache: std::sync::Mutex::new(None),
             richer_floor_cache: std::sync::Mutex::new(None),
             #[cfg(test)]
             richer_floor_counts: std::sync::atomic::AtomicUsize::new(0),
@@ -3550,6 +3556,10 @@ impl Trainable for SurrogateKs {
 
     fn knowledge_map(&self) -> Option<sim::KnowledgeMap> {
         SurrogateKs::knowledge_map(self)
+    }
+
+    fn triple_map(&self) -> Option<sim::knowledge::TripleMap> {
+        SurrogateKs::triple_map(self)
     }
 
     fn request_display(&mut self, scene: &Scene) -> bool {

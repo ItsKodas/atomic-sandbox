@@ -819,7 +819,7 @@ pub struct UiState {
     /// `orbital_sections`): the Spin readout in Spin density mode by default. Display state.
     pub orbital_sections: dock::orbitals::Sections,
     /// The Knowledge panel's folds that are open (`knowledge::Sections`; the profile's
-    /// `knowledge_sections`): "Why thin?", closed by default. Display state.
+    /// `knowledge_sections`): "Why thin?" and "Three-atom arrangements", closed by default. Display state.
     pub knowledge_sections: knowledge::Sections,
     /// The Readouts panel's folds that are open (`dock::readouts`; the profile's
     /// `readouts_sections`): Work done, Energy breakdown and solver, Compare. Display state.
@@ -1447,6 +1447,13 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
     if want != st.activity.views_sent {
         st.activity.views_sent = want;
         out.commands.push(Command::SetActivityViews(want));
+    }
+    // the three-atom map is built only while its section or a picked type's card is shown
+    // (spec 2026-11-17 §6.4)
+    let want = knowledge::triples::wanted(st);
+    if want != st.activity.triples_sent {
+        st.activity.triples_sent = want;
+        out.commands.push(Command::SetTripleView(want));
     }
     overlays::show(root.ctx(), view, st, input, &mut acts);
     knowledge::legend(root.ctx(), view, st, input);
