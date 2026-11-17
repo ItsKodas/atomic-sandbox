@@ -9222,6 +9222,60 @@ mod triple_map {
         assert!(outs.iter().all(|o| o.actions.is_empty()));
     }
 
+    /// Task 9 (spec U8): a shot's pose (`--ui slice=`, `cell=`) is resolved once against the
+    /// map's grid, and only while the picked type is the one shown; a cell that is not drawn is
+    /// dropped as a stale pick is. Display only.
+    #[test]
+    fn a_shot_pose_resolves_once_against_the_map() {
+        let map = knowledge::fixture_triples();
+        let hoh = TripleType::new(8, 1, 1);
+        // the resolution: 1.9 Bohr is bin 6, 2.2 bin 7, cos 108° bin 6 (102–114°); a folded cell
+        // is stored k₁ ≤ k₂; without slice_r the slice is the cell's r₂ bin
+        let pose = triples::ShotPose { slice_r: None, cell: Some((2.2, 1.9, 108.0)) };
+        assert_eq!(pose.resolve(&map.grid, true), (Some(6), Some((6, 7, 6))));
+        assert_eq!(pose.resolve(&map.grid, false), (Some(6), Some((7, 6, 6))));
+        assert_eq!(triples::ShotPose { slice_r: Some(2.2), cell: Some((1.9, 1.9, 108.0)) }.resolve(&map.grid, true), (Some(7), Some((6, 6, 6))));
+        // past the grid (r_cut 6: the top edge is 6.0 Bohr): nothing
+        assert_eq!(triples::ShotPose { slice_r: Some(6.5), cell: Some((1.9, 6.5, 90.0)) }.resolve(&map.grid, true), (None, None));
+        assert_eq!(triples::ShotPose { slice_r: None, cell: None }.resolve(&map.grid, true), (None, None));
+
+        let scene = Scene::preset("h2o").unwrap();
+        let cam = camera();
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = state(&scene, &snap);
+        st.knowledge_sections.triples = true;
+        st.knowledge.set_pick(Pick::Triple(hoh));
+        st.knowledge.triple.pose = Some(triples::ShotPose { slice_r: Some(1.9), cell: Some((1.9, 1.9, 108.0)) });
+        // no map yet: the pose waits for it
+        let out = frame_sized(&ctx, &mut st, &inp, TALL, vec![]);
+        assert!(out.actions.is_empty());
+        assert!(st.knowledge.triple.pose.is_some() && st.knowledge.triple.cell.is_none());
+        // the map arrives: resolved once, the cell's card open
+        st.activity.triples = Some(Arc::new(map.clone()));
+        let (t, outs) = run(&ctx, &mut st, &inp);
+        assert!(outs.iter().all(|o| o.actions.is_empty()), "display only");
+        assert_eq!((st.knowledge.triple.slice, st.knowledge.triple.cell, st.knowledge.triple.pose), (Some(6), Some((6, 6, 6)), None));
+        let tk = map.get(hoh).unwrap();
+        assert!(probed("knowledge-triple-cell-card") && t.contains(&triples::cell_card_line(&map, tk, map.grid.index(true, 6, 6, 6))), "{t}");
+        // resolved once: a later pick by hand is not overridden
+        st.knowledge.triple.cell = Some((5, 6, 6));
+        run(&ctx, &mut st, &inp);
+        assert_eq!(st.knowledge.triple.cell, Some((5, 6, 6)));
+        // a cell that is not drawn (far out of reach, empty) is dropped, never kept
+        st.knowledge.triple.pose = Some(triples::ShotPose { slice_r: None, cell: Some((5.5, 5.5, 10.0)) });
+        run(&ctx, &mut st, &inp);
+        assert_eq!((st.knowledge.triple.cell, st.knowledge.triple.pose), (None, None));
+        // the shown type is not the picked one (nothing picked): the pose is left for the pick
+        st.knowledge.set_pick(Pick::None);
+        let pending = Some(triples::ShotPose { slice_r: Some(1.9), cell: None });
+        st.knowledge.triple.pose = pending;
+        run(&ctx, &mut st, &inp);
+        assert_eq!(st.knowledge.triple.pose, pending);
+    }
+
     /// The fixture's pending-only type, O centred with H and O (`fixture_triples`).
     fn hoo_type() -> TripleType {
         TripleType::new(8, 1, 8)

@@ -67,6 +67,14 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// switches View ▸ Display aids ▸ knowledge overlay (the atoms' tint and its legend; off by
 /// default). Both need the estimated solver's map to show more than their empty state.
 ///
+/// The three-atom map (spec 2026-11-17 §6.8, Phase A): `triple=<Za>-<Zc>-<Zb>` picks the type
+/// (centre Zc; either neighbour order), opens the Knowledge tab and its Three-atom arrangements
+/// fold, and the shot waits for the worker's map (300 s; a fitted model is needed, so pair it with
+/// `wait=model` or `--sample`); `triples=2d|3d` the view; `slice=<r₂ Bohr>` the 2D slice;
+/// `cell=<r₁>,<r₂>,<deg>` picks that cell and opens its card (Z 1–118, distances finite and
+/// above 0, the angle 0–180; the slice and the cell are resolved once against the map's grid);
+/// `rotate=<yaw>,<pitch>` the 3D cloud's rotation in degrees.
+///
 /// `--ui tab=activity` shows the Activity tab (jobs, counters, the solve log, the trust checklist,
 /// the training plots and the timeline: the last three for the estimated solver).
 ///
@@ -146,6 +154,31 @@ pub struct ShotUi {
     pub phase: Option<bool>,
     pub additive: Option<bool>,
     pub physical: Option<bool>,
+    /// `triple=<Za>-<Zc>-<Zb>`: the three-atom type to pick (either neighbour order); it opens the
+    /// Knowledge tab and the Three-atom arrangements fold, and the shot waits for the map.
+    pub triple: Option<sim::knowledge::TripleType>,
+    /// `triples=2d|3d`: the section's view (`true`: the 3D cloud).
+    pub triples_3d: Option<bool>,
+    /// `slice=<r₂ Bohr>`: the 2D slice holding that r₂.
+    pub slice: Option<f64>,
+    /// `cell=<r₁>,<r₂>,<deg>`: the cell to pick (Bohr, Bohr, degrees), its card open.
+    pub cell: Option<(f64, f64, f64)>,
+    /// `rotate=<yaw>,<pitch>`: the 3D cloud's rotation (degrees).
+    pub rotate: Option<(f32, f32)>,
+}
+
+/// A distance of a `--ui` key: finite and > 0 Bohr (NaN for a value that is not a number).
+fn distance(kv: &str, r: f64) -> Result<f64, String> {
+    (r.is_finite() && r > 0.0).then_some(r).ok_or_else(|| format!("--ui: {kv}: a distance is a finite number of Bohr above 0"))
+}
+
+/// `n` comma-separated numbers of a `--ui` key (`what` names its form in the error).
+fn numbers<T: std::str::FromStr>(kv: &str, v: &str, n: usize, what: &str) -> Result<Vec<T>, String> {
+    let parts: Vec<&str> = v.split(',').map(str::trim).collect();
+    if parts.len() != n {
+        return Err(format!("--ui: {what}, got {kv}"));
+    }
+    parts.iter().map(|p| p.parse::<T>().map_err(|_| format!("--ui: {what}, got {kv}"))).collect()
 }
 
 impl ShotUi {
@@ -309,6 +342,37 @@ impl ShotUi {
                         _ => return Err(format!("--ui: camera=on|off, got {v}")),
                     })
                 }
+                "triple" => {
+                    let z: Vec<u8> = numbers(kv, &v.replace('-', ","), 3, "triple=<Za>-<Zc>-<Zb> (Z 1–118)")?;
+                    if z.iter().any(|z| !(1..=118).contains(z)) {
+                        return Err(format!("--ui: triple=<Za>-<Zc>-<Zb> (Z 1–118), got {kv}"));
+                    }
+                    // centre Zc, neighbours Za and Zb in either order
+                    s.triple = Some(sim::knowledge::TripleType::new(z[1], z[0], z[2]));
+                }
+                "triples" => {
+                    s.triples_3d = Some(match v {
+                        "2d" => false,
+                        "3d" => true,
+                        other => return Err(format!("--ui: triples=2d|3d, got {other}")),
+                    })
+                }
+                "slice" => s.slice = Some(distance(kv, v.trim().parse().unwrap_or(f64::NAN))?),
+                "cell" => {
+                    let x: Vec<f64> = numbers(kv, v, 3, "cell=<r₁>,<r₂>,<deg> (Bohr, Bohr, degrees)")?;
+                    let (r1, r2) = (distance(kv, x[0])?, distance(kv, x[1])?);
+                    if !(0.0..=180.0).contains(&x[2]) {
+                        return Err(format!("--ui: cell=<r₁>,<r₂>,<deg>: the angle is 0 to 180 degrees, got {kv}"));
+                    }
+                    s.cell = Some((r1, r2, x[2]));
+                }
+                "rotate" => {
+                    let a: Vec<f32> = numbers(kv, v, 2, "rotate=<yaw>,<pitch> (degrees)")?;
+                    if a.iter().any(|x| !x.is_finite()) {
+                        return Err(format!("--ui: rotate=<yaw>,<pitch> (degrees), got {kv}"));
+                    }
+                    s.rotate = Some((a[0], a[1]));
+                }
                 "load" => s.load = Some(v.to_string()),
                 "nuclei" => s.nucleus_scale = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "render" => {
@@ -386,6 +450,32 @@ impl ShotUi {
         Ok(())
     }
 
+    /// The three-atom map's keys (spec §6.8): `triple=` picks the type, opens the Knowledge tab and
+    /// the fold (so the UI asks the worker for the map); `triples=` the 2D/3D view; `rotate=` the
+    /// cloud's camera (yaw wrapped into [−180°, 180°), pitch held within ±`PITCH_LIMIT_DEG`, as a
+    /// drag holds them); `slice=` and `cell=` a pose resolved once the map arrives
+    /// (`triples::apply_pose`). Display state only, after `tab=`.
+    fn apply_triples(&self, viewer: &mut Viewer) {
+        use crate::ui::knowledge::{cloud, triples::ShotPose, Pick, TripleMode};
+        let ui = &mut viewer.ui;
+        if let Some(t) = self.triple {
+            ui.open_tab(crate::ui::DockTab::Knowledge);
+            ui.knowledge_sections.triples = true;
+            ui.knowledge.set_pick(Pick::Triple(t));
+        }
+        let view = &mut ui.knowledge.triple;
+        if let Some(on) = self.triples_3d {
+            view.mode = if on { TripleMode::Cloud } else { TripleMode::Flat };
+        }
+        if let Some((yaw, pitch)) = self.rotate {
+            view.yaw_deg = (yaw + 180.0).rem_euclid(360.0) - 180.0;
+            view.pitch_deg = pitch.clamp(-cloud::PITCH_LIMIT_DEG, cloud::PITCH_LIMIT_DEG);
+        }
+        if self.slice.is_some() || self.cell.is_some() {
+            view.pose = Some(ShotPose { slice_r: self.slice, cell: self.cell });
+        }
+    }
+
     /// Puts the chrome into the requested state (before the frames are rendered).
     fn apply(&self, viewer: &mut Viewer) -> Result<(), String> {
         use crate::ui::{DockTab, ToolMode};
@@ -405,6 +495,7 @@ impl ShotUi {
             let tab = crate::ui::panel_named(t).ok_or_else(|| format!("--ui: unknown tab {t}"))?;
             viewer.ui.open_tab(tab);
         }
+        self.apply_triples(viewer);
         if let Some(i) = self.select {
             viewer.tool.selected = Some(i);
         }
@@ -710,8 +801,48 @@ pub fn run(path: &str, o: &ShotOptions, setup: &dyn Fn(&mut Viewer) -> Result<()
         shot.render(&mut viewer, Default::default());
         wait_for_views(&mut viewer, &shot.hl, &mut shot.painter)?;
     }
+    if let Some(t) = o.ui.triple {
+        // the section is open: its first frame tells the worker (`SetTripleView`), which then
+        // builds the map on its next publish
+        shot.render(&mut viewer, Default::default());
+        wait_for_triples(&mut viewer, &shot.hl, &mut shot.painter)?;
+        shot.render(&mut viewer, Default::default());
+        report_triples(&viewer, t, &o.ui);
+    }
     shot.render(&mut viewer, Default::default());
     shot.write(path)
+}
+
+/// The three-atom shot's outcome on stderr: the type missing from the map, or a pose that did not
+/// land (a distance past the grid, a cell that is not drawn) — the shot is still written.
+fn report_triples(viewer: &Viewer, t: sim::knowledge::TripleType, ui: &ShotUi) {
+    let name = crate::ui::knowledge::triples::triple_name(t);
+    let Some(map) = viewer.ui.activity.triples.as_ref() else { return };
+    let view = &viewer.ui.knowledge.triple;
+    if map.get(t).is_none_or(|k| k.samples == 0 && k.pending_samples == 0) {
+        eprintln!("--ui triple: {name} is not in the three-atom map (r_cut {:.1} Bohr); the shot shows its note", map.r_cut);
+        return;
+    }
+    if let Some((r1, r2, deg)) = ui.cell.filter(|_| view.cell.is_none()) {
+        eprintln!("--ui cell={r1},{r2},{deg}: no drawn cell of {name} there (empty and outside reach, or past the grid); no cell card");
+    }
+    eprintln!("three-atom shot: {name}, {:?}, slice {:?}, cell {:?}, yaw {:.0}°, pitch {:.0}°", view.mode, view.slice, view.cell, view.yaw_deg, view.pitch_deg);
+}
+
+/// Blocks until the worker has shipped a three-atom map (`triple=`): it builds one only for a
+/// fitted model, so without one this times out with a message.
+fn wait_for_triples(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while viewer.ui.activity.triples.is_none() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("no three-atom map within 300 s (is the model fitted?)".into());
+        }
+        if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_timeout(left.min(Duration::from_secs(1))) {
+            viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
+        }
+    }
+    Ok(())
 }
 
 /// The row `want` names in the newest orbital payload: `<label or #k>[↑|↓]` (`2p_x↑`, `#2↓`, `1s`),
@@ -1064,5 +1195,20 @@ mod tests {
         assert_eq!(ShotUi::parse("tab=graph").unwrap().layout, None);
         assert_eq!(ShotUi::parse("dock=open").unwrap().layout, None, "as before: only closed means anything");
         assert!(ShotUi::parse("layout=three").err().is_some_and(|e| e.contains("training")));
+    }
+
+    /// Spec U8 (Phase A's keys).
+    #[test]
+    fn the_triple_keys_parse() {
+        use sim::knowledge::TripleType;
+        let s = ShotUi::parse("tab=knowledge;triple=1-8-1;triples=3d;rotate=35,20").unwrap();
+        assert_eq!((s.triple, s.triples_3d, s.rotate), (Some(TripleType::new(8, 1, 1)), Some(true), Some((35.0, 20.0))));
+        assert_eq!(ShotUi::parse("triple=8-1-1").unwrap().triple, Some(TripleType { centre: 1, a: 1, b: 8 }));
+        let p = ShotUi::parse("triple=1-8-1;triples=2d;slice=1.9;cell=1.9,1.9,108").unwrap();
+        assert_eq!((p.triples_3d, p.slice, p.cell), (Some(false), Some(1.9), Some((1.9, 1.9, 108.0))));
+        for bad in ["triple=1-8", "triple=1-0-1", "triple=a-b-c", "triples=4d", "slice=-1", "slice=x", "cell=1.9,1.9", "cell=1.9,1.9,200", "rotate=35", "region=1-2,90-120"] {
+            assert!(ShotUi::parse(bad).is_err(), "{bad}");
+        }
+        assert_eq!(ShotUi::parse("tab=knowledge").unwrap().triple, None);
     }
 }

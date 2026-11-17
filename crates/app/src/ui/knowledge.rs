@@ -130,6 +130,9 @@ pub struct TripleView {
     /// An entry link's centre (the pair card's, or the element card's before a map arrived): with
     /// no triple picked, the section shows that centre's type with the most gaps.
     pub want_centre: Option<u8>,
+    /// A screenshot's `--ui slice=` / `cell=` (Phase A Task 9), resolved once against the map's
+    /// grid when the picked type is shown ([`triples::apply_pose`]); `None` in the window.
+    pub pose: Option<triples::ShotPose>,
     /// The shown type's classes and extent, computed once per (map, type) (spec §6.4 "UI cost";
     /// [`triples::sync`]). Keyed on the map, not the scene: a new scene keeps it, so the
     /// type-change reset still applies after it.
@@ -147,6 +150,7 @@ impl Default for TripleView {
             zoom: 1.0,
             show_missing: true,
             want_centre: None,
+            pose: None,
             cache: None,
         }
     }

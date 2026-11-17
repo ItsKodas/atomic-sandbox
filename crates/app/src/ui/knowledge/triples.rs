@@ -285,9 +285,14 @@ pub fn section(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, r_cut: f64
     }
     // the view: the slice, or the 3D cloud (Task 8)
     ui.add_space(6.0);
+    let picked = st.knowledge.pick == Pick::Triple(tk.t);
     let view = &mut st.knowledge.triple;
     mode_switch(ui, view);
     sync(view, &map, tk);
+    // a screenshot's pose (`--ui slice=`, `cell=`) belongs to the picked type
+    if picked {
+        apply_pose(view, &map, tk);
+    }
     let mut cache = view.cache.take().expect("sync fills it");
     let r = ui
         .scope(|ui| match view.mode {
@@ -655,6 +660,44 @@ pub fn sync(view: &mut TripleView, map: &Arc<TripleMap>, tk: &TripleKnowledge) {
         let c = g.index(tk.t.folded(), k1, k2, q);
         drawn(tk, cache.classes[c], c).then(|| g.coords(c))
     });
+}
+
+/// A screenshot's pose of the view (`--ui slice=`, `cell=`; spec §6.8, Phase A Task 9), kept in
+/// `TripleView::pose` until the picked type is shown with a map, then resolved once against that
+/// map's grid ([`apply_pose`]): in Bohr, Bohr and degrees, so it does not depend on r_cut.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShotPose {
+    /// The r₂ (Bohr) whose bin is the 2D slice.
+    pub slice_r: Option<f64>,
+    /// The cell to pick: (r₁, r₂, θ) in Bohr, Bohr, degrees.
+    pub cell: Option<(f64, f64, f64)>,
+}
+
+impl ShotPose {
+    /// (the slice, the cell's stored (k₁, k₂, q)) on `grid`: the slice is the bin of `slice_r`,
+    /// else of the cell's r₂; the cell is `grid.cell(folded, r₁, r₂, cos θ)` (an angle exactly on a
+    /// bin edge may land in either neighbour, as `cos` rounds). A distance past the grid gives
+    /// `None`.
+    pub fn resolve(&self, grid: &TripleGrid, folded: bool) -> (Option<usize>, Option<(usize, usize, usize)>) {
+        let cell = self.cell.and_then(|(r1, r2, deg)| grid.cell(folded, r1, r2, deg.to_radians().cos())).map(|c| grid.coords(c));
+        let slice = self.slice_r.or(self.cell.map(|c| c.1)).and_then(|r| grid.r_bin_of(r));
+        (slice, cell)
+    }
+}
+
+/// Resolves a pending [`ShotPose`] once the picked type `tk` is shown with its map: the slice and
+/// the cell are set from it, then [`sync`] clamps the slice and drops a cell that is not drawn,
+/// as for any stale pick. The pose is spent either way.
+pub fn apply_pose(view: &mut TripleView, map: &Arc<TripleMap>, tk: &TripleKnowledge) {
+    let Some(pose) = view.pose.take() else { return };
+    let (slice, cell) = pose.resolve(&map.grid, tk.t.folded());
+    if slice.is_some() {
+        view.slice = slice;
+    }
+    if pose.cell.is_some() {
+        view.cell = cell;
+    }
+    sync(view, map, tk);
 }
 
 /// The rows' height (points): together ≈ 180 pt, each 8–18.
