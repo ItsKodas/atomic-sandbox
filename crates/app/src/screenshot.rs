@@ -386,6 +386,13 @@ impl ShotUi {
                 other => return Err(format!("--ui: unknown key {other}")),
             }
         }
+        // the three-atom view's pose keys pose the picked type's view: without one they would do nothing
+        if s.triple.is_none() {
+            let orphan = [("slice", s.slice.is_some()), ("cell", s.cell.is_some()), ("rotate", s.rotate.is_some())].into_iter().find(|k| k.1);
+            if let Some((k, _)) = orphan {
+                return Err(format!("--ui: {k}= needs triple=<Za>-<Zc>-<Zb>"));
+            }
+        }
         Ok(s)
     }
 
@@ -823,6 +830,9 @@ fn report_triples(viewer: &Viewer, t: sim::knowledge::TripleType, ui: &ShotUi) {
         eprintln!("--ui triple: {name} is not in the three-atom map (r_cut {:.1} Bohr); the shot shows its note", map.r_cut);
         return;
     }
+    if let Some(r) = ui.slice.filter(|&r| map.grid.r_bin_of(r).is_none()) {
+        eprintln!("--ui slice={r}: past the grid ({:.1} Bohr at r_cut {:.1}); the default slice", map.grid.n_r as f64 * map.grid.r_bin, map.r_cut);
+    }
     if let Some((r1, r2, deg)) = ui.cell.filter(|_| view.cell.is_none()) {
         eprintln!("--ui cell={r1},{r2},{deg}: no drawn cell of {name} there (empty and outside reach, or past the grid); no cell card");
     }
@@ -830,15 +840,19 @@ fn report_triples(viewer: &Viewer, t: sim::knowledge::TripleType, ui: &ShotUi) {
 }
 
 /// Blocks until the worker has shipped a three-atom map (`triple=`): it builds one only for a
-/// fitted model, so without one this times out with a message.
+/// fitted model, so without one this times out with a message. Another backend than the
+/// estimated solver, or a worker that has exited, fails at once.
 fn wait_for_triples(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(300);
     while viewer.ui.activity.triples.is_none() {
+        if viewer.snapshot.as_ref().is_some_and(|s| s.backend != Backend::Estimated) {
+            return Err("triple= needs the estimated solver (--estimated)".into());
+        }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err("no three-atom map within 300 s (is the model fitted?)".into());
         }
-        if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_timeout(left.min(Duration::from_secs(1))) {
+        if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_or_gone(left.min(Duration::from_secs(1)))? {
             viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
         }
     }
@@ -1050,7 +1064,7 @@ fn wait_for_views(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter) -> 
         if left.is_zero() {
             return Err("no training views within 300 s (is the model fitted?)".into());
         }
-        if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_timeout(left.min(Duration::from_secs(1))) {
+        if let Some(ev) = viewer.sim.as_ref().ok_or("no worker")?.recv_or_gone(left.min(Duration::from_secs(1)))? {
             viewer.on_event(ev, &hl.ctx, painter, &hl.depth);
         }
     }
@@ -1210,5 +1224,10 @@ mod tests {
             assert!(ShotUi::parse(bad).is_err(), "{bad}");
         }
         assert_eq!(ShotUi::parse("tab=knowledge").unwrap().triple, None);
+        // the pose keys pose the picked type's view: alone they are refused
+        for orphan in ["slice=1.9", "cell=1.9,1.9,108", "rotate=35,20", "tab=knowledge;triples=3d;rotate=35,20"] {
+            assert!(ShotUi::parse(orphan).err().is_some_and(|e| e.contains("needs triple=")), "{orphan}");
+        }
+        assert!(ShotUi::parse("rotate=35,20;triple=1-8-1").is_ok(), "in any order");
     }
 }

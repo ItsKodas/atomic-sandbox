@@ -675,11 +675,11 @@ pub struct ShotPose {
 
 impl ShotPose {
     /// (the slice, the cell's stored (k₁, k₂, q)) on `grid`: the slice is the bin of `slice_r`,
-    /// else of the cell's r₂; the cell is `grid.cell(folded, r₁, r₂, cos θ)` (an angle exactly on a
-    /// bin edge may land in either neighbour, as `cos` rounds). A distance past the grid gives
-    /// `None`.
+    /// else of the cell's r₂; the cell is `grid.cell(folded, r₁, r₂, u)` with u = cos θ computed
+    /// as sin(90° − θ), exact at 0°, 90° and 180° (cos 90° would be 6e-17 and land a bin short
+    /// of u = 0's bin 5). A distance past the grid gives `None`.
     pub fn resolve(&self, grid: &TripleGrid, folded: bool) -> (Option<usize>, Option<(usize, usize, usize)>) {
-        let cell = self.cell.and_then(|(r1, r2, deg)| grid.cell(folded, r1, r2, deg.to_radians().cos())).map(|c| grid.coords(c));
+        let cell = self.cell.and_then(|(r1, r2, deg)| grid.cell(folded, r1, r2, (90.0 - deg).to_radians().sin())).map(|c| grid.coords(c));
         let slice = self.slice_r.or(self.cell.map(|c| c.1)).and_then(|r| grid.r_bin_of(r));
         (slice, cell)
     }

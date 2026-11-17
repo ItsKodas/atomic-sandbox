@@ -9238,6 +9238,11 @@ mod triple_map {
         // past the grid (r_cut 6: the top edge is 6.0 Bohr): nothing
         assert_eq!(triples::ShotPose { slice_r: Some(6.5), cell: Some((1.9, 6.5, 90.0)) }.resolve(&map.grid, true), (None, None));
         assert_eq!(triples::ShotPose { slice_r: None, cell: None }.resolve(&map.grid, true), (None, None));
+        // the angle's edges are exact: 90° is u = 0, bin 5 (spec §6.2: an edge goes to the larger θ);
+        // 0° bin 0, 180° the last
+        for (deg, q) in [(90.0, 5), (0.0, 0), (180.0, 9)] {
+            assert_eq!(triples::ShotPose { slice_r: None, cell: Some((1.9, 1.9, deg)) }.resolve(&map.grid, true).1, Some((6, 6, q)), "{deg}°");
+        }
 
         let scene = Scene::preset("h2o").unwrap();
         let cam = camera();
@@ -9418,6 +9423,33 @@ mod triple_map {
         let (t, more) = run(&ctx, &mut st, &inp);
         outs.extend(more);
         assert!(probed("knowledge-triple-cell-card") && t.contains(&triples::cell_card_line(&map, tk, front.cell)), "{t}");
+        // Task 9 review minor 5: a double-click on the picked cube resets the view and keeps the
+        // pick (its second click does not pick again under the reset view)
+        st.knowledge.triple.yaw_deg = 100.0;
+        st.knowledge.triple.pitch_deg = -30.0;
+        run(&ctx, &mut st, &inp);
+        let turned = cloud_drawn(&st);
+        let cube = turned.iter().rev().find(|d| !d.faces.is_empty()).unwrap().clone();
+        let at = egui::Rect::from_points(&cube.hull).center();
+        assert_eq!(cloud::hit(&turned, at), Some(cube.cell));
+        st.knowledge.triple.cell = Some(map.grid.coords(cube.cell));
+        // the cloud as the reset view draws it (the "missing" squares hidden, as now)
+        let memo = st.knowledge.triple.cache.as_ref().unwrap().cloud.clone().unwrap();
+        let kept: Vec<_> = memo.voxels.iter().filter(|v| !missing(v.cell)).copied().collect();
+        let reprojected = cloud::project_sized(&kept, memo.size, cloud::DEFAULT_YAW_DEG, cloud::DEFAULT_PITCH_DEG, 1.0, probed_rect("knowledge-triple-cloud"));
+        assert_ne!(cloud::hit(&reprojected, at), Some(cube.cell), "the default view has another cell (or none) under the pointer, so a re-pick would show");
+        // past egui's triple-click window (0.6 s at 1/60 s a frame) since the pick's click
+        for _ in 0..40 {
+            frame_sized(&ctx, &mut st, &inp, TALL, vec![]);
+        }
+        outs.push(frame_sized(&ctx, &mut st, &inp, TALL, vec![egui::Event::PointerMoved(at), pointer(at, true)]));
+        outs.push(frame_sized(&ctx, &mut st, &inp, TALL, vec![pointer(at, false)]));
+        outs.push(frame_sized(&ctx, &mut st, &inp, TALL, vec![pointer(at, true)]));
+        outs.push(frame_sized(&ctx, &mut st, &inp, TALL, vec![pointer(at, false)]));
+        outs.push(frame_sized(&ctx, &mut st, &inp, TALL, vec![egui::Event::PointerGone]));
+        let v = &st.knowledge.triple;
+        assert_eq!((v.yaw_deg, v.pitch_deg, v.zoom), (cloud::DEFAULT_YAW_DEG, cloud::DEFAULT_PITCH_DEG, 1.0), "reset");
+        assert_eq!(v.cell, Some(map.grid.coords(cube.cell)), "the pick is unchanged");
         // back to 2D: the slice again, the pick kept
         outs.extend(click(&ctx, &mut st, &inp, "knowledge-triple-mode-2d"));
         assert_eq!(st.knowledge.triple.mode, TripleMode::Flat);
