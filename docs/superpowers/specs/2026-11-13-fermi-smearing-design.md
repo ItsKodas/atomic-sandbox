@@ -736,7 +736,9 @@ file order:
      resume reproduces them exactly.
 2. Check the solve. It must have converged (not stalled, not capped), carry no solver warning (core overlap, LSDA
    domain, Poisson cap), have a face density within the box rule (`box_affected_face_density(h)`), and reproduce the
-   recorded multiplicity when one is recorded.
+   recorded multiplicity when one is recorded. (That last check is a consistency check of the settings, not a state
+   guard: under multiplicity auto the electron count's parity fixes M. The class decides the state; plan Task 14 fix
+   round 1, M1.)
    - A sample that fails is **not migrated**. It is listed with its reason in `migration.txt` and stays in the old
      folder.
    - Its old label is never carried: it belongs to the old surface.
@@ -773,7 +775,23 @@ So the criterion is a comparison with a fresh solve, and its cost is stated abov
 
 ### 7.4 Classification
 
-Thresholds: ε_E = 1e-5 Ha per sample, and ε_F = 1.5e-4 Ha/Bohr per force component.
+Thresholds, per sample, from the teacher's noise model (plan Task 14 fix round 1, physics review I2):
+**ε_E = max(1e-5 Ha, 5σ_E)** and **ε_F = 3σ_F** (Ha/Bohr per force component), with σ_E, σ_F the per-solve path scatter
+the `branch_jump` guard uses (`providers::branch_jump::noise_tier`): by surface (pseudo or all-electron), by the
+tolerance the new solve stopped at (a GPU solve with a partly occupied level stops at `GPU_PARTIAL_TOL` = 1e-5, the app
+tier), and σ_E = max(the tier's, c·|E_old|), c = 9e-8 pseudo, 1.0e-7 all-electron.
+
+| | ε_E | ε_F |
+|---|---|---|
+| pseudo, sample tier, \|E\| ≲ 22 Ha (H₂, H₂O, OH) | 1e-5 | 1.5e-4 (3 × `PSEUDO_FORCE_NOISE`) |
+| pseudo, 35 Ha | 1.58e-5 | 1.5e-4 |
+| pseudo, 70 Ha | 3.15e-5 | 1.5e-4 |
+| pseudo, partial stop (app tier) | as the sample tier's (its σ_E 1.6e-6 is below the floor) | 2.7e-4 |
+| all-electron, sample tier, \|E\| ≤ 54 Ha | 2.7e-5 | 7.2e-5 |
+| all-electron, 70 Ha | 3.5e-5 | 7.2e-5 |
+
+A fixed 1e-5 was 1.6σ_E at 70 Ha (about a quarter of gapped samples falsely S) and below 2σ_F of a partial stop. The
+classes decide the review only: a T or S label is always the new solve's.
 
 | class | condition | meaning |
 |---|---|---|
@@ -781,16 +799,16 @@ Thresholds: ε_E = 1e-5 Ha per sample, and ε_F = 1.5e-4 Ha/Bohr per force compo
 | **T**, entropy only | not U, \|E_new − E_old\| ≤ ε_E (the internal energy), every force within ε_F | the same electronic state (an equal-share ensemble before and the same f now); only the reported quantity changed, by −TS |
 | **S**, state changed | anything else | the old rule had a different state here: e.g. a released integer pattern where FD now pins the frontier at μ (H₆ seed 5: E −3.148291 before, F −3.148504 now), or a different SCF branch |
 
-- **ε_E** [SHOULD-7] is 5× the largest measured path scatter on the pseudo surface (1.87e-6 Ha, H₂O warm vs cold,
-  `references.md` "SCF, GPU against CPU"), about 2× all-electron H₂O's (5.4e-6), and 100× below the model's
-  1 mHa/atom energy bound.
+- **ε_E's floor** [SHOULD-7], 1e-5 Ha, is 5× the largest measured path scatter on the pseudo surface (1.87e-6 Ha,
+  H₂O warm vs cold, `references.md` "SCF, GPU against CPU") and 100× below the model's 1 mHa/atom energy bound; above
+  it, 5σ_E of the noise model (table above).
   - The earlier "10× the 6e-7 Ha scatter" cited the H₂ number, which is the wrong surface for an H/N/O collection.
   - Because the margin is thinner on O-containing samples, V11 reports the fraction of class S whose only failing test
     is |ΔE| ∈ (ε_E, 3ε_E] as the false-S estimate.
-- **ε_F** is 3 × `PSEUDO_FORCE_NOISE` (5e-5 Ha/Bohr, the teacher's measured path scatter), the tier an audit already
-  judges against.
-- **Both errors are safe.** A false "changed" costs one review. A false "unchanged" keeps a label within 1e-5 Ha of the
-  new one.
+- **ε_F** is 3σ_F: on the pseudo sample tier 3 × `PSEUDO_FORCE_NOISE` (5e-5 Ha/Bohr, the teacher's measured path
+  scatter), the tier an audit already judges against.
+- **Both errors are safe.** A false "changed" costs one review (and re-judges a misfit hold or a lifted fence). A false
+  "unchanged" keeps a label within ε_E of the new one.
 - **Class S can replace a lower-F label** (rule 7; plan Task 10 review M4, V7). At V7's near-square H₄ (aspect 1.005)
   the shared-shell rule released the e pair into the broken-symmetry integer state, E_DS = −2.028985 Ha; the cold
   Fermi–Dirac solve reaches the symmetric ensemble, F = −2.014486 Ha, 14.5 mHa higher (section 4.7(e)). The new label is

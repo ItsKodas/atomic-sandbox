@@ -1328,7 +1328,7 @@ impl SurrogateKs {
         let dir = sh.coll.folder().to_path_buf();
         let Some(root) = dir.parent().map(Path::to_path_buf) else { return };
         let slug = sh.coll.key.slug();
-        let log = match surrogate::read_migration(&dir) {
+        let mut log = match surrogate::read_migration(&dir) {
             Ok(l) => l,
             Err(e) => {
                 self.user_notes.push(format!("shared collection {slug}: its {} can't be read ({e}) — the re-solve for the new solver is not offered", surrogate::migration::MIGRATION_FILE));
@@ -1355,6 +1355,17 @@ impl SurrogateKs {
                 None => return,
             },
         };
+        // the status window (`crate::sampling::migrate` module doc, 4.; fix round 1 I1): a code recorded before its
+        // sample's append, which a crash kept from its status record, is applied now — before attach's refit
+        if let Some(l) = log.as_mut().filter(|l| l.state == MigrationState::Running && l.pending.is_some()) {
+            let (k, code) = l.pending.take().expect("checked");
+            self.apply_pending_status(k, code);
+            if !self.shared.as_ref().is_some_and(|sh| sh.coll.read_only) {
+                if let Err(e) = surrogate::write_migration(&dir, l) {
+                    self.user_notes.push(format!("shared collection {slug}: its {} could not be rewritten ({e})", surrogate::migration::MIGRATION_FILE));
+                }
+            }
+        }
         let done = log.as_ref().is_some_and(|l| l.state != MigrationState::Running);
         let (samples, sample_boxes, reference_boxes) = if done {
             (log.as_ref().map_or(0, |l| l.counts.iter().sum()), Vec::new(), Vec::new())
@@ -1378,6 +1389,28 @@ impl SurrogateKs {
             return;
         }
         self.migration = Some(MigrationSlot { source, samples, sample_boxes, reference_boxes, log });
+    }
+
+    /// A pending status (`find_migration`): collection sample `k` takes `code` when it exists and still holds 0 — the
+    /// status record a crash kept from following its sample record —, in the collection and in the store (through its
+    /// link). Anything else (no such sample, a code set since, a code no collection holds) leaves it as it is.
+    fn apply_pending_status(&mut self, k: usize, code: u8) {
+        let n = self.samples();
+        let Some(sh) = self.shared.as_mut() else { return };
+        let slug = sh.coll.key.slug();
+        if k >= sh.coll.samples.len() || sh.coll.quarantine[k] != Q_NONE || !surrogate::quarantine::is_collection_code(code) || code == Q_NONE {
+            return;
+        }
+        let failed = if sh.coll.read_only { None } else { sh.coll.set_status(k, code).err() };
+        let i = sh.link.iter().position(|l| *l == Link::In(k));
+        if let Some(e) = failed {
+            self.user_notes.push(format!("shared collection {slug}: the re-solved sample {k}'s status {code} could not be written ({e}) — it is held out for this session"));
+        }
+        if let Some(i) = i {
+            self.quarantine.resize(n, Q_NONE);
+            self.quarantine[i] = code;
+        }
+        self.user_notes.push(format!("shared collection {slug}: the re-solve pass stopped between sample {k}'s record and its status — its code {code} is applied now"));
     }
 
     /// The migration's state for `Trainable::migration` (module doc, "The migration").
@@ -1441,8 +1474,15 @@ impl SurrogateKs {
             return Err(format!("the shared collection {} is read-only", sh.coll.key.slug()));
         }
         let k = sh.coll.samples.len();
+        #[cfg(test)]
+        let crash = std::mem::take(&mut self.status_window_crash);
+        let sh = self.shared.as_mut().expect("checked above");
         match sh.coll.append(cs.clone()) {
             Ok(()) => {
+                #[cfg(test)]
+                if crash {
+                    return Err("injected crash between the sample record and its status".into());
+                }
                 if code != Q_NONE {
                     sh.coll.set_status(k, code)?;
                 }
@@ -1559,12 +1599,22 @@ impl SurrogateKs {
 
 #[cfg(test)]
 impl SurrogateKs {
-    /// Test hook (Review Focus 4): the running re-solve pass stops with an error right after sample `k`'s append,
-    /// before its cursor is written — a crash there.
-    pub(crate) fn migration_crash_after(&mut self, k: usize) {
+    /// Test hook (Review Focus 4, fix round 1 I1): the running re-solve pass stops with an error inside sample `k`'s
+    /// append — after its sample record, before its status record and the cursor — a crash in the status window.
+    pub(crate) fn migration_crash_in_window(&mut self, k: usize) {
         if let Some(m) = self.pass.as_mut().and_then(|p| p.migrator_mut()) {
-            m.crash_after_append = Some(k);
+            m.crash_in_window = Some(k);
         }
+    }
+
+    /// Test hook: the next `take_migrated` stops after its sample record (`migration_crash_in_window`).
+    pub(crate) fn arm_status_window_crash(&mut self) {
+        self.status_window_crash = true;
+    }
+
+    /// Test reader: stored sample `i`'s code in the store (what a fit reads).
+    pub(crate) fn code_of(&self, i: usize) -> u8 {
+        self.quarantine.get(i).copied().unwrap_or(Q_NONE)
     }
 }
 

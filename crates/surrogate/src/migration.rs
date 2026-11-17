@@ -19,7 +19,14 @@
 //!   none or it did not solve;
 //! - class U's largest |ΔE| (Hartree) and |ΔF| (Hartree/Bohr), so the thresholds' margin is seen;
 //! - the review log: per code-9 sample judged, its index in the **new** file, its leave-one-out
-//!   ratio and whether it was released.
+//!   ratio and whether it was released;
+//! - the **pending status** (Task 14 fix round 1, physics review I1): the index in the new file and
+//!   the code of the sample being appended, written before its append whenever its code is not 0
+//!   and cleared by the cursor write. A status record can only follow its sample record, so a crash
+//!   between the two would leave the sample at code 0 (in the fit); the next attach applies the
+//!   pending code first;
+//! - the superseded samples left without their superseder (fix round 1, M4): source indices of
+//!   migrated code-2 samples whose likely superseder was not migrated.
 //!
 //! # The file
 //!
@@ -41,6 +48,8 @@
 //! not_migrated <source index> <reason>              (zero or more, in order)
 //! reference <Z> <n> <old | -> <new | ->             (zero or more, in order)
 //! review <new index> <ratio> released | kept        (zero or more, in order)
+//! pending <new index> <code>                        (at most one)
+//! orphaned <source index>                           (zero or more, in order)
 //! end
 //! ```
 //!
@@ -113,6 +122,10 @@ pub struct MigrationLog {
     pub class_u_max: (f64, f64),
     /// The review log: (the sample's index in the new file, its leave-one-out ratio, released).
     pub review: Vec<(usize, f64, bool)>,
+    /// The status of the sample being appended (index in the new file, code ≠ 0), cleared by the cursor write.
+    pub pending: Option<(usize, u8)>,
+    /// Source indices of migrated superseded (code 2) samples whose likely superseder was not migrated.
+    pub orphaned: Vec<usize>,
 }
 
 /// The length and the hash (64-bit FNV-1a of every byte) of a source `samples.bin` (F3: what
@@ -194,6 +207,12 @@ fn encode(log: &MigrationLog) -> String {
     for &(i, ratio, released) in &log.review {
         t.push_str(&format!("review {i} {ratio:?} {}\n", if released { "released" } else { "kept" }));
     }
+    if let Some((k, code)) = log.pending {
+        t.push_str(&format!("pending {k} {code}\n"));
+    }
+    for i in &log.orphaned {
+        t.push_str(&format!("orphaned {i}\n"));
+    }
     t.push_str("end\n");
     t
 }
@@ -217,6 +236,7 @@ fn decode(text: &str) -> Result<MigrationLog, String> {
     let (mut format, mut slug, mut key, mut build, mut date) = (None, None, None, None, None);
     let (mut len, mut hash, mut cursor, mut state, mut counts, mut u_max) = (None, None, None, None, None, None);
     let (mut not_migrated, mut references, mut review) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut pending, mut orphaned) = (None, Vec::new());
     let mut ended = false;
     let once = |slot: bool, name: &str| if slot { Err(format!("'{name}' appears twice")) } else { Ok(()) };
     while let Some((k, raw)) = lines.next() {
@@ -322,6 +342,12 @@ fn decode(text: &str) -> Result<MigrationLog, String> {
                 };
                 review.push((num::<usize>(i, "a sample index").map_err(at)?, float(ratio, "the ratio").map_err(at)?, released));
             }
+            "pending" => {
+                once(pending.is_some(), name).map_err(at)?;
+                let [k, code] = fields[..] else { return Err(at("a pending status is 'index code'".into())) };
+                pending = Some((num::<usize>(k, "a sample index").map_err(at)?, num::<u8>(code, "a status code").map_err(at)?));
+            }
+            "orphaned" => orphaned.push(num::<usize>(value, "a sample index").map_err(at)?),
             "end" if value.is_empty() => ended = true,
             other => return Err(at(format!("unknown line '{other}'"))),
         }
@@ -345,6 +371,8 @@ fn decode(text: &str) -> Result<MigrationLog, String> {
         references,
         class_u_max: u_max.ok_or_else(|| need("class_u_max"))?,
         review,
+        pending,
+        orphaned,
     })
 }
 
@@ -425,6 +453,8 @@ mod tests {
             references: vec![(1, 57, Some(-0.478_123_456_789_012_3), Some(-0.479)), (8, 57, None, Some(-15.9)), (8, 81, Some(-15.8), None)],
             class_u_max: (9.876_543_210_987_654e-6, -0.0),
             review: vec![(1700, 0.25, true), (1701, 3.5, false), (2400, 1.0, true)],
+            pending: Some((1702, 9)),
+            orphaned: vec![3, 17],
         }
     }
 
@@ -446,13 +476,13 @@ mod tests {
             assert_eq!(back.references[0].2.unwrap().to_bits(), want.references[0].2.unwrap().to_bits());
         }
         // empty lists and an empty key round-trip too
-        let bare = MigrationLog { not_migrated: Vec::new(), references: Vec::new(), review: Vec::new(), source_key: String::new(), ..log() };
+        let bare = MigrationLog { not_migrated: Vec::new(), references: Vec::new(), review: Vec::new(), source_key: String::new(), pending: None, orphaned: Vec::new(), ..log() };
         write_migration(&d.0, &bare).unwrap();
         assert_eq!(read_migration(&d.0).unwrap(), Some(bare));
         // readable: one line per field, the key's lines as they are in key.txt
         write_migration(&d.0, &log()).unwrap();
         let text = std::fs::read_to_string(d.0.join(MIGRATION_FILE)).unwrap();
-        for line in ["state running", "cursor 412", "functional lsda", "not_migrated 7 stalled"] {
+        for line in ["state running", "cursor 412", "functional lsda", "not_migrated 7 stalled", "pending 1702 9", "orphaned 17"] {
             assert!(text.lines().any(|l| l.trim_start() == line), "{line:?} in\n{text}");
         }
         // a damaged file is an error, never a silent default

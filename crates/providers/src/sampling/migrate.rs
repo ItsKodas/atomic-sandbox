@@ -10,8 +10,9 @@
 //! The old label is (E_old, F_old): E_old the energy the previous solver stored — its total energy, with integer or
 //! equal-share ("degenerate shells") occupations, so no entropy term — and F_old_{Ia} = −∂E_old/∂R_{Ia} its forces. The
 //! new cold solve reports the Mermin free energy F = E − TS (`ForceResult::energy` = `EvalStats::energy.total`), its
-//! internal energy E (`EvalStats::energy.internal`; TS = E − F ≥ 0) and its forces −∂F/∂R. With ε_E = [`MIGRATION_EPS_E`]
-//! (Ha per sample) and ε_F = [`MIGRATION_EPS_F`] (Ha/Bohr per component), ΔF_{Ia} = F_new,{Ia} − F_old,{Ia}:
+//! internal energy E (`EvalStats::energy.internal`; TS = E − F ≥ 0) and its forces −∂F/∂R. With ε_E (Ha per sample)
+//! and ε_F (Ha/Bohr per component) from the teacher's noise model ([`migration_eps`], "The thresholds" below) and
+//! ΔF_{Ia} = F_new,{Ia} − F_old,{Ia}:
 //!
 //! - **U, unchanged:** |F − E_old| ≤ ε_E and max_{Ia} |ΔF_{Ia}| ≤ ε_F. A gapped state: TS ≈ 0, the same label within
 //!   solver noise. The old record is kept bit for bit.
@@ -31,11 +32,23 @@
 //!
 //! # The thresholds
 //!
-//! - ε_E = 1e-5 Ha: 5× the largest measured path scatter on the pseudo surface (1.87e-6 Ha, pseudo-H₂O warm vs cold,
-//!   `validate/references.md` "SCF, GPU against CPU"), about 2× all-electron H₂O's (5.4e-6), 100× below the model's
-//!   1 mHa/atom energy bound.
-//! - ε_F = 3 × `PSEUDO_FORCE_NOISE` = 1.5e-4 Ha/Bohr: the tier an audit already judges forces against.
-//! - Both errors are safe: a false S costs a review; a false U keeps a label within ε_E of the new one.
+//! Per sample, from the per-solve path scatter the `branch_jump` guard already uses (`crate::branch_jump::noise_tier`:
+//! by surface — pseudo or all-electron —, by the tolerance the new solve stopped at, `EvalStats::scf_tol_used`, and
+//! with σ_E = max(the tier's σ_E, c·|E_old|), c = 9e-8 pseudo, 1.0e-7 all-electron; Task 14 fix round 1, physics
+//! review I2):
+//!
+//! - ε_E = max([`MIGRATION_EPS_E`] = 1e-5 Ha, [`MIGRATION_EPS_E_SIGMAS`] = 5 × σ_E). The floor is 5× the pseudo sample
+//!   tier's 1.87e-6 Ha (pseudo-H₂O warm vs cold, `validate/references.md` "SCF, GPU against CPU"), the value spec §7.4
+//!   chose for small molecules. Pseudo (sample tier or partial stop): 1e-5 up to |E| ≈ 22 Ha, then 5c|E| —
+//!   35 Ha → 1.58e-5, 70 Ha → 3.15e-5. All-electron: the tier's own σ_E is already above the floor — 2.7e-5 at the
+//!   sample tier up to |E| = 54 Ha (2.35e-5 at the app tier up to 47 Ha), then 5c|E| — 70 Ha → 3.5e-5.
+//! - ε_F = [`MIGRATION_EPS_F_SIGMAS`] = 3 × σ_F: pseudo sample tier 1.5e-4 Ha/Bohr ([`MIGRATION_EPS_F`], 3 ×
+//!   `PSEUDO_FORCE_NOISE`), pseudo partial stop (every GPU solve with a partly occupied level stops at
+//!   `qm::GPU_PARTIAL_TOL` = 1e-5: the app tier) 2.7e-4, all-electron sample tier 7.2e-5, all-electron app tier 4.2e-5.
+//! - Derived from the documented noise model, not chosen to make a case pass. A fixed 1e-5 was 1.6σ_E at 70 Ha (about a
+//!   quarter of gapped samples falsely S) and below 2σ_F for a partial-stop solve.
+//! - Both errors are safe: a false S costs a review (and, for a misfit hold or a lifted fence, re-judges it); a false U
+//!   keeps a label within ε_E of the new one. The classes decide review only: a T or S label is always the new solve's.
 //!
 //! # Per sample, in file order (spec §7.3)
 //!
@@ -47,18 +60,32 @@
 //!    not depend on the order or on a resume.
 //! 3. The solve must have converged (a stall or the cap is an error), carry no solver warning and nothing
 //!    untrainable (overlapping cores, a branch jump), report a face density within the box rule
-//!    (`box_affected_face_density(h)`), and reproduce the recorded multiplicity when one is recorded. A sample that
-//!    fails is **not migrated**: listed in `migration.txt` with its reason, never appended — its old label belongs to
+//!    (`box_affected_face_density(h)`), and reproduce the recorded multiplicity when one is recorded — a consistency
+//!    check of the settings only: under multiplicity auto the electron count's parity fixes it, so it says nothing about
+//!    the electronic state (physics review M1; the class does). A sample that fails is **not migrated**: listed in `migration.txt` with its reason, never appended — its old label belongs to
 //!    the old surface. A device error ("GPU busy") is not the sample's: the cursor stays and the provider retries.
 //! 4. Classify, then append (spec §7.5): U the old record as it was, plus a status record when its code is not 0; T the
 //!    new label with the old metadata and the old code; S the new label with [`migrated_code`]. An append refused as a
 //!    duplicate (`REFUSE_DUPLICATE`: the same answer is stored — a crash between the append and the cursor write) is
 //!    done: its status is written if it is missing.
+//!    **The status window** (fix round 1, I1): a status record can only follow its sample record, so a crash between
+//!    the two would leave a sample with a non-zero code (any S, a U or T of a held, forgotten or superseded sample) at
+//!    0 — in the fit. So before such an append the log records `pending <index> <code>` (through the temporary file);
+//!    the next attach applies it before anything is fitted (`SurrogateKs::find_migration`), and the cursor write clears it.
 //! 5. The cursor is rewritten (`surrogate::write_migration`, through a temporary file).
+//!
+//! **Spin** (M1): the cold solve's ∫|ρ↑ − ρ↓| is not on its `ForceResult` (`EvalStats::spin_change` is a difference
+//! between two judged evaluations, and a cold solve after `reset` is not judged), so it is not logged for S samples.
+//!
+//! **Superseded samples** (M4): a migrated code-2 sample stays 2. The collection does not record which answer
+//! superseded it; the pass takes the nearest later source sample of the same atoms (rms displacement) as its superseder,
+//! and when that one was not migrated — or there is none — lists the superseded sample in the log (`orphaned`), so
+//! that geometry is seen to have no label in the fit.
 //!
 //! **References** come first: every (species, box) of the old `references.txt` is solved by the multiplicity scan
 //! (lowest F; `sim::references::AtomScan`) and offered through `Collection::offer_reference`; the log keeps the old and
-//! the new energy. A resume skips those already logged.
+//! the new energy. A scan with a multiplicity that did not solve in the end is not offered (its lowest solved F need not
+//! be the lowest; M2): logged without a new energy, and retried by a resume, which skips only references logged with one.
 //!
 //! **The source fingerprint (F3).** The pass records the source `samples.bin`'s length and hash when it starts. A resume
 //! whose source differs (purged, or appended to by an older build since) starts again from sample 0 with the counts
@@ -74,10 +101,28 @@ use surrogate::migration::MIGRATION_FILE;
 use surrogate::quarantine::{is_collection_code, Q_FORGOTTEN, Q_FORGOTTEN_UNFENCED, Q_RESOLVED, Q_SUPERSEDED};
 use surrogate::{Collection, CollectionSample, MigrationLog, MigrationState, SurfaceKey};
 
-/// ε_E (module doc, "The thresholds"): Hartree per sample.
+/// ε_E's floor (module doc, "The thresholds"): Hartree per sample.
 pub const MIGRATION_EPS_E: f64 = 1e-5;
-/// ε_F (module doc, "The thresholds"): Hartree/Bohr per force component, 3 × `PSEUDO_FORCE_NOISE` (1.5e-4).
-pub const MIGRATION_EPS_F: f64 = 3.0 * PSEUDO_FORCE_NOISE;
+/// ε_E = max([`MIGRATION_EPS_E`], this × σ_E) (module doc, "The thresholds").
+pub const MIGRATION_EPS_E_SIGMAS: f64 = 5.0;
+/// ε_F = this × σ_F (module doc, "The thresholds").
+pub const MIGRATION_EPS_F_SIGMAS: f64 = 3.0;
+/// ε_F on the pseudo sample tier: 3 × `PSEUDO_FORCE_NOISE` = 1.5e-4 Ha/Bohr (module doc, "The thresholds").
+pub const MIGRATION_EPS_F: f64 = MIGRATION_EPS_F_SIGMAS * PSEUDO_FORCE_NOISE;
+
+/// A sample's thresholds (module doc, "The thresholds"): ε_E (Ha) and ε_F (Ha/Bohr per component).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MigrationEps {
+    pub e: f64,
+    pub f: f64,
+}
+
+/// The thresholds of a sample whose old energy is `e_old` (Ha), re-solved on the all-electron surface or not, by a solve
+/// that stopped at `scf_tol_used` (module doc, "The thresholds"; `crate::branch_jump::noise_tier`).
+pub fn migration_eps(all_electron: bool, scf_tol_used: f64, e_old: f64) -> MigrationEps {
+    let t = crate::branch_jump::noise_tier(all_electron, scf_tol_used, e_old);
+    MigrationEps { e: MIGRATION_EPS_E.max(MIGRATION_EPS_E_SIGMAS * t.sigma_e), f: MIGRATION_EPS_F_SIGMAS * t.sigma_f }
+}
 /// The time estimate uses the median of the pass's own sample solves once it has made this many (spec §7.3, "Cost").
 pub const MIGRATION_ETA_SOLVES: usize = 20;
 /// The a-priori cost of one cold solve (s) at [`MIGRATION_PRIOR_GRID_N`]³ on the RX 7900 XTX: H₂O cold at 57³, 1.1 s
@@ -131,12 +176,12 @@ fn max_force_diff(old_f: &[[f64; 3]], new_f: &[[f64; 3]]) -> f64 {
 }
 
 /// The class of a re-solved sample (module doc, "What is compared"): `old_e`, `old_f` the stored label (Ha, Ha/Bohr),
-/// `new_free` the new solve's F, `new_internal` its E, `new_f` its forces −∂F/∂R.
-pub fn classify(old_e: f64, old_f: &[[f64; 3]], new_free: f64, new_internal: f64, new_f: &[[f64; 3]]) -> MigrationClass {
-    let forces_within = max_force_diff(old_f, new_f) <= MIGRATION_EPS_F;
-    if (new_free - old_e).abs() <= MIGRATION_EPS_E && forces_within {
+/// `new_free` the new solve's F, `new_internal` its E, `new_f` its forces −∂F/∂R, `eps` its thresholds ([`migration_eps`]).
+pub fn classify(old_e: f64, old_f: &[[f64; 3]], new_free: f64, new_internal: f64, new_f: &[[f64; 3]], eps: MigrationEps) -> MigrationClass {
+    let forces_within = max_force_diff(old_f, new_f) <= eps.f;
+    if (new_free - old_e).abs() <= eps.e && forces_within {
         MigrationClass::Unchanged
-    } else if (new_internal - old_e).abs() <= MIGRATION_EPS_E && forces_within {
+    } else if (new_internal - old_e).abs() <= eps.e && forces_within {
         MigrationClass::EntropyOnly
     } else {
         MigrationClass::StateChanged
@@ -208,16 +253,19 @@ pub struct Migrator {
     h: f64,
     sigma: f64,
     policy: IonicPolicy,
+    /// The key's tolerance (the stop a solve that reports none is taken to have used) and its surface.
+    tol: f64,
+    all_electron: bool,
     /// The model's cutoff (Bohr): a sample without a neighbour within it is not migrated (module doc, 1.).
     r_cut: f64,
     /// Wall times (s) of this run's sample solves (the estimate's median).
     walls: Vec<f64>,
     progress: SamplingProgress,
     notes: Vec<String>,
-    /// Test hook (Review Focus 4): stop with an error right after sample `k`'s append, before the cursor is written —
-    /// a crash there.
+    /// Test hook (Review Focus 4, fix round 1 I1): sample `k`'s append stops with an error right after its sample
+    /// record, before its status record and the cursor are written — a crash in the status window.
     #[cfg(test)]
-    pub(crate) crash_after_append: Option<usize>,
+    pub(crate) crash_in_window: Option<usize>,
 }
 
 impl Migrator {
@@ -247,6 +295,8 @@ impl Migrator {
             references: Vec::new(),
             class_u_max: (0.0, 0.0),
             review: Vec::new(),
+            pending: None,
+            orphaned: Vec::new(),
         };
         let (log, new_start) = match existing {
             Some(l) if l.state != MigrationState::Running => return Err(format!("the collection was already re-solved from {} ({})", l.source_slug, if l.state == MigrationState::Complete { "complete" } else { "reviewed" })),
@@ -269,7 +319,8 @@ impl Migrator {
                 }
             }
         }
-        let done: Vec<(u8, usize)> = log.references.iter().map(|r| (r.0, r.1)).collect();
+        // a reference logged without a new energy did not solve: a resume tries it again (M2)
+        let done: Vec<(u8, usize)> = log.references.iter().filter(|r| r.3.is_some()).map(|r| (r.0, r.1)).collect();
         let refs: VecDeque<RefJob> = ro.references.iter().filter(|(z, n, _)| !done.contains(&(*z, *n))).map(|&(z, n, r): &(u8, usize, CollectionReference)| RefJob { z, n, old: r.energy, scan: None }).collect();
         let ref_solves: usize = refs.iter().map(|r| allowed_multiplicities(r.z as u32).len()).sum();
         let total = ref_solves + ro.samples.len();
@@ -285,12 +336,14 @@ impl Migrator {
             h: key.h,
             sigma: key.sigma,
             policy,
+            tol: key.tol,
+            all_electron: crate::pseudo::is_all_electron_tag(&key.ionic),
             r_cut,
             walls: Vec::new(),
             progress,
             notes,
             #[cfg(test)]
-            crash_after_append: None,
+            crash_in_window: None,
         })
     }
 
@@ -377,6 +430,7 @@ impl Migrator {
                 Some(scan) => self.refs.front_mut().expect("a reference job").scan = Some(scan),
                 None => {
                     let job = self.refs.pop_front().expect("a reference job");
+                    self.log.references.retain(|r| (r.0, r.1) != (z, n));
                     self.log.references.push((z, n, Some(job.old), None));
                     self.notes.push(format!("re-solving: the reference of Z = {z} has no isotope in the table — not re-solved"));
                     self.write_log()?;
@@ -401,10 +455,15 @@ impl Migrator {
         }
         let job = self.refs.pop_front().expect("a reference job");
         let scan = job.scan.expect("a started scan");
-        let failed: Vec<String> = scan.failed().iter().map(|(m, e)| format!("M = {m}: {e}")).collect();
+        // the multiplicities that did not solve in the end (a device loss retried successfully is solved)
+        let solved: Vec<u32> = scan.tried().map(|t| t.0).collect();
+        let failed: Vec<String> = scan.failed().iter().filter(|(m, _)| !solved.contains(m)).map(|(m, e)| format!("M = {m}: {e}")).collect();
         let tol = surrogate.collection().map_or(f64::NAN, |c| c.key.tol);
         let name = surrogate.teacher_mut().name().to_string();
-        match scan.finish(tol, &name) {
+        self.log.references.retain(|r| (r.0, r.1) != (z, n));
+        // a scan with an unsolved multiplicity is not offered: its lowest solved F need not be the lowest (M2)
+        let best = if failed.is_empty() { scan.finish(tol, &name) } else { None };
+        match best {
             Some(r) => {
                 surrogate.set_reference_solved(z, r.energy, n, r.face_density);
                 self.log.references.push((z, n, Some(job.old), Some(r.energy)));
@@ -412,7 +471,7 @@ impl Migrator {
             }
             None => {
                 self.log.references.push((z, n, Some(job.old), None));
-                self.notes.push(format!("re-solving: reference {} (Z = {z}) of the {n}³ box did not solve ({}) — its samples wait for a reference from a later pass", symbol(z), failed.join("; ")));
+                self.notes.push(format!("re-solving: reference {} (Z = {z}) of the {n}³ box was not taken ({}) — not offered: the lowest of the solved multiplicities need not be the lowest; a resume tries it again, and its samples wait for a reference", symbol(z), if failed.is_empty() { "nothing solved".to_string() } else { failed.join("; ") }));
             }
         }
         self.write_log()?;
@@ -435,6 +494,10 @@ impl Migrator {
         // the end
         let i = self.log.cursor;
         if i >= self.source_samples.len() {
+            self.log.orphaned = self.orphaned_superseded();
+            for &k in &self.log.orphaned {
+                self.notes.push(format!("re-solving {}: superseded sample {k} keeps code 2, but what superseded it was not migrated — that geometry has no label in the fit", self.log.source_slug));
+            }
             self.log.state = MigrationState::Complete;
             self.write_log()?;
             self.progress.finished = true;
@@ -486,27 +549,57 @@ impl Migrator {
             return self.not_migrated(i, why);
         }
         // 4. classify, append
-        let class = classify(old.sample.energy, &old.sample.forces, r.energy, r.stats.energy.internal, &r.forces);
+        let eps = migration_eps(self.all_electron, r.stats.scf_tol_used.unwrap_or(self.tol), old.sample.energy);
+        let class = classify(old.sample.energy, &old.sample.forces, r.energy, r.stats.energy.internal, &r.forces, eps);
         let mut cs = old.clone();
         if class != MigrationClass::Unchanged {
             cs.sample.energy = r.energy;
             cs.sample.forces = r.forces.clone();
         }
         let new_code = migrated_code(code, class);
-        surrogate.take_migrated(cs, new_code).map_err(|e| ProviderError::Invalid(format!("re-solving: the new collection could not be written ({e}) — the pass stops; it resumes from sample {i}")))?;
-        #[cfg(test)]
-        if self.crash_after_append == Some(i) {
-            return Err(ProviderError::Invalid(format!("re-solving: injected crash after sample {i}'s append")));
+        // the status window (module doc, 4.): the code is on disk before the sample record that needs it
+        if new_code != 0 {
+            self.log.pending = Some((surrogate.collection().map_or(0, |c| c.samples.len()), new_code));
+            self.write_log()?;
         }
+        #[cfg(test)]
+        if self.crash_in_window == Some(i) {
+            surrogate.arm_status_window_crash();
+        }
+        surrogate.take_migrated(cs, new_code).map_err(|e| ProviderError::Invalid(format!("re-solving: the new collection could not be written ({e}) — the pass stops; it resumes from sample {i}")))?;
         if class == MigrationClass::Unchanged {
             let (e, f) = self.log.class_u_max;
             self.log.class_u_max = ((r.energy - old.sample.energy).abs().max(e), max_force_diff(&old.sample.forces, &r.forces).max(f));
         }
         self.log.counts[class.index()] += 1;
         self.log.cursor = i + 1;
+        self.log.pending = None;
         self.write_log()?;
         self.progress.done += 1;
         Ok(Some(self.progress()))
+    }
+}
+
+impl Migrator {
+    /// The migrated superseded samples whose likely superseder was not migrated (module doc, "Superseded samples"):
+    /// for each source sample at code 2 that is not in the not-migrated list, the nearest later source sample of the same
+    /// atoms (rms displacement) is taken as its superseder; listed when that one was not migrated or there is none.
+    fn orphaned_superseded(&self) -> Vec<usize> {
+        let not: Vec<usize> = self.log.not_migrated.iter().map(|x| x.0).collect();
+        let rms = |a: &[[f64; 3]], b: &[[f64; 3]]| (a.iter().zip(b).map(|(p, q)| (0..3).map(|k| (p[k] - q[k]).powi(2)).sum::<f64>()).sum::<f64>() / a.len().max(1) as f64).sqrt();
+        let mut out = Vec::new();
+        for (i, s) in self.source_samples.iter().enumerate() {
+            if self.source_codes.get(i) != Some(&Q_SUPERSEDED) || not.contains(&i) {
+                continue;
+            }
+            let superseder = (i + 1..self.source_samples.len())
+                .filter(|&j| self.source_samples[j].sample.z == s.sample.z)
+                .min_by(|&a, &b| rms(&self.source_samples[a].sample.pos, &s.sample.pos).total_cmp(&rms(&self.source_samples[b].sample.pos, &s.sample.pos)));
+            if superseder.is_none_or(|j| not.contains(&j)) {
+                out.push(i);
+            }
+        }
+        out
     }
 }
 

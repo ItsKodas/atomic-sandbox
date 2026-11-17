@@ -2651,7 +2651,7 @@ fn cancelling_a_paused_pass_ends_it() {
 
 mod migration {
     use super::*;
-    use crate::sampling::migrate::{classify, migrated_code, MigrationClass, MIGRATION_EPS_E, MIGRATION_EPS_F};
+    use crate::sampling::migrate::{classify, migrated_code, migration_eps, MigrationClass, MigrationEps, MIGRATION_EPS_E, MIGRATION_EPS_F};
     use crate::surrogate::{predecessor_of, PASS_STARTED_WITH_PREVIOUS_SOLVER, PURGE_WAIT_MIGRATION};
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
@@ -2682,6 +2682,8 @@ mod migration {
         mult: Vec<(f64, u32)>,
         /// Added to every isolated atom's energy (the old references differ from the new ones).
         atom_shift: f64,
+        /// Isolated-atom solves (Z, multiplicity) that stall, once each.
+        fail_atom: Vec<(u8, u32)>,
     }
 
     /// A pair-Morse teacher with the Fermi–Dirac breakdown (`EvalStats::energy`: internal E, TS, F) and scripted
@@ -2707,6 +2709,11 @@ mod migration {
             let mut stats = EvalStats::default();
             stats.face_density = Some(1e-7);
             if pos.len() == 1 {
+                let key = (scene.nuclei[0].z, scene.multiplicity.unwrap_or(0));
+                if let Some(k) = self.tw.fail_atom.iter().position(|&f| f == key) {
+                    self.tw.fail_atom.remove(k);
+                    return Err(ProviderError::Solver(sim::SolverError::ScfStalled { iterations: 63, best_delta_rho: 0.2, tol: 1e-6, window: 50, level: 5e-3 }));
+                }
                 let e = self.morse.e_atom + self.tw.atom_shift;
                 stats.multiplicity = scene.multiplicity;
                 stats.energy.internal = e;
@@ -2837,28 +2844,53 @@ mod migration {
         surrogate::read_migration(s.collection().unwrap().folder()).unwrap().expect("a migration.txt")
     }
 
-    /// Spec §7.4's thresholds (F14: ε_F compared within 1e-18, it is 3 × `PSEUDO_FORCE_NOISE`).
+    /// Spec §7.4's thresholds from the noise model (fix round 1, I2: ε_E = max(1e-5, 5σ_E), ε_F = 3σ_F with
+    /// `branch_jump::noise_tier`; F14: ε_F compared within 1e-18, it is 3 × `PSEUDO_FORCE_NOISE` on the pseudo sample
+    /// tier).
     #[test]
     fn classify_thresholds() {
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs();
         let f = vec![[0.012, -0.021, 0.003], [-0.012, 0.021, -0.003]];
         let e = -1.17;
-        assert_eq!(classify(e, &f, e + 0.99e-5, e + 0.99e-5, &f), MigrationClass::Unchanged, "ΔE = 0.99e-5, forces within");
-        assert_eq!(classify(e, &f, e - 0.99e-5, e, &f), MigrationClass::Unchanged, "|F − E_old| ≤ ε_E either sign");
+        // a small pseudo molecule on the sample tier: the floor and 3 × PSEUDO_FORCE_NOISE
+        let eps = migration_eps(false, 1e-6, e);
+        assert_eq!(eps, MigrationEps { e: MIGRATION_EPS_E, f: MIGRATION_EPS_F });
+        assert!((eps.f - 1.5e-4).abs() <= 1e-18, "ε_F = {:e}", eps.f);
+        assert_eq!(MIGRATION_EPS_E, 1e-5);
+        assert_eq!(classify(e, &f, e + 0.99e-5, e + 0.99e-5, &f, eps), MigrationClass::Unchanged, "ΔE = 0.99e-5, forces within");
+        assert_eq!(classify(e, &f, e - 0.99e-5, e, &f, eps), MigrationClass::Unchanged, "|F − E_old| ≤ ε_E either sign");
         let two_kt_ln2 = 2.0 * qm::ELECTRON_KT * 2f64.ln();
-        assert_eq!(classify(e, &f, e - two_kt_ln2, e, &f), MigrationClass::EntropyOnly, "F moved by −2 kT ln 2, internal equal");
-        assert_eq!(classify(e, &f, e - two_kt_ln2, e + 0.99e-5, &f), MigrationClass::EntropyOnly, "internal within ε_E");
-        assert_eq!(classify(e, &f, e + 2e-5, e + 2e-5, &f), MigrationClass::StateChanged, "internal moved by 2e-5");
-        assert_eq!(classify(e, &f, e - two_kt_ln2, e + 2e-5, &f), MigrationClass::StateChanged, "−TS and the internal energy moved");
+        assert_eq!(classify(e, &f, e - two_kt_ln2, e, &f, eps), MigrationClass::EntropyOnly, "F moved by −2 kT ln 2, internal equal");
+        assert_eq!(classify(e, &f, e - two_kt_ln2, e + 0.99e-5, &f, eps), MigrationClass::EntropyOnly, "internal within ε_E");
+        assert_eq!(classify(e, &f, e + 2e-5, e + 2e-5, &f, eps), MigrationClass::StateChanged, "internal moved by 2e-5");
+        assert_eq!(classify(e, &f, e - two_kt_ln2, e + 2e-5, &f, eps), MigrationClass::StateChanged, "−TS and the internal energy moved");
         let mut g = f.clone();
         g[1][2] += 1.6e-4;
-        assert_eq!(classify(e, &f, e, e, &g), MigrationClass::StateChanged, "one force component off by 1.6e-4");
-        assert_eq!(classify(e, &f, e - two_kt_ln2, e, &g), MigrationClass::StateChanged, "−TS with a force off is not T");
+        assert_eq!(classify(e, &f, e, e, &g, eps), MigrationClass::StateChanged, "one force component off by 1.6e-4");
+        assert_eq!(classify(e, &f, e - two_kt_ln2, e, &g, eps), MigrationClass::StateChanged, "−TS with a force off is not T");
         g[1][2] = f[1][2] + 1.4e-4;
-        assert_eq!(classify(e, &f, e, e, &g), MigrationClass::Unchanged, "1.4e-4 is within ε_F");
-        assert_eq!(classify(e, &f, f64::NAN, f64::NAN, &f), MigrationClass::StateChanged, "a non-finite label is never carried");
-        assert_eq!(classify(e, &f, e, e, &f[..1]), MigrationClass::StateChanged, "another atom count");
-        assert!((MIGRATION_EPS_F - 1.5e-4).abs() <= 1e-18, "ε_F = {MIGRATION_EPS_F:e}");
-        assert_eq!(MIGRATION_EPS_E, 1e-5);
+        assert_eq!(classify(e, &f, e, e, &g, eps), MigrationClass::Unchanged, "1.4e-4 is within ε_F");
+        assert_eq!(classify(e, &f, f64::NAN, f64::NAN, &f, eps), MigrationClass::StateChanged, "a non-finite label is never carried");
+        assert_eq!(classify(e, &f, e, e, &f[..1], eps), MigrationClass::StateChanged, "another atom count");
+        // large |E|: σ_E = c·|E| (c = 9e-8 pseudo, 1.0e-7 all-electron) takes over from the floor
+        let (big35, big70, ae70) = (migration_eps(false, 1e-6, -35.0), migration_eps(false, 1e-6, -70.0), migration_eps(true, 1e-6, -70.0));
+        assert!(close(big35.e, 5.0 * 9e-8 * 35.0) && close(big70.e, 5.0 * 9e-8 * 70.0) && close(ae70.e, 5.0 * 1.0e-7 * 70.0), "{big35:?} {big70:?} {ae70:?}");
+        assert!(close(big70.e, 3.15e-5) && close(ae70.e, 3.5e-5));
+        let e70 = -70.0;
+        assert_eq!(classify(e70, &f, e70 + 2e-5, e70 + 2e-5, &f, big70), MigrationClass::Unchanged, "2e-5 at 70 Ha is within 5σ_E = 3.15e-5");
+        assert_eq!(classify(e70, &f, e70 + 4e-5, e70 + 4e-5, &f, big70), MigrationClass::StateChanged, "4e-5 at 70 Ha is not");
+        assert_eq!(classify(e70, &f, e70 - two_kt_ln2, e70 + 2e-5, &f, big70), MigrationClass::EntropyOnly);
+        // all-electron, small |E|: the tier's own σ_E (5.4e-6) is above the floor; its σ_F is 2.4e-5
+        let ae = migration_eps(true, 1e-6, e);
+        assert!(close(ae.e, 5.0 * 5.4e-6) && close(ae.f, 3.0 * 2.4e-5), "{ae:?}");
+        // a partial-level stop (every GPU solve with a partly occupied level stops at GPU_PARTIAL_TOL = 1e-5: the app tier)
+        let oh = -16.78;
+        let partial = migration_eps(false, qm::GPU_PARTIAL_TOL, oh);
+        assert!(close(partial.f, 3.0 * 9.0e-5) && partial.e == MIGRATION_EPS_E, "{partial:?}");
+        let mut h = f.clone();
+        h[0][0] += 2.0e-4;
+        assert_eq!(classify(oh, &f, oh - two_kt_ln2, oh, &h, partial), MigrationClass::EntropyOnly, "2e-4 is within 3σ_F of a partial stop");
+        assert_eq!(classify(oh, &f, oh - two_kt_ln2, oh, &h, migration_eps(false, 1e-6, oh)), MigrationClass::StateChanged, "and beyond the sample tier's");
     }
 
     /// Spec §7.5 with F2: U and T keep the code; S goes to 9 except a forgotten sample (7 → 7, 8 → 7) and a superseded
@@ -3017,8 +3049,8 @@ mod migration {
         let (mut s, _) = student(tw.clone());
         s.attach_collection(&crashed, &h2_at(1.4)).unwrap();
         s.start_migration().unwrap();
-        // the S sample: its append and its status record (code 9) are written, then the crash
-        s.migration_crash_after(2);
+        // the S sample: its sample record is written, then the crash — before its status record (code 9) and the cursor
+        s.migration_crash_in_window(2);
         let mut steps = 0;
         let e = loop {
             match Trainable::pass_step(&mut s, &mut never()) {
@@ -3030,8 +3062,9 @@ mod migration {
         assert!(e.to_string().contains("injected crash"), "{e}");
         assert_eq!(steps, 2, "samples 0 and 1 made it");
         let log = log_of(&s);
-        assert_eq!((log.cursor, log.counts, log.state), (2, [1, 1, 0, 0], MigrationState::Running), "the cursor before the crashed sample");
+        assert_eq!((log.cursor, log.counts, log.state, log.pending), (2, [1, 1, 0, 0], MigrationState::Running, Some((2, Q_RESOLVED))), "the cursor before the crashed sample, its code pending");
         assert_eq!(s.collection().unwrap().samples.len(), 3, "its record is in the new file");
+        assert_eq!(s.collection().unwrap().quarantine[2], Q_NONE, "without its status record");
         assert_eq!(s.migration().unwrap().state, sim::MigrationPhase::Paused);
         drop(s);
         // the next app start
@@ -3039,6 +3072,8 @@ mod migration {
         s.attach_collection(&crashed, &h2_at(1.4)).unwrap();
         let st = s.migration().unwrap();
         assert_eq!((st.state, st.done, st.counts), (sim::MigrationPhase::Paused, 2, [1, 1, 0, 0]));
+        assert_eq!((s.collection().unwrap().quarantine[2], s.code_of(2)), (Q_RESOLVED, Q_RESOLVED), "the pending code applied at attach");
+        assert_eq!(log_of(&s).pending, None);
         s.start_migration().unwrap();
         run(&mut s);
         assert_eq!(solves.load(Ordering::SeqCst), 2, "sample 2 solved again, then sample 3");
@@ -3342,6 +3377,8 @@ mod migration {
                 references: Vec::new(),
                 class_u_max: (0.0, 0.0),
                 review: Vec::new(),
+                pending: None,
+                orphaned: Vec::new(),
             };
             surrogate::write_migration(&dir, &log).unwrap();
             let before = files(&dir);
@@ -3360,5 +3397,99 @@ mod migration {
             }
             let _ = std::fs::remove_dir_all(&outside);
         }
+    }
+
+    /// Physics review I1/M3 (fix round 1): a crash between a migrated sample's record and its status record — any
+    /// non-zero code: an S (9) and a U of a forgotten-unfenced sample (8). The code was recorded as pending before the
+    /// append, and the next attach applies it before anything is fitted (attach's refit runs after `find_migration`);
+    /// the pass then goes on and ends as an uninterrupted run, byte for byte.
+    #[test]
+    fn a_crash_in_the_status_window_is_healed_at_attach() {
+        let (samples, tw) = mixed();
+        let whole = root("window-whole");
+        old_folder(&whole, &samples, &[]);
+        let (mut s, _) = student(tw.clone());
+        s.attach_collection(&whole, &h2_at(1.4)).unwrap();
+        s.start_migration().unwrap();
+        run(&mut s);
+        let want_bin = std::fs::read(s.collection().unwrap().folder().join("samples.bin")).unwrap();
+        drop(s);
+        for (k, code) in [(2usize, Q_RESOLVED), (3, Q_FORGOTTEN_UNFENCED)] {
+            let crashed = root(&format!("window-{k}"));
+            old_folder(&crashed, &samples, &[]);
+            let (mut s, _) = student(tw.clone());
+            s.attach_collection(&crashed, &h2_at(1.4)).unwrap();
+            s.start_migration().unwrap();
+            s.migration_crash_in_window(k);
+            let e = loop {
+                match Trainable::pass_step(&mut s, &mut never()) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => panic!("the crash stops the pass"),
+                    Err(e) => break e,
+                }
+            };
+            assert!(e.to_string().contains("injected crash"), "{e}");
+            assert_eq!(log_of(&s).pending, Some((k, code)), "sample {k}: its code recorded before its append");
+            assert_eq!(s.collection().unwrap().quarantine[k], Q_NONE, "sample {k}: the record without its status");
+            drop(s);
+            // the next start: the code is on the sample before any fit sees it
+            let (mut s, _) = student(tw.clone());
+            s.attach_collection(&crashed, &h2_at(1.4)).unwrap();
+            assert_eq!((s.collection().unwrap().quarantine[k], s.code_of(k)), (code, code), "sample {k}: applied at attach");
+            let (on_disk, _) = Collection::open(&crashed, &new_key()).unwrap();
+            assert_eq!(on_disk.quarantine[k], code, "sample {k}: written");
+            drop(on_disk);
+            assert_eq!(log_of(&s).pending, None, "cleared");
+            assert!(Trainable::take_notes(&mut s).iter().any(|n| n.contains("its code") && n.contains("applied now")));
+            s.start_migration().unwrap();
+            run(&mut s);
+            assert_eq!(log_of(&s).counts, [2, 1, 1, 0]);
+            assert_eq!(std::fs::read(s.collection().unwrap().folder().join("samples.bin")).unwrap(), want_bin, "sample {k}: an uninterrupted run's bytes");
+        }
+    }
+
+    /// Physics review M2 (fix round 1): a reference scan with a multiplicity that did not solve is not offered (its
+    /// lowest solved F need not be the lowest), is logged without a new energy, and a resume solves it again.
+    #[test]
+    fn a_reference_with_an_unsolved_multiplicity_is_retried_not_offered() {
+        let root = root("ref-retry");
+        let e_atom = PairMorse::h2().e_atom;
+        // He: multiplicities 1 and 3; M = 3 stalls on the first attempt only
+        let tw = Tweaks { fail_atom: vec![(2, 3)], ..Tweaks::default() };
+        old_folder(&root, &[(old_sample(1.30), Q_NONE), (old_sample(1.35), Q_NONE)], &[(2, N, -2.9)]);
+        let (mut s, _) = student(tw);
+        s.attach_collection(&root, &h2_at(1.4)).unwrap();
+        s.start_migration().unwrap();
+        for _ in 0..3 {
+            Trainable::pass_step(&mut s, &mut never()).unwrap().expect("a solve");
+        }
+        Trainable::cancel_pass(&mut s);
+        assert!(!s.collection().unwrap().references.contains_key(&(2, N)), "not offered");
+        let log = log_of(&s);
+        assert_eq!((log.references.clone(), log.cursor), (vec![(2, N, Some(-2.9), None)], 1));
+        s.start_migration().unwrap();
+        run(&mut s);
+        let log = log_of(&s);
+        assert_eq!(log.references, vec![(2, N, Some(-2.9), Some(e_atom))], "retried by the resume, one entry");
+        assert_eq!(s.collection().unwrap().references.get(&(2, N)).map(|r| r.energy), Some(e_atom), "offered now");
+        assert_eq!((log.state, log.counts), (MigrationState::Complete, [2, 0, 0, 0]));
+    }
+
+    /// Physics review M4 (fix round 1): a superseded (code 2) sample whose likely superseder — the nearest later sample
+    /// of the same atoms — was not migrated keeps code 2 and is listed in the log; one whose superseder was migrated is not.
+    #[test]
+    fn a_superseded_sample_without_its_superseder_is_listed() {
+        let root = root("orphan");
+        let tw = Tweaks { stall: vec![1.41], ..Tweaks::default() };
+        old_folder(&root, &[(old_sample(1.40), Q_SUPERSEDED), (old_sample(1.41), Q_NONE), (old_sample(1.60), Q_SUPERSEDED), (old_sample(1.61), Q_NONE)], &[]);
+        let (mut s, _) = student(tw);
+        s.attach_collection(&root, &h2_at(1.4)).unwrap();
+        s.start_migration().unwrap();
+        run(&mut s);
+        let log = log_of(&s);
+        assert_eq!((log.counts, log.orphaned.clone()), ([3, 0, 0, 1], vec![0]), "1.40's superseder (1.41) stalled; 1.60's (1.61) was migrated");
+        assert_eq!(s.collection().unwrap().quarantine, vec![Q_SUPERSEDED, Q_SUPERSEDED, Q_NONE], "both stay 2");
+        let text = std::fs::read_to_string(s.collection().unwrap().folder().join("migration.txt")).unwrap();
+        assert!(text.lines().any(|l| l == "orphaned 0"), "{text}");
     }
 }

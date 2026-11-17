@@ -5777,10 +5777,15 @@ with that item, not bounded separately.
 ### Task 14: the collection migration engine and V7 (plan 2026-11-13 Task 14, 2026-11-17, release, RX 7900 XTX)
 
 The engine is `providers::sampling::migrate` (module doc: the cold re-solve, the checks, the classes, the writes, the
-resume; spec §7.2–7.5). **Thresholds** (spec §7.4): ε_E = 1e-5 Ha per sample = 5× the largest measured path scatter on
-the pseudo surface (1.87e-6 Ha, pseudo-H₂O warm vs cold, "SCF, GPU against CPU"), ≈ 2× all-electron H₂O's 5.4e-6;
-ε_F = 3 × `PSEUDO_FORCE_NOISE` = 1.5e-4 Ha/Bohr per component. U: |F_new − E_old| ≤ ε_E and every |ΔF| ≤ ε_F; T: not U,
-|E_new − E_old| ≤ ε_E (the internal energy) and every |ΔF| ≤ ε_F; S otherwise (NaN is S).
+resume; spec §7.2–7.5). **Thresholds** (spec §7.4; fix round 1, physics review I2): per sample, ε_E = max(1e-5,
+5σ_E) and ε_F = 3σ_F with σ from `branch_jump::noise_tier(all-electron, scf_tol_used, E_old)` ("The branch_jump guard":
+the tiers and σ_E = max(tier, c·|E|), c = 9e-8 pseudo, 1.0e-7 all-electron). Values: pseudo sample tier below ≈ 22 Ha
+1e-5 / 1.5e-4 (3 × `PSEUDO_FORCE_NOISE`); pseudo 35 Ha 1.58e-5, 70 Ha 3.15e-5; pseudo partial stop (`GPU_PARTIAL_TOL`,
+the app tier) ε_F 2.7e-4; all-electron sample tier 2.7e-5 / 7.2e-5 up to 54 Ha, 70 Ha 3.5e-5. The floor 1e-5 is 5× the
+pseudo-H₂O warm-vs-cold 1.87e-6. U: |F_new − E_old| ≤ ε_E and every |ΔF| ≤ ε_F; T: not U, |E_new − E_old| ≤ ε_E (the
+internal energy) and every |ΔF| ≤ ε_F; S otherwise (NaN is S). V7's classes are the same under these thresholds: H₂ is
+on the sample tier at 1e-5 / 1.5e-4 (|ΔE| 7.6e-8); OH is a partial stop, ε_E 1e-5, ε_F 2.7e-4 (|ΔE_internal| 7.3e-7,
+|ΔF| 1.22e-5); H₄'s |ΔE| 1.45e-2.
 
 **V7, `migration_classifies_h2_oh_h4`** (`tests/surrogate.rs`; the DS-era fixture `tests/fixtures/ds_era_labels.txt`:
 `Accepted`, 61³ × 0.20, σ = h, tol 1e-6; three cold GPU solves plus one repeat; the run of record shared the GPU with
@@ -5809,7 +5814,11 @@ another worktree's `providers` suite, timings only):
 `source_change_restarts_from_zero` (F3; byte-identical to an uninterrupted run on the changed source),
 `purge_refused_while_migration_runs`, `old_pass_checkpoint_resume_refused`, `migration_is_a_pass_through_dynamics`,
 `a_crafted_source_slug_never_leaves_the_collections_root` (security review: a `migration.txt` whose `source_slug` is not
-the predecessor recomputed from the key — `..\other`, an absolute, drive or UNC path, a separator — is ignored). Six
+the predecessor recomputed from the key — `..\other`, an absolute, drive or UNC path, a separator — is ignored); fix round
+1: `a_crash_in_the_status_window_is_healed_at_attach` (I1: the `pending` code applied at attach for an S and a U of an 8,
+then byte-identical to an uninterrupted run), `a_reference_with_an_unsolved_multiplicity_is_retried_not_offered` (M2),
+`a_superseded_sample_without_its_superseder_is_listed` (M4), `classify_thresholds` with the large-|E| and partial-stop
+cases (I2). Six
 mutations of the engine (the (8, S) code, the duplicate rule, the fingerprint restart, the warning check, the purge
 refusal, an all-atom force comparison cut to one atom) each fail their test.
 
