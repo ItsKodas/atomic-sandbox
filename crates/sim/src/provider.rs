@@ -1105,8 +1105,31 @@ pub trait Trainable {
     /// Starts a refit off the step path: the model that stands keeps answering — judged by its own
     /// verdicts, as between two refits — until [`poll_refit_background`](Self::poll_refit_background)
     /// installs the new one between ticks. `false` when the provider cannot, or one is running or
-    /// nothing is fitted: the caller refits synchronously then. Default: cannot.
+    /// nothing is fitted (unless [`first_fit_ready`](Self::first_fit_ready): the first fit of
+    /// samples that have no model yet starts the same way): the caller refits synchronously then.
+    /// Default: cannot.
     fn begin_refit_background(&mut self) -> bool {
+        false
+    }
+    /// A counter of the changes to what a refit fits (quiet refits, 2026-11-17): samples appended,
+    /// the user's Forget / Restore, a reference that moved the labels, samples loaded, imported or
+    /// attached. Bumped by those changes only — never by a refit's own outcome, installed, failed
+    /// or discarded. The worker refits on its own only when it moved since the last refit that ran
+    /// to completion (`app::worker`, "Refits"). `None` (the default): not tracked — every pending
+    /// refit counts as new data.
+    fn fit_inputs_gen(&self) -> Option<u64> {
+        None
+    }
+    /// The caller starts the first fit of samples that have no model yet — an attached shared
+    /// collection's — itself, in the background ([`first_fit_ready`](Self::first_fit_ready),
+    /// [`begin_refit_background`](Self::begin_refit_background)), instead of
+    /// [`attach_collection`](Self::attach_collection) running it in place (minutes on a large
+    /// collection). Off by default. The default: nothing to defer.
+    fn set_first_fit_background(&mut self, _on: bool) {}
+    /// No model yet, but one can form from the samples held now (every reference in, enough
+    /// samples) and no pass or refit runs: [`begin_refit_background`](Self::begin_refit_background)
+    /// starts it. The default: never.
+    fn first_fit_ready(&self) -> bool {
         false
     }
     /// A background refit's state; `Done` once it is installed, with [`refit`](Self::refit)'s

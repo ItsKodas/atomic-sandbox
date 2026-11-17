@@ -9641,6 +9641,51 @@ fn collection_mode_learns_across_scenes() {
     }
 }
 
+/// Quiet refits (2026-11-17; the app worker's "Refits"): with `set_first_fit_background` an attach
+/// whose samples can be fitted leaves that first fit to the caller — no model, a refit due,
+/// `first_fit_ready` — and `begin_background_refit` runs it on a copy while the provider answers as
+/// with no model (a fallback, kept: one more change counted, `fit_inputs_gen`). The install counts
+/// no change of its own, and the appended sample is the next refit's. Without the switch the attach
+/// fits in place, as before. No Retry is offered while the first fit runs (it would fit in place).
+#[test]
+fn a_deferred_first_fit_runs_in_the_background_and_counts_no_change_of_its_own() {
+    let dir = collection_root("deferred_first_fit");
+    let mut rng = StdRng::seed_from_u64(11);
+    {
+        let (mut q, _) = pair_student();
+        q.attach_collection(&dir, &h2(1.4)).unwrap();
+        q.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));
+        for i in 0..60 {
+            q.evaluate(&h2_at(1.1 + 0.02 * i as f64, &mut rng), &mut never()).unwrap();
+        }
+        assert_eq!(q.collection().unwrap().samples.len(), 60);
+    }
+    let (mut s, _) = pair_student();
+    Trainable::set_first_fit_background(&mut s, true);
+    s.attach_collection(&dir, &h2(1.4)).unwrap();
+    assert!(!s.fitted() && s.pending_refit() && Trainable::first_fit_ready(&s), "the attach fits nothing: {:?}", s.no_model().map(|n| n.words));
+    assert!(Trainable::status(&s, &h2(1.4), &[[0.0; 3]; 2]).retry_fit, "the Retry, before it starts");
+    let (g, n) = (s.fit_inputs_gen(), s.samples());
+    assert!(s.begin_background_refit(), "the first fit starts in the background");
+    assert!(!Trainable::first_fit_ready(&s) && !Trainable::status(&s, &h2(1.4), &[[0.0; 3]; 2]).retry_fit, "running: neither again nor a Retry");
+    let r = s.evaluate(&h2_at(1.45, &mut rng), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback, "no model yet: the teacher answers");
+    assert_eq!((s.samples(), s.fit_inputs_gen()), (n + 1, g + 1), "kept: one change of what a refit fits");
+    match s.finish_background_refit() {
+        BackgroundPoll::Installed(Ok(_)) => {}
+        BackgroundPoll::Installed(Err(e)) => panic!("the first fit failed: {e}"),
+        BackgroundPoll::Discarded(why) => panic!("discarded: {why}"),
+        _ => panic!("no background refit"),
+    }
+    assert!(s.fitted() && s.pending_refit(), "installed; the sample kept meanwhile is the next refit's");
+    assert_eq!(s.fit_inputs_gen(), g + 1, "the install is no change of what a refit fits");
+    assert!(!Trainable::first_fit_ready(&s));
+    // without the switch: fitted in place by the attach, as before
+    let (mut t, _) = pair_student();
+    t.attach_collection(&dir, &h2(1.4)).unwrap();
+    assert!(t.fitted() && !Trainable::first_fit_ready(&t), "{:?}", t.no_model().map(|n| n.words));
+}
+
 // ---- the body-4 degree grown with the store (spec 2026-11-13 §4.1) ----
 
 /// A provider learning into a collection of its own under `dir`, with the H and He references of

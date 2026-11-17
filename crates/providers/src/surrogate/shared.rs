@@ -279,7 +279,9 @@ impl SurrogateKs {
         let r_cut = self.cutoff();
         let lone = self.hold_out_lone(r_cut);
         self.refs_dirty = true;
-        self.pending_refit = n > 0;
+        if n > 0 {
+            self.arm_refit();
+        }
         // the collection's audit history (module doc); its generations are the writers', so this
         // provider's generation moves past them (as `install_sidecar` does)
         let newest = c.history.iter().map(|p| p.model_gen).max().unwrap_or(0);
@@ -335,7 +337,11 @@ impl SurrogateKs {
         self.user_notes.push(note);
         self.note_lone_held_out(&format!("shared collection {slug}"), lone, r_cut);
         if self.no_model().is_some_and(|nm| nm.missing.is_empty() && nm.retry) {
-            if let Err(e) = SurrogateKs::refit(self) {
+            if self.first_fit_background {
+                // the caller fits it, in the background (`Trainable::set_first_fit_background`;
+                // quiet refits 2026-11-17: a collection's first fit took 2 min on the worker thread)
+                self.first_fit_due = true;
+            } else if let Err(e) = SurrogateKs::refit(self) {
                 self.last_fit_error = Some(e.to_string());
             }
         }
@@ -888,7 +894,11 @@ impl SurrogateKs {
         }
         if changed {
             self.species_dirty = true;
-            self.pending_refit = n > 0;
+            if n > 0 {
+                self.arm_refit();
+            } else {
+                self.pending_refit = false;
+            }
         }
     }
 
@@ -955,7 +965,7 @@ impl SurrogateKs {
             }
         }
         if report.imported > 0 {
-            self.pending_refit = true;
+            self.arm_refit();
             // each against its own box's references; a box without them waits (module doc)
             self.rebase_collection();
         }
@@ -1079,7 +1089,7 @@ impl SurrogateKs {
             st.provenance.record_masses(&set.provenance.masses);
         }
         if taken > 0 {
-            self.pending_refit = true;
+            self.arm_refit();
             self.user_notes.push(format!("shared collection {slug}: {taken} session-only samples of this session are back (kept beside the collection, never added to it)"));
             let r_cut = self.cutoff();
             let lone = self.hold_out_lone(r_cut);

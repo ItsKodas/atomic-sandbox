@@ -1403,6 +1403,20 @@ pub struct SurrogateKs {
     verdict_counts: Vec<usize>,
     epoch: u64,
     pending_refit: bool,
+    /// What a refit fits changed this many times (`Trainable::fit_inputs_gen`, quiet refits
+    /// 2026-11-17): bumped with `pending_refit` by [`arm_refit`](SurrogateKs::arm_refit) — an
+    /// appended sample, the user's Forget / Restore, a rebase, samples loaded, imported or
+    /// attached — never by a refit's own outcome (a discard or a failure re-arms `pending_refit`
+    /// without it).
+    fit_inputs_gen: u64,
+    /// The worker starts the first fit of an attached collection itself, in the background
+    /// (`Trainable::set_first_fit_background`): the attach does not run it in place.
+    first_fit_background: bool,
+    /// An attach left its first fit to the worker (`first_fit_background`): until a model forms
+    /// (or `forget` clears it), [`first_fit_ready`](SurrogateKs::first_fit_ready) may say so. Only
+    /// an attach sets it — a no-model session's kept fallback samples still wait for a pass
+    /// (module doc, "No model yet").
+    first_fit_due: bool,
     pending_jump: Option<f64>,
     last: Option<LastEval>,
     /// Consultations since the variance was last evaluated (the cadence, module doc).
@@ -1749,6 +1763,9 @@ impl SurrogateKs {
             verdict_counts: Vec::new(),
             epoch: 0,
             pending_refit: false,
+            fit_inputs_gen: 0,
+            first_fit_background: false,
+            first_fit_due: false,
             pending_jump: None,
             last: None,
             consults: 0,
@@ -1906,6 +1923,25 @@ impl SurrogateKs {
     /// Whether a fallback step has been kept since the last refit.
     pub fn pending_refit(&self) -> bool {
         self.pending_refit
+    }
+
+    /// What a refit fits changed (`fit_inputs_gen`): a refit is due. Every change from outside a
+    /// refit arms it through here; a refit's own outcome (a discard, a failure) never does.
+    pub(super) fn arm_refit(&mut self) {
+        self.pending_refit = true;
+        self.fit_inputs_gen += 1;
+    }
+
+    /// `Trainable::fit_inputs_gen`.
+    pub fn fit_inputs_gen(&self) -> u64 {
+        self.fit_inputs_gen
+    }
+
+    /// `Trainable::first_fit_ready`: an attach left its first fit to the caller
+    /// (`first_fit_background`), no model formed yet, no pass or refit runs, and a fit can form
+    /// from the samples held (the "No model yet" state whose Retry would fit at once).
+    pub fn first_fit_ready(&self) -> bool {
+        self.first_fit_due && self.model.is_none() && self.pass.is_none() && self.background.is_none() && self.no_model().is_some_and(|nm| nm.retry && nm.missing.is_empty())
     }
 
     /// The user's Forget / Restore changes no fit holds yet (2026-11-14, the batched forget): made
@@ -3228,6 +3264,18 @@ impl Trainable for SurrogateKs {
         self.begin_background_refit()
     }
 
+    fn fit_inputs_gen(&self) -> Option<u64> {
+        Some(SurrogateKs::fit_inputs_gen(self))
+    }
+
+    fn set_first_fit_background(&mut self, on: bool) {
+        self.first_fit_background = on;
+    }
+
+    fn first_fit_ready(&self) -> bool {
+        SurrogateKs::first_fit_ready(self)
+    }
+
     fn poll_refit_background(&mut self) -> sim::RefitPoll {
         match self.poll_background_refit() {
             BackgroundPoll::Idle => sim::RefitPoll::Idle,
@@ -3406,7 +3454,8 @@ impl Trainable for SurrogateKs {
             readiness: self.readiness(scene),
             teach_offer: self.teach_offer(),
             no_model: self.no_model().map(|n| n.words),
-            retry_fit: self.pass.is_none() && self.no_model().is_some_and(|n| n.retry),
+            // (not while the first fit runs in the background: a Retry would fit in place)
+            retry_fit: self.pass.is_none() && self.background.is_none() && self.no_model().is_some_and(|n| n.retry),
             model_source: self.model_source(),
             lone_note: lone_atoms_note(&scene.nuclei.iter().map(|n| n.pos).collect::<Vec<_>>(), self.cutoff()),
         }

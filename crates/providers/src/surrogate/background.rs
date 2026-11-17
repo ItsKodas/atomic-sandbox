@@ -227,10 +227,16 @@ impl SurrogateKs {
     }
 
     /// Starts a refit on a copy on its own thread (module doc); `false` when one is running already,
-    /// a sampling pass runs, or there is nothing to fit. The live provider keeps answering with the
-    /// model that stands until [`poll_background_refit`](Self::poll_background_refit) installs it.
+    /// a sampling pass runs, or there is nothing to fit — no samples, or no model and no first fit
+    /// an attach left to the caller ([`first_fit_ready`](Self::first_fit_ready): that one starts
+    /// here too, quiet refits 2026-11-17; until it installs the provider answers as with no model).
+    /// The live provider keeps answering with the model that stands until
+    /// [`poll_background_refit`](Self::poll_background_refit) installs it.
     pub fn begin_background_refit(&mut self) -> bool {
-        if self.background.is_some() || self.pass.is_some() || self.model.is_none() || self.store.as_ref().is_none_or(|s| s.is_empty()) {
+        if self.background.is_some() || self.pass.is_some() || self.store.as_ref().is_none_or(|s| s.is_empty()) {
+            return false;
+        }
+        if self.model.is_none() && !self.first_fit_ready() {
             return false;
         }
         let snap = self.snapshot();

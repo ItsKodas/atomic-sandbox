@@ -1826,7 +1826,7 @@ impl SurrogateKs {
         self.quarantine.resize(n, Q_NONE);
         self.quarantine[i] = code;
         self.species_dirty = true;
-        self.pending_refit = true;
+        self.arm_refit();
         self.note_user_code(i, code);
         match self.write_status_now(i) {
             Ok(true) => " (written to the shared collection)".to_string(),

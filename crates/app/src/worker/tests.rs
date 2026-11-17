@@ -3978,3 +3978,282 @@ fn the_knowledge_map_ships_when_the_fit_changes() {
     w.send(Command::SetAudit(7));
     snapshot_until(&w, "a map after a policy change", |s| s.activity.knowledge.is_some());
 }
+
+/// What [`RefitFake`] holds and was asked for (quiet refits, 2026-11-17): the provider's refit
+/// state as `sim::Trainable` shows it, a background refit the test releases, and every refit
+/// started — `"background"` or `"tick"` — with the samples it started on.
+#[derive(Default)]
+struct RefitState {
+    fitted: bool,
+    samples: usize,
+    pending: bool,
+    /// `Trainable::fit_inputs_gen`.
+    gen: u64,
+    /// An attach left its first fit to the worker (`Trainable::first_fit_ready`).
+    first_fit: bool,
+    /// Every evaluation keeps a sample (a fallback): appended, a refit due.
+    keep: bool,
+    /// The running background refit: the samples it started on; it lands once `release` is set.
+    running: Option<usize>,
+    release: bool,
+    /// How the next background refit ends: `Ok` installed, `Err(true)` discarded (due again, as
+    /// the provider's conflict leaves it), `Err(false)` failed (the fit's error; still pending).
+    outcome: Option<Result<(), bool>>,
+    /// After an install the provider leaves a refit due by its own outcome: `pending` stays set.
+    sticky: bool,
+    started: Vec<(&'static str, usize)>,
+}
+
+impl RefitState {
+    /// A sample kept (a fallback, a relax check): appended, a refit due.
+    fn keep_one(&mut self) {
+        self.samples += 1;
+        self.pending = true;
+        self.gen += 1;
+    }
+}
+
+/// A stand-in for the estimated solver's refit side, no GPU: Morse H₂ answers every step; its
+/// `sim::Trainable` refit state is [`RefitState`], which the test drives.
+struct RefitFake {
+    inner: sim::MorseDimer,
+    st: Arc<std::sync::Mutex<RefitState>>,
+}
+
+impl RefitFake {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RefitState> {
+        self.st.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl ForceProvider for RefitFake {
+    fn evaluate(&mut self, scene: &sim::Scene, a: &mut dyn FnMut() -> bool) -> Result<sim::ForceResult, sim::ProviderError> {
+        let r = self.inner.evaluate(scene, a);
+        let mut st = self.lock();
+        if st.keep {
+            st.keep_one();
+        }
+        r
+    }
+    fn name(&self) -> &'static str {
+        "refit-fake"
+    }
+    fn reset(&mut self) {}
+    fn as_trainable(&mut self) -> Option<&mut dyn Trainable> {
+        Some(self)
+    }
+}
+
+impl Trainable for RefitFake {
+    fn start_pass(&mut self, _s: &sim::Scene, _p: &SamplingPlan, _r: &mut sim::AtomReferences) -> Result<(), String> {
+        Err("refit-fake: no passes".into())
+    }
+    fn pass_step(&mut self, _a: &mut dyn FnMut() -> bool) -> Result<Option<sim::SamplingProgress>, sim::ProviderError> {
+        Ok(None)
+    }
+    fn cancel_pass(&mut self) {}
+    fn pass_active(&self) -> bool {
+        false
+    }
+    fn progress(&self) -> Option<sim::SamplingProgress> {
+        None
+    }
+    fn refit(&mut self) -> Result<String, String> {
+        let mut st = self.lock();
+        let p = st.samples;
+        st.started.push(("tick", p));
+        (st.fitted, st.pending, st.first_fit) = (true, false, false);
+        Ok(format!("{p} samples"))
+    }
+    fn begin_refit_background(&mut self) -> bool {
+        let mut st = self.lock();
+        if st.running.is_some() || (!st.fitted && !st.first_fit) {
+            return false;
+        }
+        let p = st.samples;
+        st.started.push(("background", p));
+        (st.running, st.release) = (Some(p), false);
+        true
+    }
+    fn poll_refit_background(&mut self) -> sim::RefitPoll {
+        let mut st = self.lock();
+        let Some(p) = st.running else { return sim::RefitPoll::Idle };
+        if !st.release {
+            return sim::RefitPoll::Running;
+        }
+        st.running = None;
+        match st.outcome.take().unwrap_or(Ok(())) {
+            Ok(()) => {
+                st.fitted = true;
+                st.first_fit = false;
+                st.pending = st.samples > p || st.sticky;
+                sim::RefitPoll::Done(Ok(format!("{p} samples")))
+            }
+            Err(true) => {
+                st.pending = true;
+                sim::RefitPoll::Discarded("background refit discarded: the teach-around rounds changed while it ran — it is due again".into())
+            }
+            Err(false) => sim::RefitPoll::Done(Err("the fit failed".into())),
+        }
+    }
+    fn fit_inputs_gen(&self) -> Option<u64> {
+        Some(self.lock().gen)
+    }
+    fn first_fit_ready(&self) -> bool {
+        let st = self.lock();
+        st.first_fit && !st.fitted && st.running.is_none()
+    }
+    fn forget(&mut self) {}
+    fn save(&self, _p: &std::path::Path) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::InvalidInput.into())
+    }
+    fn load(&mut self, _p: &std::path::Path, _s: &sim::Scene) -> Result<(), String> {
+        Err("refit-fake: no files".into())
+    }
+    fn teacher_mut(&mut self) -> &mut dyn ForceProvider {
+        &mut self.inner
+    }
+    fn status(&self, _s: &sim::Scene, _f: &[[f64; 3]]) -> sim::TrainableStatus {
+        let st = self.lock();
+        sim::TrainableStatus {
+            teacher: "morse", fitted: st.fitted, trusted: st.fitted, untrusted_reason: None, samples: st.samples, pending_refit: st.pending, epoch: 0, fit: None,
+            body4_degree: None, residuals: None, force_bound: 0.0, provenance_mismatch: None, provenance: None, audit_every: 0, draft: true,
+            quarantined: 0, superseded: 0, forgotten: 0, forgotten_in_fit: 0, box_excluded: 0, held_out: 0, lone: 0, box_affected: 0,
+            trust_floor: None, unfitted: 0, pending: 0, recovery: None, audits_background: true, audit_in_flight: false, last_audit: None,
+            last_audit_this_fit: false, audits_box_unjudged: 0, stuck: None, class_loo: Vec::new(), solves: Default::default(),
+            trust_checks: Vec::new(), stuck_info: None, model_gen: 0, readiness: None, teach_offer: None, no_model: None, retry_fit: false,
+            model_source: Default::default(), lone_note: None,
+        }
+    }
+    fn fitted(&self) -> bool {
+        self.lock().fitted
+    }
+    fn samples(&self) -> usize {
+        self.lock().samples
+    }
+    fn pending_refit(&self) -> bool {
+        self.lock().pending
+    }
+    fn set_audit_every(&mut self, _n: usize) {}
+    fn force_teacher_next(&mut self) {}
+}
+
+/// A worker over a [`RefitFake`] in `st`'s state (paused).
+fn refit_fake(st: RefitState) -> (SimWorker, Arc<std::sync::Mutex<RefitState>>) {
+    let st = Arc::new(std::sync::Mutex::new(st));
+    let s = st.clone();
+    let w = SimWorker::spawn_test(h2_33(), Box::new(move || Box::new(RefitFake { inner: sim::MorseDimer::h2(), st: s.clone() })));
+    (w, st)
+}
+
+/// The refits `st` saw started.
+fn refits_started(st: &Arc<std::sync::Mutex<RefitState>>) -> Vec<(&'static str, usize)> {
+    st.lock().unwrap_or_else(|e| e.into_inner()).started.clone()
+}
+
+/// The snapshots of the next `secs` (the worker ticking, playing or polling); the last one.
+fn snapshots_for(w: &SimWorker, secs: f64) -> Snapshot {
+    let until = Instant::now() + Duration::from_secs_f64(secs);
+    let mut last = next_snapshot(w);
+    while Instant::now() < until {
+        match w.recv_timeout(Duration::from_millis(50)) {
+            Some(Event::Snapshot(s)) => last = *s,
+            Some(Event::Error(message)) => panic!("{message}"),
+            _ => {}
+        }
+    }
+    last
+}
+
+/// Quiet refits (2026-11-17, the user: "Can we PLEASE stop refitting all the samples on repeat
+/// whilst in model only mode"): under ⚠ Model only a kept sample makes no refit due — playing, the
+/// samples pile up pending and nothing refits; turning Model only off starts one (playing: in the
+/// background) through the normal throttle.
+#[test]
+fn model_only_keeps_samples_pending_and_leaving_it_starts_one_refit() {
+    let (w, st) = refit_fake(RefitState { fitted: true, samples: 100, ..Default::default() });
+    idle(&w);
+    w.send(Command::SetModelOnly(true));
+    st.lock().unwrap().keep = true;
+    w.send(Command::Dyn(DynCommand::Play));
+    let s = snapshot_until(&w, "samples kept while playing", |s| s.model.as_ref().is_some_and(|m| m.samples >= 110));
+    let s2 = snapshots_for(&w, 1.0);
+    assert!(refits_started(&st).is_empty(), "Model only: no refit: {:?}", refits_started(&st));
+    assert!(model(&s2).pending_refit && model(&s2).samples > model(&s).samples, "the kept samples wait, pending");
+    w.send(Command::SetModelOnly(false));
+    snapshot_until(&w, "the refit after Model only", |s| model(s).refit_running);
+    let started = refits_started(&st);
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(started[0].0, "background", "playing: off the step path");
+}
+
+/// … paused too (a relax check or a teleport keeps a sample while paused): Model only holds it;
+/// **Refit now** runs it anyway — the user asked — in the background.
+#[test]
+fn refit_now_runs_in_model_only() {
+    let (w, st) = refit_fake(RefitState { fitted: true, samples: 100, ..Default::default() });
+    idle(&w);
+    w.send(Command::SetModelOnly(true));
+    st.lock().unwrap().keep_one();
+    // a command wakes the paused worker for a round
+    w.send(Command::Dyn(DynCommand::SetSpeed(2)));
+    let s = snapshots_for(&w, 0.5);
+    assert!(model(&s).pending_refit && refits_started(&st).is_empty(), "Model only holds it: {:?}", refits_started(&st));
+    w.send(Command::RefitNow);
+    snapshot_until(&w, "the refit the user asked for", |s| model(s).refit_running);
+    assert_eq!(refits_started(&st), vec![("background", 101)]);
+    st.lock().unwrap().release = true;
+    let s = snapshot_until(&w, "it landed", |s| !model(s).refit_running && model(s).refits == 1);
+    assert!(!model(&s).pending_refit);
+}
+
+/// The repeated 1629-sample refits (refit_times.csv, 2026-11-17: full trust recoveries on 1628,
+/// 1629, then 1629 again): a refit that ran to completion is never started again on the same data,
+/// whatever it left behind — discarded (the provider marks it due again), failed (still pending),
+/// or installed with the provider still reporting a refit due. A new sample makes exactly one more.
+#[test]
+fn a_finished_refit_is_not_repeated_without_new_data() {
+    let (w, st) = refit_fake(RefitState { fitted: true, samples: 1628, ..Default::default() });
+    idle(&w);
+    w.send(Command::Dyn(DynCommand::Play));
+    for (k, outcome) in [Err(true), Err(false), Ok(())].into_iter().enumerate() {
+        {
+            let mut s = st.lock().unwrap();
+            s.keep_one();
+            s.outcome = Some(outcome);
+            s.sticky = outcome.is_ok();
+        }
+        snapshot_until(&w, "a refit started", |_| refits_started(&st).len() == k + 1);
+        st.lock().unwrap().release = true;
+        snapshot_until(&w, "it ended", |s| !model(s).refit_running && st.lock().unwrap().running.is_none());
+        let s = snapshots_for(&w, 1.5);
+        let started = refits_started(&st);
+        assert_eq!(started.len(), k + 1, "{outcome:?}: no second refit on the same data: {started:?}");
+        assert!(model(&s).pending_refit, "{outcome:?}: the provider still says a refit is due");
+        assert!(started.iter().all(|x| x.0 == "background"), "playing: never in the tick: {started:?}");
+    }
+}
+
+/// Quiet refits, the "freeze": the first fit after a collection is attached (no model yet; 113 s
+/// for 1627 samples on the worker thread, 2026-11-17) runs in the background — paused, and on
+/// while playing: the run goes on meanwhile, answered as with no model — and installs when done.
+#[test]
+fn the_first_fit_after_an_attach_runs_in_the_background_while_playing() {
+    let (w, st) = refit_fake(RefitState { fitted: false, samples: 1627, pending: true, gen: 1, first_fit: true, ..Default::default() });
+    // the attach arrives as a command (`EnsureModel`, `UseModel`): any command makes the round
+    // that starts the fit
+    w.send(Command::Dyn(DynCommand::SetSpeed(2)));
+    let s = snapshot_until(&w, "the first fit started", |s| s.model.as_ref().is_some_and(|m| m.refit_running));
+    assert!(s.dynamics.paused, "paused at the start: in the background too");
+    w.send(Command::Dyn(DynCommand::Play));
+    let a = snapshot_until(&w, "playing", |s| !s.dynamics.paused);
+    let b = snapshot_until(&w, "steps while the first fit runs", |s| s.dynamics.step >= a.dynamics.step + 20);
+    assert!(model(&b).refit_running && !model(&b).fitted, "still fitting, the run goes on");
+    assert_eq!(refits_started(&st), vec![("background", 1627)], "never in the tick");
+    st.lock().unwrap().release = true;
+    let s = snapshot_until(&w, "the first fit installed", |s| model(s).fitted && !model(s).refit_running);
+    assert_eq!(model(&s).refits, 1);
+    let s = snapshots_for(&w, 1.0);
+    assert_eq!(refits_started(&st).len(), 1, "nothing new: no second refit");
+    assert!(!model(&s).pending_refit);
+}

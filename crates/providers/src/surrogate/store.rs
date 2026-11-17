@@ -150,6 +150,7 @@ impl SurrogateKs {
         self.failed_audits.clear();
         self.audit_fences.clear();
         self.pending_refit = false;
+        self.first_fit_due = false;
         self.pending_jump = None;
         self.consults = 0;
         self.last_variance = None;
@@ -290,7 +291,7 @@ impl SurrogateKs {
             self.user_notes.push("samples file: its reference energies predate ruling S9 (lowest-energy multiplicity) — not used; Retry or a sampling pass re-solves them".into());
         }
         self.refs_dirty = true;
-        self.pending_refit = true;
+        self.arm_refit();
         self.ledger.counts = match teacher_solves {
             Some(t) => SolveCounts { pass: t.pass, fallback: t.fallback, audit: t.audit, verification: t.verification, kept: t.kept, unrecorded_before: !t.complete, reference: self.ledger.counts.reference },
             None => SolveCounts { unrecorded_before: true, reference: self.ledger.counts.reference, ..SolveCounts::default() },
@@ -412,7 +413,11 @@ impl SurrogateKs {
             prefix += 1;
         }
         self.accumulated = prefix;
-        self.pending_refit = store.len() > self.accumulated;
+        if store.len() > self.accumulated {
+            self.arm_refit();
+        } else {
+            self.pending_refit = false;
+        }
         self.envelope = Some(accumulator.envelope.clone());
         self.null_space = Some(NullSpace::of(&accumulator, &model.scale));
         self.null_space_pending = false;
@@ -653,7 +658,7 @@ impl SurrogateKs {
                     self.quarantine[n - 1] = Q_DRAFT;
                     notes.push("surrogate: kept, held out of the strict fit — a draft-mode audit at a geometry strict mode refuses (it would otherwise judge the strict model by the guess's own excursions)".into());
                 }
-                self.pending_refit = true;
+                self.arm_refit();
                 true
             }
             Err(e) => {
