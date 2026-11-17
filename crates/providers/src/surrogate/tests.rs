@@ -11365,6 +11365,9 @@ mod harris;
 /// worker's `audits_background` read builds no status (`status_cache.rs`).
 mod status_cache;
 
+/// 2026-11-17: the estimated step's cost on a collection, the variance step's pieces (`step_cost.rs`).
+mod step_cost;
+
 // ---- M8a Task 10: masked scenes (a capped segment teaches only its interior atoms) ----
 
 /// H₂ + H with a training mask: atoms 0 and 1 interior, the third a "cap".

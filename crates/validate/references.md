@@ -4938,3 +4938,23 @@ A copy of the user's collection (1 621 samples, H/O/P, degree cap unset, an offe
 | words from the cache (after) | **1.05 ms (1.57)** | 1 build ≈ 1 ms |
 
 At a geometry the last step did not evaluate, `readiness` judges the strict policy afresh (`first_refusal`: the variance prediction and rule 5d's novelty) — 96 ms of a 94–207 ms status; the worker's snapshot is at the evaluated geometry, so it does not pay this. The teach offer itself with the cached words: 0.47 ms (the diagnosis 0.26 ms, the cache key 0.22 ms). Not changed here: the variance step every `variance_cadence`-th consultation (`predict(…, true)` and the novelty, 20–37 ms in the diagnosis).
+
+### The variance step (2026-11-17; same branch, the next commit; `providers` `surrogate::tests::step_cost::step_cost_on_a_collection`, `#[ignore]`d measurement; `refit_golden` for the equivalence; release, Ryzen 7 9800X3D, the same collection copy: Q′ 1 902, null-space dimension 1 717)
+
+Every `variance_cadence`-th Model-only step evaluates `predict(…, true)` and rule 5d's novelty; they held the mean step at 5–10 ms. Both are now **the same arithmetic, scheduled differently** — every number bit for bit, so no threshold, tier or verdict moved:
+- **Novelty** (`surrogate::NullSpace`): the null directions are stored by component (`columns[k·dim + v]`) and every row's dots are accumulated one query entry at a time over all directions at once; an entry that is exactly zero (a species block or neighbour channel the query does not touch — most of them for H₂ in an H/O/P basis) is skipped: its products are ±0, which leave a nonzero partial sum unchanged and at most flip the sign of a zero one, gone in the square. Each dot is still summed over k in order. (The complement form ‖φ‖² − ‖Rᵀφ‖² over the 185 spanned directions was not needed and is not exact: its cancellation is O(Q′ε‖φ‖²) absolute against ν's threshold N_null·τ.)
+- **Predictive variance** (`surrogate::linalg::cholesky_quad_forms`): the 1 + 3N rows of a step substituted together through the fit's Cholesky factor — eight right-hand sides as lanes, four rows of L at a time, AVX2 when the CPU has it (no FMA; Rust never contracts) — each lane subtracting the same products in the same order as `forward_substitute`, its squares summed as before.
+
+Unit tests: `linalg::batched_quad_forms_are_the_single_ones_bit_for_bit`, `novelty::batched_nu_is_the_row_by_row_form_bit_for_bit` (random factors and rows with zeros, every batch size around the lane and row widths). **`refit_golden`** recorded on the status-cache commit and compared on this one, cases cold, append-20 and misfit recovery (6 193 items: every prediction and std at the 398 probes, ν and its atom at every probe, every `would_answer` verdict, codes, class and key verdicts, LOO, grades): **0 items differ, every relative difference 0.00e0**.
+
+H₂ near 1.4 Bohr, 400 Model-only steps (draft on, audits off), 100 of them variance steps; the pieces at 1.41 Bohr (ν = 2.15e-9 before and after). Before: the machine fully loaded by other agents' suites; after: lightly loaded — the pieces' ratios are the kernels', the step means are indicative.
+
+| | before | after |
+|---|---|---|
+| `evaluate`, every step (mean) | 12.6 ms | **1.28 ms** |
+| `evaluate`, variance step (mean / max) | 47.7 / 80.9 ms | **2.92 / 4.57 ms** |
+| `evaluate`, other steps (mean) | 0.90 ms | 0.73 ms |
+| `predict(…, true)` | 15.6 ms | **1.50 ms** |
+| `novelty` | 21.5 ms | **0.18 ms** |
+
+The batched substitution alone (`quad_forms_speed`, `#[ignore]`d: 7 rows at n = 1 902): 27.5 ms one at a time → 1.70 ms. The status's `readiness` at a geometry the last step did not evaluate (96 ms in "Status cache" above) runs the same two pieces, and so do the training views' `predict(…, true)` per curve point.
