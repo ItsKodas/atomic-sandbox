@@ -3103,7 +3103,7 @@ impl Trainable for HarrisFake {
             teacher: "morse", fitted: false, trusted: false, untrusted_reason: None, samples: 0, pending_refit: false, epoch: 0, fit: None,
             body4_degree: None, residuals: None, force_bound: 0.0, provenance_mismatch: None, provenance: None, audit_every: 0, draft: true,
             quarantined: 0, superseded: 0, forgotten: 0, forgotten_in_fit: 0, box_excluded: 0, held_out: 0, lone: 0, box_affected: 0,
-            trust_floor: None, unfitted: 0, recovery: None, audits_background: true, audit_in_flight: false, last_audit: None,
+            trust_floor: None, unfitted: 0, pending: 0, recovery: None, audits_background: true, audit_in_flight: false, last_audit: None,
             last_audit_this_fit: false, audits_box_unjudged: 0, stuck: None, class_loo: Vec::new(), solves: Default::default(),
             trust_checks: Vec::new(), stuck_info: None, model_gen: 0, readiness: None, teach_offer: None, no_model: None, retry_fit: false,
             model_source: Default::default(), lone_note: None,

@@ -1428,6 +1428,10 @@ pub struct TrainableStatus {
     /// `samples` = fit samples + `quarantined` + `superseded` + `forgotten` + `box_excluded` + `held_out` + `lone` + `unfitted`
     /// exactly (M6 Task 11: the panel's "fit vs held" reconciliation).
     pub unfitted: usize,
+    /// Of `unfitted`, the samples in the next fit's codes (no quarantine code: not forgotten, held,
+    /// superseded, box-excluded, a draft, lone atoms or waiting for a reference): the knowledge
+    /// map's "new, waiting for refit" (`knowledge` module doc), what the app's map key watches.
+    pub pending: usize,
     /// What the last refit's trust recovery did.
     pub recovery: Option<String>,
     /// The audits run on a background teacher.

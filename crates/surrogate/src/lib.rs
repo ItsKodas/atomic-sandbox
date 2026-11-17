@@ -18,6 +18,7 @@
 
 pub mod basis;
 pub mod collection;
+pub mod dense;
 pub mod descriptor;
 pub mod envelope;
 pub mod fit;
@@ -30,6 +31,7 @@ pub mod novelty;
 pub mod quarantine;
 pub mod sidecar;
 pub mod threads;
+pub mod prof;
 
 pub use descriptor::{describe, describe_values, no_neighbours, touched_columns, AtomDescriptor, Basis, Body3Term, Body4Term, DescribeError, BODY4_DEGREE_CAP, BODY4_DEGREE_START, COLLECTION_R_CUT};
 pub use envelope::Envelope;

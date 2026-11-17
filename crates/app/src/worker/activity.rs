@@ -56,10 +56,18 @@
 //! # The knowledge map (M8a Task 9)
 //! `sim::KnowledgeMap` is built whenever the model is fitted and what it shows may have changed
 //! ([`KnowledgeKey`]: the model generation, the trust rule, the exclusions — the forgotten count
-//! included — and every per-key class verdict — not the store's size, since samples kept since the last refit are not in the fit the
-//! map counts), whether or not the views are on: one pass over the fitted samples, no prediction
-//! (milliseconds for thousands of samples), in `activity_ms`. Shipped like the views:
-//! `ActivityDelta::knowledge`, `None` = no new build.
+//! included — every per-key class verdict, and the count of samples kept since the last refit and
+//! in the next fit's codes, `ModelStatus::pending` — not the store's size, since a kept sample
+//! with a quarantine code shows nowhere), whether or not the views are on: one pass over the
+//! fitted samples and one over the pending ones, no prediction (milliseconds for thousands of
+//! samples), in `activity_ms`. Shipped like the views: `ActivityDelta::knowledge`, `None` = no new
+//! build.
+//!
+//! **The live graph** (2026-11-16): while a pass, a teach scan or anything else keeps samples, only
+//! the pending count moves, and the map is rebuilt for it at most once per [`views_interval`] of
+//! its own last build ([`knowledge_build`]: the views' 2 s floor and duty backstop); a deferred
+//! rebuild wakes the worker like a deferred view build ([`Worker::views_wake`]). Any other change
+//! — a refit, a Forget or Restore, a re-judged verdict — rebuilds at once, as before.
 use super::*;
 
 /// The fewest seconds between two training-view builds (spec §6).
@@ -148,6 +156,8 @@ pub(super) struct KnowledgeKey {
     superseded: usize,
     box_excluded: usize,
     verdicts: Vec<bool>,
+    /// Samples kept since the last refit, in the next fit's codes (the live graph, module doc).
+    pending: usize,
 }
 
 impl KnowledgeKey {
@@ -160,7 +170,37 @@ impl KnowledgeKey {
             superseded: m.superseded,
             box_excluded: m.box_excluded,
             verdicts: m.class_loo.iter().flat_map(|c| std::iter::once(c.trusted).chain(c.species.iter().map(|s| s.trusted))).collect(),
+            pending: m.pending,
         }
+    }
+
+    /// The same map but for its pending count.
+    fn same_fit(&self, o: &KnowledgeKey) -> bool {
+        KnowledgeKey { pending: 0, ..self.clone() } == KnowledgeKey { pending: 0, ..o.clone() }
+    }
+}
+
+/// Whether to rebuild the knowledge map now (module doc, "The live graph").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum KnowledgeBuild {
+    /// Nothing it shows changed.
+    Skip,
+    Now,
+    /// Only the pending count moved, within the interval of the last build: at this instant.
+    At(Instant),
+}
+
+/// The knowledge map's schedule: `last` the key of the last build and `built` when it ended and
+/// its wall time (ms). A change other than the pending count builds at once; a pending-only change
+/// waits for [`views_interval`] after the last build.
+pub(super) fn knowledge_build(last: Option<&KnowledgeKey>, built: Option<(Instant, f64)>, key: &KnowledgeKey, now: Instant) -> KnowledgeBuild {
+    match last {
+        Some(k) if k == key => KnowledgeBuild::Skip,
+        Some(k) if k.same_fit(key) => match built.map(|(at, ms)| at + views_interval(ms)) {
+            Some(due) if now < due => KnowledgeBuild::At(due),
+            _ => KnowledgeBuild::Now,
+        },
+        _ => KnowledgeBuild::Now,
     }
 }
 
@@ -189,8 +229,11 @@ pub(super) struct ActivityWork {
     /// ended and its `build_ms`.
     built_key: Option<ViewKey>,
     built_at: Option<(Instant, f64)>,
-    /// What the last knowledge map showed (module doc, "The knowledge map").
+    /// What the last knowledge map showed (module doc, "The knowledge map"), when its build ended
+    /// and its wall time (ms), and when a deferred rebuild is due (module doc, "The live graph").
     knowledge_key: Option<KnowledgeKey>,
+    knowledge_built: Option<(Instant, f64)>,
+    knowledge_due_at: Option<Instant>,
     /// A build deferred by the interval is due at this instant (module doc; [`Worker::views_wake`]).
     views_due_at: Option<Instant>,
     /// The latest run start not yet published, and the current run's start (module doc, "Runs").
@@ -236,10 +279,11 @@ impl ActivityWork {
 }
 
 impl Worker {
-    /// When an idle worker must wake for a deferred view build (module doc; the loop waits until
-    /// then instead of blocking for a command).
+    /// When an idle worker must wake for a deferred view build or knowledge-map rebuild (module
+    /// doc; the loop waits until then instead of blocking for a command).
     pub(super) fn views_wake(&self) -> Option<Instant> {
-        self.activity.views_due_at.filter(|_| self.activity.views_on)
+        let a = &self.activity;
+        [a.views_due_at.filter(|_| a.views_on), a.knowledge_due_at].into_iter().flatten().min()
     }
 
     /// Moves the driver's teaching events into the pending list (module doc, "The events");
@@ -284,6 +328,7 @@ impl Worker {
         };
         // set again below while a build waits for its interval
         self.activity.views_due_at = None;
+        self.activity.knowledge_due_at = None;
         if let Some(m) = model.filter(|m| m.fitted) {
             if let Some((n, q, e, f)) = m.fit {
                 let key = (m.epoch, (n, q, e.to_bits(), f.to_bits()));
@@ -293,10 +338,17 @@ impl Worker {
                 }
             }
             let kkey = KnowledgeKey::of(m);
-            if self.activity.knowledge_key.as_ref() != Some(&kkey) {
-                // a refused build records its key too: no retry until something changes
-                self.activity.knowledge_key = Some(kkey);
-                d.knowledge = trainable(&mut self.dy).and_then(|s| s.knowledge_map()).map(Arc::new);
+            match knowledge_build(self.activity.knowledge_key.as_ref(), self.activity.knowledge_built, &kkey, Instant::now()) {
+                KnowledgeBuild::Skip => {}
+                // deferred: the loop wakes an idle worker then (module doc, "The live graph")
+                KnowledgeBuild::At(due) => self.activity.knowledge_due_at = Some(due),
+                KnowledgeBuild::Now => {
+                    // a refused build records its key too: no retry until something changes
+                    self.activity.knowledge_key = Some(kkey);
+                    let tb = Instant::now();
+                    d.knowledge = trainable(&mut self.dy).and_then(|s| s.knowledge_map()).map(Arc::new);
+                    self.activity.knowledge_built = Some((Instant::now(), tb.elapsed().as_secs_f64() * 1e3));
+                }
             }
             let key = ViewKey::of(m);
             let a = &self.activity;
@@ -348,6 +400,44 @@ mod schedule_tests {
         for ms in [40.0, 100.0, 3100.0, 3800.0] {
             let duty = ms / 1e3 / views_interval(ms).as_secs_f64();
             assert!(duty <= 1.0 / VIEWS_DUTY_FACTOR + 1e-12, "{ms} ms: {duty}");
+        }
+    }
+
+    /// The live knowledge graph (2026-11-16): the map's key moves with the count of samples kept
+    /// since the last refit (`ModelStatus::pending`), not with the store's raw tail.
+    #[test]
+    fn the_knowledge_key_watches_the_pending_count() {
+        let m = crate::ui::tests::model();
+        let k0 = KnowledgeKey::of(&m);
+        let k3 = KnowledgeKey::of(&ModelStatus { pending: 3, unfitted: 3, ..m.clone() });
+        assert_ne!(k0, k3, "a kept sample moves the key");
+        assert!(k0.same_fit(&k3), "and only its pending part");
+        assert_eq!(k0, KnowledgeKey::of(&ModelStatus { unfitted: 2, ..m.clone() }), "a kept but quarantined sample shows nowhere");
+        assert!(!k0.same_fit(&KnowledgeKey::of(&ModelStatus { model_gen: m.model_gen + 1, pending: 3, ..m.clone() })), "a refit is not pending-only");
+        assert!(!k0.same_fit(&KnowledgeKey::of(&ModelStatus { forgotten: m.forgotten + 1, ..m.clone() })), "a Forget is not pending-only");
+    }
+
+    /// The live knowledge graph's cadence: a pending-only change rebuilds at most once per
+    /// `views_interval` of the last build (2 s, or 50 × a slow build), and is due at that instant;
+    /// any other change (a refit, a Forget) rebuilds at once; nothing changed, nothing built.
+    #[test]
+    fn knowledge_rebuilds_for_pending_samples_are_rate_limited() {
+        let m = crate::ui::tests::model();
+        let k0 = KnowledgeKey::of(&m);
+        let k1 = KnowledgeKey::of(&ModelStatus { pending: 1, ..m.clone() });
+        let refit = KnowledgeKey::of(&ModelStatus { model_gen: m.model_gen + 1, ..m.clone() });
+        let forget = KnowledgeKey::of(&ModelStatus { forgotten: m.forgotten + 1, pending: 1, ..m.clone() });
+        let t = Instant::now();
+        let built = Some((t, 3.0));
+        assert_eq!(knowledge_build(None, None, &k0, t), KnowledgeBuild::Now, "the first map");
+        assert_eq!(knowledge_build(Some(&k0), built, &k0, t + Duration::from_secs(60)), KnowledgeBuild::Skip);
+        assert_eq!(knowledge_build(Some(&k0), built, &k1, t + Duration::from_millis(500)), KnowledgeBuild::At(t + VIEWS_MIN_INTERVAL), "within 2 s: deferred");
+        assert_eq!(knowledge_build(Some(&k0), built, &k1, t + VIEWS_MIN_INTERVAL), KnowledgeBuild::Now, "at 2 s: built");
+        assert_eq!(knowledge_build(Some(&k0), None, &k1, t), KnowledgeBuild::Now, "no build time recorded: at once");
+        let slow = Some((t, 100.0));
+        assert_eq!(knowledge_build(Some(&k0), slow, &k1, t + Duration::from_secs(3)), KnowledgeBuild::At(t + Duration::from_secs(5)), "the duty backstop: 50 x 100 ms");
+        for k in [&refit, &forget] {
+            assert_eq!(knowledge_build(Some(&k0), built, k, t + Duration::from_millis(1)), KnowledgeBuild::Now, "{k:?}: at once");
         }
     }
 }

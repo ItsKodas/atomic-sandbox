@@ -93,6 +93,7 @@ impl NullSpace {
     /// The unspanned directions of `acc`'s training rows under the standardisation `scale` (the
     /// fitted model's per-feature scale; 0 means 1, as in the fit).
     pub fn of(acc: &Accumulator, scale: &[f64]) -> NullSpace {
+        let _prof = crate::prof::span("fit: NullSpace::of");
         let basis = acc.basis.clone();
         let p = basis.n_features();
         let classes = basis.column_classes();

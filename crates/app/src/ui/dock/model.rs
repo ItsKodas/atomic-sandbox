@@ -15,7 +15,10 @@
 //! 2. **Teach next** (open): what blocks or helps teaching — the refused autoload, the box advice,
 //!    "no model yet" with Retry, Teach around blockers, the running pass's progress, the first-pass
 //!    offer — then the environment keys not learned yet ([`gaps`]: the scene's first, the others
-//!    under "other gaps (n)"), or "Everything this scene needs is learned"; the preset, Sample more
+//!    under "other gaps (n)"; samples kept since the last refit that count toward a gap read
+//!    "12 +7 / 60" with an outlined segment after the fill — the knowledge map's per-key pending
+//!    count, rebuilt live during a pass — while the fill and "N to learn here" stay fitted-only),
+//!    or "Everything this scene needs is learned"; the preset, Sample more
 //!    with its cost, Cancel while a pass runs; the "Plan settings" fold; the audits line ("audits on
 //!    · every N steps" / "audits off (unsafe)") and the "Audits" fold (cadence, auto, draft mode).
 //! 3. **Health** (open): uncertainty against its bound, the last fit, the last audit — short.
@@ -354,8 +357,10 @@ fn sentence(text: &str) -> String {
 }
 
 /// One environment key not learned yet (Teach next): its short label ("pair O–S", "many-body H with
-/// H, S"), its progress (`have` of `need`, for a sample or evidence floor), the short words on the
-/// row's right, the full verdict line on hover, and whether the scene holds every species it names.
+/// H, S"), its progress (`have` of `need`, for a sample or evidence floor), the samples kept since
+/// the last refit that count toward it (`new`, the knowledge map's per-key pending count: drawn as
+/// an outline after the fill, never in it or in the verdict), the short words on the row's right,
+/// the full verdict line on hover, and whether the scene holds every species it names.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Gap {
     pub label: String,
@@ -363,7 +368,9 @@ pub struct Gap {
     pub phrase: String,
     pub have: usize,
     pub need: usize,
-    /// "12 / 60", or a short fit-error word ("fit 2.5×") when the floor is met.
+    pub new: usize,
+    /// "12 / 60" ("12 +7 / 60" with new samples), or a short fit-error word ("fit 2.5×", "fit 2.5×
+    /// · +7 new") when the floor is met.
     pub right: String,
     pub words: String,
     pub in_scene: bool,
@@ -419,25 +426,48 @@ fn refusal_words(refusal: Option<(sim::ClassKey, f64, f64)>, samples: usize, col
 
 /// The environment keys not learned yet (`ModelStatus::class_loo`, per key; a class with no keys
 /// counts as one), those whose species the scene all holds first — each group in the order the
-/// model lists them.
+/// model lists them. The fitted counts only: [`gaps_with`] adds the new samples.
 pub fn gaps(m: &ModelStatus, scene_z: &[u8]) -> Vec<Gap> {
+    gaps_with(m, scene_z, None)
+}
+
+/// A gap's right-hand words with `new` samples waiting for the refit: "12 +7 / 60" for a sample
+/// count, "fit 2.5× · +7 new" otherwise; unchanged with none.
+fn with_new(refusal: Option<(sim::ClassKey, f64, f64)>, have: usize, need: usize, right: String, new: usize) -> String {
+    use sim::ClassKey as K;
+    match refusal {
+        _ if new == 0 => right,
+        Some((K::Samples, ..)) | None => format!("{have} +{new} / {need}"),
+        _ => format!("{right} · +{new} new"),
+    }
+}
+
+/// [`gaps`] with each gap's samples kept since the last refit from the knowledge map's per-key and
+/// per-class pending counts (`sim::knowledge`, "New samples, waiting for the refit"; none without
+/// a map). Which keys are gaps, their order and `have` stay the fitted samples'.
+pub fn gaps_with(m: &ModelStatus, scene_z: &[u8], pending: Option<&sim::KnowledgeMap>) -> Vec<Gap> {
     let mut out = Vec::new();
     for c in &m.class_loo {
         if c.species.is_empty() {
             if !c.trusted {
                 let (have, need, right) = refusal_words(c.refusal, c.samples, c.samples);
-                out.push(Gap { label: c.class.to_string(), phrase: format!("{} environments", c.class), have, need, right, words: crate::ui::activity::words::class_line(c), in_scene: true });
+                let new = pending.map_or(0, |p| p.pending_class(c.class));
+                let right = with_new(c.refusal, have, need, right, new);
+                out.push(Gap { label: c.class.to_string(), phrase: format!("{} environments", c.class), have, need, new, right, words: crate::ui::activity::words::class_line(c), in_scene: true });
             }
             continue;
         }
         for s in c.species.iter().filter(|s| !s.trusted) {
             let (have, need, right) = refusal_words(s.refusal, s.samples, s.columns);
+            let new = pending.map_or(0, |p| p.pending_key(c.class, s.z, &s.neighbours));
+            let right = with_new(s.refusal, have, need, right, new);
             let in_scene = std::iter::once(&s.z).chain(&s.neighbours).all(|z| scene_z.contains(z));
             out.push(Gap {
                 label: gap_label(c.class, s.z, &s.neighbours),
                 phrase: gap_phrase(c.class, s.z, &s.neighbours),
                 have,
                 need,
+                new,
                 right,
                 words: crate::ui::activity::words::species_line(c.class, s),
                 in_scene,
@@ -525,8 +555,9 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     }
     let sampling = input.sampling();
     ui.add_space(2.0);
-    // 2. Teach next
-    let gs = m.map(|m| gaps(m, &input.scene.nuclei.iter().map(|n| n.z).collect::<Vec<_>>())).unwrap_or_default();
+    // 2. Teach next (the new samples from the knowledge map, rebuilt live during a pass)
+    let pending = st.activity.knowledge.clone();
+    let gs = m.map(|m| gaps_with(m, &input.scene.nuclei.iter().map(|n| n.z).collect::<Vec<_>>(), pending.as_deref())).unwrap_or_default();
     let fitted = m.is_some_and(|m| m.fitted);
     let teach_summary = if !fitted {
         None
@@ -704,10 +735,18 @@ fn gap_row(ui: &mut Ui, g: &Gap) {
         let (rect, _) = ui.allocate_exact_size(vec2(bar, 14.0), Sense::hover());
         let track = egui::Rect::from_center_size(rect.center(), vec2(bar, 5.0));
         ui.painter().rect_filled(track, 2.5, theme::PANEL_3);
-        let f = if g.need > 0 { (g.have as f32 / g.need as f32).clamp(0.0, 1.0) } else { 1.0 };
+        let frac = |n: usize| if g.need > 0 { (n as f32 / g.need as f32).clamp(0.0, 1.0) } else { 1.0 };
         let mut fill = track;
-        fill.set_width(track.width() * f);
+        fill.set_width(track.width() * frac(g.have));
         ui.painter().rect_filled(fill, 2.5, AMBER);
+        // new, waiting for the refit: an outline after the fill (the knowledge map's segment), at
+        // least NEW_MIN_PX wide
+        if g.new > 0 {
+            let x0 = fill.right().min(track.right() - super::super::knowledge::NEW_MIN_PX);
+            let x1 = (track.left() + track.width() * frac(g.have + g.new)).max(x0 + super::super::knowledge::NEW_MIN_PX).min(track.right());
+            let seg = egui::Rect::from_min_max(egui::pos2(x0, track.top()), egui::pos2(x1, track.bottom()));
+            ui.painter().rect_stroke(seg, 1.0, egui::Stroke::new(1.0, super::super::knowledge::NEW_INK), egui::StrokeKind::Inside);
+        }
         ui.label(RichText::new(&g.right).monospace().size(11.0).color(theme::INK_DIM)).on_hover_text(&g.words);
     });
 }

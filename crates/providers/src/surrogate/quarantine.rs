@@ -582,6 +582,7 @@ impl SurrogateKs {
     /// Once the store holds enough other samples for the trust floor (Q′ + 30), the box-affected
     /// ones leave the fit (`Q_BOX`; a rebuild). Whether anything changed.
     pub(super) fn exclude_box_samples(&mut self) -> bool {
+        let _prof = surrogate::prof::span("P3 exclude_box_samples");
         let Some(store) = self.store.as_ref() else { return false };
         let n = store.len();
         let boxed: Vec<usize> = (0..n).filter(|&i| self.is_box(i) && self.quarantine.get(i).is_none_or(|&q| q == Q_NONE)).collect();
@@ -624,6 +625,7 @@ impl SurrogateKs {
     /// cap), so the collection gets no status record from it either (`sync_collection_status`
     /// finds no code changed). The entry report is returned, the note says so.
     pub(super) fn recover_trust(&mut self, report: FitReport) -> FitReport {
+        let _prof = surrogate::prof::span("P2 recover_trust");
         self.refit_stage(sim::RefitStage::Recovery);
         let body3 = self.basis().is_some_and(|b| b.body3);
         // the state on entry: what a recovery that does not restore the residuals returns to
@@ -736,6 +738,7 @@ impl SurrogateKs {
     /// verdict and M of the fit that stands are both final, and by `set_policy` after it re-judged
     /// them (either way: a policy change can untrust a settled fit or trust a failed one).
     pub(super) fn settle_recovery_note(&mut self) {
+        let _prof = surrogate::prof::span("P1 settle_recovery_note");
         let failed = self.recovery.as_deref().is_some_and(|r| r == RECOVERY_FAILED_NOTE || r.starts_with(RECOVERY_SETTLED_NOTE));
         if !failed {
             return;
@@ -766,6 +769,7 @@ impl SurrogateKs {
     /// high-leverage outlier the first (`tests/recovery_loo.rs`). Returns the report that stands,
     /// what its rounds held ([`Held`]) and the ranking whose result stands.
     pub(super) fn quarantine_rounds(&mut self, report: FitReport) -> (FitReport, Held, Ranking) {
+        let _prof = surrogate::prof::span("P3 quarantine_rounds");
         // tests: the training ranking alone, the recovery before spec R1
         #[cfg(test)]
         if self.training_ranking {
@@ -912,6 +916,7 @@ impl SurrogateKs {
     /// geometry the model cannot represent — and its region (the fenced samples it was kept next
     /// to, and itself) takes no further vote. How many were quarantined.
     pub(super) fn judge_votes(&mut self) -> usize {
+        let _prof = surrogate::prof::span("P2 judge_votes");
         let pending = std::mem::take(&mut self.vote_pending);
         let mut rejected = 0;
         for (k, origin) in pending {
@@ -931,6 +936,7 @@ impl SurrogateKs {
 
     /// Releases the quarantined samples the current model reproduces; how many.
     pub(super) fn release_reproduced(&mut self) -> usize {
+        let _prof = surrogate::prof::span("P2 release_reproduced");
         let held: Vec<usize> = (0..self.quarantine.len()).filter(|&i| self.quarantine[i] == Q_HELD).collect();
         let Some(store) = self.store.as_ref() else { return 0 };
         let back: Vec<usize> = held
@@ -1099,6 +1105,7 @@ impl SurrogateKs {
     /// measured against ([`Bound`]: its own bound, or in the noise-only mode the tier of the
     /// channel that attains its ratio — re-review N1, fix round 1 M6), and the worst ratio.
     pub(super) fn worst_offenders_bound(&mut self) -> (Vec<(usize, f64, Bound)>, f64) {
+        let _prof = surrogate::prof::span("P3 worst_offenders_bound (LOO ranking)");
         let absolute = !self.residuals_fail();
         let (e_tier, f_tier) = (self.policy.energy_std_per_atom, self.policy.force_std_abs);
         let Some(c) = self.ensure_loo_ratios() else { return (Vec::new(), 0.0) };
@@ -1149,7 +1156,9 @@ impl SurrogateKs {
     /// cache is stale (`surrogate::loo::leave_one_out_many` over the members, then [`loo_ratio`] —
     /// the class pass's numbers, bit for bit). `None` without a model or a store.
     pub(super) fn ensure_loo_ratios(&mut self) -> Option<&LooRatios> {
+        let _prof = surrogate::prof::span("P3 ensure_loo_ratios");
         if self.fresh_loo_ratios().is_none() {
+            let _prof_miss = surrogate::prof::span("P4 ensure_loo_ratios: cache miss -> full LOO pass");
             if self.model.is_some() && self.store.is_some() {
                 self.refit_stage(sim::RefitStage::LeaveOneOut);
             }
@@ -1192,6 +1201,7 @@ impl SurrogateKs {
     /// it names the samples that fail, where the leave-one-out ranking, once a label error is out,
     /// can go on naming high-leverage samples whose own fit is fine (the stuck-H collection).
     pub(super) fn training_offenders(&self) -> (Vec<usize>, f64) {
+        let _prof = surrogate::prof::span("P3 training_offenders");
         let (Some(model), Some(store)) = (self.model.as_ref(), self.store.as_ref()) else { return (Vec::new(), 0.0) };
         let p = &self.policy;
         let absolute = !self.residuals_fail();
@@ -1221,6 +1231,7 @@ impl SurrogateKs {
     /// The extrapolation grade's active sets (rule 5e) over the atoms of the samples the current
     /// fit was built from (the accumulated prefix, none excluded), standardised as the model is.
     pub(super) fn rebuild_active_set(&mut self) {
+        let _prof = surrogate::prof::span("P3 rebuild_active_set");
         self.ensure_desc_cache();
         let (Some(model), Some(basis)) = (self.model.as_ref(), self.desc_basis.as_ref()) else {
             self.active_set = None;
@@ -1246,6 +1257,7 @@ impl SurrogateKs {
 
     /// Fills the per-sample descriptor cache under the current model's basis.
     pub(super) fn ensure_desc_cache(&mut self) {
+        let _prof = surrogate::prof::span("P4 ensure_desc_cache");
         let Some(basis) = self.model.as_ref().map(|m| m.basis.clone()) else { return };
         if self.desc_basis.as_ref() != Some(&basis) {
             self.desc_cache.clear();

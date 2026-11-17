@@ -189,6 +189,7 @@ pub(crate) fn model() -> ModelStatus {
         superseded: 0,
         box_excluded: 0,
         unfitted: 0,
+        pending: 0,
         box_affected: 0,
         trust_floor: Some(70),
         fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0, 0, 0, 0, 0)),
@@ -8482,6 +8483,96 @@ mod knowledge_map {
         assert!((now.left() - 4.0 - x).abs() < 1.5, "the marker at 2.06 Bohr: label {now:?}, line at {x}");
     }
 
+    /// The live knowledge graph (2026-11-16): samples kept since the last refit add "+k new since
+    /// the last refit" to the pair card's sentence (a never-seen pair's too, without the "train a
+    /// scene" advice) and nothing else — the bars' colours, the "Still missing" line and the
+    /// verdict stay the fitted samples'; without pending samples the sentence is as before. The
+    /// histogram's legend names the outlined segment, the summary counts them, and the molecules
+    /// say "+k new" apart from the misfit ones still "not fitted yet".
+    #[test]
+    fn the_pair_card_counts_new_samples_waiting_for_the_refit() {
+        let mut map = knowledge::fixture_map();
+        map.pending = 15;
+        for p in map.pairs.iter_mut() {
+            match p.z {
+                (1, 6) => {
+                    p.pending[20] = 9;
+                    p.pending[44] = 3;
+                    p.pending_samples = 12;
+                }
+                (6, 6) => {
+                    p.pending[29] = 3;
+                    p.pending_samples = 3;
+                }
+                (1, 1) => {
+                    p.pending[14] = 40;
+                    p.pending_samples = 15;
+                }
+                _ => {}
+            }
+        }
+        let plain = knowledge::fixture_map();
+        let p = |m: &sim::KnowledgeMap, z: (u8, u8)| m.pair(z.0, z.1).unwrap().clone();
+        assert_eq!(knowledge::pair_sentence(&map, &p(&map, (1, 6)), &[]), "Taught 2.0–5.3 Bohr (610 samples) · +12 new since the last refit. Trusted everywhere this pair was met.");
+        assert_eq!(
+            knowledge::pair_sentence(&map, &p(&map, (6, 6)), &[]),
+            "Never seen — no fitted sample has these two within 6.0 Bohr · +3 new since the last refit: they count once the model is refitted."
+        );
+        assert_eq!(knowledge::pair_sentence(&plain, &p(&plain, (1, 6)), &[]), "Taught 2.0–5.3 Bohr (610 samples). Trusted everywhere this pair was met.", "none pending: as before");
+        let short = sim::SpeciesVerdict {
+            z: 1,
+            neighbours: vec![1, 7],
+            trusted: false,
+            refusal: Some((sim::ClassKey::Samples, 3.0, 92.0)),
+            calibration: 1.0,
+            measured: None,
+            measured_energy: None,
+            worst_atom: None,
+            evidence: 0,
+            trusted_since: None,
+            inflation: 1.0,
+            samples: 3,
+            columns: 92,
+        };
+        assert_eq!(
+            knowledge::pair_sentence(&map, &p(&map, (1, 1)), &[("many-body", &short)]),
+            "Taught 1.4–5.1 Bohr (2140 samples) · +15 new since the last refit. Still missing: three-or-more-atom arrangements around H, with H and N, 3 of 92 samples.",
+            "the Still missing line stays the fitted samples'"
+        );
+        // the bars' classes are the fitted samples' alone: a pending-only bin has no colour
+        assert_eq!(knowledge::bar_colours(&p(&map, (1, 6))), knowledge::bar_colours(&p(&plain, (1, 6))));
+        assert_eq!(knowledge::bar_colours(&p(&map, (1, 6)))[44], None);
+        // on screen: the legend's third entry, the summary's count
+        let scene = chain();
+        let cam = camera();
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
+        snap.activity.knowledge = Some(Arc::new(map));
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = knowledge_state(&scene, &snap);
+        st.knowledge.pick = Pick::Pair(1, 6);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("taught") && t.contains("thin") && t.contains(knowledge::NEW_WORDS), "{t}");
+        assert!(probed_rect("knowledge-legend-new").width() > 0.0);
+        assert!(t.contains("2140 samples · +15 new"), "{t}");
+        assert!(t.contains("· +12 new since the last refit."), "{t}");
+        // none pending: the legend keeps its third entry (what a pass will draw), the summary none
+        let snap = with_map(&scene, model());
+        let inp = input(&scene, Some(&snap), &cam);
+        let mut st = knowledge_state(&scene, &snap);
+        st.knowledge.pick = Pick::Pair(1, 6);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains(knowledge::NEW_WORDS) && !t.contains("new since the last refit") && !t.contains("+0 new"), "{t}");
+        // the molecules: "+k new" apart from the misfit ones
+        let mut m = forget_rule_map().molecules[1].clone();
+        assert_eq!(knowledge::molecule_suffix(&m), "3 held out · 9 forgotten");
+        (m.waiting, m.pending) = (6, 4);
+        assert_eq!(knowledge::molecule_suffix(&m), "+4 new · 3 held out · 9 forgotten · 2 not fitted yet");
+        (m.waiting, m.pending) = (4, 4);
+        assert_eq!(knowledge::molecule_suffix(&m), "+4 new · 3 held out · 9 forgotten");
+    }
+
     /// Teach this emits the Model tab's Sample more — the same `Action::Sample` — and follows its
     /// enabled rule (off while a pass runs).
     #[test]
@@ -11273,7 +11364,7 @@ mod updates {
 /// Teach next, Health, then the folds — order, default folds, the verdict's words, the gaps, the
 /// Details rows, the profile, the narrow panel.
 mod model_panel {
-    use super::super::dock::model::{gaps, surface_chip, verdict, Section, Sections, Tone};
+    use super::super::dock::model::{gaps, gaps_with, surface_chip, verdict, Section, Sections, Tone};
     use super::*;
 
     /// The text of every text shape the chrome draws in one frame (after two settling frames).
@@ -11442,6 +11533,45 @@ mod model_panel {
         let mut st = state("h2", &h2);
         let t = texts(&ctx, &mut st, &input(&h2, Some(&snap), &cam));
         assert!(t.contains("Everything this scene needs is learned") && !t.contains("other gaps"), "{t}");
+    }
+
+    /// The live Teach next (2026-11-16, the live knowledge graph's design): samples kept since the
+    /// last refit that count toward a gap read "12 +7 / 60" (the knowledge map's per-key pending
+    /// count), a gap measured by its fit error "fit 2.5× · +3 new"; the fill, the order and "N to
+    /// learn here" stay the fitted samples'; with no map or nothing pending the rows are as before.
+    #[test]
+    fn teach_next_counts_new_samples_waiting_for_the_refit() {
+        use sim::knowledge::PendingKey;
+        let cam = camera();
+        let h2s = Scene::preset("h2s").unwrap();
+        let mut map = knowledge::fixture_map();
+        map.pending = 9;
+        map.pending_keys = vec![PendingKey { class: "pair", z: 16, neighbours: vec![1], samples: 7 }, PendingKey { class: "pair", z: 1, neighbours: vec![16], samples: 7 }];
+        map.pending_classes = vec![("pair", 9)];
+        let g = gaps_with(&gappy(), &[1, 1, 16], Some(&map));
+        let rows: Vec<(&str, &str, usize, usize, usize)> = g.iter().map(|g| (g.label.as_str(), g.right.as_str(), g.have, g.new, g.need)).collect();
+        assert_eq!(rows, vec![("pair S–H", "12 +7 / 60", 12, 7, 60), ("pair O–S", "5 / 29", 5, 0, 29)]);
+        assert_eq!(gaps_with(&gappy(), &[1, 1, 16], None), gaps(&gappy(), &[1, 1, 16]), "no map: as before");
+        assert!(gaps(&gappy(), &[1, 1, 16]).iter().all(|g| g.new == 0 && !g.right.contains('+')));
+        // a gap held back by its fit error, and a class with no keys
+        let mut m = gappy();
+        m.class_loo[0].species[0].refusal = Some((sim::ClassKey::Force, 2.5, 1.0));
+        m.class_loo.push(sim::ClassLoo { class: "many-body", species: Vec::new(), samples: 40, refusal: Some((sim::ClassKey::Samples, 40.0, 74.0)), trusted: false, ..m.class_loo[0].clone() });
+        map.pending_classes.push(("many-body", 3));
+        let g = gaps_with(&m, &[1, 1, 16], Some(&map));
+        assert_eq!(g[0].right, "fit 2.5× · +7 new");
+        let mb = g.iter().find(|g| g.label == "many-body").unwrap();
+        assert_eq!((mb.right.as_str(), mb.have, mb.new), ("40 +3 / 74", 40, 3));
+        // on screen: the row, and the fold's summary unchanged
+        let mut snap = est(&h2s, gappy(), sim::Source::Fallback);
+        snap.activity.knowledge = Some(std::sync::Arc::new(map));
+        let inp = input(&h2s, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = state("h2s", &h2s);
+        st.activity.absorb(&snap);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("pair S–H") && t.contains("12 +7 / 60") && t.contains("1 to learn here") && t.contains("other gaps (1)"), "{t}");
     }
 
     /// Sample more (moved up into Teach next) emits the same `Action::Sample` as before; the audits
@@ -13224,6 +13354,7 @@ fn forget_rule_map() -> sim::KnowledgeMap {
         composition: Composition::of(z),
         fitted,
         waiting: 0,
+        pending: 0,
         held,
         forgotten,
         scenes,
@@ -13266,7 +13397,7 @@ fn the_forget_preview_says_what_goes_and_what_it_costs() {
     assert!(t.contains(" H and P will have no samples in the fit: their atoms fall back to DFT until taught again."), "{t}");
     // more compositions than the preview names: the rest folded
     let many: Vec<sim::knowledge::MoleculeKnowledge> = (2u8..10)
-        .map(|k| sim::knowledge::MoleculeKnowledge { composition: Composition::of(&vec![1; k as usize]), fitted: 10 - k as usize, waiting: 0, held: 0, forgotten: 0, scenes: Vec::new(), ratios: Vec::new(), pairs: Vec::new(), angles: Vec::new() })
+        .map(|k| sim::knowledge::MoleculeKnowledge { composition: Composition::of(&vec![1; k as usize]), fitted: 10 - k as usize, waiting: 0, pending: 0, held: 0, forgotten: 0, scenes: Vec::new(), ratios: Vec::new(), pairs: Vec::new(), angles: Vec::new() })
         .collect();
     let t = forget_preview_text(&ForgetPreview::of(&many, &ForgetRule::Element(1)), 0, 100_000);
     assert!(t.starts_with("Forget 36 samples: 8 H₂, 7 H₃, 6 H₄, 5 H₅, 4 H₆, 3 H₇, + 3 in 2 more compositions."), "{t}");
