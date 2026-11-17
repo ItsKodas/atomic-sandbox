@@ -11338,6 +11338,8 @@ mod knowledge;
 mod triples;
 mod refit_cost;
 mod refit_profile;
+/// The triple map's build cost on a collection copy (`#[ignore]`d measurement).
+mod triple_cost;
 mod refit_golden;
 mod residual_diag;
 

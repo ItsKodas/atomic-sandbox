@@ -17,7 +17,7 @@ use super::*;
 use std::time::Instant;
 use surrogate::Collection;
 
-fn open_copy() -> Collection {
+pub(super) fn open_copy() -> Collection {
     let dir = std::path::PathBuf::from(std::env::var("COLLECTION_DIR").expect("COLLECTION_DIR names a collection folder copy"));
     let key = surrogate::SurfaceKey::from_text(&std::fs::read_to_string(dir.join("key.txt")).unwrap()).unwrap();
     let (mut c, _) = surrogate::Collection::open(dir.parent().unwrap(), &key).unwrap();
@@ -65,12 +65,12 @@ fn dump(label: &str, wall: f64, s: &SurrogateKs) {
     }
 }
 
-fn provider() -> SurrogateKs {
+pub(super) fn provider() -> SurrogateKs {
     SurrogateKs::new(Box::new(StubKsGpu), FallbackPolicy::default()).with_teacher_tol(1e-6)
 }
 
 /// Attach (its own refit is the cold one) and time it; a refit when the attach did not fit.
-fn attach_timed(s: &mut SurrogateKs, c: Collection) -> f64 {
+pub(super) fn attach_timed(s: &mut SurrogateKs, c: Collection) -> f64 {
     let t = Instant::now();
     s.attach(c).unwrap();
     if s.report().is_none() {
