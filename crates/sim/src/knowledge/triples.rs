@@ -49,11 +49,12 @@ impl TripleGrid {
     /// The grid for cutoff `r_cut` (Bohr): n_r = ⌈r_cut/[`TRIPLE_BIN`]⌉ (20 at 6, 27 at 8, 34 at
     /// 10), so every r < r_cut has a bin; the last may be partial.
     pub fn new(r_cut: f64) -> TripleGrid {
+        assert!(r_cut.is_finite() && r_cut > 0.0, "r_cut {r_cut}");
         let r_bin = TRIPLE_BIN;
         let mut n_r = (r_cut / r_bin).ceil().max(1.0) as usize;
         // a rounded quotient must not leave the top edge n_r·r_bin below r_cut (never taken for a
-        // decimal multiple of 0.3: TRIPLE_BIN's double lies above 0.3)
-        while (n_r as f64) * r_bin < r_cut {
+        // decimal multiple of 0.3: TRIPLE_BIN's double lies above 0.3); one bin always suffices
+        if (n_r as f64) * r_bin < r_cut {
             n_r += 1;
         }
         TripleGrid { r_bin, n_r, cos_bins: COS_BINS }
@@ -65,7 +66,10 @@ impl TripleGrid {
     }
 
     /// The distance bin of r (Bohr): `None` for a non-finite r, r ≤ 0 or r at or past the grid's
-    /// top edge n_r·r_bin (which is ≥ r_cut).
+    /// top edge n_r·r_bin (which is ≥ r_cut). It does not apply r < r_cut: a partial last bin
+    /// takes r in [r_cut, n_r·r_bin) too. Only [`each_triple`] applies the cutoff, so callers must
+    /// not rely on this for it. Binning is ⌊r / r_bin⌋, consistent with [`Self::r_edges`] and
+    /// [`Self::centre`].
     pub fn r_bin_of(&self, r: f64) -> Option<usize> {
         if !r.is_finite() || r <= 0.0 || r >= self.n_r as f64 * self.r_bin {
             return None;
@@ -111,8 +115,9 @@ impl TripleGrid {
 
 /// The cos θ bin of u ([`COS_BINS`] bins of 0.2, θ increasing with q): ⌊(1 − u)·COS_BINS/2⌋,
 /// u clamped to [−1, 1] first, capped at COS_BINS − 1 (u = −1 is the last bin's). On an edge u
-/// goes to the larger-θ bin (u = 0 → 5). The spec's ⌊(1 − u)/0.2⌋ is written as a multiplication so
-/// the exact edges land exactly. A NaN u reads bin 0; [`TripleGrid::cell`] refuses it first.
+/// goes to the larger-θ bin (u = 0 → 5). The spec's ⌊(1 − u)/0.2⌋ is written as a multiplication:
+/// u = 0 and ±1 land exactly; other decimal edges may land one bin to the larger-θ side within an
+/// ulp. A NaN u reads bin 0; [`TripleGrid::cell`] refuses it first.
 pub fn cos_bin(u: f64) -> usize {
     cos_bin_of(u, COS_BINS)
 }
@@ -489,6 +494,14 @@ mod tests {
             let below = f64::from_bits(rc.to_bits() - 1);
             assert_eq!(g.r_bin_of(below), Some(g.n_r - 1), "one ulp under r_cut {rc}");
             assert!(g.r_bin_of(f64::MIN_POSITIVE) == Some(0));
+        }
+    }
+
+    /// Review Focus 2: a non-finite or non-positive r_cut is refused, never a wrapped n_r.
+    #[test]
+    fn a_non_finite_r_cut_is_refused() {
+        for bad in [f64::INFINITY, f64::NAN, 0.0, -1.0] {
+            assert!(std::panic::catch_unwind(|| TripleGrid::new(bad)).is_err(), "r_cut {bad}");
         }
     }
 
