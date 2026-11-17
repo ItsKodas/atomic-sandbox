@@ -880,6 +880,8 @@ impl Worker {
         // worker would otherwise wait for a command: a discard's retry, samples kept meanwhile)
         let mut landed = false;
         if let Some(started) = self.refit_started {
+            // (whatever it was: a discard re-arms nothing in the driver, but a retick is cheap)
+            self.refit_landed = false;
             let Some(s) = trainable(&mut self.dy) else {
                 self.refit_started = None;
                 return false;
@@ -918,12 +920,14 @@ impl Worker {
                     self.last_refit_at = Some(Instant::now());
                     self.dy.add_note(why);
                     landed = true;
+                    self.refit_landed = true;
                 }
                 sim::RefitPoll::Done(fit) => {
                     self.refit_started = None;
                     self.refit_done_gen = self.refit_started_gen.take();
                     self.log_refit(snap, fit, started.elapsed().as_secs_f64() * 1e3, " (background)");
                     landed = true;
+                    self.refit_landed = true;
                 }
             }
         }

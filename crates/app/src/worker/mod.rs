@@ -83,7 +83,10 @@
 //!     stands keeps answering, judged by its own verdicts, and each round polls it — a paused
 //!     worker once a budget — and installs it between ticks once done (or discards it when more
 //!     than appended data changed meanwhile). `working` holds while one runs, so a paused session
-//!     still reads as busy until it lands. Before fix round 1 a paused automatic refit ran in the
+//!     still reads as busy until it lands. A refit that lands after a round's tick is followed by
+//!     one more round at once (round 2: `retick`), so the driver sees the new surface epoch and
+//!     re-evaluates on it — paused and idle it would otherwise show the old surface's answer until
+//!     the next command; `working` holds until that round too. Before fix round 1 a paused automatic refit ran in the
 //!     tick (for a deterministic note order), blocking the worker for its wall — 30–160 s on a
 //!     1 600-sample collection: the window drew but every command waited. Only a provider that
 //!     cannot (the default `Trainable`) refits in the tick, and never a first fit or a retry.
@@ -693,6 +696,12 @@ struct Worker {
     /// … and of the last discarded one: a discard earns one retry at that data, a second one
     /// there sets `refit_done_gen` (module doc, "Refits").
     refit_discarded_gen: Option<u64>,
+    /// A background refit landed (installed or discarded) in this round, after the tick: one more
+    /// round follows at once (`retick`), so the driver sees the new surface epoch and re-evaluates
+    /// on it — paused and idle it would otherwise wait for the next command.
+    refit_landed: bool,
+    /// One more round is wanted without a command (`refit_landed`).
+    retick: bool,
     /// The refit the user's Forget / Restore asked for, debounced (`user_samples`, [`UserRefit`];
     /// 2026-11-14, the batched forget).
     user_refit: UserRefit,
@@ -939,6 +948,8 @@ fn worker(
         refit_started_gen: None,
         refit_done_gen: None,
         refit_discarded_gen: None,
+        refit_landed: false,
+        retick: false,
         user_refit: UserRefit::default(),
         samples_at_refit: 0,
         refits: 0,
@@ -1007,14 +1018,16 @@ fn worker(
         // running): wait for it, not forever
         let refit_wake = w.user_refit.due().filter(|_| w.refit_started.is_none());
         let wake = [w.views_wake(), w.harris.wake(), refit_wake].into_iter().flatten().min();
-        if let Some(d) = w.pace_until {
+        if w.retick {
+            // a refit landed after the last tick: the next round now (`refit_landed`)
+        } else if let Some(d) = w.pace_until {
             inbox.wait_until(d);
         } else if let Some(d) = wake {
             inbox.wait_until(d);
         }
         // (idle with a bond reference or a background job to poll, or a view build due: the
         // round's pacing or the wait above was the round's, the take must not block)
-        let Some(cmds) = inbox.take(!has_work(&w.last) && w.last.bonds_pending.is_empty() && !w.side_pending && w.refit_started.is_none() && wake.is_none()) else {
+        let Some(cmds) = inbox.take(!has_work(&w.last) && w.last.bonds_pending.is_empty() && !w.side_pending && w.refit_started.is_none() && !w.retick && wake.is_none()) else {
             w.retire();
             return;
         };
@@ -1065,6 +1078,7 @@ impl Worker {
 
     /// Applies a batch, ticks once, refits the surrogate if it kept a sample, publishes.
     fn round(&mut self, cmds: Vec<Command>, inbox: &mut Inbox) {
+        self.retick = false;
         let applied = self.apply_batch(cmds);
         let fresh = applied.then(|| self.dy.snapshot());
         let pre = fresh.as_ref().unwrap_or(&self.last);
@@ -1106,6 +1120,9 @@ impl Worker {
             polls_references_only(&snap).then_some(t0 + budget)
         };
         let refitted = self.refit_if_pending(&snap);
+        // a refit landed after this round's tick: the next round's tick sees its surface epoch
+        // (forces stale, re-evaluated on the new model) — at once, not at the next command
+        self.retick = std::mem::take(&mut self.refit_landed);
         if refitted {
             // the refit's note is in the driver now: publish it with this snapshot
             let d = self.dy.snapshot();
@@ -1278,7 +1295,7 @@ impl Worker {
 
     fn publish(&mut self, snap: DynSnapshot) {
         self.track_cost(&snap);
-        let working = has_work(&snap) || self.refit_started.is_some();
+        let working = has_work(&snap) || self.refit_started.is_some() || self.retick;
         if let Some(g) = snap.teacher_gap {
             self.last_gap = Some((g, snap.step));
         }

@@ -643,6 +643,8 @@ fn enabling_estimated_without_a_model_starts_a_sampling_pass() {
         }
     };
     assert!(done.len() >= 3, "progress seen at {done:?} only");
+    // the pass's fit runs in the background (quiet refits round 2): the model lands after the end
+    let end = if model(&end).fitted && !end.working { end } else { snapshot_until(&w, "the pass's fit landed", |s| model(s).fitted && !s.working) };
     let pass = t.elapsed();
     let p = end.dynamics.sampling.clone().unwrap();
     assert!(!p.cancelled && p.done == p.total, "{p:?}");
@@ -2543,7 +2545,7 @@ fn views_are_built_only_while_open_and_at_most_every_2_s() {
     let s = snapshots_until(&w, "idle after the teleport", |s| early |= s.activity.views.is_some(), |s| !s.working);
     let idle_at = t_first.elapsed();
     assert!(s.model.as_ref().unwrap().samples > k, "the teleport fell back and was kept");
-    assert!(idle_at < VIEWS_MIN_INTERVAL / 2, "the teleport's round took {idle_at:?}: the test needs it well inside the interval");
+    assert!(idle_at < VIEWS_MIN_INTERVAL / 2, "the teleport's round took {idle_at:?}: the test needs it well inside the interval; {:#?}", s.dynamics.notes);
     assert!(!early, "rebuilt inside the interval");
     // the worker is idle and nothing is sent: the deferred build wakes it at the interval
     let s = snapshot_until(&w, "the deferred views", |s| s.activity.views.is_some());
@@ -4393,8 +4395,8 @@ fn a_pass_end_fit_runs_in_the_background_even_in_model_only() {
     let b = snapshot_until(&w, "a Step while the pass's fit runs", |s| s.dynamics.step == step + 1 && !s.dynamics.forces_stale);
     assert!(model(&b).refit_running, "still fitting; the worker answered the Step");
     st.lock().unwrap().release = true;
-    let s = snapshot_until(&w, "the pass's fit installed", |s| model(s).refits == 1 && !model(s).refit_running);
-    assert!(!model(&s).pending_refit && !s.working);
+    let s = snapshot_until(&w, "the pass's fit installed", |s| model(s).refits == 1 && !model(s).refit_running && !s.working);
+    assert!(!model(&s).pending_refit);
     let _ = snapshots_for(&w, 1.0);
     assert_eq!(refits_started(&st).len(), 1, "once per pass");
 }
