@@ -55,12 +55,15 @@ use super::{dock, theme, PanelInput, UiState, AMBER, GREEN};
 use crate::scene::SceneNucleus;
 use crate::sim::Backend;
 use egui::{pos2, vec2, Align2, Color32, FontId, Id, Order, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui, Vec2};
-use sim::knowledge::{angle_bin, first_shell, ElementKnowledge, KnowledgeMap, PairKnowledge, ANGLE_BINS, ANGLE_BIN_DEG, COVERAGE_COUNT};
+use sim::knowledge::{angle_bin, first_shell, reads_taught, ElementKnowledge, KnowledgeMap, PairKnowledge, ANGLE_BINS, ANGLE_BIN_DEG};
 use sim::Confidence;
 use std::collections::BTreeMap;
 
-/// The occupancy (1 − e^(−n/`COVERAGE_COUNT`), the overlay's) at which a distance reads taught.
-pub const TAUGHT: f64 = 0.9;
+/// The occupancy (1 − e^(−n/`COVERAGE_COUNT`), the overlay's) at which a distance reads taught:
+/// `sim::knowledge`'s, shared with the three-atom map. `Taught::of` reads it through
+/// `reads_taught`; the re-export keeps the module doc's link and the panel's name for it.
+#[allow(unused_imports)]
+pub use sim::knowledge::TAUGHT;
 
 /// The outline of a bin's "new, waiting for refit" segment (module doc, "live during training").
 pub const NEW_INK: Color32 = theme::INK;
@@ -129,7 +132,7 @@ impl Taught {
     fn of(n: u32) -> Taught {
         if n == 0 {
             Taught::Never
-        } else if 1.0 - (-(n as f64) / COVERAGE_COUNT).exp() >= TAUGHT {
+        } else if reads_taught(n) {
             Taught::Taught
         } else {
             Taught::Thin
@@ -1010,9 +1013,7 @@ fn keys_of<'a>(input: &'a PanelInput<'_>, z: (u8, u8)) -> Vec<(&'a str, &'a sim:
 
 /// The distances a pair was taught: (shortest, longest) over its histogram's filled bins.
 fn taught_range(p: &PairKnowledge) -> Option<(f64, f64)> {
-    let lo = p.hist.counts.iter().position(|&n| n > 0)? as f64 * p.hist.bin;
-    let hi = p.hist.counts.iter().rposition(|&n| n > 0).map_or(0.0, |k| (k + 1) as f64 * p.hist.bin);
-    Some((lo, hi))
+    sim::knowledge::taught_range(&p.hist)
 }
 
 /// The pair card's one plain sentence, from the verdict, the taught range and the keys behind it:

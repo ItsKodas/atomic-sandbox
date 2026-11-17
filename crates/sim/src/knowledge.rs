@@ -109,6 +109,32 @@ pub const ANGLE_BINS: usize = 36;
 /// The atom-pair count at which a distance reads 1 − 1/e ≈ 0.63 known in [`atom_coverage`].
 pub const COVERAGE_COUNT: f64 = 4.0;
 
+/// The occupancy 1 − e^(−n/[`COVERAGE_COUNT`]) at which a window of n counts reads taught: the pair
+/// graph's bins (the app's `Taught`) and the three-atom map's cells ([`triples`]).
+pub const TAUGHT: f64 = 0.9;
+
+/// The fewest counts a window needs to read taught: N_T = ⌈−[`COVERAGE_COUNT`]·ln(1 − [`TAUGHT`])⌉
+/// = 10, derived, never a literal (the smallest n with [`reads_taught`]).
+pub fn taught_count() -> u32 {
+    (-COVERAGE_COUNT * (1.0 - TAUGHT).ln()).ceil() as u32
+}
+
+/// A window of `window` counts reads taught: 1 − e^(−n/[`COVERAGE_COUNT`]) ≥ [`TAUGHT`].
+pub fn reads_taught(window: u32) -> bool {
+    1.0 - (-(window as f64) / COVERAGE_COUNT).exp() >= TAUGHT
+}
+
+/// The distances a pair was taught: (the first filled bin's lower edge, the last filled bin's upper
+/// edge), Bohr; `None` for an empty histogram.
+pub fn taught_range(h: &PairHistogram) -> Option<(f64, f64)> {
+    let first = h.counts.iter().position(|&n| n > 0)?;
+    let last = h.counts.iter().rposition(|&n| n > 0)?;
+    Some((first as f64 * h.bin, (last + 1) as f64 * h.bin))
+}
+
+pub mod triples;
+pub use triples::*;
+
 pub use crate::activity::PairHistogram;
 use std::collections::BTreeMap;
 
@@ -621,6 +647,15 @@ mod tests {
 
     fn hist(z: (u8, u8), counts: Vec<u32>) -> PairHistogram {
         PairHistogram { z, bin: BIN, counts }
+    }
+
+    #[test]
+    fn taught_count_is_derived() {
+        assert_eq!(taught_count(), 10);
+        assert!(!reads_taught(taught_count() - 1) && reads_taught(taught_count()) && !reads_taught(0));
+        let (lo, hi) = taught_range(&PairHistogram { z: (1, 8), bin: BIN, counts: vec![0, 0, 3, 0, 5, 0] }).unwrap();
+        assert!((lo - 0.2).abs() < 1e-12 && (hi - 0.5).abs() < 1e-12);
+        assert_eq!(taught_range(&PairHistogram { z: (1, 1), bin: BIN, counts: vec![0; 6] }), None);
     }
 
     /// A sampled peak with one-bin noise, a gap and a second peak: the shell ends in the gap, not
