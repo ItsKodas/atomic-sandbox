@@ -2557,11 +2557,15 @@ fn views_are_built_only_while_open_and_at_most_every_2_s() {
     assert_ne!(v.epoch, 0);
     assert_eq!(v.samples, s.model.as_ref().unwrap().samples);
     assert_eq!(v.model_gen, s.model.as_ref().unwrap().model_gen);
-    // a policy change (a new model generation, nothing else moves): rebuilt, again on its own
-    let gen = v.model_gen;
+    // an audit-cadence change moves no fit input and no verdict, so no generation (quiet refits
+    // round 3): nothing to rebuild (a new fit rebuilding on its own is the teleport above)
     w.send(Command::SetAudit(7));
-    let s = snapshot_until(&w, "views after a policy change", |s| s.activity.views.is_some());
-    assert_ne!(s.activity.views.as_ref().unwrap().model_gen, gen);
+    let mut rebuilt = false;
+    snapshots_until(&w, "idle after an audit change", |s| rebuilt |= s.activity.views.is_some(), |s| !s.working);
+    std::thread::sleep(VIEWS_MIN_INTERVAL + Duration::from_millis(100));
+    w.send(Command::Dyn(DynCommand::SetSpeed(4)));
+    snapshots_until(&w, "idle past the interval", |s| rebuilt |= s.activity.views.is_some(), |s| !s.working);
+    assert!(!rebuilt, "an audit change alone rebuilds no view");
     // closed: a change and a wait past the interval build nothing
     w.send(Command::SetActivityViews(false));
     std::thread::sleep(VIEWS_MIN_INTERVAL + Duration::from_millis(100));
@@ -3961,8 +3965,8 @@ fn a_solver_switch_reattaches_the_collection_and_the_autosave_follows_the_mode()
 }
 
 /// M8a Task 9: the knowledge map ships with the fit that made it, the training views closed, and
-/// is not rebuilt while nothing it shows changed; a policy change (a new model generation) ships
-/// it again.
+/// is not rebuilt while nothing it shows changed (an audit-cadence change included); a refit (a new
+/// model generation) ships it again.
 #[test]
 fn the_knowledge_map_ships_when_the_fit_changes() {
     let w = morse_estimated(h2_33());
@@ -3984,8 +3988,13 @@ fn the_knowledge_map_ships_when_the_fit_changes() {
     assert!(map.pairs.len() == 1 && map.pairs[0].samples > 0, "{:?}", map.pairs);
     w.send(Command::Dyn(DynCommand::SetSpeed(3)));
     assert!(idle(&w).activity.knowledge.is_none(), "nothing changed: no rebuild");
+    // an audit-cadence change moves no fit input and no verdict (quiet refits round 3): no rebuild
     w.send(Command::SetAudit(7));
-    snapshot_until(&w, "a map after a policy change", |s| s.activity.knowledge.is_some());
+    assert!(idle(&w).activity.knowledge.is_none(), "an audit change alone: no rebuild");
+    // a new fit (a compressed teleport: a fallback, a sample, a refit — a new model generation)
+    // ships it again
+    w.send(Command::MoveNucleus { index: 1, pos: COMPRESSED });
+    snapshot_until(&w, "a map after a new fit", |s| s.activity.knowledge.is_some());
 }
 
 /// What [`RefitFake`] holds and was asked for (quiet refits, 2026-11-17): the provider's refit
