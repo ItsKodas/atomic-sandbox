@@ -33,8 +33,9 @@
 //! finding 2). Of a stored sample (< P) the install takes only the tag a refit may change.
 //!
 //! Anything else is a **conflict** and the result is discarded, never merged: a model, store or
-//! policy that changed (`model_gen`: a forget, a load, an install, an attach, a policy change, a
-//! pass's or teaching round's own fit), another reference set — canonical or per box: a box
+//! policy that changed (`model_gen`: a forget, a load, an install, an attach, a change of a
+//! threshold the verdicts read — not draft mode or the audit cadence, `set_policy` — a pass's or
+//! teaching round's own fit), another reference set — canonical or per box: a box
 //! reference's arrival rebases that box's stored energies (the review's finding 1) — or degree cap
 //! or body-4 degree (spec 2026-11-13 §4.1: the degree a fit chose is provider state), a quarantine code of
 //! a sample < P (a reference arrival's rebase, a fence vote's release or supersession), the failed
@@ -73,7 +74,13 @@
 //! then carries it ([`BackgroundRefit::pass_fit`]) and the tail completes at its install
 //! (`complete_pass_tail`), reading the installed fit exactly as it read the in-place one. A
 //! discard makes it due once more; a second one completes the tail as dropped, its shell checks
-//! unjudged (said), as does a new pass started before it landed (whose own fit holds the samples).
+//! unjudged (said), as does a new pass started before it landed (whose own fit holds the samples)
+//! — dropped by the new pass's entry before it touches any state (`drop_pass_tail`, round 3: the
+//! tail reads its own pass's teaching state and `pass_start`). A dropped teach-around round judges
+//! nothing against the standing model (not its fit): its checks are kept as samples, unjudged, and
+//! the round is not counted (`drop_teach`). A forget, a loaded model or samples file and an attach
+//! take the tail's samples with them: it is discarded with one note (`discard_pass_tail`), and a
+//! running refit no longer carries it — its discard re-dues nothing.
 
 //! What a background refit changes is *when* the new model stands (a refit's wall later, as the
 //! refit throttle already delays it by up to `REFIT_INTERVAL`), never what any verdict is: the

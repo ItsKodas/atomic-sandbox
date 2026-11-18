@@ -129,7 +129,8 @@ pub struct ActivityDelta {
 
 /// What the training views show depends on (the change half of the schedule; Task 4 review I2:
 /// not (epoch, samples) alone — an untrusted refit leaves the epoch): the model generation
-/// (`TrainableStatus::model_gen`: every fit, install, restore, forget and policy change), and
+/// (`TrainableStatus::model_gen`: every fit, install, restore, forget and change of a threshold the
+/// verdicts read — not draft mode or the audit cadence, which no view shows), and
 /// what moves between generations — the store (a kept fallback adds samples and dots, a fence
 /// release moves states) and the gate (a failed audit untrusts the model without a refit).
 #[derive(Clone, Debug, PartialEq, Eq)]

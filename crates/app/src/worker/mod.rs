@@ -1018,10 +1018,14 @@ fn worker(
         // running): wait for it, not forever
         let refit_wake = w.user_refit.due().filter(|_| w.refit_started.is_none());
         let wake = [w.views_wake(), w.harris.wake(), refit_wake].into_iter().flatten().min();
-        if w.retick {
-            // a refit landed after the last tick: the next round now (`refit_landed`)
-        } else if let Some(d) = w.pace_until {
+        if let Some(d) = w.pace_until {
+            // (before the retick: a round before the deadline is the early branch below, which
+            // publishes without a round and so never clears `retick` — the loop spun, publishing a
+            // snapshot without a tick each time, until the deadline; quiet refits round 3, review
+            // Minor 5. The paced round at the deadline is the one more round it asks for)
             inbox.wait_until(d);
+        } else if w.retick {
+            // a refit landed after the last tick: the next round now (`refit_landed`)
         } else if let Some(d) = wake {
             inbox.wait_until(d);
         }

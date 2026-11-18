@@ -4281,8 +4281,10 @@ fn a_finished_refit_is_not_repeated_without_new_data() {
 }
 
 /// Fix round 1, the stranded samples: Model only on, a sample kept, **Refit now**, then Model only
-/// off while it runs — the policy change discards it (`set_policy` moves the model generation;
-/// nothing a refit fits changed). The worker retries once, in the background, and that one installs.
+/// off while it runs, and a discard that moved nothing a refit fits (the fake discards it; since
+/// round 3 the real provider's Model only toggle conflicts with nothing — `set_policy` — but a
+/// threshold change or a teach-around count still can). The worker retries once, in the
+/// background, and that one installs.
 #[test]
 fn a_refit_discarded_by_leaving_model_only_is_retried_once_and_installs() {
     let (w, st) = refit_fake(RefitState { fitted: true, samples: 100, ..Default::default() });
@@ -4399,6 +4401,40 @@ fn a_pass_end_fit_runs_in_the_background_even_in_model_only() {
     assert!(!model(&s).pending_refit);
     let _ = snapshots_for(&w, 1.0);
     assert_eq!(refits_started(&st).len(), 1, "once per pass");
+}
+
+/// Quiet refits round 3 (review Minor 5): a refit that lands while playing at a paced speed asks
+/// for one more round (`retick`), and that round keeps the pace — before the fix the loop skipped
+/// the pace wait for it, but the early branch (a deadline not yet reached) published without a
+/// round, so the request stood and the worker spun, publishing a snapshot without a tick per loop
+/// until the deadline.
+#[test]
+fn a_refit_landing_while_playing_floods_no_snapshots() {
+    let (w, st) = refit_fake(RefitState { fitted: true, samples: 100, ..Default::default() });
+    idle(&w);
+    w.send(Command::Dyn(DynCommand::Play));
+    st.lock().unwrap().keep_one();
+    snapshot_until(&w, "the refit running, playing", |s| model(s).refit_running && !s.dynamics.paused);
+    st.lock().unwrap().release = true;
+    let s = snapshot_until(&w, "the refit landed", |s| !model(s).refit_running && model(s).refits == 1);
+    // the snapshots after the landing: each one a tick's (its step moved) — no command is sent
+    let (mut last, mut n, mut repeats) = (s.dynamics.step, 0usize, 0usize);
+    let until = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < until {
+        match w.recv_timeout(Duration::from_millis(50)) {
+            Some(Event::Snapshot(s)) => {
+                n += 1;
+                if s.dynamics.step == last {
+                    repeats += 1;
+                }
+                last = s.dynamics.step;
+            }
+            Some(Event::Error(message)) => panic!("{message}"),
+            _ => {}
+        }
+    }
+    assert!(n > 5, "still playing: {n} snapshots");
+    assert!(repeats <= 1, "{repeats} of {n} snapshots after the landing were published without a tick");
 }
 
 /// … with the real provider: an automatic pass on Morse H₂ ends, its fit is left to the worker and

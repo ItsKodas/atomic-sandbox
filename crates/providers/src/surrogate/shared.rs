@@ -269,6 +269,7 @@ impl SurrogateKs {
         }
         let held = self.samples();
         // a clean slate (a previous collection is flushed and released)
+        self.discard_pass_tail("a shared collection was attached");
         self.forget();
         let n = store.len();
         self.face = vec![f64::NAN; n];

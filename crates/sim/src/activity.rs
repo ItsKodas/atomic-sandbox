@@ -963,7 +963,8 @@ pub struct TrainingViews {
     /// leaves the model untrusted — key staleness on `model_gen` (Task 4 review I2).
     pub epoch: u64,
     /// The model generation the views describe (`SurrogateKs::model_generation`): changes at
-    /// every installed, restored or forgotten model and every policy change.
+    /// every installed, restored or forgotten model and every change of a policy threshold the
+    /// verdicts read (not draft mode or the audit cadence).
     pub model_gen: u64,
     pub samples: usize,
     pub parity_energy: Vec<ParityPoint>,

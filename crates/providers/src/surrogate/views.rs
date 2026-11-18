@@ -226,7 +226,8 @@ impl SurrogateKs {
     }
 
     /// The model generation (`model_gen`): changes at every installed, restored or forgotten
-    /// model and every policy change, an untrusted → untrusted refit included. A readout.
+    /// model and every change of a policy threshold the verdicts read (not draft mode or the audit
+    /// cadence, `set_policy`), an untrusted → untrusted refit included. A readout.
     pub fn model_generation(&self) -> u64 {
         self.model_gen
     }

@@ -904,8 +904,9 @@ impl Worker {
                 }
                 sim::RefitPoll::Discarded(why) => {
                     // it ran to completion. A conflict that moved what a refit fits makes it due
-                    // anyway; one that did not (a policy change — Model only or the audit cadence
-                    // toggled while it ran —, a class verdict moving a teach-around count) earns
+                    // anyway; one that did not (a policy threshold changed while it ran — since
+                    // quiet refits round 3 not Model only or the audit cadence, which conflict with
+                    // nothing —, a class verdict moving a teach-around count) earns
                     // **one** more attempt on the same data, in the background; a second discard
                     // there waits for new data (fix round 1: no loop, no stranded samples)
                     self.refit_started = None;

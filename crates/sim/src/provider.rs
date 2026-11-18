@@ -1502,7 +1502,8 @@ pub struct TrainableStatus {
     /// `stuck` in structured form (the plain wording's input).
     pub stuck_info: Option<crate::activity::StuckInfo>,
     /// The model generation (`TrainingViews::model_gen`): changes at every installed, restored or
-    /// forgotten model and every policy change, also where the surface epoch does not (an
+    /// forgotten model and every change of a policy threshold the verdicts read (not draft mode or
+    /// the audit cadence, which no view reads), also where the surface epoch does not (an
     /// untrusted refit). The app keys its training-view rebuilds on it (activity Task 5).
     pub model_gen: u64,
     /// Whether the strict policy answers at the scene's current geometry, and if not the rule that

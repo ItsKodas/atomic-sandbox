@@ -232,7 +232,8 @@ pub(super) enum Channel {
 /// the class pass (`refresh_class_loo`), which computes every fitted sample's leave-one-out
 /// anyway, or by [`SurrogateKs::ensure_loo_ratios`] for a fit whose class pass was deferred.
 /// **Keyed to the fit**: valid only while the provider's `model_gen` is still `gen` (bumped by
-/// every fit, restored state, install, attach, forget and policy change) **and** the `rows`' indices
+/// every fit, restored state, install, attach, forget and change of a threshold the verdicts read —
+/// not draft mode or the audit cadence, `set_policy`) **and** the `rows`' indices
 /// are the standing fit's own members (`fit_members`: the samples that fit was built from). A stale
 /// cache is never read: it is recomputed, over those members. A hold, a release or a forget between
 /// fits changes the quarantine codes but not the fit: the ratios stay the standing fit's — a sample
@@ -1923,8 +1924,9 @@ impl SurrogateKs {
     /// only** ([`fresh_loo_ratios`](Self::fresh_loo_ratios)), never recomputed between refits: a
     /// recompute after a reference rebase would pair the new labels with the old fit (the
     /// `rebase_collection` comment). Empty without a model or a fresh cache (every refit, load and
-    /// policy change leaves one). One gap, accepted (fix round 1, M7): a policy change between a
-    /// forget and its refit (`set_policy` → `refresh_class_loo`, e.g. the audit cadence) refills the
+    /// policy change leaves one; draft mode and the audit cadence — ⚠ Model only — move neither the
+    /// generation nor the cache, quiet refits round 3). One gap, accepted (fix round 1, M7): a
+    /// threshold change between a forget and its refit (`set_policy` → `refresh_class_loo`) refills the
     /// cache from the live codes, which are no longer the fit's members — the list reads "no
     /// ranking yet" until that refit, the next tick.
     pub fn sample_suspects(&self) -> Vec<sim::SampleSuspect> {

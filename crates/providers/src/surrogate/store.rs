@@ -102,6 +102,9 @@ impl SurrogateKs {
     /// teacher surface without a jump and the driver restarts its conserved-energy history
     /// (the honest outcome: the surface the invariant lived on is gone).
     pub fn forget(&mut self) {
+        // a pass's tail waiting for its fit goes with the samples, said (quiet refits round 3,
+        // review Minor 6; a load or an attach said why first)
+        self.discard_pass_tail("the model was forgotten");
         // a shared collection is let go (written and released), never cleared: it is on disk for
         // every scene of its surface (`shared` module doc)
         self.detach_collection();
@@ -273,6 +276,7 @@ impl SurrogateKs {
             }
         }
         // a clean slate (what `forget` leaves), the epoch moved if a model was answering
+        self.discard_pass_tail("a samples file was loaded");
         self.forget();
         let n = store.len();
         self.face = if face_density.is_empty() { vec![f64::NAN; n] } else { face_density };
@@ -375,6 +379,7 @@ impl SurrogateKs {
                 .count();
             if usable == 0 {
                 let set = lone_fallback.expect("checked");
+                self.discard_pass_tail("a model file was loaded");
                 self.install_samples(set)?;
                 self.user_notes.push("model file: besides its lone atoms it holds no sample a fit could use — its samples are installed with no model yet".into());
                 return Ok(());
@@ -394,6 +399,11 @@ impl SurrogateKs {
         for (i, smp) in samples.into_iter().enumerate() {
             store.push(smp).map_err(|e| format!("sample {i}: {e}"))?;
         }
+        // a pass's tail waiting for its fit goes with the samples this file replaces (quiet refits
+        // round 3, review I2: kept, a discard of the refit carrying it re-dued it — an automatic
+        // refit of the loaded file, Model only or not — and the old pass's outcome, shell checks
+        // and teach checks were judged against the loaded model)
+        self.discard_pass_tail("a model file was loaded");
         let was_trusted = self.trusted();
         let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
         self.refs = model.basis.species.iter().copied().zip(model.ref_energy.iter().copied()).collect();
