@@ -942,7 +942,8 @@ impl SurrogateKs {
             self.pending_notes.push(note);
             return;
         }
-        let n = pos.len().max(1) as f64;
+        // per bonded atom at a scene with stray atoms (`stray` module doc, "Audits of a cleared answer"), else per atom
+        let n = self.audit_n(&pos) as f64;
         let gap = energy - pred.energy;
         let near = self.near_quarantined(&pos, &z);
         // next to a misfit the answer is kept only if it agrees with the model (spec 2026-11-13 §4.3)
@@ -963,6 +964,7 @@ impl SurrogateKs {
         } else {
             AuditVerdict::Passed
         };
+        let mut stray_note = None;
         notes.insert(0, match verdict {
             AuditVerdict::Passed => format!("surrogate audit passed (background teacher, judged {unaudited} answered steps after its dispatch): teacher − model {gap:+.2e} Ha"),
             AuditVerdict::BoxAffected => format!(
@@ -977,13 +979,32 @@ impl SurrogateKs {
                 force_fail.map_or(String::new(), |(d, b)| format!(", worst atom's force off by {d:.1e} > {b:.1e} Ha/Bohr"))
             ),
             AuditVerdict::Failed => {
-                self.audit_failed = Some(gap);
-                self.audit_force = force_fail;
-                self.audit_atoms = n as usize;
                 let index = outcome.is_kept().then(|| self.samples().saturating_sub(1));
-                self.failed_audits.push(FailedAudit { pos: pos.clone(), z: z.clone(), energy, forces: forces.clone(), index, ionic: prov.ionic.clone(), rejudges: 0, origin: AuditOrigin::Audit, pair: None });
-                self.audit_flip = self.last.as_ref().is_some_and(|l| l.on_model);
+                let case = FailedAudit { pos: pos.clone(), z: z.clone(), energy, forces: forces.clone(), index, ionic: prov.ionic.clone(), rejudges: 0, origin: AuditOrigin::Audit, pair: None };
+                // at a scene with stray atoms: the signature refused, its samples held, and a check attributes the
+                // failure (`stray` module doc, "Audits of a cleared answer")
+                let why = match force_fail {
+                    Some((d, b)) if gap.abs() / n <= thr => format!("worst atom's force off by {d:.1e} > {b:.1e} Ha/Bohr"),
+                    _ => format!("teacher − model {gap:+.2e} Ha, {:.1e} > {thr:.1e} Ha per bonded atom", gap.abs() / n),
+                };
+                let stray = self.stray_audit_failed(&scene, raw_energy, &forces, &case, gap, why);
+                let attributing = matches!(stray, stray::StrayAudit::Attributing(_));
+                if let stray::StrayAudit::Attributing(note) | stray::StrayAudit::CountsNow(note) = stray {
+                    stray_note = Some(note);
+                }
+                if !attributing {
+                    self.audit_failed = Some(gap);
+                    self.audit_force = force_fail;
+                    self.audit_atoms = n as usize;
+                    self.failed_audits.push(case);
+                    self.audit_flip = self.last.as_ref().is_some_and(|l| l.on_model);
+                }
                 match force_fail {
+                    _ if attributing => format!(
+                        "surrogate audit failed (background teacher) at a scene with stray atoms: teacher − model {gap:+.2e} Ha ({:.1e} Ha per bonded atom{}) — a check of the bonded part alone says whether the model or the composition failed",
+                        gap.abs() / n,
+                        force_fail.map_or(String::new(), |(d, b)| format!(", worst atom's force off by {d:.1e} > {b:.1e} Ha/Bohr"))
+                    ),
                     Some((d, b)) if gap.abs() / n <= thr => format!(
                         "surrogate audit failed on forces (background teacher): worst atom off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.2e} Ha) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until a refit predicts that geometry without the audited sample"
                     ),
@@ -994,6 +1015,7 @@ impl SurrogateKs {
                 }
             }
         });
+        notes.extend(stray_note);
         self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: unaudited, asynchronous: true, teacher_ms: ms });
         // the prediction judged above is the current model's, so the stamp is this fit's
         self.last_audit_fit = self.fits;

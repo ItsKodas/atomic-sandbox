@@ -221,7 +221,11 @@ impl SurrogateKs {
                 format!("the shared collection {} saves itself as it learns ({}); a model file of it is a specialised model", sh.coll.key.slug(), sh.coll.folder().display()),
             ));
         }
-        let samples = self.store.as_ref().map_or(&[][..], |s| &s.samples[..]);
+        // as the teacher solved them: the stray mask is in memory only (plan Task 5, B; `stray::unmasked_record`), applied
+        // again at the install (`hold_out_stray`)
+        let r_cut = self.cutoff();
+        let samples: Vec<Sample> = self.store.as_ref().map_or(&[][..], |s| &s.samples[..]).iter().map(|s| stray::unmasked_record(s, r_cut)).collect();
+        let samples = &samples[..];
         let rule = self.legacy_refs.is_empty().then_some(surrogate::sidecar::REFERENCE_RULE);
         // `Q_DRAFT` is not a file code: the `DraftAudit` tag carries it (install restores it); a
         // lone sample (`Q_LONE`, provider-only) writes the code it was loaded with

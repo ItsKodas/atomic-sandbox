@@ -1388,6 +1388,9 @@ impl SurrogateKs {
     /// answer — the exact leave-one-out prediction when the answer is in the fit (`surrogate::loo`),
     /// the plain prediction when it is not — judged by the audit's own criteria: (teacher − model
     /// gap, the force failure if any, how it was predicted). An undefined leave-one-out fails (NaN).
+    /// The callers divide the gap by [`audit_n`](Self::audit_n) — per bonded atom at a scene with stray
+    /// atoms (`stray` module doc, "Audits of a cleared answer"); `per` below is the fit's own row and
+    /// keeps the scene's n.
     fn judge_case(&self, case: &FailedAudit) -> Option<(f64, Option<(f64, f64)>, &'static str)> {
         let model = self.model.as_ref()?;
         let n = case.pos.len().max(1) as f64;
@@ -1430,7 +1433,7 @@ impl SurrogateKs {
                 } else {
                     self.audit_failed = self.audit_failed.or(Some(f64::NAN));
                 }
-                self.audit_atoms = c.pos.len();
+                self.audit_atoms = self.audit_n(&c.pos);
             }
         }
     }
@@ -1473,7 +1476,8 @@ impl SurrogateKs {
                 self.failed_audits.push(case);
                 continue;
             };
-            let n = case.pos.len().max(1) as f64;
+            // per bonded atom at a scene with stray atoms (`stray` module doc, "Audits of a cleared answer")
+            let n = self.audit_n(&case.pos) as f64;
             let tier = self.policy.energy_std_per_atom;
             if (gap.abs() / n <= tier) && force_fail.is_none() {
                 self.audit_burst = AUDIT_BURST;
@@ -1506,7 +1510,7 @@ impl SurrogateKs {
                 continue;
             }
             match self.judge_case(&case) {
-                Some((gap, None, how)) if gap.abs() / case.pos.len().max(1) as f64 <= self.policy.energy_std_per_atom => {
+                Some((gap, None, how)) if gap.abs() / self.audit_n(&case.pos) as f64 <= self.policy.energy_std_per_atom => {
                     self.user_notes.push(format!("surrogate: an audit fence is lifted — {how} now passes there (teacher − model {gap:+.2e} Ha)"));
                 }
                 _ if quarantined(self, &case) => {}
@@ -1728,7 +1732,7 @@ impl SurrogateKs {
                 st.samples[i].tag = SampleTag::Audit;
             }
             promoted += 1;
-            let n = s.pos.len().max(1) as f64;
+            let n = self.audit_n(&s.pos) as f64;
             if !(gap.abs() / n <= self.policy.energy_std_per_atom) || force_fail.is_some() {
                 self.user_notes.push(format!(
                     "surrogate: a held-out draft-mode audit (#{i}) is now in strict mode's domain and the model is off there (teacher − model {gap:+.2e} Ha{}) — a failed audit: untrusted until re-earned",

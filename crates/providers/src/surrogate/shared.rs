@@ -550,7 +550,9 @@ impl SurrogateKs {
     /// audit, else the provider's own; an answer without a face density is refused as box status
     /// unknown (module doc).
     fn offer(&mut self, i: usize, prov: &Provenance, multiplicity: Option<u32>) -> Link {
-        let mut s = self.store.as_ref().expect("stored").samples[i].clone();
+        // the record holds the sample as the teacher solved it: the stray mask is in memory only (plan Task 5, B;
+        // `stray::unmasked_record`), applied again when the collection is read (`mirror_collection_sample`)
+        let mut s = super::stray::unmasked_record(&self.store.as_ref().expect("stored").samples[i], self.cutoff());
         // the collection keeps the teacher's own answer (module doc, "References per box")
         if let Some(&raw) = self.shared.as_ref().and_then(|sh| sh.raw.get(i)) {
             s.energy = raw;
@@ -1037,7 +1039,8 @@ impl SurrogateKs {
             samples: keep
                 .iter()
                 .map(|&i| {
-                    let mut s = store.samples[i].clone();
+                    // the record without the in-memory stray mask (plan Task 5, B)
+                    let mut s = super::stray::unmasked_record(&store.samples[i], self.cutoff());
                     if let Some(&raw) = sh.raw.get(i).filter(|e| e.is_finite()) {
                         s.energy = raw;
                     }
@@ -1508,7 +1511,9 @@ impl SurrogateKs {
     /// collection with its status record when `code` is not 0, and mirrored into the store; a duplicate is
     /// [`MigratedAppend::Duplicate`], its status written only when the stored one is still 0. `Err` when nothing could
     /// be written (a read-only collection, a failed write).
-    pub fn take_migrated(&mut self, cs: CollectionSample, code: u8) -> Result<MigratedAppend, String> {
+    pub fn take_migrated(&mut self, mut cs: CollectionSample, code: u8) -> Result<MigratedAppend, String> {
+        // never a stray mask in a record (plan Task 5, B): the mirror below masks the store's copy in memory
+        cs.sample = super::stray::unmasked_record(&cs.sample, self.cutoff());
         let sh = self.shared.as_mut().ok_or("no shared collection is attached")?;
         if sh.coll.read_only {
             return Err(format!("the shared collection {} is read-only", sh.coll.key.slug()));

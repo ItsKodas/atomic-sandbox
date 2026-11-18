@@ -644,6 +644,11 @@ pub enum TeachOutcome {
     StrayCheckingNew,
     /// A composition check failed: the signature is refused for the session, its samples held out.
     StrayRefused,
+    /// A failed audit of a model answer at a scene with stray atoms was attributed by a check of the bonded part alone
+    /// and each stray atom alone (spec 2026-11-18 §4.5): `model` when the model is wrong on the bonded part alone — the
+    /// failure then counts against it (a failed audit) — else the composition's, and the model's trust is unchanged.
+    /// Either way the combination stays with DFT for the session.
+    StrayAuditAttributed { model: bool },
     FenceDisagrees,
     /// A teacher answer next to a training sample the model cannot reproduce (`NearMisfit`) that
     /// disagrees with the model: used for its step, not kept, no fence vote (spec 2026-11-13 §4.3).

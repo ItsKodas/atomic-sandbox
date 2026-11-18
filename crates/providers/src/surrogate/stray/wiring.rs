@@ -36,6 +36,52 @@ pub(in crate::surrogate) fn mask_stray_atoms(s: &mut Sample, r_cut: f64) {
     s.force_mask = Some(mask);
 }
 
+/// The record of `s` as a collection or a model file holds it (plan Task 5, B; module doc, "Answering inside a
+/// region"): [`mask_stray_atoms`] is in memory only, so the stray atoms' entries of its force mask go back to true and
+/// a whole sample's mask (`use_energy`: no other source of a mask) is dropped once nothing is masked. A capped
+/// segment's own mask (`use_energy` false) keeps its other entries: its masked atoms are caps and edge atoms, which have
+/// neighbours, so none of them is stray and nothing of it is lost. Every load masks again ([`mask_stray_atoms`] at
+/// `push_sample_coded`, `hold_out_stray` and a collection's mirror), at the r_cut of that session's model.
+pub(in crate::surrogate) fn unmasked_record(s: &Sample, r_cut: f64) -> Sample {
+    let mut out = s.clone();
+    let Some(sp) = split(&s.pos, r_cut) else { return out };
+    if let Some(m) = out.force_mask.as_mut() {
+        for &i in &sp.stray {
+            if let Some(x) = m.get_mut(i) {
+                *x = true;
+            }
+        }
+    }
+    if out.use_energy && out.force_mask.as_ref().is_some_and(|m| m.iter().all(|&b| b)) {
+        out.force_mask = None;
+    }
+    out
+}
+
+/// What an attribution check carries (parent module doc, "Audits of a cleared answer"): the failed audit's case as the
+/// audit recorded it (the scene's geometry and canonical labels: what counts against the model when the check cannot
+/// attribute), the box its labels are canonical in, and the audit's gap and words.
+#[derive(Clone, Debug)]
+pub(in crate::surrogate) struct Attribution {
+    pub case: FailedAudit,
+    pub grid_n: usize,
+    pub gap: f64,
+    pub why: String,
+}
+
+/// What [`SurrogateKs::stray_audit_failed`] did with a failed audit.
+#[derive(Clone, Debug, PartialEq)]
+pub(in crate::surrogate) enum StrayAudit {
+    /// The scene has no stray atom: an ordinary failed audit.
+    NotStray,
+    /// The signature refused, its samples held, an attribution check queued: the failure does not count against the
+    /// model unless the check says so. The note.
+    Attributing(String),
+    /// The signature refused and its samples held, but no attribution check can run: the failure counts against the
+    /// model now, the caller records it as any failed audit (the conservative side). The note.
+    CountsNow(String),
+}
+
 /// A check's solve is clean ([`PartAnswer::clean`]): no warning, trainable, its face density (if reported) within the
 /// box rule at grid spacing `h` (a NaN density is not within it).
 fn clean_solve(warned: bool, unfit: Option<&str>, face: Option<f64>, h: f64) -> bool {
@@ -46,7 +92,8 @@ fn clean_solve(warned: bool, unfit: Option<&str>, face: Option<f64>, h: f64) -> 
 /// the scene's own answer, the parts' answers as they arrive (`atoms` in [`Split::stray`]'s order), the scene-edit
 /// generation it was queued in, the store index of the scene's kept sample (`sample`, with its `sample_key`: a purge
 /// may move indices), the scene's positions and species (the bonded descriptors are taken when it is judged), the
-/// id its jobs carry and the parts' solve time.
+/// id its jobs carry and the parts' solve time; `attribution` for a failed audit's check (never booked; parent module
+/// doc, "Audits of a cleared answer").
 #[derive(Clone, Debug)]
 pub(in crate::surrogate) struct StrayCheck {
     pub sig: Signature,
@@ -61,6 +108,7 @@ pub(in crate::surrogate) struct StrayCheck {
     pub z: Vec<u8>,
     pub id: u64,
     pub ms: f64,
+    pub attribution: Option<Attribution>,
 }
 
 /// "H2 + H": the bonded part's formula and the stray atoms' (the Activity's and the notes' label of a signature).
@@ -128,10 +176,96 @@ impl SurrogateKs {
         true
     }
 
-    /// Drops the check in flight and its queued parts (an answer already on its way is told apart by its job id).
+    /// Drops the check in flight and its queued parts (an answer already on its way is told apart by its job id). An
+    /// attribution check's failed audit then counts against the model (the conservative side; parent module doc,
+    /// "Audits of a cleared answer").
     pub(in crate::surrogate) fn drop_stray_check(&mut self) {
-        self.stray_pending = None;
+        let pending = self.stray_pending.take();
         self.side_queue.retain(|j| !matches!(j.2, JobKind::Fragment | JobKind::AtomAt(_)));
+        if let Some(a) = pending.and_then(|p| p.attribution) {
+            self.count_stray_audit(a, "its check did not complete");
+        }
+    }
+
+    /// The atom count of `pos`'s per-atom audit tiers: n_bonded at the model's cutoff when it splits, else n
+    /// ([`per_atom_n`]; parent module doc, "Audits of a cleared answer").
+    pub(in crate::surrogate) fn audit_n(&self, pos: &[[f64; 3]]) -> usize {
+        per_atom_n(pos, self.cutoff())
+    }
+
+    /// A failed strict audit at `case`'s geometry (spec §4.5, review I6; parent module doc, "Audits of a cleared
+    /// answer"): when the scene has stray atoms, its signature is refused for the session (the audit's `why` as the
+    /// reason), its samples are held out ([`Q_STRAY`]; the refit armed) and an attribution check of the bonded part
+    /// alone and each stray atom alone is queued at that geometry with the audit's own answer (`raw_energy`, the
+    /// teacher's before the canonical surface, and `forces`) as its scene. `case` is the failed audit as the caller
+    /// would record it (canonical labels), `gap` its teacher − model. The caller records `case` as any failed audit
+    /// unless this says [`StrayAudit::Attributing`].
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::surrogate) fn stray_audit_failed(&mut self, scene: &Scene, raw_energy: f64, forces: &[[f64; 3]], case: &FailedAudit, gap: f64, why: String) -> StrayAudit {
+        let prov = self.scene_provenance(scene);
+        let Some((split, sig, _)) = self.stray_split(&case.pos, &case.z, &prov) else { return StrayAudit::NotStray };
+        self.stray_book_current();
+        self.stray_book.refuse(&sig, format!("audit: {why}"));
+        let held = self.hold_stray_signature(&sig);
+        if held > 0 {
+            self.arm_stray_refit();
+        }
+        let label = signature_label(&sig);
+        let base = format!(
+            "surrogate: stray atoms ({label}) — the audit of the model's answer failed ({why}): DFT answers this combination for the session and its samples stay out of the fit{}",
+            if held > 0 { format!(" ({held} taken back out)") } else { String::new() }
+        );
+        let ans = PartAnswer { energy: raw_energy, forces: forces.to_vec(), frontier: [Frontier::default(); 2], partial: Vec::new(), clean: true };
+        let a = Attribution { case: case.clone(), grid_n: prov.grid_n, gap, why };
+        let busy = self.stray_pending.as_ref().is_some_and(|p| p.attribution.is_some());
+        if self.auditor.is_none() || busy {
+            let reason = if busy { "another failed audit's check is in flight" } else { "no background teacher" };
+            return StrayAudit::CountsNow(format!("{base}; no check can attribute the failure ({reason}), so it counts against the model"));
+        }
+        self.enqueue_stray_check(scene, ans, split, sig, None, Some(a));
+        StrayAudit::Attributing(format!(
+            "{base}; a check of the bonded part alone and each stray atom alone attributes the failure — the model's trust is unchanged unless the model is wrong on the bonded part"
+        ))
+    }
+
+    /// Every sample of `sig` in the fit or on its way there ([`Q_NONE`], `Q_REF_WAIT`, `Q_DRAFT`) back to [`Q_STRAY`]:
+    /// a refused signature's samples are held out for good (spec §4.3, C1); how many. The caller arms the refit.
+    fn hold_stray_signature(&mut self, sig: &Signature) -> usize {
+        let Some(store) = self.store.as_ref() else { return 0 };
+        let r_cut = self.cutoff();
+        let mut hold = Vec::new();
+        for (i, s) in store.samples.iter().enumerate() {
+            if !matches!(self.quarantine.get(i).copied().unwrap_or(Q_NONE), Q_NONE | Q_REF_WAIT | Q_DRAFT) {
+                continue;
+            }
+            let Some(sp) = split(&s.pos, r_cut) else { continue };
+            let prov = self.sample_provenance(i);
+            if Signature::new(&s.z, &sp, prov.charge, &prov) == *sig {
+                hold.push(i);
+            }
+        }
+        if let Some(&last) = hold.last() {
+            if self.quarantine.len() <= last {
+                self.quarantine.resize(last + 1, Q_NONE);
+            }
+        }
+        for &i in &hold {
+            self.quarantine[i] = Q_STRAY;
+        }
+        hold.len()
+    }
+
+    /// A failed audit no check attributed (`why`): it counts against the model as any failed audit (rule 8, with the
+    /// scene's own labels): untrusted until re-earned, and the flip booked at the next evaluation when the model's
+    /// surface was the last.
+    fn count_stray_audit(&mut self, a: Attribution, why: &str) {
+        self.failed_audits.push(a.case);
+        self.sync_audit_failed();
+        self.audit_flip = self.last.as_ref().is_some_and(|l| l.on_model);
+        self.pending_notes.push(format!(
+            "surrogate: a failed audit at a scene with stray atoms (teacher − model {:+.2e} Ha; {}) is not attributed — {why} — so it counts against the model: untrusted until a refit predicts that geometry without the audited sample",
+            a.gap, a.why
+        ));
     }
 
     /// The model may answer this scene as "bonded part + free atoms" (parent module doc, "Answering inside a region";
@@ -197,8 +331,8 @@ impl SurrogateKs {
         }
         self.stray_book_current();
         // at most one in flight, and a newer fallback does not replace it — unless it is of a scene edited since (its
-        // answers are dropped on arrival anyway)
-        if self.stray_pending.as_ref().is_some_and(|p| p.scene_gen == self.scene_gen) {
+        // answers are dropped on arrival anyway); a failed audit's attribution check is never replaced
+        if self.stray_pending.as_ref().is_some_and(|p| p.scene_gen == self.scene_gen || p.attribution.is_some()) {
             return false;
         }
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
@@ -212,9 +346,19 @@ impl SurrogateKs {
             Some(StrayState::Checking { region, .. }) if !region.distinct(&desc, &species, units, thin) => return false,
             _ => {}
         }
+        self.enqueue_stray_check(scene, ans, split, sig, kept, None);
+        true
+    }
+
+    /// Queues the parts of a check of `scene` (the caller's gates passed): the bonded part alone and each stray atom
+    /// alone on the auditor's side queue, replacing the check in flight (an ordinary one: the callers never replace an
+    /// attribution check). `attribution`: a failed audit's check (parent module doc, "Audits of a cleared answer").
+    fn enqueue_stray_check(&mut self, scene: &Scene, ans: PartAnswer, split: Split, sig: Signature, kept: Option<usize>, attribution: Option<Attribution>) {
         self.drop_stray_check();
         self.stray_checks += 1;
         let id = self.stray_checks;
+        let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
         // the scene's provenance and ionic policy (review M5): the parts are solved on the scene's surface
         let prov = self.scene_provenance(scene);
         let mut frag = scene.clone();
@@ -234,9 +378,9 @@ impl SurrogateKs {
         }
         let sample_key = kept.and_then(|i| self.store.as_ref().and_then(|st| st.samples.get(i)).map(sample_key));
         let atoms = vec![None; split.stray.len()];
-        self.stray_pending = Some(StrayCheck { sig, split, scene: ans, frag: None, atoms, scene_gen: self.scene_gen, sample: kept.filter(|_| sample_key.is_some()), sample_key, pos, z, id, ms: 0.0 });
+        self.stray_pending =
+            Some(StrayCheck { sig, split, scene: ans, frag: None, atoms, scene_gen: self.scene_gen, sample: kept.filter(|_| sample_key.is_some()), sample_key, pos, z, id, ms: 0.0, attribution });
         self.pump_side_queue();
-        true
     }
 
     /// One part's answer from the auditor (`handle_answer`; module doc, "The checks on the auditor"): filed with the
@@ -247,17 +391,20 @@ impl SurrogateKs {
         if ans.job.id != p.id {
             return;
         }
-        if p.scene_gen != self.scene_gen {
+        // (an attribution check is of a geometry, not of the scene's history: an edit does not drop it)
+        if p.scene_gen != self.scene_gen && p.attribution.is_none() {
             return self.drop_stray_check();
         }
         let sig = p.sig.clone();
+        let attributing = p.attribution.is_some();
         let solved = match ans.result {
             Ok(s) => s,
             Err(e) => {
                 self.drop_stray_check();
                 let what = if ans.job.kind == JobKind::Fragment { "the bonded part alone" } else { "a stray atom alone" };
+                let then = if attributing { "the failed audit it was attributing counts against the model" } else { "not counted, the next fallback checks again" };
                 let note = format!(
-                    "surrogate: stray atoms ({}) — the composition check's solve of {what} failed on the background teacher ({e}); not counted, the next fallback checks again",
+                    "surrogate: stray atoms ({}) — the composition check's solve of {what} failed on the background teacher ({e}); {then}",
                     signature_label(&sig)
                 );
                 let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::IsolatedAtom, TeachOutcome::Failed);
@@ -300,11 +447,14 @@ impl SurrogateKs {
 
     /// Judges a complete check, books its verdict and releases what it covers (module doc).
     fn judge_stray_check(&mut self, p: StrayCheck) {
-        let StrayCheck { sig, split, scene, frag, atoms, sample, sample_key: key, pos, z, ms, .. } = p;
+        let StrayCheck { sig, split, scene, frag, atoms, sample, sample_key: key, pos, z, ms, attribution, .. } = p;
         let frag = frag.expect("complete");
         let atoms: Vec<PartAnswer> = atoms.into_iter().map(|a| a.expect("complete")).collect();
         let label = signature_label(&sig);
         let n_atoms = pos.len();
+        if let Some(a) = attribution {
+            return self.attribute_stray_audit(a, &label, &split, &scene, &frag, &atoms, &pos, &z, ms);
+        }
         // a model with another basis or surface since the dispatch: the book is cleared and this verdict not booked
         if self.stray_book_current() {
             return self.pending_notes.push(format!("surrogate: stray atoms ({label}) — the composition check's answer arrived after the model changed basis or settings; not booked"));
@@ -370,6 +520,73 @@ impl SurrogateKs {
             }
         };
         let ev = event(outcome, detail.clone());
+        self.push_event(ev);
+        self.pending_notes.push(detail);
+    }
+
+    /// A failed audit's attribution check answered (step 3 of the parent module doc's "Audits of a cleared answer"):
+    /// the model's prediction of the bonded part alone (the model current now, as an audit is judged) against the
+    /// fragment's solve, by the audit's own criterion — the energy per bonded atom within `energy_std_per_atom`, the
+    /// worst atom's force within its bound and the audit's floor (`worst_force_residual`, `audit_force_floor`). Wrong
+    /// there: the failure is the model's, recorded at the scene's geometry with the label the model failed to meet
+    /// (the fragment's canonical energy plus Σ_s E_ref(Z_s), its forces on the bonded atoms, 0 on the stray ones;
+    /// never fitted, so `index` is none). Right there: the composition's, and the model's trust is untouched. A
+    /// fragment solve that is not clean, a model changed since, or one that cannot describe the bonded part cannot
+    /// attribute: the audit counts as recorded (the conservative side).
+    #[allow(clippy::too_many_arguments)]
+    fn attribute_stray_audit(&mut self, a: Attribution, label: &str, split: &Split, scene: &PartAnswer, frag: &PartAnswer, atoms: &[PartAnswer], pos: &[[f64; 3]], z: &[u8], ms: f64) {
+        if self.stray_book_current() {
+            return self.count_stray_audit(a, "the model changed basis or settings while its check ran");
+        }
+        if !frag.clean {
+            return self.count_stray_audit(a, "the bonded part's solve is not clean (a warning, untrainable, or box-affected)");
+        }
+        let (fp, fz) = split.bonded_part(pos, z);
+        let model = self.model.as_ref();
+        let pred = model.and_then(|m| m.predict(&fp, &fz, false).ok());
+        let refs: Option<f64> = model.and_then(|m| split.stray.iter().map(|&i| m.basis.species_index(z[i]).map(|k| m.ref_energy[k])).sum());
+        let (Some(pred), Some(refs)) = (pred, refs) else {
+            return self.count_stray_audit(a, "the model cannot describe the bonded part");
+        };
+        let e_frag = self.to_canonical(&fz, a.grid_n, frag.energy);
+        let n = split.bonded.len().max(1) as f64;
+        let tier = self.policy.energy_std_per_atom;
+        let gap = e_frag - pred.energy;
+        let force_fail = worst_force_residual(&self.policy, &pred.forces, &frag.forces, audit_force_floor(&a.case.ionic)).filter(|(d, b)| !(d <= b));
+        let wrong = !(gap.abs() / n <= tier) || force_fail.is_some();
+        // what the composition contributed (raw energies throughout, as the check's energy test)
+        let mut terms = vec![scene.energy, -frag.energy];
+        terms.extend(atoms.iter().map(|x| -x.energy));
+        let composition = compensated_sum(&terms);
+        let on_frag = match force_fail {
+            Some((d, b)) => format!("its worst bonded atom's force is off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.2e} Ha)"),
+            None => format!("teacher − model {gap:+.2e} Ha ({:.1e} {} {tier:.1e} Ha per bonded atom)", gap.abs() / n, if wrong { ">" } else { "≤" }),
+        };
+        let detail = if wrong {
+            let mut case = a.case;
+            case.energy = e_frag + refs;
+            case.forces = split.scene_values(&frag.forces, pos.len(), [0.0; 3]);
+            case.index = None;
+            self.failed_audits.push(case);
+            self.sync_audit_failed();
+            self.audit_flip = self.last.as_ref().is_some_and(|l| l.on_model);
+            format!(
+                "surrogate: stray atoms ({label}) — the failed audit (teacher − model {:+.2e} Ha) is the model's: on the bonded part alone {on_frag}; E_scene − E_frag − Σ E_atom = {:+.3} mHa — untrusted until a refit predicts that geometry",
+                a.gap,
+                composition * 1e3
+            )
+        } else {
+            format!(
+                "surrogate: stray atoms ({label}) — the failed audit (teacher − model {:+.2e} Ha) is the composition's, not the model's: on the bonded part alone {on_frag}, while E_scene − E_frag − Σ E_atom = {:+.3} mHa; the model's trust is unchanged, the combination stays with DFT",
+                a.gap,
+                composition * 1e3
+            )
+        };
+        let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, TeachOutcome::StrayAuditAttributed { model: wrong });
+        ev.detail = detail.clone();
+        ev.gap = Some(gap);
+        ev.n_atoms = pos.len();
+        ev.solve_ms = ms;
         self.push_event(ev);
         self.pending_notes.push(detail);
     }

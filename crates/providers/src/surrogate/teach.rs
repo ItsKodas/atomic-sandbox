@@ -812,7 +812,8 @@ impl SurrogateKs {
             } else {
                 match model.predict(&pos, &z, false) {
                     Ok(p) => {
-                        let n = pos.len().max(1) as f64;
+                        // per bonded atom at a scene with stray atoms (`stray` module doc, "Audits of a cleared answer")
+                        let n = self.audit_n(&pos) as f64;
                         let e = (e_c - p.energy).abs() / n / self.policy.energy_std_per_atom;
                         let f = worst_force_residual(&self.policy, &p.forces, &h.forces, audit_force_floor(&ionic)).map_or(0.0, |(d, b)| d / b);
                         Some(e.max(f))

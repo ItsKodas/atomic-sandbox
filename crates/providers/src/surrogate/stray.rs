@@ -133,15 +133,52 @@
 //!   geometry outside. A refusal names the scene's atom.
 //!
 //! The answer is `predict(scene)`, the sum above (to a few ulp, the bonded forces bit for bit, the stray atoms' exactly
-//! 0), with the step note "stray atoms: model for the bonded part + free atoms (composition measured, 3 checks; worst
-//! residual … mHa, frontier margin … mHa)". A step outside the region is rule 5a's, as before, and one more check.
+//! 0), with the step note "stray atoms: model for the bonded part + free atoms (composition measured, {passes} checks;
+//! worst residual … mHa, frontier margin … mHa)", `passes` the passing checks booked so far (`StrayState::Cleared`).
+//! A step outside the region is rule 5a's, as before, and one more check.
 //! **Re-entry** (review M3): a stray atom back within r_cut is no longer stray and the ordinary rules judge the scene;
 //! the switch to the teacher's surface is booked by `transition_jump`, as is the switch back. Rule 5b refuses there
 //! (the returning atom's coordination far below any training atom's; `reentry_and_exit_book_every_switch`) even with
 //! released stray samples fitted: their stray atoms are no training atoms — not in the envelope (`surrogate::envelope`
 //! module doc, "Isolated atoms are not training atoms": admitted, a B = 0 would set every coordination minimum of its
 //! species to 0 and switch 5b off for ordinary scenes too) and not in the force rows (their mask,
-//! [`mask_stray_atoms`]: zero rows that would bias σ_f down). The audit criterion's n_bonded is plan Task 5's.
+//! [`mask_stray_atoms`]: zero rows that would bias σ_f down). The mask is applied in memory only, at every entry to
+//! the store, and never written: a collection record or a model file holds the sample as the teacher solved it
+//! ([`unmasked_record`]; plan Task 5, B). Which atoms are stray is a fact at this r_cut; under a longer reach the
+//! same atom may have neighbours, and a written mask would lose its force rows for good.
+//!
+//! # Audits of a cleared answer (spec §4.5, review I6; plan Task 5)
+//!
+//! A cleared answer is audited like any model answer, at the same cadence, against the teacher's solve of the whole
+//! scene, and **every per-atom tier divides by n_bonded** ([`per_atom_n`]): the audit's energy criterion (in the step
+//! and on the background teacher), a fallback's over-tier test (`teach`: reported on the model's surface only within
+//! the tier), `agree` and the fence votes, the teach-around pass's held-out checks, and a failed audit's re-judgement
+//! (`trust::judge_case`'s callers). Divided by the scene's n, the composite gap would pass at a tier × n_stray
+//! larger. A scene without a stray atom has n_bonded = n, so its criterion is unchanged bit for bit. (The fit's own
+//! per-atom rows — the energy row, the leave-one-out residuals, the misfit set — keep the scene's n: that is the row
+//! the fit was given.)
+//!
+//! A **failed** audit at a scene with stray atoms (not a draft guess's) does three things, in this order
+//! ([`stray_audit_failed`](SurrogateKs::stray_audit_failed)):
+//!
+//! 1. the signature is refused for the session (`StrayBook::refuse`, the audit's numbers as the reason) and every
+//!    sample of it in the fit goes back to [`Q_STRAY`](super::quarantine::Q_STRAY), held out for good (the audit's own
+//!    included); the refit is armed;
+//! 2. a composition check is queued at the audited geometry, the audit's own answer as its scene (an **attribution
+//!    check**: it is never booked in the book, a scene edit does not drop it, and no other check replaces it);
+//! 3. when its parts answer, the model's prediction of the bonded part alone is judged against the fragment's solve
+//!    by the audit's own criterion (per bonded atom; the forces by the audit's bound and floor), and the failure
+//!    enters the model's audit record (`FailedAudit`, rule 8: untrusted until re-earned) **only if the model is
+//!    wrong there** — `TeachOutcome::StrayAuditAttributed { model }`. Otherwise the failure was the composition's, and
+//!    the model's trust is untouched.
+//!
+//! The case recorded for the model is the scene's geometry with the label the model failed to meet there: the
+//! fragment's measured energy plus Σ_s E_ref(Z_s), the fragment's forces on the bonded atoms and 0 on the stray ones
+//! (what `predict(scene)` claims). A re-judgement then measures the model's error alone; the composite label would
+//! carry the composition error the model can never re-earn. Until the check answers, the model stays trusted (the
+//! signature itself is already on DFT). **The conservative side:** when no check can run — no background teacher, an
+//! attribution check already in flight, a part solve failed or not clean, the model changed basis or settings — the
+//! failure counts against the model at once, with the scene's own labels, as any failed audit.
 //!
 //! **Draft mode** answers these scenes as before, but a cleared scene is no longer an extrapolation there: its step
 //! carries no extrapolation readout (no rule refuses it) and an audit of it is an ordinary audit, not a draft guess's
@@ -222,6 +259,14 @@ pub(super) fn split(pos: &[[f64; 3]], r_cut: f64) -> Option<Split> {
     let (stray, bonded): (Vec<usize>, Vec<usize>) =
         (0..pos.len()).partition(|&i| (0..pos.len()).filter(|&j| j != i).all(|j| no_neighbours(&[pos[i], pos[j]], r_cut)));
     (!stray.is_empty() && !bonded.is_empty()).then_some(Split { bonded, stray })
+}
+
+/// The atom count every per-atom audit tier divides by (module doc, "Audits of a cleared answer"; spec §4.4–4.5,
+/// review I4): n_bonded when `pos` splits at `r_cut`, else the scene's n. A scene without a stray atom (including one
+/// whose atoms are all alone, rule 0b's) gets exactly `pos.len()`, so its criterion is bit for bit what it was; never
+/// below 1.
+pub(super) fn per_atom_n(pos: &[[f64; 3]], r_cut: f64) -> usize {
+    split(pos, r_cut).map_or(pos.len(), |s| s.bonded.len()).max(1)
 }
 
 impl Split {
@@ -683,4 +728,4 @@ impl StrayBook {
 }
 
 mod wiring;
-pub(super) use wiring::{mask_stray_atoms, part_answer, signature_label, StrayCheck};
+pub(super) use wiring::{mask_stray_atoms, part_answer, signature_label, unmasked_record, StrayAudit, StrayCheck};

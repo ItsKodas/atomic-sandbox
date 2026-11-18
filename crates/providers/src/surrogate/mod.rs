@@ -2075,7 +2075,9 @@ impl SurrogateKs {
         // an audit at a fenced-band geometry is not a judgement of the model (strict mode refuses
         // it there): the teacher answered, nothing is judged
         let judged_audit = h.audit && !h.shell_fence;
-        let n = h.pos.len().max(1) as f64;
+        // the per-atom tiers below (the over-tier report, the audit) per bonded atom at a scene with stray atoms
+        // (`stray` module doc, "Audits of a cleared answer"), else per atom
+        let n = self.audit_n(&h.pos) as f64;
         let mut stats = r.stats;
         if stats.pseudised.is_empty() && crate::pseudo::is_all_electron_tag(&h.prov.ionic) {
             self.last_pseudised = None;
@@ -2183,16 +2185,34 @@ impl SurrogateKs {
                 if judged_audit && audit_fails {
                     // failed audit: this step is already on the teacher surface, and the jump
                     // of the reported energy at these positions is the gap itself
-                    self.audit_failed = Some(gap);
-                    self.audit_force = force_fail;
-                    self.audit_atoms = n as usize;
                     let index = outcome.is_kept().then(|| self.samples().saturating_sub(1));
-                    self.failed_audits.push(FailedAudit { pos: h.pos.clone(), z: h.z.clone(), energy: r.energy, forces: r.forces.clone(), index, ionic: h.prov.ionic.clone(), rejudges: 0, origin: AuditOrigin::Audit, pair: None });
+                    let case = FailedAudit { pos: h.pos.clone(), z: h.z.clone(), energy: r.energy, forces: r.forces.clone(), index, ionic: h.prov.ionic.clone(), rejudges: 0, origin: AuditOrigin::Audit, pair: None };
+                    // at a scene with stray atoms the signature is refused and its samples held, and a check
+                    // attributes the failure when one can run (`stray` module doc, "Audits of a cleared answer")
+                    let why = match force_fail {
+                        Some((d, b)) if gap.abs() / n <= self.policy.energy_std_per_atom => format!("worst atom's force off by {d:.1e} > {b:.1e} Ha/Bohr"),
+                        _ => format!("teacher − model {gap:+.2e} Ha, {:.1e} > {:.1e} Ha per bonded atom", gap.abs() / n, self.policy.energy_std_per_atom),
+                    };
+                    let stray = self.stray_audit_failed(scene, raw_energy, &r.forces, &case, gap, why);
+                    let attributing = matches!(stray, stray::StrayAudit::Attributing(_));
+                    if let stray::StrayAudit::Attributing(note) | stray::StrayAudit::CountsNow(note) = stray {
+                        notes.push(note);
+                    }
+                    if !attributing {
+                        self.audit_failed = Some(gap);
+                        self.audit_force = force_fail;
+                        self.audit_atoms = n as usize;
+                        self.failed_audits.push(case);
+                    }
                     // on the refresh right after a refit the refit's own jump (E_new − E_reported
                     // at these positions) is still pending: the reported energy moves by both.
                     // (From a teacher-surface step there is nothing to book: `jump_to_teacher`.)
                     stats.refit_jump = self.jump_to_teacher(gap);
                     notes.insert(0, match force_fail {
+                        _ if attributing => format!(
+                            "surrogate audit failed at a scene with stray atoms: teacher − model {gap:+.2e} Ha ({:.1e} Ha per bonded atom) — a check of the bonded part alone says whether the model or the composition failed",
+                            gap.abs() / n
+                        ),
                         Some((d, b)) if gap.abs() / n <= self.policy.energy_std_per_atom => format!(
                             "surrogate audit failed on forces: worst atom off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.2e} Ha) — untrusted until a refit predicts that geometry without the audited sample"
                         ),

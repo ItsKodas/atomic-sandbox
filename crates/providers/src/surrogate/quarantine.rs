@@ -975,7 +975,7 @@ impl SurrogateKs {
     pub(super) fn reproduces(&self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]]) -> bool {
         let Some(model) = self.model.as_ref() else { return false };
         let Ok(pr) = model.predict(pos, z, false) else { return false };
-        Self::agree(&self.policy, pos.len(), pr.energy, &pr.forces, energy, forces)
+        Self::agree(&self.policy, self.audit_n(pos), pr.energy, &pr.forces, energy, forces)
     }
 
     /// [`reproduces`](Self::reproduces) for a stored sample, on the rows it was fitted with (M8a Task
@@ -988,15 +988,16 @@ impl SurrogateKs {
         let Some(model) = self.model.as_ref() else { return false };
         let Ok(pr) = model.predict(&s.pos, &s.z, false) else { return false };
         let p = &self.policy;
-        (!s.use_energy || (pr.energy - s.energy).abs() / s.pos.len().max(1) as f64 <= p.energy_std_per_atom)
+        (!s.use_energy || (pr.energy - s.energy).abs() / self.audit_n(&s.pos) as f64 <= p.energy_std_per_atom)
             && pr.forces.iter().zip(&s.forces).enumerate().filter(|(j, _)| s.trains_atom(*j)).all(|(_, (a, b))| {
                 let (d, bound) = p.force_residual(a, b);
                 d <= bound
             })
     }
 
-    /// Two answers agree within the policy's thresholds (per-atom energy; every atom's force
-    /// against its bound for the reference force).
+    /// Two answers agree within the policy's thresholds (per-atom energy over `n`; every atom's force
+    /// against its bound for the reference force). The callers pass [`audit_n`](Self::audit_n): per
+    /// bonded atom at a scene with stray atoms (`stray` module doc, "Audits of a cleared answer").
     pub(super) fn agree(p: &FallbackPolicy, n: usize, e_a: f64, f_a: &[[f64; 3]], e_b: f64, f_b: &[[f64; 3]]) -> bool {
         (e_a - e_b).abs() / n.max(1) as f64 <= p.energy_std_per_atom
             && f_a.iter().zip(f_b).all(|(a, b)| {
@@ -1457,13 +1458,13 @@ impl SurrogateKs {
                 (_, 0) => ("a forgotten sample", "forgotten samples"),
                 _ => ("quarantined and forgotten samples", "quarantined and forgotten samples"),
             };
-            let agrees = model.is_some_and(|(e, f)| Self::agree(&self.policy, pos.len(), e, f, energy, forces));
+            let agrees = model.is_some_and(|(e, f)| Self::agree(&self.policy, self.audit_n(pos), e, f, energy, forces));
             if !agrees {
                 // a disagreeing answer ends a run of agreeing ones toward lifting a forgotten fence
                 self.lift_votes.clear();
                 // fence voting (`surrogate` module doc, "Fence voting"): fresh answers that agree with each
                 // other but not with the model are evidence the model is wrong here
-                let n = pos.len();
+                let n = self.audit_n(pos);
                 let residual = model.map(|(e, f)| (energy - e, forces.iter().zip(f).map(|(t, m)| [t[0] - m[0], t[1] - m[1], t[2] - m[2]]).collect()));
                 self.fence_votes.push(FenceVote { near: near.to_vec(), n, energy, forces: forces.to_vec(), residual, gen: self.model_gen });
                 if self.fence_votes.len() > FENCE_VOTES {
@@ -1539,7 +1540,7 @@ impl SurrogateKs {
                 // an agreeing vote; FENCE_VOTES consecutive, mutually consistent ones next to the
                 // same forgotten samples under one model lift the fence of the samples every one
                 // of them was next to, and keep the last answer
-                let n = pos.len();
+                let n = self.audit_n(pos);
                 let residual = model.map(|(e, f)| (energy - e, forces.iter().zip(f).map(|(t, m)| [t[0] - m[0], t[1] - m[1], t[2] - m[2]]).collect()));
                 self.lift_votes.push(FenceVote { near: near.to_vec(), n, energy, forces: forces.to_vec(), residual, gen: self.model_gen });
                 if self.lift_votes.len() > FENCE_VOTES {
@@ -1608,7 +1609,7 @@ impl SurrogateKs {
         // it agrees with the model, so a region the model cannot fit stays refused without a parked
         // scene growing M; it is learned when a later refit fits M's samples
         if near_misfit {
-            let agrees = model.is_some_and(|(e, f)| Self::agree(&self.policy, pos.len(), e, f, energy, forces));
+            let agrees = model.is_some_and(|(e, f)| Self::agree(&self.policy, self.audit_n(pos), e, f, energy, forces));
             if !agrees {
                 notes.push(match model {
                     Some(_) => "surrogate: sample not kept — next to a training sample the model cannot reproduce, and the teacher disagrees with the model there (a later refit at more samples or a higher body-4 degree may fit it)".into(),

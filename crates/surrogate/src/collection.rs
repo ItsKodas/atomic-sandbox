@@ -1817,8 +1817,14 @@ impl Collection {
         if segments > 0 {
             t.push_str(&format!("{segments} of them capped segments (only their interior atoms' forces are taught and counted below)\n"));
         }
-        // a sample whose stray atoms (no neighbour within r_cut) are masked out of its force rows: its energy is taught
-        let strays = self.samples.iter().filter(|s| s.sample.use_energy && s.sample.force_mask.is_some()).count();
+        // a sample with stray atoms (no neighbour within r_cut, while another atom has one): the provider masks them out
+        // of its force rows in memory, never in the record (its energy is taught); told apart by geometry here
+        let stray_atoms = |x: &Sample| -> Vec<bool> {
+            let alone: Vec<bool> = (0..x.pos.len()).map(|i| (0..x.pos.len()).all(|j| j == i || (0..3).map(|a| (x.pos[i][a] - x.pos[j][a]).powi(2)).sum::<f64>() >= r_cut * r_cut)).collect();
+            let bonded = alone.iter().any(|&a| !a);
+            alone.iter().map(|&a| a && bonded).collect()
+        };
+        let strays = self.samples.iter().filter(|s| stray_atoms(&s.sample).contains(&true)).count();
         if strays > 0 {
             t.push_str(&format!("{strays} of them with stray atoms (their stray atoms' forces are not taught nor counted below)\n"));
         }
@@ -1827,11 +1833,13 @@ impl Collection {
         let mut pairs: BTreeMap<(u8, u8), (usize, usize, f64)> = BTreeMap::new();
         for s in &self.samples {
             let x = &s.sample;
-            let mut zs: Vec<u8> = x.z.iter().enumerate().filter(|(j, _)| x.trains_atom(*j)).map(|(_, &z)| z).collect();
+            let stray = stray_atoms(x);
+            let taught = |j: usize| x.trains_atom(j) && !stray[j];
+            let mut zs: Vec<u8> = x.z.iter().enumerate().filter(|(j, _)| taught(*j)).map(|(_, &z)| z).collect();
             zs.sort_unstable();
             zs.dedup();
             for (j, &z) in x.z.iter().enumerate() {
-                if x.trains_atom(j) {
+                if taught(j) {
                     species.entry(z).or_default().0 += 1;
                 }
             }

@@ -1730,3 +1730,359 @@ fn diag_stray_cleared_cost() {
     );
 }
 
+
+// ---- plan Task 5: audits of cleared answers and their attribution (spec §4.5, review I6) ----
+
+/// Plan Task 5, A: the per-atom audit count is n_bonded at a scene with stray atoms and exactly the scene's n
+/// otherwise — H₂, a three-atom chain, a single atom, two lone atoms (rule 0b's: no bonded part) — so a scene without a
+/// stray atom is judged bit for bit as before (every site divides by `audit_n`, which returns `pos.len()` there).
+#[test]
+fn audit_n_is_the_scene_n_without_stray_atoms() {
+    let (s, _) = cleared_student();
+    let mut chain = big(dimer(1.4, [1.0, 0.0, 0.0], H2_AT, 1, 1));
+    chain.nuclei.push(Nucleus::new(1, [2.2, -3.0, 0.0]));
+    let mut one = h2_with(1.4, &[]);
+    one.nuclei = vec![Nucleus::new(1, H2_AT)];
+    let mut lone = h2_with(1.4, &[]);
+    lone.nuclei = vec![Nucleus::new(1, H2_AT), Nucleus::new(1, STRAY_AT)];
+    for sc in [big(dimer(1.4, [1.0, 0.0, 0.0], H2_AT, 1, 1)), chain, one, lone] {
+        let pos = positions(&sc);
+        assert!(split(&pos, s.cutoff()).is_none(), "the premise: no stray atom in {pos:?}");
+        assert_eq!(s.audit_n(&pos), pos.len(), "{pos:?}");
+        assert_eq!(per_atom_n(&pos, R_CUT), pos.len());
+    }
+    assert_eq!(s.audit_n(&positions(&h2_with(INSIDE, &[STRAY_AT]))), 2, "H₂ + a stray H: per bonded atom");
+    assert_eq!(s.audit_n(&positions(&h2_with(INSIDE, &[STRAY_AT, [-5.5, 3.0, 5.0]]))), 2);
+    assert_eq!(per_atom_n(&[], R_CUT), 1, "never below 1");
+}
+
+/// The composite offset of plan Task 5's audits (Ha): within the energy tier per scene atom over H₂ + H's 3 atoms
+/// (0.83 mHa), beyond it per bonded atom over 2 (1.25 mHa) — so an audit that fails at it fails only per bonded atom
+/// (asserted in [`audited_student`]).
+const AUDIT_OFFSET: f64 = 2.5e-3;
+
+/// The cleared H₂ + H student of [`cleared_student`] with `auditor` as its background teacher and every answered step
+/// audited (`audit_every` 1): one model answer at [`INSIDE`], its audit judged (the answer is held until the next
+/// poll, as until the next step's evaluate). The student, its signature and the store index the audit's answer was
+/// kept at.
+fn audited_student(auditor: Box<dyn ForceProvider>) -> (SurrogateKs, Signature, usize) {
+    let (s, sig) = cleared_student();
+    let tier = s.policy().energy_std_per_atom;
+    assert!(AUDIT_OFFSET / 3.0 <= tier && AUDIT_OFFSET / 2.0 > tier, "the premise: the offset fails per bonded atom only");
+    let mut s = s.with_auditor(auditor);
+    let p = *s.policy();
+    s.set_policy(FallbackPolicy { audit_every: 1, ..p });
+    assert!(s.trusted(), "the premise: {:?}", s.untrusted_reason());
+    let n = s.samples();
+    let r = s.evaluate(&h2_with(INSIDE, &[STRAY_AT]), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+    assert!(s.audit_in_flight(), "the premise: the answer is audited on the background teacher");
+    settle(&mut s);
+    s.take_events();
+    s.poll_audit();
+    assert_eq!(s.samples(), n + 1, "the premise: the audit's answer is kept");
+    (s, sig, n)
+}
+
+/// A teacher whose every answer with a bonded pair (some atom has a neighbour within r_cut) is `shift` Ha off the
+/// Morse surface: the bonded part is perturbed alone — the composition stays exact (the scene and the fragment move
+/// together, a lone atom does not) and the model, fitted before, is wrong on the fragment.
+struct BondedShift {
+    inner: Composing,
+    shift: f64,
+}
+
+impl ForceProvider for BondedShift {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let mut r = self.inner.evaluate(scene, should_abort)?;
+        if !no_neighbours(&positions(scene), Basis::new(&[1]).r_cut) {
+            r.energy += self.shift;
+            r.stats.energy.total = r.energy;
+        }
+        Ok(r)
+    }
+
+    fn name(&self) -> &'static str {
+        "composing morse"
+    }
+
+    fn reset(&mut self) {}
+}
+
+/// Plan Task 5 step 1 (spec §4.5, review I6): after clearance, the background teacher shows a composite offset the
+/// parts alone never show ([`AUDIT_OFFSET`] whenever a stray atom is present). The audit of a cleared answer fails
+/// **per bonded atom** (it would pass per scene atom), and in this order: the signature is refused at once, with the
+/// audit's numbers; its samples (the three the checks released and the audit's own) go back to `Q_STRAY`; and an
+/// attribution check is queued at the audited geometry with the audit's raw answer as its scene. The model's trust is
+/// untouched meanwhile and after: on the bonded part alone the model is right, so the failure is the composition's
+/// (`StrayAuditAttributed { model: false }`), nothing enters the audit record, and the next step there falls back on
+/// rule 5a with no new check.
+#[test]
+fn a_failed_stray_audit_refuses_and_blames_by_a_check() {
+    let (mut s, sig, audited) = audited_student(Box::new(Composing::new(AUDIT_OFFSET)));
+    // 1. refused, held, the refit armed
+    assert!(
+        matches!(s.stray_book.state(&sig), Some(StrayState::Refused(why)) if why.starts_with("audit: teacher − model +2.50e-3 Ha, 1.2e-3 > 1.0e-3 Ha per bonded atom")),
+        "{:?}",
+        s.stray_book.state(&sig)
+    );
+    assert_eq!((s.quarantine[audited], s.stray_held_out()), (Q_STRAY, 4), "the released samples and the audit's own are held: {:?}", &s.quarantine[40..]);
+    assert!(s.pending_refit && s.species_dirty);
+    // 2. the attribution check at the audited geometry, the model untouched meanwhile
+    let p = s.stray_pending.as_ref().expect("an attribution check in flight");
+    assert!(p.attribution.is_some() && p.pos == positions(&h2_with(INSIDE, &[STRAY_AT])));
+    assert!((p.scene.energy - SpeciesMorse::energy_and_forces(&p.pos, &p.z).0 - AUDIT_OFFSET).abs() < 1e-12, "the audit's own raw answer is the check's scene");
+    assert!(s.trusted() && s.failed_audits.is_empty() && s.audit_failed().is_none(), "{:?}", s.untrusted_reason());
+    assert!(!s.audit_flip, "no flip to book: the model was not untrusted");
+    // 3. attributed: the composition's
+    settle(&mut s);
+    let ev = s.take_events();
+    let att: Vec<&sim::TeachEvent> = ev.iter().filter(|e| matches!(e.outcome, TeachOutcome::StrayAuditAttributed { .. })).collect();
+    assert_eq!(
+        att.iter().map(|e| (e.origin, e.rule, e.outcome)).collect::<Vec<_>>(),
+        [(TeachOrigin::Audit, TeachRule::Audit, TeachOutcome::StrayAuditAttributed { model: false })],
+        "{ev:?}"
+    );
+    assert!(att[0].detail.contains("is the composition's, not the model's") && att[0].detail.contains("E_scene − E_frag − Σ E_atom = +2.500 mHa"), "{}", att[0].detail);
+    assert!(att[0].gap.is_some_and(|g| g.abs() < 1e-6), "the model on the bonded part alone: {:?}", att[0].gap);
+    assert!(s.trusted() && s.failed_audits.is_empty() && s.audit_failed().is_none(), "the model untouched: {:?}", s.untrusted_reason());
+    assert!(matches!(s.stray_book.state(&sig), Some(StrayState::Refused(_))), "the attribution books nothing");
+    // the next step there is DFT's and checks nothing (refused)
+    let r = judged_step(&mut s, &h2_with(INSIDE, &[STRAY_AT]));
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert!(r.stats.notes.iter().any(|n| n.contains("isolated atom — atom 2")), "{:?}", r.stats.notes);
+    settle(&mut s);
+    assert!(s.stray_pending.is_none());
+    assert_eq!(s.quarantine[s.samples() - 1], Q_STRAY);
+    assert_eq!(s.refit().unwrap().n_samples, 40, "the signature's samples are out of the fit for good");
+    assert!(s.trusted(), "{:?}", s.untrusted_reason());
+}
+
+/// Plan Task 5 step 1: the background teacher's bonded part is perturbed ([`BondedShift`], [`AUDIT_OFFSET`] on every
+/// answer with a bonded pair): the composition is exact, the model is wrong on the fragment. The audit of the cleared
+/// answer fails per bonded atom; the attribution check finds the model off on the bonded part alone by the same gap,
+/// so the failure enters the model's audit record (`StrayAuditAttributed { model: true }`: untrusted) — recorded at
+/// the scene's geometry with the label the model failed to meet there (the fragment's energy + E_ref(H), the
+/// fragment's forces, 0 on the stray atom). A refit re-judges it per bonded atom: still failed (per scene atom it
+/// would pass, 0.83 mHa), so the model stays untrusted; the signature is refused either way.
+#[test]
+fn a_failed_audit_with_a_wrong_fragment_counts_against_the_model() {
+    let (mut s, sig, _) = audited_student(Box::new(BondedShift { inner: Composing::new(0.0), shift: AUDIT_OFFSET }));
+    assert!(matches!(s.stray_book.state(&sig), Some(StrayState::Refused(_))));
+    assert!(s.trusted(), "not yet attributed");
+    settle(&mut s);
+    let ev = s.take_events();
+    let att = ev.iter().find(|e| matches!(e.outcome, TeachOutcome::StrayAuditAttributed { .. })).expect("an attribution event");
+    assert_eq!(att.outcome, TeachOutcome::StrayAuditAttributed { model: true }, "{}", att.detail);
+    assert!(att.detail.contains("is the model's") && att.detail.contains("E_scene − E_frag − Σ E_atom = +0.000 mHa"), "{}", att.detail);
+    assert_eq!(s.failed_audits.len(), 1);
+    let case = s.failed_audits[0].clone();
+    let sc = h2_with(INSIDE, &[STRAY_AT]);
+    let pos = positions(&sc);
+    let (fe, ff) = SpeciesMorse::energy_and_forces(&pos[..2], &[1, 1]);
+    let m = s.model().unwrap();
+    let e_ref = m.ref_energy[m.basis.species_index(1).unwrap()];
+    assert_eq!((case.pos.clone(), case.index, case.origin), (pos.clone(), None, AuditOrigin::Audit));
+    assert!((case.energy - (fe + AUDIT_OFFSET + e_ref)).abs() < 1e-12, "the fragment's label + E_ref: {} vs {}", case.energy, fe + AUDIT_OFFSET + e_ref);
+    assert_eq!((case.forces[0], case.forces[1], case.forces[2]), (ff[0], ff[1], [0.0; 3]));
+    assert!(!s.trusted() && s.audit_failed().is_some_and(|g| (g - AUDIT_OFFSET).abs() < 1e-6), "{:?} {:?}", s.untrusted_reason(), s.audit_failed());
+    assert!(s.audit_flip, "the flip is booked at the next evaluation (the last step was the model's)");
+    assert_eq!(s.audit_atoms, 2, "the checklist's per-atom numbers per bonded atom");
+    // re-judged at the refit, per bonded atom: still failed
+    s.refit().unwrap();
+    assert_eq!(s.failed_audits.len(), 1, "{:?}", s.user_notes);
+    assert!(!s.trusted(), "per bonded atom the gap is beyond the tier: {:?}", s.untrusted_reason());
+    assert!(s.user_notes.iter().any(|n| n.contains("still untrusted")), "{:?}", s.user_notes);
+}
+
+/// The conservative side (module doc, "Audits of a cleared answer"): without a background teacher no attribution check
+/// can run — the in-step audit of a cleared answer fails per bonded atom (the teacher's composite offset), the
+/// signature is refused and its samples held, and the failure counts against the model at once with the scene's own
+/// labels, as any failed audit.
+#[test]
+fn an_unattributable_stray_audit_counts_against_the_model() {
+    let (mut s, sig) = cleared_student();
+    s.auditor = None;
+    s.teacher = Box::new(Composing::new(AUDIT_OFFSET));
+    let p = *s.policy();
+    s.set_policy(FallbackPolicy { audit_every: 1, ..p });
+    assert!(s.trusted());
+    let sc = h2_with(INSIDE, &[STRAY_AT]);
+    let r = s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback, "the in-step audit's answer");
+    assert!(r.stats.notes.iter().any(|n| n.contains("no check can attribute the failure (no background teacher), so it counts against the model")), "{:?}", r.stats.notes);
+    assert!(matches!(s.stray_book.state(&sig), Some(StrayState::Refused(_))));
+    assert_eq!(s.stray_held_out(), 4);
+    assert_eq!(s.failed_audits.len(), 1);
+    let (e, _) = SpeciesMorse::energy_and_forces(&positions(&sc), &zs(&sc));
+    assert!((s.failed_audits[0].energy - (e + AUDIT_OFFSET)).abs() < 1e-12, "the scene's own label");
+    assert!(!s.trusted() && s.audit_atoms == 2, "{:?}", s.untrusted_reason());
+}
+
+/// Plan Task 5, A (`teach`'s over-tier report): a fallback at a cleared scene whose gap is beyond the energy tier per
+/// bonded atom but within it per scene atom is reported on the teacher's surface. The fixture of `rule7_uses_n_bonded`
+/// (tier 0.5 mHa; rule 7 refuses per bonded atom — a fallback its rule does not report on the teacher's surface), the
+/// teacher shifted 1.25 mHa: 0.42 mHa per scene atom, 0.62 mHa per bonded atom.
+#[test]
+fn over_tier_uses_n_bonded() {
+    let (mut s, _) = cleared_student();
+    let p = *s.policy();
+    s.set_policy(FallbackPolicy { energy_std_per_atom: 5e-4, force_std_abs: 1e-2, ..p });
+    let sc = h2_with(INSIDE, &[STRAY_AT]);
+    let (pos, z) = (positions(&sc), zs(&sc));
+    let m = s.model().unwrap();
+    let pr = m.predict(&pos, &z, true).unwrap();
+    let c = 1.25e-3 / (pr.energy_std.unwrap().powi(2) - (3.0 * m.sigma_e).powi(2)).sqrt();
+    for x in s.model.as_mut().unwrap().sigma_inv_chol.as_mut().expect("a posterior") {
+        *x /= c;
+    }
+    s.last_variance = None;
+    let shift = 1.25e-3;
+    assert!(shift / 3.0 <= 5e-4 && shift / 2.0 > 5e-4, "the premise");
+    s.teacher = Box::new(Shifted { inner: Composing::new(0.0), shift });
+    let r = s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert!(r.stats.notes.iter().any(|n| n.contains("epistemic energy std")), "rule 7: {:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.contains("reported on the teacher's surface")), "over the tier per bonded atom: {:?}", r.stats.notes);
+    assert!(s.last.as_ref().is_some_and(|l| !l.on_model));
+}
+
+/// Plan Task 5, B (Task 4 review): the stray force mask is never written. A released stray sample appended to a
+/// collection is recorded without it (its energy row and all three atoms' forces as the teacher solved them), while
+/// the store's copy is masked; a fresh attach reads the record unmasked and masks its store copy in memory. A model
+/// file likewise: written unmasked, masked again at the install.
+#[test]
+fn a_stray_record_carries_no_mask_and_a_load_masks_it() {
+    let dir = collection_root("stray-record");
+    let template = h2_with(1.1, &[]);
+    let policy = FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() };
+    let mut s = SurrogateKs::new(Box::new(Composing::new(0.0)), policy).with_teacher_tol(1e-6);
+    s.attach_collection(&dir, &template).unwrap();
+    s.set_reference_solved(1, SpeciesMorse::atom(1), 81, Some(0.0));
+    let mut rng = StdRng::seed_from_u64(0x57c);
+    for i in 0..40 {
+        let r = TRAINED[0].0 + (TRAINED[0].1 - TRAINED[0].0) * i as f64 / 39.0;
+        let origin: [f64; 3] = std::array::from_fn(|k| H2_AT[k] + rng.gen_range(-0.3..0.3));
+        s.evaluate(&big(dimer(r, unit_vector(&mut rng), origin, 1, 1)), &mut never()).unwrap();
+    }
+    s.refit().unwrap();
+    assert!(s.trusted(), "the premise: {:?}", s.untrusted_reason());
+    let mut s = s.with_auditor(Box::new(Composing::new(0.0)));
+    let in_coll = s.collection().unwrap().samples.len();
+    s.evaluate(&h2_with(CHECKS[0], &[STRAY_AT]), &mut never()).unwrap();
+    let i = s.samples() - 1;
+    settle(&mut s);
+    assert_eq!(s.quarantine[i], Q_NONE, "the premise: released and appended");
+    assert_eq!(s.store().unwrap().samples[i].force_mask, Some(vec![true, true, false]), "masked in memory");
+    let rec = &s.collection().unwrap().samples[in_coll].sample;
+    assert_eq!((rec.pos.len(), rec.force_mask.clone(), rec.use_energy), (3, None, true), "the record carries no stray mask");
+    drop(s);
+    // a fresh attach: the record as written, the store's copy masked in memory (and held: the clearance was the session's)
+    let mut t = SurrogateKs::new(Box::new(Composing::new(0.0)), policy).with_teacher_tol(1e-6);
+    t.attach_collection(&dir, &template).unwrap();
+    let rec = &t.collection().unwrap().samples[in_coll].sample;
+    assert_eq!((rec.pos.len(), rec.force_mask.clone()), (3, None), "read back unmasked");
+    let k = (0..t.samples()).find(|&k| t.store().unwrap().samples[k].pos.len() == 3).expect("the stray sample is in the store");
+    assert_eq!((t.store().unwrap().samples[k].force_mask.clone(), t.quarantine[k]), (Some(vec![true, true, false]), Q_STRAY));
+    // a model file: written unmasked, masked again at the install
+    let (c, _) = cleared_student();
+    let path = std::env::temp_dir().join(format!("stray-record-{}.model", std::process::id()));
+    c.save_sidecar(&path).unwrap();
+    let sc = surrogate::sidecar::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(sc.samples[40..43].iter().all(|x| x.pos.len() == 3 && x.force_mask.is_none()), "the file holds no stray mask");
+    let (mut u, _, _) = student(0.0, &TRAINED, 40, false);
+    u.install_sidecar(sc).unwrap();
+    assert!((40..43).all(|k| u.store().unwrap().samples[k].force_mask == Some(vec![true, true, false])), "masked again at the install");
+    // the helper: a segment's own mask keeps its other entries
+    let mut seg = exact_sample(&h2_with(CHECKS[0], &[STRAY_AT]));
+    seg.force_mask = Some(vec![false, true, true]);
+    seg.use_energy = false;
+    mask_stray_atoms(&mut seg, R_CUT);
+    assert_eq!(unmasked_record(&seg, R_CUT).force_mask, Some(vec![false, true, true]));
+}
+
+/// A standard normal deviate (Box–Muller).
+fn gauss(rng: &mut StdRng) -> f64 {
+    let (u, v): (f64, f64) = (rng.gen_range(1e-300..1.0), rng.gen());
+    (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos()
+}
+
+/// One labelled geometry of [`diag_stray_sigma_bias`]: the H₂ scene, its energy noise (Ha) and its force noise.
+type Noisy = (Scene, f64, Vec<[f64; 3]>);
+
+/// Plan Task 5, C (Task 4 review; measured once, not a gate): the fit's noise levels σ_E and σ_F with and without a
+/// set of released stray samples. A masked stray sample's energy row is still (E − Σ E_ref)/n over the scene's n = 3,
+/// so its label noise enters at 1/3 where the bonded part's own row has 1/2. Three fits per case: the 40 H₂ samples
+/// alone, with `k` released H₂ + H samples, and with the same `k` bonded parts alone (H₂: the same geometries and
+/// noise draws — the unbiased counterpart). Exact Morse labels, then labels with Gaussian noise per sample (energy)
+/// and per force component. Printed for the task report.
+#[test]
+fn diag_stray_sigma_bias() {
+    for (label, s_e, s_f) in [("exact labels", 0.0, 0.0), ("noisy labels (s_E 2e-4 Ha per sample, s_F 2e-4 Ha/Bohr)", 2e-4, 2e-4)] {
+        for k in [10usize, 40] {
+            let mut rng = StdRng::seed_from_u64(0x5ca1e);
+            let draw = |r: f64, rng: &mut StdRng| -> Noisy {
+                let origin: [f64; 3] = std::array::from_fn(|kk| H2_AT[kk] + rng.gen_range(-0.3..0.3));
+                let sc = big(dimer(r, unit_vector(rng), origin, 1, 1));
+                let de = s_e * gauss(rng);
+                let df: Vec<[f64; 3]> = (0..2).map(|_| std::array::from_fn(|_| s_f * gauss(rng))).collect();
+                (sc, de, df)
+            };
+            let base: Vec<Noisy> = (0..40).map(|i| draw(TRAINED[0].0 + (TRAINED[0].1 - TRAINED[0].0) * i as f64 / 39.0, &mut rng)).collect();
+            let extra: Vec<Noisy> = (0..k)
+                .map(|_| {
+                    let r = rng.gen_range(TRAINED[0].0..TRAINED[0].1);
+                    draw(r, &mut rng)
+                })
+                .collect();
+            let fit = |extra: &[Noisy], stray: bool| {
+                let mut s = SurrogateKs::new(Box::new(Composing::new(0.0)), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+                s.set_reference_energy(1, SpeciesMorse::atom(1));
+                for (j, (sc, de, df)) in base.iter().chain(extra).enumerate() {
+                    let mut sc = sc.clone();
+                    let mut df = df.clone();
+                    if stray && j >= base.len() {
+                        sc.nuclei.push(Nucleus::new(1, STRAY_AT));
+                        df.push([0.0; 3]);
+                    }
+                    let mut smp = exact_sample(&sc);
+                    smp.energy += de;
+                    for (f, d) in smp.forces.iter_mut().zip(&df) {
+                        for a in 0..3 {
+                            f[a] += d[a];
+                        }
+                    }
+                    s.add_sample(smp, &sc).unwrap();
+                }
+                // released: in the fit, as a clearance would leave them (the mask is applied at the store's entry)
+                for q in s.quarantine.iter_mut() {
+                    *q = Q_NONE;
+                }
+                let rep = s.refit().expect("a fit");
+                if stray {
+                    assert!(s.store().unwrap().samples[base.len()..].iter().all(|x| x.force_mask == Some(vec![true, true, false])), "the premise: masked");
+                }
+                (rep.n_samples, rep.sigma_e, rep.sigma_f)
+            };
+            let a = fit(&[], false);
+            let b = fit(&extra, true);
+            let c = fit(&extra, false);
+            println!(
+                "{label}, k = {k}: H₂ alone ({}) σ_E {:.4e} σ_F {:.4e} | + {k} released H₂ + H ({}) σ_E {:.4e} σ_F {:.4e} | + the same {k} as H₂ ({}) σ_E {:.4e} σ_F {:.4e} | stray / fragment: σ_E × {:.4}, σ_F × {:.4}; stray / H₂ alone: σ_E × {:.4}",
+                a.0,
+                a.1,
+                a.2,
+                b.0,
+                b.1,
+                b.2,
+                c.0,
+                c.1,
+                c.2,
+                b.1 / c.1,
+                b.2 / c.2,
+                b.1 / a.1
+            );
+        }
+    }
+}
