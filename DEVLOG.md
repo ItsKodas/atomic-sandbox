@@ -1171,6 +1171,25 @@ review: 0 Critical, 0 Important, 8 Minor, all fixed. The app gate passes 795 tes
 - **Gates:** app 796/0.
 - **Time:** about an hour, mostly spent pinning down the mechanism. The user's "nothing at all" pointed at the widget id rather than the worker.
 
+### Quiet refits (2026-11-17 to 2026-11-19, merge quiet-refits)
+
+- **Report:** "Can we PLEASE stop refitting all the samples on repeat whilst in model only mode", plus freezes.
+- **Round 1:**
+  - Paused refits run in the background.
+  - A discarded fit gets one bounded retry per generation.
+  - With no model yet, the first fit is shown: "the model's first fit is running — Play once it lands".
+- **Round 2:**
+  - The end-of-pass fit runs in the background. It froze the app at the end of a teach pass, and its verdict now follows when the fit lands (PassTail).
+  - `set_policy` re-judges only when a field it reads changes, so a Model only toggle went from 1.7 s to about 0 ms.
+  - One extra worker round runs after a refit lands.
+- **Round 3** (review: 4 Important):
+  - A new pass, a load, an attach or Forget ends a waiting tail first, so an old teach round never reads the new round's state and is never judged against another model.
+  - A draft or audit-cadence change no longer moves the model generation. A Model only toggle therefore no longer discards a running fit (the pass-end fit included) or blanks Worst-fitting.
+  - The pace wait comes before the extra round: the test saw 590 of 622 snapshots published without a tick before the fix.
+- **Test fallout:** three worker tests used an audit change as a cheap "new generation". They now use a real new fit and also check that an audit change rebuilds nothing.
+- **Gates (merged tree):** providers 457/0, validate surrogate 7/0, app 808/0.
+- **Lesson:** a cheap test trigger ("change the audit cadence to force a generation") hid exactly the coupling the user complained about.
+
 ### Process wins
 
 - An input-replay harness (M6 Task 8) that found a real app bug on its first scripts: a running relax
