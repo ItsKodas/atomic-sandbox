@@ -645,6 +645,10 @@ pub struct EvalStats {
     /// (`qm::ScfStats::partial`: min(f, 1 − f) ≥ `qm::PARTIAL_OCCUPATION_MIN`), ascending ε per spin, ↑ first;
     /// empty for a gapped state.
     pub partial: Vec<PartialLevel>,
+    /// Stray-atoms spec 2026-11-18: the final SCF step's frontier levels per spin channel, ↑ then ↓ (Ha) — the highest
+    /// eigenvalue with f ≥ ½ and the lowest with f < ½ among the computed block (witnesses included). `None` where a
+    /// channel has no such level, and both `None` from a provider without electrons (analytic, surrogate-answered steps).
+    pub frontier: [Frontier; 2],
     /// Plan 2026-11-13 Task 8 (spec §6.3, the `providers::branch_jump` guard): `Some(m)` when this step's change of F
     /// disagrees with the forces' trapezoid work since the same provider's previous evaluation by m (Ha) beyond the
     /// noise and third-order bound — the SCF moved to another stationary state. The answer is used for its step and
@@ -692,6 +696,14 @@ pub struct PartialLevel {
     pub index: usize,
     pub eps: f64,
     pub f: f64,
+}
+
+/// One spin channel's frontier levels (Ha; [`EvalStats::frontier`]): `homo` the highest eigenvalue with occupation
+/// f ≥ ½, `lumo` the lowest with f < ½ among the computed block; `None` when the channel has no such level.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Frontier {
+    pub homo: Option<f64>,
+    pub lumo: Option<f64>,
 }
 
 /// What the generator recorded for one pseudised species, for the badge, the Selection tab and the
@@ -751,6 +763,7 @@ impl Default for EvalStats {
             pseudised: Vec::new(),
             core_overlaps: Vec::new(),
             partial: Vec::new(),
+            frontier: [Frontier::default(); 2],
             branch_jump: None,
             spin_change: None,
         }

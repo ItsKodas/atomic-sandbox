@@ -578,8 +578,8 @@ fn elapsed_ms(t0: Instant) -> u64 {
 /// The `EvalStats` fields that come straight from `ScfStats` — the energy breakdown with E, TS and F, the partly
 /// occupied levels, and the tolerance the converged step was tested against (`ScfStats::tol_used`, F9: the GPU's
 /// partial-level stop shows as 1e-5) — plus the M7 ones: the pseudised species' summaries (from `setup`) and the
-/// core overlaps.
-fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec<String>, eig_tol_used: f64, system: &System) -> EvalStats {
+/// core overlaps — and the per-spin `frontier` levels of the converged state ([`frontier`]).
+fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec<String>, eig_tol_used: f64, system: &System, frontier: [sim::Frontier; 2]) -> EvalStats {
     let setup = system.ionic.as_deref();
     let ScfStats { iterations, energy, boundary_density, max_eigen_residual, poisson_residual, warnings, core_overlaps, partial, tol_used, .. } = stats;
     EvalStats {
@@ -615,9 +615,25 @@ fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec
         pseudised: setup.map(crate::pseudo::summaries).unwrap_or_default(),
         core_overlaps,
         partial: partial.into_iter().map(|p| sim::PartialLevel { spin: p.spin, index: p.index, eps: p.eps, f: p.f }).collect(),
+        frontier,
         branch_jump: None,
         spin_change: None,
     }
+}
+
+/// One spin channel's frontier levels (`EvalStats::frontier`) from the converged state's eigenvalues and their
+/// occupations (one f per stored orbital, `qm::KsState` / `qm_gpu::GpuState`): the highest ε with f ≥ ½ and the lowest
+/// with f < ½. Under `Aufbau` (exactly N_σ orbitals, all f = 1) `lumo` is `None`.
+fn frontier(evals: &[f64], occ: &[f64]) -> sim::Frontier {
+    let (mut homo, mut lumo): (Option<f64>, Option<f64>) = (None, None);
+    for (&e, &f) in evals.iter().zip(occ) {
+        if f >= 0.5 {
+            homo = Some(homo.map_or(e, |h| h.max(e)));
+        } else {
+            lumo = Some(lumo.map_or(e, |l| l.min(e)));
+        }
+    }
+    sim::Frontier { homo, lumo }
 }
 
 /// The `branch_jump` guard on one finished evaluation (module doc, "The branch_jump guard"; spec 2026-11-13 §6.3):
@@ -803,6 +819,7 @@ impl ForceProvider for CpuKs {
         let forces = qm::forces(&grid, &state, &system.nuclei, settings.sigma).map_err(solver_error)?;
         // the guard's spin measure (N↑ = N↓ only): the CPU spin reduction, compensated
         let spin_abs = (system.n_up == system.n_dn).then(|| qm::orbitals::spin_summary(&grid, &state.rho_up, &state.rho_dn, system.n_up, system.n_dn).abs_integral);
+        let levels = [frontier(&state.evals_up, &state.occ_up), frontier(&state.evals_dn, &state.occ_dn)];
         self.unocc.new_state(t0.elapsed());
         let display = self.display.then(|| {
             // ρ (+ ρ_pc when asked: the generator's core model, a display aid, never solved)
@@ -832,7 +849,7 @@ impl ForceProvider for CpuKs {
                                stats.max_eigen_residual, settings.eig_tol));
         }
         let energy = stats.energy.total;
-        let mut stats = eval_stats(stats, None, t0, notes, settings.eig_tol, &system);
+        let mut stats = eval_stats(stats, None, t0, notes, settings.eig_tol, &system, levels);
         judge_branch(&mut self.guard, &mut stats, scene, &grid, &system, &forces, spin_abs);
         Ok(ForceResult { energy, forces, stats, display, orbitals })
     }
@@ -1522,6 +1539,7 @@ impl GpuKs {
         // the guard's spin measure (N↑ = N↓ only): the orbital view's spin reduction, one readback (a failed one is
         // caught by the `device_fault` below and the evaluation repeated)
         let spin_abs = (system.n_up == system.n_dn).then(|| solver.spin_abs_integral(state));
+        let levels = [frontier(&state.evals_up, &state.occ_up), frontier(&state.evals_dn, &state.occ_dn)];
         self.unocc.new_state(t0.elapsed());
         let display = self.display.then(|| {
             let volume = self.textures.take(&self.ctx, grid.n.map(|n| n as u32));
@@ -1562,7 +1580,7 @@ impl GpuKs {
             self.drop_view_after_fault();
             None
         };
-        let mut stats = eval_stats(stats, Some(readbacks), t0, notes, eig_tol_used, &system);
+        let mut stats = eval_stats(stats, Some(readbacks), t0, notes, eig_tol_used, &system, levels);
         judge_branch(&mut self.guard, &mut stats, scene, &grid, &system, &forces, spin_abs);
         Ok(ForceResult { energy, forces, stats, display, orbitals })
     }
@@ -2042,6 +2060,59 @@ pub(crate) mod tests {
         assert!(*max > 0.0 && *max == expect.iter().copied().fold(0.0f32, f32::max), "max {max}");
         println!("CPU display: max ρ = {max:.6} e/Bohr³, breakdown {a:?}, eig res {:.2e}, Poisson res {:.2e}",
                  r.stats.max_eigen_residual, r.stats.poisson_residual);
+    }
+
+    /// `frontier`: the highest level with f ≥ ½ and the lowest with f < ½, whatever the order; `None` for a channel
+    /// without such a level (all occupied: the `Aufbau` block, or an empty channel).
+    #[test]
+    fn frontier_picks_the_half_occupation_split() {
+        let f = frontier(&[-0.2, -0.5, 0.1, 0.05], &[0.5, 1.0, 1e-9, 0.49]);
+        assert_eq!(f, sim::Frontier { homo: Some(-0.2), lumo: Some(0.05) });
+        assert_eq!(frontier(&[-0.5, -0.3], &[1.0, 1.0]), sim::Frontier { homo: Some(-0.3), lumo: None }, "no unoccupied level");
+        assert_eq!(frontier(&[0.2], &[1e-12]), sim::Frontier { homo: None, lumo: Some(0.2) }, "no occupied level");
+        assert_eq!(frontier(&[], &[]), sim::Frontier { homo: None, lumo: None });
+    }
+
+    /// The frontier levels of H₂ at 1.4 Bohr (41³ × 0.25, automatic multiplicity): the closed shell's ↑ and ↓ HOMO agree,
+    /// each below its channel's LUMO, and the HOMO is the solve's own lowest eigenvalue (σ_g, the one occupied level).
+    fn assert_h2_frontier(stats: &EvalStats, lowest: f64) -> f64 {
+        let [up, dn] = &stats.frontier;
+        println!("H₂ 41³: ↑ {up:?}, ↓ {dn:?}, lowest ε {lowest:+.8}");
+        let (hu, hd) = (up.homo.expect("↑ HOMO"), dn.homo.expect("↓ HOMO"));
+        assert!((hu - hd).abs() < 1e-6, "closed shell: ↑ HOMO {hu} vs ↓ {hd}");
+        for (s, f) in [("↑", up), ("↓", dn)] {
+            let (h, l) = (f.homo.unwrap(), f.lumo.expect("a computed unoccupied level"));
+            assert!(h < l, "{s}: HOMO {h} < LUMO {l}");
+        }
+        assert!((hu - lowest).abs() < 1e-6, "HOMO {hu} is the lowest eigenvalue {lowest}");
+        hu
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn cpu_h2_reports_frontier_levels() {
+        let mut c = CpuKs::new(1e-6);
+        let r = c.evaluate(&h2(41, 1.4), &mut never()).expect("CpuKs");
+        let state = c.warm.as_ref().expect("a converged state");
+        let lowest = state.evals_up.iter().chain(&state.evals_dn).copied().fold(f64::INFINITY, f64::min);
+        assert_h2_frontier(&r.stats, lowest);
+    }
+
+    /// As `cpu_h2_reports_frontier_levels` through the GPU provider, and its HOMO within 1e-3 Ha of the CPU's (f32 grid).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn gpu_h2_reports_frontier_levels() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let s = h2(41, 1.4);
+        let mut g = GpuKs::new(ctx, 1e-6);
+        let r = g.evaluate(&s, &mut never()).expect("GpuKs");
+        let state = g.solver.as_ref().and_then(|s| s.state()).expect("a converged state");
+        let lowest = state.evals_up.iter().chain(&state.evals_dn).copied().fold(f64::INFINITY, f64::min);
+        let gpu_homo = assert_h2_frontier(&r.stats, lowest);
+        let cpu = CpuKs::new(1e-6).evaluate(&s, &mut never()).expect("CpuKs");
+        let cpu_homo = cpu.stats.frontier[0].homo.expect("CPU ↑ HOMO");
+        assert!((gpu_homo - cpu_homo).abs() < 1e-3, "GPU HOMO {gpu_homo} vs CPU {cpu_homo}");
     }
 
     /// GPU vs CPU on the same discrete problem (σ = h = 0.25, 33³, tol 1e-6) along a short
