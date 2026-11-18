@@ -158,7 +158,7 @@ pub(super) enum Lone {
 /// Neumaier's compensated sum in the order given — the same additions as the model's energy
 /// (`surrogate::energy_and_forces`), so a reference answer equals the model's at a lone geometry
 /// bit for bit when the references are the model's.
-fn compensated_sum(values: &[f64]) -> f64 {
+pub(super) fn compensated_sum(values: &[f64]) -> f64 {
     let (mut sum, mut comp) = (0.0f64, 0.0f64);
     for &x in values {
         let t = sum + x;
@@ -177,6 +177,13 @@ fn compensated_sum(values: &[f64]) -> f64 {
 /// multiplicity are not compared (the references are neutral atoms at their own spin state).
 fn same_reference_settings(a: &Provenance, b: &Provenance) -> bool {
     a.grid_n == b.grid_n && a.h == b.h && a.sigma == b.sigma && a.tol == b.tol && a.teacher == b.teacher && a.ionic == b.ionic
+}
+
+/// The settings [`same_reference_settings`] compares, as one key (the `stray` module's signature surface): two
+/// provenances that compare equal there give the same key, and (`{:?}` of an f64 round-trips its value) the key tells
+/// apart any two that differ in those settings.
+pub(super) fn reference_settings_key(p: &Provenance) -> String {
+    format!("{}³ · h {:?} · σ {:?} · tol {:?} · {} · {}", p.grid_n, p.h, p.sigma, p.tol, p.teacher, p.ionic)
 }
 
 /// Whether the reference of species `z` is known to **end at a gap** in each spin channel (module doc, "The

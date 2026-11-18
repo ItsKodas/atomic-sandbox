@@ -11367,6 +11367,9 @@ mod residual_diag;
 /// Rule 0b: lone atoms answered from the isolated-atom references (`lone.rs`).
 mod lone;
 
+/// Stray atoms (spec 2026-11-18): the split, the floor, the composition check's verdict, the cleared region (`stray.rs`).
+mod stray;
+
 /// Spec 2026-11-12 R1: the recovery ranks offenders by their leave-one-out ratio (`recovery_loo.rs`).
 mod recovery_loo;
 

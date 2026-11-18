@@ -1222,6 +1222,9 @@ mod shared;
 pub use shared::{predecessor_of, COLLECTION_CHECKPOINT_PREFIX, PASS_STARTED_WITH_PREVIOUS_SOLVER};
 pub use purge::PURGE_WAIT_MIGRATION;
 mod store;
+// the stray-atom logic (spec 2026-11-18); plan Task 3 wires it into `evaluate` and the auditor, until then unused
+#[allow(dead_code)]
+mod stray;
 mod teach;
 mod trust;
 mod views;
