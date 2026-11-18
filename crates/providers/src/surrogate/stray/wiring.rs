@@ -115,6 +115,35 @@ impl SurrogateKs {
         self.side_queue.retain(|j| !matches!(j.2, JobKind::Fragment | JobKind::AtomAt(_)));
     }
 
+    /// The model may answer this scene as "bonded part + free atoms" (parent module doc, "Answering inside a region";
+    /// spec §4.4): it splits at the model's cutoff, every stray species is in the model's basis (rule 2, review M2), its
+    /// signature is `Cleared`, the floor still passes at these positions (a stray atom drifting within
+    /// [`STRAY_FACE_MARGIN`] of a face, a forced multiplicity, a shell fence since — the signature does not carry them)
+    /// and the region covers the bonded part's descriptors. The split, the region's worst energy residual and smallest
+    /// frontier margin (Ha); `None` otherwise. Read-only: a book built under another basis or surface than the model's
+    /// covers nothing (it is cleared at the next `stray_book_current`, controller ruling B).
+    pub(in crate::surrogate) fn stray_cleared(&self, pos: &[[f64; 3]], z: &[u8], prov: &Provenance) -> Option<(Split, f64, f64)> {
+        let model = self.model.as_ref()?;
+        if pos.len() != z.len() {
+            return None;
+        }
+        let split = split(pos, self.cutoff())?;
+        if split.stray.iter().any(|&i| model.basis.species_index(z[i]).is_none()) {
+            return None;
+        }
+        let (basis, key) = self.stray_key.as_ref()?;
+        if model.basis != *basis || reference_settings_key(&model.provenance) != *key {
+            return None;
+        }
+        let sig = Signature::new(z, &split, prov.charge, prov);
+        let Some(StrayState::Cleared { region, residual, margin }) = self.stray_book.state(&sig) else { return None };
+        if self.stray_floor(pos, z, prov, &split).is_some() {
+            return None;
+        }
+        let (desc, species) = self.bonded_descriptors(pos, z, &split)?;
+        region.contains(&desc, &species).then_some((split, *residual, *margin))
+    }
+
     /// Whether a cleared region of `sig` covers the bonded geometry of `pos` (module doc, "The hold-out").
     pub(in crate::surrogate) fn stray_covered(&mut self, pos: &[[f64; 3]], z: &[u8], split: &Split, sig: &Signature) -> bool {
         self.stray_book_current();

@@ -46,6 +46,7 @@
 use super::*;
 use sim::activity::{StuckInfo, TeachRule, TrustCheck, TrustKey};
 use sim::ClassKey;
+use super::stray::Split;
 
 /// Trust rule: both residual degrees of freedom of the fit must reach this.
 pub const MIN_RESIDUAL_DOF: f64 = 30.0;
@@ -1618,9 +1619,10 @@ impl SurrogateKs {
     }
 
     /// The refusal of a geometry with an atom near a misfit (`near_misfit_atoms`; spec 2026-11-13
-    /// §4.3), naming the first such atom — `evaluate`'s text. `None` when no atom is near.
-    pub(super) fn near_misfit_refusal(&self, pos: &[[f64; 3]], z: &[u8]) -> Option<Refusal> {
-        let i = self.near_misfit_atoms(pos, z).iter().position(|&b| b)?;
+    /// §4.3), naming the first such atom — `evaluate`'s text. `None` when no atom is near. `part`: the
+    /// split of a cleared stray-atom scene, whose bonded part is judged alone (`near_misfit_atoms_judged`).
+    pub(super) fn near_misfit_refusal(&self, pos: &[[f64; 3]], z: &[u8], part: Option<&Split>) -> Option<Refusal> {
+        let i = self.near_misfit_atoms_judged(pos, z, part).iter().position(|&b| b)?;
         Some(Refusal::new(
             format!(
                 "surrogate: atom {i} is within {:.2} training spreads of a training sample the model cannot reproduce",
@@ -1653,7 +1655,12 @@ impl SurrogateKs {
     /// the novelty (5d), a quarantine fence, an atom near a misfit (`NearMisfit`, spec 2026-11-13
     /// §4.3) or an audit fence. `None`: strict mode refuses there only for
     /// reasons that lift with trust (4, 4b, 6, 7), or answers.
-    pub(super) fn geometry_refusal(&self, pos: &[[f64; 3]], z: &[u8]) -> Option<Refusal> {
+    ///
+    /// `prov` is the settings the geometry was solved at: a cleared stray-atom geometry (`stray_cleared`, keyed by
+    /// its signature on `prov`; spec §4.4) is judged as `evaluate` judges it — its stray atoms exempt from 5a–5e, 5d
+    /// and the fences on the bonded part. Anything else with a stray atom is refused by 5a, so a held draft guess with
+    /// stray atoms is promoted (`judge_held_out`) only inside a cleared region of its signature (Task 3 review M2).
+    pub(super) fn geometry_refusal(&self, pos: &[[f64; 3]], z: &[u8], prov: &Provenance) -> Option<Refusal> {
         let model = self.model.as_ref()?;
         let pred = match model.predict(pos, z, true) {
             Ok(p) => p,
@@ -1662,23 +1669,25 @@ impl SurrogateKs {
         if let Some(r) = non_finite_answer(&pred) {
             return Some(r);
         }
-        if let (_, Some(r)) = self.envelope_outside(model, pos, z) {
+        let cleared = self.stray_cleared(pos, z, prov);
+        let part = cleared.as_ref().map(|c| &c.0);
+        if let (_, Some(r)) = self.envelope_outside_except(model, pos, z, part.map_or(&[][..], |s| &s.stray)) {
             if r.rule != TeachRule::NoGrade {
                 return Some(r);
             }
         }
         if pred.energy_std.is_some() {
-            if let Some((nu, at)) = self.novelty(pos, z).filter(|(nu, _)| *nu > 1.0) {
+            if let Some((nu, at)) = self.novelty_judged(pos, z, part).filter(|(nu, _)| *nu > 1.0) {
                 return Some(novelty_refusal(nu, at));
             }
         }
-        if !self.near_quarantined_cached(pos, z).is_empty() {
+        if !self.near_quarantined_judged(pos, z, part).is_empty() {
             return Some(Refusal::new("surrogate: near a quarantined geometry", TeachRule::NearQuarantine, None));
         }
-        if let Some(r) = self.near_misfit_refusal(pos, z) {
+        if let Some(r) = self.near_misfit_refusal(pos, z, part) {
             return Some(r);
         }
-        self.audit_fence_refusal(pos, z)
+        self.audit_fence_refusal_judged(pos, z, part)
     }
 
     /// The held-out draft guesses as a test set (round 1, MUST-1): at a refit, every `Q_DRAFT`
@@ -1708,7 +1717,7 @@ impl SurrogateKs {
             if self.shared.as_ref().and_then(|sh| sh.box_n.get(i)).is_some_and(|&n| self.box_offset(&s.z, n).is_none()) {
                 continue;
             }
-            if self.geometry_refusal(&s.pos, &s.z).is_some() {
+            if self.geometry_refusal(&s.pos, &s.z, &self.sample_provenance(i)).is_some() {
                 continue;
             }
             let case = FailedAudit { pos: s.pos.clone(), z: s.z.clone(), energy: s.energy, forces: s.forces.clone(), index: Some(i), ionic: ionic.clone(), rejudges: 0, origin: AuditOrigin::HeldOutGuess, pair: None };

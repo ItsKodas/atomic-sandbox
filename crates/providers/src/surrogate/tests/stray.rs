@@ -1235,3 +1235,346 @@ fn in_collection_mode_a_check_reads_raw_energies_and_a_release_appends() {
     assert_eq!(s.release_stray_samples(&sig85), 1);
     assert_eq!(s.quarantine[j], Q_REF_WAIT, "released into the reference wait, not the fit");
 }
+
+
+// ---- plan Task 4: answering a cleared, in-region scene ----
+
+/// The answering tests' geometries (H–H, Bohr): the region three checks at [`CHECKS`] open (ruling A's fixture,
+/// [`TRAINED`]) covers 1.4 ([`INSIDE`], never checked) and not 1.9 ([`OUTSIDE`]); both asserted in
+/// [`cleared_student`]. The region is a per-feature box of the checks' descriptors (`Region::contains`), so it covers a
+/// geometry between checks only where every feature is monotone between them — true at this spacing, not at 0.3 Bohr
+/// (measured: checks at 1.2 / 1.5 / 1.8 cover none of 1.25–1.75 but themselves).
+const INSIDE: f64 = 1.4;
+const OUTSIDE: f64 = 1.9;
+
+/// Whether `sig`'s region covers the bonded H₂ at H–H `r`.
+fn covers(s: &SurrogateKs, sig: &Signature, r: f64) -> bool {
+    let sc = h2_with(r, &[STRAY_AT]);
+    let (d, sp) = s.bonded_descriptors(&positions(&sc), &zs(&sc), &Split { bonded: vec![0, 1], stray: vec![2] }).unwrap();
+    matches!(s.stray_book.state(sig), Some(StrayState::Cleared { region, .. }) if region.contains(&d, &sp))
+}
+
+/// A trusted H₂ student ([`TRAINED`]) whose H₂ + H signature three real composition checks at [`CHECKS`] (asserted
+/// distinct) cleared, refitted with the samples the checks released (so the bonded part at [`INSIDE`] lies inside the
+/// training data: it must pass rules 5b–5e on its own), its events drained; the book survives the refit (same basis),
+/// and its region covers [`INSIDE`] and not [`OUTSIDE`] (asserted).
+fn cleared_student() -> (SurrogateKs, Signature) {
+    let (mut s, _, _) = student(0.0, &TRAINED, 40, true);
+    assert_distinct(&mut s, &CHECKS);
+    let sig = sig_of(&s, &h2_with(CHECKS[0], &[STRAY_AT]));
+    for &r in &CHECKS {
+        let res = s.evaluate(&h2_with(r, &[STRAY_AT]), &mut never()).unwrap();
+        assert_eq!(res.stats.source, Source::Fallback, "a check geometry before clearance: {:?}", res.stats.notes);
+        settle(&mut s);
+    }
+    assert!(matches!(s.stray_book.state(&sig), Some(StrayState::Cleared { .. })), "{:?}", s.stray_book.state(&sig));
+    assert_eq!(s.refit().unwrap().n_samples, 43, "the checks' samples are released into the fit");
+    assert!(!s.stray_book_current() && s.trusted(), "the same basis keeps the book; trusted: {:?}", s.untrusted_reason());
+    assert!(covers(&s, &sig, INSIDE) && !covers(&s, &sig, OUTSIDE), "the premise: the region covers {INSIDE}, not {OUTSIDE}");
+    s.take_events();
+    (s, sig)
+}
+
+/// The step note of a cleared answer (spec §4.4, review M6), with the book's numbers for `sig`.
+fn cleared_note(s: &SurrogateKs, sig: &Signature) -> String {
+    let Some(StrayState::Cleared { residual, margin, .. }) = s.stray_book.state(sig) else { panic!("not cleared") };
+    format!(
+        "stray atoms: model for the bonded part + free atoms (composition measured, 3 checks; worst residual {:.2} mHa, frontier margin {:.0} mHa)",
+        residual * 1e3,
+        margin * 1e3
+    )
+}
+
+/// One strict step at `sc`, asserting first that the read-only verdicts agree with it (plan Task 4,
+/// `would_answer_agrees_with_evaluate`): `would_answer`, `atom_verdicts` and the readiness readout's `first_refusal`
+/// answer exactly when `evaluate` does, and a refusal names the rule and atom the step's Activity row names.
+fn judged_step(s: &mut SurrogateKs, sc: &Scene) -> ForceResult {
+    let (pos, z) = (positions(sc), zs(sc));
+    let prov = s.provenance_for(sc);
+    let would = s.would_answer(&pos, &z, &prov);
+    let atoms = s.atom_verdicts(sc).expect("atoms");
+    let first = s.first_refusal(&pos, &z, &prov).map(|r| (r.rule, r.atom));
+    s.take_events();
+    let r = s.evaluate(sc, &mut never()).unwrap();
+    let answered = r.stats.source == Source::Surrogate;
+    assert_eq!(would.is_ok(), answered, "would_answer {would:?} against the step's {:?}: {:?}", r.stats.source, r.stats.notes);
+    assert_eq!(atoms.answers(), answered, "atom_verdicts {atoms:?} against the step's {:?}", r.stats.source);
+    assert_eq!(first, would.err(), "the readiness readout's refusal is would_answer's");
+    if let Err(code) = would {
+        let ev = s.take_events();
+        let row = ev.iter().find(|e| e.origin == TeachOrigin::Fallback).expect("a fallback row");
+        assert_eq!((row.rule, row.atom), code, "{}", row.detail);
+    }
+    r
+}
+
+fn ulp(x: f64) -> f64 {
+    let a = x.abs();
+    f64::from_bits(a.to_bits() + 1) - a
+}
+
+/// Plan Task 4, review M1: after three checks clear H₂ + H, a fourth bonded geometry inside the region (never checked)
+/// is the model's (`Source::Surrogate`). Its answer is the model's own `predict(scene)`, which is spec §2's sum: the
+/// energy within 4 ulp of `predict(H₂ alone) + E_ref(H)`, the bonded forces bit for bit the bonded part's, the stray
+/// force exactly 0; the note says what answered and on what measurement. The step queues no check.
+#[test]
+fn a_cleared_scene_is_the_models() {
+    let (mut s, sig) = cleared_student();
+    let sc = h2_with(INSIDE, &[STRAY_AT]);
+    let r = judged_step(&mut s, &sc);
+    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+    let m = s.model().unwrap();
+    let frag = big(dimer(INSIDE, [1.0, 0.0, 0.0], H2_AT, 1, 1));
+    assert_eq!(positions(&frag), positions(&sc)[..2].to_vec(), "the premise: the bonded part alone");
+    let pf = m.predict(&positions(&frag), &[1, 1], false).unwrap();
+    let e_ref = m.ref_energy[m.basis.species_index(1).unwrap()];
+    let want = pf.energy + e_ref;
+    println!("E_scene {:.15} vs E_frag + E_ref {want:.15}: {:.1} ulp", r.energy, (r.energy - want).abs() / ulp(want));
+    assert!((r.energy - want).abs() <= 4.0 * ulp(want), "E {} vs {want}", r.energy);
+    for k in 0..2 {
+        assert_eq!(r.forces[k].map(f64::to_bits), pf.forces[k].map(f64::to_bits), "bonded atom {k}: bit for bit");
+    }
+    assert_eq!(r.forces[2], [0.0; 3], "the stray atom's force is exactly 0");
+    assert!(pf.forces[0][0].abs() > 1e-3, "the premise: nonzero bonded forces ({:?})", pf.forces);
+    assert!(r.stats.notes.contains(&cleared_note(&s, &sig)), "{:?}", r.stats.notes);
+    assert!(s.stray_pending.is_none() && s.side_queue.is_empty(), "no check inside the region");
+}
+
+/// Plan Task 4: H–H 1.9 Bohr lies outside the cleared region — rule 5a refuses (the stray atom), the teacher answers,
+/// and the fallback is one more check, whose pass grows the region (`StrayCheckingNew`); the next step there is the
+/// model's.
+#[test]
+fn outside_the_region_falls_back_and_checks() {
+    let (mut s, sig) = cleared_student();
+    let sc = h2_with(OUTSIDE, &[STRAY_AT]);
+    let r = judged_step(&mut s, &sc);
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert!(r.stats.notes.iter().any(|n| n.contains("isolated atom — atom 2")), "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.contains("stray atoms (H2 + H) — a composition check") && n.contains("queued")), "{:?}", r.stats.notes);
+    settle(&mut s);
+    let ev = s.take_events();
+    assert!(ev.iter().any(|e| e.outcome == TeachOutcome::StrayCheckingNew), "{ev:?}");
+    assert!(covers(&s, &sig, OUTSIDE), "the region grows");
+    // with its released sample fitted, the next step there is the model's
+    s.refit().unwrap();
+    let r = judged_step(&mut s, &sc);
+    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+}
+
+/// Plan Task 4, review I4: rule 7 normalises per **bonded** atom. With the energy tier at 0.5 mHa per atom (and the
+/// force tier at 1e-2 Ha/Bohr, so rule 6 does not decide first), the model's posterior factor is scaled so that at the
+/// cleared geometry the epistemic energy std √(e² − (3 s_E)²) is 1.25 mHa: 0.42 mHa per atom over the scene's 3 atoms
+/// (it would pass), 0.62 mHa over the bonded part's 2 (it fails). The step falls back on rule 7, and the read-only
+/// verdicts agree; rule 6 passes and the stray atom's force std is exactly 0 (asserted).
+#[test]
+fn rule7_uses_n_bonded() {
+    let (mut s, _) = cleared_student();
+    let p = *s.policy();
+    s.set_policy(FallbackPolicy { energy_std_per_atom: 5e-4, force_std_abs: 1e-2, ..p });
+    assert!(s.trusted(), "the premise: {:?}", s.untrusted_reason());
+    let sc = h2_with(INSIDE, &[STRAY_AT]);
+    let (pos, z) = (positions(&sc), zs(&sc));
+    let epistemic = |s: &SurrogateKs| {
+        let m = s.model().unwrap();
+        let p = m.predict(&pos, &z, true).unwrap();
+        (p.energy_std.unwrap().powi(2) - (3.0 * m.sigma_e).powi(2)).sqrt()
+    };
+    let c = 1.25e-3 / epistemic(&s);
+    let model = s.model.as_mut().unwrap();
+    for x in model.sigma_inv_chol.as_mut().expect("a posterior") {
+        *x /= c;
+    }
+    s.last_variance = None;
+    assert!((epistemic(&s) - 1.25e-3).abs() < 1e-7, "{:e}", epistemic(&s));
+    let m = s.model().unwrap().clone();
+    let pred = m.predict(&pos, &z, true).unwrap();
+    let (e, f) = (pred.energy_std.unwrap(), pred.force_std_epistemic.clone().unwrap());
+    let infl = s.atom_inflation(&m, &pos, &z);
+    assert!(s.energy_variance_refusal(&m, 3, 3, e, &infl).is_none(), "the premise: it passes per scene atom");
+    assert!(s.energy_variance_refusal(&m, 3, 2, e, &infl).is_some(), "the premise: it fails per bonded atom");
+    let v = s.variance_check_n(&m, &pred, e, &f, &pos, &z, 3);
+    assert!(v.accept && v.atoms[2] == 0.0, "the premise: rules 6–7 per scene atom pass, the stray atom's std is 0: {:?}", v.atoms);
+    assert_eq!(s.would_answer(&pos, &z, &s.provenance_for(&sc)), Err((TeachRule::EnergyUncertainty, None)));
+    let r = judged_step(&mut s, &sc);
+    assert_eq!(r.stats.source, Source::Fallback);
+    assert!(r.stats.notes.iter().any(|n| n.contains("epistemic energy std 6.25e-4 > 5.00e-4 Ha/atom")), "{:?}", r.stats.notes);
+    // the variance cadence: a verdict reached while the stray atom was not exempt (here near a face: rule 5a refuses,
+    // and the variance, per scene atom, accepts) is not reused for the next, cleared step at the same neighbour counts
+    let near_face = h2_with(INSIDE, &[[0.0, 6.5, 0.0]]);
+    assert_eq!(judged_step(&mut s, &near_face).stats.source, Source::Fallback);
+    assert!(s.last_variance.as_ref().is_some_and(|v| v.accept), "the premise: an accepting verdict per scene atom");
+    let back = h2_with(INSIDE, &[[0.0, 5.9, 0.0]]);
+    let r = judged_step(&mut s, &back);
+    assert!(r.stats.notes.iter().any(|n| n.contains("epistemic energy std 6.25e-4")), "judged afresh per bonded atom: {:?}", r.stats.notes);
+}
+
+/// The teacher, shifted by `shift` Ha everywhere after the model was fitted: every model ↔ teacher switch then moves
+/// the reported energy by about `shift`, so an unbooked switch shows in the energy ledger.
+struct Shifted {
+    inner: Composing,
+    shift: f64,
+}
+
+impl ForceProvider for Shifted {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let mut r = self.inner.evaluate(scene, should_abort)?;
+        r.energy += self.shift;
+        r.stats.energy.total = r.energy;
+        Ok(r)
+    }
+
+    fn name(&self) -> &'static str {
+        // the model's teacher by name: the same surface (the provenance names it)
+        "composing morse"
+    }
+
+    fn reset(&mut self) {}
+}
+
+/// Review Focus 1, spec §4.4 re-entry (review M3): the stray H on a path 8 → 5 → 8 Bohr from H₂'s centre in 1/8-Bohr
+/// steps, the teacher shifted 10 mHa off the model. At ≥ 6 Bohr (stray, cleared) the model answers; inside r_cut the
+/// ordinary rules refuse and the teacher answers on its own surface. Every model ↔ teacher switch carries a booking
+/// (`refit_jump`, from `transition_jump`), and E_conserved has no unbooked step: per step, ΔE_reported − J +
+/// ½ (F₀ + F₁)·Δr — what the driver's E_conserved moves by beyond the bounded shadow term — stays at the trapezoid's
+/// error, far below the 10 mHa an unbooked switch would leave. No sample flood: the way back out keeps no copy of the
+/// way in's fallbacks.
+#[test]
+fn reentry_and_exit_book_every_switch() {
+    let (mut s, _) = cleared_student();
+    s.teacher = Box::new(Shifted { inner: Composing::new(0.0), shift: 1e-2 });
+    let mut path: Vec<f64> = (0..=24).map(|k| 8.0 - 0.125 * k as f64).collect();
+    path.extend((1..=24).map(|k| 5.0 + 0.125 * k as f64));
+    let n0 = s.samples();
+    let mut at_turn = n0;
+    let mut prev: Option<(f64, Vec<[f64; 3]>, Vec<[f64; 3]>, bool)> = None;
+    let (mut switches, mut rules) = (0, Vec::new());
+    for (k, &d) in path.iter().enumerate() {
+        if k == 25 {
+            at_turn = s.samples();
+        }
+        let stray = [H2_AT[0], H2_AT[1] + d, H2_AT[2]];
+        let sc = h2_with(INSIDE, &[stray]);
+        if d < R_CUT {
+            rules.push(s.would_answer(&positions(&sc), &zs(&sc), &s.provenance_for(&sc)).err().map(|e| e.0));
+        }
+        let r = judged_step(&mut s, &sc);
+        let on_model = s.last.as_ref().unwrap().on_model;
+        assert_eq!(r.stats.source == Source::Surrogate, d >= R_CUT, "d = {d}: {:?}", r.stats.notes);
+        assert_eq!(on_model, d >= R_CUT, "d = {d}: the re-entry steps are reported on the teacher's surface");
+        let pos = positions(&sc);
+        if let Some((e0, p0, f0, m0)) = prev.take() {
+            let j = r.stats.refit_jump;
+            if on_model != m0 {
+                switches += 1;
+                assert!(j.is_some(), "d = {d}: an unbooked switch ({} → {})", if m0 { "model" } else { "teacher" }, if on_model { "model" } else { "teacher" });
+            }
+            let mut work = 0.0;
+            for ((a, b), (fa, fb)) in p0.iter().zip(&pos).zip(f0.iter().zip(&r.forces)) {
+                for k in 0..3 {
+                    work += 0.5 * (fa[k] + fb[k]) * (b[k] - a[k]);
+                }
+            }
+            let unbooked = r.energy - e0 - j.unwrap_or(0.0) + work;
+            assert!(unbooked.abs() < 1e-5, "d = {d}: E_conserved moves by {unbooked:.3e} Ha (jump {j:?})");
+        }
+        prev = Some((r.energy, pos, r.forces.clone(), on_model));
+    }
+    println!("re-entry refusals: {rules:?}; {} samples kept on the way in, {} on the way out", at_turn - n0, s.samples() - at_turn);
+    assert_eq!(switches, 2, "in once, out once");
+    assert!(rules.iter().all(|r| r.is_some_and(|r| r != TeachRule::IsolatedAtom)), "inside r_cut the ordinary rules refuse: {rules:?}");
+    assert_eq!(s.samples(), at_turn, "no sample flood: the way out revisits the way in's geometries, and keeps none of them");
+}
+
+/// Review Focus 3: a stray atom drifting toward a face during a cleared run falls back as soon as it is within the
+/// floor's 4 Bohr of a face — the floor is re-checked at every step, the reason shown in the step's notes — and the
+/// model answers again once it is back.
+#[test]
+fn a_stray_near_a_face_falls_back_inside_a_cleared_region() {
+    let (mut s, _) = cleared_student();
+    // the 81³ cell's half-extent is 10 Bohr: at y = 5.9 the stray H is 4.1 Bohr from a face, at 6.5 3.5 Bohr
+    for (y, model) in [(5.9, true), (6.5, false), (5.9, true)] {
+        let sc = h2_with(INSIDE, &[[0.0, y, 0.0]]);
+        let r = judged_step(&mut s, &sc);
+        assert_eq!(r.stats.source == Source::Surrogate, model, "y = {y}: {:?}", r.stats.notes);
+        if !model {
+            assert!(r.stats.notes.iter().any(|n| n.contains("box: the stray H is 3.50 Bohr from a face")), "{:?}", r.stats.notes);
+            assert!(s.stray_pending.is_none(), "no check of a floor-refused scene");
+        }
+    }
+}
+
+/// Plan Task 4: the read-only verdicts agree with `evaluate` on the answering tests' scenes (each step of those tests
+/// goes through [`judged_step`]); here they are walked once more side by side — cleared, outside the region, a stray
+/// near a face, a stray back inside r_cut, cleared again — and two more facts: a stray species missing from the basis
+/// has no exemption (rule 2), and two stray H are another signature (rule 5a's).
+#[test]
+fn would_answer_agrees_with_evaluate() {
+    let (mut s, _) = cleared_student();
+    for (sc, model) in [
+        (h2_with(INSIDE, &[STRAY_AT]), true),
+        (h2_with(OUTSIDE, &[STRAY_AT]), false),
+        (h2_with(INSIDE, &[[0.0, 6.5, 0.0]]), false),
+        (h2_with(INSIDE, &[[0.0, 2.0, 0.0]]), false),
+        (h2_with(INSIDE, &[STRAY_AT]), true),
+    ] {
+        assert_eq!(judged_step(&mut s, &sc).stats.source == Source::Surrogate, model);
+        settle(&mut s);
+    }
+    // a He stray atom: not in the basis (rule 2), no exemption
+    let mut he = h2_with(INSIDE, &[STRAY_AT]);
+    he.nuclei[2].z = 2;
+    let prov = s.provenance_for(&he);
+    assert!(s.stray_cleared(&positions(&he), &zs(&he), &prov).is_none());
+    assert!(matches!(s.would_answer(&positions(&he), &zs(&he), &prov), Err((TeachRule::NewSpecies(2), _))));
+    // two stray H: another signature (and the floor's spin rule), rule 5a's
+    let two = h2_with(INSIDE, &[STRAY_AT, [-5.5, 3.0, 5.0]]);
+    assert_eq!(judged_step(&mut s, &two).stats.source, Source::Fallback);
+}
+
+/// Task 3 review M2, kept with the exemption: `judge_held_out` reads `geometry_refusal`, which exempts stray atoms
+/// only inside a cleared region of the signature (`stray_cleared`). A draft guess with a stray atom inside the region
+/// is kept at the draft hold-out and promoted; one outside stays held (`Q_STRAY`), and even forced to `Q_DRAFT` it is
+/// never promoted — rule 5a refuses it there.
+#[test]
+fn a_stray_draft_guess_is_promoted_only_inside_a_cleared_region() {
+    let (mut s, _) = cleared_student();
+    let keep = |s: &mut SurrogateKs, r: f64| {
+        let sc = h2_with(r, &[STRAY_AT]);
+        let (pos, z) = (positions(&sc), zs(&sc));
+        let (e, f) = SpeciesMorse::energy_and_forces(&pos, &z);
+        let prov = s.provenance_for(&sc);
+        let mut notes = Vec::new();
+        assert!(s.keep_sample(&pos, &z, e, &f, Some(0.0), Some(2), &prov, SampleTag::DraftAudit, &mut notes), "{notes:?}");
+        (s.samples() - 1, pos, z, prov)
+    };
+    let (a, pos_a, z_a, prov_a) = keep(&mut s, INSIDE);
+    let (b, pos_b, z_b, prov_b) = keep(&mut s, OUTSIDE);
+    let (c, _, _, _) = keep(&mut s, OUTSIDE + 0.05);
+    assert_eq!((s.quarantine[a], s.quarantine[b], s.quarantine[c]), (Q_DRAFT, Q_STRAY, Q_STRAY));
+    assert!(s.geometry_refusal(&pos_a, &z_a, &prov_a).is_none(), "inside the region: strict mode's domain");
+    assert_eq!(s.geometry_refusal(&pos_b, &z_b, &prov_b).map(|r| r.rule), Some(TeachRule::IsolatedAtom));
+    s.quarantine[c] = Q_DRAFT;
+    assert_eq!(s.judge_held_out(), 1);
+    assert_eq!((s.quarantine[a], s.quarantine[b], s.quarantine[c]), (Q_NONE, Q_STRAY, Q_DRAFT), "only the covered guess is promoted");
+}
+
+
+/// Ruling (the fences judge the bonded part alone, spec §4.4 "the bonded part must pass every rule on its own"): a
+/// forgotten H₂ sample at the cleared geometry fences H₂ there, and so it fences H₂ + a stray H. Judged on the whole
+/// scene the quarantine fence (the worst atom's distance to the fenced geometry) would let the stray H — no atom of
+/// the fenced H₂ is its counterpart — carry the geometry outside (asserted: the premise).
+#[test]
+fn a_fence_on_the_bonded_part_fences_the_cleared_scene() {
+    let (mut s, _) = cleared_student();
+    let sc = h2_with(INSIDE, &[STRAY_AT]);
+    let h2 = big(dimer(INSIDE, [1.0, 0.0, 0.0], H2_AT, 1, 1));
+    s.add_sample(exact_sample(&h2), &h2).unwrap();
+    let i = s.samples() - 1;
+    s.quarantine.resize(s.samples(), Q_NONE);
+    s.quarantine[i] = Q_FORGOTTEN;
+    assert!(!s.near_quarantined_cached(&positions(&h2), &zs(&h2)).is_empty(), "the premise: H₂ alone is fenced");
+    assert!(s.near_quarantined_cached(&positions(&sc), &zs(&sc)).is_empty(), "the premise: the whole scene escapes it");
+    let r = judged_step(&mut s, &sc);
+    assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+    assert_eq!(s.would_answer(&positions(&sc), &zs(&sc), &s.provenance_for(&sc)), Err((TeachRule::NearQuarantine, None)));
+}

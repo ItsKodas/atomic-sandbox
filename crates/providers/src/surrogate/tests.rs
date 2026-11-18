@@ -1646,7 +1646,7 @@ fn a_geometry_near_a_misfit_is_refused_and_far_ones_answer() {
     let far = s.evaluate(&h2(2.1), &mut never()).unwrap();
     assert_eq!(far.stats.source, Source::Surrogate, "{:?}", s.ledger.events.back());
     let (pos, z) = pos_z(&near);
-    let g = s.geometry_refusal(&pos, &z);
+    let g = s.geometry_refusal(&pos, &z, &s.provenance_for(&near));
     assert_eq!(g.as_ref().map(|r| r.rule), Some(R::NearMisfit), "{g:?}");
     let v = s.would_answer(&pos, &z, &s.provenance_for(&near));
     assert!(matches!(v, Err((R::NearMisfit, Some(_)))), "{v:?}");
@@ -1777,7 +1777,7 @@ fn a_misfit_beyond_its_limit_fences_nothing() {
     let sc = h2(1.45);
     let (pos, z) = pos_z(&sc);
     assert_eq!(s.near_misfit_atoms(&pos, &z), vec![false, false]);
-    assert!(s.geometry_refusal(&pos, &z).is_none_or(|r| r.rule != R::NearMisfit));
+    assert!(s.geometry_refusal(&pos, &z, &s.provenance_for(&sc)).is_none_or(|r| r.rule != R::NearMisfit));
     s.evaluate(&sc, &mut never()).unwrap();
     let ev = s.ledger.events.back().cloned().unwrap();
     println!("r = 1.45: {:?} {:?}: {}", ev.rule, ev.outcome, ev.detail);

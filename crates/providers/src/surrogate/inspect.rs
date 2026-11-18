@@ -130,7 +130,10 @@ impl SurrogateKs {
         if let Some(r) = non_finite_answer(&pred) {
             return Some(r);
         }
-        if let (_, Some(r)) = self.envelope_outside(model, pos, z) {
+        // a cleared stray-atom scene, judged as `evaluate` judges it (spec §4.4)
+        let cleared = self.stray_cleared(pos, z, prov);
+        let part = cleared.as_ref().map(|c| &c.0);
+        if let (_, Some(r)) = self.envelope_outside_except(model, pos, z, part.map_or(&[][..], |s| &s.stray)) {
             return Some(r);
         }
         let posterior = match (pred.energy_std, pred.force_std_epistemic.as_ref()) {
@@ -138,7 +141,7 @@ impl SurrogateKs {
             _ => None,
         };
         if posterior.is_some() {
-            if let Some((nu, at)) = self.novelty(pos, z).filter(|(nu, _)| *nu > 1.0) {
+            if let Some((nu, at)) = self.novelty_judged(pos, z, part).filter(|(nu, _)| *nu > 1.0) {
                 return Some(novelty_refusal(nu, at));
             }
         }
@@ -147,19 +150,19 @@ impl SurrogateKs {
             return Some(r);
         }
         if let Some((e, f)) = posterior {
-            let v = self.variance_check(model, &pred, e, f, pos, z);
+            let v = self.variance_check_n(model, &pred, e, f, pos, z, part.map_or(pos.len(), |s| s.bonded.len()));
             if !v.accept {
                 return v.reason;
             }
         }
-        let near = self.near_quarantined_cached(pos, z);
+        let near = self.near_quarantined_judged(pos, z, part);
         if !near.is_empty() {
             return Some(Refusal::new(self.fence_refusal_text(&near), TeachRule::NearQuarantine, None));
         }
-        if let Some(r) = self.near_misfit_refusal(pos, z) {
+        if let Some(r) = self.near_misfit_refusal(pos, z, part) {
             return Some(r);
         }
-        self.audit_fence_refusal(pos, z)
+        self.audit_fence_refusal_judged(pos, z, part)
     }
 
     /// Whether the strict policy answers at `scene`'s geometry (module doc, "Readiness"); `None`

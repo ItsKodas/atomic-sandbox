@@ -106,7 +106,11 @@
 //!      force, which is not the teacher's: the scene is solved at one spin state, and a pulled-
 //!      apart pair keeps it (the restricted H₂ singlet lies 4.6e-2 Ha above 2 E_ref at r = 6.4,
 //!      measured; the diagnosis §1). A one-atom scene is exempt: its answer is E_ref, the
-//!      teacher's own isolated atom (rulings S5, S9).
+//!      teacher's own isolated atom (rulings S5, S9). So is a **stray atom** of a bonded part
+//!      plus stray atoms whose composition checks cleared it for bonded geometries like this one
+//!      (`stray` module doc, "Answering inside a region"; spec 2026-11-18 §4.4): exempt from 5a–5e,
+//!      the bonded part judged on its own (rule 7 per bonded atom, 5d and the fences on the bonded
+//!      part alone).
 //!    - **5b, coordination ratio** (M6 Task 11): an atom whose coordination C_t = Σ_{j∈t} f_c(r_ij)
 //!      (the n = 0 body-2 feature of neighbour species t) is more than
 //!      [`surrogate::envelope::COORDINATION_RATIO`] = 3 below the smallest the fit has seen for
@@ -2418,10 +2422,23 @@ impl ForceProvider for SurrogateKs {
         // or a rejection, else at least every k-th consultation — an accepting verdict is reused
         // at most k − 1 times, a rejecting one never
         // a neighbour entering or leaving r_cut is a new environment for the verdict (M6 Task 11)
-        let counts = {
+        let mut counts = {
             let rc2 = self.model.as_ref().map_or(0.0, |m| m.basis.r_cut * m.basis.r_cut);
             neighbour_counts(&pos, rc2)
         };
+        // a bonded part plus stray atoms whose composition was measured for bonded geometries like this one (`stray`
+        // module doc, "Answering inside a region"; spec §4.4): the stray atoms are exempt from 5a–5e (and 6: their
+        // force rows are zero), rule 7 is per bonded atom, 5d and the fences judge the bonded part alone; every other
+        // rule as before. The answer is the model's own `predict(scene)`, the bonded part's plus Σ E_ref. Only a scene
+        // with an atom without neighbours can have stray atoms (the split's test is the counts')
+        let cleared = if counts.contains(&0) { self.stray_cleared(&pos, &z, &prov) } else { None };
+        let part = cleared.as_ref().map(|c| &c.0);
+        let n_bonded = part.map_or(pos.len(), |s| s.bonded.len());
+        // an exempt stray atom is another environment for the verdict than a refused one (rule 7's n differs): a
+        // verdict reached before the clearance is never reused for a cleared step, nor the reverse
+        for &i in part.map_or(&[][..], |s| &s.stray) {
+            counts[i] = usize::MAX;
+        }
         let with_variance = {
             let k = self.policy.variance_cadence.max(1);
             let fresh = self.last_variance.as_ref().is_none_or(|v| !v.accept) || self.consults + 1 >= k || counts != self.verdict_counts;
@@ -2464,9 +2481,9 @@ impl ForceProvider for SurrogateKs {
         // rule 6 on the epistemic force std (σ_f excluded, as rule 7 excludes the energy floor)
         let variance = match (pred.energy_std, pred.force_std_epistemic.as_ref()) {
             (Some(e), Some(f)) => {
-                let mut v = self.variance_check(model, &pred, e, f, &pos, &z);
+                let mut v = self.variance_check_n(model, &pred, e, f, &pos, &z, n_bonded);
                 // rule 5d with the variance (the same cadence; a rejection is never reused)
-                if let Some((nu, at)) = self.null_space.as_ref().and_then(|ns| ns.novelty(&pos, &z).ok()).filter(|(nu, _)| *nu > 1.0) {
+                if let Some((nu, at)) = self.novelty_judged(&pos, &z, part).filter(|(nu, _)| *nu > 1.0) {
                     v.accept = false;
                     v.novel = true;
                     v.reason = Some(novelty_refusal(nu, at));
@@ -2479,7 +2496,7 @@ impl ForceProvider for SurrogateKs {
         };
         let uncertainty = Some(variance.uncertainty);
         let atom_uncertainty = Some(variance.atoms.clone());
-        let (mut atom_envelope, mut envelope) = self.envelope_outside(model, &pos, &z);
+        let (mut atom_envelope, mut envelope) = self.envelope_outside_except(model, &pos, &z, part.map_or(&[][..], |s| &s.stray));
         // a lone scene rule 0b declined is never the model's in strict mode (review I1): rule 5a's
         // refusal, which covers a scene of two or more lone atoms already, also for one atom (5a's
         // one-atom exemption assumed the reference composes — 0b checks it) and without an envelope
@@ -2510,7 +2527,7 @@ impl ForceProvider for SurrogateKs {
             .or_else(|| if variance.accept { None } else { variance.reason.clone() });
         // a quarantined geometry is outside what the model may answer (ruling S15), whichever
         // rule fired first; its answer is kept only if it agrees with the model (teach)
-        let near = self.near_quarantined(&pos, &z);
+        let near = policy::judged_part(&pos, &z, part, |p, q| self.near_quarantined(p, q));
         // refused by the fence alone (final review I1): its answer is thinned and copy-checked as an
         // envelope (rule 5) fallback's is — which reaches `admit`'s checks only where forgotten samples
         // alone fence (a held one is released or superseded by an agreeing answer, and a
@@ -2527,7 +2544,14 @@ impl ForceProvider for SurrogateKs {
         // module doc, "M, the misfit set"): refused when **any** atom is near — broader than the
         // all-atom quarantine test above, deliberately — and the teacher's answer is kept only if
         // it agrees with the model (`admit`), whichever rule fired first
-        let near_misfit_atoms = self.near_misfit(&pos, &z);
+        let near_misfit_atoms = match part {
+            Some(sp) => {
+                let (p, q) = sp.bonded_part(&pos, &z);
+                let near = self.near_misfit(&p, &q);
+                sp.scene_values(&near, pos.len(), false)
+            }
+            None => self.near_misfit(&pos, &z),
+        };
         let near_misfit = near_misfit_atoms.contains(&true);
         if reason.is_none() {
             if let Some(i) = near_misfit_atoms.iter().position(|&b| b) {
@@ -2547,14 +2571,14 @@ impl ForceProvider for SurrogateKs {
         // fitting (f_c → 0 there), and a flood of them would untrust a class everywhere or let the
         // fit absorb them; then an audit fence (round 1, SHOULD-3), whose fallbacks are never
         // copies (R1-2)
-        let in_shell = self.shell_fence_refusal(&pos, &z);
+        let in_shell = self.shell_fence_refusal_judged(&pos, &z, part);
         let by_shell_fence = in_shell.is_some();
         if reason.is_none() {
             reason = in_shell;
         }
         let mut by_audit_fence = false;
         if reason.is_none() {
-            reason = self.audit_fence_refusal(&pos, &z);
+            reason = self.audit_fence_refusal_judged(&pos, &z, part);
             by_audit_fence = reason.is_some();
         }
         self.record_verdict(&pos, &z, strict_gate.clone().or_else(|| reason.clone()));
@@ -2661,6 +2685,15 @@ impl ForceProvider for SurrogateKs {
         self.take_offset_jump(&mut stats);
         stats.energy.total = pred.energy;
         stats.solve_ms = t0.elapsed().as_millis() as u64;
+        if let Some((_, residual, margin)) = cleared {
+            // rule 7 of the doc's honesty (review M6): what answered, and on what measurement
+            stats.notes.push(format!(
+                "stray atoms: model for the bonded part + free atoms (composition measured, {} checks; worst residual {:.2} mHa, frontier margin {:.0} mHa)",
+                stray::STRAY_CHECKS,
+                residual * 1e3,
+                margin * 1e3
+            ));
+        }
         stats.notes.append(&mut self.step_notes);
         stats.notes.append(&mut self.pending_notes);
         self.streak = 0;

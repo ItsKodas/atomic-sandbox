@@ -82,6 +82,7 @@
 //! in the order, so the composed verdict is exactly `would_answer`'s. Measured:
 //! `training_views_build_time_is_reported` (the task report). Nothing here runs inside
 //! `evaluate`.
+use super::stray::Split;
 use super::trust::max_nan;
 use super::*;
 use sim::activity::{
@@ -149,6 +150,9 @@ impl SurrogateKs {
     /// between fresh checks. Every installed model has a posterior (`install_sidecar` refuses a
     /// file without one, Task 4 review I4), so 5d and 6–7 are always judged; the branch without
     /// stds is unreachable and kept only so a hand-built model cannot panic here.
+    ///
+    /// A cleared stray-atom scene (`stray_cleared`; spec §4.4) is judged as `evaluate` judges it: its stray atoms
+    /// exempt from 5a–5e, rule 7 per bonded atom, 5d and the fences on the bonded part alone.
     pub fn would_answer(&self, pos: &[[f64; 3]], z: &[u8], prov: &Provenance) -> Verdict {
         self.gate(z, prov).map_err(|g| (g.reason.rule, g.reason.atom))?;
         let model = self.model.as_ref().expect("the gate passed: a model exists");
@@ -157,24 +161,33 @@ impl SurrogateKs {
             // what rule 2 names; `evaluate` returns an error there with no rule
             DescribeError::UnknownSpecies(zu) => (TeachRule::NewSpecies(zu), None),
         })?;
-        self.verdict_past_gate(model, pos, z, &pred)
+        let cleared = self.stray_cleared(pos, z, prov);
+        self.verdict_judged(model, pos, z, &pred, cleared.as_ref().map(|c| &c.0))
     }
 
     /// [`would_answer`](Self::would_answer) past the gate, on the caller's prediction at
     /// (`pos`, `z`) — `model.predict(pos, z, true)` (the curve's band shares it, plan review S2).
+    /// No stray-atom exemption (no provenance to key a signature by).
+    #[cfg(test)]
     pub(super) fn verdict_past_gate(&self, model: &Model, pos: &[[f64; 3]], z: &[u8], pred: &surrogate::Prediction) -> Verdict {
-        self.verdict_middle(model, pos, z, pred)?;
-        self.fence_verdict(pos, z)
+        self.verdict_judged(model, pos, z, pred, None)
+    }
+
+    /// [`would_answer`](Self::would_answer) past the gate, on the caller's prediction at (`pos`, `z`), with `part`
+    /// the split of a cleared stray-atom scene (`stray_cleared`), judged as `evaluate` judges it.
+    fn verdict_judged(&self, model: &Model, pos: &[[f64; 3]], z: &[u8], pred: &surrogate::Prediction, part: Option<&Split>) -> Verdict {
+        self.verdict_middle(model, pos, z, pred, part)?;
+        self.fence_verdict(pos, z, part)
     }
 
     /// The verdict between the gate and the fence: a function of the model and the policy only
-    /// (what the curve cache keeps).
-    fn verdict_middle(&self, model: &Model, pos: &[[f64; 3]], z: &[u8], pred: &surrogate::Prediction) -> Verdict {
+    /// (what the curve cache keeps; `part` as [`verdict_judged`](Self::verdict_judged)).
+    fn verdict_middle(&self, model: &Model, pos: &[[f64; 3]], z: &[u8], pred: &surrogate::Prediction, part: Option<&Split>) -> Verdict {
         let code = |r: Refusal| (r.rule, r.atom);
         if let Some(r) = non_finite_answer(pred) {
             return Err(code(r));
         }
-        if let (_, Some(r)) = self.envelope_outside(model, pos, z) {
+        if let (_, Some(r)) = self.envelope_outside_except(model, pos, z, part.map_or(&[][..], |s| &s.stray)) {
             return Err(code(r));
         }
         let posterior = match (pred.energy_std, pred.force_std_epistemic.as_ref()) {
@@ -183,7 +196,7 @@ impl SurrogateKs {
         };
         // 5d beside the variance, as `evaluate` (the same threshold: ν > 1)
         if posterior.is_some() {
-            if let Some((_, at)) = self.null_space.as_ref().and_then(|ns| ns.novelty(pos, z).ok()).filter(|(nu, _)| *nu > 1.0) {
+            if let Some((_, at)) = self.novelty_judged(pos, z, part).filter(|(nu, _)| *nu > 1.0) {
                 return Err((TeachRule::NewEnvironment, at));
             }
         }
@@ -192,7 +205,7 @@ impl SurrogateKs {
             return Err(code(r));
         }
         if let Some((e, f)) = posterior {
-            let v = self.variance_check(model, pred, e, f, pos, z);
+            let v = self.variance_check_n(model, pred, e, f, pos, z, part.map_or(pos.len(), |s| s.bonded.len()));
             if !v.accept {
                 return Err(code(v.reason.expect("a refusing variance verdict names its rule")));
             }
@@ -206,14 +219,14 @@ impl SurrogateKs {
     /// audit fence (`audit_fence_refusal` is the last two). Before the M7 leftovers (final review
     /// M1) this read `near_audit_fence` alone, so the curves drew a fenced shell band as answered
     /// while strict mode refused it.
-    fn fence_verdict(&self, pos: &[[f64; 3]], z: &[u8]) -> Verdict {
-        if !self.near_quarantined_cached(pos, z).is_empty() {
+    fn fence_verdict(&self, pos: &[[f64; 3]], z: &[u8], part: Option<&Split>) -> Verdict {
+        if !self.near_quarantined_judged(pos, z, part).is_empty() {
             return Err((TeachRule::NearQuarantine, None));
         }
-        if let Some(r) = self.near_misfit_refusal(pos, z) {
+        if let Some(r) = self.near_misfit_refusal(pos, z, part) {
             return Err((r.rule, r.atom));
         }
-        match self.audit_fence_refusal(pos, z) {
+        match self.audit_fence_refusal_judged(pos, z, part) {
             Some(r) => Err((r.rule, r.atom)),
             None => Ok(()),
         }
@@ -285,7 +298,7 @@ impl SurrogateKs {
                         // rule 6's ratio: max over the atoms of σ_F,epi/(√3 · bound) (plan review M5)
                         c.force_ratio.push(self.variance_check(model, &p, e, f, &pos, &zs).atoms.iter().copied().fold(0.0, max_nan));
                     }
-                    c.middle.push(self.verdict_middle(model, &pos, &zs, &p).err().map(|e| e.0));
+                    c.middle.push(self.verdict_middle(model, &pos, &zs, &p, None).err().map(|e| e.0));
                     c.r.push(x);
                 }
                 curves.push(c);
@@ -387,7 +400,7 @@ impl SurrogateKs {
                     .map(|(&x, middle)| match (gate, middle) {
                         (Some(rule), _) => Some(rule),
                         (None, Some(rule)) => Some(*rule),
-                        (None, None) if fence => self.fence_verdict(&dimer_at(x), &[c.z.0, c.z.1]).err().map(|e| e.0),
+                        (None, None) if fence => self.fence_verdict(&dimer_at(x), &[c.z.0, c.z.1], None).err().map(|e| e.0),
                         (None, None) => None,
                     })
                     .collect();

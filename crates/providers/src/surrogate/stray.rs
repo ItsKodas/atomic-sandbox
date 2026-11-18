@@ -110,10 +110,37 @@
 //! **One failing check refuses the signature for the session.** Session-only state (spec §4.6). The region lives in
 //! the descriptor space of the basis it was built with: a model with another basis must clear the book.
 //!
-//! # Answering inside a region (spec §4.4, the caller's)
+//! # Answering inside a region (spec §4.4; plan Task 4)
 //!
-//! The answer is `predict(scene)`, the sum above. The bonded part must pass every rule on its own, with every per-atom
-//! normalisation (rule 7, its (Nσ_e)² floor, the audit criterion) over n_bonded, not the scene's n.
+//! [`stray_cleared`](SurrogateKs::stray_cleared) decides, before the envelope: the scene splits, every stray species is
+//! in the model's basis (rule 2), the signature is `Cleared`, the floor passes **at these positions** (the signature
+//! does not carry a forced multiplicity, a stray atom's distance to a face or a shell fence since, so the floor is
+//! re-checked every step) and the region covers the bonded part's descriptors. Then the strict rules judge the scene
+//! with the stray atoms exempt and the bonded part on its own (`evaluate`, mirrored by `would_answer`, `atom_verdicts`,
+//! the readiness readout and `geometry_refusal`):
+//!
+//! - **5a–5e**: the stray atoms are skipped (`envelope_outside_except`); the bonded atoms' descriptors are the bonded
+//!   part's own (a stray atom is no atom's neighbour), so they are judged exactly as the bonded part alone. Rule 6
+//!   needs no exemption: a stray atom's force rows are zero, so its epistemic force std is exactly 0. Rule 4b's key of
+//!   an isolated atom is none.
+//! - **Rule 7 per bonded atom** (review I4): the prediction's floor (n s_E)² is removed exactly and the epistemic rest,
+//!   the same as the bonded part's alone (B_s = 0 adds nothing to the energy row), is divided by n_bonded — rule 7 on
+//!   the bonded part's own prediction, floor (n_bonded s_E)² included.
+//! - **5d and the fences on the bonded part alone** (`policy::judged_part`; controller-facing ruling of Task 4): 5d's
+//!   energy row is per atom over the atoms it is given (`energy_per_atom` models), so the scene's row would be the
+//!   bonded part's × n_bonded/n, its ν × (n_bonded/n)²; and the quarantine and audit fences take the worst query atom's
+//!   distance to a fenced geometry, so a stray atom (no counterpart in a fenced H₂) would carry a fenced bonded
+//!   geometry outside. A refusal names the scene's atom.
+//!
+//! The answer is `predict(scene)`, the sum above (to a few ulp, the bonded forces bit for bit, the stray atoms' exactly
+//! 0), with the step note "stray atoms: model for the bonded part + free atoms (composition measured, 3 checks; worst
+//! residual … mHa, frontier margin … mHa)". A step outside the region is rule 5a's, as before, and one more check.
+//! **Re-entry** (review M3): a stray atom back within r_cut is no longer stray and the ordinary rules judge the scene;
+//! the switch to the teacher's surface is booked by `transition_jump`, as is the switch back. Measured on the Morse
+//! fixture, rule 5b does **not** fire there once a released stray sample is fitted — its stray atom puts an empty
+//! neighbourhood (C = 0) into the envelope, and `coordination_ratio` skips a channel whose minimum is 0 — so it is 5e
+//! (γ = ∞) at the cutoff and 5c deeper in that refuse (`reentry_and_exit_book_every_switch`). The audit criterion's
+//! n_bonded is plan Task 5's.
 //!
 //! # The checks on the auditor and the sample hold-out (spec §4.3, review C1; plan Task 3)
 //!
@@ -190,6 +217,28 @@ pub(super) fn split(pos: &[[f64; 3]], r_cut: f64) -> Option<Split> {
     let (stray, bonded): (Vec<usize>, Vec<usize>) =
         (0..pos.len()).partition(|&i| (0..pos.len()).filter(|&j| j != i).all(|j| no_neighbours(&[pos[i], pos[j]], r_cut)));
     (!stray.is_empty() && !bonded.is_empty()).then_some(Split { bonded, stray })
+}
+
+impl Split {
+    /// The bonded part alone: its positions and species in [`Split::bonded`]'s order (module doc, "Answering inside a
+    /// region": what rule 5d and the fences judge in a cleared scene).
+    pub(super) fn bonded_part(&self, pos: &[[f64; 3]], z: &[u8]) -> (Vec<[f64; 3]>, Vec<u8>) {
+        (self.bonded.iter().map(|&i| pos[i]).collect(), self.bonded.iter().map(|&i| z[i]).collect())
+    }
+
+    /// The scene's index of the bonded part's atom `j` (a refusal names the scene's atom).
+    pub(super) fn scene_atom(&self, j: Option<usize>) -> Option<usize> {
+        j.and_then(|j| self.bonded.get(j).copied())
+    }
+
+    /// The bonded part's per-atom values `v` as the scene's `n` atoms', `fill` at the stray atoms.
+    pub(super) fn scene_values<T: Clone>(&self, v: &[T], n: usize, fill: T) -> Vec<T> {
+        let mut out = vec![fill; n];
+        for (&i, x) in self.bonded.iter().zip(v) {
+            out[i] = x.clone();
+        }
+        out
+    }
 }
 
 /// What a clearance or a refusal is keyed by (spec §4.1): the sorted Z of the bonded part and of the stray atoms, the

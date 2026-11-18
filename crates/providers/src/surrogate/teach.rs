@@ -799,7 +799,7 @@ impl SurrogateKs {
             let mut sink = Vec::new();
             // outside strict mode's domain (Minor): held out like a draft guess, judged once strict
             // mode reaches it (`judge_held_out`)
-            if self.geometry_refusal(&pos, &z).is_some() {
+            if self.geometry_refusal(&pos, &z, prov).is_some() {
                 if self.keep_sample(&pos, &z, h.energy, &h.forces, h.face, h.multiplicity, prov, SampleTag::DraftAudit, &mut sink) {
                     deferred += 1;
                     *deferred_near.entry(h.blocker).or_insert(0) += 1;
