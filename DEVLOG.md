@@ -1162,6 +1162,15 @@ review: 0 Critical, 0 Important, 8 Minor, all fixed. The app gate passes 795 tes
     panel's right column ran off its edge. It now switches to two columns only once both fit.
 - Phase B ("Teach this cell") waits for targeted teach.
 
+### The teach-around button takes one click (2026-11-18, merge teach-one-click)
+
+- **Report:** "Fix it: Teach around N blockers" needed two clicks, and the first did "nothing at all".
+- **Cause:** egui gives every widget an id from the widgets drawn before it in the same `Ui`. In egui 0.36 a salted child's ids include that count too. A warning that appeared above the button between the press and the release (any new snapshot could add one) gave the button a new id mid-click, and egui drops a click whose pressed widget has gone.
+- **Fix:** the teach box, the no-model row and the first-pass offer each sit in a child `Ui` with an explicit id (`fixed_row`).
+- **Test:** `one_click_teaches_around_even_when_the_panel_changes_mid_click` failed before the fix in the in-section-warning case. A first attempt with `push_id` still failed, which is how we learnt that salted children are not stable in 0.36.
+- **Gates:** app 796/0.
+- **Time:** about an hour, mostly spent pinning down the mechanism. The user's "nothing at all" pointed at the widget id rather than the worker.
+
 ### Process wins
 
 - An input-replay harness (M6 Task 8) that found a real app bug on its first scripts: a running relax
