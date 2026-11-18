@@ -11693,6 +11693,10 @@ mod residual_diag;
 /// Rule 0b: lone atoms answered from the isolated-atom references (`lone.rs`).
 mod lone;
 
+/// Isolated atoms are no training atoms: a fitted stray atom leaves the envelope and rule 5b
+/// alone, and an installed file's envelope is rebuilt without them (`envelope_isolated.rs`).
+mod envelope_isolated;
+
 /// Spec 2026-11-12 R1: the recovery ranks offenders by their leave-one-out ratio (`recovery_loo.rs`).
 mod recovery_loo;
 

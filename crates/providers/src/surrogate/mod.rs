@@ -107,11 +107,18 @@
 //!      teacher's own isolated atom (rulings S5, S9).
 //!    - **5b, coordination ratio** (M6 Task 11): an atom whose coordination C_t = Σ_{j∈t} f_c(r_ij)
 //!      (the n = 0 body-2 feature of neighbour species t) is more than
-//!      [`surrogate::envelope::COORDINATION_RATIO`] = 3 below the smallest the fit has seen for
-//!      its species — the vanishing direction judged relatively, because one kept stretched-pair
-//!      sample (the user's r = 5.125, f_c 0.05) put an empty neighbourhood half a training spread
-//!      inside the old spread box (derivation and the old/new decision on the repro: the
-//!      envelope module doc).
+//!      [`surrogate::envelope::COORDINATION_RATIO`] = 3 below the smallest the fit has seen
+//!      among its species' non-isolated training atoms — the vanishing direction judged
+//!      relatively, because one kept stretched-pair sample (the user's r = 5.125, f_c 0.05) put an
+//!      empty neighbourhood half a training spread inside the old spread box (derivation and the
+//!      old/new decision on the repro: the envelope module doc). An isolated atom of a fitted
+//!      sample (the stray atom of a kept 5a fallback, B = 0) is no training atom and never enters
+//!      the envelope (`surrogate::envelope` module doc, "Isolated atoms are not training atoms"):
+//!      admitted, it would set the minimum to 0 and switch this rule off for its species
+//!      everywhere. A model file whose stored envelope admitted them (written before this rule)
+//!      has its envelope rebuilt from its stored samples at install, without a refit
+//!      (`install_sidecar`, `rebuild_envelope_without_isolated`; a shared collection keeps no
+//!      envelope — its fit is rebuilt from the samples at open).
 //!    - **5c, spread**: any feature farther than `max_descriptor_distance` (3.0) training spreads
 //!      outside its per-feature training range (`surrogate::Envelope`, unit in its module doc).
 //!    - **5d, new environment** (M6 Task 11 round 2, controller ruling): a query row (the energy

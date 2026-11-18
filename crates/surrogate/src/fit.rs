@@ -291,7 +291,8 @@
 //!   row, so n_scale = n_E and every earlier fit is unchanged bit for bit.
 //! * the **envelope** (`Envelope::add_atom`) of the interior atoms only: a cap or an edge atom
 //!   describes no knowledge of the source (the conservative ruling — the provider's active set
-//!   and key counts follow it).
+//!   and key counts follow it). Nor, masked or not, an isolated atom (no neighbour within r_cut,
+//!   [`crate::envelope::isolated_atom`]): it is no training atom (`envelope` module doc).
 //!
 //! **A fit without energy rows** (a collection taught only by segments): G_E = b_E = yᵀWy_E = 0,
 //! so s_E enters neither A, m, γ nor the evidence (every energy term is 0 · something finite). It
@@ -322,7 +323,7 @@
 //!   a few percent.
 
 use crate::descriptor::{describe, Basis, DescribeError};
-use crate::envelope::Envelope;
+use crate::envelope::{isolated_atom, Envelope};
 use crate::linalg::{
     cholesky_in_place, cholesky_inverse, cholesky_logdet, cholesky_solve, cholesky_update_upper, dot, mat_vec, mat_vec_fast, tridiagonal_ql, upper_solve,
 };
@@ -970,7 +971,10 @@ impl Accumulator {
         let qr = self.q_prime;
         let w = prep.w;
         for (s, b) in &prep.atoms {
-            self.envelope.add_atom(*s, b);
+            // an isolated atom is no training atom (`envelope` module doc, "Isolated atoms are not training atoms")
+            if !isolated_atom(&self.basis, b) {
+                self.envelope.add_atom(*s, b);
+            }
         }
         if prep.use_energy {
             rank1_update(&mut self.gram_e, &mut self.comp.gram_e, &mut self.rhs_e, &mut self.comp.rhs_e, qr, &prep.phi, prep.y, w, &mut self.support);
@@ -1035,7 +1039,10 @@ impl Accumulator {
         for (prep, se) in preps.iter().zip(&support_e) {
             let w = prep.w;
             for (s, b) in &prep.atoms {
-                self.envelope.add_atom(*s, b);
+                // as `apply_one`: an isolated atom is no training atom
+                if !isolated_atom(&self.basis, b) {
+                    self.envelope.add_atom(*s, b);
+                }
             }
             if prep.use_energy {
                 for &i in se {
@@ -3287,6 +3294,57 @@ mod tests {
                 Sample { pos, z, energy: e, forces: f, tag: SampleTag::Perturbation, weight: 1.0, force_mask: None, use_energy: true }
             })
             .collect()
+    }
+
+    /// An isolated atom (no neighbour within r_cut; `envelope` module doc, "Isolated atoms are not
+    /// training atoms") is no training atom. A sample of H₂ plus an H ≥ 12.9 Bohr from both atoms
+    /// leaves the envelope bit for bit what H₂ alone leaves — on the per-sample path (`add`) and the
+    /// batched path (`add_many`, body-4 threaded; a loop of `add` otherwise), on body-2, body-3 and
+    /// body-4 bases — so its species keeps a positive coordination minimum and rule 5b stays on; a
+    /// species seen only isolated has no training atom (count 0, infinitely far). A sparse but
+    /// non-empty neighbourhood (a pair at 5.125 Bohr, f_c ≈ 0.05) still enters.
+    #[test]
+    fn an_isolated_atom_is_no_envelope_atom() {
+        let mut rng = StdRng::seed_from_u64(77);
+        let opts = FitOptions::default();
+        let train: Vec<Sample> = (0..12).map(|i| dimer_sample(1.0 + 0.1 * i as f64, unit_vector(&mut rng), [0.0, -3.0, 0.0], None)).collect();
+        let with_stray = |s: &Sample| {
+            let mut t = s.clone();
+            t.pos.push([0.0, 12.0, 0.0]);
+            t.z.push(H);
+            t.forces.push([0.0; 3]);
+            t
+        };
+        let bits = |e: &Envelope| [&e.min, &e.max, &e.sum, &e.sumsq].iter().flat_map(|v| v.iter().map(|x| x.to_bits())).chain(e.count.iter().map(|&c| c as u64)).collect::<Vec<u64>>();
+        for basis in [h2_basis(6), Basis::new(&[H]), small_body4_basis()] {
+            let refs: Vec<f64> = basis.species.iter().map(|&z| if z == H { E_ATOM_H } else { -74.8 }).collect();
+            let (mut plain, mut stray, mut batched) = (Accumulator::new(&basis), Accumulator::new(&basis), Accumulator::new(&basis));
+            for s in &train {
+                plain.add(s, &basis, &refs, &opts).unwrap();
+                stray.add(&with_stray(s), &basis, &refs, &opts).unwrap();
+            }
+            let strays: Vec<Sample> = train.iter().map(with_stray).collect();
+            batched.add_many(&strays.iter().collect::<Vec<_>>(), &basis, &refs, &opts).unwrap();
+            assert_eq!(bits(&stray.envelope), bits(&plain.envelope), "add: the isolated H adds nothing to the envelope (body-3 {}, body-4 {})", basis.body3, basis.body4);
+            assert_eq!(bits(&batched.envelope), bits(&plain.envelope), "add_many: the isolated H adds nothing to the envelope (body-3 {}, body-4 {})", basis.body3, basis.body4);
+            let h = basis.species_index(H).unwrap();
+            let k = basis.body2_index(h, 0) + h * basis.n_features();
+            assert!(stray.envelope.min[k] > 0.5, "the coordination minimum stays the bonded atoms' ({})", stray.envelope.min[k]);
+        }
+        // a species seen only isolated: no training atom
+        let basis = Basis::new(&[H, O]);
+        let mut acc = Accumulator::new(&basis);
+        let mut s = with_stray(&train[0]);
+        s.z[2] = O;
+        acc.add(&s, &basis, &[E_ATOM_H, -74.8], &opts).unwrap();
+        assert_eq!(acc.envelope.count, vec![2, 0]);
+        assert_eq!(acc.envelope.distance(1, &vec![0.0; basis.n_features()]).0, f64::INFINITY);
+        // the stretched pair's sparse neighbourhood is a training atom
+        let basis = Basis::new(&[H]);
+        let mut acc = Accumulator::new(&basis);
+        acc.add(&dimer_sample(5.125, [1.0, 0.0, 0.0], [0.0; 3], None), &basis, &[E_ATOM_H], &opts).unwrap();
+        assert_eq!(acc.envelope.count, vec![2]);
+        assert!(acc.envelope.min[basis.body2_index(0, 0)] > 0.0, "the tail sample's f_c ≈ 0.05 enters the envelope");
     }
 
     /// The statistics of every public field and the compensated totals, as bits.

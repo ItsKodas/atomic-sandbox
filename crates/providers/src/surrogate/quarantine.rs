@@ -392,6 +392,16 @@ pub(super) fn quarantine_words(held: usize, added: usize, h: Held, ranking: Rank
 
 /// L∞ distance between two descriptors of species `s` in the envelope's training-spread units
 /// (a feature the training never varied counts as infinitely far once the two differ).
+///
+/// Never NaN: a species with no training atom — since isolated atoms are no training atoms
+/// (`surrogate::envelope` module doc), also one seen only as an isolated atom — has a NaN unit,
+/// and a non-finite descriptor a NaN gap; either is infinitely far, never dropped by the callers'
+/// `f64::max` folds (`max` with a NaN keeps the other operand: a NaN gap read as 0, "identical").
+/// Far is the conservative side for every caller: thinning keeps the sample; the label-copy check
+/// and the teach planner's distances count it distinct; the quarantine, misfit and audit fences
+/// do not call it near; and the envelope's own rules refuse every query atom of a species with
+/// no training atom before any fence is read (`Envelope::coordination_ratio` and
+/// `Envelope::distance`: ∞ at count 0), as rule 5a refuses an isolated atom.
 pub(super) fn spread_distance(env: &Envelope, s: usize, a: &[f64], b: &[f64]) -> f64 {
     let mut worst = 0.0f64;
     for (k, (x, y)) in a.iter().zip(b).enumerate() {
@@ -400,7 +410,11 @@ pub(super) fn spread_distance(env: &Envelope, s: usize, a: &[f64], b: &[f64]) ->
             continue;
         }
         let u = env.unit(s, k);
-        worst = worst.max(if u > 0.0 { gap / u } else { f64::INFINITY });
+        let d = gap / u;
+        if !(u > 0.0) || d.is_nan() {
+            return f64::INFINITY;
+        }
+        worst = worst.max(d);
     }
     worst
 }

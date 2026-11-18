@@ -209,9 +209,11 @@ pub(super) fn novelty_refusal(nu: f64, at: Option<usize>) -> Refusal {
 
 /// Rule 5a: the atom with descriptor `b` has no neighbour the model can see — every coordination
 /// feature C_t = Σ_{j∈t} f_c(r_ij) is exactly zero (no neighbour inside r_cut; a coincident one
-/// counts, f_c(0) = 1). O(S) per atom from the descriptor already computed.
+/// counts, f_c(0) = 1). O(S) per atom from the descriptor already computed. The predicate is the
+/// `surrogate` crate's [`surrogate::envelope::isolated_atom`], which also keeps such an atom out of
+/// the fit's envelope, so rule 5a and the envelope cannot disagree on what is isolated.
 pub(super) fn lone_atom(basis: &Basis, b: &[f64]) -> bool {
-    (0..basis.n_species()).all(|t| b[basis.body2_index(t, 0)] == 0.0)
+    surrogate::envelope::isolated_atom(basis, b)
 }
 
 /// When the model may answer (`surrogate` module doc, "The fallback policy"). Defaults are the spec's.
