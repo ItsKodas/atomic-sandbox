@@ -65,17 +65,31 @@
 //!   stray atoms, not to the scene's size (compensated sum).
 //! - **Forces:** every bonded atom's scene force against the fragment's, every stray atom's against its own solve's,
 //!   each within [`FallbackPolicy::force_residual`]'s bound.
-//! - **Frontier margin:** per spin and per stray atom, (fragment LUMO − stray HOMO) and (stray LUMO − fragment HOMO)
-//!   ≥ [`frontier_margin_min`] = 27.6 kT = 138 mHa. That is `lone`'s gap criterion: a level with min(f, 1 − f) <
-//!   `PARTIAL_OCCUPATION_MIN` = 1e-6 lies at least ln(1/1e-6) = 13.8 kT from μ, so a donor and an acceptor that are
-//!   both clear of μ on their own sides are ≥ 2 × 13.8 = 27.6 kT apart. A channel without an occupied level (the
-//!   stray H's ↓) has no donor: that direction needs no level.
-//! - **Levels:** per spin, the scene's frontier levels are the union's (its HOMO the parts' highest, its LUMO their
-//!   lowest) and its partial levels (`EvalStats::partial`, renumbered) are the parts' together, each ε within
-//!   [`STRAY_LEVEL_TOL`] = 1.8 mHa (the largest box splitting measured, `lone` module doc) and each f within
-//!   [`level_occupation_tol`] = tol / (2 kT): if every level moves by at most tol, so does μ, so ε − μ moves by at most
-//!   2 tol and f = 1/(1 + e^{(ε−μ)/kT}) by at most 2 tol × max|∂f/∂ε| = 2 tol / (4 kT). A transfer that pins a level
-//!   at μ shows as a partial level the parts do not have.
+//! - **Frontier margin:** per spin and per stray atom, (fragment acceptor − stray donor) and (stray acceptor −
+//!   fragment donor) ≥ [`frontier_margin_min`] = 27.6 kT = 138 mHa. That is `lone`'s gap criterion: a level with
+//!   min(f, 1 − f) < `PARTIAL_OCCUPATION_MIN` = 1e-6 lies at least ln(1/1e-6) = 13.8 kT from μ, so a donor and an
+//!   acceptor that are both clear of μ on their own sides are ≥ 2 × 13.8 = 27.6 kT apart. Every level with
+//!   f > `PARTIAL_OCCUPATION_MIN` donates and every level with f < 1 − `PARTIAL_OCCUPATION_MIN` accepts, so a part's
+//!   **donor** is the higher of its HOMO and its highest partial level, and its **acceptor** the lower of its LUMO and
+//!   its lowest partial level. `Frontier` splits a channel at f = ½, so its HOMO alone would miss a partial level at
+//!   f ≥ ½ as an acceptor (an open-shell stray O at its M = 1 partial ensemble: its 2p at f ≈ 2/3 is the HOMO in both
+//!   spins and sits ~40 mHa above H₂'s σg, while its 3s LUMO is ~0.4 Ha away; review I1). A channel without an
+//!   occupied or partial level (the stray H's ↓) has no donor: that direction needs no level. **Two parts both open in
+//!   one spin channel always fail**: each one's partial level is at once its donor and its acceptor, so one of the two
+//!   directions is ≤ 0. That is the physics, not a strictness: one shared μ_σ redistributes charge between open shells
+//!   (`lone`'s open-shell copies, here across species).
+//! - **Levels:** per spin, the scene's partial levels (`EvalStats::partial`, renumbered) are the parts' together and its
+//!   frontier levels the union's (its HOMO the parts' highest, its LUMO their lowest). Partial levels are paired in ε
+//!   order: the counts must agree, each ε within [`STRAY_LEVEL_TOL`] = 1.8 mHa (the largest box splitting measured,
+//!   `lone` module doc; on a line the sorted pairing minimises the largest ε difference, so a failure there is not a
+//!   mispairing), Σf per spin within [`level_occupation_tol`] (with nothing transferred the open part's electron count
+//!   fixes it; a difference is a transferred fraction), and each f within the same tol / (2 kT). The f bound: after the
+//!   margin, a channel with partial levels has **exactly one open part** (two fail above), so the scene's μ_σ is that
+//!   part's own μ_σ up to the level shifts; if every level moves by at most tol, so does μ, so ε − μ moves by at most
+//!   2 tol and f = 1/(1 + e^{(ε−μ)/kT}) by at most 2 tol × max|∂f/∂ε| = 2 tol / (4 kT). Where a level has a neighbour
+//!   within 2 tol (near-degenerate: the ε order need not pair the same orbitals) an f outside the bound is **void**,
+//!   not a failure. A transfer that pins a level at μ shows as a partial level the parts do not have. A scene that
+//!   reports no frontier level at all while its parts do is void (a wiring slip is not a measurement).
 //!
 //! `Pass { residual, margin }` carries the absolute energy residual and the smallest margin (Ha).
 //!
@@ -287,6 +301,7 @@ pub(super) fn judge(policy: &FallbackPolicy, scene: &PartAnswer, frag: &PartAnsw
     let n = split.bonded.len() + split.stray.len();
     if atoms.len() != split.stray.len() || frag.forces.len() != split.bonded.len() || scene.forces.len() != n || atoms.iter().any(|a| a.forces.len() != 1)
     {
+        debug_assert!(false, "stray::judge: the parts' answers do not match the split");
         return CheckVerdict::Void("the parts' answers do not match the split".into());
     }
     if !scene.clean || !frag.clean || atoms.iter().any(|a| !a.clean) {
@@ -320,23 +335,26 @@ pub(super) fn judge(policy: &FallbackPolicy, scene: &PartAnswer, frag: &PartAnsw
             return CheckVerdict::Fail(format!("force: stray atom {i} differs from its own solve by {d:.2e} Ha/Bohr (bound {bound:.2e})"));
         }
     }
-    // frontier margin, per spin and per stray atom, both directions; a missing donor is an empty channel
+    // frontier margin, per spin and per stray atom, both directions. Every level with f > PARTIAL_OCCUPATION_MIN donates
+    // and every level with f < 1 − PARTIAL_OCCUPATION_MIN accepts (`lone`'s gap criterion), so a part's partial levels
+    // are both: a partial level at f ≥ ½ is the HOMO and would otherwise never be tested as an acceptor (review I1)
     let mut missing = false;
     let mut margin = f64::INFINITY;
     let floor = frontier_margin_min();
     for (spin, word) in SPIN.iter().enumerate() {
         for (a, &i) in atoms.iter().zip(&split.stray) {
             let pairs = [
-                (a.frontier[spin].homo, frag.frontier[spin].lumo, "fragment LUMO − stray HOMO"),
-                (frag.frontier[spin].homo, a.frontier[spin].lumo, "stray LUMO − fragment HOMO"),
+                (donor(a, spin), acceptor(frag, spin), "fragment acceptor − stray donor"),
+                (donor(frag, spin), acceptor(a, spin), "stray acceptor − fragment donor"),
             ];
-            for (donor, acceptor, what) in pairs {
-                let Some(donor) = donor else { continue };
-                let Some(acceptor) = acceptor else {
+            for (give, take, what) in pairs {
+                // no occupied or partial level: an empty channel donates nothing
+                let Some(give) = give else { continue };
+                let Some(take) = take else {
                     missing = true;
                     continue;
                 };
-                let m = acceptor - donor;
+                let m = take - give;
                 if !(m >= floor) {
                     return CheckVerdict::Fail(format!(
                         "frontier margin: {what} {word} (stray atom {i}) = {:.1} mHa < {:.1} mHa (27.6 kT): charge can move across the gap",
@@ -350,21 +368,15 @@ pub(super) fn judge(policy: &FallbackPolicy, scene: &PartAnswer, frag: &PartAnsw
     }
     // levels: the scene's frontier and partial levels are the union of the parts'
     let parts: Vec<&PartAnswer> = std::iter::once(frag).chain(atoms).collect();
+    let reported = |p: &PartAnswer| p.frontier.iter().any(|f| f.homo.is_some() || f.lumo.is_some());
+    if !reported(scene) && parts.iter().any(|p| reported(p)) {
+        // the scene's solve reported no level at all: a wiring slip, never a measured refusal
+        return CheckVerdict::Void(NOT_COMPUTED.into());
+    }
+    let mut ambiguous = false;
     for (spin, word) in SPIN.iter().enumerate() {
-        let homo = parts.iter().filter_map(|p| p.frontier[spin].homo).reduce(f64::max);
-        match (scene.frontier[spin].homo, homo) {
-            (None, None) => {}
-            (Some(s), Some(u)) if (s - u).abs() <= STRAY_LEVEL_TOL => {}
-            (s, u) => return CheckVerdict::Fail(format!("levels: the scene's HOMO {word} is {}, the parts' {}", level_words(s), level_words(u))),
-        }
-        let lumos: Option<Vec<f64>> = parts.iter().map(|p| p.frontier[spin].lumo).collect();
-        match (scene.frontier[spin].lumo, lumos.and_then(|l| l.into_iter().reduce(f64::min))) {
-            (Some(s), Some(u)) if (s - u).abs() > STRAY_LEVEL_TOL => {
-                return CheckVerdict::Fail(format!("levels: the scene's LUMO {word} is {}, the parts' {}", level_words(Some(s)), level_words(Some(u))));
-            }
-            (Some(_), Some(_)) => {}
-            _ => missing = true,
-        }
+        // partial levels, renumbered: one per part level, each ε within the box splitting, Σf conserved, each f within
+        // the occupation tolerance (module doc, "Levels")
         let mut have: Vec<&PartialLevel> = scene.partial.iter().filter(|l| l.spin as usize == spin).collect();
         let mut want: Vec<&PartialLevel> = parts.iter().flat_map(|p| &p.partial).filter(|l| l.spin as usize == spin).collect();
         have.sort_by(|a, b| a.eps.total_cmp(&b.eps));
@@ -373,21 +385,78 @@ pub(super) fn judge(policy: &FallbackPolicy, scene: &PartAnswer, frag: &PartAnsw
             return CheckVerdict::Fail(format!("levels: the scene has {} partly occupied {word} levels, the parts {}", have.len(), want.len()));
         }
         for (h, w) in have.iter().zip(&want) {
-            if !((h.eps - w.eps).abs() <= STRAY_LEVEL_TOL && (h.f - w.f).abs() <= level_occupation_tol()) {
+            if !((h.eps - w.eps).abs() <= STRAY_LEVEL_TOL) {
                 return CheckVerdict::Fail(format!(
-                    "levels: a partly occupied {word} level is at {:.1} mHa (f {:.3}) in the scene, {:.1} mHa (f {:.3}) in its part",
+                    "levels: a partly occupied {word} level is at {:.1} mHa in the scene, {:.1} mHa in its part (beyond {:.1} mHa)",
+                    h.eps * 1e3,
+                    w.eps * 1e3,
+                    STRAY_LEVEL_TOL * 1e3
+                ));
+            }
+        }
+        let (f_have, f_want) = (have.iter().map(|l| l.f).sum::<f64>(), want.iter().map(|l| l.f).sum::<f64>());
+        if !((f_have - f_want).abs() <= level_occupation_tol()) {
+            return CheckVerdict::Fail(format!(
+                "levels: the {word} partial levels hold Σf = {f_have:.3} in the scene, {f_want:.3} in the parts (charge moved between them)"
+            ));
+        }
+        for (k, (h, w)) in have.iter().zip(&want).enumerate() {
+            if !((h.f - w.f).abs() <= level_occupation_tol()) {
+                if crowded(&have, k) || crowded(&want, k) {
+                    // near-degenerate levels: the ε order need not pair the same orbitals, so f cannot be compared
+                    ambiguous = true;
+                    continue;
+                }
+                return CheckVerdict::Fail(format!(
+                    "levels: a partly occupied {word} level at {:.1} mHa has f {:.3} in the scene, {:.3} in its part",
                     h.eps * 1e3,
                     h.f,
-                    w.eps * 1e3,
                     w.f
                 ));
             }
+        }
+        // frontier levels: the scene's HOMO the parts' highest, its LUMO their lowest
+        let homo = parts.iter().filter_map(|p| p.frontier[spin].homo).reduce(f64::max);
+        match (scene.frontier[spin].homo, homo) {
+            (None, None) => {}
+            (Some(s), Some(u)) if (s - u).abs() <= STRAY_LEVEL_TOL => {}
+            (s, u) => return CheckVerdict::Fail(format!("levels: the scene's HOMO {word} is {}, the parts' {}", level_words(s), level_words(u))),
+        }
+        let lumos: Option<Vec<f64>> = parts.iter().map(|p| p.frontier[spin].lumo).collect();
+        match (scene.frontier[spin].lumo, lumos.and_then(|l| l.into_iter().reduce(f64::min))) {
+            (Some(s), Some(u)) if !((s - u).abs() <= STRAY_LEVEL_TOL) => {
+                return CheckVerdict::Fail(format!("levels: the scene's LUMO {word} is {}, the parts' {}", level_words(Some(s)), level_words(Some(u))));
+            }
+            (Some(_), Some(_)) => {}
+            _ => missing = true,
         }
     }
     if missing {
         return CheckVerdict::Void(NOT_COMPUTED.into());
     }
+    if ambiguous {
+        return CheckVerdict::Void("near-degenerate partial levels cannot be paired between the scene and its parts".into());
+    }
     CheckVerdict::Pass { residual, margin }
+}
+
+/// A part's highest donating level in `spin` (Ha): its HOMO or its highest partial level, whichever is higher; `None`
+/// for a channel with neither (nothing to donate).
+fn donor(p: &PartAnswer, spin: usize) -> Option<f64> {
+    p.partial.iter().filter(|l| l.spin as usize == spin).map(|l| l.eps).chain(p.frontier[spin].homo).reduce(f64::max)
+}
+
+/// A part's lowest accepting level in `spin` (Ha): its LUMO or its lowest partial level, whichever is lower; `None`
+/// when neither was computed. An uncomputed LUMO lies above every computed level, so a partial level alone answers.
+fn acceptor(p: &PartAnswer, spin: usize) -> Option<f64> {
+    p.partial.iter().filter(|l| l.spin as usize == spin).map(|l| l.eps).chain(p.frontier[spin].lumo).reduce(f64::min)
+}
+
+/// Level `k` of the ε-sorted `levels` has a neighbour within 2 × [`STRAY_LEVEL_TOL`] (two levels each moved by up to
+/// the tolerance can swap order): its ε rank does not identify it.
+fn crowded(levels: &[&PartialLevel], k: usize) -> bool {
+    let near = |j: usize| levels.get(j).is_some_and(|l| (l.eps - levels[k].eps).abs() <= 2.0 * STRAY_LEVEL_TOL);
+    (k > 0 && near(k - 1)) || near(k + 1)
 }
 
 fn level_words(e: Option<f64>) -> String {
@@ -421,6 +490,7 @@ impl Region {
     /// envelope, as `nearest_stored`). A species `units` never saw cannot be measured: not distinct (the conservative
     /// side: such a check never counts towards [`STRAY_CHECKS`]).
     pub(super) fn distinct(&self, bonded_desc: &[Vec<f64>], species: &[usize], units: &Envelope, thin: f64) -> bool {
+        debug_assert_eq!(self.env.n_features, units.n_features, "Region::distinct: the units envelope is of another basis");
         if species.iter().any(|&s| units.count.get(s).is_none_or(|&c| c == 0)) {
             return false;
         }

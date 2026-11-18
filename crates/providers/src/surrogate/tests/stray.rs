@@ -229,32 +229,93 @@ fn judge_fails_a_narrow_margin() {
     }
 }
 
+/// `exact` with the fragment open in ↑: its partial levels `levels` (ε, f), its ↑ HOMO the highest with f ≥ ½ (they lie
+/// above σg), the scene's ↑ partial levels `scene_levels` with its ↑ HOMO likewise.
+fn open_frag(levels: &[(f64, f64)], scene_levels: &[(f64, f64)]) -> (PartAnswer, PartAnswer, Vec<PartAnswer>, Split) {
+    let (mut scene, mut frag, atoms, split) = exact();
+    let to = |l: &[(f64, f64)], first: usize| -> Vec<PartialLevel> {
+        l.iter().enumerate().map(|(k, &(eps, f))| PartialLevel { spin: 0, index: first + k, eps, f }).collect()
+    };
+    let homo = |l: &[(f64, f64)], other: f64| l.iter().filter(|x| x.1 >= 0.5).map(|x| x.0).fold(other, f64::max);
+    frag.partial = to(levels, 1);
+    frag.frontier[0].homo = Some(homo(levels, -0.37));
+    scene.partial = to(scene_levels, 2);
+    scene.frontier[0].homo = Some(homo(scene_levels, -0.27));
+    (scene, frag, atoms, split)
+}
+
 #[test]
 fn judge_fails_mismatched_partial_levels() {
     let p = FallbackPolicy::default();
-    let level = |eps: f64, f: f64| PartialLevel { spin: 0, index: 3, eps, f };
-    // the parts' partial levels reappear in the scene (renumbered, within the box splitting): a pass
-    let (mut scene, mut frag, atoms, split) = exact();
-    frag.partial = vec![level(-0.2, 0.5)];
-    scene.partial = vec![PartialLevel { index: 5, ..level(-0.2 + 1e-3, 0.52) }];
-    assert!(matches!(judge(&p, &scene, &frag, &atoms, &split), CheckVerdict::Pass { .. }));
-    // a level the parts do not have (charge pinned at μ in the scene)
-    let (mut scene, frag, atoms, split) = exact();
-    scene.partial = vec![level(-0.1, 0.4)];
+    let fail_words = |v: CheckVerdict| match v {
+        CheckVerdict::Fail(why) => why,
+        v => panic!("{v:?}"),
+    };
+    // the fragment's partial level (f ≥ ½: its ↑ HOMO) reappears in the scene, renumbered, within the box splitting
+    let (scene, frag, atoms, split) = open_frag(&[(-0.1, 0.6)], &[(-0.1 + 1e-3, 0.62)]);
+    assert!(matches!(judge(&p, &scene, &frag, &atoms, &split), CheckVerdict::Pass { .. }), "{:?}", judge(&p, &scene, &frag, &atoms, &split));
+    // a level the parts do not have (charge pinned at μ in the scene; f ≥ ½ there, so the scene's HOMO)
+    let (scene, frag, atoms, split) = open_frag(&[], &[(-0.2, 0.6)]);
+    let why = fail_words(judge(&p, &scene, &frag, &atoms, &split));
+    assert!(why.contains("levels") && why.contains("partly occupied"), "{why}");
+    // a level moved by more than the box splitting
+    let (scene, frag, atoms, split) = open_frag(&[(-0.1, 0.6)], &[(-0.1 + 5e-3, 0.6)]);
+    assert!(fail_words(judge(&p, &scene, &frag, &atoms, &split)).contains("levels"));
+    // Σf not conserved (each f within its bound, 0.1 < 0.18; the sum off by 0.2)
+    let (scene, frag, atoms, split) = open_frag(&[(-0.1, 0.7), (-0.09, 0.6)], &[(-0.1, 0.6), (-0.09, 0.5)]);
+    let why = fail_words(judge(&p, &scene, &frag, &atoms, &split));
+    assert!(why.contains("Σf"), "{why}");
+    // one f beyond its bound (0.2 > 0.18) at levels 10 mHa apart: unambiguous, a failure
+    let (scene, frag, atoms, split) = open_frag(&[(-0.1, 0.7), (-0.09, 0.6)], &[(-0.1, 0.9), (-0.09, 0.5)]);
+    let why = fail_words(judge(&p, &scene, &frag, &atoms, &split));
+    assert!(why.contains("has f"), "{why}");
+    // the same at near-degenerate levels (0.5 mHa apart): the ε order need not pair the same orbitals — void
+    let (scene, frag, atoms, split) = open_frag(&[(-0.1, 0.9), (-0.0995, 0.6)], &[(-0.1, 0.6), (-0.0995, 0.9)]);
     match judge(&p, &scene, &frag, &atoms, &split) {
-        CheckVerdict::Fail(why) => assert!(why.contains("levels"), "{why}"),
+        CheckVerdict::Void(why) => assert!(why.contains("near-degenerate"), "{why}"),
         v => panic!("{v:?}"),
     }
-    // a level moved by more than the box splitting
-    let (mut scene, mut frag, atoms, split) = exact();
-    frag.partial = vec![level(-0.2, 0.5)];
-    scene.partial = vec![level(-0.2 + 5e-3, 0.5)];
-    assert!(matches!(judge(&p, &scene, &frag, &atoms, &split), CheckVerdict::Fail(_)));
     // a frontier level that is not the union's
     let (mut scene, frag, atoms, split) = exact();
     scene.frontier[0].homo = Some(-0.27 + 5e-3);
+    assert!(fail_words(judge(&p, &scene, &frag, &atoms, &split)).contains("levels"));
+}
+
+/// Review I1: a partial level donates and accepts, whatever side of ½ its f is.
+#[test]
+fn judge_fails_a_stray_whose_partial_level_is_its_homo() {
+    let p = FallbackPolicy::default();
+    // H₂ + a stray open-shell O-like atom at its partial ensemble: 2p at −0.33 Ha, f ≈ 2/3 in both spins (so its HOMO),
+    // 3s LUMO at +0.1. HOMO/LUMO alone: σu − 2p = 0.35 and 3s − σg = 0.47 pass; the real acceptor is the 2p itself,
+    // 40 mHa above σg
+    let (mut scene, frag, mut atoms, split) = exact();
+    let o2p = |spin: u8| PartialLevel { spin, index: 2, eps: -0.33, f: 2.0 / 3.0 };
+    atoms[0].frontier = [Frontier { homo: Some(-0.33), lumo: Some(0.1) }; 2];
+    atoms[0].partial = vec![o2p(0), o2p(1)];
+    scene.frontier = [Frontier { homo: Some(-0.33), lumo: Some(0.02) }; 2];
+    scene.partial = vec![PartialLevel { index: 3, ..o2p(0) }, PartialLevel { index: 3, ..o2p(1) }];
     match judge(&p, &scene, &frag, &atoms, &split) {
-        CheckVerdict::Fail(why) => assert!(why.contains("levels"), "{why}"),
+        CheckVerdict::Fail(why) => assert!(why.contains("margin") && why.contains("stray acceptor"), "{why}"),
+        v => panic!("{v:?}"),
+    }
+    // a partial level with f < ½ and no HOMO in its channel still donates (the stray H's ↓ partly filled)
+    let (mut scene, frag, mut atoms, split) = exact();
+    atoms[0].partial = vec![PartialLevel { spin: 1, index: 0, eps: -0.05, f: 0.3 }];
+    scene.partial = vec![PartialLevel { spin: 1, index: 1, eps: -0.05, f: 0.3 }];
+    match judge(&p, &scene, &frag, &atoms, &split) {
+        CheckVerdict::Fail(why) => assert!(why.contains("margin") && why.contains("fragment acceptor"), "{why}"),
+        v => panic!("{v:?}"),
+    }
+    // two parts both open in one channel fail one direction, however far apart their levels: one μ_σ is shared
+    let (mut scene, mut frag, mut atoms, split) = exact();
+    frag.frontier[0] = Frontier { homo: Some(-0.5), lumo: Some(0.3) };
+    frag.partial = vec![PartialLevel { spin: 0, index: 0, eps: -0.5, f: 0.6 }];
+    atoms[0].frontier[0] = Frontier { homo: Some(0.0), lumo: Some(0.4) };
+    atoms[0].partial = vec![PartialLevel { spin: 0, index: 0, eps: 0.0, f: 0.6 }];
+    scene.frontier[0] = Frontier { homo: Some(0.0), lumo: Some(0.3) };
+    scene.partial = vec![frag.partial[0].clone(), atoms[0].partial[0].clone()];
+    match judge(&p, &scene, &frag, &atoms, &split) {
+        CheckVerdict::Fail(why) => assert!(why.contains("margin"), "{why}"),
         v => panic!("{v:?}"),
     }
 }
@@ -280,6 +341,10 @@ fn judge_voids_an_unclean_solve_and_a_missing_lumo() {
     // the scene's LUMO, which the levels test needs
     let (mut scene, frag, atoms, split) = exact();
     scene.frontier[1].lumo = None;
+    assert_eq!(judge(&p, &scene, &frag, &atoms, &split), CheckVerdict::Void("frontier level not computed".into()));
+    // a scene that reports no frontier level at all while its parts do (a wiring slip): void, never a refusal
+    let (mut scene, frag, atoms, split) = exact();
+    scene.frontier = [Frontier::default(); 2];
     assert_eq!(judge(&p, &scene, &frag, &atoms, &split), CheckVerdict::Void("frontier level not computed".into()));
     // an absent HOMO (the stray H's empty ↓ channel) needs no margin: `exact` passes with it
 }
