@@ -1,4 +1,4 @@
-# Trust tightening: an evidence floor and tail-aware inflations (2026-11-18, rev. 1)
+# Trust tightening: an evidence floor and tail-aware inflations (2026-11-18, rev. 2)
 
 Design note only. No code, tolerance, tier or test changes here. Atomic units: Ha, Ha/Bohr.
 
@@ -14,6 +14,12 @@ APPROVE WITH CHANGES): C1, I1–I5 and M1–M3. Changes from rev. 0:
 - Fenced points and points freshened by a refusal are left out of the inflation's sample.
 - The calibration ticks get their own cadence.
 - A read-only report on the user's BEST collection is a go/no-go gate before implementation.
+
+Rev. 2 takes the re-review of rev. 1 (APPROVE WITH CHANGES; all three departures accepted):
+
+- λ_E's max condition is 1× the tier.
+- In the app, ticks are served only on the auditor; a busy auditor means a skipped, counted tick.
+- The cadence-fresh flag reads its own counter, which nothing resets.
 
 ## 1. Intent and decisions
 
@@ -68,12 +74,12 @@ bound on a per-key z. I recomputed the review's numbers from the log, and they r
 | CV²(z²) | 10.05 (a χ²₁ variable gives 2) |
 | answers with z > 18 | 5 of 248 |
 | lag-1 autocorrelation of z² | 0.63 |
-| CV² of 25-answer block means | 0.84 (9 blocks; the review says ≈ 1.0) |
+| CV² of 25-answer block means | 0.84–1.0 (0.84 over 9 whole blocks; 0.95 or 1.0 depending on how the partial block is treated) |
+| τ_int of z² | 2.8 (empirical 1 + 2Σρ_k, the re-review) |
 
-Two of the review's numbers do not reproduce:
-
-- **τ_int ≈ 2.8.** Under AR(1), (1 + ρ)/(1 − ρ) gives 4.4. Only 1/(1 − ρ) gives 2.7.
-- **s ≈ 0.17 b at the z > 18 answers.** The log prints no stds, so this cannot be checked.
+- **AR(1) gives a larger τ_int.** From ρ₁ alone, (1 + ρ)/(1 − ρ) gives 4.4. That overestimates, so
+  τ_int 2.8–4.4 is used below as a conservative range. No requirement changes.
+- **s ≈ 0.17 b at the z > 18 answers** cannot be checked: the log prints no stds.
 
 **Why the existing λ did not stop it.**
 
@@ -217,8 +223,16 @@ the window:
 
 - Per point, r_p = σ_E,epi,p/N_p/tier and e_p = |ΔE_p|/N_p/tier. Each point counts for every key it
   holds, as the LOO energy does.
-- **Max condition: e_p ≤ 4.53 (my call).** At 4.53 the rarity equals `WORST_ATOM`'s:
-  P(χ²₁ > 4.53²) = P(χ²₃/3 > 9) = 5.9e-6. It is derived, not tuned.
+- **Max condition: e_p ≤ 1, i.e. 1× the tier** (the controller's ruling on the re-review's
+  recommendation).
+  - The max condition is the answer-level criterion the validation asserts. On the force side
+    `WORST_ATOM` = `REPRO_FORCE_RATIO` = 3 already. The gate checks every answer's energy at 1× the
+    tier, so λ_E's max is 1.
+  - It only tightens: an admitted energy beyond the tier is an answer the gate already calls wrong.
+  - The over-refusal cost is small: benign energy errors are about 1e-5 to 1e-4 Ha/atom.
+  - Rev. 1's 4.53 (equal rarity with `WORST_ATOM`) never fired on the energy-only failures, e_p
+    1.03–1.39. The rms condition does not catch them either: it needs the 60-point floor, and the
+    hot run's admitted rms is ≈ 0.26 < `ENTER`, which gives λ_E = 1.
 - **Rms condition:** at `ENTER`, applied as for λ_T.
 - **The aleatoric floor** (N·s_E, about 1e-5 Ha per atom) is 1 % of the tier and is not subtracted.
 - **The epistemic energy std** is not in the history: `pred_energy_std` is the total std
@@ -249,8 +263,10 @@ computed on a step when either:
 - the consult counter reaches `variance_cadence` (σ-blind); or
 - the previous verdict refused or the counts changed (σ-coupled).
 
-Only points recorded on cadence-fresh steps, or on ticks, enter P_A. A tick decides before the
-variance is computed and forces it.
+`consults` resets on every fresh step, σ-coupled ones included (mod.rs:2388), so its phase reads σ.
+The flag therefore uses **a separate counter that nothing resets**: a step is cadence-fresh when that
+counter is a multiple of `variance_cadence`. Only points recorded on cadence-fresh steps, or on ticks,
+enter P_A. A tick decides before the variance is computed and forces it.
 
 **Ticks on their own cadence (review I5): every 25th in-envelope step, per provider (my call).**
 
@@ -259,14 +275,24 @@ variance is computed and forces it.
 - **Why 25.**
   - It is one fit interval of the harness and about 6–9 τ_int of z², so successive ticks are near
     independent.
-  - A trusted key's window then turns over in about 7500 in-envelope steps.
+- **How ticks are served.**
+  - **In the app,** ticks go asynchronously to the background auditor only, never in-step.
+  - A tick that falls due while the auditor is busy is **skipped, not deferred**, whatever answers
+    the step, so the skip does not read σ. Skips are counted and reported.
+  - A tick at a fallback needs no solve: the teacher's answer and the model's std are both at hand.
+  - A tick at an answered step is an extra audit, judged by rule 8 as well.
+  - **In-step ticks exist only on paths with no auditor:** the CPU in-step path and the harness.
+- **The effective cadence** is max(25, t_solve/t_step) in-envelope steps:
+  - ≈ 25 at 12 ms/step;
+  - 50–55 at 5 ms/step (solves of 130–270 ms);
+  - a trusted key's window turns over in 7500–16000 steps.
 - **Cost.**
-  - A tick at a fallback costs nothing: the teacher's answer and the model's std are both at hand.
-  - A tick at an answered step is an extra audit, judged by rule 8 as well. When the background
-    auditor is busy, the tick is served **in-step** (review Q7), so the selection never depends on
-    the auditor's state.
-  - Upper bound: one solve (130–270 ms) per 25 model steps (≈ 12 ms each), i.e. up to +45–90 % wall
-    time at full speed while every step is answered. To be measured.
+  - Wall time ≈ 0, plus contention for the GPU.
+  - σ-coupling ≈ 1 %: the auditor is otherwise busy only with rule-8 audits and their bursts, at
+    `audit_every` 2000.
+  - A tick lands in a 3–5-step tail cluster with a chance of ≈ 6–10 % (rev. 1: 12–20 %). That is
+    acceptable because the floor and the class-refused points do most of the catching.
+- **Rejected: ticks only for keys near their bound.** Choosing by nearness reads σ.
 - Rule 8's own cadence is unchanged.
 
 **Left out of P_A**, because λ selects them:
@@ -336,10 +362,10 @@ factor and its measured cause, e.g. "λ_T 7.7: a measured atom at 4.5× the boun
   - **The check is two-sided.** It needs ≥ 10 judged answers or ≥ 10 warranted refusals. Code-24
     refusals of a trusted class count toward neither, and 07939ac's refused steps sat at rms 0.46,
     not "warranted".
-  - **Ticks turn some answered steps into in-step audits.** This changes the trajectory and which
-    steps are judged answers.
-  - **An unmeasured first tail cluster can still be answered.** The 3–5-step clusters are hit by a
-    25-step tick with probability ≈ 12–20 % each.
+  - **The harness has no auditor, so its ticks are in-step.** A tick at an answered step there
+    becomes an in-step audit, which changes the trajectory and which steps are judged answers.
+  - **An unmeasured first tail cluster can still be answered.** A tick lands in a 3–5-step cluster
+    with a chance of ≈ 6–10 % in the app, and ≈ 12–20 % at the harness's in-step 25.
 - **If the gate fails**, the next step is policy (review Q8), never a tolerance.
 - **Suites:**
   - `cargo test -p providers --release`;
@@ -379,13 +405,21 @@ The evidence-count test near tests.rs:9070 should not move: the cap stays at 3.
    - λ_sum stays below 2.
 6. `a_harmless_confident_point_does_not_inflate`: e = 0.3 b at r = ā/b = 0.02 among 12 benign fits →
    λ_T = 1 (the M3 case).
-7. `the_energy_inflation_refuses_energy_only_failures`: points at e_p 1.03–1.39 and r_p 0.2 beside
-   benign ones → λ_E > 5, and rule 7 refuses at r_p 0.2 while forces pass.
+7. `the_energy_inflation_refuses_energy_only_failures`:
+   - fewer points than the floor: some at e_p 1.03–1.39 and r_p 0.2, beside benign ones at
+     e_p ≤ 0.1 and r_p up to 0.9;
+   - λ_E is just above 1/0.2 = 5, from the max condition alone, because the rms condition does not
+     apply below the floor;
+   - rule 7 refuses at r_p > 0.2 while the forces pass;
+   - with rev. 1's 4.53, λ_E would be 1.
 8. `the_inflations_never_read_what_they_selected`: λ_T and λ_E stay bit-identical under added code
    14/15/24 points, ordinary audits, fenced points, or points fresh only by a refusal.
 9. `no_inflation_shrinks_the_std`: λ ≥ λ_sum ≥ 1 on random histories.
-10. `a_calibration_tick_does_not_read_the_std`: σ scaled ×10 gives the same ticks; a busy auditor
-    gives the same ticks, served in-step.
+10. `a_calibration_tick_does_not_read_the_std`:
+    - σ scaled ×10 gives the same ticks;
+    - with an auditor, a tick due while it is busy is skipped and counted, whether the step was
+      answered or not, and is never served in-step;
+    - with no auditor, ticks are served in-step.
 11. `non_finite_and_zero_rules` (M1):
     - e = s = 0 adds nothing;
     - s = 0 with e/b > 3 gives λ_T = ∞, and rule 6 refuses the key's atoms, s = 0 included;
@@ -396,7 +430,7 @@ The evidence-count test near tests.rs:9070 should not move: the cap stays at 3.
 
 - **The repro, per run and key:**
   - n_fit, n_pts, λ_sum, λ_T, λ_E;
-  - ticks taken and served in-step;
+  - ticks taken, skipped while the auditor was busy, and served in-step (harness);
   - code-24 refusals;
   - judged z, raw and inflated (‖ΔF‖/(λ_F σ_epi));
   - worst ratios;
@@ -421,7 +455,7 @@ The evidence-count test near tests.rs:9070 should not move: the cap stays at 3.
 
 - The history keys: fit id, flags word, `energy_std_epistemic`.
 - Code 24 in `history_rule_name`.
-- Where the tick counter lives (async auditor, in-step path, variance cadence).
+- Where the tick counter and the never-reset cadence counter live (the async auditor, the in-step path).
 - The panel readouts.
 - The README line at the merge.
 
@@ -429,8 +463,6 @@ The evidence-count test near tests.rs:9070 should not move: the cap stays at 3.
 
 1. **λ_T's rms condition uses `ENTER`** (the review's choice). Should a trusted key's admitted set be
    held to `LEAVE` instead, to match the verdict's stay band?
-2. **Is 4.53 (equal rarity) right** for λ_E's max condition?
-3. **The fit-id over-count from other keys' refits.** Should the stricter per-key sample epoch be the
+2. **The fit-id over-count from other keys' refits.** Should the stricter per-key sample epoch be the
    default rather than the reserve?
-4. **Ticks every 25 steps.** Is the up to +45–90 % wall-time worst case acceptable, or should the
-   cadence scale with the measured τ_int per key?
+3. **Ticks every 25 steps.** Should the cadence scale with each key's measured τ_int?
