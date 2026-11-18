@@ -393,15 +393,16 @@ pub(super) fn quarantine_words(held: usize, added: usize, h: Held, ranking: Rank
 /// L∞ distance between two descriptors of species `s` in the envelope's training-spread units
 /// (a feature the training never varied counts as infinitely far once the two differ).
 ///
-/// Never NaN: a species with no training atom — since isolated atoms are no training atoms
-/// (`surrogate::envelope` module doc), also one seen only as an isolated atom — has a NaN unit,
-/// and a non-finite descriptor a NaN gap; either is infinitely far, never dropped by the callers'
-/// `f64::max` folds (`max` with a NaN keeps the other operand: a NaN gap read as 0, "identical").
-/// Far is the conservative side for every caller: thinning keeps the sample; the label-copy check
-/// and the teach planner's distances count it distinct; the quarantine, misfit and audit fences
-/// do not call it near; and the envelope's own rules refuse every query atom of a species with
-/// no training atom before any fence is read (`Envelope::coordination_ratio` and
-/// `Envelope::distance`: ∞ at count 0), as rule 5a refuses an isolated atom.
+/// Never NaN: a NaN unit (a species with no training atom — since isolated atoms are no
+/// training atoms, also one seen only as an isolated atom) or a NaN gap returns ∞, so the
+/// callers' `f64::max` folds cannot drop it (`max` with a NaN keeps the other operand). A NaN
+/// unit was ∞ already (it fails `u > 0`); a NaN gap is unreachable on finite in-cell inputs
+/// (`Scene::check_inside_cell` rejects non-finite positions; `describe` handles r = 0) and is
+/// guarded only. What ∞ means depends on the caller: for thinning, the label-copy check and the
+/// teach planner's distinctness it keeps the sample / counts it distinct (conservative); for the
+/// quarantine, misfit and audit fences (`d <= limit` fences) it is **not fenced** — permissive,
+/// and harmless only because rules 5b and 5c refuse every query atom of a count-0 species before
+/// any fence is read (`Envelope::coordination_ratio`, `Envelope::distance`: ∞ at count 0).
 pub(super) fn spread_distance(env: &Envelope, s: usize, a: &[f64], b: &[f64]) -> f64 {
     let mut worst = 0.0f64;
     for (k, (x, y)) in a.iter().zip(b).enumerate() {

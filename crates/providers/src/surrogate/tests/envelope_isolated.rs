@@ -125,3 +125,42 @@ fn an_installed_file_with_isolated_atoms_in_its_envelope_is_rebuilt() {
     assert_eq!(envelope_bits(u.envelope().unwrap()), want);
     assert!(!u.user_notes.iter().any(|n| n.contains("envelope was rebuilt")), "{:?}", u.user_notes);
 }
+
+/// The rebuilt envelope is the accumulator's too, so the fit grows from it: after installing an
+/// older file (its stored envelope admitting an isolated atom) one more sample and an incremental
+/// refit leave the envelope bit for bit that of a fresh accumulator over every member, in order.
+#[test]
+fn an_incremental_refit_after_the_rebuild_matches_a_fresh_fit() {
+    let mut s = tail_student();
+    let with = h2_maybe_stray(true);
+    s.add_sample(pair_sample(&with), &with).unwrap();
+    s.refit().unwrap();
+    let path = std::env::temp_dir().join(format!("envelope-isolated-grow-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let mut old = surrogate::sidecar::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let p = old.accumulator.basis.n_features();
+    old.accumulator.envelope.add_atom(0, &vec![0.0; p]);
+    let (mut t, _) = trained(1.2, 2.2, 0, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    t.install_sidecar(old).unwrap();
+    assert_eq!(t.accumulated, 62);
+    // one more sample, fitted on the incremental path (no species or reference change)
+    let more = in_cell_65(h2(1.45));
+    t.add_sample(pair_sample(&more), &more).unwrap();
+    assert!(!t.species_dirty && !t.refs_dirty, "the premise: the refit adds to the installed accumulator");
+    t.refit().unwrap();
+    assert_eq!((t.accumulated, t.accumulator.as_ref().unwrap().n_samples), (63, 63));
+    // a fresh accumulator over the same members, in store order
+    let model = t.model().unwrap();
+    let basis = model.basis.clone();
+    let refs = model.ref_energy.clone();
+    let st = t.store().unwrap();
+    let members: Vec<&Sample> = (0..t.accumulated).filter(|&i| !t.excluded(i)).map(|i| &st.samples[i]).collect();
+    assert_eq!(members.len(), 63);
+    let mut fresh = surrogate::Accumulator::new(&basis);
+    fresh.add_many(&members, &basis, &refs, &FitOptions::default()).unwrap();
+    assert_eq!(envelope_bits(t.envelope().unwrap()), envelope_bits(&fresh.envelope), "the provider's envelope after the incremental refit");
+    assert_eq!(envelope_bits(&t.accumulator.as_ref().unwrap().envelope), envelope_bits(&fresh.envelope), "and its accumulator's");
+    let k = basis.body2_index(0, 0);
+    assert!(fresh.envelope.min[k] > 0.0, "no isolated atom in it ({:e})", fresh.envelope.min[k]);
+}
