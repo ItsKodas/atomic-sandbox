@@ -307,6 +307,8 @@ impl SurrogateKs {
                 Q_DRAFT => SampleState::HeldOut,
                 // lone atoms loaded from before the keep rule: held out for good
                 Q_LONE => SampleState::Lone,
+                // stray atoms no composition check has measured yet: held out of the fit (`stray`)
+                Q_STRAY => SampleState::HeldOut,
                 // waiting for its box's reference (collection mode): not in the fit yet
                 Q_REF_WAIT => SampleState::Unfitted,
                 Q_NONE if i < *fit_n && fit_q.get(i).copied().unwrap_or(Q_NONE) == Q_NONE => SampleState::Fitted,

@@ -1222,7 +1222,8 @@ mod shared;
 pub use shared::{predecessor_of, COLLECTION_CHECKPOINT_PREFIX, PASS_STARTED_WITH_PREVIOUS_SOLVER};
 pub use purge::PURGE_WAIT_MIGRATION;
 mod store;
-// the stray-atom logic (spec 2026-11-18); plan Task 3 wires it into `evaluate` and the auditor, until then unused
+// the stray-atom logic (spec 2026-11-18): the composition checks and the hold-out (plan Task 3); answering inside a
+// cleared region is Task 4's, so a few of its items are not used yet
 #[allow(dead_code)]
 mod stray;
 mod teach;
@@ -1516,6 +1517,19 @@ pub struct SurrogateKs {
     side_queue: std::collections::VecDeque<(Scene, Provenance, JobKind, u64)>,
     /// An audit answer taken outside `evaluate`, judged at the next one (review M7).
     held_audit: Option<AuditAnswer>,
+    /// The stray-atom signatures of this session and their states (`stray`; spec 2026-11-18
+    /// §4.3, session-only): cleared with the model's basis or provenance (`stray_key`).
+    stray_book: stray::StrayBook,
+    /// The model's basis and surface (`lone::reference_settings_key`) the book's regions were built under
+    /// (`stray_book_current`).
+    stray_key: Option<(Basis, String)>,
+    /// The composition check in flight on the auditor (at most one; `queue_stray_check`).
+    stray_pending: Option<stray::StrayCheck>,
+    /// Composition checks queued so far: the id their parts' jobs carry (`AuditJob::id`).
+    stray_checks: u64,
+    /// The scene-edit generation: bumped by `reset` and `discontinuity` (the driver's edit
+    /// signals, `Dynamics::after_edit`); a composition check queued before an edit is dropped.
+    scene_gen: u64,
     /// Per stored sample: the teacher's face density (NaN = not known: `add_sample`, a teacher
     /// that reports none, or a file saved without densities — which `save_sidecar` writes only
     /// when no stored sample is box-affected).
@@ -1806,6 +1820,11 @@ impl SurrogateKs {
             atom_references: Vec::new(),
             side_queue: std::collections::VecDeque::new(),
             held_audit: None,
+            stray_book: stray::StrayBook::default(),
+            stray_key: None,
+            stray_pending: None,
+            stray_checks: 0,
+            scene_gen: 0,
             face: Vec::new(),
             fence_votes: Vec::new(),
             lift_votes: Vec::new(),
@@ -1996,6 +2015,13 @@ impl SurrogateKs {
                 return Err(e);
             }
         };
+        // a rule-5a fallback of a bonded part plus stray atoms the floor lets through: its answer is a composition
+        // check's scene answer (`stray` module doc, "The checks on the auditor"), raw — before the canonical surface
+        let stray_check = (h.reason.rule == TeachRule::IsolatedAtom && !h.audit && h.model.is_some() && scene.train_mask().is_none())
+            .then(|| self.stray_split(&h.pos, &h.z, &h.prov))
+            .flatten()
+            .filter(|(_, _, floor)| floor.is_none())
+            .map(|(split, sig, _)| (split, sig, stray::part_answer(&r, r.energy, h.prov.h)));
         // in collection mode every comparison and report is on the collection's canonical surface
         // (`shared` module doc, "References per box"; the identity per scene)
         let mut r = r;
@@ -2025,6 +2051,16 @@ impl SurrogateKs {
             // a capped segment's answer is kept with the scene's mask (module doc, "Masked scenes")
             self.admit_and_keep(&h.pos, &h.z, r.energy, raw_energy, &r.forces, face, multiplicity, model_answer, &h.near, h.near_misfit, h.keep_sample, h.thin && !h.audit, h.dedup && !h.audit, essential, &h.prov, unfit, tag, scene.train_mask(), &mut notes)
         };
+        if let Some((split, sig, part)) = stray_check {
+            let kept = outcome.is_kept().then(|| self.samples().saturating_sub(1));
+            let label = stray::signature_label(&sig);
+            if self.auditor.is_none() {
+                // controller ruling C: a synchronous fragment solve would stall the step
+                notes.push(format!("surrogate: stray atoms ({label}) — no background teacher, so no composition check runs; DFT answers"));
+            } else if self.queue_stray_check(scene, part, split, sig, kept) {
+                notes.push(format!("surrogate: stray atoms ({label}) — a composition check (the bonded part alone, each stray atom alone) is queued on the background teacher"));
+            }
+        }
         // an audit at a fenced-band geometry is not a judgement of the model (strict mode refuses
         // it there): the teacher answered, nothing is judged
         let judged_audit = h.audit && !h.shell_fence;
@@ -2644,9 +2680,12 @@ impl ForceProvider for SurrogateKs {
         self.last = None;
         self.offset_jump = 0.0;
         self.last_variance = None; // the next consultation checks the variance afresh
+        // an edit: a composition check in flight is of the old scene (`stray`)
+        self.scene_gen += 1;
     }
 
     fn discontinuity(&mut self) {
+        self.scene_gen += 1;
         self.teacher.discontinuity();
         self.last_fallback = false;
         self.last = None;

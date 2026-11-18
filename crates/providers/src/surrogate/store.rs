@@ -16,6 +16,11 @@ pub(super) fn masked_by(mut s: Sample, scene: &Scene) -> Sample {
     s
 }
 
+/// The note of a stray-atom answer the floor refuses (`TeachOutcome::StrayNotKept`).
+fn stray_not_kept(why: &str) -> String {
+    format!("surrogate: sample not kept (stray atoms — {why}; a combination whose DFT energy is not known to split into the bonded part's and the free atoms')")
+}
+
 impl SurrogateKs {
     /// Samples held (fallback steps and `add_sample`).
     pub fn samples(&self) -> usize {
@@ -156,6 +161,9 @@ impl SurrogateKs {
         self.answered = 0;
         self.quarantine.clear();
         self.lone_codes.clear();
+        // the session's stray-atom clearances were this model's (`stray`; controller ruling B)
+        self.stray_book.clear();
+        self.stray_key = None;
         self.face.clear();
         self.fence_votes.clear();
         self.lift_votes.clear();
@@ -279,6 +287,9 @@ impl SurrogateKs {
         let r_cut = self.cutoff();
         let lone = self.hold_out_lone(r_cut);
         self.note_lone_held_out("model file", lone, r_cut);
+        // and samples with stray atoms, until a composition check measures them (`Q_STRAY`)
+        let stray = self.hold_out_stray(r_cut);
+        self.note_stray_held_out("model file", stray, r_cut);
         // references of another rule are not fitted on (a new fit would bake them in — the model has
         // no intercept, ruling S5): they count as missing, and the Retry or a pass re-solves them
         let s9 = reference_rule.as_deref() == Some(surrogate::sidecar::REFERENCE_RULE);
@@ -349,10 +360,12 @@ impl SurrogateKs {
             return Err("the file's reference energies do not match its species".into());
         }
         // samples of lone atoms kept before the keep rule refused them are held out (`Q_LONE`,
-        // below). A fit that cannot form without them leaves the file's samples installed with no
+        // below), and so are samples with stray atoms until a composition check measures them
+        // (`Q_STRAY`). A fit that cannot form without them leaves the file's samples installed with no
         // model — the no-model case of a samples file (`install_samples`), which this set is
         let lone_cut = model.basis.r_cut;
-        let lone_fallback = samples.iter().any(|s| no_neighbours(&s.pos, lone_cut)).then(|| surrogate::SampleSet {
+        let held = |s: &Sample| no_neighbours(&s.pos, lone_cut) || super::stray::split(&s.pos, lone_cut).is_some();
+        let lone_fallback = samples.iter().any(held).then(|| surrogate::SampleSet {
             provenance: model.provenance.clone(),
             samples: samples.clone(),
             references: model.basis.species.iter().copied().zip(model.ref_energy.iter().copied()).collect(),
@@ -368,12 +381,12 @@ impl SurrogateKs {
         });
         if let Some(set) = lone_fallback.as_ref() {
             let usable = (0..set.samples.len())
-                .filter(|&i| !no_neighbours(&set.samples[i].pos, lone_cut) && set.samples[i].tag != SampleTag::DraftAudit && set.quarantine.get(i).is_none_or(|&q| q == Q_NONE))
+                .filter(|&i| !held(&set.samples[i]) && set.samples[i].tag != SampleTag::DraftAudit && set.quarantine.get(i).is_none_or(|&q| q == Q_NONE))
                 .count();
             if usable == 0 {
                 let set = lone_fallback.expect("checked");
                 self.install_samples(set)?;
-                self.user_notes.push("model file: besides its lone atoms it holds no sample a fit could use — its samples are installed with no model yet".into());
+                self.user_notes.push("model file: besides its lone atoms and its samples with stray atoms it holds no sample a fit could use — its samples are installed with no model yet".into());
                 return Ok(());
             }
         }
@@ -424,6 +437,9 @@ impl SurrogateKs {
         // the lone samples the file's fit held (`Q_LONE`; the prefix above is the file's own)
         let lone = self.hold_out_lone(lone_cut);
         let lone_in_fit = self.lone_codes.iter().filter(|&(&i, &q)| i < self.accumulated && q == Q_NONE).count();
+        // the samples with stray atoms its fit held (`Q_STRAY`: set only on a code-0 sample, so each was fitted)
+        let stray = self.hold_out_stray(lone_cut);
+        let stray_in_fit = (0..self.accumulated).filter(|&i| self.quarantine.get(i) == Some(&Q_STRAY)).count();
         self.pass_start = None;
         self.pass_coverage = None;
         self.fence_votes.clear();
@@ -439,6 +455,9 @@ impl SurrogateKs {
         self.since_kept = THIN_EVERY;
         self.recovery = None;
         self.reset_audits();
+        // a new model: the session's stray-atom clearances were the old one's (spec 2026-11-18 §4.6; ruling B)
+        self.stray_book.clear();
+        self.stray_key = None;
         // the file's audit history is the installed model's (M8a Task 1); its points' generations
         // and the saved verdicts' `trusted_since` are the writer's, so this provider's generation
         // moves past all of them — the calibrated verdict's evidence window compares generations
@@ -499,18 +518,28 @@ impl SurrogateKs {
             (s.yy_e, s.yy_f)
         });
         let (want_n, want_rows) = self.report.as_ref().map_or((members, rows), |r| (r.n_samples, r.n_rows));
-        if lone_in_fit > 0 {
+        if lone_in_fit > 0 || stray_in_fit > 0 {
             // the file's fit used them: rebuilt from its stored samples without them (no DFT); a
             // fit that cannot form leaves the samples with no model (the no-model case; its own
-            // install notes the lone samples)
+            // install notes the held-out samples)
             self.species_dirty = true;
             if let Err(e) = self.fit_store() {
-                self.install_samples(lone_fallback.expect("lone samples were found"))?;
-                self.user_notes.push(format!("model file: its fit cannot be rebuilt without its {lone_in_fit} lone-atom samples ({e}) — its samples are installed with no model yet"));
+                self.install_samples(lone_fallback.expect("held-out samples were found"))?;
+                self.user_notes.push(match (lone_in_fit, stray_in_fit) {
+                    (k, 0) => format!("model file: its fit cannot be rebuilt without its {k} lone-atom samples ({e}) — its samples are installed with no model yet"),
+                    (0, k) => format!("model file: its fit cannot be rebuilt without its {k} samples with stray atoms ({e}) — its samples are installed with no model yet"),
+                    (a, b) => format!("model file: its fit cannot be rebuilt without its {a} lone-atom samples and {b} samples with stray atoms ({e}) — its samples are installed with no model yet"),
+                });
                 return Ok(());
             }
-            self.note_lone_held_out("model file", lone, lone_cut);
-            self.user_notes.push(format!("model file: its fit used {lone_in_fit} of them — rebuilt from its stored samples without them (no DFT)"));
+            if lone_in_fit > 0 {
+                self.note_lone_held_out("model file", lone, lone_cut);
+                self.user_notes.push(format!("model file: its fit used {lone_in_fit} of them — rebuilt from its stored samples without them (no DFT)"));
+            }
+            if stray_in_fit > 0 {
+                self.note_stray_held_out("model file", stray, lone_cut);
+                self.user_notes.push(format!("model file: its fit used {stray_in_fit} of the samples with stray atoms — rebuilt from its stored samples without them (no DFT)"));
+            }
         } else if (members, rows) != (want_n, want_rows) || !close(yy_e, acc_ye) || !close(yy_f, acc_yf) {
             self.species_dirty = true;
             self.fit_store().map_err(|e| format!("the file's fit membership ({members} samples, {rows} rows) does not match its report ({want_n}, {want_rows}) and the rebuild failed: {e}"))?;
@@ -525,6 +554,9 @@ impl SurrogateKs {
         if lone_in_fit == 0 {
             // held out already (quarantined, box-excluded) or not fitted yet: the fit stands
             self.note_lone_held_out("model file", lone, lone_cut);
+        }
+        if stray_in_fit == 0 {
+            self.note_stray_held_out("model file", stray, lone_cut);
         }
         // round 1, SHOULD-2: the failed audits it still held, re-judged on this fit (not counted
         // as a refit's re-judgement)
@@ -589,9 +621,15 @@ impl SurrogateKs {
     /// collection mode the check is the collection's surface-key check and the sample is offered
     /// to the collection with the solved `multiplicity` (`shared` module doc).
     pub(super) fn push_sample(&mut self, s: Sample, prov: &Provenance, face: f64, multiplicity: Option<u32>) -> Result<(), StoreError> {
+        self.push_sample_coded(s, prov, face, multiplicity, Q_NONE)
+    }
+
+    /// [`push_sample`](Self::push_sample) at quarantine code `code` ([`Q_NONE`], or [`Q_STRAY`] for a stray-atom
+    /// sample held out until measured), set before a collection is offered the sample (a held one waits outside it).
+    pub(super) fn push_sample_coded(&mut self, s: Sample, prov: &Provenance, face: f64, multiplicity: Option<u32>, code: u8) -> Result<(), StoreError> {
         let z = s.z.clone();
         if self.shared.is_some() {
-            self.push_shared(s, prov, face, multiplicity)?;
+            self.push_shared_coded(s, prov, face, multiplicity, code)?;
             if let Some(acc) = &self.accumulator {
                 if z.iter().any(|&zi| acc.basis.species_index(zi).is_none()) {
                     self.species_dirty = true;
@@ -617,6 +655,10 @@ impl SurrogateKs {
         }
         self.face.resize(n, f64::NAN);
         self.face.push(face);
+        if code != Q_NONE {
+            self.quarantine.resize(n + 1, Q_NONE);
+            self.quarantine[n] = code;
+        }
         if let Some(acc) = &self.accumulator {
             if z.iter().any(|&zi| acc.basis.species_index(zi).is_none()) {
                 self.species_dirty = true;
@@ -641,11 +683,28 @@ impl SurrogateKs {
             notes.push("surrogate: sample not kept (lone atoms — no atom has a neighbour within the model's cutoff, nothing to learn)".into());
             return false;
         }
+        // stray atoms (`stray` module doc, "The hold-out"; spec 2026-11-18 §4.3, review C1): a combination the floor
+        // refuses is never kept; any other is held out of the fit until a check measures it, unless a cleared region of
+        // its signature covers its bonded geometry
+        let held = match self.stray_split(pos, z, prov) {
+            Some((_, _, Some(why))) => {
+                notes.push(stray_not_kept(&why));
+                return false;
+            }
+            Some((split, sig, None)) => (!self.stray_covered(pos, z, &split, &sig)).then(|| stray::signature_label(&sig)),
+            None => None,
+        };
         self.since_kept = 0;
         let sample = Sample { pos: pos.to_vec(), z: z.to_vec(), energy, forces: forces.to_vec(), tag, weight: 1.0, force_mask: mask.map(<[bool]>::to_vec), use_energy: mask.is_none() };
-        match self.push_sample(sample, prov, face.unwrap_or(f64::NAN), multiplicity) {
+        let code = if held.is_some() { Q_STRAY } else { Q_NONE };
+        match self.push_sample_coded(sample, prov, face.unwrap_or(f64::NAN), multiplicity, code) {
             Ok(()) => {
                 notes.extend(std::mem::take(&mut self.collection_note));
+                if let Some(label) = held {
+                    notes.push(format!(
+                        "surrogate: kept, held out of the fit — stray atoms ({label}) whose composition no check has measured here (a composition error would land in the bonded part's coefficients)"
+                    ));
+                }
                 if tag == SampleTag::DraftAudit {
                     // a draft guess's audit: held out of the strict fit (`Q_DRAFT`)
                     let n = self.samples();
@@ -706,6 +765,14 @@ impl SurrogateKs {
         if no_neighbours(pos, self.cutoff()) {
             notes.push("surrogate: sample not kept (lone atoms — no atom has a neighbour within the model's cutoff, nothing to learn)".into());
             return TeachOutcome::LoneNotKept;
+        }
+        // stray atoms the floor refuses (`stray` module doc, "The hold-out"): used for the step, never kept, before
+        // `admit` touches anything
+        if keep {
+            if let Some((_, _, Some(why))) = self.stray_split(pos, z, prov) {
+                notes.push(stray_not_kept(&why));
+                return TeachOutcome::StrayNotKept;
+            }
         }
         let a = self.admit(pos, z, energy, forces, face, model, near, near_misfit, keep, thin, dedup, essential, prov.h, mask, notes);
         // the store takes the teacher's own answer (`shared`, "References per box": `energy` is on

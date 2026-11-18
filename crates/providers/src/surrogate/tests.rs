@@ -5031,7 +5031,7 @@ fn fallback_events_carry_the_step_of_their_evaluation() {
 /// A teacher's (energy, forces, face density, display) as the auditor's answer carries it (no
 /// orbital payload: these audits run with the view off).
 fn solved(r: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>) -> Result<Solved, String> {
-    r.map(|(energy, forces, face, display)| Solved { energy, forces, face, multiplicity: None, display, orbitals: None, unfit: None })
+    r.map(|(energy, forces, face, display)| Solved { energy, forces, face, multiplicity: None, display, orbitals: None, unfit: None, frontier: Default::default(), partial: Vec::new(), warned: false })
 }
 
 /// A background audit job for `s` at `scene` under `prov` (the auditor's own bookkeeping

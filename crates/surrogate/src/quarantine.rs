@@ -119,8 +119,8 @@ pub fn is_forgotten_code(code: u8) -> bool {
 pub const Q_RESOLVED: u8 = 9;
 
 /// Whether `code` is one a file or a collection may hold ([`Q_NONE`]…[`Q_BOX`], [`Q_FORGOTTEN`] and
-/// [`Q_FORGOTTEN_UNFENCED`]; [`Q_DRAFT`] is carried by the sample's tag, 5 and 6 are the provider's
-/// own): the sidecar's predicate. [`Q_RESOLVED`] is a collection's only ([`is_collection_code`]).
+/// [`Q_FORGOTTEN_UNFENCED`]; [`Q_DRAFT`] is carried by the sample's tag, 5, 6 and 10 are the provider's
+/// own — `providers::surrogate`'s `Q_REF_WAIT`, `Q_LONE` and `Q_STRAY`, never written): the sidecar's predicate. [`Q_RESOLVED`] is a collection's only ([`is_collection_code`]).
 pub fn is_persisted_code(code: u8) -> bool {
     matches!(code, Q_NONE | Q_HELD | Q_SUPERSEDED | Q_BOX | Q_FORGOTTEN | Q_FORGOTTEN_UNFENCED)
 }

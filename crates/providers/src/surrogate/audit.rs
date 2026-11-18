@@ -123,6 +123,13 @@ pub(super) enum JobKind {
     /// spec §4.2): orbitals only, display only — never a fallback, an audit, a teacher solve, a
     /// sample or a teach event. At most one is queued (`SurrogateKs::harris_queued`).
     HarrisDisplay,
+    /// A composition check's bonded part alone (`stray`, spec 2026-11-18 §4.3): the scene's
+    /// bonded nuclei in its cell, charge 0, automatic multiplicity, the scene's ionic policy; its
+    /// answer goes to the check in flight (`SurrogateKs::take_stray_answer`), never a sample.
+    Fragment,
+    /// A composition check's stray atom of this Z alone at its scene position, at its reference
+    /// multiplicity, in the scene's cell — like [`Fragment`](JobKind::Fragment) never a sample.
+    AtomAt(u8),
 }
 
 /// Where a failed audit came from (the teach-around review, SHOULD-T5: the chip says which).
@@ -237,6 +244,12 @@ pub(super) struct Solved {
     pub(super) orbitals: Option<OrbitalDisplay>,
     /// Why this answer must not be trained on (`EvalStats::untrainable`), if it must not.
     pub(super) unfit: Option<&'static str>,
+    /// The solve's per-spin frontier levels and partial levels (`EvalStats::frontier`,
+    /// `EvalStats::partial`) and whether it warned (`EvalStats::warnings`): a composition check's
+    /// (`stray::PartAnswer`).
+    pub(super) frontier: [sim::Frontier; 2],
+    pub(super) partial: Vec<sim::PartialLevel>,
+    pub(super) warned: bool,
 }
 
 /// The auditor's answer: what the teacher solved, or its error; for a `Reference` job the scan's
@@ -282,7 +295,7 @@ impl Auditor {
                 let mut view = OrbitalViewRequest::default();
                 let mut core = false;
                 while let Ok(job) = jrx.recv() {
-                    let atom = matches!(job.kind, JobKind::Atom(_) | JobKind::Reference(_));
+                    let atom = matches!(job.kind, JobKind::Atom(_) | JobKind::Reference(_) | JobKind::AtomAt(_));
                     // a Harris display solve touches neither the SCF warm state nor its
                     // extrapolation (it writes its own `HarrisState`; spec §4.2): no reset, no
                     // discontinuity, and `last_atom` stays the last SCF job's
@@ -335,7 +348,7 @@ impl Auditor {
                             let interrupt = job.interrupt.clone();
                             let mut abort = || current.load(Ordering::Relaxed) != g || interrupt.as_ref().is_some_and(|i| i());
                             let result = match teacher.harris_display(&job.scene, &atoms, &mut abort) {
-                                Some(sim::HarrisAnswer::Solved(Ok(o))) => Ok(Solved { energy: f64::NAN, forces: Vec::new(), face: None, multiplicity: None, display: None, orbitals: Some(o), unfit: None }),
+                                Some(sim::HarrisAnswer::Solved(Ok(o))) => Ok(Solved { energy: f64::NAN, forces: Vec::new(), face: None, multiplicity: None, display: None, orbitals: Some(o), unfit: None, frontier: Default::default(), partial: Vec::new(), warned: false }),
                                 // superseded or yielded to the user: silent (review minor 3)
                                 Some(sim::HarrisAnswer::Solved(Err(ProviderError::Cancelled))) => Err(HARRIS_CANCELLED.into()),
                                 Some(sim::HarrisAnswer::Solved(Err(e))) => Err(e.to_string()),
@@ -349,7 +362,18 @@ impl Auditor {
                                 .evaluate(&job.scene, &mut || current.load(Ordering::Relaxed) != g)
                                 .map(|r| {
                                     (scf_steps, ts) = (Some(r.stats.scf_steps), Some(r.stats.energy.ts));
-                                    Solved { energy: r.energy, forces: r.forces, face: r.stats.face_density, multiplicity: r.stats.multiplicity, unfit: r.stats.untrainable(), display: r.display, orbitals: r.orbitals }
+                                    Solved {
+                                        energy: r.energy,
+                                        forces: r.forces,
+                                        face: r.stats.face_density,
+                                        multiplicity: r.stats.multiplicity,
+                                        unfit: r.stats.untrainable(),
+                                        display: r.display,
+                                        orbitals: r.orbitals,
+                                        frontier: r.stats.frontier,
+                                        warned: !r.stats.warnings.is_empty(),
+                                        partial: r.stats.partial,
+                                    }
                                 })
                                 .map_err(|e| e.to_string()),
                             None,
@@ -699,6 +723,9 @@ impl SurrogateKs {
         if let Some(a) = self.auditor.as_mut() {
             a.new_generation();
         }
+        // a composition check in flight is the old model's: its answers come back of an older
+        // generation (discarded), and its queued parts are dropped (`stray`)
+        self.drop_stray_check();
         self.audit_due = false;
         self.box_audits_unjudged = 0;
         self.audit_flip = false;
@@ -802,6 +829,10 @@ impl SurrogateKs {
         if ans.job.generation != a.generation() {
             return; // the model it was for was forgotten or replaced
         }
+        // a composition check's part (`stray`): to the check in flight, never a sample
+        if matches!(ans.job.kind, JobKind::Fragment | JobKind::AtomAt(_)) {
+            return self.take_stray_answer(ans);
+        }
         let positions = || ans.job.scene.nuclei.iter().map(|n| n.pos).collect::<Vec<[f64; 3]>>();
         match (ans.job.kind, ans.result) {
             (JobKind::Atom(z), Ok(Solved { display: Some(d), .. })) => return self.atom_densities.push((z, d)),
@@ -812,6 +843,7 @@ impl SurrogateKs {
             (JobKind::Reference(z), _) => {
                 return self.atom_references.push((z, Err(ProviderError::Invalid("the background teacher returned no reference".into()))));
             }
+            (JobKind::Fragment | JobKind::AtomAt(_), _) => unreachable!("routed to take_stray_answer above"),
             // display only (G4): a payload, else a note — never a teach event or a counter
             (JobKind::HarrisDisplay, Ok(Solved { orbitals: Some(o), .. })) => {
                 self.side_harris = Some(SideDisplay { display: None, orbitals: Some(o), kind: SideKind::Harris, job: ans.job.id, positions: positions() });
@@ -843,7 +875,7 @@ impl SurrogateKs {
                 self.push_event(ev);
                 return self.pending_notes.push(note);
             }
-            (JobKind::Audit, Ok(Solved { energy, forces, face, multiplicity, display, orbitals, unfit })) => {
+            (JobKind::Audit, Ok(Solved { energy, forces, face, multiplicity, display, orbitals, unfit, .. })) => {
                 if let Some(d) = display {
                     self.side_display = Some(SideDisplay { display: Some(d), orbitals, kind: SideKind::Audit, job: ans.job.id, positions: positions() });
                 }

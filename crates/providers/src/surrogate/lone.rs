@@ -320,7 +320,7 @@ impl SurrogateKs {
     /// The multiplicity of species `z`'s isolated-atom reference on `prov`'s surface (module doc,
     /// "The multiplicity rule and the occupations"): the scan's choice when it is cached, else the
     /// only one the scan can solve, else `None`.
-    fn reference_multiplicity(&self, z: u8, prov: &Provenance) -> Option<u32> {
+    pub(super) fn reference_multiplicity(&self, z: u8, prov: &Provenance) -> Option<u32> {
         if let Some(m) = self.ref_cache.get(&atom_key(prov, z)).and_then(|r| r.multiplicity) {
             return Some(m);
         }

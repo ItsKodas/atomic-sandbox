@@ -631,6 +631,19 @@ pub enum TeachOutcome {
     /// step, never trained on — every descriptor is empty, so it teaches nothing and carries only the
     /// grid/box artefacts of an isolated atom (the per-box reference energies cover isolated atoms).
     LoneNotKept,
+    /// A teacher answer of a bonded part plus stray atoms (no neighbour within the model's cutoff)
+    /// whose combination the static floor refuses (a charge, a forced multiplicity, the spin rule,
+    /// mixed stray species, a shell-check fence, a stray atom near a face): used for its step,
+    /// never kept (`providers::surrogate::stray`, spec 2026-11-18 §4.2–4.3).
+    StrayNotKept,
+    /// A composition check of a stray-atom signature passed on the background teacher: `n` of the
+    /// `of` passes at distinct bonded geometries its cleared region needs (spec 2026-11-18 §4.3).
+    StrayChecking { n: usize, of: usize },
+    /// A composition check passed at a bonded geometry outside the signature's cleared region: the
+    /// region grows.
+    StrayCheckingNew,
+    /// A composition check failed: the signature is refused for the session, its samples held out.
+    StrayRefused,
     FenceDisagrees,
     /// A teacher answer next to a training sample the model cannot reproduce (`NearMisfit`) that
     /// disagrees with the model: used for its step, not kept, no fence vote (spec 2026-11-13 §4.3).

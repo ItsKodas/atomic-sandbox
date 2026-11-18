@@ -68,6 +68,29 @@ pub(super) const Q_REF_WAIT: u8 = 5;
 /// model that may one day learn from them (long-range terms).
 pub(super) const Q_LONE: u8 = 6;
 
+/// A stored sample with **stray atoms** — a bonded part plus atoms with no neighbour within the
+/// model's cutoff ([`stray::split`](super::stray::split); spec 2026-11-18 §4.3, review C1) — that
+/// no composition check has measured: a stray atom has no features, so a composition error in its
+/// label (a spin state or a charge transfer the model cannot see) would land in the bonded part's
+/// coefficients and spoil bonded-only scenes too. **Held out of the fit** like [`Q_LONE`] — not
+/// fitted, not in the envelope, the grade or the leave-one-out, never fencing, never released by
+/// the trust recovery or superseded — until its own check passes or a cleared region of its
+/// signature covers its bonded geometry ([`SurrogateKs::release_stray_samples`]: back to
+/// `released_code`, [`Q_NONE`] or [`Q_REF_WAIT`]); for good when the signature is refused. Unlike
+/// `Q_LONE` it is **counted in the thinning distance** (`nearest_stored`): a parked molecule with a
+/// stray atom must not add a sample per step while its check waits. Set only on a sample in the fit
+/// or waiting for its box's reference (`Q_NONE`, `Q_REF_WAIT`: the keep path, `keep_sample_masked`;
+/// at load, `hold_out_stray` and `mirror_collection_sample`), so its code on disk is always `Q_NONE`
+/// and a release restores exactly that (a draft guess's audit stays `Q_DRAFT`: its promotion waits
+/// for strict mode to answer there, which rule 5a refuses until a clearance covers it). A provider-only code like [`Q_REF_WAIT`]
+/// and [`Q_LONE`]: **never written** — a saved file writes `Q_NONE`, a collection gets no status
+/// record for it (`sync_collection_status`) and a new stray sample waits outside the collection
+/// (`offer`, like a draft guess) until it is released, so the user's files are untouched. Its value
+/// is the next one that no in-memory code uses and no collection status record can hold (codes
+/// 0–9: [`surrogate::quarantine::is_collection_code`]; 9 is the Fermi–Dirac migration's
+/// `Q_RESOLVED`).
+pub(super) const Q_STRAY: u8 = 10;
+
 /// A box-affected sample ([`surrogate::quarantine::Q_BOX`]).
 pub(super) const Q_BOX: u8 = surrogate::quarantine::Q_BOX;
 
@@ -521,15 +544,55 @@ impl SurrogateKs {
         lone.len()
     }
 
+    /// Stored samples with stray atoms held out of the fit until a composition check measures them
+    /// ([`Q_STRAY`]).
+    pub fn stray_held_out(&self) -> usize {
+        self.quarantine.iter().filter(|&&q| q == Q_STRAY).count()
+    }
+
+    /// Holds every stored sample in the fit ([`Q_NONE`], or waiting for its box's reference:
+    /// [`Q_REF_WAIT`]) that has stray atoms at `r_cut` (Bohr; [`stray::split`](super::stray::split))
+    /// out of it ([`Q_STRAY`]); how many were newly held. Called where stored samples are
+    /// installed, beside [`hold_out_lone`](Self::hold_out_lone): the session's clearances start
+    /// empty (spec §4.6), so a loaded stray sample waits for a check like a new one. Samples already
+    /// out of the fit keep their own code (they are not fitted either way, and their code is what a
+    /// file holds).
+    pub(super) fn hold_out_stray(&mut self, r_cut: f64) -> usize {
+        let Some(store) = self.store.as_ref() else { return 0 };
+        let held: Vec<usize> = (0..store.len())
+            .filter(|&i| self.quarantine.get(i).is_none_or(|&q| q == Q_NONE || q == Q_REF_WAIT) && super::stray::split(&store.samples[i].pos, r_cut).is_some())
+            .collect();
+        if held.is_empty() {
+            return 0;
+        }
+        self.quarantine.resize(store.len(), Q_NONE);
+        for &i in &held {
+            self.quarantine[i] = Q_STRAY;
+        }
+        held.len()
+    }
+
+    /// The user's note on [`hold_out_stray`](Self::hold_out_stray)'s count `k` of the samples
+    /// from `source`.
+    pub(super) fn note_stray_held_out(&mut self, source: &str, k: usize, r_cut: f64) {
+        if k > 0 {
+            let r = format!("{r_cut}");
+            self.user_notes.push(format!(
+                "{source}: {k} sample{} with stray atoms (no neighbour within {r} Bohr) held out of the fit until a composition check measures them (kept on disk, unchanged)",
+                if k == 1 { "" } else { "s" }
+            ));
+        }
+    }
+
     /// The code sample `i` is written to a file with: a lone sample's ([`Q_LONE`]) is the code it
-    /// was loaded with; the provider-only codes `Q_DRAFT` (its tag carries it) and `Q_REF_WAIT` (it
-    /// waits again at the reload) write as `Q_NONE`.
+    /// was loaded with; the provider-only codes `Q_DRAFT` (its tag carries it), `Q_REF_WAIT` (it
+    /// waits again at the reload) and `Q_STRAY` (set only on a `Q_NONE` sample) write as `Q_NONE`.
     pub(super) fn persisted_code(&self, i: usize) -> u8 {
         let q = match self.quarantine.get(i).copied().unwrap_or(Q_NONE) {
             Q_LONE => self.lone_codes.get(&i).copied().unwrap_or(Q_NONE),
             q => q,
         };
-        if q == Q_DRAFT || q == Q_REF_WAIT || q == Q_LONE {
+        if q == Q_DRAFT || q == Q_REF_WAIT || q == Q_LONE || q == Q_STRAY {
             Q_NONE
         } else {
             q
@@ -1274,7 +1337,9 @@ impl SurrogateKs {
     /// held-out draft guesses (`Q_DRAFT`) left out — they are not the strict store's data, and
     /// counting them would thin (and, through `is_label_copy`, refuse) the fallbacks that teach
     /// strict mode the region (round 1 re-review, R1-1) — and so are lone atoms (`Q_LONE`: never
-    /// data). ∞ without a model, an envelope or a candidate.
+    /// data). Stray-atom samples held out (`Q_STRAY`) count: they are the teacher's answers, and a
+    /// parked molecule with a stray atom must not add one per step while its check waits. ∞ without
+    /// a model, an envelope or a candidate.
     pub(super) fn nearest_stored(&mut self, pos: &[[f64; 3]], z: &[u8]) -> f64 {
         self.ensure_desc_cache();
         let (Some(basis), Some(env)) = (self.desc_basis.as_ref(), self.envelope.as_ref()) else { return f64::INFINITY };
@@ -1682,6 +1747,7 @@ impl SurrogateKs {
                     Q_DRAFT => "a draft guess held out of the strict fit",
                     Q_REF_WAIT => "waiting for its box's isolated-atom reference",
                     Q_LONE => "lone atoms, held out for good",
+                    Q_STRAY => "stray atoms, held out until a composition check measures them",
                     _ => "held out of the fit",
                 }
             )),

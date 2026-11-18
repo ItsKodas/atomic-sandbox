@@ -1,9 +1,10 @@
 //! Stray atoms (spec 2026-11-18, `docs/superpowers/specs/2026-11-18-stray-atom-composition-design.md`): in strict
 //! mode a scene made of a **bonded part** plus one or more **stray atoms** (no neighbour within the model's r_cut) is
 //! answered by the model once it has been *measured* that this combination's DFT energy splits as the bonded part's
-//! plus the free atoms'. This module is the pure logic: the split, the signature, the static floor, the composition
-//! check's verdict and the cleared region with its book. The provider's wiring (the auditor's fragment and atom jobs,
-//! the sample hold-out, answering inside a region) is the caller's (plan Tasks 3–4). Atomic units (Hartree, Bohr).
+//! plus the free atoms'. This module holds the pure logic — the split, the signature, the static floor, the composition
+//! check's verdict and the cleared region with its book — and the provider's wiring of the checks and the sample
+//! hold-out (plan Task 3; below, "The checks on the auditor"); answering inside a region is `evaluate`'s (plan Task 4).
+//! Atomic units (Hartree, Bohr).
 //!
 //! # Why the model's answer is already "bonded part + free atoms" (spec §2)
 //!
@@ -83,8 +84,11 @@
 //!   order: the counts must agree, each ε within [`STRAY_LEVEL_TOL`] = 1.8 mHa (the largest box splitting measured,
 //!   `lone` module doc; on a line the sorted pairing minimises the largest ε difference, so a failure there is not a
 //!   mispairing), Σf per spin within [`level_occupation_tol`] (with nothing transferred the open part's electron count
-//!   fixes it; a difference is a transferred fraction), and each f within the same tol / (2 kT). The f bound: after the
-//!   margin, a channel with partial levels has **exactly one open part** (two fail above), so the scene's μ_σ is that
+//!   fixes it; a difference is a transferred fraction), and each f within the same tol / (2 kT). The f bound: a channel
+//!   with partial levels has **exactly one open part** here — the fragment and a stray atom both open in it fail the
+//!   margin above (it tests each stray atom against the fragment), and two open stray atoms never reach a check: the
+//!   floor refuses mixed stray species, and copies of one species unless `closed_spin_channels` says each ends at a
+//!   gap (the margin never compares two stray atoms) — so the scene's μ_σ is that
 //!   part's own μ_σ up to the level shifts; if every level moves by at most tol, so does μ, so ε − μ moves by at most
 //!   2 tol and f = 1/(1 + e^{(ε−μ)/kT}) by at most 2 tol × max|∂f/∂ε| = 2 tol / (4 kT). Where a level has a neighbour
 //!   within 2 tol (near-degenerate: the ε order need not pair the same orbitals) an f outside the bound is **void**,
@@ -110,6 +114,32 @@
 //!
 //! The answer is `predict(scene)`, the sum above. The bonded part must pass every rule on its own, with every per-atom
 //! normalisation (rule 7, its (Nσ_e)² floor, the audit criterion) over n_bonded, not the scene's n.
+//!
+//! # The checks on the auditor and the sample hold-out (spec §4.3, review C1; plan Task 3)
+//!
+//! - **When.** A strict-mode step refused by rule 5a (`TeachRule::IsolatedAtom`, the model consulted) whose scene
+//!   splits and passes the floor falls back as before; its solve is the check's scene answer, and
+//!   [`queue_stray_check`](SurrogateKs::queue_stray_check) queues the bonded part alone (`JobKind::Fragment`) and each
+//!   stray atom alone (`JobKind::AtomAt`) on the background auditor's side queue — behind the job in flight, never
+//!   replacing an audit. The parts keep the scene's cell, σ, ionic policy and provenance (review M5: never the
+//!   fragment's own surface tag); the fragment is neutral at automatic multiplicity, each atom at its reference
+//!   multiplicity. At most one check is in flight; a newer fallback does not replace it unless the scene was edited
+//!   since (`reset` / `discontinuity` bump the scene-edit generation, and a check of an older one is dropped silently
+//!   when its answer arrives). No check is queued for a refused signature, inside a cleared region, or at a bonded
+//!   geometry that would not count (not distinct from the region's points). **Without a background auditor** (the CPU
+//!   teacher's synchronous audits) no check runs: a synchronous fragment solve would stall the step (plan ruling).
+//! - **Judged.** When every part has answered, [`judge`] gives the verdict and [`StrayBook::record`] books it at the
+//!   bonded descriptors under the model's basis; one Activity event says what it did (`TeachOutcome::StrayChecking`,
+//!   `StrayCheckingNew`, `StrayRefused`; a void check `Discarded`, a failed part solve `Failed`).
+//! - **The hold-out.** A kept sample with stray atoms (`keep_sample_masked`) is held out of the fit
+//!   (`quarantine::Q_STRAY`, never written) unless a cleared region of its signature covers its bonded geometry; a
+//!   floor-refused one is never kept (`TeachOutcome::StrayNotKept`). A pass releases the check's own sample; a cleared
+//!   signature releases every held sample of it its region covers
+//!   ([`release_stray_samples`](SurrogateKs::release_stray_samples)); a refused one holds them for good. Loaded
+//!   samples are held the same way (`hold_out_stray`), never rewritten.
+//! - **The book's lifetime.** Session-only (spec §4.6), and built in one basis's descriptor space: a model with
+//!   another basis or surface, a Forget and an installed model clear it, drop the check in flight and release
+//!   nothing ([`stray_book_current`](SurrogateKs::stray_book_current); controller ruling B).
 use super::lone::{closed_spin_channels, compensated_sum, reference_settings_key};
 use super::quarantine::spread_distance;
 use super::*;
@@ -586,5 +616,344 @@ impl StrayBook {
     /// Forget every signature (a new model, a surface change, a reset).
     pub(super) fn clear(&mut self) {
         self.map.clear();
+    }
+}
+
+/// A solve as a check's part: its energy (`energy`, raw — never the collection's canonical one), forces and levels,
+/// and whether it is clean (no warning, trainable, its face density within the box rule at `h`).
+pub(super) fn part_answer(r: &ForceResult, energy: f64, h: f64) -> PartAnswer {
+    let boxed = r.stats.face_density.is_some_and(|rho| !(rho <= box_affected_face_density(h)));
+    PartAnswer {
+        energy,
+        forces: r.forces.clone(),
+        frontier: r.stats.frontier,
+        partial: r.stats.partial.clone(),
+        clean: r.stats.warnings.is_empty() && r.stats.untrainable().is_none() && !boxed,
+    }
+}
+
+/// The composition check in flight on the auditor (module doc, "The checks on the auditor"): the signature and split,
+/// the scene's own answer, the parts' answers as they arrive (`atoms` in [`Split::stray`]'s order), the scene-edit
+/// generation it was queued in, the store index of the scene's kept sample (`sample`, with its `sample_key`: a purge
+/// may move indices), the scene's positions and species (the bonded descriptors are taken when it is judged), the
+/// id its jobs carry and the parts' solve time.
+#[derive(Clone, Debug)]
+pub(super) struct StrayCheck {
+    pub sig: Signature,
+    pub split: Split,
+    pub scene: PartAnswer,
+    pub frag: Option<PartAnswer>,
+    pub atoms: Vec<Option<PartAnswer>>,
+    pub scene_gen: u64,
+    pub sample: Option<usize>,
+    pub sample_key: Option<u64>,
+    pub pos: Vec<[f64; 3]>,
+    pub z: Vec<u8>,
+    pub id: u64,
+    pub ms: f64,
+}
+
+/// "H2 + H": the bonded part's formula and the stray atoms' (the Activity's and the notes' label of a signature).
+pub(super) fn signature_label(sig: &Signature) -> String {
+    format!("{} + {}", super::shared::formula(&sig.bonded_z), super::shared::formula(&sig.stray_z))
+}
+
+impl SurrogateKs {
+    /// The split of `pos` at the model's cutoff, its signature on `prov` and the floor's refusal (module doc, "The
+    /// static floor"); `None` when the geometry has no stray atom.
+    pub(super) fn stray_split(&self, pos: &[[f64; 3]], z: &[u8], prov: &Provenance) -> Option<(Split, Signature, Option<String>)> {
+        let split = split(pos, self.cutoff())?;
+        let sig = Signature::new(z, &split, prov.charge, prov);
+        let floor = self.stray_floor(pos, z, prov, &split);
+        Some((split, sig, floor))
+    }
+
+    /// [`floor_refusal`] on the provider's sources: `m_ref` is `lone`'s (the scan's record, or the single allowed M,
+    /// with the record's partial-level flag), `fenced` the shell-check fences, the faces those of `prov`'s cell.
+    fn stray_floor(&self, pos: &[[f64; 3]], z: &[u8], prov: &Provenance, split: &Split) -> Option<String> {
+        let scene = Scene {
+            nuclei: pos.iter().zip(z).map(|(&p, &zi)| sim::Nucleus::new(zi, p)).collect(),
+            cell: sim::Cell { n: prov.grid_n, h: prov.h },
+            charge: prov.charge,
+            multiplicity: prov.multiplicity,
+            sigma: Some(prov.sigma),
+            external_field: [0.0; 3],
+            ionic: sim::IonicPolicy::None,
+            train_mask: None,
+        };
+        let m_ref = |zs: u8| self.reference_multiplicity(zs, prov).map(|m| (m, self.ref_cache.get(&atom_key(prov, zs)).and_then(|r| r.fractional)));
+        let fenced = |a: u8, b: u8| {
+            let key = (a.min(b), a.max(b));
+            self.audit_fences.iter().any(|c| c.origin == AuditOrigin::ShellCheck && c.pair.map(|(p, q)| (p.min(q), p.max(q))) == Some(key))
+        };
+        let half = scene.cell.half_extent();
+        let faces = |r: [f64; 3]| half - r.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+        floor_refusal(&scene, split, &m_ref, &fenced, &faces)
+    }
+
+    /// The bonded part's descriptors and species indices under the model's basis (`None` without a model, or for a
+    /// species it lacks).
+    pub(super) fn bonded_descriptors(&self, pos: &[[f64; 3]], z: &[u8], split: &Split) -> Option<(Vec<Vec<f64>>, Vec<usize>)> {
+        let basis = &self.model.as_ref()?.basis;
+        let bp: Vec<[f64; 3]> = split.bonded.iter().map(|&i| pos[i]).collect();
+        let bz: Vec<u8> = split.bonded.iter().map(|&i| z[i]).collect();
+        Some((describe_values(basis, &bp, &bz).ok()?, basis.species_indices(&bz).ok()?))
+    }
+
+    /// The book under the model that stands (controller ruling B): when the model's basis or surface differs from the
+    /// one its regions were built under — a refit with another basis, an installed model, a Forget — the book is
+    /// cleared and the check in flight dropped; no held sample is released. True when it cleared.
+    pub(super) fn stray_book_current(&mut self) -> bool {
+        let same = match (self.model.as_ref(), self.stray_key.as_ref()) {
+            (Some(m), Some((b, s))) => m.basis == *b && reference_settings_key(&m.provenance) == *s,
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return false;
+        }
+        self.stray_book.clear();
+        self.drop_stray_check();
+        self.stray_key = self.model.as_ref().map(|m| (m.basis.clone(), reference_settings_key(&m.provenance)));
+        true
+    }
+
+    /// Drops the check in flight and its queued parts (an answer already on its way is told apart by its job id).
+    pub(super) fn drop_stray_check(&mut self) {
+        self.stray_pending = None;
+        self.side_queue.retain(|j| !matches!(j.2, JobKind::Fragment | JobKind::AtomAt(_)));
+    }
+
+    /// Whether a cleared region of `sig` covers the bonded geometry of `pos` (module doc, "The hold-out").
+    pub(super) fn stray_covered(&mut self, pos: &[[f64; 3]], z: &[u8], split: &Split, sig: &Signature) -> bool {
+        self.stray_book_current();
+        let Some(StrayState::Cleared { region, .. }) = self.stray_book.state(sig) else { return false };
+        self.bonded_descriptors(pos, z, split).is_some_and(|(d, s)| region.contains(&d, &s))
+    }
+
+    /// Queues the composition check of `scene` (module doc, "The checks on the auditor"): `ans` is the scene's own
+    /// fallback answer, `split` and `sig` its split and signature (the floor passed: the caller's), `kept` the store
+    /// index of its kept sample. True when queued; false without a background auditor (controller ruling C), while
+    /// another check of this scene is in flight, for a refused signature, inside a cleared region, at a geometry that
+    /// would not count, or without a model to measure the geometry with.
+    pub(super) fn queue_stray_check(&mut self, scene: &Scene, ans: PartAnswer, split: Split, sig: Signature, kept: Option<usize>) -> bool {
+        if self.auditor.is_none() {
+            return false;
+        }
+        self.stray_book_current();
+        // at most one in flight, and a newer fallback does not replace it — unless it is of a scene edited since (its
+        // answers are dropped on arrival anyway)
+        if self.stray_pending.as_ref().is_some_and(|p| p.scene_gen == self.scene_gen) {
+            return false;
+        }
+        let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
+        let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+        let Some((desc, species)) = self.bonded_descriptors(&pos, &z, &split) else { return false };
+        let Some(units) = self.envelope.as_ref() else { return false };
+        let thin = THIN_FRACTION * self.policy.max_descriptor_distance;
+        match self.stray_book.state(&sig) {
+            Some(StrayState::Refused(_)) => return false,
+            Some(StrayState::Cleared { region, .. }) if region.contains(&desc, &species) => return false,
+            Some(StrayState::Checking { region, .. }) if !region.distinct(&desc, &species, units, thin) => return false,
+            _ => {}
+        }
+        self.drop_stray_check();
+        self.stray_checks += 1;
+        let id = self.stray_checks;
+        // the scene's provenance and ionic policy (review M5): the parts are solved on the scene's surface
+        let prov = self.scene_provenance(scene);
+        let mut frag = scene.clone();
+        frag.nuclei = split.bonded.iter().map(|&i| scene.nuclei[i].clone()).collect();
+        frag.charge = 0;
+        frag.multiplicity = None;
+        frag.train_mask = None;
+        self.side_queue.push_back((frag, prov.clone(), JobKind::Fragment, id));
+        for &s in &split.stray {
+            let mut atom = scene.clone();
+            atom.nuclei = vec![scene.nuclei[s].clone()];
+            atom.charge = 0;
+            // the floor passed, so the reference multiplicity is known
+            atom.multiplicity = self.reference_multiplicity(scene.nuclei[s].z, &prov);
+            atom.train_mask = None;
+            self.side_queue.push_back((atom, prov.clone(), JobKind::AtomAt(scene.nuclei[s].z), id));
+        }
+        let sample_key = kept.and_then(|i| self.store.as_ref().and_then(|st| st.samples.get(i)).map(sample_key));
+        let atoms = vec![None; split.stray.len()];
+        self.stray_pending = Some(StrayCheck { sig, split, scene: ans, frag: None, atoms, scene_gen: self.scene_gen, sample: kept.filter(|_| sample_key.is_some()), sample_key, pos, z, id, ms: 0.0 });
+        self.pump_side_queue();
+        true
+    }
+
+    /// One part's answer from the auditor (`handle_answer`; module doc, "The checks on the auditor"): filed with the
+    /// check in flight; when every part has answered, the check is judged. A part of another check (dropped) is ignored,
+    /// and a check of a scene edited since is dropped silently; a failed part solve voids the check (a `Failed` event).
+    pub(super) fn take_stray_answer(&mut self, ans: AuditAnswer) {
+        let Some(p) = self.stray_pending.as_mut() else { return };
+        if ans.job.id != p.id {
+            return;
+        }
+        if p.scene_gen != self.scene_gen {
+            return self.drop_stray_check();
+        }
+        let sig = p.sig.clone();
+        let solved = match ans.result {
+            Ok(s) => s,
+            Err(e) => {
+                self.drop_stray_check();
+                let what = if ans.job.kind == JobKind::Fragment { "the bonded part alone" } else { "a stray atom alone" };
+                let note = format!(
+                    "surrogate: stray atoms ({}) — the composition check's solve of {what} failed on the background teacher ({e}); not counted, the next fallback checks again",
+                    signature_label(&sig)
+                );
+                let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::IsolatedAtom, TeachOutcome::Failed);
+                ev.detail = note.clone();
+                ev.n_atoms = ans.job.scene.nuclei.len();
+                ev.solve_ms = ans.ms;
+                self.push_event(ev);
+                return self.pending_notes.push(note);
+            }
+        };
+        let boxed = solved.face.is_some_and(|rho| !(rho <= box_affected_face_density(ans.job.prov.h)));
+        let part = PartAnswer { energy: solved.energy, forces: solved.forces, frontier: solved.frontier, partial: solved.partial, clean: !solved.warned && solved.unfit.is_none() && !boxed };
+        p.ms += ans.ms;
+        match ans.job.kind {
+            JobKind::Fragment => p.frag = Some(part),
+            JobKind::AtomAt(_) => {
+                // the stray atom at this answer's position (two stray atoms of one species are told apart by it)
+                let at = ans.job.scene.nuclei.first().map(|n| n.pos);
+                match (0..p.split.stray.len()).find(|&k| p.atoms[k].is_none() && Some(p.pos[p.split.stray[k]]) == at) {
+                    Some(k) => p.atoms[k] = Some(part),
+                    None => return,
+                }
+            }
+            _ => return,
+        }
+        if p.frag.is_none() || p.atoms.iter().any(Option::is_none) {
+            return;
+        }
+        let p = self.stray_pending.take().expect("checked");
+        self.judge_stray_check(p);
+    }
+
+    /// Judges a complete check, books its verdict and releases what it covers (module doc).
+    fn judge_stray_check(&mut self, p: StrayCheck) {
+        let StrayCheck { sig, split, scene, frag, atoms, sample, sample_key: key, pos, z, ms, .. } = p;
+        let frag = frag.expect("complete");
+        let atoms: Vec<PartAnswer> = atoms.into_iter().map(|a| a.expect("complete")).collect();
+        let label = signature_label(&sig);
+        let n_atoms = pos.len();
+        // a model with another basis or surface since the dispatch: the book is cleared and this verdict not booked
+        if self.stray_book_current() {
+            return self.pending_notes.push(format!("surrogate: stray atoms ({label}) — the composition check's answer arrived after the model changed basis or settings; not booked"));
+        }
+        let verdict = judge(&self.policy, &scene, &frag, &atoms, &split);
+        let event = |outcome: TeachOutcome, detail: String| {
+            let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::IsolatedAtom, outcome);
+            ev.detail = detail;
+            ev.n_atoms = n_atoms;
+            ev.solve_ms = ms;
+            ev
+        };
+        let (outcome, detail) = match verdict.clone() {
+            CheckVerdict::Void(why) => (TeachOutcome::Discarded, format!("surrogate: stray atoms ({label}) — composition check void ({why}); not counted, the next fallback checks again")),
+            CheckVerdict::Fail(why) => {
+                self.stray_book.refuse(&sig, why.clone());
+                (TeachOutcome::StrayRefused, format!("surrogate: stray atoms ({label}) — composition fails: {why}; DFT answers this combination for the session and its samples stay out of the fit"))
+            }
+            CheckVerdict::Pass { residual, margin } => {
+                let measured = self.bonded_descriptors(&pos, &z, &split);
+                let (Some((desc, species)), Some(model), Some(units)) = (measured, self.model.as_ref(), self.envelope.as_ref()) else {
+                    let note = format!("surrogate: stray atoms ({label}) — the composition check passed, but the model cannot describe the bonded part (a species it lacks); not counted");
+                    let ev = event(TeachOutcome::Discarded, note.clone());
+                    self.push_event(ev);
+                    return self.pending_notes.push(note);
+                };
+                let (basis, units) = (model.basis.clone(), units.clone());
+                let was_cleared = matches!(self.stray_book.state(&sig), Some(StrayState::Cleared { .. }));
+                let thin = THIN_FRACTION * self.policy.max_descriptor_distance;
+                self.stray_book.record(sig.clone(), verdict, &desc, &species, &basis, &units, thin);
+                // the check's own sample is measured (unless the signature was refused while it was in flight); a cleared
+                // signature releases every held sample its region covers
+                let mut released = 0;
+                let refused = matches!(self.stray_book.state(&sig), Some(StrayState::Refused(_)));
+                if let Some(i) = sample.filter(|&i| !refused && key.is_some() && self.store.as_ref().and_then(|st| st.samples.get(i)).map(sample_key) == key) {
+                    if self.quarantine.get(i) == Some(&Q_STRAY) {
+                        self.quarantine[i] = self.released_code(i);
+                        released += 1;
+                    }
+                }
+                let (outcome, state) = match self.stray_book.state(&sig) {
+                    Some(StrayState::Checking { passes, .. }) => (TeachOutcome::StrayChecking { n: *passes, of: STRAY_CHECKS }, format!("{passes} of {STRAY_CHECKS} passes at distinct geometries")),
+                    Some(StrayState::Cleared { .. }) if was_cleared => (TeachOutcome::StrayCheckingNew, "cleared; the region grows".to_string()),
+                    Some(StrayState::Cleared { .. }) => (TeachOutcome::StrayChecking { n: STRAY_CHECKS, of: STRAY_CHECKS }, format!("cleared ({STRAY_CHECKS} checks)")),
+                    Some(StrayState::Refused(why)) => (TeachOutcome::StrayRefused, format!("refused already ({why})")),
+                    None => (TeachOutcome::Discarded, "not booked".to_string()),
+                };
+                if matches!(self.stray_book.state(&sig), Some(StrayState::Cleared { .. })) {
+                    released += self.release_stray_samples(&sig);
+                }
+                if released > 0 {
+                    self.arm_stray_refit();
+                }
+                (
+                    outcome,
+                    format!(
+                        "surrogate: stray atoms ({label}) — composition check passed (|E_scene − E_frag − Σ E_atom| = {:.3} mHa, frontier margin {:.0} mHa): {state}{}",
+                        residual * 1e3,
+                        margin * 1e3,
+                        if released > 0 { format!("; {released} held sample{} released into the fit", if released == 1 { "" } else { "s" }) } else { String::new() }
+                    ),
+                )
+            }
+        };
+        let ev = event(outcome, detail.clone());
+        self.push_event(ev);
+        self.pending_notes.push(detail);
+    }
+
+    /// The store samples of `sig` held out ([`Q_STRAY`]) whose bonded geometry its cleared region covers go back to
+    /// the fit (`released_code`: [`Q_NONE`], or `Q_REF_WAIT` while its box's reference is missing); how many. Nothing
+    /// unless `sig` is cleared. The caller arms the refit ([`arm_stray_refit`](Self::arm_stray_refit)).
+    pub(super) fn release_stray_samples(&mut self, sig: &Signature) -> usize {
+        self.stray_book_current();
+        let Some(StrayState::Cleared { region, .. }) = self.stray_book.state(sig) else { return 0 };
+        let region = region.clone();
+        let Some(store) = self.store.as_ref() else { return 0 };
+        let r_cut = self.cutoff();
+        let mut release = Vec::new();
+        for (i, s) in store.samples.iter().enumerate() {
+            if self.quarantine.get(i) != Some(&Q_STRAY) {
+                continue;
+            }
+            let Some(sp) = split(&s.pos, r_cut) else { continue };
+            let prov = self.sample_provenance(i);
+            if Signature::new(&s.z, &sp, prov.charge, &prov) != *sig {
+                continue;
+            }
+            if self.bonded_descriptors(&s.pos, &s.z, &sp).is_some_and(|(d, k)| region.contains(&d, &k)) {
+                release.push(i);
+            }
+        }
+        for &i in &release {
+            self.quarantine[i] = self.released_code(i);
+        }
+        release.len()
+    }
+
+    /// Samples came back into the fit: the next refit rebuilds the accumulator (they may lie inside its prefix), and an
+    /// attached collection is offered the ones that waited outside it.
+    pub(super) fn arm_stray_refit(&mut self) {
+        self.species_dirty = true;
+        self.pending_refit = true;
+        self.sync_collection_status();
+    }
+
+    /// The provenance stored sample `i` was solved at: the store's, in collection mode at the sample's own box.
+    fn sample_provenance(&self, i: usize) -> Provenance {
+        let mut p = self.store.as_ref().map(|s| s.provenance.clone()).expect("a stored sample");
+        if let Some(n) = self.shared.as_ref().and_then(|sh| sh.box_n.get(i)) {
+            p.grid_n = *n;
+        }
+        p
     }
 }

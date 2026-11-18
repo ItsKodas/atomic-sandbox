@@ -302,6 +302,8 @@ impl SurrogateKs {
         // (`Q_LONE`) — before the reference wait below, which they never join
         let r_cut = self.cutoff();
         let lone = self.hold_out_lone(r_cut);
+        // and samples with stray atoms until a composition check measures them (`Q_STRAY`, never written)
+        let stray = self.hold_out_stray(r_cut);
         self.refs_dirty = true;
         self.pending_refit = n > 0;
         // the collection's audit history (module doc); its generations are the writers', so this
@@ -358,6 +360,7 @@ impl SurrogateKs {
         }
         self.user_notes.push(note);
         self.note_lone_held_out(&format!("shared collection {slug}"), lone, r_cut);
+        self.note_stray_held_out(&format!("shared collection {slug}"), stray, r_cut);
         self.find_migration();
         if self.no_model().is_some_and(|nm| nm.missing.is_empty() && nm.retry) {
             if let Err(e) = SurrogateKs::refit(self) {
@@ -473,9 +476,15 @@ impl SurrogateKs {
         s.coll.admit_provenance(prov).err().map(|why| format!("the shared collection {} does not take this scene ({why}) — a per-scene model learns it", s.coll.key.slug()))
     }
 
-    /// Into the store in collection mode (`push_sample`'s branch): the surface-key check, then the
-    /// store (created with the collection's provenance), then the offer to the collection.
+    /// [`push_shared_coded`](Self::push_shared_coded) at [`Q_NONE`] (the tests' entry).
+    #[cfg(test)]
     pub(super) fn push_shared(&mut self, s: Sample, prov: &Provenance, face: f64, multiplicity: Option<u32>) -> Result<(), StoreError> {
+        self.push_shared_coded(s, prov, face, multiplicity, Q_NONE)
+    }
+
+    /// Into the store in collection mode (`push_sample_coded`'s branch): the surface-key check, then the
+    /// store (created with the collection's provenance) at quarantine code `code`, then the offer to the collection.
+    pub(super) fn push_shared_coded(&mut self, s: Sample, prov: &Provenance, face: f64, multiplicity: Option<u32>, code: u8) -> Result<(), StoreError> {
         // the note describes this sample only (a pass sample's refusal must not reach a later step)
         self.collection_note.clear();
         let sh = self.shared.as_ref().expect("collection mode");
@@ -508,6 +517,12 @@ impl SurrogateKs {
         if offset.is_none() {
             self.quarantine.resize(n + 1, Q_NONE);
             self.quarantine[n] = Q_REF_WAIT;
+        }
+        // a stray-atom sample held out until measured (`Q_STRAY`, over a reference wait: its release goes to
+        // `released_code`): set before the offer, so it waits outside the collection
+        if code != Q_NONE {
+            self.quarantine.resize(n + 1, Q_NONE);
+            self.quarantine[n] = code;
         }
         let sh = self.shared.as_mut().expect("collection mode");
         sh.link.resize(n, Link::Out);
@@ -571,6 +586,16 @@ impl SurrogateKs {
                 ));
                 Link::Waiting { grid_n: prov.grid_n, multiplicity }
             }
+            // stray atoms not measured yet (`Q_STRAY`): it waits like a draft guess, added once a composition check
+            // releases it (`sync_collection_status`)
+            Err(_) if code == Q_STRAY => {
+                sh.waiting += 1;
+                let slug = sh.coll.key.slug();
+                self.collection_note.push(format!(
+                    "surrogate: held out of the fit, so not in the shared collection {slug} yet — it is added once a composition check measures its stray atoms"
+                ));
+                Link::Waiting { grid_n: prov.grid_n, multiplicity }
+            }
             Err(why) => {
                 *sh.refused.entry(why.clone()).or_default() += 1;
                 let slug = sh.coll.key.slug();
@@ -588,8 +613,9 @@ impl SurrogateKs {
         let mut failed: Option<String> = None;
         let mut promoted: Vec<(usize, usize, Option<u32>)> = Vec::new();
         for (i, link) in sh.link.iter().enumerate() {
-            // a lone sample's hold-out is the provider's (`Q_LONE`): the collection's code stands
-            if self.quarantine.get(i) == Some(&Q_LONE) {
+            // a lone or stray sample's hold-out is the provider's (`Q_LONE`, `Q_STRAY`): the collection's code stands
+            // (a new stray sample waits outside it, `Link::Waiting`, until released)
+            if matches!(self.quarantine.get(i), Some(&Q_LONE) | Some(&Q_STRAY)) {
                 continue;
             }
             let code = self.quarantine.get(i).copied().filter(|&q| q != Q_REF_WAIT).unwrap_or(Q_NONE);
@@ -1110,6 +1136,8 @@ impl SurrogateKs {
             let r_cut = self.cutoff();
             let lone = self.hold_out_lone(r_cut);
             self.note_lone_held_out(&format!("shared collection {slug}: session-only samples {}", path.display()), lone, r_cut);
+            let stray = self.hold_out_stray(r_cut);
+            self.note_stray_held_out(&format!("shared collection {slug}: session-only samples {}", path.display()), stray, r_cut);
         }
         Ok(taken)
     }
@@ -1539,6 +1567,8 @@ impl SurrogateKs {
         self.face.resize(n, f64::NAN);
         self.face.push(f64::NAN);
         let q = if offset.is_none() && code == Q_NONE { Q_REF_WAIT } else { code };
+        // a sample with stray atoms is held out until a composition check measures it, as at attach (`Q_STRAY`)
+        let q = if (q == Q_NONE || q == Q_REF_WAIT) && super::stray::split(&cs.sample.pos, self.cutoff()).is_some() { Q_STRAY } else { q };
         if !self.quarantine.is_empty() || q != Q_NONE {
             self.quarantine.resize(n, Q_NONE);
             self.quarantine.push(q);

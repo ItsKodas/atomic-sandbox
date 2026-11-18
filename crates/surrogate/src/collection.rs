@@ -1419,7 +1419,7 @@ impl Collection {
 
     /// Records a later quarantine change of sample `index` (a status record; module doc). Only a code a collection
     /// may hold ([`crate::quarantine::is_collection_code`]: 0–3, 7, 8 and 9) is written; any other — the provider's own
-    /// 5 and 6, the draft code 4 that a sample's tag carries — is refused, nothing written (plan 2026-11-13 Task 14,
+    /// 5, 6 and 10, the draft code 4 that a sample's tag carries — is refused, nothing written (plan 2026-11-13 Task 14,
     /// with the first code-9 writer).
     pub fn set_status(&mut self, index: usize, code: u8) -> Result<(), String> {
         if !crate::quarantine::is_collection_code(code) {
