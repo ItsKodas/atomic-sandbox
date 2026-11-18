@@ -328,6 +328,8 @@ The design is in [`docs/superpowers/specs/2026-10-12-atomic-sandbox-design.md`](
 
 Scaling up the "ladder": more elements (pseudopotentials for Z > 10), larger systems through ML potentials trained on this solver's own data and loaded as data behind the same `ForceProvider` boundary, then coarse-grained and continuum stages. Gravity exists as an external-field hook but is invisible at atomic scale, as it should be.
 
+Functionals: **PBE** (a GGA, beside LSDA) is next, then **rVV10**, a nonlocal van der Waals functional on top of it. Neither LSDA nor PBE has London dispersion, the attraction that holds two H₂ molecules together in a shallow T-shaped well (≈ 3.4 Å apart, ≈ 0.1 mHa deep). rVV10 computes it from the electron density with two global constants and no per-element parameters, so it stays within the rule that chemistry must emerge. For Estimated mode to follow it, the model also needs a longer reach than its 6 Bohr and a long-range dispersion term.
+
 
 Nuclear physics (decay, transmutation) is planned as a **nuclear-events layer**, not as explicit protons and neutrons: the nucleus is 10⁻⁵ of the atom and no first-principles route from QCD exists, so nuclei stay points for the electrons while a stochastic α/β/γ event process — Q-values from the isotope mass table, rates from measured half-lives — changes Z live and lets the chemistry respond. Decay time gets its own labelled clock, separate from the MD speed.
 
