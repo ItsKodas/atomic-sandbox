@@ -145,6 +145,11 @@ pub(super) enum AuditOrigin {
     /// A pass's shell check (`sampling` module doc, 3.): the interaction left beyond the scan limit
     /// that the cutoff truncates.
     ShellCheck,
+    /// A failed audit at a scene with stray atoms that its attribution check blamed on the model
+    /// (`stray` module doc, "Audits of a cleared answer"): its label is the bonded part's teacher answer
+    /// plus each stray atom's E_ref — valid only while those atoms are stray at the model's cutoff
+    /// (`rejudge_failed_audits` fences it otherwise; Task 5 fix round 1, M7).
+    StrayAttributed,
 }
 
 impl AuditOrigin {
@@ -155,6 +160,7 @@ impl AuditOrigin {
             AuditOrigin::TeachCheck => "teach-check",
             AuditOrigin::HeldOutGuess => "held-out-guess",
             AuditOrigin::ShellCheck => "shell-check",
+            AuditOrigin::StrayAttributed => "stray-attributed",
         }
     }
 
@@ -163,6 +169,7 @@ impl AuditOrigin {
             "teach-check" => AuditOrigin::TeachCheck,
             "held-out-guess" => AuditOrigin::HeldOutGuess,
             "shell-check" => AuditOrigin::ShellCheck,
+            "stray-attributed" => AuditOrigin::StrayAttributed,
             _ => AuditOrigin::Audit,
         }
     }
@@ -683,6 +690,17 @@ impl SurrogateKs {
             self.audit_history.unrecorded.no_variance += 1;
             return;
         };
+        // a scene with stray atoms is recorded over its bonded part (Task 5 fix round 1, I3): calibration's energy
+        // evidence is per atom over the point's atoms (`calibrate`, e2 = (err_E / n_atoms / tier)²), and the stray
+        // atoms are no evidence (no feature, exactly 0 force std); the energy std is the bonded part's bit for bit
+        // (`Model::predict`'s floor per energy-row atom, ruling 9a) and the energy error the scene's
+        if let Some(sp) = self.model.as_ref().and_then(|m| super::stray::split(pos, m.basis.r_cut)).filter(|_| z.len() == pos.len()) {
+            let keep = |v: &[f64]| sp.bonded.iter().map(|&i| v[i]).collect::<Vec<f64>>();
+            let keep3 = |v: &[[f64; 3]]| sp.bonded.iter().map(|&i| v[i]).collect::<Vec<[f64; 3]>>();
+            let (bp, bz) = sp.bonded_part(pos, z);
+            let (fs, fe) = (keep(force_std), keep(force_std_epistemic));
+            return self.record_history_point(kind, &bp, &bz, Some((energy_std, &fs, &fe)), model_energy, &keep3(model_forces), energy, &keep3(forces), false, false, false);
+        }
         let n = pos.len();
         assert!(model_forces.len() == n && forces.len() == n, "a comparison's forces agree with its geometry");
         let rc2 = self.model.as_ref().map_or(0.0, |m| m.basis.r_cut * m.basis.r_cut);
@@ -728,8 +746,9 @@ impl SurrogateKs {
             a.new_generation();
         }
         // a composition check in flight is the old model's: its answers come back of an older
-        // generation (discarded), and its queued parts are dropped (`stray`)
-        self.drop_stray_check();
+        // generation (discarded), and its queued parts are dropped (`stray`) — an attribution
+        // check's failed audit too, without counting it (nothing is booked; Task 5 fix round 1, I1)
+        self.discard_stray_check();
         self.audit_due = false;
         self.box_audits_unjudged = 0;
         self.audit_flip = false;
@@ -944,6 +963,7 @@ impl SurrogateKs {
         }
         // per bonded atom at a scene with stray atoms (`stray` module doc, "Audits of a cleared answer"), else per atom
         let n = self.audit_n(&pos) as f64;
+        let unit = self.per_atom_unit(&pos);
         let gap = energy - pred.energy;
         let near = self.near_quarantined(&pos, &z);
         // next to a misfit the answer is kept only if it agrees with the model (spec 2026-11-13 §4.3)
@@ -965,6 +985,8 @@ impl SurrogateKs {
             AuditVerdict::Passed
         };
         let mut stray_note = None;
+        // an audit a check attributes leaves its history point to the check (ruling 9b)
+        let mut deferred = false;
         notes.insert(0, match verdict {
             AuditVerdict::Passed => format!("surrogate audit passed (background teacher, judged {unaudited} answered steps after its dispatch): teacher − model {gap:+.2e} Ha"),
             AuditVerdict::BoxAffected => format!(
@@ -974,7 +996,7 @@ impl SurrogateKs {
             // a draft guess's audit (a geometry strict mode refuses): recorded, held out of the
             // strict fit, and not a verdict on the strict model (module doc, "Draft mode")
             AuditVerdict::Failed if draft_guess => format!(
-                "surrogate draft-mode audit failed (background teacher): teacher − model {gap:+.2e} Ha ({:.1e} Ha/atom{}) at a geometry strict mode refuses — the guess was off; the strict model's trust is unchanged and the answer is held out of its fit",
+                "surrogate draft-mode audit failed (background teacher): teacher − model {gap:+.2e} Ha ({:.1e} {unit}{}) at a geometry strict mode refuses — the guess was off; the strict model's trust is unchanged and the answer is held out of its fit",
                 gap.abs() / n,
                 force_fail.map_or(String::new(), |(d, b)| format!(", worst atom's force off by {d:.1e} > {b:.1e} Ha/Bohr"))
             ),
@@ -989,6 +1011,7 @@ impl SurrogateKs {
                 };
                 let stray = self.stray_audit_failed(&scene, raw_energy, &forces, &case, gap, why);
                 let attributing = matches!(stray, stray::StrayAudit::Attributing(_));
+                deferred = attributing;
                 if let stray::StrayAudit::Attributing(note) | stray::StrayAudit::CountsNow(note) = stray {
                     stray_note = Some(note);
                 }
@@ -1009,7 +1032,7 @@ impl SurrogateKs {
                         "surrogate audit failed on forces (background teacher): worst atom off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.2e} Ha) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until a refit predicts that geometry without the audited sample"
                     ),
                     _ => format!(
-                        "surrogate audit failed (background teacher): teacher − model {gap:+.2e} Ha ({:.1e} > {thr:.1e} Ha/atom) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until a refit predicts that geometry without the audited sample",
+                        "surrogate audit failed (background teacher): teacher − model {gap:+.2e} Ha ({:.1e} > {thr:.1e} {unit}) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until a refit predicts that geometry without the audited sample",
                         gap.abs() / n
                     ),
                 }
@@ -1033,7 +1056,9 @@ impl SurrogateKs {
             (Some(e), Some(f), Some(fe)) => Some((e, &f[..], &fe[..])),
             _ => None,
         };
-        self.record_history_point(PointKind::Audit, &pos, &z, stds, pred.energy, &pred.forces, energy, &forces, box_rho.is_some(), draft_guess, unfit.is_some());
+        if !deferred {
+            self.record_history_point(PointKind::Audit, &pos, &z, stds, pred.energy, &pred.forces, energy, &forces, box_rho.is_some(), draft_guess, unfit.is_some());
+        }
         let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, outcome);
         ev.detail = notes.join("\n");
         ev.face_density = face;

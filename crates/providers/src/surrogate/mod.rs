@@ -193,7 +193,9 @@
 //!    condition, below).
 //! 7. **Energy uncertainty, per atom and epistemic only**: `energy_std` is the TOTAL energy's
 //!    std with the aleatoric floor (N·s_E)² (Task 3), so the criterion is
-//!    `√(energy_std² − (N s_E)²) / N ≤ energy_std_per_atom` (1e-3 Ha). The floor is excluded
+//!    `√(energy_std² − (N s_E)²) / N ≤ energy_std_per_atom` (1e-3 Ha), N the energy-row atoms
+//!    (`surrogate::energy_row_atoms`: the atom count without an isolated atom, the bonded part's at a
+//!    stray-atom scene; stray-atoms ruling 9a). The floor is excluded
 //!    because it is the teacher's own scatter (egg-box, SCF lag) — the part of the residual no
 //!    number of samples removes, so a fallback triggered by it would teach the model nothing;
 //!    the epistemic part is what new samples shrink, so it is the part a fallback can act on.
@@ -1538,6 +1540,9 @@ pub struct SurrogateKs {
     stray_pending: Option<stray::StrayCheck>,
     /// Composition checks queued so far: the id their parts' jobs carry (`AuditJob::id`).
     stray_checks: u64,
+    /// Failed stray-atom audits waiting for their attribution check while another is in flight (`stray`,
+    /// "Audits of a cleared answer"; Task 5 fix round 1, M4), oldest first.
+    stray_attributions: std::collections::VecDeque<stray::AttributionRequest>,
     /// The scene-edit generation: bumped by `reset` and `discontinuity` (the driver's edit
     /// signals, `Dynamics::after_edit`); a composition check queued before an edit is dropped.
     scene_gen: u64,
@@ -1835,6 +1840,7 @@ impl SurrogateKs {
             stray_key: None,
             stray_pending: None,
             stray_checks: 0,
+            stray_attributions: std::collections::VecDeque::new(),
             scene_gen: 0,
             face: Vec::new(),
             fence_votes: Vec::new(),
@@ -2168,8 +2174,11 @@ impl SurrogateKs {
                     };
                     self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: 0, asynchronous: false, teacher_ms: stats.solve_ms as f64 });
                     self.last_audit_fit = self.fits;
-                    // the history's point (M8a Task 1): an in-step audit is never a draft guess
-                    self.record_history_point(surrogate::history::PointKind::Audit, &h.pos, &h.z, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, box_rho.is_some(), false, unfit.is_some());
+                    // the history's point (M8a Task 1): an in-step audit is never a draft guess; a failed one
+                    // records it below, unless a check attributes it (ruling 9b)
+                    if !audit_fails {
+                        self.record_history_point(surrogate::history::PointKind::Audit, &h.pos, &h.z, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, box_rho.is_some(), false, unfit.is_some());
+                    }
                     // a box-affected audit judged nothing: it does not satisfy the cadence — the
                     // next answered step is audited again — and it is counted for the checklist
                     // (M8a Task 2, the Task 1 physics review's I4); the step keeps the model's
@@ -2199,6 +2208,7 @@ impl SurrogateKs {
                         notes.push(note);
                     }
                     if !attributing {
+                        self.record_history_point(surrogate::history::PointKind::Audit, &h.pos, &h.z, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, false, false, unfit.is_some());
                         self.audit_failed = Some(gap);
                         self.audit_force = force_fail;
                         self.audit_atoms = n as usize;
@@ -2217,8 +2227,8 @@ impl SurrogateKs {
                             "surrogate audit failed on forces: worst atom off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.2e} Ha) — untrusted until a refit predicts that geometry without the audited sample"
                         ),
                         _ => format!(
-                            "surrogate audit failed: teacher − model {gap:+.2e} Ha ({:.1e} > {:.1e} Ha/atom) — untrusted until a refit predicts that geometry without the audited sample",
-                            gap.abs() / n, self.policy.energy_std_per_atom
+                            "surrogate audit failed: teacher − model {gap:+.2e} Ha ({:.1e} > {:.1e} {}) — untrusted until a refit predicts that geometry without the audited sample",
+                            gap.abs() / n, self.policy.energy_std_per_atom, self.per_atom_unit(&h.pos)
                         ),
                     });
                     (r.energy, false)
@@ -2461,9 +2471,10 @@ impl ForceProvider for SurrogateKs {
         let scene_desc = if counts.contains(&0) { self.model.as_ref().and_then(|m| describe_values(&m.basis, &pos, &z).ok()) } else { None };
         let cleared = scene_desc.as_deref().and_then(|d| self.stray_cleared_with(&pos, &z, &prov, Some(d)));
         let part = cleared.as_ref().map(|c| &c.0);
-        let n_bonded = part.map_or(pos.len(), |s| s.bonded.len());
-        // an exempt stray atom is another environment for the verdict than a refused one (rule 7's n differs): a
-        // verdict reached before the clearance is never reused for a cleared step, nor the reverse
+        // an exempt stray atom marks another environment for the variance cadence than a refused one: a verdict reached
+        // before the clearance is never reused for a cleared step, nor the reverse. Since ruling 9a rules 7 and 5d are
+        // per energy-row atom, so the verdict no longer depends on the exemption; the marker only forces a fresh
+        // evaluation at the switch (kept: it costs one variance evaluation there)
         for &i in part.map_or(&[][..], |s| &s.stray) {
             counts[i] = usize::MAX;
         }
@@ -2509,7 +2520,7 @@ impl ForceProvider for SurrogateKs {
         // rule 6 on the epistemic force std (σ_f excluded, as rule 7 excludes the energy floor)
         let variance = match (pred.energy_std, pred.force_std_epistemic.as_ref()) {
             (Some(e), Some(f)) => {
-                let mut v = self.variance_check_n(model, &pred, e, f, &pos, &z, n_bonded);
+                let mut v = self.variance_check(model, &pred, e, f, &pos, &z);
                 // rule 5d with the variance (the same cadence; a rejection is never reused)
                 if let Some((nu, at)) = self.novelty_judged(&pos, &z, part).filter(|(nu, _)| *nu > 1.0) {
                     v.accept = false;

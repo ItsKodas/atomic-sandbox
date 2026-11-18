@@ -238,7 +238,7 @@ pub(super) fn canonical_ref(sh: &SharedCollection, z: u8) -> Option<f64> {
 /// What changes when the audit history changes: its recorded points and its unrecorded counts.
 pub(super) fn history_stamp(h: &surrogate::AuditHistory) -> (u64, u64) {
     let u = &h.unrecorded;
-    (h.recorded(), u.no_variance + u.box_affected + u.draft + u.unfit)
+    (h.recorded(), u.no_variance + u.box_affected + u.draft + u.unfit + u.composition)
 }
 
 /// A geometry's formula in Hill order (C, then H, then the rest alphabetically; without carbon all

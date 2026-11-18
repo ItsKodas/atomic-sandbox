@@ -961,6 +961,31 @@ pub fn no_neighbours(pos: &[[f64; 3]], r_cut: f64) -> bool {
     })
 }
 
+/// The atoms a sample's **per-atom energy row** is taken over (`crate::fit` module doc, "Design matrix"; stray-atoms
+/// spec 2026-11-18, controller ruling 9a): those with a neighbour the model can see — the atoms whose descriptor is not
+/// [`isolated_atom`](crate::envelope::isolated_atom). An atom is isolated exactly when its coordination features
+/// C_t = Σ_{j ∈ t} f_c(r_ij) are all 0.0; every term is a finite f_c ≥ 0, so the sum is 0.0 exactly when each term is,
+/// and the same test is made here pair by pair (`pair_geometry`, `cutoff`, as `describe` computes them), without
+/// describing. An isolated atom has B = 0: it adds nothing to the row's features, so the row over N_e is its bonded
+/// part's own row (a stray atom's E_ref carries no label of the fit's). Every atom isolated (a lone sample, no feature
+/// at all): N, so nothing changes there. **Equals N for every sample without an isolated atom**, so its energy row is
+/// bit for bit what it was. Never 0 for a non-empty sample.
+pub fn energy_row_atoms(basis: &Basis, pos: &[[f64; 3]]) -> usize {
+    energy_row_atoms_at(basis.r_cut, pos)
+}
+
+/// [`energy_row_atoms`] at the cutoff `r_cut` (Bohr) alone: the one count, for a caller holding no basis (the
+/// provider's per-atom audit tiers before a model exists).
+pub fn energy_row_atoms_at(r_cut: f64, pos: &[[f64; 3]]) -> usize {
+    let n = pos.len();
+    let seen = (0..n).filter(|&i| (0..n).any(|j| j != i && pair_geometry(pos[i], pos[j], r_cut).is_some_and(|(r, _)| crate::basis::cutoff(r, r_cut).0 != 0.0))).count();
+    if seen == 0 {
+        n
+    } else {
+        seen
+    }
+}
+
 /// The descriptor values B_i alone — what [`describe`] puts in `AtomDescriptor::b`, bit for bit
 /// (the same sums in the same order), without the gradient lists: the surrogate's per-step
 /// envelope and quarantine checks need only the values, and the gradients cost about twice the
@@ -1038,6 +1063,41 @@ pub(crate) fn pair_geometry(ri: [f64; 3], rj: [f64; 3], r_cut: f64) -> Option<(f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Controller ruling 9a: `energy_row_atoms` counts exactly the atoms whose described B is not
+    /// `isolated_atom` (the descriptor's own test, made pair by pair), with N when every atom is isolated —
+    /// so it is N for every geometry without an isolated atom. Random clusters of 1–6 atoms of two species,
+    /// spread so that some atoms are stray, plus pairs placed at, just inside and just outside r_cut.
+    #[test]
+    fn energy_row_atoms_counts_the_atoms_describe_does_not_isolate() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        let basis = Basis::new(&[1, 8]);
+        let rc = basis.r_cut;
+        let counted = |pos: &[[f64; 3]], z: &[u8]| {
+            let d = describe_values(&basis, pos, z).unwrap();
+            let k = d.iter().filter(|b| !crate::envelope::isolated_atom(&basis, b)).count();
+            if k == 0 { pos.len() } else { k }
+        };
+        let mut rng = StdRng::seed_from_u64(9);
+        let (mut with_isolated, mut without) = (0, 0);
+        for _ in 0..400 {
+            let n = rng.gen_range(1..=6);
+            let spread = rng.gen_range(2.0..20.0);
+            let pos: Vec<[f64; 3]> = (0..n).map(|_| std::array::from_fn(|_| rng.gen_range(-spread..spread))).collect();
+            let z: Vec<u8> = (0..n).map(|_| if rng.gen_bool(0.5) { 1 } else { 8 }).collect();
+            let k = energy_row_atoms(&basis, &pos);
+            assert_eq!(k, counted(&pos, &z), "{pos:?}");
+            if k < n { with_isolated += 1 } else { without += 1 }
+        }
+        assert!(with_isolated > 50 && without > 50, "the premise: both kinds drawn ({with_isolated}, {without})");
+        for r in [rc, rc - 1e-12, rc + 1e-12, f64::from_bits(rc.to_bits() - 1), 0.0] {
+            let pos = [[0.0; 3], [r, 0.0, 0.0], [0.0, 30.0, 0.0]];
+            assert_eq!(energy_row_atoms(&basis, &pos), counted(&pos, &[1, 1, 8]), "a pair at {r:e}");
+        }
+        assert_eq!(energy_row_atoms(&basis, &[[0.0; 3], [1.4, 0.0, 0.0], [0.0, 8.0, 0.0]]), 2, "H₂ + a stray atom");
+        assert_eq!(energy_row_atoms(&basis, &[[0.0; 3], [0.0, 8.0, 0.0]]), 2, "every atom alone: N");
+        assert_eq!(energy_row_atoms(&basis, &[[0.0; 3]]), 1);
+    }
 
     #[test]
     fn basis_defaults_sort_and_dedup_species_and_lay_out_body2_features() {

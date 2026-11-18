@@ -150,7 +150,7 @@ impl SurrogateKs {
             return Some(r);
         }
         if let Some((e, f)) = posterior {
-            let v = self.variance_check_n(model, &pred, e, f, pos, z, part.map_or(pos.len(), |s| s.bonded.len()));
+            let v = self.variance_check(model, &pred, e, f, pos, z);
             if !v.accept {
                 return v.reason;
             }
@@ -448,7 +448,7 @@ impl SurrogateKs {
             // the sample's largest atom class over its fitted atoms (a readout; the rule classes
             // each atom: `class_loo`)
             let Some(c) = neighbour_counts(&s.pos, rc2).into_iter().enumerate().filter(|(j, _)| s.trains_atom(*j)).filter_map(|(_, c)| atom_class(c)).max() else { continue };
-            let n = s.pos.len().max(1) as f64;
+            let n = self.audit_n(&s.pos) as f64;
             match surrogate::loo::leave_one_out(model, s) {
                 None => loo.push((i, c, f64::INFINITY, f64::INFINITY)),
                 Some(l) => {

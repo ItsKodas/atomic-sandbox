@@ -349,7 +349,7 @@ impl SurrogateKs {
                 let s = &store.samples[i];
                 let in_sample = match model.predict(&s.pos, &s.z, false) {
                     Ok(p) => {
-                        let n = s.pos.len().max(1) as f64;
+                        let n = self.audit_n(&s.pos) as f64;
                         let e = (p.energy - s.energy).abs() / n / self.policy.energy_std_per_atom;
                         p.forces.iter().zip(&s.forces).fold(e, |m, (fm, fs)| {
                             let (d, b) = self.policy.force_residual(fm, fs);
@@ -963,7 +963,7 @@ impl SurrogateKs {
         let model = self.model.as_ref()?;
         let ionic = self.store.as_ref().map_or_else(crate::pseudo::all_electron_tag, |s| s.provenance.ionic.clone());
         let p = model.predict(pos, z, false).ok()?;
-        let n = pos.len().max(1) as f64;
+        let n = self.audit_n(pos) as f64;
         let e = (energy - p.energy).abs() / n / self.policy.energy_std_per_atom;
         let f = worst_force_residual(&self.policy, &p.forces, forces, audit_force_floor(&ionic)).map_or(0.0, |(d, b)| d / b);
         Some((e, f))

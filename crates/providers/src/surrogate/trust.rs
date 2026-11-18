@@ -674,7 +674,7 @@ impl SurrogateKs {
     }
 
     /// The misfit row's scenes: M's samples per composition, largest count first ("H2 ×6, …").
-    fn misfit_scenes(&self) -> String {
+    pub(super) fn misfit_scenes(&self) -> String {
         let (Some(m), Some(store)) = (self.misfit.as_ref(), self.store.as_ref()) else { return String::new() };
         let mut count: BTreeMap<String, usize> = BTreeMap::new();
         for s in m.samples.iter().filter_map(|&i| store.samples.get(i)) {
@@ -682,7 +682,17 @@ impl SurrogateKs {
         }
         let mut v: Vec<(String, usize)> = count.into_iter().collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        v.iter().map(|(f, n)| format!("{f} ×{n}")).collect::<Vec<_>>().join(", ")
+        let list = v.iter().map(|(f, n)| format!("{f} ×{n}")).collect::<Vec<_>>().join(", ");
+        // a sample with stray atoms is its bonded part's row plus a term the model cannot represent (ruling 9a): its
+        // energy row, per bonded atom, also carries the composition and the stray atoms' box term — named, so an
+        // energy misfit there is not read as the bonded part's alone (byte-identical without one)
+        let r_cut = self.cutoff();
+        let strays = m.samples.iter().filter_map(|&i| store.samples.get(i)).filter(|s| super::stray::split(&s.pos, r_cut).is_some()).count();
+        if strays == 0 {
+            list
+        } else {
+            format!("{list}; {strays} with stray atoms, whose energy rows per bonded atom also carry the composition and the stray atoms' box term")
+        }
     }
 
     /// One pass over the samples the current model was fitted on (the accumulated prefix of
@@ -705,7 +715,8 @@ impl SurrogateKs {
             }
             let Ok(p) = model.predict(&s.pos, &s.z, false) else { continue };
             m.fitted += 1;
-            let n = s.pos.len().max(1) as f64;
+            // per energy-row atom (N_e, ruling 9a: n without an isolated atom)
+            let n = self.audit_n(&s.pos) as f64;
             // the fitted rows only (a masked sample: no energy, the interior atoms' forces)
             let energy = s.use_energy.then(|| (p.energy - s.energy).abs() / n);
             let forces: Vec<(usize, (f64, f64))> =
@@ -959,7 +970,7 @@ impl SurrogateKs {
         // fitted sample, spec 2026-11-12 R1b; `fresh_loo_ratios` matches them to the fit's members)
         let mut sample_ratios: Vec<(usize, f64, f64, Channel)> = Vec::with_capacity(fitted.len());
         for ((i, s), l) in fitted.into_iter().zip(loos) {
-            let (own, tier, channel) = super::quarantine::loo_ratio(&self.policy, model.energy_per_atom, s, l.as_ref());
+            let (own, tier, channel) = super::quarantine::loo_ratio(&self.policy, model.energy_per_atom, surrogate::energy_row_atoms(&model.basis, &s.pos), s, l.as_ref());
             sample_ratios.push((i, own, tier, channel));
             let in_m = self.in_misfit(i);
             // only the fitted (interior) atoms of a masked sample describe a class or a key
@@ -977,7 +988,7 @@ impl SurrogateKs {
                     }
                 }
             }
-            let n = s.pos.len().max(1) as f64;
+            let n = self.audit_n(&s.pos) as f64;
             // no energy evidence from a sample whose energy was not fitted (`None`)
             let e_ratio: Option<f64> = s.use_energy.then(|| l.as_ref().and_then(|l| l.energy).map_or(f64::INFINITY, |e| (if model.energy_per_atom { e.abs() } else { e.abs() / n }) / self.policy.energy_std_per_atom));
             // per environment key the same leave-one-out sums over its own atoms (user-test fix 2:
@@ -1155,7 +1166,7 @@ impl SurrogateKs {
                 None => undefined += 1,
                 Some(l) => {
                     if let Some(e) = l.energy {
-                        let e = if model.energy_per_atom { e } else { e / s.pos.len().max(1) as f64 };
+                        let e = if model.energy_per_atom { e } else { e / self.audit_n(&s.pos) as f64 };
                         se += e * e;
                         ne += 1;
                     }
@@ -1389,18 +1400,18 @@ impl SurrogateKs {
     /// the plain prediction when it is not — judged by the audit's own criteria: (teacher − model
     /// gap, the force failure if any, how it was predicted). An undefined leave-one-out fails (NaN).
     /// The callers divide the gap by [`audit_n`](Self::audit_n) — per bonded atom at a scene with stray
-    /// atoms (`stray` module doc, "Audits of a cleared answer"); `per` below is the fit's own row and
-    /// keeps the scene's n.
+    /// atoms (`stray` module doc, "Audits of a cleared answer"); `per` below is the fit's own row, per the
+    /// same N_e (ruling 9a).
     fn judge_case(&self, case: &FailedAudit) -> Option<(f64, Option<(f64, f64)>, &'static str)> {
         let model = self.model.as_ref()?;
-        let n = case.pos.len().max(1) as f64;
         let in_fit = case.index.filter(|&i| i < self.accumulated && !self.excluded(i));
         let (e_pred, f_pred, how) = match in_fit.and_then(|i| self.store.as_ref().map(|st| &st.samples[i])) {
             // (a masked sample — never audited: a masked scene is teacher-only — would take the
             // plain prediction for what its fit left out: its energy, its masked-out atoms)
             Some(smp) => match surrogate::loo::leave_one_out(model, smp).zip(model.predict(&case.pos, &case.z, false).ok()) {
                 Some((l, plain)) => {
-                    let per = if model.energy_per_atom { n } else { 1.0 };
+                    // the row's own atoms (N_e, ruling 9a: `loo` takes the residual per energy-row atom)
+                    let per = if model.energy_per_atom { surrogate::energy_row_atoms(&model.basis, &smp.pos) as f64 } else { 1.0 };
                     let f: Vec<[f64; 3]> = smp.forces.iter().zip(&l.forces).zip(&plain.forces).map(|((f, r), p)| r.map_or(*p, |r| [f[0] - r[0], f[1] - r[1], f[2] - r[2]])).collect();
                     (l.energy.map_or(plain.energy, |e| smp.energy - e * per), f, "the refit's model without the audited sample (leave-one-out)")
                 }
@@ -1468,6 +1479,14 @@ impl SurrogateKs {
         let quarantined = |s: &SurrogateKs, c: &FailedAudit| c.index.is_some_and(|i| matches!(s.quarantine.get(i), Some(&Q_HELD) | Some(&Q_SUPERSEDED)));
         let cases = std::mem::take(&mut self.failed_audits);
         for mut case in cases {
+            // a stray-attributed case's label (the bonded part's answer + Σ E_ref) is what the model claims there only
+            // while those atoms are stray at its cutoff; under a longer reach it is no label of the scene: the case
+            // turns into an audit fence, its neighbourhood falls back (Task 5 fix round 1, M7)
+            if case.origin == AuditOrigin::StrayAttributed && super::stray::split(&case.pos, self.cutoff()).is_none() {
+                self.user_notes.push("surrogate: a failed audit attributed to the model at a scene with stray atoms is no longer such a scene at the model's cutoff — its neighbourhood falls back (an audit fence) instead of the whole model".into());
+                self.audit_fences.push(case);
+                continue;
+            }
             if quarantined(self, &case) {
                 self.user_notes.push("surrogate: the failed audit's sample was quarantined by the refit — its neighbourhood falls back (the fence) instead of the whole model".into());
                 continue;
@@ -1498,7 +1517,7 @@ impl SurrogateKs {
             }
             self.user_notes.push(match force_fail {
                 Some((d, b)) => format!("surrogate: still untrusted — at the failed audit's geometry {how} is off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.2e} Ha)"),
-                None => format!("surrogate: still untrusted — at the failed audit's geometry {how} is off by {gap:+.2e} Ha ({:.1e} > {tier:.1e} Ha/atom)", gap.abs() / n),
+                None => format!("surrogate: still untrusted — at the failed audit's geometry {how} is off by {gap:+.2e} Ha ({:.1e} > {tier:.1e} {})", gap.abs() / n, self.per_atom_unit(&case.pos)),
             });
             self.failed_audits.push(case);
         }

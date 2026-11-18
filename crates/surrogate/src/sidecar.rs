@@ -867,17 +867,19 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
     ];
     if with_history {
         let u = history.unrecorded;
-        pairs.push((
-            "audit_history",
-            obj(&[
-                ("points", history.len().to_string()),
-                ("recorded", history.recorded().to_string()),
-                ("no_variance", u.no_variance.to_string()),
-                ("box_affected", u.box_affected.to_string()),
-                ("draft", u.draft.to_string()),
-                ("unfit", u.unfit.to_string()),
-            ]),
-        ));
+        let mut fields = vec![
+            ("points", history.len().to_string()),
+            ("recorded", history.recorded().to_string()),
+            ("no_variance", u.no_variance.to_string()),
+            ("box_affected", u.box_affected.to_string()),
+            ("draft", u.draft.to_string()),
+            ("unfit", u.unfit.to_string()),
+        ];
+        // `composition` (stray-atoms Task 5) only when counted: every other file stays byte-identical
+        if u.composition > 0 {
+            fields.push(("composition", u.composition.to_string()));
+        }
+        pairs.push(("audit_history", obj(&fields)));
     }
     if !memory.is_empty() {
         let list: Vec<String> = memory
@@ -1540,7 +1542,9 @@ fn decode_history_key(h: &Json) -> Result<Option<(usize, u64, Unrecorded)>, Stri
         return Err(format!("audit_history.points {points} exceeds the ring's {}", crate::history::HISTORY_CAP));
     }
     let recorded = count("recorded")?;
-    let unrecorded = Unrecorded { no_variance: count("no_variance")?, box_affected: count("box_affected")?, draft: count("draft")?, unfit: count("unfit")? };
+    // `composition` (stray-atoms Task 5) is optional: a file written before it reads 0
+    let composition = if k.get("composition").is_ok() { count("composition")? } else { 0 };
+    let unrecorded = Unrecorded { no_variance: count("no_variance")?, box_affected: count("box_affected")?, draft: count("draft")?, unfit: count("unfit")?, composition };
     Ok(Some((points, recorded, unrecorded)))
 }
 

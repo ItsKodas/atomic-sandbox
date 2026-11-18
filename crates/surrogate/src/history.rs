@@ -245,6 +245,11 @@ pub struct Unrecorded {
     pub draft: u64,
     /// The teacher's answer was unfit (cores overlap, an occupation change: used, never fitted).
     pub unfit: u64,
+    /// A failed audit at a scene with stray atoms that its attribution check found was not the model's error (the
+    /// composition, or a stray atom's box term; the provider's `stray`): no evidence about the model. Persisted in a
+    /// model file's header (an optional key: absent reads 0), not in a collection's standalone history, whose layout
+    /// other builds read (counted for the session there).
+    pub composition: u64,
 }
 
 /// The ring of the newest [`HISTORY_CAP`] audit points, oldest first (module doc).
@@ -483,7 +488,7 @@ impl AuditHistory {
         }
         let species = if arrays.len() > HistoryArrays::NAMES.len() { arrays.pop().expect("eleven") } else { Vec::new() };
         let a = HistoryArrays { species, ..HistoryArrays::from_vecs(arrays.try_into().expect("ten arrays")) };
-        Self::from_arrays(&a, recorded, Unrecorded { no_variance, box_affected, draft, unfit })
+        Self::from_arrays(&a, recorded, Unrecorded { no_variance, box_affected, draft, unfit, composition: 0 })
     }
 }
 

@@ -213,6 +213,11 @@ impl SurrogateKs {
         for f in self.failed_audits.iter_mut().chain(self.audit_fences.iter_mut()) {
             f.index = f.index.and_then(m);
         }
+        // and the failed audits waiting for their attribution check (`stray`; Task 5 fix round 1, M3)
+        let pending = self.stray_pending.as_mut().and_then(|p| p.attribution.as_mut()).map(|a| &mut a.case);
+        for f in pending.into_iter().chain(self.stray_attributions.iter_mut().map(|r| &mut r.attribution.case)) {
+            f.index = f.index.and_then(m);
+        }
         // the fit's members and its readouts
         self.accumulated = below(self.accumulated);
         self.fit_members.0 = below(self.fit_members.0);

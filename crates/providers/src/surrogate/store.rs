@@ -534,7 +534,8 @@ impl SurrogateKs {
                 m += 1;
                 r += 1 + 3 * smp.pos.len();
                 let refs: f64 = smp.z.iter().map(|&z| model.basis.species_index(z).map_or(f64::NAN, |k| model.ref_energy[k])).sum();
-                let y = if model.energy_per_atom { (smp.energy - refs) / smp.pos.len().max(1) as f64 } else { smp.energy - refs };
+                // the fit's own row, per N_e (`surrogate::energy_row_atoms`, ruling 9a)
+                let y = if model.energy_per_atom { (smp.energy - refs) / surrogate::energy_row_atoms(&model.basis, &smp.pos) as f64 } else { smp.energy - refs };
                 neumaier(&mut ye, smp.weight * y * y);
                 for x in smp.forces.iter().flatten() {
                     neumaier(&mut yf, smp.weight * x * x);

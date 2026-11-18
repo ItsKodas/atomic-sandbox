@@ -205,7 +205,7 @@ impl SurrogateKs {
             return Err(code(r));
         }
         if let Some((e, f)) = posterior {
-            let v = self.variance_check_n(model, pred, e, f, pos, z, part.map_or(pos.len(), |s| s.bonded.len()));
+            let v = self.variance_check(model, pred, e, f, pos, z);
             if !v.accept {
                 return Err(code(v.reason.expect("a refusing variance verdict names its rule")));
             }

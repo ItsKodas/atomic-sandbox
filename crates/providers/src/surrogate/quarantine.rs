@@ -189,6 +189,12 @@ pub(super) struct FenceVote {
 /// projected on the interatomic unit vectors, or Kabsch-aligned frames — would not); the vote only
 /// keeps one sample for the next refit, whose `judge_votes` decides on the full vectors.
 pub(super) fn votes_agree(p: &FallbackPolicy, va: &FenceVote, vb: &FenceVote) -> bool {
+    // the same atoms: `n` is per energy-row atom (n_bonded at a stray-atom scene), so H₂ and H₂ + a stray H both give
+    // 2 — the scenes' own atom counts (their force lists) must agree too, or the per-atom pairing below mispairs
+    // (Task 5 fix round 1, M2)
+    if va.forces.len() != vb.forces.len() || va.n != vb.n {
+        return false;
+    }
     match (&va.residual, &vb.residual) {
         (Some((ea, fa)), Some((eb, fb))) => {
             let norm = |v: &[f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
@@ -226,9 +232,10 @@ pub(super) fn votes_agree(p: &FallbackPolicy, va: &FenceVote, vb: &FenceVote) ->
 /// the tier it measured against (Task 1 re-review N1: a high-leverage energy outlier's ρ_σ is its
 /// energy ratio, against 1e-3 Ha/atom, not the force tier). The force channel wins a tie; an
 /// undefined residual reports the force channel (no channel was measured).
-pub(super) fn loo_ratio(p: &FallbackPolicy, per_atom: bool, s: &Sample, l: Option<&surrogate::loo::SampleLoo>) -> (f64, f64, Channel) {
+pub(super) fn loo_ratio(p: &FallbackPolicy, per_atom: bool, n_e: usize, s: &Sample, l: Option<&surrogate::loo::SampleLoo>) -> (f64, f64, Channel) {
     let Some(l) = l else { return (f64::INFINITY, f64::INFINITY, Channel::Force) };
-    let n = s.pos.len().max(1) as f64;
+    // `n_e`: the sample's energy-row atoms (`surrogate::energy_row_atoms`, ruling 9a)
+    let n = n_e.max(1) as f64;
     let e = if s.use_energy { l.energy.map_or(f64::INFINITY, |e| (if per_atom { e.abs() } else { e.abs() / n }) / p.energy_std_per_atom) } else { 0.0 };
     let (mut own, mut force_tier) = (e, 0.0f64);
     for (r, f) in l.forces.iter().zip(&s.forces) {
@@ -1263,7 +1270,7 @@ impl SurrogateKs {
             let loos = surrogate::loo::leave_one_out_many(model, &samples);
             let (mut rows, mut tier, mut tier_channel) = (Vec::with_capacity(members.len()), Vec::with_capacity(members.len()), Vec::with_capacity(members.len()));
             for ((&i, s), l) in members.iter().zip(&samples).zip(&loos) {
-                let (own, t, ch) = loo_ratio(&self.policy, model.energy_per_atom, s, l.as_ref());
+                let (own, t, ch) = loo_ratio(&self.policy, model.energy_per_atom, surrogate::energy_row_atoms(&model.basis, &s.pos), s, l.as_ref());
                 rows.push((i, own));
                 tier.push(t);
                 tier_channel.push(ch);
@@ -1306,7 +1313,7 @@ impl SurrogateKs {
             .filter(|(i, _)| !self.excluded(*i) && !self.is_box(*i))
             .filter_map(|(i, s)| {
                 let pr = model.predict(&s.pos, &s.z, false).ok()?;
-                let n = s.pos.len().max(1) as f64;
+                let n = self.audit_n(&s.pos) as f64;
                 // the fitted rows only (a capped segment's: no energy, its interior atoms)
                 let mut r = if s.use_energy { (pr.energy - s.energy).abs() / n / p.energy_std_per_atom } else { 0.0 };
                 for (_, (fm, fs)) in pr.forces.iter().zip(&s.forces).enumerate().filter(|(j, _)| s.trains_atom(*j)) {
@@ -1702,7 +1709,8 @@ impl SurrogateKs {
             return None;
         }
         let s = &store.samples[i];
-        let n = z.len().max(1) as f64;
+        // N_e · s_E: the fit's noise on this total energy (ruling 9a)
+        let n = surrogate::energy_row_atoms(basis, pos) as f64;
         let s_e = if model.energy_per_atom { n * report.sigma_e } else { report.sigma_e };
         let mag = |f: &[f64; 3]| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
         let same = (!use_energy || (energy - s.energy).abs() <= s_e)

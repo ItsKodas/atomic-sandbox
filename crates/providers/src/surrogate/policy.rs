@@ -584,7 +584,6 @@ impl SurrogateKs {
         // a cleared stray-atom scene (spec §4.4, `evaluate`'s): its stray atoms are exempt, the bonded part judged alone
         let cleared = self.stray_cleared(&pos, &z, &prov);
         let part = cleared.as_ref().map(|c| &c.0);
-        let n_bonded = part.map_or(n, |s| s.bonded.len());
         let model = self.model.as_ref().expect("the gate passed: a model exists");
         // past the gate an unknown species is unreachable (rule 2), named as `would_answer` names it
         let pred = match model.predict(&pos, &z, true) {
@@ -654,13 +653,13 @@ impl SurrogateKs {
         }
         // 6 per atom, 7 for the geometry
         if let Some((e, f)) = posterior {
-            let v = self.variance_check_n(model, &pred, e, f, &pos, &z, n_bonded);
+            let v = self.variance_check(model, &pred, e, f, &pos, &z);
             for (i, ratio) in v.atoms.iter().enumerate() {
                 if !(*ratio <= 1.0) {
                     refuse(&mut atoms, i, TeachRule::ForceUncertainty);
                 }
             }
-            if let Some(r) = self.energy_variance_refusal(model, n, n_bonded, e, &self.atom_inflation(model, &pos, &z)) {
+            if let Some(r) = self.energy_variance_refusal(model, &pos, e, &self.atom_inflation(model, &pos, &z)) {
                 geometry = geometry.or(Some(r.rule));
             }
         }
@@ -710,16 +709,11 @@ impl SurrogateKs {
     /// (`atom_inflation`; 1 for a calibrated or unmeasured class) and the epistemic energy std by
     /// the largest λ among the geometry's atoms — one scale of the posterior covariance per class,
     /// measured where the posterior decides (`calibrate`, "The variance inflation").
+    ///
+    /// At a stray-atom scene both rules are the bonded part's own without an exemption: rule 7 is per energy-row atom
+    /// ([`energy_variance_refusal`](Self::energy_variance_refusal)), and a stray atom's force rows are zero, so its
+    /// epistemic force std is exactly 0 (rule 6).
     pub(super) fn variance_check(&self, model: &Model, pred: &surrogate::Prediction, e_std: f64, f_std: &[f64], pos: &[[f64; 3]], z: &[u8]) -> VarianceVerdict {
-        self.variance_check_n(model, pred, e_std, f_std, pos, z, pred.forces.len())
-    }
-
-    /// [`variance_check`](Self::variance_check) with rule 7 per atom over `n_bonded` atoms
-    /// ([`energy_variance_refusal`](Self::energy_variance_refusal)): the bonded part's count in a cleared
-    /// stray-atom scene (spec §4.4, review I4), else the scene's. Rule 6 needs no exemption: a stray atom's force rows
-    /// are zero, so its epistemic force std is exactly 0.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn variance_check_n(&self, model: &Model, pred: &surrogate::Prediction, e_std: f64, f_std: &[f64], pos: &[[f64; 3]], z: &[u8], n_bonded: usize) -> VarianceVerdict {
         let n = pred.forces.len();
         let p = &self.policy;
         let infl = self.atom_inflation(model, pos, z);
@@ -754,7 +748,7 @@ impl SurrogateKs {
             };
         }
         // 7. energy, per atom, epistemic only
-        if let Some(r) = self.energy_variance_refusal(model, n, n_bonded, e_std, &infl) {
+        if let Some(r) = self.energy_variance_refusal(model, pos, e_std, &infl) {
             return VarianceVerdict { accept: false, uncertainty, reason: Some(r), atoms, novel: false };
         }
         VarianceVerdict { accept: true, uncertainty, reason: None, atoms, novel: false }
@@ -764,19 +758,20 @@ impl SurrogateKs {
     /// std per atom of an `n`-atom prediction whose total std is `e_std`, inflated by the largest
     /// of the atoms' class factors `infl`, against `energy_std_per_atom`.
     ///
-    /// Per atom over `n_bonded` atoms (spec §4.4, review I4; `n_bonded = n` is the ordinary rule): `e_std` is the std
-    /// of an `n`-atom prediction, whose aleatoric floor (n s_E)² is removed exactly; what is
-    /// left is the epistemic part, the same for a cleared stray-atom scene and its bonded part alone (a stray atom adds
-    /// nothing to the energy row: B_s = 0). So the number is rule 7 on the bonded part's own prediction — its floor
-    /// (n_bonded s_E)², its division by n_bonded — and a stray atom, whose E_ref carries no label noise in the model,
-    /// dilutes neither.
-    pub(super) fn energy_variance_refusal(&self, model: &Model, n: usize, n_bonded: usize, e_std: f64, infl: &[f64]) -> Option<Refusal> {
+    /// Per atom over the geometry's N_e energy-row atoms (`surrogate::energy_row_atoms`: N without an isolated atom,
+    /// controller ruling 9a; spec §4.4, review I4): `e_std` is `Model::predict`'s, whose aleatoric floor (N_e s_E)² is
+    /// removed exactly, and the epistemic rest is divided by N_e. At a stray-atom scene both are the bonded part's own —
+    /// a stray atom adds nothing to the energy row (B_s = 0), so the prediction's std is its bonded part's bit for bit —
+    /// so the number is rule 7 on the bonded part alone, cleared or not (Task 4's per-bonded-atom special case, now
+    /// exactly what the general rule computes).
+    pub(super) fn energy_variance_refusal(&self, model: &Model, pos: &[[f64; 3]], e_std: f64, infl: &[f64]) -> Option<Refusal> {
         let p = &self.policy;
         let scaled = |k: f64| if k == 1.0 { String::new() } else { format!(" (the model's std × {k:.2}, its measured calibration for this environment class)") };
-        let floor = if model.energy_per_atom { n as f64 * model.sigma_e } else { model.sigma_e };
+        let n_e = surrogate::energy_row_atoms(&model.basis, pos).max(1);
+        let floor = if model.energy_per_atom { n_e as f64 * model.sigma_e } else { model.sigma_e };
         // `max(0.0)` would turn a NaN variance into 0: keep it (activity Task 3b)
         let e_infl = infl.iter().copied().fold(1.0f64, max_nan);
-        let epistemic_per_atom = max_nan(e_std * e_std - floor * floor, 0.0).sqrt() / n_bonded as f64 * e_infl;
+        let epistemic_per_atom = max_nan(e_std * e_std - floor * floor, 0.0).sqrt() / n_e as f64 * e_infl;
         (!(epistemic_per_atom <= p.energy_std_per_atom)).then(|| {
             Refusal::new(
                 format!("surrogate: epistemic energy std {epistemic_per_atom:.2e} > {:.2e} Ha/atom{}", p.energy_std_per_atom, scaled(e_infl)),

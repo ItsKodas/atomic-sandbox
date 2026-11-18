@@ -180,20 +180,20 @@ fn the_leave_one_out_ratio_is_the_class_rules_reading() {
     // atom 0: d 0.03 / 1e-2 = 3 (ρ), / 2e-3 = 15 (ρ_σ); atom 1: d 0.004 / 2e-3 = 2 both
     // (ρ, ρ_σ, the channel attaining ρ_σ — re-review N1)
     let close = |a: (f64, f64, Channel), b: (f64, f64, Channel)| (a.0 - b.0).abs() < 1e-12 && (a.1 - b.1).abs() < 1e-12 && a.2 == b.2;
-    assert!(close(loo_ratio(&p, false, &s, Some(&l)), (3.0, 15.0, Channel::Force)), "{:?}", loo_ratio(&p, false, &s, Some(&l)));
-    assert!(close(loo_ratio(&p, true, &s, Some(&l)), (6.0, 15.0, Channel::Force)), "{:?}", loo_ratio(&p, true, &s, Some(&l)));
+    assert!(close(loo_ratio(&p, false, s.pos.len(), &s, Some(&l)), (3.0, 15.0, Channel::Force)), "{:?}", loo_ratio(&p, false, s.pos.len(), &s, Some(&l)));
+    assert!(close(loo_ratio(&p, true, s.pos.len(), &s, Some(&l)), (6.0, 15.0, Channel::Force)), "{:?}", loo_ratio(&p, true, s.pos.len(), &s, Some(&l)));
     let no_energy = Sample { use_energy: false, ..s.clone() };
     let l2 = SampleLoo { energy: None, ..l.clone() };
-    assert!(close(loo_ratio(&p, false, &no_energy, Some(&l2)), (3.0, 15.0, Channel::Force)));
+    assert!(close(loo_ratio(&p, false, no_energy.pos.len(), &no_energy, Some(&l2)), (3.0, 15.0, Channel::Force)));
     let small = SampleLoo { energy: Some(1e-4), forces: vec![Some([0.0; 3]), Some([0.0; 3]), None] };
-    assert!(close(loo_ratio(&p, true, &s, Some(&small)), (0.1, 0.1, Channel::Energy)), "the energy channel attains ρ_σ");
+    assert!(close(loo_ratio(&p, true, s.pos.len(), &s, Some(&small)), (0.1, 0.1, Channel::Energy)), "the energy channel attains ρ_σ");
     // an energy outlier whose forces the rest predicts: ρ_σ is its energy ratio (#1804's shape)
     let energy_outlier = SampleLoo { energy: Some(0.05), forces: vec![Some([0.0, 0.003, 0.0]), Some([0.0; 3]), None] };
-    let (own, tier, ch) = loo_ratio(&p, true, &s, Some(&energy_outlier));
+    let (own, tier, ch) = loo_ratio(&p, true, s.pos.len(), &s, Some(&energy_outlier));
     assert!((own - 50.0).abs() < 1e-9 && (tier - 50.0).abs() < 1e-9 && ch == Channel::Energy, "{own} {tier} {ch:?}");
-    assert_eq!(loo_ratio(&p, false, &s, None), (f64::INFINITY, f64::INFINITY, Channel::Force), "undefined (ruling R1a)");
+    assert_eq!(loo_ratio(&p, false, s.pos.len(), &s, None), (f64::INFINITY, f64::INFINITY, Channel::Force), "undefined (ruling R1a)");
     let nan = SampleLoo { energy: Some(f64::NAN), ..l.clone() };
-    let (own, tier, _) = loo_ratio(&p, false, &s, Some(&nan));
+    let (own, tier, _) = loo_ratio(&p, false, s.pos.len(), &s, Some(&nan));
     assert_eq!((own, tier), (f64::INFINITY, f64::INFINITY), "not a number: the worst");
 }
 

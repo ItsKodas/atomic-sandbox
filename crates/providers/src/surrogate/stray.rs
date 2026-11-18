@@ -123,9 +123,9 @@
 //!   part's own (a stray atom is no atom's neighbour), so they are judged exactly as the bonded part alone. Rule 6
 //!   needs no exemption: a stray atom's force rows are zero, so its epistemic force std is exactly 0. Rule 4b's key of
 //!   an isolated atom is none.
-//! - **Rule 7 per bonded atom** (review I4): the prediction's floor (n s_E)² is removed exactly and the epistemic rest,
-//!   the same as the bonded part's alone (B_s = 0 adds nothing to the energy row), is divided by n_bonded — rule 7 on
-//!   the bonded part's own prediction, floor (n_bonded s_E)² included.
+//! - **Rule 7 per bonded atom** (review I4): since ruling 9a the general rule — per energy-row atom, the prediction's
+//!   floor (N_e s_E)² removed — is exactly rule 7 on the bonded part's own prediction (its energy std is the scene's
+//!   bit for bit), so no exemption is needed for it.
 //! - **5d and the fences on the bonded part alone** (`policy::judged_part`; controller-facing ruling of Task 4): 5d's
 //!   energy row is per atom over the atoms it is given (`energy_per_atom` models), so the scene's row would be the
 //!   bonded part's × n_bonded/n, its ν × (n_bonded/n)²; and the quarantine and audit fences take the worst query atom's
@@ -150,13 +150,26 @@
 //! # Audits of a cleared answer (spec §4.5, review I6; plan Task 5)
 //!
 //! A cleared answer is audited like any model answer, at the same cadence, against the teacher's solve of the whole
-//! scene, and **every per-atom tier divides by n_bonded** ([`per_atom_n`]): the audit's energy criterion (in the step
-//! and on the background teacher), a fallback's over-tier test (`teach`: reported on the model's surface only within
-//! the tier), `agree` and the fence votes, the teach-around pass's held-out checks, and a failed audit's re-judgement
-//! (`trust::judge_case`'s callers). Divided by the scene's n, the composite gap would pass at a tier × n_stray
-//! larger. A scene without a stray atom has n_bonded = n, so its criterion is unchanged bit for bit. (The fit's own
-//! per-atom rows — the energy row, the leave-one-out residuals, the misfit set — keep the scene's n: that is the row
-//! the fit was given.)
+//! scene, and **every per-atom energy quantity divides by the energy-row atoms N_e** (`surrogate::energy_row_atoms`,
+//! `audit_n`; controller ruling 9a): the atoms with a neighbour the model can see, n_bonded at a stray-atom scene and
+//! exactly n for every scene without an isolated atom (so those are unchanged bit for bit). One denominator, on both
+//! sides:
+//!
+//! - **The fit's own row** (`surrogate::fit`, "Design matrix"): a released stray sample's energy row is
+//!   (E − Σ E_ref)/n_bonded. A stray atom adds nothing to φ_E (B_s = 0), so the row is its bonded part's row exactly,
+//!   with the target the fragment's plus (comp + ε_pos)/n_bonded — a bounded term the model cannot represent, not
+//!   per-atom label noise. Over the scene's n the row would carry its sample's noise at n_bonded/n and bias σ_E low
+//!   (measured: −17 % at half the fit stray, Task 5 report C). The training residuals, `loo`'s rows and residuals,
+//!   the misfit set, the class pass, the label-copy test and the install's label-sum check follow it, and
+//!   `Model::predict`'s floor is (N_e s_E)² — so a stray scene's energy std is its bonded part's bit for bit and rule 7
+//!   per N_e is rule 7 on the bonded part, cleared or not (Task 4's special case is gone: it is what the rule computes).
+//!   One energy row per sample either way (the evidence counts are unchanged); without `energy_per_atom` nothing
+//!   divides, as before.
+//! - **The audit side:** the audit's energy criterion (in the step and on the background teacher), a fallback's
+//!   over-tier test (`teach`), `agree` and the fence votes (which also require the same atoms: n alone no longer tells
+//!   H₂ from H₂ + a stray H), the teach-around pass's and the shell check's ratios, a failed audit's re-judgement
+//!   (`trust::judge_case`'s callers) and the calibration's history points (recorded over the bonded part: n_atoms
+//!   n_bonded). Divided by the scene's n, the composite gap would pass at a tier × n_stray larger.
 //!
 //! A **failed** audit at a scene with stray atoms (not a draft guess's) does three things, in this order
 //! ([`stray_audit_failed`](SurrogateKs::stray_audit_failed)):
@@ -165,20 +178,33 @@
 //!    sample of it in the fit goes back to [`Q_STRAY`](super::quarantine::Q_STRAY), held out for good (the audit's own
 //!    included); the refit is armed;
 //! 2. a composition check is queued at the audited geometry, the audit's own answer as its scene (an **attribution
-//!    check**: it is never booked in the book, a scene edit does not drop it, and no other check replaces it);
+//!    check**: never booked in the book; a scene edit and a basis change do not drop it — its parts are teacher solves
+//!    at a fixed geometry, judged with the model current when they answer; no ordinary check replaces it; a second
+//!    failed audit waits behind it, up to `STRAY_ATTRIBUTION_QUEUE`);
 //! 3. when its parts answer, the model's prediction of the bonded part alone is judged against the fragment's solve
 //!    by the audit's own criterion (per bonded atom; the forces by the audit's bound and floor), and the failure
 //!    enters the model's audit record (`FailedAudit`, rule 8: untrusted until re-earned) **only if the model is
-//!    wrong there** — `TeachOutcome::StrayAuditAttributed { model }`. Otherwise the failure was the composition's, and
-//!    the model's trust is untouched.
+//!    wrong there** — `TeachOutcome::StrayAuditAttributed { model }`. Otherwise the model's trust is untouched (and
+//!    after a refit since the audit the next `AUDIT_BURST` answered steps are audited).
+//!
+//! The audit's gap is exactly gap_frag + comp + Σ_s ε_pos,s: the model on the bonded part, the composition
+//! E_scene − E_frag − Σ E_atom(R_s), and each stray atom's box term E_atom(R_s) − E_box(Z_s) against its box reference.
+//! The attribution names all three, and every composition check logs ε_pos (the term a released sample's label
+//! carries, which (C) cannot see). "Not the model's" covers both comp and ε_pos.
 //!
 //! The case recorded for the model is the scene's geometry with the label the model failed to meet there: the
 //! fragment's measured energy plus Σ_s E_ref(Z_s), the fragment's forces on the bonded atoms and 0 on the stray ones
-//! (what `predict(scene)` claims). A re-judgement then measures the model's error alone; the composite label would
-//! carry the composition error the model can never re-earn. Until the check answers, the model stays trusted (the
-//! signature itself is already on DFT). **The conservative side:** when no check can run — no background teacher, an
-//! attribution check already in flight, a part solve failed or not clean, the model changed basis or settings — the
-//! failure counts against the model at once, with the scene's own labels, as any failed audit.
+//! (what `predict(scene)` claims; `AuditOrigin::StrayAttributed`). A re-judgement then measures the model's error
+//! alone; the composite label would carry the composition error the model can never re-earn. The label holds only
+//! while those atoms are stray at the model's cutoff: a re-judgement fences a case that no longer splits. **The audit
+//! history** (ruling 9b) takes the attribution's point, not the audit's: the fragment's (its atoms, the model's
+//! prediction of it, the fragment's answer) when the model is blamed; none, and an `unrecorded.composition` count,
+//! when it is not — no composition failure is calibration evidence. Until the check answers, the model stays trusted
+//! (the signature itself is already on DFT). **The conservative side:** when no check can run (no background teacher,
+//! the queue full) or it cannot attribute (a part solve failed or not clean, the model cannot describe the bonded
+//! part), the failure counts against the model with the scene's own labels and its history point, as any failed
+//! audit. A Forget, an installed model or a surface change discards a check in flight and its queue **without
+//! counting** (`discard_stray_check`): nothing is booked for a model that is gone.
 //!
 //! **Draft mode** answers these scenes as before, but a cleared scene is no longer an extrapolation there: its step
 //! carries no extrapolation readout (no rule refuses it) and an audit of it is an ordinary audit, not a draft guess's
@@ -259,14 +285,6 @@ pub(super) fn split(pos: &[[f64; 3]], r_cut: f64) -> Option<Split> {
     let (stray, bonded): (Vec<usize>, Vec<usize>) =
         (0..pos.len()).partition(|&i| (0..pos.len()).filter(|&j| j != i).all(|j| no_neighbours(&[pos[i], pos[j]], r_cut)));
     (!stray.is_empty() && !bonded.is_empty()).then_some(Split { bonded, stray })
-}
-
-/// The atom count every per-atom audit tier divides by (module doc, "Audits of a cleared answer"; spec §4.4–4.5,
-/// review I4): n_bonded when `pos` splits at `r_cut`, else the scene's n. A scene without a stray atom (including one
-/// whose atoms are all alone, rule 0b's) gets exactly `pos.len()`, so its criterion is bit for bit what it was; never
-/// below 1.
-pub(super) fn per_atom_n(pos: &[[f64; 3]], r_cut: f64) -> usize {
-    split(pos, r_cut).map_or(pos.len(), |s| s.bonded.len()).max(1)
 }
 
 impl Split {
@@ -728,4 +746,4 @@ impl StrayBook {
 }
 
 mod wiring;
-pub(super) use wiring::{mask_stray_atoms, part_answer, signature_label, unmasked_record, StrayAudit, StrayCheck};
+pub(super) use wiring::{mask_stray_atoms, part_answer, signature_label, unmasked_record, AttributionRequest, StrayAudit, StrayCheck};

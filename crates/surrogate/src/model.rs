@@ -79,8 +79,10 @@
 //! outputs:
 //!
 //! * `energy_std`: the TOTAL energy, φ̃ = Σ_i φ̃_i with φ̃_i the standardised descriptor of atom i
-//!   in its species block, plus the aleatoric floor of the energy rows: (N·σ_e)² when the fit
-//!   used energies per atom (the row was E/N with noise σ_e), σ_e² otherwise.
+//!   in its species block, plus the aleatoric floor of the energy rows: (N_e·σ_e)² when the fit
+//!   used energies per atom (the row was E/N_e with noise σ_e), σ_e² otherwise. N_e is
+//!   [`crate::energy_row_atoms`]: N for every geometry without an isolated atom (bit for bit as
+//!   before), the non-isolated atoms' count at a stray-atom scene (controller ruling 9a).
 //! * `force_std[j]`: √(Σ_a var_{j,a}) with var_{j,a} = σ_f² + g̃_{j,a}ᵀΣg̃_{j,a}, where g̃_{j,a}
 //!   is the force-row feature vector −Σ_i ∂B̃_i/∂r_{j,a} — the expected squared norm of the
 //!   force error on atom j, the quantity that compares to |F_j| in the fallback threshold; a
@@ -480,7 +482,8 @@ impl Model {
         restrict(&mut reduced, rep, &phi);
         let epistemic_e = cholesky_quad_form(l, qr, &mut reduced);
         let floor_e = if self.energy_per_atom {
-            (n as f64 * self.sigma_e).powi(2)
+            // N_e: the atoms the energy row is per (`crate::energy_row_atoms`; = n without an isolated atom)
+            (crate::energy_row_atoms(basis, pos) as f64 * self.sigma_e).powi(2)
         } else {
             self.sigma_e.powi(2)
         };
