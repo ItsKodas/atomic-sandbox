@@ -651,6 +651,47 @@ fn the_teach_around_button_names_its_cost() {
     assert_eq!(crate::ui::activity::words::pass_stage(&p), "teaching around #345");
 }
 
+/// User report 2026-11-18: "Fix it: Teach around N blockers" needed two clicks ("nothing at all" on
+/// the first). The Model tab's sections took automatic ids from the widgets drawn before them, so a
+/// snapshot that adds a widget above the button between the press and the release — the refit
+/// banner in the verdict card, a warning in Teach next — gave the button a new id mid-click, and
+/// egui drops a click whose pressed widget is gone. One click starts the pass whatever changes
+/// above it.
+#[test]
+fn one_click_teaches_around_even_when_the_panel_changes_mid_click() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let mut m = model();
+    m.fitted = true;
+    m.teach_offer = Some(sim::TeachOffer { blockers: vec![(345, "pair", 12.0, 0.4)], refused: Vec::new(), refused_total: 0, solves: 10, notes: Vec::new(), prompt: None });
+    let calm = snapshot(&scene, Backend::Estimated, Some(m.clone()));
+    for change in ["the refit banner above the section", "a warning above the button in its section"] {
+        let mut busy = m.clone();
+        if change.starts_with("the refit") {
+            busy.user_changes_pending = 1;
+        } else {
+            busy.autoload_refused = Some("a test refusal".into());
+        }
+        let busy = snapshot(&scene, Backend::Estimated, Some(busy));
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        alone(&mut st, DockTab::Model);
+        let inp = input(&scene, Some(&calm), &cam);
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, WIDE, vec![]);
+        }
+        let c = probed_rect("teach-around").center();
+        let mut outs = vec![frame(&ctx, &mut st, &inp, WIDE, vec![egui::Event::PointerMoved(c), pointer(c, true)])];
+        let changed = input(&scene, Some(&busy), &cam);
+        outs.push(frame(&ctx, &mut st, &changed, WIDE, vec![pointer(c, false)]));
+        outs.push(frame(&ctx, &mut st, &changed, WIDE, vec![egui::Event::PointerGone]));
+        let c = dyn_commands(&outs);
+        assert!(matches!(c.as_slice(), [DynCommand::StartTeaching]), "{change}: {c:?}");
+    }
+}
+
 /// The live case's prompt: a teach offer that carries a prompt (consecutive class-rule fallbacks
 /// blocked far away) puts "stuck on DFT: …" on the status chip; none without the prompt or while
 /// a pass runs.
