@@ -1671,7 +1671,7 @@ impl SurrogateKs {
         }
         let cleared = self.stray_cleared(pos, z, prov);
         let part = cleared.as_ref().map(|c| &c.0);
-        if let (_, Some(r)) = self.envelope_outside_except(model, pos, z, part.map_or(&[][..], |s| &s.stray)) {
+        if let (_, Some(r)) = self.envelope_outside_except(model, pos, z, part.map_or(&[][..], |s| &s.stray), None) {
             if r.rule != TeachRule::NoGrade {
                 return Some(r);
             }

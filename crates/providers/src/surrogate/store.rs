@@ -652,7 +652,9 @@ impl SurrogateKs {
 
     /// [`push_sample`](Self::push_sample) at quarantine code `code` ([`Q_NONE`], or [`Q_STRAY`] for a stray-atom
     /// sample held out until measured), set before a collection is offered the sample (a held one waits outside it).
-    pub(super) fn push_sample_coded(&mut self, s: Sample, prov: &Provenance, face: f64, multiplicity: Option<u32>, code: u8) -> Result<(), StoreError> {
+    pub(super) fn push_sample_coded(&mut self, mut s: Sample, prov: &Provenance, face: f64, multiplicity: Option<u32>, code: u8) -> Result<(), StoreError> {
+        // stray atoms are no force rows (fix round 1, I2)
+        stray::mask_stray_atoms(&mut s, self.cutoff());
         let z = s.z.clone();
         if self.shared.is_some() {
             self.push_shared_coded(s, prov, face, multiplicity, code)?;

@@ -133,7 +133,7 @@ impl SurrogateKs {
         // a cleared stray-atom scene, judged as `evaluate` judges it (spec §4.4)
         let cleared = self.stray_cleared(pos, z, prov);
         let part = cleared.as_ref().map(|c| &c.0);
-        if let (_, Some(r)) = self.envelope_outside_except(model, pos, z, part.map_or(&[][..], |s| &s.stray)) {
+        if let (_, Some(r)) = self.envelope_outside_except(model, pos, z, part.map_or(&[][..], |s| &s.stray), None) {
             return Some(r);
         }
         let posterior = match (pred.energy_std, pred.force_std_epistemic.as_ref()) {

@@ -17,6 +17,25 @@ pub(in crate::surrogate) fn part_answer(r: &ForceResult, energy: f64, h: f64) ->
     }
 }
 
+/// The stray atoms of `s` at `r_cut` (Bohr) out of its force rows (`Sample::force_mask`; Task 4 fix round 1, I2,
+/// controller ruling 8): a stray atom's force rows are identically zero (B_s = 0 and it is in no other atom's
+/// descriptor) and its label is the teacher's ≈ 0, so fitted they add 3 rows of no information each to the force
+/// count, Σ F² and the residual degrees of freedom — biasing the fitted force noise σ_f down, and rules 6 and 7 looser
+/// with it. Masked out they enter no count, no envelope and no active set (the mask's contract); the energy row is
+/// kept (`use_energy` unchanged) and an existing mask (a capped segment's) is narrowed, never widened. A sample with
+/// no stray atom is left as it is. Applied where samples enter the store (`push_sample_coded`, `hold_out_stray`, a
+/// collection's mirror): in memory only — a loaded record is never rewritten; a sample kept this session is written
+/// to a collection with its mask.
+pub(in crate::surrogate) fn mask_stray_atoms(s: &mut Sample, r_cut: f64) {
+    let Some(sp) = split(&s.pos, r_cut) else { return };
+    let n = s.pos.len();
+    let mut mask = s.force_mask.take().filter(|m| m.len() == n).unwrap_or_else(|| vec![true; n]);
+    for &i in &sp.stray {
+        mask[i] = false;
+    }
+    s.force_mask = Some(mask);
+}
+
 /// A check's solve is clean ([`PartAnswer::clean`]): no warning, trainable, its face density (if reported) within the
 /// box rule at grid spacing `h` (a NaN density is not within it).
 fn clean_solve(warned: bool, unfit: Option<&str>, face: Option<f64>, h: f64) -> bool {
@@ -120,28 +139,44 @@ impl SurrogateKs {
     /// signature is `Cleared`, the floor still passes at these positions (a stray atom drifting within
     /// [`STRAY_FACE_MARGIN`] of a face, a forced multiplicity, a shell fence since — the signature does not carry them)
     /// and the region covers the bonded part's descriptors. The split, the region's worst energy residual and smallest
-    /// frontier margin (Ha); `None` otherwise. Read-only: a book built under another basis or surface than the model's
+    /// frontier margin (Ha) and its passing checks so far (the step note's numbers; fix round 1 M1); `None` otherwise.
+    /// Read-only: a book built under another basis or surface than the model's
     /// covers nothing (it is cleared at the next `stray_book_current`, controller ruling B).
-    pub(in crate::surrogate) fn stray_cleared(&self, pos: &[[f64; 3]], z: &[u8], prov: &Provenance) -> Option<(Split, f64, f64)> {
+    pub(in crate::surrogate) fn stray_cleared(&self, pos: &[[f64; 3]], z: &[u8], prov: &Provenance) -> Option<(Split, f64, f64, usize)> {
+        self.stray_cleared_with(pos, z, prov, None)
+    }
+
+    /// [`stray_cleared`](Self::stray_cleared) with the scene's descriptors under the model's basis when the caller
+    /// has them (`evaluate`, which shares them with the envelope; fix round 1 M6): a bonded atom's descriptor in the
+    /// scene is the bonded part's own (a stray atom is no atom's neighbour, so no term and no order changes), so the
+    /// region is read from them without describing the bonded part again. Cheapest tests first: a scene that does not
+    /// split or whose signature is not cleared costs a split and a lookup.
+    pub(in crate::surrogate) fn stray_cleared_with(&self, pos: &[[f64; 3]], z: &[u8], prov: &Provenance, desc: Option<&[Vec<f64>]>) -> Option<(Split, f64, f64, usize)> {
         let model = self.model.as_ref()?;
         if pos.len() != z.len() {
             return None;
         }
-        let split = split(pos, self.cutoff())?;
+        // the model's own cutoff (fix round 1 M2: the one its descriptors and rule 5a use)
+        let split = split(pos, model.basis.r_cut)?;
         if split.stray.iter().any(|&i| model.basis.species_index(z[i]).is_none()) {
             return None;
         }
+        let sig = Signature::new(z, &split, prov.charge, prov);
+        let Some(StrayState::Cleared { region, residual, margin, passes }) = self.stray_book.state(&sig) else { return None };
         let (basis, key) = self.stray_key.as_ref()?;
         if model.basis != *basis || reference_settings_key(&model.provenance) != *key {
             return None;
         }
-        let sig = Signature::new(z, &split, prov.charge, prov);
-        let Some(StrayState::Cleared { region, residual, margin }) = self.stray_book.state(&sig) else { return None };
         if self.stray_floor(pos, z, prov, &split).is_some() {
             return None;
         }
-        let (desc, species) = self.bonded_descriptors(pos, z, &split)?;
-        region.contains(&desc, &species).then_some((split, *residual, *margin))
+        let bz: Vec<u8> = split.bonded.iter().map(|&i| z[i]).collect();
+        let species = model.basis.species_indices(&bz).ok()?;
+        let inside = match desc.filter(|d| d.len() == pos.len()) {
+            Some(d) => region.contains(&split.bonded.iter().map(|&i| &d[i]).collect::<Vec<_>>(), &species),
+            None => self.bonded_descriptors(pos, z, &split).is_some_and(|(d, _)| region.contains(&d, &species)),
+        };
+        inside.then_some((split, *residual, *margin, *passes))
     }
 
     /// Whether a cleared region of `sig` covers the bonded geometry of `pos` (module doc, "The hold-out").
@@ -312,8 +347,8 @@ impl SurrogateKs {
                 }
                 let (outcome, state) = match self.stray_book.state(&sig) {
                     Some(StrayState::Checking { passes, .. }) => (TeachOutcome::StrayChecking { n: *passes, of: STRAY_CHECKS }, format!("{passes} of {STRAY_CHECKS} passes at distinct geometries")),
-                    Some(StrayState::Cleared { .. }) if was_cleared => (TeachOutcome::StrayCheckingNew, "cleared; the region grows".to_string()),
-                    Some(StrayState::Cleared { .. }) => (TeachOutcome::StrayChecking { n: STRAY_CHECKS, of: STRAY_CHECKS }, format!("cleared ({STRAY_CHECKS} checks)")),
+                    Some(StrayState::Cleared { passes, .. }) if was_cleared => (TeachOutcome::StrayCheckingNew, format!("cleared; the region grows ({passes} checks)")),
+                    Some(StrayState::Cleared { passes, .. }) => (TeachOutcome::StrayChecking { n: STRAY_CHECKS, of: STRAY_CHECKS }, format!("cleared ({passes} checks)")),
                     Some(StrayState::Refused(why)) => (TeachOutcome::StrayRefused, format!("refused already ({why})")),
                     None => (TeachOutcome::Discarded, "not booked".to_string()),
                 };

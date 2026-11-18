@@ -136,11 +136,16 @@
 //! 0), with the step note "stray atoms: model for the bonded part + free atoms (composition measured, 3 checks; worst
 //! residual … mHa, frontier margin … mHa)". A step outside the region is rule 5a's, as before, and one more check.
 //! **Re-entry** (review M3): a stray atom back within r_cut is no longer stray and the ordinary rules judge the scene;
-//! the switch to the teacher's surface is booked by `transition_jump`, as is the switch back. Measured on the Morse
-//! fixture, rule 5b does **not** fire there once a released stray sample is fitted — its stray atom puts an empty
-//! neighbourhood (C = 0) into the envelope, and `coordination_ratio` skips a channel whose minimum is 0 — so it is 5e
-//! (γ = ∞) at the cutoff and 5c deeper in that refuse (`reentry_and_exit_book_every_switch`). The audit criterion's
-//! n_bonded is plan Task 5's.
+//! the switch to the teacher's surface is booked by `transition_jump`, as is the switch back. Rule 5b refuses there
+//! (the returning atom's coordination far below any training atom's; `reentry_and_exit_book_every_switch`) even with
+//! released stray samples fitted: their stray atoms are no training atoms — not in the envelope (`surrogate::envelope`
+//! module doc, "Isolated atoms are not training atoms": admitted, a B = 0 would set every coordination minimum of its
+//! species to 0 and switch 5b off for ordinary scenes too) and not in the force rows (their mask,
+//! [`mask_stray_atoms`]: zero rows that would bias σ_f down). The audit criterion's n_bonded is plan Task 5's.
+//!
+//! **Draft mode** answers these scenes as before, but a cleared scene is no longer an extrapolation there: its step
+//! carries no extrapolation readout (no rule refuses it) and an audit of it is an ordinary audit, not a draft guess's
+//! (its sample is kept in the fit when the region covers it).
 //!
 //! # The checks on the auditor and the sample hold-out (spec §4.3, review C1; plan Task 3)
 //!
@@ -590,11 +595,12 @@ impl Region {
 
     /// Every bonded atom lies within its species' per-feature [min, max] of the region; a species absent from the
     /// region (or an empty geometry) is not contained.
-    pub(super) fn contains(&self, bonded_desc: &[Vec<f64>], species: &[usize]) -> bool {
+    pub(super) fn contains<D: AsRef<[f64]>>(&self, bonded_desc: &[D], species: &[usize]) -> bool {
         let p = self.env.n_features;
         !bonded_desc.is_empty()
             && species.len() == bonded_desc.len()
             && species.iter().zip(bonded_desc).all(|(&s, b)| {
+                let b = b.as_ref();
                 self.env.count.get(s).is_some_and(|&c| c > 0)
                     && b.len() == p
                     && b.iter().enumerate().all(|(k, &v)| self.env.min[s * p + k] <= v && v <= self.env.max[s * p + k])
@@ -607,7 +613,8 @@ impl Region {
 #[derive(Clone, Debug)]
 pub(super) enum StrayState {
     Checking { passes: usize, region: Region, residual: f64, margin: f64 },
-    Cleared { region: Region, residual: f64, margin: f64 },
+    /// `passes`: every passing check booked so far (the [`STRAY_CHECKS`] that opened the region and each that grew it).
+    Cleared { region: Region, residual: f64, margin: f64, passes: usize },
     Refused(String),
 }
 
@@ -651,14 +658,14 @@ impl StrayBook {
                     region.add(desc, species);
                 }
                 if passes >= STRAY_CHECKS {
-                    StrayState::Cleared { region, residual, margin }
+                    StrayState::Cleared { region, residual, margin, passes }
                 } else {
                     StrayState::Checking { passes, region, residual, margin }
                 }
             }
-            StrayState::Cleared { mut region, residual, margin } => {
+            StrayState::Cleared { mut region, residual, margin, passes } => {
                 region.add(desc, species);
-                StrayState::Cleared { region, residual: residual.max(r), margin: margin.min(m) }
+                StrayState::Cleared { region, residual: residual.max(r), margin: margin.min(m), passes: passes + 1 }
             }
         };
         *st = next;
@@ -676,4 +683,4 @@ impl StrayBook {
 }
 
 mod wiring;
-pub(super) use wiring::{part_answer, signature_label, StrayCheck};
+pub(super) use wiring::{mask_stray_atoms, part_answer, signature_label, StrayCheck};

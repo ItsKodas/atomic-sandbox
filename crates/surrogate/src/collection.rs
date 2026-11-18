@@ -1813,9 +1813,14 @@ impl Collection {
         }
         t.push_str(&format!("by origin: {}\n", tags.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", ")));
         // capped segments (M8a Task 10): only their interior atoms are knowledge, below too
-        let segments = self.samples.iter().filter(|s| !s.sample.is_whole()).count();
+        let segments = self.samples.iter().filter(|s| !s.sample.use_energy).count();
         if segments > 0 {
             t.push_str(&format!("{segments} of them capped segments (only their interior atoms' forces are taught and counted below)\n"));
+        }
+        // a sample whose stray atoms (no neighbour within r_cut) are masked out of its force rows: its energy is taught
+        let strays = self.samples.iter().filter(|s| s.sample.use_energy && s.sample.force_mask.is_some()).count();
+        if strays > 0 {
+            t.push_str(&format!("{strays} of them with stray atoms (their stray atoms' forces are not taught nor counted below)\n"));
         }
         t.push('\n');
         let mut species: BTreeMap<u8, (usize, usize)> = BTreeMap::new();

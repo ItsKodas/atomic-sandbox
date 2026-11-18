@@ -400,6 +400,14 @@ pub(super) fn quarantine_words(held: usize, added: usize, h: Held, ranking: Rank
 
 /// L∞ distance between two descriptors of species `s` in the envelope's training-spread units
 /// (a feature the training never varied counts as infinitely far once the two differ).
+///
+/// Never NaN (stray-atoms Task 4 fix round 1, C1(c)): a species with no training atom — since
+/// isolated atoms are no training atoms, one seen only as a stray atom — has a NaN unit, and a
+/// non-finite descriptor a NaN gap; either is infinitely far, never folded away by a `max`. Far is
+/// the conservative side for every caller: thinning keeps the sample; the quarantine, misfit and
+/// audit fences do not call it near, and the envelope's own distance (rule 5c) refuses every
+/// query of a species with no training atom first (`Envelope::distance`: ∞ at count 0); the
+/// cleared region's distinctness refuses such a species before measuring (`Region::distinct`).
 pub(super) fn spread_distance(env: &Envelope, s: usize, a: &[f64], b: &[f64]) -> f64 {
     let mut worst = 0.0f64;
     for (k, (x, y)) in a.iter().zip(b).enumerate() {
@@ -408,7 +416,11 @@ pub(super) fn spread_distance(env: &Envelope, s: usize, a: &[f64], b: &[f64]) ->
             continue;
         }
         let u = env.unit(s, k);
-        worst = worst.max(if u > 0.0 { gap / u } else { f64::INFINITY });
+        let d = gap / u;
+        if !(u > 0.0) || d.is_nan() {
+            return f64::INFINITY;
+        }
+        worst = worst.max(d);
     }
     worst
 }
@@ -561,7 +573,12 @@ impl SurrogateKs {
     /// of the fit keep their own code (they are not fitted either way, and their code is what a file
     /// holds).
     pub(super) fn hold_out_stray(&mut self, r_cut: f64) -> usize {
-        let Some(store) = self.store.as_ref() else { return 0 };
+        let Some(store) = self.store.as_mut() else { return 0 };
+        // every loaded sample with stray atoms has them out of its force rows (in memory; fix round 1, I2)
+        for s in store.samples.iter_mut() {
+            super::stray::mask_stray_atoms(s, r_cut);
+        }
+        let store = self.store.as_ref().expect("checked");
         let candidates: Vec<usize> = (0..store.len())
             .filter(|&i| self.quarantine.get(i).is_none_or(|&q| q == Q_NONE || q == Q_REF_WAIT || q == Q_DRAFT) && super::stray::split(&store.samples[i].pos, r_cut).is_some())
             .collect();

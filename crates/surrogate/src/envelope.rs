@@ -89,9 +89,31 @@
 //! The window m/3 ≤ C < m is still answered by extrapolation toward the pinned limit; there the
 //! variance and the audits are what judge it (a documented gap, not a guarantee).
 //!
+//! # Isolated atoms are not training atoms (stray-atoms Task 4 fix round 1, controller ruling 7)
+//!
+//! An atom with no neighbour inside r_cut ([`isolated_atom`]: every coordination feature is exactly 0, so every
+//! feature is) describes no environment: the model's answer for it is E_ref with zero force, whatever was fitted.
+//! It is never added to the envelope (`Accumulator::add`'s call sites skip it, not [`Envelope::add_atom`]: a stray
+//! atoms' cleared region is a box of chosen descriptors and adds them itself). Admitting one would put B = 0 into
+//! every feature of its species: the minimum of every coordination feature becomes 0, so
+//! [`Envelope::coordination_ratio`] skips the channel ("an empty neighbourhood was seen") and the vanishing
+//! direction is no longer judged at all; the box of the spread rule contains 0; and zeros enter Σ B and Σ B², the
+//! spread unit. A stretched pair just inside r_cut, whose features all tend to 0 with f_c, would then be answered
+//! by the model's free-atom limit — the M6 Task 11 failure above. A sparse but **non-empty** neighbourhood (the
+//! r = 5.125 tail sample, f_c = 0.05) is a training atom as before: the ratio rule's derivation relies on it. A
+//! species seen only as isolated atoms has no training atom (count 0): every query of it is infinitely far.
+//!
 //! [`Accumulator`]: crate::fit::Accumulator
 
 use crate::descriptor::Basis;
+
+/// An atom with no neighbour the model can see (module doc, "Isolated atoms are not training atoms"): every
+/// coordination feature C_t = b2[(t, n = 0)] = Σ_{j ∈ t} f_c(r_ij) is exactly zero (no neighbour inside r_cut; a
+/// coincident one counts, f_c(0) = 1). O(S) from the descriptor `b`. The one predicate behind the fit's envelope
+/// skip and the provider's rule 5a (`policy::lone_atom`), so the two cannot drift.
+pub fn isolated_atom(basis: &Basis, b: &[f64]) -> bool {
+    (0..basis.n_species()).all(|t| b[basis.body2_index(t, 0)] == 0.0)
+}
 
 /// Per (species, feature) range and spread of the training descriptors (module doc). All
 /// fields public for the sidecar; `add_atom` is the way to fill them.

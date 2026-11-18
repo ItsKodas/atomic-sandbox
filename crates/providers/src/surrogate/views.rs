@@ -187,7 +187,7 @@ impl SurrogateKs {
         if let Some(r) = non_finite_answer(pred) {
             return Err(code(r));
         }
-        if let (_, Some(r)) = self.envelope_outside_except(model, pos, z, part.map_or(&[][..], |s| &s.stray)) {
+        if let (_, Some(r)) = self.envelope_outside_except(model, pos, z, part.map_or(&[][..], |s| &s.stray), None) {
             return Err(code(r));
         }
         let posterior = match (pred.energy_std, pred.force_std_epistemic.as_ref()) {

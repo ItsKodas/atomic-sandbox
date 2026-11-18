@@ -400,7 +400,7 @@ fn region_clears_after_three_distinct_passes() {
     let Some(StrayState::Cleared { region, .. }) = book.state(&sig()) else { unreachable!() };
     assert!(!region.contains(&d, &s));
     book.record(sig(), CheckVerdict::Pass { residual: 5e-4, margin: 0.25 }, &d, &s, &basis, &env, thin());
-    let Some(StrayState::Cleared { region, residual, margin }) = book.state(&sig()) else { panic!() };
+    let Some(StrayState::Cleared { region, residual, margin, .. }) = book.state(&sig()) else { panic!() };
     assert!(region.contains(&d, &s));
     assert_eq!((*residual, *margin), (5e-4, 0.2));
     // the book is session state: `clear` forgets it
@@ -787,7 +787,7 @@ fn three_distinct_passes_clear_and_release() {
     assert_eq!(s.quarantine[b], Q_STRAY);
     gate.store(true, SeqCst);
     settle(&mut s);
-    let Some(StrayState::Cleared { region, residual, margin }) = s.stray_book.state(&sig) else { panic!("cleared: {:?}", s.stray_book.state(&sig)) };
+    let Some(StrayState::Cleared { region, residual, margin, .. }) = s.stray_book.state(&sig) else { panic!("cleared: {:?}", s.stray_book.state(&sig)) };
     println!("cleared: worst residual {residual:.2e} Ha, smallest margin {margin:.3} Ha");
     assert!(*residual < 1e-12 && (*margin - 0.32).abs() < 1e-9, "an exact split, the stand-in levels' margin");
     let (d, sp) = s.bonded_descriptors(&positions(&between), &zs(&between), &Split { bonded: vec![0, 1], stray: vec![2] }).unwrap();
@@ -1277,9 +1277,9 @@ fn cleared_student() -> (SurrogateKs, Signature) {
 
 /// The step note of a cleared answer (spec §4.4, review M6), with the book's numbers for `sig`.
 fn cleared_note(s: &SurrogateKs, sig: &Signature) -> String {
-    let Some(StrayState::Cleared { residual, margin, .. }) = s.stray_book.state(sig) else { panic!("not cleared") };
+    let Some(StrayState::Cleared { residual, margin, passes, .. }) = s.stray_book.state(sig) else { panic!("not cleared") };
     format!(
-        "stray atoms: model for the bonded part + free atoms (composition measured, 3 checks; worst residual {:.2} mHa, frontier margin {:.0} mHa)",
+        "stray atoms: model for the bonded part + free atoms (composition measured, {passes} checks; worst residual {:.2} mHa, frontier margin {:.0} mHa)",
         residual * 1e3,
         margin * 1e3
     )
@@ -1346,9 +1346,13 @@ fn a_cleared_scene_is_the_models() {
 #[test]
 fn outside_the_region_falls_back_and_checks() {
     let (mut s, sig) = cleared_student();
+    // in the region first (the model's), then out of it: the exit switch is booked (fix round 1 M3)
+    let r = judged_step(&mut s, &h2_with(INSIDE, &[STRAY_AT]));
+    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
     let sc = h2_with(OUTSIDE, &[STRAY_AT]);
     let r = judged_step(&mut s, &sc);
     assert_eq!(r.stats.source, Source::Fallback);
+    assert!(r.stats.refit_jump.is_some() && s.last.as_ref().is_some_and(|l| !l.on_model), "the switch out to the teacher's surface is booked");
     assert!(r.stats.notes.iter().any(|n| n.contains("isolated atom — atom 2")), "{:?}", r.stats.notes);
     assert!(r.stats.notes.iter().any(|n| n.contains("stray atoms (H2 + H) — a composition check") && n.contains("queued")), "{:?}", r.stats.notes);
     settle(&mut s);
@@ -1359,6 +1363,7 @@ fn outside_the_region_falls_back_and_checks() {
     s.refit().unwrap();
     let r = judged_step(&mut s, &sc);
     assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+    assert!(r.stats.refit_jump.is_some(), "the switch back to the model's surface is booked");
 }
 
 /// Plan Task 4, review I4: rule 7 normalises per **bonded** atom. With the energy tier at 0.5 mHa per atom (and the
@@ -1433,7 +1438,9 @@ impl ForceProvider for Shifted {
 
 /// Review Focus 1, spec §4.4 re-entry (review M3): the stray H on a path 8 → 5 → 8 Bohr from H₂'s centre in 1/8-Bohr
 /// steps, the teacher shifted 10 mHa off the model. At ≥ 6 Bohr (stray, cleared) the model answers; inside r_cut the
-/// ordinary rules refuse and the teacher answers on its own surface. Every model ↔ teacher switch carries a booking
+/// ordinary rules refuse — rule 5b at the first step in (spec M3: the returning atom's coordination is far below any
+/// training atom's; the fitted stray samples' stray atoms are no training atoms, fix round 1 C1) — and the teacher
+/// answers on its own surface. Every model ↔ teacher switch carries a booking
 /// (`refit_jump`, from `transition_jump`), and E_conserved has no unbooked step: per step, ΔE_reported − J +
 /// ½ (F₀ + F₁)·Δr — what the driver's E_conserved moves by beyond the bounded shadow term — stays at the trapezoid's
 /// error, far below the 10 mHa an unbooked switch would leave. No sample flood: the way back out keeps no copy of the
@@ -1482,6 +1489,8 @@ fn reentry_and_exit_book_every_switch() {
     println!("re-entry refusals: {rules:?}; {} samples kept on the way in, {} on the way out", at_turn - n0, s.samples() - at_turn);
     assert_eq!(switches, 2, "in once, out once");
     assert!(rules.iter().all(|r| r.is_some_and(|r| r != TeachRule::IsolatedAtom)), "inside r_cut the ordinary rules refuse: {rules:?}");
+    assert_eq!(rules[0], Some(TeachRule::Coordination), "rule 5b refuses at the first step inside r_cut (spec M3): {rules:?}");
+    assert!(s.store().unwrap().samples[..n0].iter().any(|x| x.force_mask.is_some()), "the premise: released stray samples are fitted");
     assert_eq!(s.samples(), at_turn, "no sample flood: the way out revisits the way in's geometries, and keeps none of them");
 }
 
@@ -1492,10 +1501,13 @@ fn reentry_and_exit_book_every_switch() {
 fn a_stray_near_a_face_falls_back_inside_a_cleared_region() {
     let (mut s, _) = cleared_student();
     // the 81³ cell's half-extent is 10 Bohr: at y = 5.9 the stray H is 4.1 Bohr from a face, at 6.5 3.5 Bohr
+    // every step is a switch of surface (the clearance's last step was a fallback), each booked (fix round 1 M3)
     for (y, model) in [(5.9, true), (6.5, false), (5.9, true)] {
         let sc = h2_with(INSIDE, &[[0.0, y, 0.0]]);
         let r = judged_step(&mut s, &sc);
         assert_eq!(r.stats.source == Source::Surrogate, model, "y = {y}: {:?}", r.stats.notes);
+        assert_eq!(s.last.as_ref().map(|l| l.on_model), Some(model), "y = {y}: the fallback is reported on the teacher's surface");
+        assert!(r.stats.refit_jump.is_some(), "y = {y}: the switch is booked");
         if !model {
             assert!(r.stats.notes.iter().any(|n| n.contains("box: the stray H is 3.50 Bohr from a face")), "{:?}", r.stats.notes);
             assert!(s.stray_pending.is_none(), "no check of a floor-refused scene");
@@ -1578,3 +1590,143 @@ fn a_fence_on_the_bonded_part_fences_the_cleared_scene() {
     assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
     assert_eq!(s.would_answer(&positions(&sc), &zs(&sc), &s.provenance_for(&sc)), Err((TeachRule::NearQuarantine, None)));
 }
+
+// ---- plan Task 4 fix round 1 ----
+
+/// The envelope's bits (min, max, Σ, Σ², counts).
+fn envelope_bits(e: &Envelope) -> Vec<u64> {
+    [&e.min, &e.max, &e.sum, &e.sumsq].iter().flat_map(|v| v.iter().map(|x| x.to_bits())).chain(e.count.iter().map(|&c| c as u64)).collect()
+}
+
+/// The strict verdicts (`would_answer`'s rule, or none) on a stretched, non-stray H₂ scan r ∈ [4.5, 6) Bohr.
+fn stretched_verdicts(s: &SurrogateKs) -> Vec<(f64, Option<TeachRule>)> {
+    (0..15)
+        .map(|k| {
+            let r = 4.5 + 0.1 * k as f64;
+            let sc = big(dimer(r, [1.0, 0.0, 0.0], H2_AT, 1, 1));
+            (r, s.would_answer(&positions(&sc), &zs(&sc), &s.provenance_for(&sc)).err().map(|e| e.0))
+        })
+        .collect()
+}
+
+/// Fix round 1 C1 (controller ruling 7) and (g): a fitted sample with a stray atom leaves the training envelope bit
+/// for bit what the same sample without its stray atom leaves — the stray H (B = 0) is no training atom — so the
+/// coordination minimum stays the bonded atoms' and rule 5b judges a stretched, non-stray H₂ near r_cut exactly as
+/// before: the verdicts of a scan r ∈ [4.5, 6) Bohr are unchanged by fitting it (admitted, the stray H would set the
+/// minimum to 0, 5b would skip the channel and the model would answer the stretched pair by its free-atom limit,
+/// the M6 Task 11 failure).
+#[test]
+fn a_fitted_stray_atom_leaves_the_envelope_and_the_stretched_pair_alone() {
+    let (mut base, _, _) = student(0.0, &TRAINED, 40, false);
+    let before = stretched_verdicts(&base);
+    println!("stretched H₂ verdicts before: {before:?}");
+    assert!(before.iter().all(|(_, v)| v.is_some()), "the premise: strict mode refuses the stretched pair");
+    let (mut plain, _, _) = student(0.0, &TRAINED, 40, false);
+    let bonded = big(dimer(CHECKS[0], [1.0, 0.0, 0.0], H2_AT, 1, 1));
+    plain.add_sample(exact_sample(&bonded), &bonded).unwrap();
+    let with = h2_with(CHECKS[0], &[STRAY_AT]);
+    base.add_sample(exact_sample(&with), &with).unwrap();
+    let i = base.samples() - 1;
+    assert!(!base.excluded(i), "the premise: the stray sample is fitted");
+    base.species_dirty = true;
+    plain.species_dirty = true;
+    assert_eq!(base.refit().unwrap().n_samples, 41);
+    assert_eq!(plain.refit().unwrap().n_samples, 41);
+    assert_eq!(envelope_bits(base.envelope().unwrap()), envelope_bits(plain.envelope().unwrap()), "the stray H adds nothing to the envelope");
+    let k = base.model().unwrap().basis.body2_index(0, 0);
+    assert!(base.envelope().unwrap().min[k] > 0.5, "the coordination minimum stays the bonded atoms' ({:e})", base.envelope().unwrap().min[k]);
+    assert_eq!(stretched_verdicts(&base), before, "the stretched pair's verdicts are unchanged by the fitted stray sample");
+}
+
+/// Fix round 1 I2 (controller ruling 8): a sample with stray atoms is stored with them masked out of its force rows
+/// (`force_mask`; its energy row kept), so a released one adds 3 × n_bonded force rows, not 3 × n — no zero rows
+/// enter the force count, Σ F² or the residual degrees of freedom (they would bias σ_f down). A loaded one is masked
+/// in memory at its hold-out; a capped segment's mask is narrowed, never widened.
+#[test]
+fn a_released_stray_sample_adds_no_stray_force_rows() {
+    let (s, _) = cleared_student();
+    let st = s.store().unwrap();
+    let rows: usize = (0..s.samples()).filter(|&i| !s.excluded(i)).map(|i| 3 * st.samples[i].trained_atoms()).sum();
+    let acc = s.accumulator().unwrap();
+    assert_eq!(acc.n_samples, 43);
+    assert_eq!((acc.n_f, rows), (3 * 2 * 43, 3 * 2 * 43), "40 H₂ samples and 3 released H₂ + H: 2 taught atoms each");
+    for i in 40..43 {
+        let smp = &st.samples[i];
+        assert_eq!((smp.pos.len(), smp.force_mask.clone(), smp.use_energy), (3, Some(vec![true, true, false]), true), "sample {i}");
+    }
+    // the helper alone: a segment's mask narrowed, a sample without stray atoms untouched
+    let mut seg = exact_sample(&h2_with(CHECKS[0], &[STRAY_AT]));
+    seg.force_mask = Some(vec![false, true, true]);
+    seg.use_energy = false;
+    mask_stray_atoms(&mut seg, R_CUT);
+    assert_eq!((seg.force_mask, seg.use_energy), (Some(vec![false, true, false]), false));
+    let mut plain = exact_sample(&big(dimer(1.2, [1.0, 0.0, 0.0], H2_AT, 1, 1)));
+    mask_stray_atoms(&mut plain, R_CUT);
+    assert_eq!(plain.force_mask, None);
+}
+
+/// Fix round 1 C1(d): a model file written by an older build, whose fit admitted its released stray samples' stray
+/// atoms into the envelope (simulated: an isolated H added to the stored envelope), installs with those samples held
+/// out (`Q_STRAY`, the session's clearances start empty) — and every sample with an isolated atom is a lone or stray
+/// sample, so the fit is rebuilt from the stored samples without them: the installed envelope holds no isolated atom.
+#[test]
+fn an_installed_file_with_isolated_atoms_in_its_envelope_is_rebuilt() {
+    let (s, _) = cleared_student();
+    let path = std::env::temp_dir().join(format!("stray-envelope-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let mut sc = surrogate::sidecar::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let p = sc.accumulator.basis.n_features();
+    sc.accumulator.envelope.add_atom(0, &vec![0.0; p]);
+    let k = sc.accumulator.basis.body2_index(0, 0);
+    assert_eq!(sc.accumulator.envelope.min[k], 0.0, "the premise: the stored envelope admits an isolated atom");
+    let (mut t, _, _) = student(0.0, &TRAINED, 40, false);
+    t.install_sidecar(sc).unwrap();
+    assert_eq!(t.stray_held_out(), 3);
+    assert!(t.user_notes.iter().any(|n| n.contains("rebuilt from its stored samples without them")), "{:?}", t.user_notes);
+    assert!(t.envelope().unwrap().min[k] > 0.5, "the rebuilt envelope holds no isolated atom ({:e})", t.envelope().unwrap().min[k]);
+}
+
+/// Fix round 1 M6: the per-step cost of the cleared decision on a stray scene (the split, the basis comparison, the
+/// surface key, the book, the floor and the bonded part's descriptors), against a strict model step there. Reported,
+/// not judged (a timing): printed for the task report.
+#[test]
+fn diag_stray_cleared_cost() {
+    let (mut s, _) = cleared_student();
+    let sc = h2_with(INSIDE, &[STRAY_AT]);
+    let (pos, z, prov) = (positions(&sc), zs(&sc), s.provenance_for(&sc));
+    let n = 20_000;
+    let t0 = Instant::now();
+    for _ in 0..n {
+        std::hint::black_box(s.stray_cleared(&pos, &z, &prov));
+    }
+    let alone = t0.elapsed().as_secs_f64() / n as f64;
+    // as `evaluate` asks: with the scene's descriptors it computes for the envelope anyway
+    let desc = describe_values(&s.model().unwrap().basis, &pos, &z).unwrap();
+    let t0 = Instant::now();
+    for _ in 0..n {
+        std::hint::black_box(s.stray_cleared_with(&pos, &z, &prov, Some(&desc)));
+    }
+    let cleared = t0.elapsed().as_secs_f64() / n as f64;
+    let t0 = Instant::now();
+    for _ in 0..n {
+        let m = s.model().unwrap();
+        std::hint::black_box((m.basis == s.stray_key.as_ref().unwrap().0, super::super::lone::reference_settings_key(&m.provenance)));
+    }
+    let key = t0.elapsed().as_secs_f64() / n as f64;
+    let steps = 2_000;
+    let t0 = Instant::now();
+    for _ in 0..steps {
+        assert_eq!(s.evaluate(&sc, &mut never()).unwrap().stats.source, Source::Surrogate);
+    }
+    let step = t0.elapsed().as_secs_f64() / steps as f64;
+    println!(
+        "stray_cleared {:.2} µs alone, {:.2} µs with the scene's descriptors (basis == + surface key {:.2} µs); a strict model step {:.2} µs: {:.1} %",
+        alone * 1e6,
+        cleared * 1e6,
+        key * 1e6,
+        step * 1e6,
+        100.0 * cleared / step
+    );
+}
+

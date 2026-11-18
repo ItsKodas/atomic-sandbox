@@ -113,11 +113,14 @@
 //!      part alone).
 //!    - **5b, coordination ratio** (M6 Task 11): an atom whose coordination C_t = Σ_{j∈t} f_c(r_ij)
 //!      (the n = 0 body-2 feature of neighbour species t) is more than
-//!      [`surrogate::envelope::COORDINATION_RATIO`] = 3 below the smallest the fit has seen for
-//!      its species — the vanishing direction judged relatively, because one kept stretched-pair
-//!      sample (the user's r = 5.125, f_c 0.05) put an empty neighbourhood half a training spread
-//!      inside the old spread box (derivation and the old/new decision on the repro: the
-//!      envelope module doc).
+//!      [`surrogate::envelope::COORDINATION_RATIO`] = 3 below the smallest the fit has seen
+//!      among its species' non-isolated training atoms — the vanishing direction judged
+//!      relatively, because one kept stretched-pair sample (the user's r = 5.125, f_c 0.05) put an
+//!      empty neighbourhood half a training spread inside the old spread box (derivation and the
+//!      old/new decision on the repro: the envelope module doc). An isolated atom of a fitted
+//!      sample (a released stray atom, B = 0) is no training atom and never enters the envelope
+//!      (`surrogate::envelope` module doc, "Isolated atoms are not training atoms"): admitted, it
+//!      would set the minimum to 0 and switch this rule off for its species.
 //!    - **5c, spread**: any feature farther than `max_descriptor_distance` (3.0) training spreads
 //!      outside its per-feature training range (`surrogate::Envelope`, unit in its module doc).
 //!    - **5d, new environment** (M6 Task 11 round 2, controller ruling): a query row (the energy
@@ -1126,7 +1129,10 @@
 //!   (`add_sample`, `add_sample_answer` via `store::masked_by`) — is kept with `force_mask` = the
 //!   scene's mask and `use_energy` false. A mask whose length is not the nucleus count is never
 //!   used (`Scene::train_mask`); an answer with no interior atom is refused by the store (it teaches
-//!   nothing). A `.model` file or a collection reads a sample as it was stored.
+//!   nothing). A `.model` file or a collection reads a sample as it was stored. A sample with
+//!   **stray atoms** (`stray` module doc) carries a mask too, its energy fitted: its stray atoms'
+//!   force rows are zero and are left out (`stray::mask_stray_atoms`, at every entry to the store;
+//!   in memory only for a loaded sample).
 //! - **The model never answers in a masked scene** (`TeachRule::Segment`, checked in `evaluate`
 //!   before rule 1): every step is the teacher's and is kept; nothing is audited, judged as a fallback
 //!   point, thinned or held out there — the caps and edge atoms are not the source's, so a model
@@ -2431,7 +2437,9 @@ impl ForceProvider for SurrogateKs {
         // force rows are zero), rule 7 is per bonded atom, 5d and the fences judge the bonded part alone; every other
         // rule as before. The answer is the model's own `predict(scene)`, the bonded part's plus Σ E_ref. Only a scene
         // with an atom without neighbours can have stray atoms (the split's test is the counts')
-        let cleared = if counts.contains(&0) { self.stray_cleared(&pos, &z, &prov) } else { None };
+        // (the scene's descriptors, shared with the envelope below: no extra description on this path)
+        let scene_desc = if counts.contains(&0) { self.model.as_ref().and_then(|m| describe_values(&m.basis, &pos, &z).ok()) } else { None };
+        let cleared = scene_desc.as_deref().and_then(|d| self.stray_cleared_with(&pos, &z, &prov, Some(d)));
         let part = cleared.as_ref().map(|c| &c.0);
         let n_bonded = part.map_or(pos.len(), |s| s.bonded.len());
         // an exempt stray atom is another environment for the verdict than a refused one (rule 7's n differs): a
@@ -2496,7 +2504,7 @@ impl ForceProvider for SurrogateKs {
         };
         let uncertainty = Some(variance.uncertainty);
         let atom_uncertainty = Some(variance.atoms.clone());
-        let (mut atom_envelope, mut envelope) = self.envelope_outside_except(model, &pos, &z, part.map_or(&[][..], |s| &s.stray));
+        let (mut atom_envelope, mut envelope) = self.envelope_outside_except(model, &pos, &z, part.map_or(&[][..], |s| &s.stray), scene_desc.as_deref());
         // a lone scene rule 0b declined is never the model's in strict mode (review I1): rule 5a's
         // refusal, which covers a scene of two or more lone atoms already, also for one atom (5a's
         // one-atom exemption assumed the reference composes — 0b checks it) and without an envelope
@@ -2685,11 +2693,12 @@ impl ForceProvider for SurrogateKs {
         self.take_offset_jump(&mut stats);
         stats.energy.total = pred.energy;
         stats.solve_ms = t0.elapsed().as_millis() as u64;
-        if let Some((_, residual, margin)) = cleared {
-            // rule 7 of the doc's honesty (review M6): what answered, and on what measurement
+        if let Some((_, residual, margin, passes)) = cleared {
+            // the answer identity E = E_model(bonded) + Σ E_ref needs offset_s = 0 (mean 0, no intercept; fix round 1 M5)
+            debug_assert!(self.model.as_ref().is_some_and(|m| m.effective_coefficients().1.iter().all(|&o| o == 0.0)), "a cleared answer needs every per-species offset 0");
+            // rule 7 of the doc's honesty (review M6): what answered, and on what measurement — the passing checks booked
             stats.notes.push(format!(
-                "stray atoms: model for the bonded part + free atoms (composition measured, {} checks; worst residual {:.2} mHa, frontier margin {:.0} mHa)",
-                stray::STRAY_CHECKS,
+                "stray atoms: model for the bonded part + free atoms (composition measured, {passes} checks; worst residual {:.2} mHa, frontier margin {:.0} mHa)",
                 residual * 1e3,
                 margin * 1e3
             ));

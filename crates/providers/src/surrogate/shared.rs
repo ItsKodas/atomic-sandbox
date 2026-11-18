@@ -1563,6 +1563,8 @@ impl SurrogateKs {
         if let Some(o) = offset {
             s.energy -= o;
         }
+        // stray atoms are no force rows (fix round 1, I2; in memory, the record is the collection's)
+        super::stray::mask_stray_atoms(&mut s, self.cutoff());
         let z = s.z.clone();
         let mut box_prov = prov.clone();
         box_prov.grid_n = cs.grid_n;

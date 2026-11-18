@@ -211,9 +211,11 @@ pub(super) fn novelty_refusal(nu: f64, at: Option<usize>) -> Refusal {
 
 /// Rule 5a: the atom with descriptor `b` has no neighbour the model can see — every coordination
 /// feature C_t = Σ_{j∈t} f_c(r_ij) is exactly zero (no neighbour inside r_cut; a coincident one
-/// counts, f_c(0) = 1). O(S) per atom from the descriptor already computed.
+/// counts, f_c(0) = 1). O(S) per atom from the descriptor already computed. The predicate is the
+/// `surrogate` crate's [`surrogate::envelope::isolated_atom`], which also keeps such an atom out of
+/// the fit's envelope, so rule 5a and the envelope cannot disagree on what is isolated.
 pub(super) fn lone_atom(basis: &Basis, b: &[f64]) -> bool {
-    (0..basis.n_species()).all(|t| b[basis.body2_index(t, 0)] == 0.0)
+    surrogate::envelope::isolated_atom(basis, b)
 }
 
 /// When the model may answer (`surrogate` module doc, "The fallback policy"). Defaults are the spec's.
@@ -432,16 +434,29 @@ impl SurrogateKs {
     /// isolated atom) and the reason naming the rule that fired (and the atom), if any atom is
     /// outside.
     pub(super) fn envelope_outside(&self, model: &Model, pos: &[[f64; 3]], z: &[u8]) -> (Vec<f64>, Option<Refusal>) {
-        self.envelope_outside_except(model, pos, z, &[])
+        self.envelope_outside_except(model, pos, z, &[], None)
     }
 
     /// [`envelope_outside`](Self::envelope_outside) with the atoms `stray` exempt from 5a–5e: the stray atoms of a
     /// cleared, in-region scene (`stray` module doc, "Answering inside a region"; spec §4.4) — the model's answer there
     /// is the free atom's E_ref with zero force, measured to be the teacher's. Their distance is 0; the bonded part is
-    /// judged as before (its descriptors are the bonded part's own: a stray atom is no atom's neighbour).
-    pub(super) fn envelope_outside_except(&self, model: &Model, pos: &[[f64; 3]], z: &[u8], stray: &[usize]) -> (Vec<f64>, Option<Refusal>) {
+    /// judged as before (its descriptors are the bonded part's own: a stray atom is no atom's neighbour). `desc`: the
+    /// scene's descriptors under the model's basis when the caller has them (`evaluate`'s, shared with the cleared
+    /// decision), else they are computed here.
+    pub(super) fn envelope_outside_except(&self, model: &Model, pos: &[[f64; 3]], z: &[u8], stray: &[usize], desc: Option<&[Vec<f64>]>) -> (Vec<f64>, Option<Refusal>) {
         let Some(env) = self.envelope.as_ref() else { return (Vec::new(), None) };
-        let (Ok(desc), Ok(s)) = (describe_values(&model.basis, pos, z), model.basis.species_indices(z)) else { return (Vec::new(), None) };
+        let described;
+        let desc = match desc.filter(|d| d.len() == pos.len()) {
+            Some(d) => d,
+            None => match describe_values(&model.basis, pos, z) {
+                Ok(d) => {
+                    described = d;
+                    &described[..]
+                }
+                Err(_) => return (Vec::new(), None),
+            },
+        };
+        let Ok(s) = model.basis.species_indices(z) else { return (Vec::new(), None) };
         let n = pos.len();
         let limit = self.policy.max_descriptor_distance;
         let r_cut = model.basis.r_cut;
