@@ -202,7 +202,7 @@ use sim::references::{AtomScan, ReferenceKey};
 use sim::sampling::{allowed_multiplicities, SamplingPlan, SamplingProgress, EMPTY_SCENE, MAX_JOBS};
 use sim::thermostat::{standard_normal, Csvr};
 use sim::{ForceProvider, ForceResult, ProviderError, ReferenceCache, Scene, CELL_MARGIN_H};
-use crate::surrogate::{box_affected_face_density, lone_pass_refusal, no_neighbours, SurrogateKs, MIN_RESIDUAL_DOF};
+use crate::surrogate::{box_affected_face_density, lone_pass_refusal, no_neighbours, PassKeep, SurrogateKs, MIN_RESIDUAL_DOF};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::collections::VecDeque;
@@ -1707,11 +1707,34 @@ impl Sampler {
             force_mask: None, use_energy: true,
         };
         let boxed = face.is_some_and(|rho| rho > box_affected_face_density(scene.cell.h));
-        let outcome = match surrogate.add_sample_answer(sample, scene, face, multiplicity) {
-            Ok(()) => {
+        let mut detail = detail;
+        let outcome = match surrogate.add_pass_sample(sample, scene, face, multiplicity) {
+            // stray atoms the floor refuses (`surrogate::stray`, spec 2026-11-18 §4.3, review C1): never kept
+            Ok(PassKeep::StrayNotKept(why)) => {
+                let note = format!("sampling: a {} geometry was not kept (stray atoms — {why})", self.progress.stage);
+                self.progress.done += 1;
+                self.progress.skipped += 1;
+                let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(pass_job(tag)), TeachOutcome::StrayNotKept);
+                ev.face_density = face;
+                ev.n_atoms = scene.nuclei.len();
+                ev.solve_ms = solve_ms;
+                ev.scf_steps = Some(scf);
+                ev.ts = Some(ts);
+                ev.scf_end = converged(scf);
+                ev.burst_t = burst_t;
+                ev.detail = note.clone();
+                surrogate.push_event(ev);
+                self.notes.push(note);
+                self.mark(GhostOutcome::Skipped, ghost_atoms(scene));
+                return;
+            }
+            Ok(PassKeep::Kept { held }) => {
                 self.added += 1;
                 if boxed {
                     self.boxed += 1;
+                }
+                if held {
+                    detail.push_str(" — kept, held out of the fit until a composition check measures its stray atoms");
                 }
                 if boxed { TeachOutcome::KeptBoxAffected } else { TeachOutcome::Kept }
             }

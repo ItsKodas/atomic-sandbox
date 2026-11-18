@@ -798,16 +798,20 @@ fn three_distinct_passes_clear_and_release() {
     assert!(kept.iter().chain([&b]).all(|&i| s.quarantine[i] == Q_NONE), "{:?}", &s.quarantine[40..]);
     assert_eq!(s.stray_held_out(), 0);
     assert!(s.pending_refit && s.species_dirty, "the refit is armed");
-    let rep = s.refit().unwrap();
-    assert_eq!(rep.n_samples, 44, "the released samples are fitted");
-    // a fallback inside the cleared region is kept in the fit at once, and queues no check
-    let inside = h2_with(1.42, &[STRAY_AT]);
+    // a fallback inside the cleared region (H–H 1.4: beyond the thinning radius of every stored sample in
+    // the training spreads, so it is kept)
+    // is kept in the fit at once, and queues no check
+    let inside = h2_with(1.4, &[STRAY_AT]);
+    let (d, sp) = s.bonded_descriptors(&positions(&inside), &zs(&inside), &Split { bonded: vec![0, 1], stray: vec![2] }).unwrap();
+    assert!(matches!(s.stray_book.state(&sig), Some(StrayState::Cleared { region, .. }) if region.contains(&d, &sp)), "the premise: the region covers H–H 1.4");
+    let n = s.samples();
     assert_eq!(s.evaluate(&inside, &mut never()).unwrap().stats.source, Source::Fallback, "answering is plan Task 4's");
+    assert_eq!(s.samples(), n + 1, "kept, not thinned");
     let i = s.samples() - 1;
-    if s.store().unwrap().samples[i].pos == positions(&inside) {
-        assert_eq!(s.quarantine[i], Q_NONE);
-    }
+    assert_eq!((s.store().unwrap().samples[i].pos.clone(), s.excluded(i)), (positions(&inside), false), "covered: in the fit at once");
     assert!(s.stray_pending.is_none() && s.side_queue.is_empty(), "no check inside a cleared region");
+    let rep = s.refit().unwrap();
+    assert_eq!(rep.n_samples, 45, "the released samples and the covered one are fitted");
 }
 
 /// Plan Task 3 step 1: a composite offset (5 mHa whenever a stray atom is present, which the parts alone never show)
@@ -1035,4 +1039,199 @@ fn loaded_stray_samples_are_held_out_not_rewritten() {
     assert_eq!((hash(&after), after.len()), (before, stored.len()), "samples.bin unchanged: no record for a stray sample");
     let (again, _) = surrogate::Collection::open(&dir, &key).unwrap();
     assert_eq!(again.quarantine, want);
+}
+
+// ---- plan Task 3 fix round 1 ----
+
+/// Clears `sig`'s region with three passes at [`CHECKS`] (the pure book, at the student's model and spreads) — the
+/// state three distinct composition checks leave.
+fn clear_by_hand(s: &mut SurrogateKs, sig: &Signature) {
+    s.stray_book_current();
+    let basis = s.model().unwrap().basis.clone();
+    let units = s.envelope().unwrap().clone();
+    let thin = THIN_FRACTION * s.policy().max_descriptor_distance;
+    for &r in &CHECKS {
+        let (d, sp) = h2_desc(&basis, r);
+        s.stray_book.record(sig.clone(), CheckVerdict::Pass { residual: 0.0, margin: 0.32 }, &d, &sp, &basis, &units, thin);
+    }
+    assert!(matches!(s.stray_book.state(sig), Some(StrayState::Cleared { .. })));
+}
+
+/// Review Important 1 (controller ruling 5): the sampling pass's keep path (`add_pass_sample`) follows the same rules —
+/// a pass sample of H₂ + a stray H is held out (`Q_STRAY`) and not fitted; one with two stray H at automatic (the floor's
+/// spin rule) is not kept; an H₂-only one is kept in the fit as before.
+#[test]
+fn pass_samples_with_stray_atoms_are_held_or_not_kept() {
+    let (mut s, _, _) = student(0.0, &TRAINED, 40, false);
+    let n = s.samples();
+    let one = h2_with(CHECKS[0], &[STRAY_AT]);
+    assert_eq!(s.add_pass_sample(exact_sample(&one), &one, Some(0.0), Some(2)), Ok(PassKeep::Kept { held: true }));
+    assert_eq!((s.samples(), s.quarantine[n], s.stray_held_out()), (n + 1, Q_STRAY, 1));
+    let two = h2_with(CHECKS[0], &[STRAY_AT, [-5.5, 3.0, 5.0]]);
+    match s.add_pass_sample(exact_sample(&two), &two, Some(0.0), Some(1)) {
+        Ok(PassKeep::StrayNotKept(why)) => assert!(why.starts_with("spin: 2 stray H, H at automatic"), "{why}"),
+        other => panic!("not kept: {other:?}"),
+    }
+    assert_eq!(s.samples(), n + 1, "the floor-refused sample is not kept");
+    let plain = big(dimer(1.2, [1.0, 0.0, 0.0], H2_AT, 1, 1));
+    assert_eq!(s.add_pass_sample(exact_sample(&plain), &plain, Some(0.0), Some(1)), Ok(PassKeep::Kept { held: false }));
+    assert!(!s.excluded(n + 1));
+    s.species_dirty = true;
+    assert_eq!(s.refit().unwrap().n_samples, 41, "the held one is not fitted, the H₂-only one is");
+    // under a cleared region covering it, a pass sample is kept in the fit
+    let sig = sig_of(&s, &one);
+    clear_by_hand(&mut s, &sig);
+    let again = h2_with(CHECKS[1], &[STRAY_AT]);
+    assert_eq!(s.add_pass_sample(exact_sample(&again), &again, Some(0.0), Some(2)), Ok(PassKeep::Kept { held: false }));
+}
+
+/// Review M2: a draft guess's audit with stray atoms is held as a stray sample (`Q_STRAY`, its tag saying it is a
+/// draft guess), so `judge_held_out` — which promotes `Q_DRAFT` alone — never takes an unmeasured one into the fit; a
+/// clearance covering it releases it to the draft hold-out `Q_DRAFT`, not straight into the fit.
+#[test]
+fn a_stray_draft_guess_is_released_to_the_draft_hold_out() {
+    let (mut s, _, _) = student(0.0, &TRAINED, 40, true);
+    let sc = h2_with(CHECKS[1], &[STRAY_AT]);
+    let (pos, z) = (positions(&sc), zs(&sc));
+    let (e, f) = SpeciesMorse::energy_and_forces(&pos, &z);
+    let prov = s.provenance_for(&sc);
+    let mut notes = Vec::new();
+    assert!(s.keep_sample(&pos, &z, e, &f, Some(0.0), Some(2), &prov, SampleTag::DraftAudit, &mut notes));
+    let i = s.samples() - 1;
+    assert_eq!((s.quarantine[i], s.store().unwrap().samples[i].tag), (Q_STRAY, SampleTag::DraftAudit), "{notes:?}");
+    assert_eq!(s.judge_held_out(), 0);
+    assert_eq!(s.quarantine[i], Q_STRAY, "never promoted while unmeasured");
+    let sig = sig_of(&s, &sc);
+    clear_by_hand(&mut s, &sig);
+    assert_eq!(s.release_stray_samples(&sig), 1);
+    assert_eq!(s.quarantine[i], Q_DRAFT, "released to the draft hold-out");
+}
+
+/// Review M3: a sample loaded (here: re-held at an install of samples into a live provider) while its signature is
+/// already cleared and its region covers it stays in the fit; one outside the region is held.
+#[test]
+fn a_hold_out_after_a_clearance_spares_the_covered_samples() {
+    let (mut s, _, _) = student(0.0, &TRAINED, 40, true);
+    let inside = h2_with(1.5, &[STRAY_AT]);
+    let outside = h2_with(1.9, &[STRAY_AT]);
+    let sig = sig_of(&s, &inside);
+    clear_by_hand(&mut s, &sig);
+    // as a restore brings them in: stored at code 0, then the hold-out
+    s.add_sample(exact_sample(&inside), &inside).unwrap();
+    s.add_sample(exact_sample(&outside), &outside).unwrap();
+    let (a, b) = (s.samples() - 2, s.samples() - 1);
+    assert_eq!((s.quarantine.get(a).copied().unwrap_or(Q_NONE), s.quarantine.get(b).copied().unwrap_or(Q_NONE)), (Q_NONE, Q_NONE));
+    let r_cut = s.cutoff();
+    assert_eq!(s.hold_out_stray(r_cut), 1);
+    assert_eq!((s.quarantine[a], s.quarantine[b]), (Q_NONE, Q_STRAY), "the covered one stays in the fit");
+}
+
+/// Review M4: an atom answer that matches none of the check's stray atoms drops the check with a note (never a check
+/// wedged in flight, blocking every later one), and the next fallback checks again.
+#[test]
+fn an_unmatched_atom_answer_drops_the_check() {
+    let (mut s, gate, _) = student(0.0, &TRAINED, 40, true);
+    let sc = h2_with(CHECKS[0], &[STRAY_AT]);
+    let sig = sig_of(&s, &sc);
+    gate.store(false, SeqCst);
+    s.evaluate(&sc, &mut never()).unwrap();
+    let id = s.stray_pending.as_ref().map(|p| p.id).expect("in flight");
+    let mut stray = sc.clone();
+    stray.nuclei = vec![Nucleus::new(1, [0.0, 4.0, 0.0])];
+    let prov = s.provenance_for(&sc);
+    let mut ans = audit_answer(&s, &stray, prov, Ok((SpeciesMorse::atom(1), vec![[0.0; 3]], Some(0.0), None)));
+    (ans.job.kind, ans.job.id) = (JobKind::AtomAt(1), id);
+    s.take_stray_answer(ans);
+    assert!(s.stray_pending.is_none() && !s.side_queue.iter().any(|j| matches!(j.2, JobKind::AtomAt(_))), "dropped");
+    assert!(s.pending_notes.iter().any(|n| n.contains("matched none of its stray atoms")), "{:?}", s.pending_notes);
+    gate.store(true, SeqCst);
+    settle(&mut s);
+    assert!(s.stray_book.state(&sig).is_none(), "no verdict from the dropped check");
+    s.discontinuity();
+    s.evaluate(&sc, &mut never()).unwrap();
+    settle(&mut s);
+    assert!(matches!(s.stray_book.state(&sig), Some(StrayState::Checking { passes: 1, .. })), "the next fallback checks again");
+}
+
+/// Review M10: with the stray H first in the scene (index 0; the bonded part 1 and 2), the scene's forces and the
+/// fragment's are paired by the split, not by position in the list: the check passes and releases its sample.
+#[test]
+fn a_stray_atom_first_in_the_scene_is_checked() {
+    let (mut s, _, _) = student(0.0, &TRAINED, 40, true);
+    let mut sc = h2_with(CHECKS[0], &[]);
+    sc.nuclei.insert(0, Nucleus::new(1, STRAY_AT));
+    let (split, sig, floor) = s.stray_split(&positions(&sc), &zs(&sc), &s.provenance_for(&sc)).unwrap();
+    assert_eq!((split.bonded.clone(), split.stray.clone(), floor), (vec![1, 2], vec![0], None));
+    // a scene whose forces are not zero on the bonded atoms (H–H 1.35 is compressed), so a mispairing would show
+    let (_, f) = SpeciesMorse::energy_and_forces(&positions(&sc), &zs(&sc));
+    assert!(f[1][0].abs() > 1e-3 && f[0] == [0.0; 3], "{f:?}");
+    s.evaluate(&sc, &mut never()).unwrap();
+    let i = s.samples() - 1;
+    settle(&mut s);
+    let ev = s.take_events();
+    assert!(ev.iter().any(|e| e.outcome == TeachOutcome::StrayChecking { n: 1, of: 3 }), "{ev:?}");
+    assert!(matches!(s.stray_book.state(&sig), Some(StrayState::Checking { passes: 1, .. })));
+    assert_eq!(s.quarantine[i], Q_NONE);
+}
+
+/// Review M10, collection mode with a nonzero box offset: the scene's answer enters the check raw (never the canonical
+/// energy, which differs here by 3 × 1 mHa), so the residual stays ≈ 0 and the check passes; the held sample waits
+/// outside the collection (`Link::Waiting`) and is appended once released; and a held sample of a box without its
+/// reference is released over the reference wait (`Q_REF_WAIT`), not into the fit.
+#[test]
+fn in_collection_mode_a_check_reads_raw_energies_and_a_release_appends() {
+    use super::super::shared::Link;
+    let dir = collection_root("stray-collection");
+    let template = h2_with(1.1, &[]);
+    let mut s = SurrogateKs::new(Box::new(Composing::new(0.0)), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    s.attach_collection(&dir, &template).unwrap();
+    // the 81³ box's reference, and a larger box's 1 mHa lower: the canonical one, so the 81³ box's offset is nonzero
+    s.set_reference_solved(1, SpeciesMorse::atom(1), 81, Some(0.0));
+    s.set_reference_solved(1, SpeciesMorse::atom(1) - 1e-3, 97, Some(0.0));
+    let mut rng = StdRng::seed_from_u64(0x57b);
+    for i in 0..40 {
+        let r = TRAINED[0].0 + (TRAINED[0].1 - TRAINED[0].0) * i as f64 / 39.0;
+        let origin: [f64; 3] = std::array::from_fn(|k| H2_AT[k] + rng.gen_range(-0.3..0.3));
+        s.evaluate(&big(dimer(r, unit_vector(&mut rng), origin, 1, 1)), &mut never()).unwrap();
+    }
+    s.refit().unwrap();
+    assert!(s.trusted(), "the premise: {:?}", s.untrusted_reason());
+    let mut s = s.with_auditor(Box::new(Composing::new(0.0)));
+    let sc = h2_with(CHECKS[0], &[STRAY_AT]);
+    let (pos, z) = (positions(&sc), zs(&sc));
+    let raw = SpeciesMorse::energy_and_forces(&pos, &z).0;
+    let offset = raw - s.to_canonical(&z, 81, raw);
+    assert!((offset - 3e-3).abs() < 1e-9, "the premise: a 3 mHa box offset ({offset:e})");
+    let in_coll = s.collection().unwrap().samples.len();
+    s.evaluate(&sc, &mut never()).unwrap();
+    let i = s.samples() - 1;
+    assert_eq!(s.quarantine[i], Q_STRAY);
+    assert!(matches!(s.shared.as_ref().unwrap().link[i], Link::Waiting { .. }), "it waits outside the collection");
+    assert_eq!(s.collection().unwrap().samples.len(), in_coll);
+    settle(&mut s);
+    let ev = s.take_events();
+    let check = ev.iter().find(|e| e.origin == TeachOrigin::Audit && e.rule == TeachRule::IsolatedAtom).expect("a check event");
+    assert_eq!(check.outcome, TeachOutcome::StrayChecking { n: 1, of: 3 }, "{}", check.detail);
+    let sig = sig_of(&s, &sc);
+    let Some(StrayState::Checking { residual, .. }) = s.stray_book.state(&sig) else { panic!("{:?}", s.stray_book.state(&sig)) };
+    assert!(*residual < 1e-9, "raw energies throughout: residual {residual:e}");
+    assert_eq!(s.quarantine[i], Q_NONE, "released");
+    assert!(matches!(s.shared.as_ref().unwrap().link[i], Link::In(k) if k == in_coll), "appended once released");
+    let stored = &s.collection().unwrap().samples[in_coll];
+    assert_eq!(stored.sample.energy.to_bits(), raw.to_bits(), "the collection holds the teacher's raw answer");
+    // a box without its reference (85³): kept held over the reference wait, released into the wait
+    let mut far = h2_with(CHECKS[1], &[STRAY_AT]);
+    far.cell = Cell { n: 85, h: 0.25 };
+    let (pos, z) = (positions(&far), zs(&far));
+    let (e, f) = SpeciesMorse::energy_and_forces(&pos, &z);
+    let prov = s.provenance_for(&far);
+    let mut notes = Vec::new();
+    assert!(s.keep_sample(&pos, &z, e, &f, Some(0.0), Some(2), &prov, SampleTag::Fallback, &mut notes), "{notes:?}");
+    let j = s.samples() - 1;
+    assert_eq!(s.quarantine[j], Q_STRAY, "{notes:?}");
+    let sig85 = sig_of(&s, &far);
+    assert_ne!(sig85, sig, "another box: another signature");
+    clear_by_hand(&mut s, &sig85);
+    assert_eq!(s.release_stray_samples(&sig85), 1);
+    assert_eq!(s.quarantine[j], Q_REF_WAIT, "released into the reference wait, not the fit");
 }

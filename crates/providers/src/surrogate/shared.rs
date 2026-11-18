@@ -141,7 +141,8 @@ pub(super) enum Link {
     In(usize),
     /// Kept for this session only: the collection refused it for good (module doc).
     Out,
-    /// A held-out draft guess (`Q_DRAFT`): offered again once a refit promotes it into the fit.
+    /// A held-out draft guess (`Q_DRAFT`), or a sample with stray atoms no composition check has
+    /// measured yet (`Q_STRAY`): offered again once it is promoted or released into the fit.
     Waiting { grid_n: usize, multiplicity: Option<u32> },
 }
 
@@ -1563,12 +1564,15 @@ impl SurrogateKs {
             s.energy -= o;
         }
         let z = s.z.clone();
+        let mut box_prov = prov.clone();
+        box_prov.grid_n = cs.grid_n;
         self.store.get_or_insert_with(|| SampleStore::new(prov)).push(s)?;
         self.face.resize(n, f64::NAN);
         self.face.push(f64::NAN);
         let q = if offset.is_none() && code == Q_NONE { Q_REF_WAIT } else { code };
-        // a sample with stray atoms is held out until a composition check measures it, as at attach (`Q_STRAY`)
-        let q = if (q == Q_NONE || q == Q_REF_WAIT) && super::stray::split(&cs.sample.pos, self.cutoff()).is_some() { Q_STRAY } else { q };
+        // a sample with stray atoms is held out until a composition check measures it, as at attach (`Q_STRAY`) —
+        // unless a cleared region of its signature covers it already (review M3)
+        let q = if (q == Q_NONE || q == Q_REF_WAIT) && self.stray_held(&cs.sample.pos, &cs.sample.z, &box_prov) { Q_STRAY } else { q };
         if !self.quarantine.is_empty() || q != Q_NONE {
             self.quarantine.resize(n, Q_NONE);
             self.quarantine.push(q);

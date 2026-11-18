@@ -16,6 +16,15 @@ pub(super) fn masked_by(mut s: Sample, scene: &Scene) -> Sample {
     s
 }
 
+/// What [`SurrogateKs::add_pass_sample`] did with a pass sample.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PassKeep {
+    /// Into the store; `held`: out of the fit until a composition check measures its stray atoms (`Q_STRAY`).
+    Kept { held: bool },
+    /// Not kept: stray atoms whose combination the floor refuses (the reason in words).
+    StrayNotKept(String),
+}
+
 /// The note of a stray-atom answer the floor refuses (`TeachOutcome::StrayNotKept`).
 fn stray_not_kept(why: &str) -> String {
     format!("surrogate: sample not kept (stray atoms — {why}; a combination whose DFT energy is not known to split into the bonded part's and the free atoms')")
@@ -56,6 +65,22 @@ impl SurrogateKs {
     pub fn add_sample_answer(&mut self, s: Sample, scene: &Scene, face: Option<f64>, multiplicity: Option<u32>) -> Result<(), StoreError> {
         let prov = self.scene_provenance(scene);
         self.push_sample(masked_by(s, scene), &prov, face.unwrap_or(f64::NAN), multiplicity)
+    }
+
+    /// The sampling pass's entry (controller ruling 5, review Important 1): [`add_sample_answer`](Self::add_sample_answer)
+    /// under the stray-atom rules of the keep path (`stray` module doc, "The hold-out") — a geometry with stray atoms
+    /// whose combination the floor refuses is not kept ([`PassKeep::StrayNotKept`], the reason), any other is held out of
+    /// the fit (`Q_STRAY`) unless a cleared region of its signature covers it. `add_sample` and its siblings stay as
+    /// they are (the tests' and the loaders' entries).
+    pub(crate) fn add_pass_sample(&mut self, s: Sample, scene: &Scene, face: Option<f64>, multiplicity: Option<u32>) -> Result<PassKeep, StoreError> {
+        let prov = self.scene_provenance(scene);
+        let held = match self.stray_split(&s.pos, &s.z, &prov) {
+            Some((_, _, Some(why))) => return Ok(PassKeep::StrayNotKept(why)),
+            Some((split, sig, None)) => !self.stray_covered(&s.pos, &s.z, &split, &sig),
+            None => false,
+        };
+        self.push_sample_coded(masked_by(s, scene), &prov, face.unwrap_or(f64::NAN), multiplicity, if held { Q_STRAY } else { Q_NONE })?;
+        Ok(PassKeep::Kept { held })
     }
 
     /// Isolated-atom energy of species `z` (Hartree), the model's reference (Z-only: computed
@@ -437,9 +462,10 @@ impl SurrogateKs {
         // the lone samples the file's fit held (`Q_LONE`; the prefix above is the file's own)
         let lone = self.hold_out_lone(lone_cut);
         let lone_in_fit = self.lone_codes.iter().filter(|&(&i, &q)| i < self.accumulated && q == Q_NONE).count();
-        // the samples with stray atoms its fit held (`Q_STRAY`: set only on a code-0 sample, so each was fitted)
+        // the samples with stray atoms its fit held (newly `Q_STRAY` from code 0: a draft guess's was not fitted)
+        let codes = self.quarantine.clone();
         let stray = self.hold_out_stray(lone_cut);
-        let stray_in_fit = (0..self.accumulated).filter(|&i| self.quarantine.get(i) == Some(&Q_STRAY)).count();
+        let stray_in_fit = (0..self.accumulated).filter(|&i| self.quarantine.get(i) == Some(&Q_STRAY) && codes.get(i).is_none_or(|&c| c == Q_NONE)).count();
         self.pass_start = None;
         self.pass_coverage = None;
         self.fence_votes.clear();
@@ -705,8 +731,9 @@ impl SurrogateKs {
                         "surrogate: kept, held out of the fit — stray atoms ({label}) whose composition no check has measured here (a composition error would land in the bonded part's coefficients)"
                     ));
                 }
-                if tag == SampleTag::DraftAudit {
-                    // a draft guess's audit: held out of the strict fit (`Q_DRAFT`)
+                if tag == SampleTag::DraftAudit && code == Q_NONE {
+                    // a draft guess's audit: held out of the strict fit (`Q_DRAFT`) — one with stray atoms stays
+                    // `Q_STRAY` and is released to `Q_DRAFT` (review M2: `judge_held_out` reads `Q_DRAFT` only)
                     let n = self.samples();
                     self.quarantine.resize(n, Q_NONE);
                     self.quarantine[n - 1] = Q_DRAFT;

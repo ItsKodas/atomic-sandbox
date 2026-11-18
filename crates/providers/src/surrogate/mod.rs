@@ -1222,6 +1222,7 @@ mod shared;
 pub use shared::{predecessor_of, COLLECTION_CHECKPOINT_PREFIX, PASS_STARTED_WITH_PREVIOUS_SOLVER};
 pub use purge::PURGE_WAIT_MIGRATION;
 mod store;
+pub(crate) use store::PassKeep;
 // the stray-atom logic (spec 2026-11-18): the composition checks and the hold-out (plan Task 3); answering inside a
 // cleared region is Task 4's, so a few of its items are not used yet
 #[allow(dead_code)]

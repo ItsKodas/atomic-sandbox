@@ -81,8 +81,9 @@ pub(super) const Q_LONE: u8 = 6;
 /// stray atom must not add a sample per step while its check waits. Set only on a sample in the fit
 /// or waiting for its box's reference (`Q_NONE`, `Q_REF_WAIT`: the keep path, `keep_sample_masked`;
 /// at load, `hold_out_stray` and `mirror_collection_sample`), so its code on disk is always `Q_NONE`
-/// and a release restores exactly that (a draft guess's audit stays `Q_DRAFT`: its promotion waits
-/// for strict mode to answer there, which rule 5a refuses until a clearance covers it). A provider-only code like [`Q_REF_WAIT`]
+/// and a release restores exactly that — a draft guess's audit is held here too (its tag says it is
+/// one) and is released to `Q_DRAFT`, so strict mode's promotion (`judge_held_out`, which reads only
+/// `Q_DRAFT`) never takes an unmeasured one into the fit (review M2). A provider-only code like [`Q_REF_WAIT`]
 /// and [`Q_LONE`]: **never written** — a saved file writes `Q_NONE`, a collection gets no status
 /// record for it (`sync_collection_status`) and a new stray sample waits outside the collection
 /// (`offer`, like a draft guess) until it is released, so the user's files are untouched. Its value
@@ -550,22 +551,35 @@ impl SurrogateKs {
         self.quarantine.iter().filter(|&&q| q == Q_STRAY).count()
     }
 
-    /// Holds every stored sample in the fit ([`Q_NONE`], or waiting for its box's reference:
-    /// [`Q_REF_WAIT`]) that has stray atoms at `r_cut` (Bohr; [`stray::split`](super::stray::split))
-    /// out of it ([`Q_STRAY`]); how many were newly held. Called where stored samples are
-    /// installed, beside [`hold_out_lone`](Self::hold_out_lone): the session's clearances start
-    /// empty (spec §4.6), so a loaded stray sample waits for a check like a new one. Samples already
-    /// out of the fit keep their own code (they are not fitted either way, and their code is what a
-    /// file holds).
+    /// Holds every stored sample in the fit ([`Q_NONE`], waiting for its box's reference:
+    /// [`Q_REF_WAIT`], or a draft guess's audit: [`Q_DRAFT`], whose tag carries it back on release)
+    /// that has stray atoms at `r_cut` (Bohr; [`stray::split`](super::stray::split)) out of it
+    /// ([`Q_STRAY`]) — unless a cleared region of its signature covers it already; how many were
+    /// newly held. Called where stored samples are installed, beside
+    /// [`hold_out_lone`](Self::hold_out_lone): at an install the session's clearances start empty
+    /// (spec §4.6), so a loaded stray sample waits for a check like a new one. Samples otherwise out
+    /// of the fit keep their own code (they are not fitted either way, and their code is what a file
+    /// holds).
     pub(super) fn hold_out_stray(&mut self, r_cut: f64) -> usize {
         let Some(store) = self.store.as_ref() else { return 0 };
-        let held: Vec<usize> = (0..store.len())
-            .filter(|&i| self.quarantine.get(i).is_none_or(|&q| q == Q_NONE || q == Q_REF_WAIT) && super::stray::split(&store.samples[i].pos, r_cut).is_some())
+        let candidates: Vec<usize> = (0..store.len())
+            .filter(|&i| self.quarantine.get(i).is_none_or(|&q| q == Q_NONE || q == Q_REF_WAIT || q == Q_DRAFT) && super::stray::split(&store.samples[i].pos, r_cut).is_some())
             .collect();
+        // one a cleared region of its signature covers already stays in (review M3: a session-only restore or a mirrored
+        // sample after a clearance; at a fresh install the book is empty)
+        let mut held = Vec::with_capacity(candidates.len());
+        for i in candidates {
+            let (pos, z) = self.store.as_ref().map(|st| (st.samples[i].pos.clone(), st.samples[i].z.clone())).expect("stored");
+            let prov = self.sample_provenance(i);
+            if self.stray_held(&pos, &z, &prov) {
+                held.push(i);
+            }
+        }
         if held.is_empty() {
             return 0;
         }
-        self.quarantine.resize(store.len(), Q_NONE);
+        let n = self.store.as_ref().map_or(0, |st| st.len());
+        self.quarantine.resize(n, Q_NONE);
         for &i in &held {
             self.quarantine[i] = Q_STRAY;
         }
