@@ -4482,11 +4482,15 @@ fn the_triple_map_ships_only_while_shown() {
     assert!(t.types.is_empty() && t.span(1, 1).is_some(), "H₂ holds no triple, but its H–H span is there");
     w.send(Command::Dyn(DynCommand::SetSpeed(3)));
     assert!(idle(&w).activity.triples.is_none(), "nothing changed: no rebuild");
-    w.send(Command::SetAudit(7));
-    snapshot_until(&w, "a rebuild after a new model generation", |s| s.activity.triples.is_some());
+    // hidden: a new fit (a compressed teleport: a fallback, a sample, a refit — a new model
+    // generation; an audit-cadence change moves none since quiet refits round 3) rebuilds the
+    // knowledge map, not the triple map
     w.send(Command::SetTripleView(false));
-    w.send(Command::SetAudit(5));
+    w.send(Command::MoveNucleus { index: 1, pos: COMPRESSED });
     let mut built = false;
-    snapshots_until(&w, "the knowledge map after the policy change", |s| built |= s.activity.triples.is_some(), |s| s.activity.knowledge.is_some());
-    assert!(!built, "hidden again: not built");
+    snapshots_until(&w, "the knowledge map after the new fit", |s| built |= s.activity.triples.is_some(), |s| s.activity.knowledge.is_some());
+    assert!(!built, "hidden: not built");
+    // shown again: built for the new generation
+    w.send(Command::SetTripleView(true));
+    snapshot_until(&w, "a rebuild for the new model generation", |s| s.activity.triples.is_some());
 }
