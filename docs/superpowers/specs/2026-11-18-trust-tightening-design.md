@@ -59,7 +59,7 @@ threshold can still flip on 1e-7 of label noise. What changes is what a flip can
 
 ## 3. (a) The evidence floor
 
-**Reading of the decision (my call; open question 1).** The verdict that opened on 3 points is the
+**Reading of the decision (user ruling 2026-11-18: "Keep it, gated").** The user chose this reading over the literal one: a class may still open on the zero-evidence LOO path after a pass, and below the floor the calibrated verdict cannot open a class alone. The verdict that opened on 3 points is the
 *calibrated* one, `ClassCalibration::calibrated()`, true at evidence ≥ `MIN_EVIDENCE` = 3. The
 zero-evidence path is the rule of before, `trust::class_refusal`: LOO force rms ≤ 1 and max ≤ 1, LOO
 energy max ≤ 1. That path is how every class opens after a sampling pass, and it **refused** this
@@ -375,7 +375,7 @@ z̃_p² = mean over the point's atoms j of key k of  max(0, e_j² − ā_c²) / 
 
 **Open questions for the physics reviewer.**
 
-1. **Is (a) read right?** The literal reading would open *no* class on fewer than 12 checks,
+1. **Is (a) read right?** *Resolved by the user 2026-11-18: keep the LOO opening, gated (this design's reading).* The literal reading would open *no* class on fewer than 12 checks,
    including the LOO-only opening after a pass. That costs the default H₂ pass's pair class 12
    generations of fallback. Counted in generations, a thinned, vibrating H₂ may never get there;
    counted in points it is about 12 correlated steps. This design keeps the zero-evidence LOO path,
