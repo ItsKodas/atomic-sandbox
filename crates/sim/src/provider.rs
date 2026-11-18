@@ -648,6 +648,7 @@ pub struct EvalStats {
     /// Stray-atoms spec 2026-11-18: the final SCF step's frontier levels per spin channel, ↑ then ↓ (Ha) — the highest
     /// eigenvalue with f ≥ ½ and the lowest with f < ½ among the computed block (witnesses included). `None` where a
     /// channel has no such level, and both `None` from a provider without electrons (analytic, surrogate-answered steps).
+    /// Under Fermi–Dirac a `lumo` from a witness column is converged to the guard tolerance only, not the SCF's.
     pub frontier: [Frontier; 2],
     /// Plan 2026-11-13 Task 8 (spec §6.3, the `providers::branch_jump` guard): `Some(m)` when this step's change of F
     /// disagrees with the forces' trapezoid work since the same provider's previous evaluation by m (Ha) beyond the

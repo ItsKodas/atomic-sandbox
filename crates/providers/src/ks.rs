@@ -2107,7 +2107,7 @@ pub(crate) mod tests {
         let s = h2(41, 1.4);
         let mut g = GpuKs::new(ctx, 1e-6);
         let r = g.evaluate(&s, &mut never()).expect("GpuKs");
-        let state = g.solver.as_ref().and_then(|s| s.state()).expect("a converged state");
+        let state = g.solver.as_ref().and_then(|sv| sv.state()).expect("a converged state");
         let lowest = state.evals_up.iter().chain(&state.evals_dn).copied().fold(f64::INFINITY, f64::min);
         let gpu_homo = assert_h2_frontier(&r.stats, lowest);
         let cpu = CpuKs::new(1e-6).evaluate(&s, &mut never()).expect("CpuKs");
