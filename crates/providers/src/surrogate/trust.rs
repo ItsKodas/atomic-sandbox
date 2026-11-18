@@ -1096,6 +1096,29 @@ impl SurrogateKs {
         &self.class_loo
     }
 
+    /// Per environment key of the standing judgement — every key of [`class_loo`](Self::class_loo)'s
+    /// species, once, in the calibration's key order — the leave-one-out statistics its verdict
+    /// read: its own sums from the class pass (`compute_class_loo_full`, [`LooSums`]), or for a key
+    /// no fitted atom holds the unseen-key statistics (n_k = 0, final review 5). A readout for the
+    /// trust-tightening go/no-go report (plan 2026-11-19 Task 0); it decides nothing. Empty without
+    /// a fit.
+    pub fn key_class_stats(&self) -> Vec<(surrogate::EnvKey, super::calibrate::ClassStats)> {
+        let Some(j) = self.class_judge.as_ref() else { return Vec::new() };
+        j.cal
+            .per_key
+            .keys()
+            .filter(|k| (1..=2).contains(&k.class))
+            .map(|k| {
+                let c = (k.class - 1) as usize;
+                let st = match (j.key_stats.get(k), j.key_q.get(k)) {
+                    (Some(st), Some(_)) => *st,
+                    _ => unseen_key_stats(&j.stats[c]),
+                };
+                (k.clone(), st)
+            })
+            .collect()
+    }
+
     /// Makes the standing class verdicts the calibrated verdict's hysteresis memory
     /// (`class_memory`; M8a Task 2): called once a refit, an install or a policy change is done,
     /// never by the intermediate fits inside one of them.

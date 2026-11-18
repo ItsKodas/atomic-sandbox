@@ -2191,3 +2191,231 @@ fn migration_classifies_h2_oh_h4() {
     let lg = log.lock().unwrap().clone();
     record(&ctx, timing_row("migration_classifies_h2_oh_h4", "H₂, OH, H₄ (Accepted)", fx.grid_n, fx.tol, &lg, wall, "pass"));
 }
+
+/// Trust tightening Task 0 (plan 2026-11-19, spec 2026-11-18 §6): the go/no-go report on the
+/// user's BEST collection, before any trust change is built. A measurement: CPU only, no GPU
+/// context, no teacher (`ReportNoTeacher` returns `Err`, so nothing is solved; its calls are
+/// counted and reported), and the user's folder is never opened for writing — it is copied without
+/// its `.lock` into `BEST_COPY_DIR` (default: the system temp folder) and only the copy is opened,
+/// attached and refitted. The source's every file keeps its size, mtime and (but the `.lock`,
+/// which is never opened) content hash, asserted at the end. The source is `BEST_COLLECTION` or
+/// the first `models/collections/<slug>` above this crate.
+///
+/// Per environment key it prints today's verdict (trusted, refusal, evidence, λ_sum), the key's
+/// leave-one-out force rms / max and energy max, its attributed history points and their distinct
+/// `model_gen`s (information only), and the verdict at load under the evidence floor: saved points
+/// carry no fit ids, so n_fit = 0 and the floor is never met; a key trusted today on evidence ≥ 3
+/// keeps trust only if its LOO force rms, force max and energy max are all ≤ 1× (`class_refusal`,
+/// the rule of before). λ_T = λ_E = 1 on legacy points, so only the floor's effect is previewed.
+/// Per key also the collection's scene names whose samples hold it. No assertion on the count.
+#[test]
+#[ignore = "go/no-go measurement: cargo test -p validate --release --test surrogate trust_tightening_go_no_go_report -- --ignored --nocapture"]
+fn trust_tightening_go_no_go_report() {
+    use providers::surrogate::{atom_class, history_rule_code, MIN_EVIDENCE};
+    use sim::activity::{EnvClass, TeachRule};
+    use sim::ProviderError;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+    use surrogate::history::PointKind;
+    use surrogate::{Collection, EnvKey, SurfaceKey};
+
+    const SLUG: &str = "lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5";
+
+    /// The copy's teacher: named as the collection's (the provenance check reads the name), never
+    /// solving — every call is counted and refused.
+    struct ReportNoTeacher(&'static str, Arc<std::sync::atomic::AtomicUsize>);
+    impl ForceProvider for ReportNoTeacher {
+        fn evaluate(&mut self, _scene: &Scene, _should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ProviderError::Invalid("the go/no-go report has no teacher".into()))
+        }
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn reset(&mut self) {}
+    }
+
+    // the source folder (read only) and a fingerprint of every file in it
+    let source: PathBuf = match std::env::var_os("BEST_COLLECTION") {
+        Some(p) => PathBuf::from(p),
+        None => Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .map(|a| a.join("models").join("collections").join(SLUG))
+            .find(|p| p.join("key.txt").is_file())
+            .expect("the BEST collection under some models/collections above this crate (or set BEST_COLLECTION)"),
+    };
+    let fingerprint = |dir: &Path| -> Vec<(String, u64, std::time::SystemTime, Option<u64>)> {
+        let mut v: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let md = e.metadata().unwrap();
+                // FNV-1a 64 of the content; the lock is never opened (size and mtime only)
+                let hash = (name != ".lock").then(|| std::fs::read(e.path()).unwrap().iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3)));
+                (name, md.len(), md.modified().unwrap(), hash)
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let before = fingerprint(&source);
+
+    // the copy: every file but the lock, into <BEST_COPY_DIR>/<slug>/
+    let copy_root = std::env::var_os("BEST_COPY_DIR").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("atomic-sandbox-best-copy"));
+    let copy = copy_root.join(SLUG);
+    let _ = std::fs::remove_dir_all(&copy);
+    std::fs::create_dir_all(&copy).unwrap();
+    for (name, ..) in &before {
+        if name != ".lock" {
+            std::fs::copy(source.join(name), copy.join(name)).unwrap();
+        }
+    }
+    let key = SurfaceKey::from_text(&std::fs::read_to_string(copy.join("key.txt")).unwrap()).unwrap();
+    assert_eq!(key.slug(), SLUG);
+    let (c, open) = Collection::open(&copy_root, &key).unwrap_or_else(|e| panic!("the copy: {e}"));
+    assert!(!c.read_only, "the copy is ours: {:?}", open.notes);
+    let r_cut = surrogate::COLLECTION_R_CUT;
+    // per environment key the collection's scene names holding it (from the samples' own records)
+    let neighbour_keys = |pos: &[[f64; 3]], z: &[u8]| -> Vec<Option<EnvKey>> {
+        (0..pos.len())
+            .map(|i| {
+                let near: Vec<usize> = (0..pos.len()).filter(|&j| j != i && (0..3).map(|a| (pos[i][a] - pos[j][a]).powi(2)).sum::<f64>() < r_cut * r_cut).collect();
+                let mut nb: Vec<u8> = near.iter().map(|&j| z[j]).collect();
+                nb.sort_unstable();
+                nb.dedup();
+                atom_class(near.len()).map(|cl| EnvKey { class: cl as u8 + 1, z: z[i], neighbours: nb })
+            })
+            .collect()
+    };
+    let mut scenes_of: BTreeMap<EnvKey, BTreeMap<String, usize>> = BTreeMap::new();
+    for (i, cs) in c.samples.iter().enumerate() {
+        let s = &cs.sample;
+        let held_out = c.quarantine.get(i).is_some_and(|&q| q != 0);
+        let keys: BTreeSet<EnvKey> = neighbour_keys(&s.pos, &s.z).into_iter().enumerate().filter(|(j, _)| s.trains_atom(*j)).filter_map(|(_, k)| k).collect();
+        for k in keys {
+            let name = if held_out { format!("{} (held out)", cs.scene) } else { cs.scene.clone() };
+            *scenes_of.entry(k).or_default().entry(name).or_default() += 1;
+        }
+    }
+    let (n_samples, n_history) = (c.samples.len(), c.history.len());
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let teacher: &'static str = Box::leak(key.teacher.clone().into_boxed_str());
+    let mut s = SurrogateKs::new(Box::new(ReportNoTeacher(teacher, calls.clone())), FallbackPolicy::default()).with_teacher_tol(key.tol);
+    let t0 = Instant::now();
+    s.attach(c).unwrap_or_else(|e| panic!("attach: {e}"));
+    let rep = s.refit();
+    let wall = t0.elapsed().as_secs_f64();
+    let teacher_calls = calls.load(std::sync::atomic::Ordering::SeqCst);
+    println!(
+        "BEST copy: {} — {n_samples} samples, {n_history} history points; attach + refit {wall:.1} s; refit {}; teacher calls {teacher_calls} (all refused: nothing solved); model generation {}",
+        copy.display(),
+        match &rep {
+            Ok(r) => format!("ok (σ_F {:.2e}, Q′ {})", r.sigma_f, r.q_prime),
+            Err(e) => format!("FAILED: {e}"),
+        },
+        s.model_generation()
+    );
+    rep.expect("the refit of the copy");
+    assert_eq!(s.cutoff(), r_cut, "the scenes' keys were read at the model's own cutoff");
+
+    // per key its attributed verdict points (audits and class fallbacks, codes 5/6) over the whole
+    // history and their distinct generations (information only: the verdict reads `evidence`)
+    let class_codes = [history_rule_code(TeachRule::Class(EnvClass::Pair)), history_rule_code(TeachRule::Class(EnvClass::ManyBody))];
+    let mut points: BTreeMap<EnvKey, (usize, BTreeSet<u64>)> = BTreeMap::new();
+    for p in s.audit_history().iter() {
+        let verdict_point = match p.kind {
+            PointKind::Audit => true,
+            PointKind::Fallback { rule } => class_codes.contains(&rule),
+        };
+        if !verdict_point {
+            continue;
+        }
+        let keys: BTreeSet<EnvKey> = (0..p.n_atoms).filter_map(|j| p.key(j)).collect();
+        for k in keys {
+            let e = points.entry(k).or_default();
+            e.0 += 1;
+            e.1.insert(p.model_gen);
+        }
+    }
+
+    let stats: BTreeMap<EnvKey, providers::surrogate::ClassStats> = s.key_class_stats().into_iter().collect();
+    let le1 = |x: f64| x <= 1.0; // NaN fails
+    let mut table = String::new();
+    let _ = writeln!(table, "| class | key | trusted today | refusal today | evidence | n_fit | n_pts (gens) | LOO F rms | LOO F max | LOO E max | λ_sum | at load | why | scenes (samples) |");
+    let _ = writeln!(table, "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    let (mut total, mut trusted_today, mut trusted_new) = (0usize, 0usize, 0usize);
+    let mut losing: Vec<String> = Vec::new();
+    for (c, l) in s.class_loo().iter().enumerate() {
+        if l.species.is_empty() {
+            let _ = writeln!(
+                table,
+                "| {} | (class-wide: no keys) | {} | {:?} | {} | 0 | – | {:.3} | {:.3} | {:.3} | {:.2} | – | judged class-wide | – |",
+                l.class,
+                if l.trusted { "yes" } else { "no" },
+                l.refusal,
+                l.evidence,
+                l.force_rms,
+                l.force_max,
+                l.energy_max,
+                l.inflation
+            );
+            continue;
+        }
+        for v in &l.species {
+            let k = EnvKey { class: c as u8 + 1, z: v.z, neighbours: v.neighbours.clone() };
+            let st = stats.get(&k).copied().expect("every species key has its statistics");
+            total += 1;
+            let loo_ok = le1(st.force_rms) && le1(st.force_max) && le1(st.energy_max);
+            let (new, why) = if !v.trusted {
+                (false, "untrusted today (unchanged)".to_string())
+            } else if v.evidence < MIN_EVIDENCE {
+                (true, format!("evidence {} < {MIN_EVIDENCE}: today's rule", v.evidence))
+            } else if loo_ok {
+                (true, "floor not met (n_fit 0); LOO ≤ 1×: keeps trust".to_string())
+            } else {
+                let worst = [("force rms", st.force_rms), ("force max", st.force_max), ("energy max", st.energy_max)]
+                    .into_iter()
+                    .filter(|(_, x)| !le1(*x))
+                    .map(|(n, x)| format!("{n} {x:.2}×"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (false, format!("floor not met (n_fit 0); LOO {worst} > 1×: LOSES trust"))
+            };
+            trusted_today += v.trusted as usize;
+            trusted_new += new as usize;
+            let (n_pts, gens) = points.get(&k).map_or((0, 0), |(n, g)| (*n, g.len()));
+            let scenes = scenes_of.get(&k).map_or("–".to_string(), |m| m.iter().map(|(n, c)| format!("{n} ({c})")).collect::<Vec<_>>().join(", "));
+            let refusal = v.refusal.map_or("–".to_string(), |(key, value, limit)| format!("{key:?} {value:.3} / {limit:.3}"));
+            let words = v.words();
+            let _ = writeln!(
+                table,
+                "| {} | {words} | {} | {refusal} | {} | 0 | {n_pts} ({gens}) | {:.3} | {:.3} | {:.3} | {:.2} | {} | {why} | {scenes} |",
+                l.class,
+                if v.trusted { "yes" } else { "no" },
+                v.evidence,
+                st.force_rms,
+                st.force_max,
+                st.energy_max,
+                v.inflation,
+                if new { "yes" } else { "**no**" }
+            );
+            if v.trusted && !new {
+                losing.push(format!("- {} {words}: evidence {}, LOO force rms {:.2}×, max {:.2}×, energy max {:.2}×; scenes: {scenes}", l.class, v.evidence, st.force_rms, st.force_max, st.energy_max));
+            }
+        }
+    }
+    println!("\n{table}");
+    println!("keys {total}; trusted today {trusted_today}; trusted under the new rule at load {trusted_new}; keys that lose trust {}", losing.len());
+    for line in &losing {
+        println!("{line}");
+    }
+
+    drop(s);
+    let after = fingerprint(&source);
+    assert_eq!(after, before, "the user's collection folder is unchanged (sizes, mtimes, content hashes)");
+    println!("source folder {}: {} files, sizes, mtimes and content hashes unchanged", source.display(), after.len());
+    assert_eq!(teacher_calls, 0, "no teacher call (no DFT path) — {teacher_calls} were refused");
+}

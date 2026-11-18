@@ -11805,3 +11805,32 @@ fn a_fallback_event_carries_its_solves_ts() {
     assert!(!solved.is_empty(), "no model yet: the teacher answered — {events:?}");
     assert!(solved.iter().all(|e| e.ts == Some(4.2e-3)), "{solved:?}");
 }
+
+/// Trust tightening Task 0 (plan 2026-11-19): the go/no-go readout `key_class_stats` lists every
+/// key of `class_loo()`'s species once, in their order, and each key's leave-one-out numbers are
+/// the class pass's own per-key sums (`compute_class_loo_full`, recomputed here) — the
+/// statistics the standing verdict read.
+#[test]
+fn key_class_stats_match_the_verdicts_inputs() {
+    let mut s = dimer_model_three_atom_teacher();
+    let mut rng = StdRng::seed_from_u64(1019);
+    for _ in 0..40 {
+        let sc = random_h3(&mut rng);
+        s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    let stats = s.key_class_stats();
+    let species: Vec<surrogate::EnvKey> = s.class_loo().iter().enumerate().flat_map(|(c, l)| l.species.iter().map(move |v| surrogate::EnvKey { class: c as u8 + 1, z: v.z, neighbours: v.neighbours.clone() })).collect();
+    assert!(species.iter().any(|k| k.class == 1) && species.iter().any(|k| k.class == 2), "the fixture holds pair and many-body keys: {species:?}");
+    let listed: Vec<surrogate::EnvKey> = stats.iter().map(|(k, _)| k.clone()).collect();
+    assert_eq!(listed, species, "every species key once, in the verdicts' order");
+    let (fresh, ..) = s.compute_class_loo_full();
+    let (_, judge) = fresh.expect("a judgement after the refit");
+    for (k, st) in &stats {
+        let own = judge.key_stats.get(k).expect("every key here has fitted atoms");
+        println!("{k:?}: samples {} force rms {:.3e} max {:.3e} energy max {:.3e}", st.samples, st.force_rms, st.force_max, st.energy_max);
+        assert_eq!((st.force_max, st.force_rms, st.energy_max, st.samples), (own.force_max, own.force_rms, own.energy_max, own.samples), "{k:?}");
+        let v = s.class_loo()[(k.class - 1) as usize].species.iter().find(|v| v.z == k.z && v.neighbours == k.neighbours).unwrap();
+        assert_eq!(v.samples, st.samples, "the verdict's own sample count: {k:?}");
+    }
+}
