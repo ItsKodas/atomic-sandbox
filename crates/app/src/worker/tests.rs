@@ -4463,3 +4463,30 @@ fn a_real_pass_end_fit_lands_in_the_background() {
     assert!(deferred < outcome && outcome < refit, "deferred, then the outcome at the install, then the refit's note: {notes:#?}");
     assert!(model(&s).trusted, "{:?}", model(&s).untrusted_reason);
 }
+
+/// The three-atom map (spec 2026-11-17 §6.4): `SetTripleView` is a display setting; the map is
+/// built only while shown, once when turned on, not again while nothing changed, again after a new
+/// model generation, and not while hidden.
+#[test]
+fn the_triple_map_ships_only_while_shown() {
+    assert!(![Command::SetTripleView(true).is_edit(), Command::SetTripleView(true).pauses(), Command::SetTripleView(true).reaches_driver(), Command::SetTripleView(true).aborts()].contains(&true));
+    let w = morse_estimated(h2_33());
+    idle(&w);
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default(), auto_pass: true });
+    let mut early = false;
+    snapshots_until(&w, "a fitted model", |s| early |= s.activity.triples.is_some(), |s| s.model.as_ref().is_some_and(|m| m.fitted) && !s.working);
+    assert!(!early, "not built while hidden");
+    w.send(Command::SetTripleView(true));
+    let s = snapshot_until(&w, "the triple map", |s| s.activity.triples.is_some());
+    let t = s.activity.triples.as_ref().unwrap();
+    assert!(t.types.is_empty() && t.span(1, 1).is_some(), "H₂ holds no triple, but its H–H span is there");
+    w.send(Command::Dyn(DynCommand::SetSpeed(3)));
+    assert!(idle(&w).activity.triples.is_none(), "nothing changed: no rebuild");
+    w.send(Command::SetAudit(7));
+    snapshot_until(&w, "a rebuild after a new model generation", |s| s.activity.triples.is_some());
+    w.send(Command::SetTripleView(false));
+    w.send(Command::SetAudit(5));
+    let mut built = false;
+    snapshots_until(&w, "the knowledge map after the policy change", |s| built |= s.activity.triples.is_some(), |s| s.activity.knowledge.is_some());
+    assert!(!built, "hidden again: not built");
+}

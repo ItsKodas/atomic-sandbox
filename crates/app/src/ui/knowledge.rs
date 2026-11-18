@@ -35,6 +35,12 @@
 //!   A wide panel (a wide leaf, or a detached window) lays the map out in two columns. Its old
 //!   pop-out window is gone (docking spec D-5): detaching the panel to an OS window (docking D3)
 //!   does that job;
+//! - **"Three-atom arrangements"** (spec 2026-11-17 §6.5, [`triples`]): a fold under the card of
+//!   the pick holding the triple types' picker and the card of the one shown ([`Pick::Triple`]);
+//!   the map (`ActivityDelta::triples`) is built only while the fold is open and the panel shown
+//!   (`Command::SetTripleView`); the element card links to its centre's types and the pair card to
+//!   the arrangements around a short many-body key's centre; its view is a 2D slice or, by its
+//!   `2D | 3D` switch, a rotatable voxel cloud ([`cloud`]);
 //! - the **3D overlay** (the View panel's Display aids ▸ knowledge overlay, [`OVERLAY_TIP`]): each atom
 //!   tinted by `sim::atom_coverage` ([`overlay_coverage`], [`tint_srgb`]: grey 0 never seen → amber
 //!   0.5 thin → green 1 well known, the graph's colours) with a legend card ([`legend`]).
@@ -55,12 +61,18 @@ use super::{dock, theme, PanelInput, UiState, AMBER, GREEN};
 use crate::scene::SceneNucleus;
 use crate::sim::Backend;
 use egui::{pos2, vec2, Align2, Color32, FontId, Id, Order, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui, Vec2};
-use sim::knowledge::{angle_bin, first_shell, ElementKnowledge, KnowledgeMap, PairKnowledge, ANGLE_BINS, ANGLE_BIN_DEG, COVERAGE_COUNT};
+use sim::knowledge::{angle_bin, first_shell, reads_taught, ElementKnowledge, KnowledgeMap, PairKnowledge, ANGLE_BINS, ANGLE_BIN_DEG};
 use sim::Confidence;
 use std::collections::BTreeMap;
 
-/// The occupancy (1 − e^(−n/`COVERAGE_COUNT`), the overlay's) at which a distance reads taught.
-pub const TAUGHT: f64 = 0.9;
+pub mod cloud;
+pub mod triples;
+
+/// The occupancy (1 − e^(−n/`COVERAGE_COUNT`), the overlay's) at which a distance reads taught:
+/// `sim::knowledge`'s, shared with the three-atom map. `Taught::of` reads it through
+/// `reads_taught`; the re-export keeps the module doc's link and the panel's name for it.
+#[allow(unused_imports)]
+pub use sim::knowledge::TAUGHT;
 
 /// The outline of a bin's "new, waiting for refit" segment (module doc, "live during training").
 pub const NEW_INK: Color32 = theme::INK;
@@ -86,6 +98,70 @@ pub enum Pick {
     Element(u8),
     /// A composition of "Molecules trained" ([`KnowledgeView::molecule`]).
     Molecule,
+    /// A three-atom arrangement type (spec 2026-11-17 §6.5): its card head in the detail area.
+    Triple(sim::knowledge::TripleType),
+}
+
+/// The three-atom map's view: the 2D slice (default) or the 3D cloud ([`cloud`]; spec 2026-11-17
+/// §6.5), switched by the section's `2D | 3D`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TripleMode {
+    #[default]
+    Flat,
+    Cloud,
+}
+
+/// The "Three-atom arrangements" section's own view state (display only, not recorded; spec
+/// 2026-11-17 §6.8): kept across a new scene ([`KnowledgeView::reset_view`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TripleView {
+    pub mode: TripleMode,
+    /// The 2D slice's r₂ bin k₂ (`None`: the default slice).
+    pub slice: Option<usize>,
+    /// The picked cell (k₁, k₂, q): the bins are 0.3 Bohr at every r_cut, so a pick survives a
+    /// reach change.
+    pub cell: Option<(usize, usize, usize)>,
+    /// The 3D cloud's rotation (degrees; [`cloud::rotate`], [`cloud::reset`]) and zoom.
+    pub yaw_deg: f32,
+    pub pitch_deg: f32,
+    pub zoom: f32,
+    /// The 3D cloud's "missing" checkbox.
+    pub show_missing: bool,
+    /// An entry link's centre (the pair card's, or the element card's before a map arrived): with
+    /// no triple picked, the section shows that centre's type with the most gaps.
+    pub want_centre: Option<u8>,
+    /// A screenshot's `--ui slice=` / `cell=` (Phase A Task 9), resolved once against the map's
+    /// grid when the picked type is shown ([`triples::apply_pose`]); `None` in the window.
+    pub pose: Option<triples::ShotPose>,
+    /// The shown type's classes and extent, computed once per (map, type) (spec §6.4 "UI cost";
+    /// [`triples::sync`]). Keyed on the map, not the scene: a new scene keeps it, so the
+    /// type-change reset still applies after it.
+    pub cache: Option<triples::ClassCache>,
+    /// Every held type's summary (the picker's gaps, the card head's counts), computed once per
+    /// map ([`triples::summaries`]; final review Minor 1).
+    pub summaries: Option<triples::SummaryCache>,
+    /// The open scene's arrangements by type, enumerated once per geometry and cutoff
+    /// ([`triples::scene_memo`]): the picker's dots, the slice's rings, the cloud's crosses.
+    pub scene: Option<triples::SceneTriples>,
+}
+
+impl Default for TripleView {
+    fn default() -> Self {
+        TripleView {
+            mode: TripleMode::Flat,
+            slice: None,
+            cell: None,
+            yaw_deg: cloud::DEFAULT_YAW_DEG,
+            pitch_deg: cloud::DEFAULT_PITCH_DEG,
+            zoom: 1.0,
+            show_missing: true,
+            want_centre: None,
+            pose: None,
+            cache: None,
+            summaries: None,
+            scene: None,
+        }
+    }
 }
 
 /// The map's own view state (display only, not an `Action`, not recorded): the pick, and the
@@ -102,18 +178,30 @@ pub struct KnowledgeView {
     /// zoom that fit gave (zoomed out past it, crowded pair labels fade).
     pub fitted: Option<Vec<u8>>,
     pub fit_zoom: f32,
+    /// The "Three-atom arrangements" section's view.
+    pub triple: TripleView,
 }
 
 impl Default for KnowledgeView {
     fn default() -> Self {
-        KnowledgeView { pick: Pick::None, molecule: None, zoom: 1.0, pan: Vec2::ZERO, fitted: None, fit_zoom: 1.0 }
+        KnowledgeView { pick: Pick::None, molecule: None, zoom: 1.0, pan: Vec2::ZERO, fitted: None, fit_zoom: 1.0, triple: TripleView::default() }
     }
 }
 
 impl KnowledgeView {
-    /// A new scene: the graph fits itself again on its next frame (the pick is kept).
+    /// A new scene: the graph fits itself again on its next frame (the pick and the three-atom
+    /// view are kept, with its class cache, but not an entry link's centre: the new scene has its
+    /// own default).
     pub fn reset_view(&mut self) {
-        *self = KnowledgeView { pick: self.pick, molecule: self.molecule.take(), ..Default::default() };
+        let triple = TripleView { want_centre: None, ..std::mem::take(&mut self.triple) };
+        *self = KnowledgeView { pick: self.pick, molecule: self.molecule.take(), triple, ..Default::default() };
+    }
+
+    /// A pick by the user (a line, a node, a chip, a row, a link): an entry link's centre
+    /// (`TripleView::want_centre`) is forgotten, so the section's default follows the new pick.
+    pub fn set_pick(&mut self, pick: Pick) {
+        self.pick = pick;
+        self.triple.want_centre = None;
     }
 }
 
@@ -129,7 +217,7 @@ impl Taught {
     fn of(n: u32) -> Taught {
         if n == 0 {
             Taught::Never
-        } else if 1.0 - (-(n as f64) / COVERAGE_COUNT).exp() >= TAUGHT {
+        } else if reads_taught(n) {
             Taught::Taught
         } else {
             Taught::Thin
@@ -296,25 +384,32 @@ pub fn peek(st: &UiState) -> String {
 /// recorded; kept in the profile).
 pub const OVERLAY_TIP: &str = "tints each atom by how well the estimated solver's model knows its surroundings: 0 never seen (grey) … 0.5 thin (amber) … 1 well known (green), the knowledge map's colours. Per atom it is its least-known neighbour within the model's cutoff — that pair's verdict and how many distances like this one were taught. Needs the estimated solver's map (the Knowledge panel). Display only, not recorded";
 
-/// The panel at least this wide draws the map in two columns (the old pop-out window's layout).
-const WIDE: f32 = 760.0;
+/// The panel at least this wide draws the map in two columns (the old pop-out window's layout):
+/// the left column's 460, the gap's 14 and the right column's 420, so the card, the picker and the
+/// slice never get less than 420 pt (final review Minor 6; it was 760, which left the right column
+/// ≈ 286 pt and narrower than the single column just below it).
+pub const WIDE: f32 = 460.0 + 14.0 + 420.0;
 
 /// The Knowledge panel's folds that are open (`UiState::knowledge_sections`, the profile's
-/// `knowledge_sections`): "Why thin?" under the pair card. Closed by default. Display state.
+/// `knowledge_sections`): "Why thin?" under the pair card and "Three-atom arrangements" under the
+/// card of the pick. Closed by default. Display state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Sections {
     pub why: bool,
+    /// Open with the panel shown, the worker builds the three-atom map (`Command::SetTripleView`).
+    pub triples: bool,
 }
 
 impl Sections {
-    /// The profile's value: the open folds' ids ("why"), comma separated.
+    /// The profile's value: the open folds' ids ("why", "triples"), comma separated.
     pub fn encode(&self) -> String {
-        if self.why { "why".into() } else { String::new() }
+        [(self.why, "why"), (self.triples, "triples")].iter().filter(|(on, _)| *on).map(|(_, id)| *id).collect::<Vec<_>>().join(",")
     }
 
     /// The profile's value read back (unknown words dropped).
     pub fn parse(v: &str) -> Sections {
-        Sections { why: v.split(',').any(|w| w.trim().eq_ignore_ascii_case("why")) }
+        let has = |id: &str| v.split(',').any(|w| w.trim().eq_ignore_ascii_case(id));
+        Sections { why: has("why"), triples: has("triples") }
     }
 }
 
@@ -371,8 +466,13 @@ pub fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, wide: bool, a
             });
             ui.add_space(14.0);
             ui.vertical(|ui| {
-                ui.set_min_width(420.0);
+                // 420 at most what is left of the panel: `WIDE` leaves exactly that, and a column
+                // wider than the space left would run past the panel's edge, clipping the card and
+                // the three-atom section (seen in the Task 11 screenshot at an 870-pt leaf, when
+                // `WIDE` was 760)
+                ui.set_min_width(420.0f32.min(ui.available_width()));
                 detail(ui, st, map, &asks, input, acts);
+                triples::section(ui, st, input, map.r_cut);
             });
         });
     } else {
@@ -381,6 +481,7 @@ pub fn body(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, wide: bool, a
         scene_asks(ui, st, map, &asks);
         molecules(ui, st, map);
         detail(ui, st, map, &asks, input, acts);
+        triples::section(ui, st, input, map.r_cut);
     }
 }
 
@@ -478,6 +579,28 @@ pub const ZOOM_MIN: f32 = 0.25;
 pub const ZOOM_MAX: f32 = 8.0;
 /// The zoom factor per wheel line (a pixel wheel's 50 points count as a line).
 const WHEEL_STEP: f32 = 1.2;
+
+/// The wheel's lines this frame (a pixel wheel's 50 points count as one, a page as ten), taken
+/// from the panel's scroll: the graph's and the 3D cloud's zoom read it over their own rect.
+pub(super) fn wheel_lines(ui: &Ui) -> f32 {
+    ui.input_mut(|i| {
+        let lines = i
+            .events
+            .iter()
+            .map(|e| match e {
+                egui::Event::MouseWheel { unit, delta, .. } => match unit {
+                    egui::MouseWheelUnit::Line => delta.y,
+                    egui::MouseWheelUnit::Point => delta.y / 50.0,
+                    egui::MouseWheelUnit::Page => delta.y * 10.0,
+                },
+                _ => 0.0,
+            })
+            .sum();
+        i.smooth_scroll_delta = Vec2::ZERO;
+        lines
+    })
+}
+
 /// Room (points) Fit leaves round the nodes, and right of them for their atom counts.
 const FIT_MARGIN: f32 = 14.0;
 const FIT_BESIDE: f32 = 26.0;
@@ -601,23 +724,8 @@ fn graph(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, size: Vec2) {
     }
     // the wheel, over the map only (taken from the panel's scroll then)
     if ui.rect_contains_pointer(rect) {
-        let (lines, at) = ui.input_mut(|i| {
-            let lines: f32 = i
-                .events
-                .iter()
-                .map(|e| match e {
-                    egui::Event::MouseWheel { unit, delta, .. } => match unit {
-                        egui::MouseWheelUnit::Line => delta.y,
-                        egui::MouseWheelUnit::Point => delta.y / 50.0,
-                        egui::MouseWheelUnit::Page => delta.y * 10.0,
-                    },
-                    _ => 0.0,
-                })
-                .sum();
-            i.smooth_scroll_delta = Vec2::ZERO;
-            (lines, i.pointer.hover_pos())
-        });
-        if let (true, Some(at)) = (lines != 0.0, at) {
+        let lines = wheel_lines(ui);
+        if let (true, Some(at)) = (lines != 0.0, ui.input(|i| i.pointer.hover_pos())) {
             zoom_about(&mut st.knowledge, o, at, WHEEL_STEP.powf(lines));
         }
     }
@@ -740,7 +848,7 @@ fn graph(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, size: Vec2) {
     }
     for (pick, r) in &hits {
         if r.clicked() {
-            st.knowledge.pick = *pick;
+            st.knowledge.set_pick(*pick);
         }
     }
     // a click on a line itself (not its label); a double-click away from every line fits
@@ -760,7 +868,7 @@ fn graph(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, size: Vec2) {
     };
     if bg.clicked() {
         if let Some((_, a, b)) = bg.interact_pointer_pos().and_then(near_line) {
-            st.knowledge.pick = Pick::Pair(a, b);
+            st.knowledge.set_pick(Pick::Pair(a, b));
         }
     }
     // (a third quick click counts too: egui reports it as a triple)
@@ -775,7 +883,7 @@ fn shown_pair(st: &UiState, map: &KnowledgeMap, asks: &BTreeMap<(u8, u8), Vec<f6
     match st.knowledge.pick {
         Pick::Pair(a, b) => Some((a, b)),
         Pick::None => default_pair(map, asks),
-        Pick::Element(_) | Pick::Molecule => None,
+        Pick::Element(_) | Pick::Molecule | Pick::Triple(_) => None,
     }
 }
 
@@ -814,7 +922,7 @@ fn scene_asks(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, asks: &BTreeMap
             let r = ui.add(b).on_hover_text(format!("{}: {} · asked now {} Bohr — click for its card", pair_name(z.0, z.1), confidence_word(c), words.join(" · ")));
             super::probe(&format!("knowledge-ask-{}-{}", z.0, z.1), &r);
             if r.clicked() {
-                st.knowledge.pick = Pick::Pair(z.0, z.1);
+                st.knowledge.set_pick(Pick::Pair(z.0, z.1));
             }
         }
     });
@@ -887,7 +995,7 @@ fn molecules(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap) {
             let r = ui.add(b).on_hover_text(molecule_scenes(m));
             super::probe(&molecule_probe(&m.composition), &r);
             if r.clicked() {
-                st.knowledge.pick = Pick::Molecule;
+                st.knowledge.set_pick(Pick::Molecule);
                 st.knowledge.molecule = Some(m.composition.clone());
             }
         }
@@ -959,8 +1067,9 @@ fn detail(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, asks: &BTreeMap<(u8
                 theme::note(ui, "that composition is no longer among the stored samples");
             }
         },
+        Pick::Triple(t) => triples::detail(ui, st, input, t),
         Pick::Element(z) => match map.element(z) {
-            Some(e) => card(ui, "knowledge-card", |ui| element_detail(ui, map, e, input)),
+            Some(e) => card(ui, "knowledge-card", |ui| element_detail(ui, st, map, e, input)),
             None => {
                 theme::note(ui, format!("{} is not in the model's fitted samples", sym(z)));
             }
@@ -1010,9 +1119,7 @@ fn keys_of<'a>(input: &'a PanelInput<'_>, z: (u8, u8)) -> Vec<(&'a str, &'a sim:
 
 /// The distances a pair was taught: (shortest, longest) over its histogram's filled bins.
 fn taught_range(p: &PairKnowledge) -> Option<(f64, f64)> {
-    let lo = p.hist.counts.iter().position(|&n| n > 0)? as f64 * p.hist.bin;
-    let hi = p.hist.counts.iter().rposition(|&n| n > 0).map_or(0.0, |k| (k + 1) as f64 * p.hist.bin);
-    Some((lo, hi))
+    sim::knowledge::taught_range(&p.hist)
 }
 
 /// The pair card's one plain sentence, from the verdict, the taught range and the keys behind it:
@@ -1070,6 +1177,12 @@ fn pair_detail(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, p: &PairKnowle
     });
     let s = ui.add(egui::Label::new(RichText::new(pair_sentence(map, p, &keys)).size(12.0).color(theme::INK)).wrap());
     super::probe("knowledge-sentence", &s);
+    // the sentence names a short many-body key: its centre's arrangements (spec 2026-11-17 §6.5)
+    if c == Confidence::Thin {
+        if let Some((_, s)) = keys.iter().find(|(_, s)| !s.trusted).filter(|(class, _)| *class != "pair") {
+            triples::pair_link(ui, st, s.z);
+        }
+    }
     // the model's own trust rule first: no pair reads trusted until it holds (a warning, never folded)
     if c != Confidence::Unseen {
         if let Some(m) = input.model().filter(|m| !m.trusted) {
@@ -1203,7 +1316,7 @@ fn teach_button(ui: &mut Ui, st: &UiState, input: &PanelInput<'_>, z: (u8, u8), 
     }
 }
 
-fn element_detail(ui: &mut Ui, map: &KnowledgeMap, e: &ElementKnowledge, input: &PanelInput<'_>) {
+fn element_detail(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, e: &ElementKnowledge, input: &PanelInput<'_>) {
     let nuclei = &input.scene.nuclei;
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(sym(e.z)).strong().size(14.0));
@@ -1301,6 +1414,7 @@ fn element_detail(ui: &mut Ui, map: &KnowledgeMap, e: &ElementKnowledge, input: 
         }
         theme::note(ui, format!("asked now: {} angle{} at {} atom{}, {taught} in a bin taught", angles.len(), if angles.len() == 1 { "" } else { "s" }, mine.len(), if mine.len() == 1 { "" } else { "s" }));
     }
+    triples::element_links(ui, st, input, e.z);
 }
 
 /// A log-scale histogram: `counts` in bins of `bin` x-units from 0 to `x_max`, each bar coloured
@@ -1435,6 +1549,28 @@ pub fn legend(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<
                 }
             });
         });
+}
+
+/// The three-atom map of the tests (Task 6): r_cut 6, reach to 5 Bohr, spans H–H 2.6–3.2 and
+/// O–H 1.6–2.2 Bohr, body-3 on and body-4 off. H–O–H: fitted 342 at (6, 6, 6), 9 at (5, 6, 6) and
+/// 10 at (6, 6, 5) in 610 samples (2140 arrangements), 12 new at (6, 6, 6) in 12 samples; O–H–H
+/// (centre H): 120 at (9, 6, 1) in 140 samples; H–O–O, pending only: 3 at (6, 6, 6) in 1 sample.
+#[cfg(test)]
+pub(crate) fn fixture_triples() -> sim::knowledge::TripleMap {
+    use sim::knowledge::{PairSpan, TripleBasis, TripleBlock, TripleGrid, TripleMap, TripleType};
+    let grid = TripleGrid::new(6.0);
+    let block = |t: TripleType, cells: &[((usize, usize, usize), u32)], samples: usize, triples: u64| {
+        let mut counts = vec![0u32; grid.cells()];
+        for &((k1, k2, q), n) in cells {
+            counts[grid.index(t.folded(), k1, k2, q)] = n;
+        }
+        TripleBlock { t, counts: counts.into(), samples, triples, compositions: Vec::new() }
+    };
+    let (hoh, ohh, hoo) = (TripleType::new(8, 1, 1), TripleType::new(1, 1, 8), TripleType::new(8, 1, 8));
+    let fitted = [block(hoh, &[((6, 6, 6), 342), ((5, 6, 6), 9), ((6, 6, 5), 10)], 610, 2140), block(ohh, &[((9, 6, 1), 120)], 140, 120)];
+    let pending = [block(hoh, &[((6, 6, 6), 12)], 12, 12), block(hoo, &[((6, 6, 6), 3)], 1, 3)];
+    let spans = vec![PairSpan { z: (1, 1), lo: 2.6, hi: 3.2 }, PairSpan { z: (1, 8), lo: 1.6, hi: 2.2 }];
+    TripleMap::assemble(6.0, 5.0, TripleBasis { body3: true, body4: false, degree_cap: 4, l_max: 3 }, spans, &fitted, &pending)
 }
 
 #[cfg(test)]

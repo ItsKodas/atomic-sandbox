@@ -7,7 +7,7 @@
 //! `workspace::detached`), the view and density-look settings and which
 //! of the View panel's sections are open (`view_sections = what,looks`) and which of the Model
 //! panel's folds (`model_sections = teach,health`) and of the Activity panel's
-//! (`activity_sections = trust,training`) and of the Orbitals panel's (`orbital_sections = spin`) and the Knowledge panel's (`knowledge_sections = why`) and the Readouts panel's (`readouts_sections = work,breakdown,compare`) and the Selection panel's (`selection_sections = details,molecules,charges`), the units, the Version
+//! (`activity_sections = trust,training`) and of the Orbitals panel's (`orbital_sections = spin`) and the Knowledge panel's (`knowledge_sections = why,triples`) and the Readouts panel's (`readouts_sections = work,breakdown,compare`) and the Selection panel's (`selection_sections = details,molecules,charges`), the units, the Version
 //! panel's channel and Check automatically (`update_channel = Stable`, `update_auto_check = true`;
 //! installer Task 4) — as a small
 //! text file of `key = value` lines. Display state only: nothing here is an `Action`
