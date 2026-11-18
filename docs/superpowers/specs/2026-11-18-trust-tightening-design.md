@@ -1,6 +1,6 @@
 # Trust tightening: an evidence floor and tail-aware inflations (2026-11-18, rev. 2)
 
-Design note only. No code, tolerance, tier or test changes here. Atomic units: Ha, Ha/Bohr.
+**Approved by the user 2026-11-19** (after physics reviews 1 and 2). Design note only. No code, tolerance, tier or test changes here. Atomic units: Ha, Ha/Bohr.
 
 - A force ratio is e_j/b_j, where e_j = ‖ΔF_j‖/√3 and b_j = min(max(2e-3, 10 %|F_j|), 1e-2) is the
   policy's per-atom bound. Likewise s_j = σ_epi,j/√3.
