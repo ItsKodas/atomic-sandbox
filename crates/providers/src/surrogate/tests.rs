@@ -8719,7 +8719,6 @@ fn a_teach_round_waiting_for_its_fit_is_dropped_before_the_next_round_counts() {
     let (failed0, samples0) = (s.failed_audits.len(), s.samples());
     s.start_teach(&scene).unwrap();
     let notes = Trainable::take_notes(&mut s);
-    println!("{notes:#?}");
     assert_eq!(s.teach_rounds.get(&0).copied(), Some(1), "the dropped round is not counted, the new one is: {notes:?}");
     assert!(s.teach_start.is_some() && s.teach_classes == vec![0], "the new round's own state");
     assert_eq!(s.failed_audits.len(), failed0, "nothing judged against the standing model");
