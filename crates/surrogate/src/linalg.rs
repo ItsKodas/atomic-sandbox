@@ -673,7 +673,7 @@ pub fn mat_vec_fast(a: &[f64], n: usize, x: &[f64], y: &mut [f64]) {
     }
 }
 
-/// ---- the predictive variance on a support (spec 2026-11-20-variance-support-design.md) ----
+// ---- the predictive variance on a support (spec 2026-11-20-variance-support-design.md) ----
 //
 // For a lower factor L of A = L Lᵀ (n × n) and an ascending set S of m indices (N the rest),
 // every v supported on S has
@@ -690,11 +690,11 @@ pub fn mat_vec_fast(a: &[f64], n: usize, x: &[f64], y: &mut [f64]) {
 // the full path's own forward substitution through a reordered exact factor of the same A, whose
 // N block meets a zero right-hand side (y_N = 0 exactly) and drops out. F is that block computed
 // in double-double and rounded once to f64; the forms are in the full path's accuracy class.
-// That is a statement of class, not a derived bound: the agreement is **measured** (the stds
-// within 4.4e-13 relative of the full path's in the `model` tests and 1.9e-12 on the user's BEST
-// fit; the forms within about 2× the full substitution's own error against double-double, on a
-// posterior-shaped factor in the tests below and on BEST: 3.2e-12 vs 1.7e-12), and every new factor
-// is self-checked against the full path at build (`model::SupportCache`, bound 1e-10).
+// That is a statement of class, not a derived bound: it is **measured** against a double-double
+// evaluation through L (the user's BEST fit, every form of 1 000 H₂/H₃ geometries: support max
+// 3.2e-12, full max 3.3e-12; a posterior-shaped factor in the tests below: 1.43e-11 vs 1.09e-11),
+// and every new factor is self-checked against the full path at build (`model::SupportCache`,
+// bound 1e-10).
 //
 // **Why double-double.** Built in f64, F loses digits to cancellation: the unit columns L⁻¹e_s
 // carry the prior's variance (of order 1/λ) while a query in a direction the data determine has

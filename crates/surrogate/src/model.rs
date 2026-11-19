@@ -107,11 +107,13 @@
 //! F the trailing Cholesky block of A ordered (N, reversed S) (`linalg::support_factor`, built in
 //! double-double: in f64 the cancellation that block carries cost up to 3.5e-11 relative on fitted
 //! factors). The forms are the full path's own substitution through a reordered exact factor, at
-//! |S|²/2 per vector instead of Q′²/2; their agreement with the full path is measured (≤ 4.4e-13
-//! relative on the stds in the tests; 1.9e-12 on the user's BEST fit, where the full path is
-//! itself up to 1.7e-12 from a double-double evaluation and the support path 3.2e-12) and
-//! self-checked at every build (`SupportCache`). On the
-//! H/O/P collection basis (Q′ 1 902): |S({H})| = 52, a pair 468, all three 1 902.
+//! |S|²/2 per vector instead of Q′²/2. They are in the full path's accuracy class, measured
+//! against a double-double evaluation through L on the user's BEST fit (every form of 1 000
+//! H₂/H₃ geometries: support max 3.2e-12, median 4.3e-13; full max 3.3e-12, median 4.2e-13), so
+//! the two paths can differ by about their sum (1.9e-12 on the stds there); the unit-test
+//! fixtures pin them within 1e-12 on the stds (4.4e-13 measured). Every build is guarded by the
+//! 1e-10 self-check (`SupportCache`). On the H/O/P collection basis (Q′ 1 902): |S({H})| = 52, a
+//! pair 468, all three 1 902.
 //!
 //! The model caches one factor per composition (`Model::variance_support`, a [`SupportCache`]).
 //! A composition with |S(C)| > Q′/2 takes the full factor (the support gains little there), and so
@@ -763,9 +765,12 @@ const SELF_CHECK_BOUND: f64 = 1e-10;
 /// full path (|S(C)| > Q′/2, an unusable L, a failed build or a failed self-check). Derived data
 /// of the model's `sigma_inv_chol`, `basis` and `representatives`, built lazily by `predict`.
 ///
-/// * **Determinism.** S(C) is a function of the basis and C, and `support_factor` is bitwise
-///   deterministic whatever the thread count, so a std is a pure function of (L, geometry,
-///   species set): the same across runs, threads, clones and call orders.
+/// * **Determinism.** S(C) is a function of the basis and C, `support_factor` is bitwise
+///   deterministic whatever the thread count, and the self-check runs on a canonical cluster of
+///   the composition (not on the triggering call), so whether C takes the support or the full
+///   path, and every std, is a pure function of (L, geometry, species set): the same across
+///   runs, threads, clones and call orders. A call whose query vectors are all zero (no
+///   neighbour inside r_cut) settles nothing and answers +0.0 forms, as the full path does.
 /// * **Threads.** The model is shared with the auditor's thread: entries are immutable `Arc`s
 ///   behind a `Mutex` held only to read or insert one, never while a factor is built or L is
 ///   checked (no lock is held across a call into rayon, where a stolen job could re-enter
@@ -774,10 +779,13 @@ const SELF_CHECK_BOUND: f64 = 1e-10;
 /// * **Staleness.** Every call compares a fingerprint of L (`fingerprint`, O(Q′)) with the one
 ///   the entries were built for and empties the cache on a mismatch. Replace the cell anyway if
 ///   `sigma_inv_chol` or `basis` is changed in place.
-/// * **Self-check.** A new factor is used only if the triggering call's first forms (one lane
-///   group) agree with the full path's within `SELF_CHECK_BOUND`; else the composition takes the
+/// * **Self-check.** A new factor is used only if every form of the composition's canonical
+///   cluster (`canonical_cluster`: one atom of each species and one more, all within r_cut, so
+///   the forms are non-zero) agrees with the full path's within `SELF_CHECK_BOUND`
+///   (NaN-propagating), and at least one checked form is non-zero; else the composition takes the
 ///   full path for good. The largest difference seen is kept (`self_check_max`); a fallback is
-///   reported once on stderr.
+///   reported once on stderr, and so is a call that found a non-zero outside S(C) (counted per
+///   factor, `outside_support_calls`; impossible by the module doc's argument).
 /// * **Equality and clone.** Not part of `PartialEq` (derived data); `Clone` copies the entries
 ///   (the `Arc`s): a clone has the same L, and an entry either builds is the same bits.
 pub struct SupportCache {
@@ -817,6 +825,9 @@ struct SupportFactor {
     map: Vec<u32>,
     /// The |S| × |S| lower factor F of `linalg::support_factor` (row-major, S reversed).
     factor: Vec<f64>,
+    /// Calls that found a non-zero outside S(C) (impossible by the module doc's argument; each
+    /// took the full path, and the first is reported on stderr).
+    outside: std::sync::atomic::AtomicU64,
 }
 
 impl SupportFactor {
@@ -824,6 +835,39 @@ impl SupportFactor {
     fn quad_forms(&self, vs: &[Vec<f64>]) -> Vec<f64> {
         cholesky_quad_forms(&self.factor, self.support.len(), &vs.iter().map(|v| &v[..]).collect::<Vec<_>>())
     }
+}
+
+/// The self-check's query set for composition `mask` (struct doc, "Self-check"): one fixed
+/// cluster, a function of the basis and the composition alone — one atom of every species of C
+/// in ascending order, then one more of the first (two of it when C has one species), on a
+/// fixed spiral 1.4–2.4 Bohr from the origin, so every pair is inside r_cut and every block of
+/// S(C) the cluster reaches is non-zero. Returns (pos, z).
+fn canonical_cluster(basis: &Basis, mask: u32) -> (Vec<[f64; 3]>, Vec<u8>) {
+    let mut z: Vec<u8> = (0..basis.n_species()).filter(|&s| mask & (1 << s) != 0).map(|s| basis.species[s]).collect();
+    z.push(z[0]);
+    let n = z.len();
+    let pos = (0..n)
+        .map(|k| {
+            if k == 0 {
+                return [0.0; 3];
+            }
+            let r = 1.4 + 1.0 * k as f64 / n as f64;
+            let cos_t = 1.0 - 2.0 * (k as f64 - 0.5) / n as f64;
+            let sin_t = (1.0 - cos_t * cos_t).max(0.0).sqrt();
+            let phi = 2.399_963_229_728_653 * k as f64; // the golden angle
+            [r * sin_t * phi.cos(), r * sin_t * phi.sin(), r * cos_t]
+        })
+        .collect();
+    (pos, z)
+}
+
+/// The largest relative difference between two lists of forms, NaN-propagating (a NaN on either
+/// side, or a NaN quotient, gives NaN, which fails every `diff <= bound` test).
+fn max_relative_difference(a: &[f64], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| if x == y { 0.0 } else { (x - y).abs() / y.abs() })
+        .fold(0.0, |m: f64, d| if d.is_nan() || m.is_nan() { f64::NAN } else { m.max(d) })
 }
 
 impl SupportCache {
@@ -850,15 +894,34 @@ impl SupportCache {
         self.state().entries.values().filter(|e| matches!(e, Slot::Support(_))).count()
     }
 
+    /// How many compositions are settled (a support factor or the full path).
+    pub fn settled(&self) -> usize {
+        self.state().entries.len()
+    }
+
     /// How many support factors this cache has built (the tests count them).
     pub fn builds(&self) -> u64 {
         self.state().builds
     }
 
-    /// The largest relative difference between a build's own forms on the support and on the
-    /// full path seen so far (struct doc, "Self-check"); 0 before the first build.
+    /// The largest relative difference between a build's self-check forms on the support and on
+    /// the full path seen so far (struct doc, "Self-check"); 0 before the first build, NaN if a
+    /// check met a NaN.
     pub fn self_check_max(&self) -> f64 {
         self.state().self_check_max
+    }
+
+    /// Calls that found a non-zero query entry outside their composition's S(C), over every held
+    /// factor (0 by the module doc's argument).
+    pub fn outside_support_calls(&self) -> u64 {
+        self.state()
+            .entries
+            .values()
+            .map(|e| match e {
+                Slot::Support(f) => f.outside.load(std::sync::atomic::Ordering::Relaxed),
+                Slot::Full => 0,
+            })
+            .sum()
     }
 
     /// Report a full-path fallback, once per cache (struct doc).
@@ -875,6 +938,11 @@ impl SupportCache {
     fn quad_forms(&self, model: &Model, l: &[f64], q: &QueryInputs) -> Vec<f64> {
         let qr = model.representatives().len();
         let full = || full_quad_forms(l, qr, &model.full_query_vectors(q));
+        // every query vector zero (no atom has a neighbour inside r_cut): ‖L⁻¹0‖² = +0.0 exactly,
+        // as on the full path; nothing is built or settled (review round 2, I1)
+        if q.desc.iter().all(|d| d.b.iter().all(|&x| x == 0.0) && d.grad.iter().all(|(_, g)| g.iter().all(|v| v.iter().all(|&x| x == 0.0)))) {
+            return vec![0.0; 1 + 3 * q.desc.len()];
+        }
         let Some(mask) = mask_of(q.species) else {
             return full();
         };
@@ -892,7 +960,7 @@ impl SupportCache {
         let entry = match slot {
             Some(Slot::Full) => return full(),
             Some(Slot::Support(e)) => e,
-            None => match self.build(model, l, qr, mask, fp, q) {
+            None => match self.build(model, l, qr, mask, fp) {
                 Some(e) => e,
                 None => return full(),
             },
@@ -902,14 +970,19 @@ impl SupportCache {
             // a non-zero value outside S(C) contradicts the module doc's argument: never seen
             None => {
                 debug_assert!(false, "a query vector is non-zero outside the composition's support");
+                if entry.outside.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    eprintln!("surrogate: a query vector was non-zero outside its composition's support (the call took the full path)");
+                }
                 full()
             }
         }
     }
 
     /// Settle composition `mask`: insert its support factor or the full path, and return the
-    /// factor if it has one. Nothing O(Q′²) runs under the lock.
-    fn build(&self, model: &Model, l: &[f64], qr: usize, mask: u32, fp: u64, q: &QueryInputs) -> Option<Arc<SupportFactor>> {
+    /// factor if it has one. The outcome is a function of (L, basis, composition) alone — the
+    /// self-check runs on `canonical_cluster`, not on the triggering call — so racing builders
+    /// insert the same thing. Nothing O(Q′²) runs under the lock.
+    fn build(&self, model: &Model, l: &[f64], qr: usize, mask: u32, fp: u64) -> Option<Arc<SupportFactor>> {
         let insert = |slot: Slot| -> Option<Arc<SupportFactor>> {
             let mut st = self.state();
             if st.fingerprint != Some(fp) {
@@ -950,24 +1023,34 @@ impl SupportCache {
         for (t, &r) in support.iter().enumerate() {
             map[rep[r]] = (m - 1 - t) as u32;
         }
-        let entry = SupportFactor { support, map, factor };
-        // the self-check: the call's first forms (one lane group) on both paths
-        let Some(on_s) = accumulate_query_vectors(&model.basis, q, &entry.map, m) else {
+        let entry = SupportFactor { support, map, factor, outside: std::sync::atomic::AtomicU64::new(0) };
+        // the self-check on the composition's canonical cluster: every form on both paths
+        let (pos, z) = canonical_cluster(&model.basis, mask);
+        let species = model.basis.species_indices(&z).expect("the basis's own species");
+        let desc = describe(&model.basis, &pos, &z).expect("the basis's own species");
+        let cq = QueryInputs { species: &species, desc: &desc, inv_scale: model.inverse_scale() };
+        let Some(on_s) = accumulate_query_vectors(&model.basis, &cq, &entry.map, m) else {
+            debug_assert!(false, "the canonical cluster is non-zero outside its composition's support");
+            self.report("the self-check's cluster was non-zero outside its composition's support");
             return insert(Slot::Full);
         };
-        let k = on_s.len().min(crate::linalg::QUAD_LANES);
-        let full_vs = model.full_query_vectors(q);
-        let (a, b) = (entry.quad_forms(&on_s[..k]), full_quad_forms(l, qr, &full_vs[..k]));
-        let diff = a.iter().zip(&b).map(|(x, y)| if x == y { 0.0 } else { (x - y).abs() / y.abs() }).fold(0.0, f64::max);
+        let b = full_quad_forms(l, qr, &model.full_query_vectors(&cq));
+        let a = entry.quad_forms(&on_s);
+        let diff = max_relative_difference(&a, &b);
         let bound = {
             let mut st = self.state();
-            st.self_check_max = st.self_check_max.max(diff);
+            st.self_check_max = if diff.is_nan() || st.self_check_max.is_nan() { f64::NAN } else { st.self_check_max.max(diff) };
             #[cfg(test)]
             let bound = st.bound.unwrap_or(SELF_CHECK_BOUND);
             #[cfg(not(test))]
             let bound = SELF_CHECK_BOUND;
             bound
         };
+        if !b.iter().any(|&x| x > 0.0) {
+            // nothing was checked (a posterior whose forms all vanish on the cluster)
+            self.report("a support factor's self-check had no non-zero form");
+            return insert(Slot::Full);
+        }
         if !(diff <= bound) {
             self.report(&format!("a support factor's self-check differed by {diff:.1e} relative"));
             return insert(Slot::Full);
@@ -1011,7 +1094,7 @@ impl std::fmt::Debug for SupportCache {
     }
 }
 
-// The per-step hot path: total energy and forces without materialising per-atom descriptor
+/// The per-step hot path: total energy and forces without materialising per-atom descriptor
 /// gradients (module doc). O(N²) pair sweep, `radial` once per pair inside r_cut.
 ///
 /// # Panics
@@ -1304,6 +1387,11 @@ mod tests {
     fn random_posterior_model(rng: &mut StdRng, species: &[u8], body3: bool) -> Model {
         let mut basis = Basis::new(species);
         basis.body3 = body3;
+        random_posterior_on(rng, basis)
+    }
+
+    /// [`random_posterior_model`] on a given basis.
+    fn random_posterior_on(rng: &mut StdRng, basis: Basis) -> Model {
         let p = basis.n_features();
         let s = basis.n_species();
         let q = basis.n_independent_columns();
@@ -1427,7 +1515,10 @@ mod tests {
                 if m.variance_support.support_entries() > 0 {
                     supported += 1;
                 }
-                assert!(m.variance_support.self_check_max() <= 1e-12, "self-check {:.2e}", m.variance_support.self_check_max());
+                // the self-check compares forms (variances), whose relative difference is twice
+                // a std's: the spec's 1e-12 on the stds is 2e-12 here (round 2: the canonical
+                // cluster's forms measured 1.0e-12 on these fixtures)
+                assert!(m.variance_support.self_check_max() <= 2e-12, "self-check {:.2e}", m.variance_support.self_check_max());
             }
         }
         assert_eq!(supported, n_models, "every model ran on the support path");
@@ -1455,8 +1546,17 @@ mod tests {
         assert_eq!(size(0b001), single.n_independent_columns());
         // every geometric support inside its composition's S(C)
         let mut rng = StdRng::seed_from_u64(71);
-        for (species, body3) in [(&[1u8, 8][..], false), (&[1, 8], true), (&[1, 8, 15], true)] {
-            let m = random_posterior_model(&mut rng, species, body3);
+        let mut body4 = Basis::new(&[1, 8]);
+        body4.body4 = true;
+        body4.body4_degree = 3;
+        let models = [
+            (vec![1u8, 8], random_posterior_model(&mut rng, &[1, 8], false)),
+            (vec![1, 8], random_posterior_model(&mut rng, &[1, 8], true)),
+            (vec![1, 8, 15], random_posterior_model(&mut rng, &[1, 8, 15], true)),
+            (vec![1, 8], random_posterior_on(&mut rng, body4)),
+        ];
+        for (species, m) in &models {
+            let species = &species[..];
             for t in 0..12 {
                 let pick: Vec<u8> = species.iter().copied().filter(|_| rng.gen_bool(0.6)).collect();
                 let pick = if pick.is_empty() { vec![species[0]] } else { pick };
@@ -1739,70 +1839,134 @@ mod tests {
         }
     }
 
-    /// The support path against the full one on a real fit (review I3b): 1 000 seeded H₂ and H₃
-    /// geometries on the model in `MODEL_FILE`. Prints the largest relative difference of every
-    /// std between the paths, the self-check's, and for the 10 geometries that differ most each
-    /// path's error against a double-double evaluation of the same forms through L (which of the
-    /// two the difference is). A measurement.
+    /// A call with no neighbour inside r_cut (its query vectors all zero) answers +0.0 forms and
+    /// settles nothing (review round 2, I1); the composition is settled, and checked, by the
+    /// first call that has neighbours: with the bound below any difference it takes the full path.
+    #[test]
+    fn a_call_without_neighbours_settles_nothing() {
+        let mut rng = StdRng::seed_from_u64(89);
+        let m = random_posterior_model(&mut rng, &[1, 8], true);
+        m.variance_support.state().bound = Some(-1.0);
+        let l = m.sigma_inv_chol.as_ref().unwrap();
+        for (pos, z) in [(vec![[0.0, 0.0, 0.0]], vec![1u8]), (vec![[0.0, 0.0, 0.0], [0.0, 0.0, 7.0]], vec![1u8, 1])] {
+            let auto = m.predictive_std_with(l, &pos, &z, VariancePath::Auto).unwrap();
+            let full = m.predictive_std_with(l, &pos, &z, VariancePath::Full).unwrap();
+            assert_eq!(auto.0.to_bits(), full.0.to_bits());
+            assert!(auto.2.iter().zip(&full.2).all(|(a, b)| a.to_bits() == b.to_bits() && *a == 0.0));
+        }
+        assert_eq!((m.variance_support.settled(), m.variance_support.builds()), (0, 0), "nothing settled");
+        let h2 = [[0.0, 0.0, 0.0], [0.0, 0.0, 1.4]];
+        let auto = m.predictive_std_with(l, &h2, &[1, 1], VariancePath::Auto).unwrap();
+        let full = m.predictive_std_with(l, &h2, &[1, 1], VariancePath::Full).unwrap();
+        assert_eq!(auto.0.to_bits(), full.0.to_bits());
+        assert_eq!((m.variance_support.settled(), m.variance_support.support_entries(), m.variance_support.builds()), (1, 0, 1), "checked by the real call: the full path");
+        assert!(m.variance_support.self_check_max() >= 0.0);
+    }
+
+    /// The self-check's maximum propagates NaN (review round 2, M2).
+    #[test]
+    fn a_nan_difference_fails_the_self_check() {
+        assert!(max_relative_difference(&[1.0, f64::NAN, 2.0], &[1.0, 1.0, 2.0]).is_nan());
+        assert!(max_relative_difference(&[1.0, 1.0], &[f64::NAN, 1.0]).is_nan());
+        assert!(!(max_relative_difference(&[f64::NAN], &[1.0]) <= SELF_CHECK_BOUND));
+        assert_eq!(max_relative_difference(&[1.0, 3.0], &[1.0, 2.0]), 0.5);
+    }
+
+    /// The canonical cluster holds every species of its composition, inside r_cut.
+    #[test]
+    fn the_canonical_cluster_spans_its_composition() {
+        let basis = Basis::new(&[1, 6, 8, 15]);
+        for mask in 1u32..16 {
+            let (pos, z) = canonical_cluster(&basis, mask);
+            let want: Vec<u8> = (0..4).filter(|s| mask & (1 << s) != 0).map(|s| basis.species[s]).collect();
+            assert!(want.iter().all(|w| z.contains(w)) && z.iter().all(|x| want.contains(x)));
+            for i in 0..pos.len() {
+                for j in i + 1..pos.len() {
+                    let d = (0..3).map(|a| (pos[i][a] - pos[j][a]).powi(2)).sum::<f64>().sqrt();
+                    assert!(d > 0.5 && d < basis.r_cut, "mask {mask:b}: atoms {i} {j} at {d}");
+                }
+            }
+        }
+    }
+
+    /// The support path against the full one on a real fit (review I3b, round 2): 1 000 seeded H₂
+    /// and H₃ geometries on the model in `MODEL_FILE`. For every geometry and every form (the
+    /// 1 + 3N quadratic forms), each path's relative error against a double-double evaluation
+    /// through L; and the largest relative std difference between the paths. A measurement.
     /// `MODEL_FILE=<a model sidecar> cargo test -p surrogate --release --lib support_accuracy_on_a_model_file -- --ignored --nocapture`
     #[test]
     #[ignore = "a measurement on a model file (MODEL_FILE)"]
     fn support_accuracy_on_a_model_file() {
+        use rayon::prelude::*;
         let path = std::path::PathBuf::from(std::env::var("MODEL_FILE").expect("MODEL_FILE"));
         let m = crate::sidecar::read(&path).expect("a readable model sidecar").model;
         let l = m.sigma_inv_chol.clone().expect("a posterior");
         let qr = m.representatives().len();
         let mut rng = StdRng::seed_from_u64(0xbe57);
+        let geometries: Vec<(Vec<[f64; 3]>, Vec<u8>)> = (0..1000)
+            .map(|k| {
+                let n = if k % 2 == 0 { 2 } else { 3 };
+                let mut pos = vec![[0.0; 3]; n];
+                pos[1] = [0.0, 0.0, rng.gen_range(0.9..3.5)];
+                if n == 3 {
+                    pos[2] = [rng.gen_range(-2.5..2.5), rng.gen_range(0.6..3.0), rng.gen_range(-1.0..4.0)];
+                }
+                (pos, vec![1u8; n])
+            })
+            .collect();
         let t = std::time::Instant::now();
-        // the stds' squares minus their floors are the forms; compare the forms themselves
-        let mut rows: Vec<(f64, usize, Vec<[f64; 3]>, Vec<u8>)> = Vec::new();
+        // the std difference between the paths, and the factor for {H} (built by the first call)
         let mut worst_std = 0.0f64;
-        for k in 0..1000 {
-            let n = if k % 2 == 0 { 2 } else { 3 };
-            let mut pos = vec![[0.0; 3]; n];
-            pos[1] = [0.0, 0.0, rng.gen_range(0.9..3.5)];
-            if n == 3 {
-                pos[2] = [rng.gen_range(-2.5..2.5), rng.gen_range(0.6..3.0), rng.gen_range(-1.0..4.0)];
-            }
-            let z = vec![1u8; n];
-            let a = m.predictive_std_with(&l, &pos, &z, VariancePath::Auto).unwrap();
-            let f = m.predictive_std_with(&l, &pos, &z, VariancePath::Full).unwrap();
-            let pairs = std::iter::once((a.0, f.0)).chain(a.1.iter().copied().zip(f.1.iter().copied())).chain(a.2.iter().copied().zip(f.2.iter().copied()));
-            let d = pairs.map(|(x, y)| if x == y { 0.0 } else { (x - y).abs() / y.abs() }).fold(0.0, f64::max);
-            worst_std = worst_std.max(d);
-            rows.push((d, k, pos, z));
+        for (pos, z) in &geometries {
+            let a = m.predictive_std_with(&l, pos, z, VariancePath::Auto).unwrap();
+            let f = m.predictive_std_with(&l, pos, z, VariancePath::Full).unwrap();
+            let pairs: Vec<(f64, f64)> = std::iter::once((a.0, f.0)).chain(a.1.iter().copied().zip(f.1.iter().copied())).chain(a.2.iter().copied().zip(f.2.iter().copied())).collect();
+            let (x, y): (Vec<f64>, Vec<f64>) = pairs.into_iter().unzip();
+            worst_std = worst_std.max(max_relative_difference(&x, &y));
         }
-        println!(
-            "Q′ {qr}, |S({{H}})| {:?}: 1000 H₂/H₃ geometries, worst relative std difference support vs full {worst_std:.2e}; self-check max {:.2e}; {:.1} s",
-            m.variance_support.support_for(&[0]).map(|s| s.len()),
-            m.variance_support.self_check_max(),
-            t.elapsed().as_secs_f64()
-        );
-        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
         let entry = match m.variance_support.state().entries.get(&1).cloned() {
             Some(Slot::Support(e)) => e,
             _ => panic!("{{H}} is on the support path"),
         };
-        let (mut ws, mut wf) = (0.0f64, 0.0f64);
-        for (d, k, pos, z) in rows.iter().take(10) {
-            let s = m.basis.species_indices(z).unwrap();
-            let desc = describe(&m.basis, pos, z).unwrap();
-            let q = QueryInputs { species: &s, desc: &desc, inv_scale: m.inverse_scale() };
-            let full_vs = m.full_query_vectors(&q);
-            let on_s = accumulate_query_vectors(&m.basis, &q, &entry.map, entry.support.len()).unwrap();
-            let (sup, full) = (entry.quad_forms(&on_s), full_quad_forms(&l, qr, &full_vs));
-            let (mut es, mut ef) = (0.0f64, 0.0f64);
-            for (j, v) in full_vs.iter().enumerate() {
-                let exact = crate::linalg::tests::quad_form_dd(&l, qr, v);
-                if exact > 0.0 {
-                    es = es.max((sup[j] - exact).abs() / exact);
-                    ef = ef.max((full[j] - exact).abs() / exact);
+        // every form of every geometry against double-double (in parallel; each is independent)
+        let errors: Vec<(f64, f64, f64)> = geometries
+            .par_iter()
+            .map(|(pos, z)| {
+                let s = m.basis.species_indices(z).unwrap();
+                let desc = describe(&m.basis, pos, z).unwrap();
+                let q = QueryInputs { species: &s, desc: &desc, inv_scale: m.inverse_scale() };
+                let full_vs = m.full_query_vectors(&q);
+                let on_s = accumulate_query_vectors(&m.basis, &q, &entry.map, entry.support.len()).unwrap();
+                let (sup, full) = (entry.quad_forms(&on_s), full_quad_forms(&l, qr, &full_vs));
+                let (mut es, mut ef, mut between) = (0.0f64, 0.0f64, 0.0f64);
+                for (j, v) in full_vs.iter().enumerate() {
+                    let exact = crate::linalg::tests::quad_form_dd(&l, qr, v);
+                    if exact > 0.0 {
+                        es = es.max((sup[j] - exact).abs() / exact);
+                        ef = ef.max((full[j] - exact).abs() / exact);
+                        between = between.max((sup[j] - full[j]).abs() / full[j]);
+                    }
                 }
-            }
-            ws = ws.max(es);
-            wf = wf.max(ef);
-            println!("  geometry {k}: std difference {d:.2e}; forms against double-double: support {es:.2e}, full {ef:.2e}");
-        }
-        println!("  the 10 most different: worst form error against double-double, support {ws:.2e}, full {wf:.2e}");
+                (es, ef, between)
+            })
+            .collect();
+        let max = |f: fn(&(f64, f64, f64)) -> f64| errors.iter().map(f).fold(0.0, f64::max);
+        let median = |f: fn(&(f64, f64, f64)) -> f64| {
+            let mut v: Vec<f64> = errors.iter().map(f).collect();
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let ratio = errors.iter().filter(|e| e.1 > 0.0).map(|e| e.0 / e.1).fold(0.0, f64::max);
+        println!(
+            "Q′ {qr}, |S({{H}})| {}: 1000 H₂/H₃ geometries, every form against double-double through L —\n  support: max {:.2e}, median {:.2e}; full: max {:.2e}, median {:.2e}; support vs full on the forms: max {:.2e}; on the stds: max {worst_std:.2e}\n  largest per-geometry ratio (support error / full error) {ratio:.1}; self-check (canonical cluster) {:.2e}; {:.0} s",
+            entry.support.len(),
+            max(|e| e.0),
+            median(|e| e.0),
+            max(|e| e.1),
+            median(|e| e.1),
+            max(|e| e.2),
+            m.variance_support.self_check_max(),
+            t.elapsed().as_secs_f64()
+        );
     }
 }

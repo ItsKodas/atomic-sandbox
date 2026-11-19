@@ -4978,20 +4978,20 @@ The batched substitution alone (`quad_forms_speed`, `#[ignore]`d: 7 rows at n = 
 
 `Model::predictive_std` forms its 1 + 3N quadratic forms on S(C), every reduced column whose centre and channel species lie in the scene's species set C (exact: a feature of an absent channel species is an empty sum, +0.0), φ̃ᵀA⁻¹φ̃ = φ̃_Sᵀ(A⁻¹)_SS φ̃_S, when |S(C)| ≤ Q′/2; one factor per composition is cached on the model, so a std is a pure function of (L, geometry, species set). On the H/O/P collection basis |S({H})| = 52, a pair 468, all three 1 902 (the full path). The factor F is the trailing Cholesky block of A ordered (N, reversed S), built in double-double (`linalg::support_factor`): in f64 its cancellation cost, on fitted [H, O] factors against a double-double reference, up to 3.5e-11 relative (the spec's f64 QR of X = L⁻¹E_S) and 1.8e-10 / 5.9e-12 (f64 Householder / Givens elimination of L), where the full substitution is ≤ 2.2e-13. Every new factor is self-checked against the full path at build (bound 1e-10). `describe` skips the body-3/4 terms of absent channel species (bit for bit, tested).
 
-**Accuracy, measured** (the class claim is the reordering identity; nothing is a derived bound):
-- unit tests (random and 30-sample fitted posteriors): the stds agree with the full path to ≤ 4.4e-13 relative; a posterior-shaped factor with multiply amplification 7e6 gives the support forms 1.43e-11 against the full forms' 1.09e-11, both against double-double;
-- **the user's BEST fit** (H/O/P, Q′ 1 902, 1 624 samples; its v9 sidecar read on `scf-stall` and rebuilt as a model-only file for this build, measurement only): 1 000 seeded H₂/H₃ geometries, worst relative std difference support vs full **1.93e-12**; for the 10 most different, the forms against double-double through L are within **3.2e-12** on the support path and **1.7e-12** on the full one, so on this posterior the full path is itself ~1e-12 from the exact value and the support path within 2× of it. Self-check maximum 6.2e-13.
+**Accuracy, measured** (the class claim is the reordering identity; nothing is a derived bound). The support path is in the full path's accuracy class: its forms are within the full substitution's own error against a double-double evaluation through L, so the two paths can differ by about the sum of their errors; every build is guarded by the 1e-10 self-check against the full path (on a canonical cluster of the composition, so the outcome is a function of the posterior and the composition).
+- **The user's BEST fit** (H/O/P, Q′ 1 902, 1 624 samples; its v9 sidecar read on `scf-stall` and rebuilt as a model-only file for this build, measurement only, then deleted), every form of 1 000 seeded H₂/H₃ geometries against double-double: **support max 3.18e-12, median 4.33e-13; full max 3.26e-12, median 4.21e-13**. Support vs full: 4.25e-12 on the forms, **1.93e-12 on the stds**. Self-check (canonical {H} cluster) 7.5e-13.
+- Unit tests (random and 30-sample fitted posteriors): the stds agree with the full path to ≤ 4.4e-13 relative, under the 1e-12 + 1e-15 pin kept on those fixtures; a posterior-shaped factor with multiply amplification 7e6 gives the support forms 1.43e-11 against the full forms' 1.09e-11, both against double-double.
 
 **Timing**, H₂ at 1.4 Bohr, 2 000 calls each, |S| = 52:
 
 | | before | after |
 |---|---|---|
-| BEST fit, `predict(…, false)` | 50 µs (the user's measurement) | 38–41 µs (unchanged code) |
-| BEST fit, `predict(…, true)` | 679 µs (the user's measurement) | **66–75 µs** |
-| BEST fit, first `predict(…, true)` (checks L, builds {H}) | — | 13–15 ms |
+| BEST fit, `predict(…, false)` | 50 µs (the user's measurement) | 38–44 µs (unchanged code) |
+| BEST fit, `predict(…, true)` | 679 µs (the user's measurement) | **66–76 µs** |
+| BEST fit, first `predict(…, true)` (checks L, builds and self-checks {H}) | — | 13–18 ms |
 | synthetic BEST-shaped model, `predict(…, true)` | 560 µs | 73–82 µs |
 
-The remainder is the descriptor (`describe` with gradients 17–24 µs after the composition skip) and `energy_and_forces` (~40 µs, unchanged); the spec's ≤ 60 µs target is not met. Factor builds (`support_factor_build_cost`, n = 1 902): 9.5 ms at |S| = 52, 57 ms at 282, 0.26 s at 950 (a two-species composition, 468, is about 0.1–0.15 s, once per model and composition).
+The remainder is the descriptor (`describe` with gradients 17–24 µs after the composition skip) and `energy_and_forces` (~40 µs, unchanged); the spec's ≤ 60 µs target is **missed**: those two alone are about 60 µs, and the variance's own forms are about 6–10 µs. Factor builds (`support_factor_build_cost`, n = 1 902): 9.5 ms at |S| = 52, 57 ms at 282, 0.26 s at 950 (a two-species composition, 468, is about 0.1–0.15 s, once per model and composition).
 
 ## Warm-started recovery trials (2026-11-17; branch `recovery-warm`, spec `2026-11-17-recovery-warm-start-design.md`, option B; `providers` `surrogate::tests::refit_golden` with its `fit_log` line, `#[ignore]`d; release, Ryzen 7 9800X3D, other agents' test binaries running throughout)
 
