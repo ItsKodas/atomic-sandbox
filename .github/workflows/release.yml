@@ -316,16 +316,22 @@ jobs:
             exit 1
           }
           $sec = Join-Path $env:RUNNER_TEMP 'release.sec'
+          $pw = Join-Path $env:RUNNER_TEMP 'release.pw'
           try {
             [System.IO.File]::WriteAllText($sec, $env:MINISIGN_SECRET_KEY.Trim() + "`n", (New-Object System.Text.ASCIIEncoding))
+            # minisign reads the key's password as one line from stdin. It is given as a redirected
+            # file, never through a PowerShell pipe: minisign 0.12 on Windows reads a piped password
+            # wrong and refuses a correct one ("Wrong password for that key"; reproduced locally
+            # 2026-11-20, the v0.2.0-beta.3 run's failure). UTF-8 without a BOM, one line.
+            [System.IO.File]::WriteAllText($pw, $env:MINISIGN_PASSWORD + "`n", (New-Object System.Text.UTF8Encoding $false))
             # -H: prehashed (the app's verify refuses legacy signatures; 0.12 signs prehashed unless
             # -l is given, and -H keeps that explicit). -t: the trusted comment, covered by the
             # signature, which the app requires to be "atomic-sandbox <the tag it installs>".
-            # minisign reads the key's password as one line from stdin.
-            $env:MINISIGN_PASSWORD | & $env:MINISIGN_EXE -S -H -s $sec -m $sums -x "$sums.minisig" -t "atomic-sandbox $env:TAG"
-            if ($LASTEXITCODE -ne 0) { Write-Output "::error::minisign -S failed (exit $LASTEXITCODE): is MINISIGN_PASSWORD the key's password?"; exit 1 }
+            $msArgs = @('-S', '-H', '-s', "`"$sec`"", '-m', "`"$sums`"", '-x', "`"$sums.minisig`"", '-t', "`"atomic-sandbox $env:TAG`"")
+            $p = Start-Process -FilePath $env:MINISIGN_EXE -ArgumentList $msArgs -RedirectStandardInput $pw -NoNewWindow -Wait -PassThru
+            if ($p.ExitCode -ne 0) { Write-Output "::error::minisign -S failed (exit $($p.ExitCode)): is MINISIGN_PASSWORD the key's password?"; exit 1 }
           } finally {
-            Remove-Item -LiteralPath $sec -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $sec, $pw -Force -ErrorAction SilentlyContinue
           }
           Get-Content -LiteralPath "$sums.minisig"
 
