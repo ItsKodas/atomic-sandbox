@@ -42,6 +42,9 @@ pub use sim::{AuditRecord, AuditVerdict};
 /// | 21 | `Class(_)` refused **and** the variance verdict (rule 6/7) refused too — the class's note
 ///       is shown, but the step is not the class verdict's evidence ([`HISTORY_RULE_CLASS_AND_VARIANCE`];
 ///       M8a Task 2: `calibrate` reads codes 5 and 6 only) |
+/// | 24 | `ForceUncertainty` / `EnergyUncertainty` refused **only** by the tail-aware factor — rule 6/7
+///       at λ_F = max(λ_sum, λ_T) or λ_E refused, at λ_sum alone it passes ([`HISTORY_RULE_TAIL_INFLATION`];
+///       trust tightening, spec 2026-11-18 §4: never in the answer sample P_A, since λ selected it) |
 pub fn history_rule_code(rule: TeachRule) -> u8 {
     use sim::activity::EnvClass;
     match rule {
@@ -77,6 +80,13 @@ pub fn history_rule_code(rule: TeachRule) -> u8 {
 /// comparison is not evidence for the class verdict — `calibrate::in_jurisdiction` leaves it out.
 pub const HISTORY_RULE_CLASS_AND_VARIANCE: u8 = 21;
 
+/// The history code of a step rule 6 or 7 refused only at the tail-aware inflations (trust
+/// tightening, spec 2026-11-18 §4; `calibrate`, "The tail-aware inflations"): rule 6 at
+/// λ_F(j) = max(λ_sum(k), λ_T(k)) or rule 7 at max(max_j λ_F(j), max_k λ_E(k)) refused, and at
+/// λ_sum alone both pass. Recorded for the Log and the measurement; `calibrate::in_answer_sample`
+/// leaves it out (λ selected it), while λ_sum's posterior jurisdiction reads it as it reads 14/15.
+pub const HISTORY_RULE_TAIL_INFLATION: u8 = 24;
+
 /// The rule a [`history_rule_code`] names, in the decision list's words ("?" for an unknown code).
 pub fn history_rule_name(code: u8) -> &'static str {
     match code {
@@ -104,6 +114,7 @@ pub fn history_rule_name(code: u8) -> &'static str {
         21 => "rule 4b with rule 6/7 failing too",
         22 => "capped segment (teacher only)",
         23 => "near a misfit",
+        24 => "rule 6/7 at the tail-aware inflation (passes at λ_sum)",
         _ => "?",
     }
 }

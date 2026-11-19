@@ -250,7 +250,8 @@
 //! dominates the denominator exactly where the epistemic std is too small).
 //!
 //! over the class's points in the **posterior's jurisdiction** — the verdict's (audits, rule-4b
-//! fallbacks) plus the fallbacks rules 6/7 refused alone (codes 14, 15) or with the class (21): the
+//! fallbacks) plus the fallbacks rules 6/7 refused alone (codes 14, 15, and 24 where only λ_T or
+//! λ_E refused: rule 6/7 at the inflated factor, still the std deciding) or with the class (21): the
 //! geometries where the std decides. Points of rules 5/5a–5e and the fences are not: those refuse
 //! whatever the std says. The same window of generations as the verdict (≥ [`WINDOW_POINTS`]),
 //! one draw per point, no weight cap (every comparison is equally a draw of the posterior; the cap
@@ -391,9 +392,12 @@
 //! λ_sum is 1.21 (`the_tail_inflation_refuses_the_measured_tail`, where λ_T is 7.69). λ_T (forces)
 //! and λ_E (energy) ask the question rule 6/7 answer, of exactly the
 //! measured atoms (points) those rules would admit. Pure functions of the history's **answer
-//! sample** P_A ([`in_answer_sample`]) and the policy's bounds; they decide nothing here (rules 6
-//! and 7 read them from Task 6 on, as λ_F(j) = max(λ_sum(k), λ_T(k)) and max(max_j λ_F(j),
-//! max_k λ_E(k)) on σ_E,epi/N). All quantities are ratios, no unit enters:
+//! sample** P_A ([`in_answer_sample`]) and the policy's bounds; they decide nothing here — rules 6
+//! and 7 read them (`SurrogateKs::key_factors`, `variance_check`) as λ_F(j) = max(λ_sum(k),
+//! λ_T(k)) on s_j and max(max_j λ_F(j), max_k λ_E(k)) on σ_E,epi/N, N the one normalisation rule 7
+//! and λ_E share (`policy::energy_atoms`), a sparse key (fewer than [`MIN_EVIDENCE`] P_A points of
+//! its own) at its class's λ_T and λ_E as floors. Each comes with its [`TailCause`], which the
+//! refusal names. All quantities are ratios, no unit enters:
 //!
 //! ```text
 //! forces, per P_A atom j of the key (bound units; force_bound(|F|) = min(max(2e-3, 10 %|F|), 1e-2) Ha/Bohr):
@@ -587,6 +591,10 @@ pub struct ClassCalibration {
     pub energy_inflation: f64,
     /// The P_A points in λ_T's window (the sparse-key rule reads it: fewer than [`MIN_EVIDENCE`]).
     pub answer_points: usize,
+    /// What decided `tail_inflation` (the refusal's words name it; Task 6).
+    pub tail_cause: TailCause,
+    /// What decided `energy_inflation`.
+    pub energy_cause: TailCause,
 }
 
 impl ClassCalibration {
@@ -690,7 +698,8 @@ struct PointEvidence {
 /// A history point in the **posterior's** jurisdiction (fix round 3, the variance inflation): the
 /// geometries where the model's predictive std decided or would have decided — the class
 /// verdict's jurisdiction (audits, rule-4b fallbacks) plus the fallbacks rules 6/7 refused alone
-/// (codes 14, 15) and those the class and rules 6/7 refused together (code 21). Not rules
+/// (codes 14, 15; code 24 where only the tail-aware factor refused, trust tightening Task 6) and
+/// those the class and rules 6/7 refused together (code 21). Not rules
 /// 5/5a–5e or the fences: those refuse whatever the std says (the extrapolating posterior's z rms
 /// 12–54 there argues for those rules, not for the std inside their reach).
 fn in_posterior_jurisdiction(kind: PointKind) -> bool {
@@ -700,6 +709,7 @@ fn in_posterior_jurisdiction(kind: PointKind) -> bool {
             in_jurisdiction(kind)
                 || rule == super::history_rule_code(TeachRule::ForceUncertainty)
                 || rule == super::history_rule_code(TeachRule::EnergyUncertainty)
+                || rule == super::HISTORY_RULE_TAIL_INFLATION
                 || rule == super::HISTORY_RULE_CLASS_AND_VARIANCE
         }
     }
@@ -864,7 +874,7 @@ pub fn calibrate_with(history: &AuditHistory, policy: &FallbackPolicy, aleatoric
 /// (module doc).
 fn summarise(all: &[&PointEvidence], posterior: &[&PointEvidence], answer: &[&AnswerEvidence]) -> ClassCalibration {
     let (inflation_var, inflation_points, inflation_raw) = variance_inflation(posterior);
-    let (tail_inflation, energy_inflation, answer_points) = tail_inflations(answer);
+    let ((tail_inflation, tail_cause), (energy_inflation, energy_cause), answer_points) = tail_inflations(answer);
     let from = window_from(all);
     let inside = |e: &&&PointEvidence| from.is_none_or(|g| e.gen >= g);
     let audits: Vec<&PointEvidence> = all.iter().filter(inside).filter(|e| e.audit).copied().collect();
@@ -878,7 +888,7 @@ fn summarise(all: &[&PointEvidence], posterior: &[&PointEvidence], answer: &[&An
     let floor_points = floor_ids.len();
     let fits = floor_ids.iter().collect::<BTreeSet<_>>().len();
     if points == 0 {
-        return ClassCalibration { factor: 1.0, audits: 0, fallbacks: 0, evidence: 0, points: 0, aged, window_from: None, z_rms: f64::NAN, measured: f64::NAN, measured_energy: f64::NAN, worst_atom: 0.0, inflation: inflation_var, inflation_points, inflation_raw, fits, floor_points, tail_inflation, energy_inflation, answer_points };
+        return ClassCalibration { factor: 1.0, audits: 0, fallbacks: 0, evidence: 0, points: 0, aged, window_from: None, z_rms: f64::NAN, measured: f64::NAN, measured_energy: f64::NAN, worst_atom: 0.0, inflation: inflation_var, inflation_points, inflation_raw, fits, floor_points, tail_inflation, energy_inflation, answer_points, tail_cause, energy_cause };
     }
     // the fallbacks of the class together weigh at most the audits (never fewer than three);
     // the count in integers (review I1), the per-point weight only for the sums
@@ -892,7 +902,7 @@ fn summarise(all: &[&PointEvidence], posterior: &[&PointEvidence], answer: &[&An
     let measured = (sum(&|e| e.w2) / den).sqrt() * inflation;
     let measured_energy = (sum(&|e| e.e2) / den).sqrt() * inflation;
     let worst_atom = audits.iter().chain(&fallbacks).map(|e| e.worst).fold(0.0f64, |m, w| if w.is_nan() || m.is_nan() { f64::NAN } else { m.max(w) });
-    ClassCalibration { factor: z_rms.max(1.0) * inflation, audits: n_a, fallbacks: n_f, evidence, points, aged, window_from: from, z_rms, measured, measured_energy, worst_atom, inflation: inflation_var, inflation_points, inflation_raw, fits, floor_points, tail_inflation, energy_inflation, answer_points }
+    ClassCalibration { factor: z_rms.max(1.0) * inflation, audits: n_a, fallbacks: n_f, evidence, points, aged, window_from: from, z_rms, measured, measured_energy, worst_atom, inflation: inflation_var, inflation_points, inflation_raw, fits, floor_points, tail_inflation, energy_inflation, answer_points, tail_cause, energy_cause }
 }
 
 /// λ_c (module doc, "The variance inflation"): over the class's points in the posterior's
@@ -969,6 +979,24 @@ pub struct TailPoint {
 /// rev. 2 — the gate's own per-answer criterion).
 pub const ENERGY_MAX: f64 = 1.0;
 
+/// What decided a tail-aware inflation (module doc, "The one pass"): the first bad prefix's failing
+/// condition and the r of the group that made it bad — what a refusal at the factor names (Task 6).
+/// All values are ratios: bound units for λ_T, tier units for λ_E.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum TailCause {
+    /// Every admitted set is good: λ = 1.
+    #[default]
+    None,
+    /// The max condition: an item of the decisive group at `e`× the bound (tier) with the model's std
+    /// `r`× of it (the previous prefix was good, so the running max that fails is this group's).
+    Max { e: f64, r: f64 },
+    /// The rms condition on a set meeting the floor: its rms × (1 + 1/√(2n)) is `value` (> [`ENTER`])
+    /// over `points` points, the decisive group's std `r`× the bound (tier).
+    Rms { value: f64, points: usize, r: f64 },
+    /// A comparison in the sample is not a number: λ = NaN.
+    NotANumber,
+}
+
 /// What [`tail_factor`] reads of an item.
 trait Tail: Copy {
     fn point(&self) -> usize;
@@ -1035,19 +1063,19 @@ pub fn points_meet_floor(points: &[TailPoint]) -> bool {
 /// condition at [`WORST_ATOM`] = 3, the rms condition at [`ENTER`] on the sets `floor_met` (monotone
 /// in the set) accepts. ≥ 1; ∞ when a bad atom has r = 0; NaN when any r or e is NaN.
 pub fn tail_inflation(atoms: &[TailAtom], floor_met: impl Fn(&[TailAtom]) -> bool) -> f64 {
-    tail_factor(atoms, WORST_ATOM, floor_met)
+    tail_factor(atoms, WORST_ATOM, floor_met).0
 }
 
 /// λ_E over a key's answer-sample points with an epistemic energy std: as [`tail_inflation`], the
 /// max condition at [`ENERGY_MAX`] = 1× the tier.
 pub fn energy_inflation(points: &[TailPoint], floor_met: impl Fn(&[TailPoint]) -> bool) -> f64 {
-    tail_factor(points, ENERGY_MAX, floor_met)
+    tail_factor(points, ENERGY_MAX, floor_met).0
 }
 
 /// [`energy_inflation`] with another max condition: a test's counterfactual (rev. 1's 4.53).
 #[cfg(test)]
 pub(super) fn energy_inflation_with_max(points: &[TailPoint], max: f64, floor_met: impl Fn(&[TailPoint]) -> bool) -> f64 {
-    tail_factor(points, max, floor_met)
+    tail_factor(points, max, floor_met).0
 }
 
 /// Neumaier's compensated running sum (CLAUDE.md rule 4): the rms condition's Σ of per-point means,
@@ -1076,11 +1104,11 @@ impl Compensated {
 
 /// The smallest λ ≥ 1 with A(λ′) good for every λ′ ≥ λ (module doc, "The tail-aware inflations",
 /// "The one pass"): `max` the max condition's limit, the rms condition at [`ENTER`] on the prefixes
-/// `floor_met` accepts.
-fn tail_factor<T: Tail>(items: &[T], max: f64, floor_met: impl Fn(&[T]) -> bool) -> f64 {
+/// `floor_met` accepts. With it, what decided ([`TailCause`]).
+fn tail_factor<T: Tail>(items: &[T], max: f64, floor_met: impl Fn(&[T]) -> bool) -> (f64, TailCause) {
     // any NaN, admitted or not: the inflation is undefined (M1)
     if items.iter().any(|t| t.r().is_nan() || t.e().is_nan()) {
-        return f64::NAN;
+        return (f64::NAN, TailCause::NotANumber);
     }
     // admitted at some λ ≥ 1 (λ·r ≤ 1 needs r ≤ 1), and not e = r = 0 (no draw: adds nothing)
     let mut a: Vec<T> = items.iter().copied().filter(|t| t.r() <= 1.0 && !(t.r() == 0.0 && t.e() == 0.0)).collect();
@@ -1120,21 +1148,24 @@ fn tail_factor<T: Tail>(items: &[T], max: f64, floor_met: impl Fn(&[T]) -> bool)
             j += 1;
         }
         // (an infinite e fails the max first, so a NaN the sum may then hold is never read)
-        let good = worst <= max && {
-            j < first_floor || {
-                let n_a = per_point.len() as f64;
-                let v = total.value() / n_a;
-                let v = if v < 0.0 { 0.0 } else { v }; // rounding below 0; a NaN stays NaN and fails
-                v.sqrt() * (1.0 + 1.0 / (2.0 * n_a).sqrt()) <= ENTER
-            }
+        let cause = if !(worst <= max) {
+            Some(TailCause::Max { e: worst, r })
+        } else if j < first_floor {
+            None
+        } else {
+            let n_a = per_point.len() as f64;
+            let v = total.value() / n_a;
+            let v = if v < 0.0 { 0.0 } else { v }; // rounding below 0; a NaN stays NaN and fails
+            let value = v.sqrt() * (1.0 + 1.0 / (2.0 * n_a).sqrt());
+            (!(value <= ENTER)).then_some(TailCause::Rms { value, points: per_point.len(), r })
         };
-        if !good {
+        if let Some(cause) = cause {
             // λ·r > 1 excludes this group; no finite λ excludes r = 0
-            return if r <= 0.0 { f64::INFINITY } else { (1.0 / r).next_up() };
+            return (if r <= 0.0 { f64::INFINITY } else { (1.0 / r).next_up() }, cause);
         }
         i = j;
     }
-    1.0
+    (1.0, TailCause::None)
 }
 
 /// One answer-sample point's measurements over the atoms of one class or key (module doc): per
@@ -1163,7 +1194,9 @@ fn answer_evidence(p: &AuditPoint, atoms: &[usize], policy: &FallbackPolicy) -> 
             (p.pred_force_std_epistemic[j] / SQRT_3 / rule6, p.err_force[j] / SQRT_3 / bound)
         })
         .collect();
-    let (n, tier) = (p.n_atoms.max(1) as f64, policy.energy_std_per_atom);
+    // N: rule 7's own normalisation, through the one shared function (spec §5; `atoms` is not empty,
+    // so n_atoms ≥ 1)
+    let (n, tier) = (super::policy::energy_atoms(p.n_atoms), policy.energy_std_per_atom);
     Some(AnswerEvidence {
         gen: p.model_gen,
         // as the evidence floor: a point counts only with species and a fit id
@@ -1173,14 +1206,15 @@ fn answer_evidence(p: &AuditPoint, atoms: &[usize], policy: &FallbackPolicy) -> 
     })
 }
 
-/// (λ_T, λ_E, the P_A points in the window) of one class or key: over its own window of the newest
-/// generations holding [`WINDOW_POINTS`] of its P_A points (module doc, "The window").
-fn tail_inflations(points: &[&AnswerEvidence]) -> (f64, f64, usize) {
+/// (λ_T, λ_E — each with its cause — and the P_A points in the window) of one class or key: over its
+/// own window of the newest generations holding [`WINDOW_POINTS`] of its P_A points (module doc,
+/// "The window").
+fn tail_inflations(points: &[&AnswerEvidence]) -> ((f64, TailCause), (f64, TailCause), usize) {
     let from = window_from_gens(points.iter().map(|p| p.gen));
     let inside: Vec<&AnswerEvidence> = points.iter().filter(|p| from.is_none_or(|g| p.gen >= g)).copied().collect();
     let atoms: Vec<TailAtom> = inside.iter().enumerate().flat_map(|(i, p)| p.atoms.iter().map(move |&(r, e)| TailAtom { point: i, fit: p.fit, r, e })).collect();
     let energies: Vec<TailPoint> = inside.iter().enumerate().filter_map(|(i, p)| p.energy.map(|(r, e)| TailPoint { point: i, fit: p.fit, r, e })).collect();
-    (tail_inflation(&atoms, atoms_meet_floor), energy_inflation(&energies, points_meet_floor), inside.len())
+    (tail_factor(&atoms, WORST_ATOM, atoms_meet_floor), tail_factor(&energies, ENERGY_MAX, points_meet_floor), inside.len())
 }
 
 /// What the refusal's words read (a `ClassLoo` holds all of it; `class_verdict` passes its own).

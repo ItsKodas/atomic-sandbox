@@ -46,6 +46,7 @@
 use super::*;
 use sim::activity::{StuckInfo, TeachRule, TrustCheck, TrustKey};
 use sim::ClassKey;
+use super::policy::KeyFactors;
 
 /// Trust rule: both residual degrees of freedom of the fit must reach this.
 pub const MIN_RESIDUAL_DOF: f64 = 30.0;
@@ -896,22 +897,56 @@ impl SurrogateKs {
             .collect()
     }
 
-    /// λ of an environment key (`calibrate`, "The variance inflation"; per key since M8a user-test
-    /// fix 2): its verdict's, or — for a key no fitted atom and no attributed point holds — the
-    /// calibration its class's species-less points give; 1 before the first fit.
-    pub(super) fn key_inflation(&self, k: &surrogate::EnvKey) -> f64 {
+    /// The inflations rules 6 and 7 read for an environment key (trust tightening, spec 2026-11-18
+    /// §4): (λ_F, λ_E) with λ_F = max(λ_sum, λ_T) — [`key_factors`](Self::key_factors)' parts. The
+    /// max propagates NaN (`max_nan`, never `f64::max`), and a NaN or ∞ factor refuses (M1). The
+    /// rules read [`key_factors`](Self::key_factors) itself (their words name the cause); this is
+    /// the pair the tests and the Model tab's readout (plan Task 8) read.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn key_inflations(&self, k: &surrogate::EnvKey) -> (f64, f64) {
+        let f = self.key_factors(k);
+        (f.force(), f.energy)
+    }
+
+    /// The three factors of an environment key, from the calibration of the last refit, install
+    /// or policy change (`refit_cal`: they never move on a step they decided), with what decided
+    /// the tail-aware ones (the refusal's words):
+    ///
+    /// - **λ_sum** (`calibrate`, "The variance inflation"; per key since M8a user-test fix 2): its
+    ///   verdict's, or — for a key no fitted atom and no attributed point holds — the calibration
+    ///   its class's species-less points give. A key with fewer than `MIN_EVIDENCE` (3) points of
+    ///   its own posterior evidence takes its class's λ_sum as a floor (user-fix-2 physics review,
+    ///   Important: a sparse key must not drop to λ = 1 where its class measured 17.6).
+    /// - **λ_T, λ_E** (`calibrate`, "The tail-aware inflations"): the key's own; a **sparse key**
+    ///   (fewer than `MIN_EVIDENCE` points of its own answer sample P_A in the window) takes its
+    ///   class's λ_T and λ_E as floors (spec §4, M2), the same rule as λ_sum's.
+    ///
+    /// All 1 before the first fit (no judge: the shown λ_sum, if any, and no tail evidence).
+    pub(super) fn key_factors(&self, k: &surrogate::EnvKey) -> KeyFactors {
         let c = (k.class as usize).wrapping_sub(1);
         let shown = self.class_loo.get(c).and_then(|l| l.species.iter().find(|s| s.z == k.z && s.neighbours == k.neighbours)).map(|s| s.inflation);
-        let Some(j) = self.class_judge.as_ref() else { return shown.unwrap_or(1.0) };
+        let Some(j) = self.class_judge.as_ref() else { return KeyFactors { sum: shown.unwrap_or(1.0), ..KeyFactors::ONE } };
         let own = j.refit_cal.key(k);
-        let lambda = shown.unwrap_or(own.inflation);
-        // a key with too little evidence of its own (fewer than MIN_EVIDENCE points: its λ is the
-        // floor 1) runs rule 6 at its class's measured λ, never looser (user-fix-2 physics review,
-        // Important: a sparse key must not drop to λ = 1 where its class measured 17.6)
+        let class = j.refit_cal.per_class.get(c);
+        let mut sum = shown.unwrap_or(own.inflation);
         if own.inflation_points < super::calibrate::MIN_EVIDENCE {
-            return j.refit_cal.per_class.get(c).map_or(lambda, |cl| lambda.max(cl.inflation));
+            if let Some(cl) = class {
+                sum = max_nan(sum, cl.inflation);
+            }
         }
-        lambda
+        let mut f = KeyFactors { sum, tail: own.tail_inflation, energy: own.energy_inflation, tail_cause: own.tail_cause, energy_cause: own.energy_cause, tail_from_class: false, energy_from_class: false };
+        if own.answer_points < super::calibrate::MIN_EVIDENCE {
+            if let Some(cl) = class {
+                // the class's factor (and its cause) where it is the larger, or not a number
+                if !(cl.tail_inflation <= f.tail) && !f.tail.is_nan() {
+                    (f.tail, f.tail_cause, f.tail_from_class) = (cl.tail_inflation, cl.tail_cause, true);
+                }
+                if !(cl.energy_inflation <= f.energy) && !f.energy.is_nan() {
+                    (f.energy, f.energy_cause, f.energy_from_class) = (cl.energy_inflation, cl.energy_cause, true);
+                }
+            }
+        }
+        f
     }
 
     /// The class-wise trust numbers (module doc, "Class-wise trust"): for every fitted sample (the

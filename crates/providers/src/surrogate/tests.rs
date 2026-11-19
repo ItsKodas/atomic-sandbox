@@ -8587,9 +8587,11 @@ fn fallback_steps_are_recorded_in_the_history_with_their_rule() {
     assert_eq!(codes.len(), rules.len(), "distinct codes");
     assert!(codes.iter().all(|&c| history_rule_name(c) != "?"));
     assert!(!codes.contains(&HISTORY_RULE_CLASS_AND_VARIANCE) && history_rule_name(HISTORY_RULE_CLASS_AND_VARIANCE) != "?", "code 21 is the provider's own, beside the rules'");
-    // 22 is the capped segment's (M8a Task 10), 23 `NearMisfit`'s (spec 2026-11-13 §4.3); the
-    // next code is unnamed
-    assert_eq!(history_rule_name(24), "?");
+    // 22 is the capped segment's (M8a Task 10), 23 `NearMisfit`'s (spec 2026-11-13 §4.3), 24 the
+    // tail-aware inflations' (trust tightening Task 6: the provider's own, like 21); the next code
+    // is unnamed
+    assert!(!codes.contains(&HISTORY_RULE_TAIL_INFLATION) && history_rule_name(HISTORY_RULE_TAIL_INFLATION) != "?");
+    assert_eq!(history_rule_name(25), "?");
     // the sidecar keeps the kind
     let path = std::env::temp_dir().join(format!("fallback-history-{}.model", std::process::id()));
     s.save_sidecar(&path).unwrap();
@@ -12184,8 +12186,9 @@ fn the_cadence_flag_does_not_follow_refusals() {
         let m = s.model().unwrap();
         let p = m.predict(&pos, &z, true).unwrap();
         let infl = s.atom_inflation(m, &pos, &z);
-        let f = p.force_std_epistemic.as_ref().unwrap().iter().zip(&p.forces).zip(&infl).map(|((sd, f), l)| sd / 3f64.sqrt() * l / s.policy().force_bound((f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt())).fold(0.0, f64::max);
-        let e = epistemic_energy_std(m, pos.len(), p.energy_std.unwrap()) / pos.len() as f64 * infl.iter().copied().fold(1.0, f64::max) / s.policy().energy_std_per_atom;
+        // rule 6 at λ_F, rule 7 at max(max λ_F, max λ_E) (trust tightening Task 6)
+        let f = p.force_std_epistemic.as_ref().unwrap().iter().zip(&p.forces).zip(&infl).map(|((sd, f), l)| sd / 3f64.sqrt() * l.force() / s.policy().force_bound((f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt())).fold(0.0, f64::max);
+        let e = epistemic_energy_std(m, pos.len(), p.energy_std.unwrap()) / pos.len() as f64 * infl.iter().map(|l| l.force().max(l.energy)).fold(1.0, f64::max) / s.policy().energy_std_per_atom;
         f.max(e)
     };
     let ratios: Vec<f64> = (0..steps).map(|i| worst_ratio(&base, &scene(i))).collect();
@@ -13132,4 +13135,350 @@ fn a_point_records_the_model_force_rule_6_bounds_with() {
     let want: Vec<f64> = f.iter().map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt()).collect();
     println!("|F_m| {:?} (|F_t| {:?})", p.model_force, p.teacher_force);
     assert_eq!(p.model_force.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), want.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+}
+
+// ---- trust tightening Task 6 (spec 2026-11-18 §4): rules 6 and 7 on λ_F and λ_E; code 24 ----
+
+/// The dimer model with its pair class judged and trusted, every consultation through rules 6–7
+/// (variance cadence 1), no audits: it answers `h2(1.6)` (each test asserts it). The noise-free
+/// Morse posterior puts rule 6 at ≈ 5e-7 of the bound there; its epistemic stds are scaled so the
+/// worst atom sits at 0.13 of it (the hot run's confident atom), so the factors that refuse are of
+/// the size the spec discusses (≈ 15) rather than ≈ 10⁶.
+fn inflations_fixture() -> SurrogateKs {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, variance_cadence: 1, ..FallbackPolicy::default() });
+    assert!(s.class_judge.is_some() && s.class_loo()[0].trusted, "the premise: a judged, trusted pair class");
+    let (r6, _, _) = sum_ratios(&s, &h2(1.6));
+    scale_epistemic(&mut s, 0.13 / r6);
+    s
+}
+
+/// Sets a key's λ_T and λ_E (with what decided them) and its P_A count in the refit's calibration —
+/// what a refit would have measured — and drops the cached variance verdict, as
+/// `refresh_class_loo` does.
+fn set_key_tail(s: &mut SurrogateKs, k: &surrogate::EnvKey, tail: (f64, calibrate::TailCause), energy: (f64, calibrate::TailCause), answer_points: usize) {
+    let j = s.class_judge.as_mut().expect("a class judge");
+    let base = j.refit_cal.key(k);
+    j.refit_cal.per_key.insert(k.clone(), calibrate::ClassCalibration { tail_inflation: tail.0, tail_cause: tail.1, energy_inflation: energy.0, energy_cause: energy.1, answer_points, ..base });
+    s.last_variance = None;
+}
+
+/// Sets a key's λ_sum where rule 6 reads it (the class verdict's species readout and the refit's
+/// calibration, with enough points of its own).
+fn set_key_sum(s: &mut SurrogateKs, k: &surrogate::EnvKey, lambda: f64) {
+    for sp in s.class_loo[0].species.iter_mut().filter(|sp| sp.z == k.z && sp.neighbours == k.neighbours) {
+        sp.inflation = lambda;
+    }
+    let j = s.class_judge.as_mut().expect("a class judge");
+    let base = j.refit_cal.key(k);
+    j.refit_cal.per_key.insert(k.clone(), calibrate::ClassCalibration { inflation: lambda, inflation_points: 10, ..base });
+    s.last_variance = None;
+}
+
+/// At `sc`: rule 6's worst atom ratio and rule 7's ratio at λ_sum (the factors of before), and the
+/// largest λ_sum among its atoms.
+fn sum_ratios(s: &SurrogateKs, sc: &Scene) -> (f64, f64, f64) {
+    let (pos, z) = pos_z(sc);
+    let m = s.model().unwrap();
+    let p = m.predict(&pos, &z, true).unwrap();
+    let infl = s.atom_inflation(m, &pos, &z);
+    let norm = |f: &[f64; 3]| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
+    let r6 = p.force_std_epistemic.as_ref().unwrap().iter().zip(&p.forces).zip(&infl).map(|((sd, f), l)| sd / 3f64.sqrt() * l.sum / s.policy().force_bound(norm(f))).fold(0.0, f64::max);
+    let lsum = infl.iter().map(|l| l.sum).fold(1.0, f64::max);
+    let r7 = epistemic_energy_std(m, pos.len(), p.energy_std.unwrap()) / pos.len() as f64 * lsum / s.policy().energy_std_per_atom;
+    (r6, r7, lsum)
+}
+
+/// One step at `sc`: its source, its history point's code (`None` when it left none) and its note.
+fn inflation_step(s: &mut SurrogateKs, sc: &Scene) -> (Source, Option<u8>, String) {
+    use surrogate::history::PointKind;
+    let before = s.audit_history().recorded();
+    let r = s.evaluate(sc, &mut never()).unwrap();
+    let code = (s.audit_history().recorded() > before).then(|| match last_point(s).kind {
+        PointKind::Fallback { rule } => rule,
+        PointKind::Audit => panic!("no audits here"),
+    });
+    (r.stats.source, code, r.stats.notes.first().cloned().unwrap_or_default())
+}
+
+/// Spec §4 (M2): a **sparse key** — fewer than 3 points of its own answer sample P_A in the window —
+/// takes its class's λ_T and λ_E as floors, as λ_sum takes its class's; with 3 it keeps its own, and
+/// one above its class keeps its own. A NaN class factor reaches a sparse key (`max_nan`, never
+/// `f64::max`). Through `evaluate`: the sparse key at its class's λ_T is refused (code 24) where
+/// its own λ_T of 1 answers, the note saying the factor is its class's; with 3 own points it answers.
+#[test]
+fn a_sparse_key_takes_its_class_inflations_as_floors() {
+    use calibrate::TailCause;
+    let mut s = inflations_fixture();
+    let (k, sc) = (hk_pair(), h2(1.6));
+    let (r6, _, lsum) = sum_ratios(&s, &sc);
+    assert_eq!(s.key_inflations(&k), (lsum, 1.0), "the premise: no tail evidence");
+    // the class's λ_T puts rule 6 at 2× the bound here
+    let class_t = 2.0 * lsum / r6;
+    let set_class = |s: &mut SurrogateKs, t: f64, e: f64| {
+        let c = &mut s.class_judge.as_mut().unwrap().refit_cal.per_class[0];
+        (c.tail_inflation, c.tail_cause, c.energy_inflation, c.energy_cause) = (t, TailCause::Max { e: 4.5, r: 0.13 }, e, TailCause::Max { e: 1.2, r: 0.3 });
+        s.last_variance = None;
+    };
+    set_class(&mut s, class_t, 3.0);
+    println!("λ_sum {lsum}, rule 6 at λ_sum {r6:.3e}; the class's λ_T {class_t:.3}, λ_E 3");
+    for own in [0, 1, 2] {
+        set_key_tail(&mut s, &k, (1.0, TailCause::None), (1.0, TailCause::None), own);
+        assert_eq!(s.key_inflations(&k), (class_t.max(lsum), 3.0), "{own} own points: the class's floors");
+    }
+    set_key_tail(&mut s, &k, (1.0, TailCause::None), (1.0, TailCause::None), 3);
+    assert_eq!(s.key_inflations(&k), (lsum, 1.0), "3 own points: its own");
+    set_key_tail(&mut s, &k, (2.0 * class_t, TailCause::Max { e: 9.0, r: 0.1 }), (6.0, TailCause::Max { e: 2.0, r: 0.2 }), 2);
+    assert_eq!(s.key_inflations(&k), (2.0 * class_t, 6.0), "above its class: its own");
+    assert_eq!(s.key_factors(&k).sum, lsum, "λ_sum's own rule is untouched");
+    // NaN class factors reach a sparse key
+    set_class(&mut s, f64::NAN, f64::NAN);
+    set_key_tail(&mut s, &k, (1.0, TailCause::None), (1.0, TailCause::None), 2);
+    let (f, e) = s.key_inflations(&k);
+    assert!(f.is_nan() && e.is_nan(), "a sparse key at NaN class factors: ({f}, {e})");
+    set_key_tail(&mut s, &k, (1.0, TailCause::None), (1.0, TailCause::None), 3);
+    assert_eq!(s.key_inflations(&k), (lsum, 1.0), "not sparse: its own");
+    // through `evaluate`
+    set_class(&mut s, class_t, 1.0);
+    set_key_tail(&mut s, &k, (1.0, TailCause::None), (1.0, TailCause::None), 3);
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    assert_eq!((src, code), (Source::Surrogate, None), "its own λ_T of 1: answered ({note})");
+    set_key_tail(&mut s, &k, (1.0, TailCause::None), (1.0, TailCause::None), 2);
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    println!("sparse: {note}");
+    assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "{note}");
+    assert!(
+        note.contains(&format!("(the model's std × λ_T {class_t:.1}, its class's (this environment has fewer than 3 checks of its own): a measured atom at 4.5× the bound with the model's std 0.13× of it)")),
+        "{note}"
+    );
+}
+
+/// Spec §4, code 24: a step rule 6 refuses only at λ_F = max(λ_sum, λ_T) — at λ_sum it passes — is
+/// a fallback coded 24, never in the answer sample P_A; the note names λ_T and its measured cause
+/// ("λ_T 7.7: a measured atom at 4.5× the bound with the model's std 0.13× of it"). A step that
+/// λ_sum already refuses is code 14 whatever λ_T is, and its words are byte-identical to before
+/// unless λ_T is the larger factor (at λ_T = 1 and at λ_T = λ_sum alike).
+#[test]
+fn a_step_refused_only_by_the_tail_inflation_is_code_24() {
+    use calibrate::TailCause;
+    let mut s = inflations_fixture();
+    let (k, sc) = (hk_pair(), h2(1.6));
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    assert_eq!((src, code), (Source::Surrogate, None), "the premise: answered at λ_sum ({note})");
+    let (r6, r7, lsum) = sum_ratios(&s, &sc);
+    let lt = 2.0 * lsum / r6;
+    println!("at λ_sum {lsum}: rule 6 {r6:.3e}, rule 7 {r7:.3e} of the limit; λ_T {lt:.3}");
+    let cause = TailCause::Max { e: 4.48, r: 0.13 };
+    set_key_tail(&mut s, &k, (lt, cause), (1.0, TailCause::None), 81);
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    println!("{note}");
+    assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "{note}");
+    let p = last_point(&s);
+    assert!(!calibrate::in_answer_sample(&p) && p.flags.has(surrogate::history::PointFlags::CADENCE_FRESH), "cadence-fresh, but λ selected it: {p:?}");
+    assert!(note.starts_with("surrogate: epistemic force std"), "rule 6 named it: {note}");
+    assert!(note.contains(&format!(" (the model's std × λ_T {lt:.1}: a measured atom at 4.5× the bound with the model's std 0.13× of it)")), "{note}");
+    assert_eq!(history_rule_name(HISTORY_RULE_TAIL_INFLATION), "rule 6/7 at the tail-aware inflation (passes at λ_sum)");
+    // refused at λ_sum already: code 14 whatever λ_T is (λ_sum 1.5 here, so its words are not empty)
+    set_key_sum(&mut s, &k, 1.5);
+    scale_epistemic(&mut s, 4.0 / r6);
+    set_key_tail(&mut s, &k, (1.0, TailCause::None), (1.0, TailCause::None), 81);
+    let (src, code, plain) = inflation_step(&mut s, &sc);
+    println!("{plain}");
+    assert_eq!((src, code), (Source::Fallback, Some(history_rule_code(TeachRule::ForceUncertainty))), "{plain}");
+    assert!(plain.contains(" (the model's std × 1.50, its measured calibration for this environment class)"), "the words of before: {plain}");
+    set_key_tail(&mut s, &k, (1.5, cause), (1.0, TailCause::None), 81);
+    let (src, code, same) = inflation_step(&mut s, &sc);
+    assert_eq!((src, code, &same), (Source::Fallback, Some(history_rule_code(TeachRule::ForceUncertainty)), &plain), "λ_T = λ_sum: byte-identical");
+    set_key_tail(&mut s, &k, (4.0 * lt, cause), (1.0, TailCause::None), 81);
+    let (src, code, named) = inflation_step(&mut s, &sc);
+    println!("{named}");
+    assert_eq!((src, code), (Source::Fallback, Some(history_rule_code(TeachRule::ForceUncertainty))), "refused at λ_sum: code 14");
+    assert!(named.contains(&format!("λ_T {:.1}: a measured atom at 4.5× the bound", 4.0 * lt)), "the larger factor is named: {named}");
+}
+
+/// Plan M1: a NaN factor refuses — λ_T NaN refuses rule 6 (code 24: at λ_sum it passes), λ_E NaN
+/// refuses rule 7 — and their words say the measurement is not a number; an infinite factor
+/// refuses an atom whose std is 0 (∞·0 counts as ∞: its ratio is ∞, never NaN) and rule 7 at an
+/// energy std of 0.
+#[test]
+fn a_nan_inflation_refuses() {
+    use calibrate::TailCause;
+    use sim::activity::TeachRule as R;
+    let mut s = inflations_fixture();
+    let (k, sc) = (hk_pair(), h2(1.6));
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    assert_eq!((src, code), (Source::Surrogate, None), "the premise: answered ({note})");
+    set_key_tail(&mut s, &k, (f64::NAN, TailCause::NotANumber), (1.0, TailCause::None), 81);
+    assert!(s.key_inflations(&k).0.is_nan());
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    println!("{note}");
+    assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "{note}");
+    assert!(note.starts_with("surrogate: epistemic force std NaN") && note.contains("(the model's std × λ_T NaN: a measured comparison is not a number; it lifts as the window ages)"), "{note}");
+    set_key_tail(&mut s, &k, (1.0, TailCause::None), (f64::NAN, TailCause::NotANumber), 81);
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    println!("{note}");
+    assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "{note}");
+    assert!(note.starts_with("surrogate: epistemic energy std NaN") && note.contains("λ_E NaN"), "{note}");
+    // ∞·0 = ∞
+    set_key_tail(&mut s, &k, (f64::INFINITY, TailCause::Max { e: 4.0, r: 0.0 }), (1.0, TailCause::None), 81);
+    let (pos, z) = pos_z(&sc);
+    let model = s.model().unwrap().clone();
+    let pred = model.predict(&pos, &z, true).unwrap();
+    let v = s.variance_check(&model, &pred, 0.0, &[0.0, 0.0], &pos, &z);
+    println!("{:?} {:?}", v.atoms, v.reason.as_ref().map(|r| &r.text));
+    assert!(!v.accept && v.by_tail && v.atoms == [f64::INFINITY; 2] && v.uncertainty == f64::INFINITY, "{:?}", v.atoms);
+    assert_eq!(v.reason.as_ref().map(|r| r.rule), Some(R::ForceUncertainty));
+    let (at_sum, r7) = s.energy_variance(&model, 2, 0.0, &s.atom_inflation(&model, &pos, &z));
+    assert!(at_sum && r7.is_some_and(|r| r.text.contains("λ_T = ∞")), "rule 7 at an energy std of 0 and λ_F ∞");
+}
+
+/// Review Focus 3 (spec §4, "No lockout follows"): a trusted key locked by λ_T = ∞ says so and keeps
+/// measuring. One calibration tick of H{H} (at a code-15 fallback: no solve, its stds at hand) with
+/// the model's force std 0 and both atoms' errors 4× the bound: at the next calibration of a refit
+/// (`refresh_class_loo`: the inflations move there, never on a step) λ_T = ∞. Every atom of the
+/// key is then refused (rule 6, code 24 — at λ_sum it answers), the note names λ_T = ∞, the
+/// measured atom and "lifts as the window ages", while the class panel still says trusted. The
+/// locked steps keep leaving history points (code 24, not in P_A: the factor never reads its own
+/// refusals), a tick at one of them would be in P_A, and recalibrating on them changes nothing.
+/// Once 300 newer answer-sample points have moved the window past the bad tick, the next
+/// calibration lifts λ_T and the step is answered again. (Ticks are generated from plan Task 7
+/// on; here they are recorded as Task 7 records them.)
+#[test]
+fn a_key_locked_by_its_tail_inflation_says_so_and_keeps_measuring() {
+    use sim::activity::TeachRule as R;
+    use surrogate::history::PointFlags;
+    let mut s = inflations_fixture();
+    let (k, sc) = (hk_pair(), h2(1.6));
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    assert_eq!((src, code), (Source::Surrogate, None), "the premise: answered ({note})");
+    let (lsum, le) = s.key_inflations(&k);
+    let (g, fit) = (s.model_gen, s.fit_id());
+    let code_15 = history_rule_code(R::EnergyUncertainty);
+    let tick = |r: f64, e: f64, gen: u64, fit: u64| surrogate::AuditPoint { model_gen: gen, ..answer_point(Some(code_15), r, e, fit, PointFlags::TICK, None) };
+    s.audit_history.push(tick(0.0, 4.0, g, fit));
+    s.refresh_class_loo();
+    let kf = s.key_factors(&k);
+    println!("before: λ_F {lsum}, λ_E {le}; after the tick: {kf:?}");
+    assert_eq!((kf.force(), kf.energy), (f64::INFINITY, 1.0), "{kf:?}");
+    assert!(s.class_loo()[0].trusted, "the panel says trusted");
+    // every atom of the key is refused
+    let v = s.atom_verdicts(&sc).unwrap();
+    assert!(v.atoms.iter().all(|a| *a == Some(R::ForceUncertainty)), "{:?}", v.atoms);
+    let mut note = String::new();
+    for _ in 0..5 {
+        let (src, code, n) = inflation_step(&mut s, &sc);
+        assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "{n}");
+        assert!(!calibrate::in_answer_sample(&last_point(&s)));
+        note = n;
+    }
+    println!("{note}");
+    assert!(note.contains("(the model's std × λ_T = ∞: a measured atom at 4.0× the bound where the model's std was 0; it lifts as the window ages)"), "{note}");
+    let mut p = last_point(&s);
+    p.flags = PointFlags(p.flags.0 | PointFlags::TICK);
+    assert!(calibrate::in_answer_sample(&p), "a tick at a locked step is in P_A");
+    s.refresh_class_loo();
+    assert_eq!(s.key_inflations(&k).0, f64::INFINITY, "its own refusals do not move it");
+    // the window ages: 300 benign ticks of a newer generation over 16 fits
+    for i in 0..300 {
+        s.audit_history.push(tick(0.3, 0.2, g + 1, (i % 16) as u64 + 1));
+    }
+    s.refresh_class_loo();
+    let kf = s.key_factors(&k);
+    println!("after 300 newer ticks: {kf:?}");
+    assert_eq!(kf.tail, 1.0, "{kf:?}");
+    assert!(kf.force().is_finite());
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    assert_eq!((src, code), (Source::Surrogate, None), "lifted: answered again ({note})");
+}
+
+/// Spec §4, rule 7: max(max_j λ_F(j), max_k λ_E(k))·σ_E,epi/N ≤ tier. With λ_T = 1 and λ_E set so
+/// rule 7 is at 2× the tier while every atom's rule 6 passes (its factor λ_sum unchanged), the step
+/// falls back on rule 7, coded 24, and the note names λ_E and its measured energy. At the verdict
+/// itself, with σ_E,epi/N = 0.5× the tier: the factor is the max of both — λ_T 3 alone refuses
+/// (λ_T named), λ_T 1.5 passes, λ_E 3 above λ_T 2.5 refuses (λ_E named), λ_E 2.5 below λ_T 3 does
+/// not lower it (λ_T named), and a NaN in either refuses; at λ_sum alone all of them pass.
+#[test]
+fn rule_7_uses_the_energy_inflation_while_forces_pass() {
+    use calibrate::TailCause;
+    use sim::activity::TeachRule as R;
+    let mut s = inflations_fixture();
+    let (k, sc) = (hk_pair(), h2(1.6));
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    assert_eq!((src, code), (Source::Surrogate, None), "the premise: answered ({note})");
+    let (r6, r7, lsum) = sum_ratios(&s, &sc);
+    let le = 2.0 * lsum / r7;
+    println!("at λ_sum {lsum}: rule 6 {r6:.3e}, rule 7 {r7:.3e}; λ_E {le:.3}");
+    set_key_tail(&mut s, &k, (1.0, TailCause::None), (le, TailCause::Max { e: 1.2, r: 0.2 }), 81);
+    let (pos, z) = pos_z(&sc);
+    let model = s.model().unwrap().clone();
+    let pred = model.predict(&pos, &z, true).unwrap();
+    let v = s.variance_check(&model, &pred, pred.energy_std.unwrap(), pred.force_std_epistemic.as_ref().unwrap(), &pos, &z);
+    assert!(v.atoms.iter().all(|&a| a <= 1.0) && v.by_tail && v.reason.as_ref().map(|r| r.rule) == Some(R::EnergyUncertainty), "rule 6 passes on every atom: {:?}", v.atoms);
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    println!("{note}");
+    assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "{note}");
+    assert!(note.starts_with("surrogate: epistemic energy std"), "{note}");
+    assert!(note.contains(&format!(" (the model's std × λ_E {le:.1}: a measured energy at 1.2× the tier with the model's std 0.20× of it)")), "{note}");
+    // the factor at the verdict, σ_E,epi/N = 0.5× the tier
+    let n = 2usize;
+    let tier = s.policy().energy_std_per_atom;
+    let floor = if model.energy_per_atom { n as f64 * model.sigma_e } else { model.sigma_e };
+    let e_std = (floor * floor + (0.5 * tier * n as f64).powi(2)).sqrt();
+    let epi = epistemic_energy_std(&model, n, e_std) / n as f64 / tier;
+    assert!((epi - 0.5).abs() < 1e-9, "{epi}");
+    let at = |tail: f64, energy: f64| {
+        let f = KeyFactors { tail, energy, tail_cause: TailCause::Max { e: 4.0, r: 0.2 }, energy_cause: TailCause::Max { e: 1.3, r: 0.25 }, ..KeyFactors::ONE };
+        s.energy_variance(&model, n, e_std, &[KeyFactors::ONE, f])
+    };
+    let words = |r: &Option<Refusal>| r.as_ref().map(|r| r.text.clone()).unwrap_or_default();
+    let (sum_ok, r) = at(3.0, 1.0);
+    assert!(sum_ok && words(&r).contains("λ_T 3.0: a measured atom at 4.0× the bound"), "λ_T alone: {}", words(&r));
+    assert!(at(1.5, 1.0).1.is_none(), "1.5 × 0.5 ≤ 1");
+    let (sum_ok, r) = at(2.5, 3.0);
+    assert!(sum_ok && words(&r).contains("λ_E 3.0: a measured energy at 1.3× the tier"), "{}", words(&r));
+    let (sum_ok, r) = at(3.0, 2.5);
+    assert!(sum_ok && words(&r).contains("λ_T 3.0"), "λ_E below λ_F does not lower it: {}", words(&r));
+    for (t, e) in [(f64::NAN, 1.0), (1.0, f64::NAN)] {
+        let (sum_ok, r) = at(t, e);
+        assert!(sum_ok && r.is_some(), "NaN ({t}, {e}) refuses");
+    }
+}
+
+/// Task 6: what decided a tail-aware inflation is carried with it, and the refusal names it.
+/// Through `calibrate`: the measured tail (80 benign points and one at r 0.13, e/b 4.48) is the max
+/// condition at that atom; 80 points at e/b 0.8 fail the rms from the floor on (60 points, 0.873 ×
+/// ENTER's 0.707); a NaN comparison is not a number; a benign sample decided nothing. The rms words
+/// through `evaluate`: "the measured error rms 0.87× the bound over 60 checks, limit 0.71, with the
+/// model's std up to 0.50× of it".
+#[test]
+fn the_inflations_name_their_cause() {
+    use calibrate::TailCause;
+    use surrogate::history::PointFlags;
+    let pol = FallbackPolicy::default();
+    let cf = PointFlags::CADENCE_FRESH;
+    assert_eq!(calibrate::calibrate(&benign_answers(80, 16), &pol).key(&hk_pair()).tail_cause, TailCause::None);
+    let mut h = benign_answers(80, 16);
+    h.push(answer_point(Some(code_pair()), 0.13, 4.48, 1, cf, Some((0.1, 0.05))));
+    let kc = calibrate::calibrate(&h, &pol).key(&hk_pair());
+    println!("{:?}", kc.tail_cause);
+    assert!(matches!(kc.tail_cause, TailCause::Max { e, r } if (e - 4.48).abs() < 1e-9 && (r - 0.13).abs() < 1e-9), "{:?}", kc.tail_cause);
+    let r_of = |i: usize| 0.1 + 0.8 * i as f64 / 79.0;
+    let mut h = surrogate::AuditHistory::default();
+    for i in 0..80 {
+        h.push(answer_point(Some(code_pair()), r_of(i), 0.8, (i % 16) as u64 + 1, cf, None));
+    }
+    let kc = calibrate::calibrate(&h, &pol).key(&hk_pair());
+    println!("{:?}", kc.tail_cause);
+    assert!(matches!(kc.tail_cause, TailCause::Rms { value, points: 60, r } if value > ENTER && (value - 0.8 * (1.0 + 1.0 / 120f64.sqrt())).abs() < 1e-9 && (r - r_of(59)).abs() < 1e-9), "{:?}", kc.tail_cause);
+    let mut h = benign_answers(20, 4);
+    h.push(answer_point(Some(code_pair()), 0.3, 0.2, 1, cf, Some((0.2, f64::NAN))));
+    assert_eq!(calibrate::calibrate(&h, &pol).key(&hk_pair()).energy_cause, TailCause::NotANumber);
+    // the rms words
+    let mut s = inflations_fixture();
+    let (k, sc) = (hk_pair(), h2(1.6));
+    let (r6, _, lsum) = sum_ratios(&s, &sc);
+    set_key_tail(&mut s, &k, (2.0 * lsum / r6, TailCause::Rms { value: 0.873, points: 60, r: 0.5 }), (1.0, TailCause::None), 81);
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    println!("{note}");
+    assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "{note}");
+    assert!(note.contains(": the measured error rms 0.87× the bound over 60 checks, limit 0.71, with the model's std up to 0.50× of it)"), "{note}");
 }

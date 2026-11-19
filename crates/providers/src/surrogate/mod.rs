@@ -201,6 +201,22 @@
 //!    geometries where the std decides (audits, rule-4b and rule-6/7 fallbacks), ≥ 1, used from
 //!    three comparisons on. A refusal it decides says "(the model's std × λ, its measured
 //!    calibration for this environment class)".
+//!
+//!    **And by the tail-aware inflations** (trust tightening, spec 2026-11-18 §4; [`calibrate`],
+//!    "The tail-aware inflations"): per environment key, λ_F(j) = max(λ_sum, λ_T) on atom j's
+//!    force std (rule 6) and max(max_j λ_F(j), max_k λ_E(k)) on σ_E,epi/N (rule 7), N the
+//!    normalisation rule 7 and λ_E share (`policy::energy_atoms`). λ_T and λ_E ask rule 6/7's own
+//!    question of the measured answer sample P_A: the smallest factor at which every measured
+//!    atom (point) the rule would admit is within `WORST_ATOM` (3× the bound; λ_E: 1× the tier)
+//!    and, from the evidence floor on, its rms within `ENTER`. A key with fewer than 3 P_A points
+//!    of its own takes its class's λ_T and λ_E as floors. The bounds and the tier never move; every
+//!    factor is ≥ 1; a NaN or ∞ factor refuses (∞·0 counts as ∞). The factors move at refits,
+//!    installs and policy changes only (`refit_cal`), never on a step they decided. A step refused
+//!    only by λ_T or λ_E — it passes at λ_sum — is history code 24
+//!    ([`HISTORY_RULE_TAIL_INFLATION`]), never in P_A; its words name the factor and its measured
+//!    cause ("(the model's std × λ_T 7.7: a measured atom at 4.5× the bound with the model's std
+//!    0.13× of it)"; at ∞ "… it lifts as the window ages"), and are byte-identical to the λ_sum
+//!    words when λ_sum is the larger.
 //! 8. **Audit** (ruling S7): every `audit_every`-th step the model answers (2000 by default;
 //!    0 disables) the teacher checks it at that geometry, the sample is kept and the gap is
 //!    recorded ([`SurrogateKs::last_audit`]). If |gap|/N > `energy_std_per_atom` — or, since
@@ -1280,7 +1296,7 @@ use ledger::*;
 use lone::Lone;
 use policy::*;
 use quarantine::*;
-pub use audit::{history_rule_code, history_rule_name, AuditRecord, AuditVerdict, HISTORY_RULE_CLASS_AND_VARIANCE};
+pub use audit::{history_rule_code, history_rule_name, AuditRecord, AuditVerdict, HISTORY_RULE_CLASS_AND_VARIANCE, HISTORY_RULE_TAIL_INFLATION};
 pub use calibrate::{calibrate, refusal_words, Calibration, ClassCalibration, ClassStats, ClassVerdict, WordsInput, ENTER, FLOOR_FITS, FLOOR_POINTS, LEAVE, MIN_EVIDENCE, WINDOW_POINTS, WORST_ATOM};
 pub use ledger::EVENT_QUEUE;
 pub(crate) use policy::PSEUDO_FORCE_NOISE;
@@ -2531,6 +2547,7 @@ impl ForceProvider for SurrogateKs {
                 if let Some((nu, at)) = novelty(self.null_space.as_ref()) {
                     v.accept = false;
                     v.novel = true;
+                    v.by_tail = false;
                     v.reason = Some(novelty_refusal(nu, at));
                     novel_bit = true;
                 }
@@ -2666,9 +2683,12 @@ impl ForceProvider for SurrogateKs {
         // the history's rule code of this step's fallback point, from the rule that fired (before
         // the relax verification overrides the reason — the Task 1 re-review's Minor 1): a class
         // refusal the variance verdict would have refused as well is coded apart, since the model
-        // would not have answered it had the class been trusted (M8a Task 2, `calibrate`)
+        // would not have answered it had the class been trusted (M8a Task 2, `calibrate`); a rule-6/7
+        // refusal that passes at λ_sum — only λ_T or λ_E refused — is coded apart as well (trust
+        // tightening, spec 2026-11-18 §4: λ selected it, so it is never in the answer sample P_A)
         let history_rule = match reason.as_ref() {
             Some(r) if matches!(r.rule, TeachRule::Class(_)) && !variance.accept => HISTORY_RULE_CLASS_AND_VARIANCE,
+            Some(r) if matches!(r.rule, TeachRule::ForceUncertainty | TeachRule::EnergyUncertainty) && variance.by_tail => HISTORY_RULE_TAIL_INFLATION,
             Some(r) => history_rule_code(r.rule),
             None => history_rule_code(TeachRule::RelaxVerification),
         };
