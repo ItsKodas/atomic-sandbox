@@ -1203,6 +1203,20 @@ review: 0 Critical, 0 Important, 8 Minor, all fixed. The app gate passes 795 tes
 - **Tests:** RED before the fix (coordination minimum 0, 36 envelope atoms instead of 24). A stretched-H₂ scan over 4.5–6 Bohr has the same verdicts with and without the stray sample.
 - **Gates:** providers 460/0, validate surrogate 7/0.
 
+### Large shared models are fast in Estimated mode (2026-11-20, merge variance-support)
+
+- **Found by:** the user. An H₂ model trained alone ran far faster than the same molecule on the shared BEST collection.
+- **Measured:** an H₂ step's `predict` with variance took 679 µs on BEST (3 species, Q′ = 1902) against 5 µs on `hydrogen.model` (Q′ = 29). The variance solved against all 1902 columns for every force component, though H₂ touches only 52 of them.
+- **Fix (spec `2026-11-20-variance-support-design.md`):**
+  - the variance is computed on the composition's support S(C), one cached factor per species set;
+  - the factor is built in double-double, because the plain f64 QR missed the accuracy target on fitted posteriors;
+  - a self-check against the full path runs on a fixed cluster per composition, with a 1e-10 fallback, so the std is a pure function of (L, geometry, species set);
+  - `describe` skips body-3/4 terms whose species are absent, bit for bit.
+- **Result:** 679 → 66–76 µs per H₂ step on BEST. Over 1000 BEST geometries, measured against a double-double reference, the support path is off by at most 3.18e-12 and the full path by 3.26e-12. No trust decision moved. The 60 µs target was missed, because the plain energy/force prediction is about 60 µs on its own.
+- **Not fixed by this:** fallbacks in trained areas on BEST, which come from the H₂ vs H₃/H₄ fit clash (a separate design).
+- **Reviews:** physics review, then two re-review rounds. The composition key replaced a growing support whose bits depended on call order.
+- **Gates:** surrogate 161, providers 461, sim 180, validate surrogate 7/0.
+
 ### Process wins
 
 - An input-replay harness (M6 Task 8) that found a real app bug on its first scripts: a running relax
