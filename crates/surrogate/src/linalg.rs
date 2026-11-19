@@ -959,10 +959,13 @@ fn unit_solves_lanes_kernel(l: &[f64], n: usize, cols: &[usize], xh: &mut [f64],
 /// G = XᵀX, G = L_G L_Gᵀ, and F_ab = (L_G⁻¹)_{m−1−b, m−1−a} (F = J L_G⁻ᵀ J), rounded once to f64.
 /// Σ_j (n − S_j)²/2 + n m²/2 double-double multiply-adds and O(m³).
 ///
+/// `None` when L is not a usable factor (a pivot of G that is not positive, or a value that is
+/// not finite: a zero or non-finite entry on L's diagonal); the caller then takes the full path,
+/// whose numbers are what L gives.
+///
 /// # Panics
-/// If `support` is not ascending within 0..n, or G is not numerically positive definite (A not
-/// positive definite).
-pub fn support_factor(l: &[f64], n: usize, support: &[usize]) -> Vec<f64> {
+/// If `support` is not ascending within 0..n.
+pub fn support_factor(l: &[f64], n: usize, support: &[usize]) -> Option<Vec<f64>> {
     use dd::Dd;
     use rayon::prelude::*;
     debug_assert_eq!(l.len(), n * n);
@@ -970,7 +973,7 @@ pub fn support_factor(l: &[f64], n: usize, support: &[usize]) -> Vec<f64> {
     assert!(support.last().is_none_or(|&s| s < n), "support_factor: support outside 0..{n}");
     let m = support.len();
     if m == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
     // X = L⁻¹E_S, column-major hi and lo parts; column j is zero above row S_j. Four columns
     // at a time (`unit_solves_lanes`), the groups in parallel.
@@ -996,7 +999,9 @@ pub fn support_factor(l: &[f64], n: usize, support: &[usize]) -> Vec<f64> {
     // the rows below independently, in parallel)
     for j in 0..m {
         let d = Dd { hi: gh[j * m + j], lo: gl[j * m + j] }.sub(dd::dot2_dd_dd(&gh[j * m..j * m + j], &gl[j * m..j * m + j], &gh[j * m..j * m + j], &gl[j * m..j * m + j]));
-        assert!(d.hi > 0.0, "support_factor: (A⁻¹)_SS is not positive definite (pivot {j})");
+        if !(d.hi > 0.0 && d.hi.is_finite()) {
+            return None;
+        }
         let ljj = d.sqrt();
         gh[j * m + j] = ljj.hi;
         gl[j * m + j] = ljj.lo;
@@ -1035,7 +1040,7 @@ pub fn support_factor(l: &[f64], n: usize, support: &[usize]) -> Vec<f64> {
             f[a * m + b] = yh[(m - 1 - a) * m + (m - 1 - b)];
         }
     }
-    f
+    f.iter().all(|v| v.is_finite()).then_some(f)
 }
 
 #[cfg(test)]
@@ -1449,7 +1454,7 @@ pub(crate) mod tests {
     /// The support path's quadratic forms for vectors on `support`: gathered in reverse order
     /// through `support_factor`.
     fn support_forms(l: &[f64], n: usize, support: &[usize], vs: &[Vec<f64>]) -> Vec<f64> {
-        let f = support_factor(l, n, support);
+        let f = support_factor(l, n, support).unwrap();
         let rev: Vec<Vec<f64>> = vs.iter().map(|v| support.iter().rev().map(|&k| v[k]).collect()).collect();
         cholesky_quad_forms(&f, support.len(), &rev.iter().map(|v| &v[..]).collect::<Vec<_>>())
     }
@@ -1584,7 +1589,7 @@ pub(crate) mod tests {
         for m in [52, 282, 950] {
             let support: Vec<usize> = (0..m).map(|k| k * 2).collect();
             let t = std::time::Instant::now();
-            let f = support_factor(&l, n, &support);
+            let f = support_factor(&l, n, &support).unwrap();
             println!("support_factor: |S| {m}: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
             assert_eq!(f.len(), m * m);
         }

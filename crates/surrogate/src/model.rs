@@ -117,7 +117,8 @@
 //! the composition's reachable set instead of churning as neighbours come and go. When the union
 //! would exceed Q′/2 the call takes the full factor (the support gains little there; the cached
 //! entry stays for the smaller calls), and so does every call of a model without a posterior
-//! (none is asked for). The value depends on S only at rounding level: the same geometry can read
+//! (none is asked for) or with a factor the full substitution cannot use (a non-finite entry or
+//! a zero pivot: the full path then reports the non-finite stds L gives). The value depends on S only at rounding level: the same geometry can read
 //! a last-bit-different std before and after S grows; every trust rule compares against bounds
 //! many orders wider.
 //!
@@ -657,6 +658,11 @@ pub struct SupportCache {
 struct SupportState {
     entry: Option<Arc<SupportFactor>>,
     builds: u64,
+    /// L is not a usable factor (a non-finite entry in its lower triangle or a zero on its
+    /// diagonal, checked before the first build, or `linalg::support_factor` gave `None`): every
+    /// call takes the full path, which reports what L gives (non-finite stds for such a factor;
+    /// the support path could miss a bad entry outside S and answer finitely).
+    unusable: bool,
 }
 
 /// S and its factor (module doc).
@@ -674,14 +680,14 @@ impl SupportFactor {
         call.iter().all(|&k| self.member[k])
     }
 
-    /// The factor on `support` (ascending; `linalg::support_factor`).
-    fn build(l: &[f64], qr: usize, support: Vec<usize>) -> SupportFactor {
-        let factor = support_factor(l, qr, &support);
+    /// The factor on `support` (ascending; `linalg::support_factor`), `None` for an unusable L.
+    fn build(l: &[f64], qr: usize, support: Vec<usize>) -> Option<SupportFactor> {
+        let factor = support_factor(l, qr, &support)?;
         let mut member = vec![false; qr];
         for &k in &support {
             member[k] = true;
         }
-        SupportFactor { support, member, factor }
+        Some(SupportFactor { support, member, factor })
     }
 
     /// vᵀA⁻¹v = ‖F⁻¹ J v_S‖² for every query vector (each supported on S): the entries on S
@@ -729,9 +735,18 @@ impl SupportCache {
 
     /// The entry whose S covers `call`, built (on the union with the current S) if need be;
     /// `None` when that union exceeds Q′/2 (the full path; the cached entry is kept for the
-    /// smaller calls).
+    /// smaller calls) or L is unusable.
     fn entry_covering(&self, l: &[f64], qr: usize, call: &[usize]) -> Option<Arc<SupportFactor>> {
-        let mut current = self.state().entry.clone();
+        let mut current = {
+            let mut st = self.state();
+            if st.entry.is_none() && !st.unusable && !factor_usable(l, qr) {
+                st.unusable = true;
+            }
+            if st.unusable {
+                return None;
+            }
+            st.entry.clone()
+        };
         loop {
             if let Some(e) = current.as_ref().filter(|e| e.covers(call)) {
                 return Some(e.clone());
@@ -744,9 +759,13 @@ impl SupportCache {
                 return None;
             }
             // built without the lock (struct doc, "Threads")
-            let built = Arc::new(SupportFactor::build(l, qr, union));
+            let built = SupportFactor::build(l, qr, union);
             let mut st = self.state();
             st.builds += 1;
+            let Some(built) = built.map(Arc::new) else {
+                st.unusable = true;
+                return None;
+            };
             match &st.entry {
                 // another thread installed a superset of ours meanwhile (it covers this call)
                 Some(e) if e.covers(&built.support) => return Some(e.clone()),
@@ -763,6 +782,12 @@ impl SupportCache {
             }
         }
     }
+}
+
+/// Whether the full substitution through L gives finite numbers for finite vectors: every entry
+/// it reads (the lower triangle) finite and no zero on the diagonal. O(Q′²) reads, once per cache.
+fn factor_usable(l: &[f64], qr: usize) -> bool {
+    (0..qr).all(|i| l[i * qr + i] != 0.0 && l[i * qr..i * qr + i + 1].iter().all(|v| v.is_finite()))
 }
 
 impl Default for SupportCache {
@@ -1380,6 +1405,32 @@ mod tests {
                     assert!(g.iter().zip(w).all(|(a, b)| a.to_bits() == b.to_bits()), "{species:?} scene {t}");
                 }
             }
+        }
+    }
+
+    /// A factor with a zero on its diagonal, or a NaN in a row the scene's support never reaches
+    /// (hand-built models; `fit` never writes one): the cache finds L unusable before building
+    /// and every call gives the full path's numbers bit for bit (non-finite here), never a panic
+    /// and never a finite answer the full path would not give.
+    #[test]
+    fn an_unusable_factor_takes_the_full_path() {
+        let mut rng = StdRng::seed_from_u64(67);
+        let base = random_posterior_model(&mut rng, &[1, 8, 15], true);
+        let q = base.basis.n_independent_columns();
+        let (p_h, z_h) = random_scene(&mut rng, &[1], 2);
+        let (p_o, z_o) = random_scene(&mut rng, &[8], 2);
+        for (what, at, value, pos, z) in [("zero pivot", 0, 0.0, &p_h, &z_h), ("NaN before S", q + 0, f64::NAN, &p_o, &z_o)] {
+            let mut m = base.clone();
+            m.variance_support = SupportCache::new();
+            m.sigma_inv_chol.as_mut().unwrap()[at] = value;
+            let l = m.sigma_inv_chol.clone().unwrap();
+            let auto = m.predictive_std_with(&l, pos, z, VariancePath::Auto).unwrap();
+            let full = m.predictive_std_with(&l, pos, z, VariancePath::Full).unwrap();
+            assert!(!full.0.is_finite(), "{what}: the full path gives {:e}", full.0);
+            assert_eq!(auto.0.to_bits(), full.0.to_bits(), "{what}");
+            assert!(auto.1.iter().zip(&full.1).all(|(a, b)| a.to_bits() == b.to_bits()), "{what}");
+            assert!(m.variance_support.support().is_none());
+            assert_eq!(m.variance_support.builds(), 0, "{what}: nothing built");
         }
     }
 }

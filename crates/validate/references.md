@@ -4974,6 +4974,20 @@ H₂ near 1.4 Bohr, 400 Model-only steps (draft on, audits off), 100 of them var
 
 The batched substitution alone (`quad_forms_speed`, `#[ignore]`d: 7 rows at n = 1 902): 27.5 ms one at a time → 1.70 ms. The status's `readiness` at a geometry the last step did not evaluate (96 ms in "Status cache" above) runs the same two pieces, and so do the training views' `predict(…, true)` per curve point.
 
+### The variance on the scene's support (2026-11-20; branch `variance-support`, spec `2026-11-20-variance-support-design.md`; `surrogate` unit tests and `tests/variance_timing.rs`, `#[ignore]`d measurement; release, Ryzen 7 9800X3D, other agents' cargo runs throughout)
+
+`Model::predictive_std` forms its 1 + 3N quadratic forms on the union S of the query vectors' non-zero columns (exact: a zero entry adds nothing), φ̃ᵀA⁻¹φ̃ = φ̃_Sᵀ(A⁻¹)_SS φ̃_S, when |S| ≤ Q′/2; S and its factor are cached on the model and only grow. **Accuracy, against a double-double reference** (fitted [H, O] factors, the `model` tests): the full substitution ≤ 2.2e-13 relative on the forms; the spec's f64 route (R from the QR of X = L⁻¹E_S, then ‖R v_S‖²) up to 3.5e-11, and f64 Schur-complement factors by Householder / Givens elimination of L up to 1.8e-10 / 5.9e-12 — the products cancel (the unit columns of L⁻¹ carry the prior's variance, a trained query's is orders smaller). So `linalg::support_factor` builds R in double-double and keeps W = R⁻¹ (reversed, lower triangular): the forms are a triangular solve of size |S|, componentwise stable like the full one. Tests: the stds agree with the full path to **≤ 4.4e-13 relative** (spec bound 1e-12 + 1e-15); a posterior-shaped factor whose multiply amplification is 7e6 gives the support solve 1.43e-11 against the full solve's 1.09e-11 (both against double-double); |S| > Q′/2 is the full path bit for bit.
+
+The user's BEST model copy (format v9) is newer than main's sidecar reader (v1–v8), so the timing is on a synthetic model of its shape (H/O/P, body-4 at degree 3, Q′ 1 902, seeded coefficients, L = chol(λI + BBᵀ)); H₂ at 1.4 Bohr, 2 000 calls each, **|S| = 52**:
+
+| | before | after |
+|---|---|---|
+| `predict(…, false)` | 48.5 µs | 42–46 µs (unchanged code) |
+| `predict(…, true)` | 560 µs | **87–105 µs** |
+| first `predict(…, true)` (checks L, builds the factor) | 4.1 ms | 11–14 ms |
+
+The remainder of a variance call is the descriptor: `describe` with gradients 28–38 µs, the query vectors' accumulation ~6 µs, the forms ~6 µs (the support scan, the gather, a 52-wide substitution). The spec's target (≤ 60 µs with variance) is not met: `energy_and_forces` and `describe` alone take ~75 µs here, the descriptor cost the spec leaves out. Factor builds (`support_factor_build_cost`, n = 1 902): 9.5 ms at |S| = 52, 57 ms at 282 (an H₂O), 0.26 s at 950.
+
 ## Warm-started recovery trials (2026-11-17; branch `recovery-warm`, spec `2026-11-17-recovery-warm-start-design.md`, option B; `providers` `surrogate::tests::refit_golden` with its `fit_log` line, `#[ignore]`d; release, Ryzen 7 9800X3D, other agents' test binaries running throughout)
 
 A trust recovery's quarantine trials (each round of both rankings, on the standing basis and in step 3, and step 3's default-basis fit; not the cap retries of steps 1 and 1b since fix round 1) are searched from the most recent fit's (s_E, s_F) (`Accumulator::refit_from`; λ is searched over its whole grid every round, so it needs no start); a trial that would stand or end the rounds is searched again from the data and judged on that fit (`confirm_cold`; the rounds' stop test since fix round 2, review I1: a round that passes warm and fails cold goes on from the cold fit, as main's rounds would). Every standing fit is the cold search of its store state.
