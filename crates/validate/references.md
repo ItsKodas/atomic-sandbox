@@ -6068,3 +6068,87 @@ The second refit with nothing new: 192.6 → 10.6 s. What is left: `NullSpace::o
 
   (σ_F: the force std and its epistemic part, per atom.) The relative 3.4e-3 of the first report was a value of 3.7e-6 moving by 1.3e-8: the absolute differences are at most 0.4 % of a tier.
 - **Across machines.** faer picks its SIMD kernels at run time (AVX-512 here, AVX2 elsewhere), so a refit on a CPU with another instruction set differs from this one by the same ~κε spread — never in a verdict measured here, but a golden compares bit for bit only on the same ISA (the thread count never matters: `dense::SPLIT`).
+
+## Stray atoms (plan 2026-11-18 Task 7, 2026-11-19; spec `2026-11-18-stray-atom-composition-design.md` §6; `tests/surrogate.rs` and `tests/dynamics.rs`, release, RX 7900 XTX, teacher GpuKs tol 1e-6, `ionic accepted`, σ = h) — **BLOCKED: H₂ + H never clears on the real teacher**
+
+Geometry (`common::surrogate::diatomic_and_atom`): the diatomic's centre and the third atom on the cube's body diagonal,
+8 Bohr apart, the diatomic's axis ⊥ the diagonal, placed so the stray atom and the diatomic's outer atoms are equally far
+from the faces. Cold solves throughout (the auditor solves the parts cold). Box rule `box_affected_face_density(h)`:
+1.28e-5 e/Bohr³ at h = 0.20, 7.2e-6 at 0.15. Floor 27.6 kT = 138.0 mHa.
+
+**The box (`stray_box_probe`, `--ignored`;** `cargo test -p validate --release --test surrogate stray_box_probe -- --ignored --nocapture`**).**
+H₂ (1.4) + H at 8 Bohr, h = 0.20:
+
+| grid | cube (Bohr) | smallest face distance | face density scene / H₂ / H | E_scene − E_H₂ − E_H (mHa) | ↑ margins (mHa) |
+|---|---|---|---|---|---|
+| 61³ (the plan's) | 12.0 | **3.44 (floor refuses < 4)** | **3.05e-5 / 1.79e-5 / 3.04e-5 (all "box too small")** | −0.173 | +318.4 / +437.3 |
+| 81³ | 16.0 | 5.44 | 7.83e-7 / 2.62e-7 / 7.82e-7 | −0.087 | +299.0 / +413.3 |
+| 87³ | 17.2 | 6.04 | 2.71e-7 / 7.66e-8 / 2.70e-7 | −0.086 | +294.4 / +408.5 |
+| 91³ | 18.0 | 6.44 | 1.34e-7 / 3.40e-8 / 1.34e-7 | −0.086 | +291.9 / +405.8 |
+
+The residual is box-independent from 81³ on (−0.086 mHa: LSDA's overlap tail at 8 Bohr, not confinement); the lone H's
+energy is not (−0.477741 Ha at 81³, −0.478069 at 91³). **The stray tests run at 81³ × 0.20.** A 12 Bohr cube (the
+plan's 61³ × 0.20, and the app's Accurate default 81³ × 0.15) cannot hold a clean H₂ + H check at all: an H must be
+≈ 5 Bohr from every face for its face density to pass the rule, so two parts more than r_cut = 6 apart cannot both be
+clean (a design consequence for the app: in the default box the composition check is void or floor-refused for every
+H₂ + H; the "estimated box size" item would change that).
+
+**`stray_h_clears_and_matches_dft` — FAILS (blocked; not loosened, rule 6).** Default H₂ pass at 81³ × 0.20 (seed 7):
+272 samples, 216–253 s, Q′ 29, rmse 3.0e-7 Ha/atom, 8.6e-6 Ha/Bohr, E_ref(H) −0.478139 Ha, trusted. Composition checks
+through the provider (strict, background auditor, 2 auditor solves each, 1.1–2.0 s):
+
+| H₂ bond | step | check verdict |
+|---|---|---|
+| 1.434 | Fallback (5a), teacher − model +4.15e-4 Ha | **refused — "levels: the scene's LUMO ↑ is 25.5 mHa, the parts' 28.4 mHa"** (beyond `STRAY_LEVEL_TOL` 1.8); ε_pos +0.402 mHa |
+| 2.0 | Fallback, +5.37e-4 | **void — "frontier level not computed"**; ε_pos +0.473 |
+| 2.3 | Fallback, +6.24e-4 | **void** (same); ε_pos +0.516 |
+| 1.8 | Fallback, +4.93e-4 | **void** (same); ε_pos +0.447 |
+
+Two causes, both in the check's levels test (`providers::surrogate::stray::judge`), not in the physics of the case
+(energy residual −0.09 to −0.15 mHa against the 1 mHa tolerance; margins ≥ 181 mHa up to r = 2.5):
+1. **The ↑ LUMO near equilibrium is a positive-energy box state** (H₂ σu* +28.4, the H's ↑ LUMO +36.5 mHa; they fall
+   with the box: 61.2/68.8 at 61³, 19.7/23.4 at 91³). The scene's lowest continuum state spreads over both wells and lies
+   2.9 mHa (81³), 3.6 (87³), 3.7 (91³) below the parts' lowest: not a union of the parts' levels, and ~300 mHa above μ,
+   so no charge can move through it. Bound LUMOs do compose: at r = 2.0 the scene's ↑ LUMO −32.1 vs the fragment's −31.6,
+   at 2.5 −85.8 vs −85.7 (`stretched_h2_margin_is_reported`).
+2. **The stray H's ↓ channel has no level**: an empty channel stores no orbital (`providers::ks::frontier`; the atom's
+   ↓ HOMO/LUMO print "—/—"), while the scene's ↓ LUMO is that H's empty 1s↓ at −95 mHa. `judge` takes the parts' ↓ LUMO
+   only when every part has one, so `missing` is set and every H₂ + H check is void, at any geometry. The Morse-teacher
+   unit tests (synthetic levels) cannot show either.
+Options for the controller (not taken here: each changes the check's criterion): compare a LUMO only where it is a bound
+level / within reach of μ (the partial-level and margin tests already cover the charge-moving levels), and let an empty
+channel's absent LUMO count as "above every computed level" (as `acceptor` already does) — or have the solver store one
+level in an empty channel. `stray_h_returning_conserves_energy` (dynamics) needs the same clearing and was not run.
+
+**`stray_li_beside_f2_is_refused` — passes** (`cargo test -p validate --release --test surrogate stray_li_beside_f2_is_refused -- --nocapture`;
+3 cold solves, GPU 214 s: scene 68 s, F₂ 15 s, Li 115 s). The recipe refuses F at h = 0.20 ("h_req = 0.15", asserted),
+so the case runs at **107³ × 0.15** (15.9 Bohr; smallest face distance 5.17); Li is all-electron at σ = h under
+`Accepted` (the recipe refuses Li), Li alone at M = 2. Measured as the check measures it, **not through the provider**: a
+model with Li and F in its basis at this grid needs passes of hours (Li solves 60–115 s each).
+
+| solve | E (Ha) | face | ↑ HOMO / LUMO (mHa) | ↓ HOMO / LUMO | partial levels |
+|---|---|---|---|---|---|
+| F₂ + Li (M 2) | −54.69157421 | 4.10e-6 | −98.6 / −96.6 | −213.5 / −66.8 | ↑ −98.6 f 0.548, −96.6 f 0.451 (two levels pinned at μ), −60.5/−60.1/−54.2 f ≤ 6e-4 |
+| F₂ (M 1) | −48.93807414 | 4.48e-7 | −354.3 / −232.1 | −354.3 / −232.1 | — (f 1 / 0) |
+| Li (M 2) | −5.71628938 | 4.51e-6 | −75.7 / −29.8 | −1394.5 / −31.2 | ↑ 2s −75.7 f 0.985 |
+
+All three clean. **The check refuses it by the energy test first**: E_scene − E_F₂ − E_Li = **−37.211 mHa** (> 1 mHa).
+The margin fails too: F₂'s ↑ acceptor (σu*, −232.1) lies **331.6 mHa below** Li's ↑ donor (2s, −75.7) — margin −331.6 mHa
+against +138; the other three directions +156.3, +1040.2, +200.9 mHa. The transfer: in the scene the Li 2s↑ electron
+and F₂'s σu*↑ meet at μ (two ↑ levels at −98.6/−96.6 mHa with f 0.548/0.451) and the energy drops 37.2 mHa below the
+separated parts — LSDA's single μ_σ moving charge across 8 Bohr (physics honesty, rule 7: the separated limit would be
+neutral; the model must not answer where it disagrees with its teacher). The fraction transferred is not separated per
+orbital here (no projection is computed).
+
+**`stretched_h2_margin_is_reported` — passes** (`… --test surrogate stretched_h2_margin_is_reported -- --nocapture`;
+12 cold solves, 154 s incl. the first pseudo-H load). σu − 1s (↑) = fragment ↑ acceptor − stray ↑ donor, 81³ × 0.20:
+
+| H₂ bond | σu − 1s ↑ (mHa) | other direction ↑ | E_scene − E_frag − E_atom (mHa) | scene ↑ LUMO / fragment's |
+|---|---|---|---|---|
+| 1.434 | +295.9 | +410.1 | −0.089 | +25.5 / +28.4 |
+| 2.0 | +235.6 | +368.1 | −0.117 | −32.1 / −31.6 |
+| **2.5** | **+181.3** | +342.9 | −0.137 | −85.8 / −85.7 |
+| 3.0 | **+136.9 (below the 138.0 floor)** | +325.1 | −0.152 | −129.9 / −129.9 |
+
+At 2.5 Bohr the margin passes by 43 mHa; by 3.0 Bohr the stretched bond's σu has come within 27.6 kT of the H's 1s and
+the check would refuse by margin (the onset the margin test exists for).

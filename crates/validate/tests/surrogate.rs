@@ -192,6 +192,22 @@
 //!   and F_new > E_DS: **the migration replaces a lower-F label at this geometry** (rule 7; the shared-shell release
 //!   found the broken-symmetry integer state, 14.5 mHa lower, that the cold Fermi–Dirac solve does not reach, spec
 //!   §4.7(e)). The old folder hashes identical. Task 15 adds the code-9 review's assertions.
+//! - Stray atoms (spec 2026-11-18 §6; plan Task 7; `references.md`, "Stray atoms"). The grid is 81³ × 0.20 (a 16 Bohr
+//!   cube, `ionic accepted`), not the plan's 61³: at 61³ the stray H on the body diagonal is 3.44 Bohr from a face (the
+//!   floor refuses below 4) and every solve is box-affected (`stray_box_probe`, `--ignored`).
+//!   `stray_h_clears_and_matches_dft`: a default H₂ pass, then composition checks through the provider (strict mode, a
+//!   background auditor) at H₂ + H 8 Bohr until K = 3 passes clear the signature; at an unchecked bond length the
+//!   provider's own `would_answer` puts inside the region, the step must be the model's and |E_model − E_DFT|/n_bonded
+//!   ≤ the audit tier (`energy_std_per_atom`); then a stretched-bond check through the provider, its verdict and the
+//!   next step's source required to agree. **Fails on this branch (2026-11-19): the check never clears H₂ + H on the
+//!   real teacher** — at r = 1.434 the levels test refuses (the scene's ↑ LUMO 25.5 mHa against the parts' 28.4: both
+//!   positive, box continuum states), and at r = 1.8–2.3 every check is void ("frontier level not computed": the stray
+//!   H's empty ↓ channel stores no orbital, so it has no LUMO, while the scene's ↓ LUMO is the H's empty 1s↓ at
+//!   −95 mHa). `stray_li_beside_f2_is_refused`: the charge-transfer case measured as the check measures it (three clean
+//!   cold solves) at 107³ × 0.15 — F's h_req; the recipe refuses F at 0.20 (asserted) and Li runs all-electron under
+//!   `Accepted` — asserting that the check's energy, force or margin test fails; the provider path is not exercised
+//!   here (a model with Li and F in its basis at that grid costs hours of passes). `stretched_h2_margin_is_reported`:
+//!   σu − 1s (↑) at r = 1.434, 2.0, 2.5, 3.0 from cold solves of the check's parts; report only, finite asserted.
 //!
 //! The GPU work of concurrently running tests is serialised through `common::GPU` (the `Locked`
 //! teacher), one evaluation at a time, so the per-solve times in the timing rows are uncontended
@@ -211,7 +227,10 @@ use common::{
     au_per_ps, bond, chrono_free_date, fit_line, h2, h3_plus, locate_surface, ms, never, no_augment, period_from_upward_crossings, relax, scene, solve,
     timing_row, triangle, EvalLog, Locked, DISPLACEMENT, DT_FS, H, H3_SIDE0, HARTREE_IN_CM, N_H2, TOL_H2,
 };
-use common::surrogate::{class_summary, fit_summary, model_vs_dft, residuals, sample_and_fit, student};
+use common::surrogate::{
+    class_summary, clear_h2_h, diatomic_and_atom, face_margin, fit_summary, h2_and_h, model_vs_dft, part, residuals, sample_and_fit, stray_check, stray_student, student,
+    train_h2, STRAY_CHECK_R, STRAY_D, STRAY_H, STRAY_N, STRAY_R0,
+};
 
 /// Timing rows for `last-run-surrogate.md`, rewritten whenever a test finishes.
 static TIMING: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -2190,4 +2209,276 @@ fn migration_classifies_h2_oh_h4() {
     let _ = std::fs::remove_dir_all(&root);
     let lg = log.lock().unwrap().clone();
     record(&ctx, timing_row("migration_classifies_h2_oh_h4", "H₂, OH, H₄ (Accepted)", fx.grid_n, fx.tol, &lg, wall, "pass"));
+}
+
+// ---- stray atoms (spec 2026-11-18 §6; plan Task 7; module doc and `references.md`, "Stray atoms") ----
+
+/// Unchecked bond lengths for the in-region answer, the first one the provider's own verdict (`would_answer`) answers.
+const STRAY_PROBE_R: [f64; 8] = [1.37, 1.50, 1.27, 1.65, 1.40, 1.55, 1.20, 1.70];
+/// The stretched bond (Bohr; spec §6: r ≥ 2.5) and the report's scan.
+const STRETCHED_R: f64 = 2.5;
+const STRETCHED_SCAN: [f64; 4] = [STRAY_R0, 2.0, STRETCHED_R, 3.0];
+/// The charge-transfer case: F₂ at 2.68 Bohr + Li at `STRAY_D`, on F's certified grid (its h_req 0.15; the recipe
+/// refuses F at 0.20) in a 15.9 Bohr cube.
+const F2_R: f64 = 2.68;
+const LI_N: usize = 107;
+const LI_H: f64 = 0.15;
+
+/// One cold solve with its levels: "E …, face … (rule …), M …, ↑ HOMO/LUMO …, ↓ …, partial […], … ms".
+fn levels_line(r: &ForceResult, h: f64) -> String {
+    let lv = |x: Option<f64>| x.map_or("—".to_string(), |e| format!("{:+.1}", e * 1e3));
+    let partial: Vec<String> = r.stats.partial.iter().map(|l| format!("{}{} {:+.1} mHa f {:.4}", ["↑", "↓"][l.spin as usize], l.index, l.eps * 1e3, l.f)).collect();
+    format!(
+        "E {:+.8} Ha, face {:.2e} (rule {:.2e}), M {:?}, ↑ HOMO/LUMO {}/{} mHa, ↓ {}/{} mHa, partial [{}], {} SCF steps, {} ms{}",
+        r.energy,
+        r.stats.face_density.unwrap_or(f64::NAN),
+        providers::box_affected_face_density(h),
+        r.stats.multiplicity,
+        lv(r.stats.frontier[0].homo),
+        lv(r.stats.frontier[0].lumo),
+        lv(r.stats.frontier[1].homo),
+        lv(r.stats.frontier[1].lumo),
+        partial.join(", "),
+        r.stats.scf_steps,
+        r.stats.solve_ms,
+        if r.stats.warnings.is_empty() { String::new() } else { format!(", warnings {:?}", r.stats.warnings) }
+    )
+}
+
+/// Clean as the composition check means it: no warning, trainable, the face density within the box rule.
+fn clean(r: &ForceResult, h: f64) -> bool {
+    r.stats.warnings.is_empty() && r.stats.untrainable().is_none() && r.stats.face_density.is_none_or(|f| f <= providers::box_affected_face_density(h))
+}
+
+/// A part's highest donating and lowest accepting level in `spin` (Ha): `stray`'s rule (its HOMO or highest partial
+/// level; its LUMO or lowest partial level), restated here for the report — the provider's check is the judge.
+fn donor_acceptor(r: &ForceResult, spin: usize) -> (Option<f64>, Option<f64>) {
+    let partial = || r.stats.partial.iter().filter(move |l| l.spin as usize == spin).map(|l| l.eps);
+    (partial().chain(r.stats.frontier[spin].homo).reduce(f64::max), partial().chain(r.stats.frontier[spin].lumo).reduce(f64::min))
+}
+
+/// The frontier margins per spin (fragment acceptor − stray donor, stray acceptor − fragment donor; a side without a
+/// level is skipped, as the check skips an empty channel), a report line and the smallest (Ha).
+fn margins(frag: &ForceResult, atom: &ForceResult) -> (String, f64) {
+    let mut out = Vec::new();
+    let mut worst = f64::INFINITY;
+    for (spin, w) in ["↑", "↓"].iter().enumerate() {
+        let (fd, fa) = donor_acceptor(frag, spin);
+        let (sd, sa) = donor_acceptor(atom, spin);
+        for (give, take, what) in [(sd, fa, "fragment acceptor − stray donor"), (fd, sa, "stray acceptor − fragment donor")] {
+            if let (Some(g), Some(t)) = (give, take) {
+                worst = worst.min(t - g);
+                out.push(format!("{what} {w} {:+.1} mHa", (t - g) * 1e3));
+            }
+        }
+    }
+    (out.join("; "), worst)
+}
+
+/// The composition check's three solves, cold on the GPU teacher, restated for a report: the scene, the bonded part
+/// alone (automatic M) and the stray atom alone at its reference multiplicity `ms`.
+struct Parts {
+    scene: ForceResult,
+    frag: ForceResult,
+    atom: ForceResult,
+}
+
+fn composition_parts(t: &mut dyn ForceProvider, sc: &Scene, bonded: &[usize], stray: usize, ms: Option<u32>, out: &mut String) -> Parts {
+    let mut cold = |s: &Scene, what: &str| {
+        t.reset();
+        solve(t, s, what)
+    };
+    let p = Parts { scene: cold(sc, "scene"), frag: cold(&part(sc, bonded, None), "bonded part alone"), atom: cold(&part(sc, &[stray], ms), "stray atom alone") };
+    let h = sc.cell.h;
+    let _ = writeln!(out, "    scene    {}\n    fragment {}\n    atom     {}", levels_line(&p.scene, h), levels_line(&p.frag, h), levels_line(&p.atom, h));
+    let (m, _) = margins(&p.frag, &p.atom);
+    let _ = writeln!(out, "    E_scene − E_frag − E_atom = {:+.4} mHa; margins: {m} (floor {:.1} mHa = 27.6 kT)", (p.scene.energy - p.frag.energy - p.atom.energy) * 1e3, 27.6 * qm::ELECTRON_KT * 1e3);
+    p
+}
+
+/// The box the stray-atom tests need (a measurement, `--ignored`; `references.md`, "Stray atoms"): H₂ (1.4 Bohr) + H
+/// at `STRAY_D` on the body diagonal (`diatomic_and_atom`) at h = `STRAY_H`, `ionic accepted`, on each grid of
+/// `STRAY_PROBE_GRIDS` (default 61, 81, 87, 91): the smallest face distance (the floor refuses a stray atom nearer than
+/// 4 Bohr to a face) and the three solves' face densities against the box rule, the residual and the margins.
+#[test]
+#[ignore = "measurement (stray atoms, plan Task 7): cargo test -p validate --release --test surrogate stray_box_probe -- --ignored --nocapture"]
+fn stray_box_probe() {
+    let Some(ctx) = gpu() else { return };
+    let grids: Vec<usize> = std::env::var("STRAY_PROBE_GRIDS").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_else(|| vec![61, 81, 87, 91]);
+    let (mut t, log) = Locked::new(ctx.clone(), TOL_H2);
+    for n in grids {
+        let sc = diatomic_and_atom(n, STRAY_H, 1, 1, 1.4, 1, STRAY_D);
+        let mut out = String::new();
+        let _ = writeln!(out, "H₂ (1.4) + H at {STRAY_D} Bohr, {n}³ × {STRAY_H} ({:.1} Bohr box): smallest face distance {:.2} Bohr", 2.0 * sc.cell.half_extent(), face_margin(&sc));
+        composition_parts(&mut t, &sc, &[0, 1], 2, Some(2), &mut out);
+        println!("{out}");
+    }
+    println!("teacher: {}", snapshot(&log).summary());
+}
+
+/// Spec §6, GPU (module doc, `stray_h_clears_and_matches_dft`): H₂ + H at 8 Bohr clears on the real teacher, and at an
+/// unchecked geometry inside the region the model's answer meets the teacher's within the audit tier per bonded atom.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test surrogate")]
+fn stray_h_clears_and_matches_dft() {
+    let Some(ctx) = gpu() else { return };
+    let t_test = Instant::now();
+    let (mut s, log, alog) = stray_student(&ctx);
+    let tier = s.policy().energy_std_per_atom;
+    let mut out = String::new();
+    let _ = writeln!(out, "H₂ + H at {STRAY_D} Bohr, automatic (M = 2), {STRAY_N}³ × {STRAY_H} (σ = h), accepted, tol {TOL_H2:e}:");
+    train_h2(&mut s, STRAY_R0, SEED, &mut out);
+    let passed = clear_h2_h(&mut s, &STRAY_CHECK_R, &mut out);
+    let _ = writeln!(out, "  cleared by the checks at r = {passed:?} (tried in the order {STRAY_CHECK_R:?})");
+    // the fourth geometry: never checked, inside the region by the provider's own verdict (no step, so no check)
+    let mut r4 = None;
+    for r in STRAY_PROBE_R {
+        let sc = h2_and_h(r);
+        let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+        let z: Vec<u8> = sc.nuclei.iter().map(|n| n.z).collect();
+        let v = s.would_answer(&pos, &z, &s.provenance_for(&sc));
+        let _ = writeln!(out, "  candidate r = {r}: would_answer {v:?}");
+        if v.is_ok() {
+            r4 = Some(r);
+            break;
+        }
+    }
+    let r4 = r4.unwrap_or_else(|| panic!("no unchecked candidate of {STRAY_PROBE_R:?} lies in the cleared region\n{out}"));
+    assert!(!passed.contains(&r4), "an unchecked geometry");
+    let sc = h2_and_h(r4);
+    s.discontinuity();
+    let ans = s.evaluate(&sc, &mut never()).unwrap_or_else(|e| panic!("r = {r4}: {e}"));
+    let note = ans.stats.notes.iter().find(|n| n.contains("stray atoms: model for the bonded part")).cloned();
+    let _ = writeln!(out, "  r = {r4}: source {:?}, E_model {:+.8} Ha; note: {note:?}", ans.stats.source, ans.energy);
+    // the teacher's answer (cold) and the parts, for the gap's three terms (`stray` module doc, "Audits")
+    let parts = composition_parts(s.teacher_mut(), &sc, &[0, 1], 2, Some(2), &mut out);
+    let (fpos, fz): (Vec<[f64; 3]>, Vec<u8>) = sc.nuclei[..2].iter().map(|n| (n.pos, n.z)).unzip();
+    let model_frag = s.model().expect("a model").predict(&fpos, &fz, false).expect("H₂ alone").energy;
+    let e_ref = s.reference_energy(1).expect("E_ref(H)");
+    let gap = parts.scene.energy - ans.energy;
+    let (gap_frag, comp, eps_pos) = (parts.frag.energy - model_frag, parts.scene.energy - parts.frag.energy - parts.atom.energy, parts.atom.energy - e_ref);
+    let policy = s.policy();
+    let (df, bound) = (0..2).map(|i| policy.force_residual(&ans.forces[i], &parts.scene.forces[i])).fold((0.0f64, 0.0f64), |(d, b), (di, bi)| if di / bi > d / b.max(1e-300) { (di, bi) } else { (d, b) });
+    let f_stray = parts.scene.forces[2].iter().map(|x| x * x).sum::<f64>().sqrt();
+    let _ = writeln!(
+        out,
+        "  E_DFT − E_model = {:+.4} mHa = gap_frag {:+.4} + comp {:+.4} + ε_pos {:+.4} mHa (sum {:+.4}); per bonded atom {:.4} mHa against the audit tier {:.3} mHa",
+        gap * 1e3,
+        gap_frag * 1e3,
+        comp * 1e3,
+        eps_pos * 1e3,
+        (gap_frag + comp + eps_pos) * 1e3,
+        gap.abs() / 2.0 * 1e3,
+        tier * 1e3
+    );
+    let _ = writeln!(out, "  forces: worst bonded atom {df:.2e} Ha/Bohr (the policy's bound {bound:.2e}); the stray atom's DFT force {f_stray:.2e} (the model's 0 exactly: {:?})", ans.forces[2]);
+    // a stretched bond through the provider: its check's verdict holds for the session (report; spec §4.3)
+    let _ = writeln!(out, "  then H₂ ({STRETCHED_R}) + H through the provider (a verdict for the session, reported):");
+    let stretched = stray_check(&mut s, &h2_and_h(STRETCHED_R), &mut out);
+    s.discontinuity();
+    let again = s.evaluate(&sc, &mut never()).unwrap_or_else(|e| panic!("r = {r4} again: {e}"));
+    let _ = writeln!(out, "  r = {r4} again: source {:?}", again.stats.source);
+    let _ = writeln!(out, "  teacher: {}\n  auditor: {}\n  wall {:.0} s", snapshot(&log).summary(), snapshot(&alog).summary(), t_test.elapsed().as_secs_f64());
+    println!("{out}");
+    record(&ctx, timing_row("stray_h_clears_and_matches_dft", "H₂ + H", STRAY_N, TOL_H2, &snapshot(&log), t_test.elapsed(), &format!("cleared at {passed:?}; r = {r4}: |ΔE|/2 {:.3} mHa", gap.abs() / 2.0 * 1e3)));
+    assert_eq!(ans.stats.source, Source::Surrogate, "an in-region step is the model's\n{out}");
+    assert!(note.is_some(), "the stray-atom note\n{out}");
+    assert_eq!(ans.forces[2], [0.0; 3], "a stray atom's model force is exactly 0");
+    assert!(gap.abs() / 2.0 <= tier, "|E_model − E_DFT|/n_bonded = {:.3e} Ha > the audit tier {tier:.1e}\n{out}", gap.abs() / 2.0);
+    // the stretched check's verdict and the step after it agree: a refusal is for the session, a pass keeps the region
+    match stretched.as_ref().map(|e| e.outcome) {
+        Some(sim::activity::TeachOutcome::StrayRefused) => assert_eq!(again.stats.source, Source::Fallback, "a refused signature is on DFT for the session\n{out}"),
+        Some(sim::activity::TeachOutcome::StrayChecking { .. } | sim::activity::TeachOutcome::StrayCheckingNew) => assert_eq!(again.stats.source, Source::Surrogate, "\n{out}"),
+        _ => {}
+    }
+}
+
+/// Spec §6, GPU (module doc, `stray_li_beside_f2_is_refused`): the charge-transfer case, F₂ (2.68 Bohr) + Li at 8 Bohr,
+/// measured as the composition check measures it (three clean cold solves on the real teacher). Asserts that the check
+/// would refuse it — the energy, force or frontier-margin test fails on clean solves — and prints which test fails
+/// first in the check's order, the margin and the transfer.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test surrogate")]
+fn stray_li_beside_f2_is_refused() {
+    let Some(ctx) = gpu() else { return };
+    let t_test = Instant::now();
+    let (mut t, log) = Locked::new(ctx.clone(), TOL_H2);
+    let policy = FallbackPolicy::default();
+    let mut out = String::new();
+    // the recipe refuses F at the H₂ tests' h = 0.20 (its h_req is 0.15): asserted, so a recipe change shows here
+    let coarse = diatomic_and_atom(STRAY_N, STRAY_H, 9, 9, F2_R, 3, STRAY_D);
+    let refused = t.evaluate(&coarse, &mut never()).err().map(|e| e.to_string());
+    let _ = writeln!(out, "F₂ ({F2_R}) + Li at {STRAY_D} Bohr, {STRAY_N}³ × {STRAY_H}, accepted: {}", refused.as_deref().unwrap_or("accepted (no refusal)"));
+    let sc = diatomic_and_atom(LI_N, LI_H, 9, 9, F2_R, 3, STRAY_D);
+    let _ = writeln!(
+        out,
+        "F₂ ({F2_R}) + Li at {STRAY_D} Bohr, automatic (M = 2), {LI_N}³ × {LI_H} ({:.1} Bohr cube; smallest face distance {:.2}), accepted (pseudo-F; Li all-electron at σ = h: the recipe refuses Li), Li alone at M = 2:",
+        2.0 * sc.cell.half_extent(),
+        face_margin(&sc)
+    );
+    let p = composition_parts(&mut t, &sc, &[0, 1], 2, Some(2), &mut out);
+    let all_clean = [&p.scene, &p.frag, &p.atom].iter().all(|r| clean(r, LI_H));
+    let residual = p.scene.energy - p.frag.energy - p.atom.energy;
+    let e_tol = policy.energy_std_per_atom;
+    let force_fail = (0..2)
+        .map(|i| (i, policy.force_residual(&p.scene.forces[i], &p.frag.forces[i])))
+        .chain(std::iter::once((2, policy.force_residual(&p.scene.forces[2], &p.atom.forces[0]))))
+        .find(|(_, (d, b))| !(d <= b));
+    let (m_line, margin) = margins(&p.frag, &p.atom);
+    let floor = 27.6 * qm::ELECTRON_KT;
+    let first = if !(residual.abs() <= e_tol) {
+        format!("energy: |E_scene − E_frag − E_atom| = {:.3} mHa > {:.3} mHa", residual.abs() * 1e3, e_tol * 1e3)
+    } else if let Some((i, (d, b))) = force_fail {
+        format!("force: atom {i} {d:.2e} > {b:.2e} Ha/Bohr")
+    } else if !(margin >= floor) {
+        format!("frontier margin {:.1} mHa < {:.1} mHa", margin * 1e3, floor * 1e3)
+    } else {
+        "none of energy, forces, margin (the levels test is not restated here)".to_string()
+    };
+    let sum_f = |r: &ForceResult, spin: u8| r.stats.partial.iter().filter(|l| l.spin == spin).map(|l| l.f).sum::<f64>();
+    let _ = writeln!(out, "  clean solves: {all_clean}; the check's first failing test: {first}");
+    let _ = writeln!(out, "  margins: {m_line}; smallest {:+.1} mHa (floor {:.1})", margin * 1e3, floor * 1e3);
+    let _ = writeln!(
+        out,
+        "  transfer: the energy drops by {:.3} mHa below the separated parts; Σf of the partly occupied ↑ levels: scene {:.4}, fragment {:.4} + atom {:.4} (the fragment's acceptor lies {:.1} mHa below the atom's donor in ↑: LSDA's one μ_σ moves charge across 8 Bohr)",
+        -residual * 1e3,
+        sum_f(&p.scene, 0),
+        sum_f(&p.frag, 0),
+        sum_f(&p.atom, 0),
+        -(donor_acceptor(&p.frag, 0).1.unwrap_or(f64::NAN) - donor_acceptor(&p.atom, 0).0.unwrap_or(f64::NAN)) * 1e3
+    );
+    let _ = writeln!(out, "  teacher: {}; wall {:.0} s", snapshot(&log).summary(), t_test.elapsed().as_secs_f64());
+    println!("{out}");
+    record(&ctx, timing_row("stray_li_beside_f2_is_refused", "F₂ + Li", LI_N, TOL_H2, &snapshot(&log), t_test.elapsed(), &first));
+    assert!(refused.as_deref().is_some_and(|e| e.contains("h_req")), "F at h = 0.20: {refused:?}");
+    assert!(all_clean, "the three solves must be clean, or the check would be void (not a refusal)\n{out}");
+    assert!(!(residual.abs() <= e_tol) || force_fail.is_some() || !(margin >= floor), "the composition check would pass F₂ + Li\n{out}");
+}
+
+/// Spec §6, GPU (module doc, `stretched_h2_margin_is_reported`): the σu − 1s margin of H₂ + H at a stretched bond,
+/// measured on the stray tests' grid (cold solves of the check's three parts), with a scan for context. Report only;
+/// asserted finite.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test surrogate")]
+fn stretched_h2_margin_is_reported() {
+    let Some(ctx) = gpu() else { return };
+    let t_test = Instant::now();
+    let (mut t, log) = Locked::new(ctx.clone(), TOL_H2);
+    let mut out = String::new();
+    let mut at_stretched = f64::NAN;
+    for r in STRETCHED_SCAN {
+        let sc = h2_and_h(r);
+        let _ = writeln!(out, "H₂ ({r}) + H at {STRAY_D} Bohr, {STRAY_N}³ × {STRAY_H}, accepted (smallest face distance {:.2}):", face_margin(&sc));
+        let p = composition_parts(&mut t, &sc, &[0, 1], 2, Some(2), &mut out);
+        // σu (the fragment's ↑ acceptor) − 1s↑ (the stray atom's donor)
+        let sigma_u = donor_acceptor(&p.frag, 0).1.unwrap_or(f64::NAN) - donor_acceptor(&p.atom, 0).0.unwrap_or(f64::NAN);
+        let _ = writeln!(out, "  σu − 1s (↑) = {:+.1} mHa (floor {:.1}); clean {}", sigma_u * 1e3, 27.6 * qm::ELECTRON_KT * 1e3, [&p.scene, &p.frag, &p.atom].iter().all(|x| clean(x, STRAY_H)));
+        if r == STRETCHED_R {
+            at_stretched = sigma_u;
+        }
+    }
+    let _ = writeln!(out, "teacher: {}; wall {:.0} s", snapshot(&log).summary(), t_test.elapsed().as_secs_f64());
+    println!("{out}");
+    record(&ctx, timing_row("stretched_h2_margin_is_reported", "H₂ + H", STRAY_N, TOL_H2, &snapshot(&log), t_test.elapsed(), &format!("σu − 1s at {STRETCHED_R}: {:+.1} mHa", at_stretched * 1e3)));
+    assert!(at_stretched.is_finite(), "σu − 1s at {STRETCHED_R} Bohr: {at_stretched}\n{out}");
 }
