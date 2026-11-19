@@ -118,9 +118,9 @@
 //! would exceed Q′/2 the call takes the full factor (the support gains little there; the cached
 //! entry stays for the smaller calls), and so does every call of a model without a posterior
 //! (none is asked for) or with a factor the full substitution cannot use (a non-finite entry or
-//! a zero pivot: the full path then reports the non-finite stds L gives). The value depends on S only at rounding level: the same geometry can read
-//! a last-bit-different std before and after S grows; every trust rule compares against bounds
-//! many orders wider.
+//! a zero pivot: the full path then reports the non-finite stds L gives). The value depends on
+//! S only at rounding level: the same geometry can read a last-bit-different std before and
+//! after S grows; every trust rule compares against bounds many orders wider.
 //!
 //! Cost: one `describe`, then the forms: on the support |S|²/2 multiply-adds per vector (1 + 3N
 //! of them) and a rebuild when S grows (double-double, Σ_s (Q′ − s)²/2 + Q′|S|²/2 and O(|S|³):
