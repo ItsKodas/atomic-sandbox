@@ -3988,14 +3988,15 @@ fn sample_tol_is_the_branch_jump_guards() {
 }
 
 /// Spec §7.9 (plan 2026-11-13 Task 16; ruling R17): a model file taught before the Fermi–Dirac switch — its ionic tag
-/// the legacy all-electron "none", or a shared-shell one — is refused on load with the reason, `<version>` this build's
-/// `CARGO_PKG_VERSION`, never the generic "another Kohn-Sham surface"; nothing is loaded. This build's own tags are
+/// the legacy all-electron "none", or a shared-shell one — is refused on load with the reason, naming the last
+/// pre-Fermi–Dirac release (R17 as revised), never the generic "another Kohn-Sham surface"; nothing is loaded. This build's own tags are
 /// not legacy. Analytic teacher: no solve.
 #[test]
 fn legacy_tag_model_refused_with_reason() {
     use providers::surrogate::legacy_model_refusal;
-    let v = env!("CARGO_PKG_VERSION");
-    let reason = format!("taught with the solver before {v} (integer / shared occupations); this version uses Fermi–Dirac smearing: re-teach it, or open it in {v}");
+    // both slots name the last pre-Fermi–Dirac release (ruling R17 as revised at Task 16 fix round 1)
+    assert_eq!(providers::surrogate::LAST_PRE_FD_RELEASE, "0.2.0-beta.5");
+    let reason = "taught with the solver of 0.2.0-beta.5 or earlier (integer / shared occupations); this version uses Fermi–Dirac smearing: re-teach it, or open it in 0.2.0-beta.5".to_string();
     assert_eq!(legacy_model_refusal("none").as_deref(), Some(reason.as_str()));
     for p in [sim::IonicPolicy::CoresOnly, sim::IonicPolicy::All] {
         assert_eq!(legacy_model_refusal(&providers::pseudo::legacy_tag_of(p)).as_deref(), Some(reason.as_str()), "{p:?}");

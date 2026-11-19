@@ -325,6 +325,8 @@ fn status_chip(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput
 pub const OFFER_TITLE: &str = "This model was taught at other settings than this scene's";
 pub const OFFER_APPLY: &str = "Apply the model's settings and load";
 pub const OFFER_CANCEL: &str = "Cancel";
+/// The card's settings-only button, for a model the load refuses (Task 16 review I2).
+pub const OFFER_SETTINGS_ONLY: &str = "Apply the settings only";
 pub const OFFER_NOTE: &str = "Apply changes only the settings listed (the nuclei stay where they are), then loads the model. Cancel leaves everything as it is.";
 
 /// The card for a picked model file whose settings differ from the scene's (`ui::model_offer`): each
@@ -357,10 +359,20 @@ fn model_offer_card(ctx: &egui::Context, view: Rect, st: &UiState, input: &Panel
                     }
                 }
                 ui.add_space(4.0);
+                // a model the load refuses whatever the settings (Task 16 review I2): the reason, and the settings only
+                if let Some(r) = &o.refusal {
+                    ui.add(egui::Label::new(RichText::new(format!("this model cannot be loaded here: {r}")).size(11.0).color(super::AMBER)).wrap());
+                }
                 theme::note(ui, OFFER_NOTE);
                 ui.horizontal(|ui| {
                     let apply = egui::Button::new(RichText::new(OFFER_APPLY).strong());
-                    let why = if sampling { Some("a sampling pass is running: cancel it first") } else { blocked.map(|_| "a setting listed above cannot be applied") };
+                    let why = if sampling {
+                        Some("a sampling pass is running: cancel it first")
+                    } else if o.refusal.is_some() {
+                        Some("the model cannot be loaded in this version (the reason is above): apply the settings only to re-teach it at them")
+                    } else {
+                        blocked.map(|_| "a setting listed above cannot be applied")
+                    };
                     let r = ui.add_enabled(why.is_none(), apply);
                     let r = match why {
                         Some(w) => r.on_disabled_hover_text(w),
@@ -368,6 +380,12 @@ fn model_offer_card(ctx: &egui::Context, view: Rect, st: &UiState, input: &Panel
                     };
                     if r.clicked() {
                         acts.push(Action::ApplyModelSettings);
+                    }
+                    if o.refusal.is_some() {
+                        let only = ui.add_enabled(!sampling && blocked.is_none(), egui::Button::new(OFFER_SETTINGS_ONLY));
+                        if super::probed("model-offer-settings-only", only).on_hover_text("switch the scene to this model's settings without loading it (to re-teach the model at them)").clicked() {
+                            acts.push(Action::ApplyModelSettingsOnly(o.path.clone()));
+                        }
                     }
                     if ui.button(OFFER_CANCEL).on_hover_text("close this card; nothing is changed or loaded").clicked() {
                         acts.push(Action::CancelModelOffer);
@@ -475,11 +493,20 @@ fn sampling_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInpu
                         pause_button(ui, p.paused, "sampling-card", acts);
                     });
                 });
-                dock::progress(ui, p, input.model());
                 match mg {
-                    Some(mg) => theme::note(ui, &crate::ui::migration::progress_line(mg)),
-                    None => theme::note(ui, "Stages: isolated-atom references, perturbations, pair scans, hot MD burst."),
-                };
+                    // one estimate, the migration's own (review M2): the bar and the counts of the progress line
+                    Some(mg) => {
+                        let frac = if mg.samples > 0 { mg.done as f32 / mg.samples as f32 } else { 0.0 };
+                        let left = mg.eta_s.filter(|_| !p.paused).map_or(String::new(), |s| format!(" — about {} left", crate::ui::migration::hm(s)));
+                        let paused = if p.paused { "paused · " } else { "" };
+                        ui.add(egui::ProgressBar::new(frac).show_percentage().text(format!("{paused}{}{left}", crate::ui::migration::progress_counts(mg))));
+                        theme::note(ui, "Each old sample is solved once, cold, with the new solver; Pause keeps its place, Cancel stops it and it goes on from there later.");
+                    }
+                    None => {
+                        dock::progress(ui, p, input.model());
+                        theme::note(ui, "Stages: isolated-atom references, perturbations, pair scans, hot MD burst.");
+                    }
+                }
             });
         });
     Some(r.response.rect.top())

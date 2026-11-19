@@ -71,6 +71,11 @@ pub struct ModelOffer {
     pub rows: Vec<Row>,
     /// What Apply sends, in order; unused while a row is blocked.
     pub edits: Vec<Edit>,
+    /// The model will be refused on load whatever the settings — taught before the Fermi–Dirac switch
+    /// (`providers::surrogate::legacy_model_refusal`; spec §7.9, Task 16 review I2): "Apply and load" refuses with it
+    /// before applying anything (no scene re-solve, no dimer gate for a load that cannot happen); applying the settings
+    /// only (to re-teach the model at them) stays.
+    pub refusal: Option<String>,
 }
 
 impl ModelOffer {
@@ -332,7 +337,7 @@ pub fn offer(path: &Path, prov: &Provenance, scene: &Scene, ctx: &Context<'_>) -
         rows.push(r);
     }
 
-    Some(ModelOffer { path: path.to_path_buf(), rows, edits })
+    Some(ModelOffer { path: path.to_path_buf(), rows, edits, refusal: providers::surrogate::legacy_model_refusal(&prov.ionic) })
 }
 
 #[cfg(test)]
@@ -525,6 +530,14 @@ mod tests {
         assert_eq!(o.rows.iter().map(|r| r.name).collect::<Vec<_>>(), ["grid"], "{:?}", o.rows);
         assert_eq!(o.edits, vec![Edit::Grid { n: 49, h: 0.25 }]);
         assert_eq!(o.blocked(), None);
+        // the card carries the load's refusal, so Apply-and-load refuses before applying (review I2)
+        assert_eq!(o.refusal, providers::surrogate::legacy_model_refusal("none"));
+        assert!(o.refusal.is_some());
+        let mut current = prov_of(&s);
+        current.grid_n = 49;
+        current.h = 0.25;
+        current.sigma = 0.25;
+        assert_eq!(make(&current, &s).unwrap().refusal, None, "this build's tag: no refusal");
         // a shared-shell pseudopotential tag of the scene's own policy: occupations only
         let mut s = scene();
         s.ionic = sim::IonicPolicy::All;

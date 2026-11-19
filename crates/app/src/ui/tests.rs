@@ -547,7 +547,8 @@ fn settings_that_cannot_be_applied_disable_apply() {
     let inp = input(&scene, None, &cam);
     let mut st = UiState::new("h2", &scene);
     (st.gpu_available, st.backend) = (true, Backend::Estimated);
-    let p = header_only_model("blocked.model", 81, 0.15, 0.15, 1e-5, 0, "null", "Kohn-Sham (CPU)", "cores/0123456789abcdef/shared0/0/stop2x0");
+    // another recipe's Fermi–Dirac tag (a pre-Fermi–Dirac one is refused outright: `apply_settings_refuses_a_legacy_model_before_applying_anything`)
+    let p = header_only_model("blocked.model", 81, 0.15, 0.15, 1e-5, 0, "null", "Kohn-Sham (CPU)", "cores/0123456789abcdef/fd5e-3/stop2x5e-8/pin1e-5");
     st.model_file = Some(p);
     assert!(act(&mut st, &inp, Action::LoadModel).commands.is_empty());
     let o = st.model_offer.clone().unwrap();
@@ -573,6 +574,51 @@ fn settings_that_cannot_be_applied_disable_apply() {
     let out = act(&mut st, &busy, Action::ApplyModelSettings);
     assert!(out.commands.is_empty() && out.error.as_deref().is_some_and(|e| e.contains("sampling pass")), "{:?} {:?}", out.commands, out.error);
     assert!(st.model_offer.is_some());
+}
+
+/// Spec §7.9 (Task 16 review I2): a model taught before the Fermi–Dirac switch that also differs in another setting
+/// gets the card, but Apply-and-load refuses with the legacy reason before applying anything — no grid change, no
+/// policy change, no load — and the card stays; Apply the settings only still sets the scene to them (to re-teach the
+/// model there) without loading it. A model whose only difference is the occupation rule gets no card: the load goes
+/// to the driver, which refuses it with the same reason.
+#[test]
+fn apply_settings_refuses_a_legacy_model_before_applying_anything() {
+    let scene = Scene::preset("h2").unwrap(); // 49³ × 0.25, all-electron
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let mut st = UiState::new("h2", &scene);
+    (st.gpu_available, st.backend) = (true, Backend::Estimated);
+    let reason = providers::surrogate::legacy_model_refusal("none").unwrap();
+    // the occupation rule alone: no card, straight to the driver's refusal
+    let only = header_only_model("legacy-same.model", 49, 0.25, 0.25, 1e-6, 0, "null", "Kohn-Sham (GPU)", "none");
+    st.model_file = Some(only.clone());
+    assert!(matches!(one_dyn(&act(&mut st, &inp, Action::LoadModel)), DynCommand::LoadModel(p) if *p == only));
+    assert!(st.model_offer.is_none());
+    // and another grid: the card, which carries the reason
+    let legacy = header_only_model("legacy-grid.model", 81, 0.15, 0.15, 1e-6, 0, "null", "Kohn-Sham (GPU)", "none");
+    st.model_file = Some(legacy.clone());
+    assert!(act(&mut st, &inp, Action::LoadModel).commands.is_empty());
+    let o = st.model_offer.clone().expect("the card");
+    assert_eq!(o.refusal.as_deref(), Some(reason.as_str()));
+    assert!(o.rows.iter().all(|r| r.name != "ionic potential"), "the occupation rule is never a row: {:?}", o.rows);
+    let out = act(&mut st, &inp, Action::ApplyModelSettings);
+    assert!(out.commands.is_empty(), "nothing applied, nothing loaded: {:?}", out.commands);
+    assert!(out.error.as_deref().is_some_and(|e| e.starts_with("the model cannot be loaded") && e.contains(&reason)), "{:?}", out.error);
+    assert_eq!((st.grid_n, st.grid_h), (scene.grid_n, scene.grid_h), "the panel's grid untouched");
+    assert!(st.model_offer.is_some(), "the card stays up to read");
+    // the card draws its reason and its settings-only button
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let all = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    let t = texts_in(&ctx, &mut st, &inp, 1400.0, all);
+    assert!(t.contains("this model cannot be loaded here") && t.contains(super::overlays::OFFER_SETTINGS_ONLY), "{t}");
+    let outs = click_widget(&ctx, &mut st, &inp, "model-offer-settings-only");
+    assert!(matches!(actions(&outs).as_slice(), [Action::ApplyModelSettingsOnly(p)] if *p == legacy), "{:?}", actions(&outs));
+    // the settings only: the grid sent, no load
+    let out = act(&mut st, &inp, Action::ApplyModelSettingsOnly(legacy.clone()));
+    assert!(out.commands.iter().any(|c| matches!(c, Command::SetGrid { n: 81, .. })), "{:?}", out.commands);
+    assert!(!out.commands.iter().any(|c| matches!(c, Command::Dyn(DynCommand::LoadModel(_)))), "{:?}", out.commands);
 }
 
 /// Dock ▸ Model and File ▸ Estimated model: Forget needs two clicks; a long pass needs two
@@ -13784,10 +13830,7 @@ fn start_migration_is_an_action() {
         eta_s: Some(5400.0),
         state: sim::MigrationPhase::Offered,
         species: vec![1, 7, 8],
-        date: String::new(),
-        review: [0; 3],
-        not_migrated: Vec::new(),
-        references: Vec::new(),
+        summary: None,
     };
     let shared = sim::ModelSource::Collection { slug: "lsda-new".into(), samples: 0, read_only: false };
     let m = ModelStatus { migration: Some(offered.clone()), source: shared, collections: true, use_collection: true, ..model() };
@@ -13839,4 +13882,29 @@ fn start_migration_is_an_action() {
     assert!(!t.contains("Atomic Sandbox now fills electron levels") && t.contains(&super::migration::later_line(&offered)), "{t}");
     let outs = click_widget(&ctx, &mut st, &inp, "migration-resolve");
     assert!(matches!(actions(&outs).as_slice(), [Action::StartMigration]));
+}
+
+/// Task 16 review M1: while the migration's re-solve pass runs, the Activity pass card is titled for it, its count line
+/// is the progress counts with no time in it, its one time left is the migration's own estimate (none while paused),
+/// and its bar is the migration's sample count; the hover holds the whole §7.8 line.
+#[test]
+fn migration_pass_card_shows_the_counts_and_one_time_left() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let mg = sim::MigrationStatus { source: "lsda-old".into(), samples: 2412, done: 412, counts: [380, 22, 10, 0], eta_s: Some(3120.0), state: sim::MigrationPhase::Running, species: vec![1, 7, 8], summary: None };
+    let m = ModelStatus { migration: Some(mg.clone()), pass_eta_s: Some(99.0), ..model() };
+    for paused in [false, true] {
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(m.clone()));
+        snap.dynamics.sampling = Some(sim::SamplingProgress { stage: "re-solving", done: 412, total: 2412, skipped: 0, failed: 0, cancelled: false, last_energy: f64::NAN, finished: false, target: None, paused });
+        let inp = input(&scene, Some(&snap), &cam);
+        let rows = activity::jobs::rows(&inp, None);
+        let r = rows.iter().find(|r| r.key == activity::jobs::JobKey::Pass).expect("the pass card");
+        assert_eq!(r.title, super::migration::RESOLVING);
+        let counts = super::migration::progress_counts(&mg);
+        assert_eq!(r.count.as_deref(), Some(if paused { format!("paused · {counts}") } else { counts.clone() }.as_str()));
+        assert!(!r.count.as_deref().unwrap().contains("left"), "no time in the count line: {:?}", r.count);
+        assert_eq!(r.eta_s, if paused { None } else { Some(3120.0) }, "the migration's estimate, not the worker's pass rate");
+        assert!(matches!(r.progress, activity::jobs::JobProgress::Fraction { done: 412, total: 2412 }));
+        assert_eq!(r.detail, super::migration::progress_line(&mg));
+    }
 }

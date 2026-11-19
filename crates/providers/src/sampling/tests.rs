@@ -3107,7 +3107,10 @@ mod migration {
         run(&mut s);
         let log = log_of(&s);
         assert_eq!((log.counts, log.cursor, log.state), ([1, 0, 0, 4], 5, MigrationState::Complete));
-        let why: Vec<(usize, &str)> = log.not_migrated.iter().map(|(i, w)| (*i, w.as_str())).collect();
+        let why: Vec<(usize, &str)> = log.not_migrated.iter().map(|(i, _, w)| (*i, w.as_str())).collect();
+        // the reasons' codes (plan Task 16 fix round 1, (c)): what the summary counts by
+        use ::surrogate::NotMigrated as N;
+        assert_eq!(log.not_migrated.iter().map(|x| x.1).collect::<Vec<_>>(), vec![N::Stalled, N::SolverWarning, N::BoxAffected, N::Multiplicity]);
         assert_eq!(why.iter().map(|w| w.0).collect::<Vec<_>>(), vec![1, 2, 3, 4], "{why:?}");
         assert!(why[0].1.contains("cold solve failed") && why[0].1.contains("stalled"), "{}", why[0].1);
         assert!(why[1].1.contains("warned: Poisson solve not converged"), "{}", why[1].1);

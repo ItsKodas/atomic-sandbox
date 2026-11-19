@@ -701,7 +701,9 @@ impl Worker {
                     };
                     let paused = t.migration().is_some_and(|m| m.state == sim::MigrationPhase::Paused) && !t.pass_active();
                     if now.is_some() && now != attached && paused {
-                        self.dy.apply(DynCommand::StartMigration);
+                        // through the command path, so its bookkeeping (the first-pass offer, the pass sizing,
+                        // the autosave's owner) is the button's (review M6)
+                        self.apply(Command::Dyn(DynCommand::StartMigration));
                     }
                     None
                 }

@@ -981,7 +981,7 @@ pub struct MigrationStatus { pub source: String, pub samples: usize, pub done: u
   - `migration_summary_text`: the §7.8 summary, including "identical within solver noise", "kept out" and the old slug.
   - `no_offer_without_samples_to_migrate`: a predecessor with 0 samples, or a complete log → no offer.
   - `downgrade_line_names_the_pre_migration_folder`: present only while the log's source folder exists. The text follows §7.7.
-  - `legacy_tag_model_refused_with_reason`: "taught with the solver before <version> (integer / shared occupations); this version uses Fermi–Dirac smearing: re-teach it, or open it in <version>", where `<version>` is this build's `CARGO_PKG_VERSION` (ruling R17).
+  - `legacy_tag_model_refused_with_reason`: "taught with the solver before <version> (integer / shared occupations); this version uses Fermi–Dirac smearing: re-teach it, or open it in <version>", with both `<version>`s `LAST_PRE_FD_RELEASE` (ruling R17, revised at fix round 1).
   - `apply_settings_offer_omits_occupations`.
   - `start_migration_is_an_action`: recorded with `--record`; skipped in replay.
 - [ ] **Step 2: Run them to check they fail.** Run `cargo test -p app --release --bin app -- migration downgrade legacy_tag apply_settings`. Expected: FAIL.
@@ -1096,7 +1096,7 @@ pub struct MigrationStatus { pub source: String, pub samples: usize, pub done: u
 - **R14.** V7's old-folder fixture uses DS-era labels captured in Task 10, before DS is deleted.
 - **R15.** `legacy_tag_of` hashes with a frozen `DIMER_PROCEDURE_DS` and is pinned to strings recorded in Task 9 before any change.
 - **R16.** Starting a migration is a recorded `ui::Action`, but a replay never starts one, as with the PySCF setup.
-- **R17.** "<version>" in the legacy-model refusal is this build's `CARGO_PKG_VERSION`.
+- **R17** (revised at Task 16 fix round 1). Both "<version>" slots of the legacy-model refusal are one constant, the last pre-Fermi–Dirac release `LAST_PRE_FD_RELEASE` = "0.2.0-beta.5": "taught with the solver of 0.2.0-beta.5 or earlier (integer / shared occupations); this version uses Fermi–Dirac smearing: re-teach it, or open it in 0.2.0-beta.5". (First ruled: this build's `CARGO_PKG_VERSION`, which named the wrong boundary.)
 - **R18.** V5 dynamics (Task 11) comes before the UI (Task 12), swapping spec §11's A5/A6. This closes the whole-solver-half review before the UI copy is written.
 - **R19 (2026-11-14, the user's ruling after V0).** kT = 5 mHa, and the reference scan's stop at 1e-5. Spec §2 item 3 and rulings 42–46 apply it: every GPU solve with a partial level stops at max(tol_eff, 1e-5) (Task 7 implements `GPU_PARTIAL_TOL`; Task 9's tags carry `fd5e-3` and `pin1e-5`); the witness stays 36 kT / 16; V2's pins are re-measured at 5 mHa (Task 3, step 0); the FD ≡ Aufbau test runs at an explicit kT = 1e-3 (Task 5). Every "316 K" in Tasks 12 and 16 is 1579 K (`units::hartree_to_kelvin(ELECTRON_KT)`, rounded).
 - **R20.** The V0 re-run at 5 mHa (Task 1) covers B, C, N, O, F, Si, P, S, Cl, all-electron O and the spec's molecules (OH along an axis and off-axis, the O₂ singlet at auto and triplet, H₂O, NH at auto and at M = 3). Its numbers are in the V0 note's 2026-11-14 section; Task 1 step 6 copies the summary into references.md.

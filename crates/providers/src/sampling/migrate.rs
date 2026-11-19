@@ -103,7 +103,7 @@ use std::path::{Path, PathBuf};
 use surrogate::collection::CollectionReference;
 use surrogate::migration::MIGRATION_FILE;
 use surrogate::quarantine::{is_collection_code, Q_FORGOTTEN, Q_FORGOTTEN_UNFENCED, Q_RESOLVED, Q_SUPERSEDED};
-use surrogate::{Collection, CollectionSample, MigrationLog, MigrationState, SurfaceKey};
+use surrogate::{Collection, CollectionSample, MigrationLog, MigrationState, NotMigrated, SurfaceKey};
 
 /// ε_E's floor (module doc, "The thresholds"): Hartree per sample.
 pub const MIGRATION_EPS_E: f64 = 1e-5;
@@ -423,10 +423,11 @@ impl Migrator {
         ::surrogate::write_migration(&self.dir, &self.log).map_err(|e| ProviderError::Invalid(format!("re-solving: {MIGRATION_FILE} could not be written ({e}) — the pass stops; it resumes from sample {}", self.log.cursor)))
     }
 
-    /// Sample `i` is not migrated, with `why` (module doc, 3.): listed, counted, the cursor moved on.
-    fn not_migrated(&mut self, i: usize, why: String) -> Result<Option<SamplingProgress>, ProviderError> {
+    /// Sample `i` is not migrated, for the reason `code` in the words `why` (module doc, 3.): listed, counted, the cursor
+    /// moved on.
+    fn not_migrated(&mut self, i: usize, code: NotMigrated, why: String) -> Result<Option<SamplingProgress>, ProviderError> {
         self.notes.push(format!("re-solving {}: sample {i} not migrated ({why}) — it stays in the old collection", self.log.source_slug));
-        self.log.not_migrated.push((i, why));
+        self.log.not_migrated.push((i, code, why));
         self.log.counts[3] += 1;
         self.log.cursor = i + 1;
         self.write_log()?;
@@ -522,23 +523,23 @@ impl Migrator {
         let code = self.source_codes.get(i).copied().unwrap_or(0);
         // 1. no solve needed to refuse
         if !is_collection_code(code) {
-            return self.not_migrated(i, format!("its status code {code} is not one a collection holds"));
+            return self.not_migrated(i, NotMigrated::StatusCode, format!("its status code {code} is not one a collection holds"));
         }
         if old.multiplicity_forced {
-            return self.not_migrated(i, "its scene forced the multiplicity (never shared)".into());
+            return self.not_migrated(i, NotMigrated::ForcedMultiplicity, "its scene forced the multiplicity (never shared)".into());
         }
         if no_neighbours(&old.sample.pos, self.r_cut) {
-            return self.not_migrated(i, ::surrogate::collection::REFUSE_LONE.into());
+            return self.not_migrated(i, NotMigrated::Lone, ::surrogate::collection::REFUSE_LONE.into());
         }
         let scene = match self.scene_of(&old) {
             Ok(s) => s,
-            Err(why) => return self.not_migrated(i, why),
+            Err(why) => return self.not_migrated(i, NotMigrated::NoScene, why),
         };
         let want = surrogate.collection().map(|c| c.key.clone());
         let got = surrogate.provenance_for(&scene).surface_key();
         if want.as_ref() != Some(&got) {
             let d = want.as_ref().and_then(|w| w.difference(&got)).unwrap_or_else(|| "no collection is attached".into());
-            return self.not_migrated(i, format!("its scene is not on the collection's surface ({d})"));
+            return self.not_migrated(i, NotMigrated::OtherSurface, format!("its scene is not on the collection's surface ({d})"));
         }
         // 2. the cold solve
         let started = Instant::now();
@@ -553,14 +554,21 @@ impl Migrator {
         let r = match r {
             Err(ProviderError::Cancelled) => return Err(ProviderError::Cancelled),
             Err(e @ ProviderError::Solver(sim::SolverError::Device(_))) => return Err(e),
-            Err(e) => return self.not_migrated(i, format!("the cold solve failed: {e}")),
+            Err(e) => {
+                let code = match &e {
+                    ProviderError::Solver(sim::SolverError::ScfStalled { .. }) => NotMigrated::Stalled,
+                    ProviderError::Solver(sim::SolverError::ScfNotConverged(..)) => NotMigrated::NotConverged,
+                    _ => NotMigrated::SolveFailed,
+                };
+                return self.not_migrated(i, code, format!("the cold solve failed: {e}"));
+            }
             Ok(r) => r,
         };
         self.walls.push(started.elapsed().as_secs_f64());
         self.progress.last_energy = r.energy;
         // 3. the checks
-        if let Err(why) = check_solve(&r, old.sample.z.len(), self.h, old.multiplicity) {
-            return self.not_migrated(i, why);
+        if let Err((code, why)) = check_solve(&r, old.sample.z.len(), self.h, old.multiplicity) {
+            return self.not_migrated(i, code, why);
         }
         // 4. classify, append
         let eps = migration_eps(self.all_electron, r.stats.scf_tol_used.unwrap_or(self.tol), old.sample.energy);
@@ -636,29 +644,29 @@ impl Migrator {
 pub const BOND_EXPERIENCE_FILE: &str = "bond_experience.txt";
 
 /// The checks of a cold solve (module doc, 3.): `Err` with the reason a sample is not migrated.
-fn check_solve(r: &ForceResult, n: usize, h: f64, recorded: Option<u32>) -> Result<(), String> {
+fn check_solve(r: &ForceResult, n: usize, h: f64, recorded: Option<u32>) -> Result<(), (NotMigrated, String)> {
     if r.forces.len() != n {
-        return Err(format!("the solve returned {} forces for {n} nuclei", r.forces.len()));
+        return Err((NotMigrated::SolveFailed, format!("the solve returned {} forces for {n} nuclei", r.forces.len())));
     }
     if !r.energy.is_finite() || !r.stats.energy.internal.is_finite() || r.forces.iter().flatten().any(|x| !x.is_finite()) {
-        return Err("the solve returned a non-finite energy or force".into());
+        return Err((NotMigrated::SolveFailed, "the solve returned a non-finite energy or force".into()));
     }
     if let Some(why) = r.stats.untrainable() {
-        return Err(format!("the solve is not trained on ({why})"));
+        return Err((NotMigrated::Untrainable, format!("the solve is not trained on ({why})")));
     }
     if !r.stats.warnings.is_empty() {
-        return Err(format!("the solve warned: {}", r.stats.warnings.join("; ")));
+        return Err((NotMigrated::SolverWarning, format!("the solve warned: {}", r.stats.warnings.join("; "))));
     }
     let limit = box_affected_face_density(h);
     match r.stats.face_density {
-        None => return Err("box status unknown (the solve reported no face density)".into()),
-        Some(f) if !(f <= limit) => return Err(format!("box-affected: face density {f:.2e} e/Bohr³ above the box rule's {limit:.2e} at h = {h}")),
+        None => return Err((NotMigrated::BoxUnknown, "box status unknown (the solve reported no face density)".into())),
+        Some(f) if !(f <= limit) => return Err((NotMigrated::BoxAffected, format!("box-affected: face density {f:.2e} e/Bohr³ above the box rule's {limit:.2e} at h = {h}"))),
         Some(_) => {}
     }
     if let Some(m) = recorded {
         if r.stats.multiplicity != Some(m) {
             let got = r.stats.multiplicity.map_or("an unreported multiplicity".to_string(), |g| format!("multiplicity {g}"));
-            return Err(format!("solved at {got}, recorded {m}"));
+            return Err((NotMigrated::Multiplicity, format!("solved at {got}, recorded {m}")));
         }
     }
     Ok(())

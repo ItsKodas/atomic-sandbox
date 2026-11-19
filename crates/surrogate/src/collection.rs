@@ -1807,6 +1807,10 @@ impl Collection {
             count(Q_DRAFT),
             count(crate::quarantine::Q_FORGOTTEN) + count(crate::quarantine::Q_FORGOTTEN_UNFENCED)
         ));
+        // re-solved for the new solver and awaiting their review (code 9; Fermi–Dirac spec §7.6)
+        if count(crate::quarantine::Q_RESOLVED) > 0 {
+            t.push_str(&format!("{} of them re-solved for the new solver, awaiting their review (out of the fit until then)\n", count(crate::quarantine::Q_RESOLVED)));
+        }
         let mut tags: BTreeMap<String, usize> = BTreeMap::new();
         for s in &self.samples {
             *tags.entry(format!("{:?}", s.sample.tag)).or_default() += 1;
@@ -1890,6 +1894,13 @@ impl Collection {
             t.push_str(&format!("  {name}: {k} samples, grid {grids}\n"));
         }
         t.push_str(&format!("\naudit history: {} points ({} recorded)\n", self.history.len(), self.history.recorded()));
+        // a collection a migration made (Fermi–Dirac spec §7.5, §7.8): once its re-solve pass is complete, its summary
+        // — the Model tab's text (`crate::migration::summary_text`)
+        if let Some(summary) = crate::migration::read_migration(&self.folder).ok().flatten().as_ref().and_then(crate::migration::summary_text) {
+            t.push_str("\nmigration (re-solved for the Fermi–Dirac solver; the old folder is kept unchanged):\n");
+            t.push_str(&summary);
+            t.push('\n');
+        }
         t
     }
 }
@@ -2598,6 +2609,54 @@ mod tests {
         for want in ["lsda", "h 0.25", "4 samples", "H (Z 1)", "O (Z 8)", "H–H", "H–O", "h2o", "1 held"] {
             assert!(text.contains(want), "README lacks '{want}':\n{text}");
         }
+    }
+
+    /// Fermi–Dirac spec §7.5, §7.8 (plan Task 16 fix round 1): a collection a migration made carries, once the pass is
+    /// complete, the summary as its README paragraph — the very text of `migration::summary_text`, the Model tab's —
+    /// and counts its code-9 samples; while the pass runs, or without a `migration.txt`, there is no paragraph.
+    #[test]
+    fn the_readme_carries_the_migration_summary() {
+        use crate::migration::{summary_text, write_migration, MigrationLog, MigrationState, NotMigrated};
+        let dir = root("readme-migration");
+        let key = prov().surface_key();
+        let (mut c, _) = Collection::open(&dir, &key).unwrap();
+        for i in 0..3 {
+            c.append(cs(i)).unwrap();
+        }
+        c.set_status(1, crate::quarantine::Q_RESOLVED).unwrap();
+        let folder = dir.join(key.slug());
+        c.write_readme().unwrap();
+        let before = std::fs::read_to_string(folder.join("README.txt")).unwrap();
+        assert!(!before.contains("migration (") , "no migration.txt, no paragraph:\n{before}");
+        assert!(before.contains("1 of them re-solved for the new solver, awaiting their review"), "{before}");
+        let mut log = MigrationLog {
+            source_slug: "lsda-old".into(),
+            source_key: String::new(),
+            build: "0.2.0".into(),
+            date: "2026-11-20".into(),
+            source_len: 0,
+            source_hash: 0,
+            cursor: 4,
+            state: MigrationState::Running,
+            counts: [2, 0, 1, 1],
+            not_migrated: vec![(3, NotMigrated::Stalled, "the cold solve failed: SCF stalled".into())],
+            references: vec![(1, 49, Some(-0.478), Some(-0.478))],
+            class_u_max: (0.0, 0.0),
+            review: Vec::new(),
+            waiting: Vec::new(),
+            pending: None,
+            orphaned: Vec::new(),
+        };
+        write_migration(&folder, &log).unwrap();
+        c.write_readme().unwrap();
+        assert!(!std::fs::read_to_string(folder.join("README.txt")).unwrap().contains("Migrated from"), "running: no summary yet");
+        log.state = MigrationState::Complete;
+        write_migration(&folder, &log).unwrap();
+        c.write_readme().unwrap();
+        let text = std::fs::read_to_string(folder.join("README.txt")).unwrap();
+        let summary = summary_text(&log).unwrap();
+        assert!(summary.starts_with("Migrated from lsda-old on 2026-11-20:") && summary.contains("- 1 not migrated (1 stalled; it remains in the old collection)."), "{summary}");
+        assert!(text.contains(&summary), "README lacks the summary:\n{text}");
     }
 
     fn solved(energy: f64, n: usize, face: f64) -> CollectionReference {

@@ -991,20 +991,27 @@ body-4 degree) change (review M3). Its note appears only when the verdicts chang
 The wording says "identical within solver noise", not "identical". It says "kept out", not "discarded". It names the
 old folder.
 
-As built (plan Task 16, `app::ui::migration`):
+As built (plan Task 16 and its fix round 1; the words in `app::ui::migration`, the summary in
+`surrogate::migration::summary_text`):
 - Code-9 samples the review cannot judge (stray atoms, §7.6) get their own clause in the state-changed line, in the
   same style: "…; 2 waiting (stray atoms)". State-changed samples with no verdict and not waiting (they kept code 7
   or 2, or wait for an isolated-atom reference) are "N not reviewed (…)". Before the first review the line says what
   the review will do.
 - The references line reads "References re-solved (the new F against the old E): O −9.5 mHa": the log holds the old
   and new values only, and their difference is −TS only where E did not move, so it is labelled as what it is.
-- The not-migrated reasons are worded from the pass's reasons ("stalled", "now box-affected", "not converged", …).
-- Numbers are grouped with a space as above ("2 412", "1 579 K"); times are "1 h 30 min", to 5 min from an hour on.
+- The not-migrated reasons are counted by a code `migration.txt` records with each one (`surrogate::NotMigrated`:
+  "stalled", "now box-affected", "not converged", …), never by matching the reason's prose.
+- Numbers are grouped as above ("2 412", "1 579 K"), with a narrow no-break space (U+202F) so a label never breaks a
+  number; times are "1 h 30 min", to 5 min from an hour on ("under a minute left", without "≈").
+- The offer card sits at the top of the Model tab, under the verdict card, so it is seen; the collection section (the
+  *Model file* fold) is where Later folds it to. Re-solve now is disabled, with the reason, on a read-only collection.
 - **Later** folds the offer into one line of the Model tab's *Model file* section, which keeps Re-solve now; there the
   section shows the progress line while the pass runs, "stopped at sample k of n … It goes on from there at the next
   start of the app, or now with Resume" for a stopped pass, and the summary once complete. A stopped pass is started
   again by the worker when it next attaches the collection (§7.3, "Resume").
-- The `README.txt` paragraph is not written yet (the collection's README writer is `surrogate::collection`).
+- The summary is one text (`surrogate::migration::summary_text` of `migration.txt`): the Model tab shows it
+  (`sim::MigrationStatus::summary`), and `README.txt` carries it as its migration paragraph once the pass is complete,
+  with a count of the code-9 samples awaiting their review. "- 0 changed state;" stands alone when none did.
 
 ### 7.9 Model files
 
@@ -1019,6 +1026,12 @@ As built (plan Task 16, `app::ui::migration`):
   <version> (integer / shared occupations); this version uses Fermi–Dirac smearing: re-teach it, or open it in
   <version>". The Load-model card's "apply the model's settings" offer does not offer the occupation difference, which
   cannot be applied.
+  - **Amended (plan Task 16 fix round 1, R17 revised):** both `<version>` slots are one constant, the last
+    pre-Fermi–Dirac release (`providers::surrogate::LAST_PRE_FD_RELEASE` = 0.2.0-beta.5): "taught with the solver of
+    0.2.0-beta.5 or earlier (integer / shared occupations); this version uses Fermi–Dirac smearing: re-teach it, or open
+    it in 0.2.0-beta.5". This build's own version named the wrong boundary. The refusal covers every load path, Import
+    a model file…, and the card: when other settings differ too, "Apply and load" refuses with the reason before
+    applying anything, and "Apply the settings only" remains (to re-teach the model at them).
   - Migrating model files in the app is a non-goal. The engine exists, so it is a small follow-up if the user wants it.
 
 ## 8. Interaction with the trust rework (`claude/charming-keller-0bc26b`)

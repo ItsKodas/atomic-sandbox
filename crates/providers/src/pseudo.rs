@@ -313,12 +313,18 @@ pub fn is_all_electron_tag(tag: &str) -> bool {
 }
 
 /// Whether `tag` is a surface tag of a build before the Fermi–Dirac switch (spec 2026-11-13 §7.9): its first word a
-/// policy this build knows and no `fd…` part — the legacy all-electron `"none"`, a shared-shell tag
+/// policy this build knows and no Fermi–Dirac occupation segment — the legacy all-electron `"none"`, a shared-shell tag
 /// (`…/shared1e-3/1e-1/stop2x5e-8`, [`legacy_tag_of`]) or an older pseudopotential tag with no occupation part. A model
 /// file carrying one is refused on load with its reason (`providers::surrogate::legacy_model_refusal`).
+///
+/// The occupation segment is read by position — the second for `none/…`, the third (after the recipe hash) otherwise —
+/// and is Fermi–Dirac only as `fd<kT>` with a kT that parses, never by a prefix anywhere in the tag (plan Task 16
+/// review M4: a recipe hash may itself begin with "fd").
 pub fn is_pre_fermi_dirac_tag(tag: &str) -> bool {
-    let mut parts = tag.split('/');
-    parts.next().and_then(IonicPolicy::parse).is_some() && !parts.any(|w| w.starts_with("fd"))
+    let parts: Vec<&str> = tag.split('/').collect();
+    let Some(policy) = parts.first().and_then(|w| IonicPolicy::parse(w)) else { return false };
+    let occupation = parts.get(if policy == IonicPolicy::None { 1 } else { 2 });
+    !occupation.is_some_and(|w| w.strip_prefix("fd").is_some_and(|kt| kt.parse::<f64>().is_ok_and(|kt| kt > 0.0)))
 }
 
 /// `τ` and `τ_c` of the last shared-shell build's tags (its decision threshold τ = 1e-3 Ha and candidate window
@@ -1617,5 +1623,24 @@ mod tests {
         assert!(!is_all_electron_tag("cores/0123456789abcdef/fd5e-3/stop2x5e-8/pin1e-5"));
         assert!(!is_all_electron_tag(""));
         assert!(!is_all_electron_tag("nonesuch"), "a prefix of the word is not the word");
+    }
+
+    /// Spec §7.9 (plan Task 16 review M4): the pre-Fermi–Dirac test reads the occupation segment by position, so a
+    /// recipe hash that begins with "fd" (1 in 256) neither hides a legacy tag nor makes one of a current tag.
+    #[test]
+    fn pre_fermi_dirac_tags_are_read_by_position() {
+        for legacy in ["none", "all/0123456789abcdef/shared1e-3/1e-1/stop2x5e-8", "cores/fdab0123456789ab/shared1e-3/1e-1/stop2x5e-8", "cores/fd00000000000000", "all/0123456789abcdef"] {
+            assert!(is_pre_fermi_dirac_tag(legacy), "{legacy}");
+        }
+        for p in [IonicPolicy::None, IonicPolicy::CoresOnly, IonicPolicy::All] {
+            assert!(is_pre_fermi_dirac_tag(&legacy_tag_of(p)), "{p:?}");
+            assert!(!is_pre_fermi_dirac_tag(&tag_of(p)), "{p:?}");
+        }
+        for current in [all_electron_tag().as_str(), "cores/fdab0123456789ab/fd5e-3/stop2x5e-8/pin1e-5", "all/0123456789abcdef/fd5e-3/stop2x5e-8/pin1e-5"] {
+            assert!(!is_pre_fermi_dirac_tag(current), "{current}");
+        }
+        for not_a_tag in ["", "weird/1", "nonesuch"] {
+            assert!(!is_pre_fermi_dirac_tag(not_a_tag), "{not_a_tag}: only a known policy word is a tag at all");
+        }
     }
 }

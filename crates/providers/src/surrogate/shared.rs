@@ -993,6 +993,10 @@ impl SurrogateKs {
             return Err("import: cancel the running sampling pass first".into());
         }
         let sh = self.shared.as_mut().ok_or("import: no shared collection is attached (the Model tab's shared model)")?;
+        // a model of the previous solver (spec §7.9; plan Task 16 review M7): its reason, never "another surface"
+        if let Some(why) = surrogate::sidecar::read_provenance(path).ok().and_then(|p| legacy_model_refusal(&p.ionic)) {
+            return Err(format!("import {}: refused — {why}", path.display()));
+        }
         let limit = box_affected_face_density(sh.coll.key.h);
         let before = sh.coll.samples.len();
         let r_cut = self.cutoff();
@@ -1539,10 +1543,7 @@ impl SurrogateKs {
                 eta_s: Some(slot.prior_s(0)),
                 state: sim::MigrationPhase::Offered,
                 species: slot.species.clone(),
-                date: String::new(),
-                review: [0; 3],
-                not_migrated: Vec::new(),
-                references: Vec::new(),
+                summary: None,
             });
         };
         let state = match log.state {
@@ -1557,7 +1558,6 @@ impl SurrogateKs {
             _ => None,
         };
         let samples = running.map_or(slot.samples, |m| m.source_samples());
-        let released = log.review.iter().filter(|e| e.2).count();
         Some(sim::MigrationStatus {
             source,
             samples,
@@ -1566,10 +1566,7 @@ impl SurrogateKs {
             eta_s,
             state,
             species: slot.species.clone(),
-            date: log.date.clone(),
-            review: [released, log.review.len() - released, log.waiting.len()],
-            not_migrated: log.not_migrated.iter().map(|(_, why)| why.clone()).collect(),
-            references: log.references.clone(),
+            summary: surrogate::summary_text(log),
         })
     }
 
@@ -1714,7 +1711,12 @@ impl SurrogateKs {
         self.teacher.discontinuity();
         let [u, t, s, x] = log.counts;
         let head = match log.state {
-            MigrationState::Running => format!("re-solving {} for the new solver stopped at sample {} of {n} (it goes on from there when started again)", log.source_slug, log.cursor + 1),
+            MigrationState::Running => format!(
+                "re-solving {} for the new solver stopped at sample {} of {} (it goes on from there when started again)",
+                log.source_slug,
+                surrogate::migration::spaced(log.cursor as u64 + 1),
+                surrogate::migration::spaced(n as u64)
+            ),
             _ => format!("re-solving {} for the new solver finished", log.source_slug),
         };
         let counts = format!("{u} identical within solver noise, {t} changed only by −TS, {s} changed state (held out until reviewed), {x} not migrated (they stay in the old collection)");
@@ -1784,13 +1786,18 @@ impl SurrogateKs {
 /// Why an interrupted pass of the previous solver never resumes (spec §7.7, the `training/pass.ckpt` row).
 pub const PASS_STARTED_WITH_PREVIOUS_SOLVER: &str = "the interrupted pass was started with the previous solver";
 
+/// The last release whose solver used the integer / shared occupation rules (v0.2.0-beta.1 … beta.5 are all
+/// pre-Fermi–Dirac): the version the legacy-model refusal names in both its slots (plan ruling R17 as revised at Task 16
+/// fix round 1 — a build's own `CARGO_PKG_VERSION` named the wrong boundary).
+pub const LAST_PRE_FD_RELEASE: &str = "0.2.0-beta.5";
+
 /// Why a model file taught before the Fermi–Dirac switch is refused on load (spec §7.9; plan 2026-11-13 Task 16): `Some`
-/// with the reason when its ionic tag is one of the previous solver's (`pseudo::is_pre_fermi_dirac_tag`). `<version>`
-/// is this build's `CARGO_PKG_VERSION` (plan ruling R17; the workspace's one version). Migrating model files in the app
-/// is a non-goal (spec §7.9): the reason says to re-teach the model, or to open it in that version.
+/// with the reason when its ionic tag is one of the previous solver's (`pseudo::is_pre_fermi_dirac_tag`), naming
+/// [`LAST_PRE_FD_RELEASE`]. Migrating model files in the app is a non-goal (spec §7.9): the reason says to re-teach the
+/// model, or to open it in that version.
 pub fn legacy_model_refusal(tag: &str) -> Option<String> {
-    let v = env!("CARGO_PKG_VERSION");
-    crate::pseudo::is_pre_fermi_dirac_tag(tag).then(|| format!("taught with the solver before {v} (integer / shared occupations); this version uses Fermi–Dirac smearing: re-teach it, or open it in {v}"))
+    let v = LAST_PRE_FD_RELEASE;
+    crate::pseudo::is_pre_fermi_dirac_tag(tag).then(|| format!("taught with the solver of {v} or earlier (integer / shared occupations); this version uses Fermi–Dirac smearing: re-teach it, or open it in {v}"))
 }
 
 impl Drop for SurrogateKs {

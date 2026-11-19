@@ -1254,7 +1254,7 @@ mod policy;
 mod purge;
 mod quarantine;
 mod shared;
-pub use shared::{legacy_model_refusal, predecessor_of, COLLECTION_CHECKPOINT_PREFIX, PASS_STARTED_WITH_PREVIOUS_SOLVER};
+pub use shared::{legacy_model_refusal, predecessor_of, LAST_PRE_FD_RELEASE, COLLECTION_CHECKPOINT_PREFIX, PASS_STARTED_WITH_PREVIOUS_SOLVER};
 pub use purge::PURGE_WAIT_MIGRATION;
 mod store;
 pub(crate) use store::PassKeep;

@@ -601,6 +601,13 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             match model_offer_for(st, input, &shown.path) {
                 None => out.commands.push(dyn_(DynCommand::LoadModel(shown.path))),
                 Some(offer) => {
+                    // a model the load will refuse whatever the settings (Task 16 review I2): its reason first, nothing
+                    // applied — Apply settings only remains for re-teaching at them
+                    if let Some(why) = &offer.refusal {
+                        out.error = Some(format!("the model cannot be loaded: {why} — nothing was changed (Apply the settings only sets the scene to them)"));
+                        st.model_offer = Some(offer);
+                        return;
+                    }
                     if let Some(why) = offer.blocked() {
                         out.error = Some(format!("the model's settings cannot be applied: {why}"));
                         st.model_offer = Some(offer);
@@ -653,6 +660,8 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
         Action::StartMigration => {
             if input.sampling() {
                 out.error = Some("a pass is running: cancel it first, then re-solve the collection for the new solver".into());
+            } else if input.model().is_some_and(|m| matches!(m.source, sim::ModelSource::Collection { read_only: true, .. })) {
+                out.error = Some(super::dock::model::MIGRATION_READ_ONLY.into());
             } else {
                 out.commands.push(dyn_(DynCommand::StartMigration));
                 st.set_status("re-solving the collection for the new solver (Pause and Cancel on its card in the Activity tab)");

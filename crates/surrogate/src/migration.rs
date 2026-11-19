@@ -14,7 +14,7 @@
 //!   starts again from sample 0 — the cursor names samples by index, and those indices moved;
 //! - the cursor (the next source sample to re-solve) and the state (running, complete, reviewed);
 //! - the counts per class — unchanged (U), entropy only (T), state changed (S) — and not migrated;
-//! - every sample not migrated, by its source index, with the reason;
+//! - every sample not migrated, by its source index, with its reason's code ([`NotMigrated`]) and the reason;
 //! - the references re-solved: (Z, box n, the old energy, the new), either missing when there was
 //!   none or it did not solve;
 //! - class U's largest |ΔE| (Hartree) and |ΔF| (Hartree/Bohr), so the thresholds' margin is seen;
@@ -48,7 +48,7 @@
 //! state running | complete | reviewed
 //! counts unchanged <n> entropy_only <n> state_changed <n> not_migrated <n>
 //! class_u_max <|ΔE|> <|ΔF|>
-//! not_migrated <source index> <reason>              (zero or more, in order)
+//! not_migrated <source index> <code> <reason>       (zero or more, in order; <code> a NotMigrated word)
 //! reference <Z> <n> <old | -> <new | ->             (zero or more, in order)
 //! review <new index> <ratio> released | kept        (zero or more, in order)
 //! waiting <new index>                               (zero or more, in order: not judged, stray atoms)
@@ -62,6 +62,16 @@
 //! (`\\`, `\n`, `\r`), so a reason may hold any text. The reader is strict — every field once, in
 //! any order, lists in file order, nothing unknown, the closing `end` present (a file cut short is
 //! an error, never a silent default) — and refuses a newer `migration` version.
+//!
+//! **Format version 1 is not frozen yet**: no build with this file has shipped (the Fermi–Dirac switch is unreleased),
+//! so its lines may still change at version 1 — as the `not_migrated` line did, gaining its code (plan Task 16 fix
+//! round 1). Once a build ships, a change is a new `migration` version.
+//!
+//! # The summary
+//!
+//! [`summary_text`] is the migration's summary for people (spec §7.8): the Model tab shows it
+//! (`sim::MigrationStatus::summary`), and the collection's `README.txt` carries it as its migration paragraph
+//! (`Collection::write_readme`) — one text in both places.
 //!
 //! [`write_migration`] rewrites the file whole through `migration.txt.tmp`, synced and renamed into
 //! place (on Windows with write-through), after every source sample's append (spec §7.3,
@@ -118,8 +128,8 @@ pub struct MigrationLog {
     pub state: MigrationState,
     /// Samples per class: unchanged (U), entropy only (T), state changed (S), not migrated.
     pub counts: [usize; 4],
-    /// Each sample not migrated: its source index and the reason.
-    pub not_migrated: Vec<(usize, String)>,
+    /// Each sample not migrated: its source index, its reason's code and the reason.
+    pub not_migrated: Vec<(usize, NotMigrated, String)>,
     /// Each reference re-solved: (Z, grid points per side, the old energy, the new; Hartree).
     pub references: Vec<(u8, usize, Option<f64>, Option<f64>)>,
     /// Class U's largest |ΔE| (Hartree) and largest force-component |ΔF| (Hartree/Bohr).
@@ -132,6 +142,207 @@ pub struct MigrationLog {
     pub pending: Option<PendingStatus>,
     /// Source indices of migrated superseded (code 2) samples whose likely superseder was not migrated.
     pub orphaned: Vec<usize>,
+}
+
+/// Why a source sample was not migrated (spec §7.3 step 2): `migration.txt`'s `not_migrated` lines carry it as a word,
+/// and the summary counts by it — never by matching the reason's prose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotMigrated {
+    /// The cold solve's SCF stalled (the stall stop).
+    Stalled,
+    /// The cold solve hit its iteration cap.
+    NotConverged,
+    /// The cold solve failed otherwise.
+    SolveFailed,
+    /// The solve's face density is above the box rule.
+    BoxAffected,
+    /// The solve reported no face density.
+    BoxUnknown,
+    /// The solve carried a solver warning (core overlap, LSDA domain, Poisson cap).
+    SolverWarning,
+    /// The solve is not trained on (`EvalStats::untrainable`).
+    Untrainable,
+    /// The solve did not reproduce the recorded multiplicity.
+    Multiplicity,
+    /// Lone atoms: no neighbour within the model's cutoff.
+    Lone,
+    /// Its scene forced the multiplicity.
+    ForcedMultiplicity,
+    /// Its status code is not one a collection holds.
+    StatusCode,
+    /// Its scene could not be rebuilt (an isotope missing from the table).
+    NoScene,
+    /// Its scene is not on the collection's surface.
+    OtherSurface,
+}
+
+impl NotMigrated {
+    /// Every code, in the enum's order.
+    pub const ALL: [NotMigrated; 13] = [
+        NotMigrated::Stalled,
+        NotMigrated::NotConverged,
+        NotMigrated::SolveFailed,
+        NotMigrated::BoxAffected,
+        NotMigrated::BoxUnknown,
+        NotMigrated::SolverWarning,
+        NotMigrated::Untrainable,
+        NotMigrated::Multiplicity,
+        NotMigrated::Lone,
+        NotMigrated::ForcedMultiplicity,
+        NotMigrated::StatusCode,
+        NotMigrated::NoScene,
+        NotMigrated::OtherSurface,
+    ];
+
+    /// Its word in `migration.txt`.
+    pub fn word(self) -> &'static str {
+        match self {
+            NotMigrated::Stalled => "stalled",
+            NotMigrated::NotConverged => "not-converged",
+            NotMigrated::SolveFailed => "solve-failed",
+            NotMigrated::BoxAffected => "box-affected",
+            NotMigrated::BoxUnknown => "box-unknown",
+            NotMigrated::SolverWarning => "solver-warning",
+            NotMigrated::Untrainable => "untrainable",
+            NotMigrated::Multiplicity => "multiplicity",
+            NotMigrated::Lone => "lone",
+            NotMigrated::ForcedMultiplicity => "forced-multiplicity",
+            NotMigrated::StatusCode => "status-code",
+            NotMigrated::NoScene => "no-scene",
+            NotMigrated::OtherSurface => "other-surface",
+        }
+    }
+
+    /// The code of a `migration.txt` word.
+    pub fn parse(w: &str) -> Option<NotMigrated> {
+        NotMigrated::ALL.into_iter().find(|c| c.word() == w)
+    }
+
+    /// The summary's words for it ("2 stalled, 3 now box-affected").
+    pub fn summary_words(self) -> &'static str {
+        match self {
+            NotMigrated::Stalled => "stalled",
+            NotMigrated::NotConverged => "not converged",
+            NotMigrated::SolveFailed => "failed to solve",
+            NotMigrated::BoxAffected => "now box-affected",
+            NotMigrated::BoxUnknown => "box status unknown",
+            NotMigrated::SolverWarning => "with a solver warning",
+            NotMigrated::Untrainable => "not trainable",
+            NotMigrated::Multiplicity => "solved at another multiplicity",
+            NotMigrated::Lone => "lone atoms",
+            NotMigrated::ForcedMultiplicity => "with a forced multiplicity",
+            NotMigrated::StatusCode => "with a status no collection holds",
+            NotMigrated::NoScene => "whose scene could not be rebuilt",
+            NotMigrated::OtherSurface => "on another surface",
+        }
+    }
+}
+
+/// "2 412" for 2412: thousands grouped as spec §7.8 prints them, with a narrow no-break space (U+202F), so a wrapping
+/// label never breaks a number.
+pub fn spaced(n: u64) -> String {
+    let d = n.to_string();
+    let mut out = String::with_capacity(d.len() + d.len());
+    for (i, c) in d.chars().enumerate() {
+        if i > 0 && (d.len() - i) % 3 == 0 {
+            out.push('\u{202f}');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// "+0.0", "−9.5": a signed value with spec §7.8's minus sign.
+fn signed(x: f64, digits: usize) -> String {
+    let t = format!("{:.*}", digits, x.abs());
+    if x < 0.0 && t.chars().any(|c| c.is_ascii_digit() && c != '0') {
+        format!("−{t}")
+    } else {
+        format!("+{t}")
+    }
+}
+
+/// "2 stalled, 3 now box-affected": the not-migrated samples by their code, in the order the codes first appear.
+fn reasons(log: &MigrationLog) -> String {
+    let mut tally: Vec<(NotMigrated, usize)> = Vec::new();
+    for &(_, code, _) in &log.not_migrated {
+        match tally.iter_mut().find(|(k, _)| *k == code) {
+            Some(e) => e.1 += 1,
+            None => tally.push((code, 1)),
+        }
+    }
+    tally.iter().map(|(c, n)| format!("{} {}", spaced(*n as u64), c.summary_words())).collect::<Vec<_>>().join(", ")
+}
+
+/// The migration's summary (spec §7.8; module doc, "The summary"): the Model tab's and `README.txt`'s one text. `None`
+/// while the pass has samples left (state running).
+pub fn summary_text(log: &MigrationLog) -> Option<String> {
+    if log.state == MigrationState::Running {
+        return None;
+    }
+    let [u, t, s, n] = log.counts;
+    let released = log.review.iter().filter(|e| e.2).count();
+    let kept = log.review.len() - released;
+    let waiting = log.waiting.len();
+    let sp = |k: usize| spaced(k as u64);
+    let date = if log.date.is_empty() { String::new() } else { format!(" on {}", log.date) };
+    let mut out = format!("Migrated from {}{date}:\n", log.source_slug);
+    out += &format!("- {} identical within solver noise (kept as they were);\n", sp(u));
+    out += &format!("- {} changed only by the electronic-entropy term −TS (re-labelled, kept in the fit);\n", sp(t));
+    if s == 0 {
+        out += "- 0 changed state;\n";
+    } else {
+        let changed = if log.state == MigrationState::Complete && log.review.is_empty() && log.waiting.is_empty() {
+            "re-solved; the next refit reviews them: those the model without each predicts within its bound rejoin the fit, the others are kept out and the model falls back to DFT near them".to_string()
+        } else {
+            let kept_words = match kept {
+                0 => "none is kept out".to_string(),
+                1 => "1 is kept out, and the model falls back to DFT near it".to_string(),
+                k => format!("{} are kept out, and the model falls back to DFT near them", sp(k)),
+            };
+            let mut w = format!("re-solved and reviewed: {} rejoined the fit because the model without each predicts it within its bound; {kept_words}", sp(released));
+            if waiting > 0 {
+                w += &format!("; {} waiting (stray atoms)", sp(waiting));
+            }
+            let unjudged = s.saturating_sub(released + kept + waiting);
+            if unjudged > 0 {
+                w += &format!("; {} not reviewed (they kept an earlier Forget or supersede, or wait for an isolated-atom reference)", sp(unjudged));
+            }
+            w
+        };
+        out += &format!("- {} changed state ({changed});\n", sp(s));
+    }
+    out += &if n == 0 {
+        "- 0 not migrated.\n".to_string()
+    } else {
+        let remain = if n == 1 { "it remains" } else { "they remain" };
+        format!("- {} not migrated ({}; {remain} in the old collection).\n", sp(n), reasons(log))
+    };
+    out.push('\n');
+    out += &if log.references.is_empty() {
+        "References re-solved: none.".to_string()
+    } else {
+        let mut per_z: std::collections::BTreeMap<u8, usize> = Default::default();
+        for r in &log.references {
+            *per_z.entry(r.0).or_default() += 1;
+        }
+        let words: Vec<String> = log
+            .references
+            .iter()
+            .map(|&(z, box_n, old, new)| {
+                let sym = units::elements::symbol(z);
+                let name = if per_z[&z] > 1 { format!("{sym} ({box_n}³)") } else { sym.to_string() };
+                match (old, new) {
+                    (Some(o), Some(x)) => format!("{name} {} mHa", signed((x - o) * 1e3, 1)),
+                    (None, Some(_)) => format!("{name} new (none before)"),
+                    (_, None) => format!("{name} not solved"),
+                }
+            })
+            .collect();
+        format!("References re-solved (the new F against the old E): {}.", words.join(", "))
+    };
+    out += " The audit history starts empty, so trust is rebuilt from new audits.";
+    Some(out)
 }
 
 /// The status of a migrated sample being appended ([`MigrationLog::pending`]): its index in the new file, its code, and
@@ -239,8 +450,8 @@ fn encode(log: &MigrationLog) -> String {
     let [u, tt, s, n] = log.counts;
     t.push_str(&format!("counts unchanged {u} entropy_only {tt} state_changed {s} not_migrated {n}\n"));
     t.push_str(&format!("class_u_max {:?} {:?}\n", log.class_u_max.0, log.class_u_max.1));
-    for (i, why) in &log.not_migrated {
-        t.push_str(&format!("not_migrated {i} {}\n", escape(why)));
+    for (i, code, why) in &log.not_migrated {
+        t.push_str(&format!("not_migrated {i} {} {}\n", code.word(), escape(why)));
     }
     for &(z, n, old, new) in &log.references {
         t.push_str(&format!("reference {z} {n} {} {}\n", opt(old), opt(new)));
@@ -366,8 +577,10 @@ fn decode(text: &str) -> Result<MigrationLog, String> {
                 u_max = Some((float(e, "|dE|").map_err(at)?, float(f, "|dF|").map_err(at)?));
             }
             "not_migrated" => {
-                let (i, why) = value.split_once(' ').unwrap_or((value, ""));
-                not_migrated.push((num::<usize>(i, "a sample index").map_err(at)?, unescape(why).map_err(at)?));
+                let (i, rest) = value.split_once(' ').unwrap_or((value, ""));
+                let (code, why) = rest.split_once(' ').unwrap_or((rest, ""));
+                let code = NotMigrated::parse(code).ok_or_else(|| at(format!("'{code}' is not a not-migrated code")))?;
+                not_migrated.push((num::<usize>(i, "a sample index").map_err(at)?, code, unescape(why).map_err(at)?));
             }
             "reference" => {
                 let [z, n, old, new] = fields[..] else { return Err(at("a reference is 'Z n old new'".into())) };
@@ -497,7 +710,7 @@ mod tests {
             cursor: 412,
             state: MigrationState::Running,
             counts: [380, 22, 10, 2],
-            not_migrated: vec![(7, "stalled".into()), (19, "box-affected: face density 3.1e-4 e/Bohr³ above 1.0e-4\nsecond line \\ tail ".into())],
+            not_migrated: vec![(7, NotMigrated::Stalled, "stalled".into()), (19, NotMigrated::BoxAffected, "box-affected: face density 3.1e-4 e/Bohr³ above 1.0e-4\nsecond line \\ tail ".into())],
             references: vec![(1, 57, Some(-0.478_123_456_789_012_3), Some(-0.479)), (8, 57, None, Some(-15.9)), (8, 81, Some(-15.8), None)],
             class_u_max: (9.876_543_210_987_654e-6, -0.0),
             review: vec![(1700, 0.25, true), (1701, 3.5, false), (2400, 1.0, true)],
@@ -531,11 +744,11 @@ mod tests {
         // readable: one line per field, the key's lines as they are in key.txt
         write_migration(&d.0, &log()).unwrap();
         let text = std::fs::read_to_string(d.0.join(MIGRATION_FILE)).unwrap();
-        for line in ["state running", "cursor 412", "functional lsda", "not_migrated 7 stalled", "waiting 2401", "pending 1702 9 c002000000000000 0123456789abcdef", "orphaned 17"] {
+        for line in ["state running", "cursor 412", "functional lsda", "not_migrated 7 stalled stalled", "waiting 2401", "pending 1702 9 c002000000000000 0123456789abcdef", "orphaned 17"] {
             assert!(text.lines().any(|l| l.trim_start() == line), "{line:?} in\n{text}");
         }
         // a damaged file is an error, never a silent default
-        for (what, from, to) in [("a bad state", "state running", "state paused"), ("a bad count", "cursor 412", "cursor -1"), ("an unknown line", "cursor 412", "cursor 412\nspeed 3")] {
+        for (what, from, to) in [("a bad state", "state running", "state paused"), ("a bad count", "cursor 412", "cursor -1"), ("an unknown line", "cursor 412", "cursor 412\nspeed 3"), ("an unknown not-migrated code", "not_migrated 7 stalled stalled", "not_migrated 7 bogus stalled")] {
             std::fs::write(d.0.join(MIGRATION_FILE), text.replacen(from, to, 1)).unwrap();
             assert!(read_migration(&d.0).is_err(), "{what}");
         }
