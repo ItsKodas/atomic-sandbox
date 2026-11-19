@@ -2105,7 +2105,7 @@ mod tests {
             c.set_status(4, crate::quarantine::Q_FORGOTTEN).unwrap();
             assert!(c.set_status(5, Q_HELD).is_err(), "no sample 5");
             c.set_reference(1, CollectionReference { energy: -0.478_123_456_789_012_3, grid_n: Some(49), face_density: Some(1.25e-9) }).unwrap();
-            c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2], fit_id: None, flags: Default::default(), energy_std_epistemic: None });
+            c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2], fit_id: None, flags: Default::default(), energy_std_epistemic: None, model_force: Vec::new() });
             c.save_history().unwrap();
             assert_eq!(c.append(cs(2)), Err(REFUSE_DUPLICATE.to_string()), "an identical sample is refused");
             let mut retagged = cs(2);
@@ -2148,7 +2148,7 @@ mod tests {
         let mut newer = format!("ASAUDIT{}", crate::history::MAGICS.len() + 1).into_bytes();
         newer.extend_from_slice(b" whatever a later build keeps after its magic, of any length");
         std::fs::write(&path, &newer).unwrap();
-        let point = || AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2], fit_id: Some(3), flags: crate::history::PointFlags(5), energy_std_epistemic: Some(1e-5) };
+        let point = || AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2], fit_id: Some(3), flags: crate::history::PointFlags(5), energy_std_epistemic: Some(1e-5), model_force: Vec::new() };
         for _ in 0..2 {
             let (mut c, r) = Collection::open(&dir, &key).unwrap();
             assert!(!c.read_only && c.history.is_empty());
@@ -2378,7 +2378,7 @@ mod tests {
         c.set_status(6, Q_SUPERSEDED).unwrap();
         c.set_status(1, Q_NONE).unwrap();
         c.set_reference(1, CollectionReference { energy: -0.478, grid_n: Some(49), face_density: Some(1e-9) }).unwrap();
-        c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2], fit_id: None, flags: Default::default(), energy_std_epistemic: None });
+        c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2], fit_id: None, flags: Default::default(), energy_std_epistemic: None, model_force: Vec::new() });
         c.save_history().unwrap();
     }
 
@@ -2779,7 +2779,7 @@ mod tests {
         c.set_reference(1, solved(-0.478, 49, 1e-9)).unwrap();
         c.set_reference(1, solved(-0.4785, 57, 2e-10)).unwrap();
         c.set_reference(8, CollectionReference { energy: -15.8, grid_n: Some(57), face_density: None }).unwrap();
-        c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2], fit_id: None, flags: Default::default(), energy_std_epistemic: None });
+        c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2], fit_id: None, flags: Default::default(), energy_std_epistemic: None, model_force: Vec::new() });
         c.save_history().unwrap();
         c.write_readme().unwrap();
         c.save_refit_times("refit\n").unwrap();

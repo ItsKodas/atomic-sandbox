@@ -396,9 +396,10 @@
 //! max_k λ_E(k)) on σ_E,epi/N). All quantities are ratios, no unit enters:
 //!
 //! ```text
-//! forces, per P_A atom j of the key (bound units, b_j = force_bound(|F_t,j|) = min(max(2e-3, 10 %|F_t,j|), 1e-2) Ha/Bohr):
-//!   r_j = s_j / b_j,   s_j = σ_epi,j/√3       (the epistemic std per component — rule 6's number, uninflated)
-//!   e_j = ‖F_t,j − F_m,j‖/√3 / b_j            (the measured error per component)
+//! forces, per P_A atom j of the key (bound units; force_bound(|F|) = min(max(2e-3, 10 %|F|), 1e-2) Ha/Bohr):
+//!   r_j = s_j / b⁶_j,  s_j = σ_epi,j/√3,  b⁶_j = force_bound(|F_m,j|)   rule 6's own ratio (uninflated): its bound is the model's
+//!   e_j = ‖F_t,j − F_m,j‖/√3 / b_j,      b_j = force_bound(|F_t,j|)     the measured error on the teacher's bound (rule 8's)
+//!   (a point recorded without |F_m,j|: b⁶_j = force_bound(|F_t,j| + ‖ΔF_j‖) ≥ force_bound(|F_m,j|))
 //! energy, per P_A point p holding the key (tier units, tier = energy_std_per_atom = 1e-3 Ha/atom; N_p its atoms):
 //!   r_p = σ_E,epi,p / N_p / tier,   e_p = |E_t − E_m| / N_p / tier      (the aleatoric floor not subtracted)
 //!
@@ -419,7 +420,22 @@
 //! the prefix (a later benign group can bring the rms back), which is why the *first* bad prefix
 //! decides: "for every λ′ ≥ λ". The max is a running max; the rms a compensated running sum of the
 //! per-point means, each point's old mean taken out and its new one put in as its atoms join; the
-//! floor is monotone in the set, so its first prefix is found by bisection. One sort and one pass.
+//! floor is monotone in the set, so its first prefix is found by bisection. One sort, one pass and
+//! O(log n) floor counts.
+//!
+//! **Which bound r is on** (fix round 1, review I1). The bound is piecewise in |F| (2e-3, 10 %|F|,
+//! 1e-2), and the model's force differs from the teacher's by the very error measured: at
+//! |F_t| = 0.05 Ha/Bohr and e/b = 4.48 the two bounds differ by up to 1.78×. On the teacher's
+//! bound, A(λ_T) was not rule 6's set: at λ_T rule 6 still admitted the measured bad atom. So r is
+//! formed on rule 6's own bound, force_bound(|F_m,j|) with |F_m,j| recorded per atom
+//! (`AuditPoint::model_force`), the same expression as `variance_check`'s — A(λ) is the set rule 6
+//! admits at factor λ (to the rounding of a different evaluation order: λ = next_up(1/r) is not a
+//! bit-exact boundary). A point recorded without |F_m| (an older file) uses |F_t,j| + ‖ΔF_j‖ ≥
+//! |F_m,j| (the triangle inequality; the bound is non-decreasing in |F|): its r is never above rule
+//! 6's, so the atom the max condition names is refused by rule 6 at λ_T, never let through; the
+//! cost is a λ_T up to 1.78× larger than rule 6's own bound would need. Never the teacher's bound
+//! alone. e stays on the teacher's bound: the error is judged against the policy's claim at the
+//! true force, as rule 8 does.
 //!
 //! **Why the rms only at the floor** (the spec's addition to the review's definition): below it a
 //! single admitted atom at 0.8× the bound would fail the rms and make λ_T = ∞ — the knife edge of
@@ -908,7 +924,6 @@ fn variance_inflation(points: &[&PointEvidence]) -> (f64, usize, f64) {
     (raw.max(1.0) * (1.0 + 1.0 / (2.0 * n as f64).sqrt()), n, raw)
 }
 
-
 // ---- the tail-aware inflations (module doc, "The tail-aware inflations"; spec 2026-11-18 §4) ----
 
 /// Whether `p` is in the answer sample P_A (module doc, "The answer sample P_A"): not fenced, not
@@ -1140,8 +1155,12 @@ fn answer_evidence(p: &AuditPoint, atoms: &[usize], policy: &FallbackPolicy) -> 
     let per_atom = atoms
         .iter()
         .map(|&j| {
+            // e on the teacher's bound (rule 8's); r on rule 6's own, force_bound(|F_m|) — or, for a
+            // point recorded without |F_m|, the bound at |F_t| + ‖ΔF‖ ≥ |F_m| (the triangle
+            // inequality; the bound is non-decreasing), never larger r than rule 6's (module doc)
             let bound = policy.force_bound(p.teacher_force[j]);
-            (p.pred_force_std_epistemic[j] / SQRT_3 / bound, p.err_force[j] / SQRT_3 / bound)
+            let rule6 = policy.force_bound(p.model_force.get(j).copied().unwrap_or(p.teacher_force[j] + p.err_force[j]));
+            (p.pred_force_std_epistemic[j] / SQRT_3 / rule6, p.err_force[j] / SQRT_3 / bound)
         })
         .collect();
     let (n, tier) = (p.n_atoms.max(1) as f64, policy.energy_std_per_atom);

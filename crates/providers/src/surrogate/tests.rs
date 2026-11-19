@@ -8716,6 +8716,7 @@ fn history_point_full(kind: surrogate::history::PointKind, n: usize, code: u8, e
         fit_id: None,
         flags: surrogate::history::PointFlags::default(),
         energy_std_epistemic: None,
+        model_force: Vec::new(),
     }
 }
 
@@ -12641,7 +12642,8 @@ fn code_pair() -> u8 {
 
 /// An H–H dimer point of the pair key H{H}, both atoms alike: each atom's epistemic std is `r`× and
 /// its force error `e`× the absolute bound (2e-3 Ha/Bohr, teacher force 0), so s/b = r and e/b = e
-/// up to rounding; judged by fit `fit` with the flags word `flags`; `rule` `None` is an audit, else
+/// up to rounding — and rule 6's bound is the same 2e-3 for e ≤ 5.77, the model's force magnitude
+/// being ‖ΔF‖ there (recorded as such; beyond it rule 6's bound is the wider 10 % of |F_m|); judged by fit `fit` with the flags word `flags`; `rule` `None` is an audit, else
 /// a fallback with that code. `energy` = (r_p, e_p) in tier units — σ_E,epi/N and |ΔE|/N over the
 /// 1e-3 Ha/atom tier — or `None` for a point without an epistemic energy std.
 fn answer_point(rule: Option<u8>, r: f64, e: f64, fit: u64, flags: u8, energy: Option<(f64, f64)>) -> surrogate::AuditPoint {
@@ -12665,6 +12667,8 @@ fn answer_point(rule: Option<u8>, r: f64, e: f64, fit: u64, flags: u8, energy: O
         fit_id: Some(fit),
         flags: PointFlags(flags),
         energy_std_epistemic: energy.map(|(rp, _)| rp * n as f64 * tier),
+        // the teacher's force is 0, so the model's magnitude is the error's
+        model_force: vec![err; n],
     }
 }
 
@@ -12759,7 +12763,8 @@ fn the_energy_inflation_refuses_energy_only_failures() {
 /// points fresh only by a refusal (not cadence-fresh), novel ones (bit 8, and code 11 = 5d), the
 /// envelope's code 9, a fenced or novel tick — leave λ_T, λ_E and the count bit for bit, though
 /// each carries a 50× error at r = 0.01; the same point as a cadence-fresh code 5, 6 or 21, or as
-/// a tick (an audit or a code-14 fallback), moves both to ≈ 100.
+/// a tick (an audit or a code-14 fallback), moves λ_E to ≈ 100 and λ_T above 100 (rule 6's bound
+/// at |F_m| = ‖ΔF‖ = 0.17 Ha/Bohr is the 1e-2 cap: r = 0.002, λ_T ≈ 500).
 #[test]
 fn the_inflations_never_read_what_they_selected() {
     use surrogate::history::PointFlags;
@@ -12801,7 +12806,7 @@ fn the_inflations_never_read_what_they_selected() {
         let mut h = benign_answers(80, 16);
         h.push(p);
         let k = calibrate::calibrate(&h, &pol).key(&hk_pair());
-        assert!(k.tail_inflation > 99.0 && k.tail_inflation < 101.0 && k.energy_inflation > 99.0 && k.energy_inflation < 101.0 && k.answer_points == 81, "{what}: {k:?}");
+        assert!(k.tail_inflation > 499.0 && k.tail_inflation < 501.0 && k.energy_inflation > 99.0 && k.energy_inflation < 101.0 && k.answer_points == 81, "{what}: {k:?}");
     }
 }
 
@@ -13044,4 +13049,83 @@ fn the_cadence_counter_counts_every_step_reaching_the_gate() {
     assert_eq!(s.cadence_steps, c + 1, "{:?}", r.stats.notes);
     s.evaluate(&h2(1.6), &mut never()).unwrap();
     assert_eq!(s.cadence_steps, c + 2);
+}
+
+/// Task 5 review I1: λ_T is formed on rule 6's own bound, force_bound(|F_m,j|), not the teacher's.
+/// The 10 % regime: |F_t| = 0.05 Ha/Bohr (b_t = 5e-3), the tail atom at e/b_t = 4.48 (‖ΔF‖ = 0.0388)
+/// with s = 0.13 b_t among 80 benign points. Rule 6 sees |F_m| anywhere in |F_t| ± ‖ΔF‖, its bound
+/// from 2e-3 to 8.88e-3 (0.4× to 1.78× b_t). For both ends, recorded or not (an older point: the
+/// bound at |F_t| + ‖ΔF‖), rule 6's own comparison at λ_T — λ_T·s against force_bound(|F_m|) —
+/// refuses the atom (to within rounding: λ_T = next_up(1/r) is not asserted as a bit-exact
+/// boundary). On the teacher's bound (before the fix) λ_T was 7.69 and rule 6 admitted it at 0.56×
+/// its bound.
+#[test]
+fn the_tail_inflation_is_formed_on_rule_6s_own_bound() {
+    use calibrate::{tail_inflation, TailAtom};
+    use surrogate::history::PointFlags;
+    let pol = FallbackPolicy::default();
+    let ft = 0.05;
+    let b_t = pol.force_bound(ft);
+    let err = 4.48 * 3f64.sqrt() * b_t;
+    let epi = 0.13 * 3f64.sqrt() * b_t;
+    let s = epi / 3f64.sqrt();
+    let (lo, hi) = (ft - err, ft + err);
+    println!("b_t {b_t:.3e}; rule 6's bound over |F_m| ∈ [{lo:.4}, {hi:.4}]: {:.3e} – {:.3e} ({:.2}× – {:.2}× b_t)", pol.force_bound(lo), pol.force_bound(hi), pol.force_bound(lo) / b_t, pol.force_bound(hi) / b_t);
+    assert!(pol.force_bound(hi) / b_t > 1.77, "the premise: the 10 % regime");
+    let tail = |recorded: Option<f64>| {
+        let mut p = answer_point(Some(code_pair()), 0.13, 4.48, 1, PointFlags::CADENCE_FRESH, Some((0.1, 0.05)));
+        p.teacher_force = vec![ft; 2];
+        p.err_force = vec![err; 2];
+        p.pred_force_std_epistemic = vec![epi; 2];
+        p.pred_force_std = vec![(epi * epi + 3e-8).sqrt(); 2];
+        p.model_force = recorded.map_or(Vec::new(), |f| vec![f; 2]);
+        p
+    };
+    for fm in [lo, hi] {
+        for recorded in [Some(fm), None] {
+            let mut h = benign_answers(80, 16);
+            h.push(tail(recorded));
+            let lt = calibrate::calibrate(&h, &pol).key(&hk_pair()).tail_inflation;
+            // rule 6 (`variance_check`): fs = σ_epi/√3 · λ, refused when !(fs ≤ force_bound(|F_m|))
+            let ratio = s * lt / pol.force_bound(fm);
+            println!("|F_m| {fm:.4}, recorded {}: λ_T {lt:.6}; rule 6 at λ_T: {ratio:.15}× its bound (strictly refused: {})", recorded.is_some(), !(s * lt <= pol.force_bound(fm)));
+            assert!(ratio >= 1.0 - 1e-12, "rule 6 at λ_T refuses the measured tail atom (|F_m| {fm}, recorded {}): {ratio}", recorded.is_some());
+        }
+    }
+    // the teacher's bound, as before the fix: λ_T 7.69, and rule 6 admits the atom at |F_m| = |F_t| + ‖ΔF‖
+    let before = tail_inflation(&[TailAtom { point: 0, fit: Some(1), r: s / b_t, e: err / 3f64.sqrt() / b_t }], |_| false);
+    let ratio = s * before / pol.force_bound(hi);
+    println!("on the teacher's bound: λ_T {before:.4}, rule 6 at it {ratio:.3}× its bound");
+    assert!(ratio < 0.6, "the teeth: before the fix rule 6 admitted it ({ratio})");
+}
+
+/// Task 5 review M1: a tie group is admitted together — goodness is judged after the whole group,
+/// never after each item. 60 points over 12 fits at r = 0.1, e = 0.55 (the floor met, its rms ×
+/// (1 + 1/√120) = 0.600 ≤ ENTER); then at r = 0.5 one point at e = 3.0 (the max holds) listed first
+/// and 20 points at e = 0: judged after the 3.0 alone the rms is 0.727 > ENTER (λ_T would be the next
+/// float above 2), after the whole group 0.624 — good, λ_T = 1.
+#[test]
+fn the_tail_inflation_admits_a_tie_group_together() {
+    use calibrate::{atoms_meet_floor, tail_inflation, TailAtom};
+    let mut atoms: Vec<TailAtom> = (0..60).map(|p| TailAtom { point: p, fit: Some(p as u64 % 12 + 1), r: 0.1, e: 0.55 }).collect();
+    atoms.push(TailAtom { point: 60, fit: Some(1), r: 0.5, e: 3.0 });
+    atoms.extend((61..81).map(|p| TailAtom { point: p, fit: Some(p as u64 % 12 + 1), r: 0.5, e: 0.0 }));
+    assert_eq!(tail_inflation(&atoms[..61], atoms_meet_floor), 2.0f64.next_up(), "the premise: judged after the 3.0 alone the set is bad");
+    assert_eq!(tail_inflation(&atoms, atoms_meet_floor), 1.0, "the group enters together");
+}
+
+/// Task 5 review I1: a consulted-model point records the model's per-atom force magnitudes — the
+/// same |F_m| (and the same expression) rule 6's bound reads in `variance_check`.
+#[test]
+fn a_point_records_the_model_force_rule_6_bounds_with() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    pin_pair_class_refused(&mut s);
+    let sc = h2(1.6);
+    let (pos, z) = pos_z(&sc);
+    let f = s.model().unwrap().predict(&pos, &z, false).unwrap().forces;
+    s.evaluate(&sc, &mut never()).unwrap();
+    let p = last_point(&s);
+    let want: Vec<f64> = f.iter().map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt()).collect();
+    println!("|F_m| {:?} (|F_t| {:?})", p.model_force, p.teacher_force);
+    assert_eq!(p.model_force.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), want.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
 }

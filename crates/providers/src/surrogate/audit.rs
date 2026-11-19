@@ -683,6 +683,11 @@ impl SurrogateKs {
         let err_force = forces.iter().zip(model_forces).map(|(t, m)| ((t[0] - m[0]).powi(2) + (t[1] - m[1]).powi(2) + (t[2] - m[2]).powi(2)).sqrt()).collect();
         // |F_teacher| per atom: the per-atom bound's input (M8a Task 2 fix round 1, review A.1)
         let teacher_force = forces.iter().map(|t| (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt()).collect();
+        // |F_model| per atom: the input of rule 6's bound, the same expression as `variance_check`'s,
+        // so λ_T admits exactly the atoms rule 6 would (Task 5 fix round 1, review I1); recorded only
+        // when every magnitude is a finite number (`push` refuses another), else absent
+        let model_force: Vec<f64> = model_forces.iter().map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt()).collect();
+        let model_force = if model_force.iter().all(|f| f.is_finite()) { model_force } else { Vec::new() };
         // (`push` checks the per-atom lengths and the class codes and panics on a mismatch)
         self.audit_history.push(surrogate::AuditPoint {
             kind,
@@ -701,6 +706,7 @@ impl SurrogateKs {
             fit_id: self.model.is_some().then_some(self.fit_id),
             flags,
             energy_std_epistemic: recordable_energy_std(energy_std_epistemic),
+            model_force,
         });
         // new verdict evidence re-judges the class verdicts now, not at the next refit (user-test
         // fix 2, the controller's ruling 3: a parked scene whose fallbacks are all "similar" never

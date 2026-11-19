@@ -832,6 +832,10 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
     let trust = hist_arrays.as_ref().and_then(HistoryArrays::trust_fields);
     if let Some(t) = &trust {
         arrays.extend(t.iter().copied());
+        // the optional model-force magnitudes after the three (Task 5 fix round 1)
+        if let Some(a) = hist_arrays.as_ref().filter(|a| !a.model_force.is_empty()) {
+            arrays.push((HistoryArrays::MODEL_FORCE, &a.model_force));
+        }
     }
     let magic = if trust.is_some() { MAGIC_V10 } else { MAGIC_V9 };
 
@@ -1465,6 +1469,11 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
             fixed.push((name, Some(*points)));
         }
     }
+    // the optional per-atom model-force magnitudes after the three (version 10 only)
+    let has_model_force = has_trust && declared.get(fixed.len()).is_some_and(|(n, _)| n == HistoryArrays::MODEL_FORCE);
+    if has_model_force {
+        fixed.push((HistoryArrays::MODEL_FORCE, None));
+    }
     let arrays = read_arrays(bytes, &declared, &fixed, version)?;
     let mut it = arrays.into_iter();
     let mut next = || it.next().expect("every declared array read");
@@ -1561,6 +1570,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
             let a = HistoryArrays::from_vecs([next(), next(), next(), next(), next(), next(), next(), next(), next(), next()]);
             let a = HistoryArrays { species: if has_species { next() } else { Vec::new() }, ..a };
             let a = if has_trust { HistoryArrays { fit: next(), flags: next(), energy_std_epistemic: next(), ..a } } else { a };
+            let a = if has_model_force { HistoryArrays { model_force: next(), ..a } } else { a };
             AuditHistory::from_arrays(&a, recorded, unrecorded).map_err(|e| format!("audit_history: {e}"))?
         }
     };
@@ -2486,6 +2496,7 @@ pub(crate) mod tests {
             fit_id: None,
             flags: crate::history::PointFlags::default(),
             energy_std_epistemic: None,
+            model_force: Vec::new(),
         }
     }
 
@@ -3096,6 +3107,41 @@ pub(crate) mod tests {
         v.extend_from_slice(header.as_bytes());
         v.extend_from_slice(&bytes[16 + hl..bytes.len() - cut]);
         v
+    }
+
+    /// Task 5 fix round 1: the optional `audit_model_force` (per atom) is declared and stored after
+    /// the three version-10 arrays when a point carries it, and reads back equal; a version-10 file
+    /// without it (every point without magnitudes) reads as before.
+    #[test]
+    fn the_model_force_round_trips_in_the_sidecar() {
+        use crate::history::AuditHistory;
+        let orig = random_sidecar(85, false);
+        let mut hist = AuditHistory::default();
+        for i in 0..6u64 {
+            let mut p = trust_point(i, 2);
+            if i % 2 == 0 {
+                p.model_force = vec![1e-2 * (1 + i) as f64, 0.0];
+            }
+            hist.push(p);
+        }
+        let p = tmp("v10-model-force.model");
+        write_full_with_history(&p, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &hist).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        assert_eq!(&bytes[..8], MAGIC_V10);
+        assert!(header_of(&bytes).contains("[\"audit_energy_std_epistemic\",6],[\"audit_model_force\",12]]"), "{}", header_of(&bytes));
+        let back = read(&p).unwrap();
+        assert_eq!(back.audit_history, hist);
+        assert_eq!(back.audit_history.to_arrays().model_force.len(), 12);
+        // none carries it: no array declared
+        let mut plain = AuditHistory::default();
+        for i in 0..6u64 {
+            plain.push(trust_point(i, 2));
+        }
+        write_full_with_history(&p, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &plain).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        assert!(!header_of(&bytes).contains("audit_model_force"));
+        assert_eq!(read(&p).unwrap().audit_history, plain);
+        let _ = std::fs::remove_file(p);
     }
 
     /// Trust tightening Task 1: a history whose points carry a fit id, a flags word or an epistemic

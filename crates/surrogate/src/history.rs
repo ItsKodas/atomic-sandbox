@@ -98,20 +98,28 @@
 //!   the evidence floor's fits.
 //! - `AuditPoint::flags` ([`PointFlags`]): bit 1 a calibration tick, bit 2 fenced (inside a
 //!   quarantine, misfit or audit fence of its key), bit 4 cadence-fresh (by the never-reset
-//!   counter), bit 8 novel (rule 5d's null-space novelty above 1 at the geometry, evaluated on
+//!   counter; a draft-mode step is never cadence-fresh), bit 8 novel (rule 5d's null-space novelty above 1 at the geometry, evaluated on
 //!   every cadence-fresh step whether or not the variance verdict was reused; trust tightening
 //!   Task 5). 0 when absent. Bits above 15 are refused.
 //! - `AuditPoint::energy_std_epistemic`: Ha, the total-energy epistemic std (`pred_energy_std`
 //!   holds the total, aleatoric floor included). `None` when not recorded: such a point is not in
 //!   λ_E's sample.
+//! - `AuditPoint::model_force` (Task 5 fix round 1): per atom, Ha/Bohr, |F_m,j| — the model's
+//!   force magnitude, the input of the bound rule 6 compares the epistemic std with
+//!   (`force_bound(|F_m|)`), so λ_T admits exactly the atoms rule 6 would. Empty when not recorded
+//!   (a point recorded before it): `calibrate` then forms the conservative bound from
+//!   |F_t,j| + ‖ΔF_j‖.
 //!
 //! Serialised as three optional per-point arrays after the species array: `audit_fit` (−1 for an
 //! absent id, else an integer below 2⁵³), `audit_flags` (an integer 0–15), `audit_energy_std_epistemic`
 //! (−1 for absent, else finite and ≥ 0); any other value — another negative, a NaN, an infinity, a
 //! fraction — is refused, never read. The three are written together, for every point, only when
 //! some point carries one of the fields; otherwise none is written and the file is version 1, bit
-//! for bit. [`AuditHistory::push`] panics on a point whose fields could not be written (an id of 2⁵³
-//! or more, a flags word above 15, a non-finite or negative std): a programming error at the
+//! for bit. The model's force magnitudes follow as an optional fourth array, `audit_model_force`
+//! (per atom: −1 for every atom of a point without them, else finite and ≥ 0), written only when
+//! some point carries them; a version-2 file without it reads with every point's empty.
+//! [`AuditHistory::push`] panics on a point whose fields could not be written (an id of 2⁵³
+//! or more, a flags word above 15, a non-finite or negative std or force magnitude): a programming error at the
 //! recording site, like a class code beyond 2.
 //!
 //! # Standalone encoding ([`AuditHistory::encode`])
@@ -126,6 +134,7 @@
 //!                                 absent in its older files; required in version 2)
 //! array₁₂ … array₁₄ (version 2)   `audit_fit`, `audit_flags`, `audit_energy_std_epistemic`
 //!                                 ("Trust-tightening fields" above)
+//! array₁₅ (version 2, optional)   `audit_model_force` (per atom; "Trust-tightening fields")
 //! (end — trailing bytes are an error)
 //! ```
 //!
@@ -196,7 +205,8 @@ impl PointFlags {
     pub const TICK: u8 = 1;
     /// The geometry sits inside a quarantine, misfit or audit fence of its key: excluded from P_A.
     pub const FENCED: u8 = 2;
-    /// The step was fresh by the never-reset cadence counter (a multiple of `variance_cadence`).
+    /// The step was fresh by the never-reset cadence counter (a multiple of `variance_cadence`); a
+    /// draft-mode step is never cadence-fresh (its points are not in P_A).
     pub const CADENCE_FRESH: u8 = 4;
     /// Rule 5d's null-space novelty exceeded 1 at the geometry (an unspanned direction): the
     /// provider evaluates it on every cadence-fresh step, read-only where the variance verdict was
@@ -282,6 +292,9 @@ pub struct AuditPoint {
     /// Ha: the total-energy **epistemic** std (`pred_energy_std` without the aleatoric floor);
     /// `None` = not recorded — such a point is not in λ_E's sample.
     pub energy_std_epistemic: Option<f64>,
+    /// Per atom, Ha/Bohr: |F_model,j| — the input of rule 6's bound (module doc, "Trust-tightening
+    /// fields"); empty = not recorded.
+    pub model_force: Vec<f64>,
 }
 
 /// The key the calibrated class verdict keeps its evidence under (module doc, "Species"): an
@@ -332,12 +345,19 @@ impl AuditPoint {
         if let Some(s) = self.energy_std_epistemic.filter(|s| !(s.is_finite() && *s >= 0.0)) {
             return Err(format!("audit point: epistemic energy std {s} is not finite and non-negative"));
         }
+        if !(self.model_force.is_empty() || self.model_force.len() == n) {
+            return Err(format!("audit point: model_force has {} entries for {n} atoms", self.model_force.len()));
+        }
+        if let Some(f) = self.model_force.iter().find(|f| !(f.is_finite() && **f >= 0.0)) {
+            return Err(format!("audit point: model force magnitude {f} is not finite and non-negative"));
+        }
         Ok(())
     }
 
-    /// The point carries a trust-tightening field (a fit id, a flag or an epistemic energy std).
+    /// The point carries a trust-tightening field (a fit id, a flag, an epistemic energy std or the
+    /// model's force magnitudes).
     fn has_new_fields(&self) -> bool {
-        self.fit_id.is_some() || self.flags.0 != 0 || self.energy_std_epistemic.is_some()
+        self.fit_id.is_some() || self.flags.0 != 0 || self.energy_std_epistemic.is_some() || !self.model_force.is_empty()
     }
 }
 
@@ -383,6 +403,9 @@ pub struct HistoryArrays {
     pub fit: Vec<f64>,
     pub flags: Vec<f64>,
     pub energy_std_epistemic: Vec<f64>,
+    /// The optional per-atom `audit_model_force` (version 2, after the three; module doc): empty =
+    /// every point without it, else one entry per atom, −1 for every atom of a point without it.
+    pub model_force: Vec<f64>,
 }
 
 impl HistoryArrays {
@@ -393,6 +416,8 @@ impl HistoryArrays {
     pub const FIT: &'static str = "audit_fit";
     pub const FLAGS: &'static str = "audit_flags";
     pub const ENERGY_STD_EPI: &'static str = "audit_energy_std_epistemic";
+    /// The optional per-atom array after the three (module doc, "Trust-tightening fields").
+    pub const MODEL_FORCE: &'static str = "audit_model_force";
 
     /// The three version-2 arrays in serialised order, when present (all three empty: `None`).
     pub fn trust_fields(&self) -> Option<[(&'static str, &[f64]); 3]> {
@@ -480,6 +505,9 @@ impl AuditHistory {
             a.flags = self.ring.iter().map(|p| p.flags.0 as f64).collect();
             a.energy_std_epistemic = self.ring.iter().map(|p| p.energy_std_epistemic.unwrap_or(ABSENT)).collect();
         }
+        if self.ring.iter().any(|p| !p.model_force.is_empty()) {
+            a.model_force = self.ring.iter().flat_map(|p| if p.model_force.is_empty() { vec![ABSENT; p.n_atoms] } else { p.model_force.clone() }).collect();
+        }
         for p in &self.ring {
             a.atoms.push(p.n_atoms as f64);
             a.model_gen.push(p.model_gen as f64);
@@ -543,6 +571,7 @@ impl AuditHistory {
             return Err(format!("audit_classes[{i}] = {c} is not 0, 1 or 2"));
         }
         let species = decode_species(&a.species, &a.atoms)?;
+        let model_force = decode_model_force(&a.model_force, &a.atoms, total, trust.is_some())?;
         let mut h = AuditHistory { ring: VecDeque::with_capacity(m.min(HISTORY_CAP)), recorded: 0, unrecorded };
         let mut at = 0usize;
         for (i, species) in species.into_iter().enumerate() {
@@ -556,7 +585,7 @@ impl AuditHistory {
                 pred_force_std_epistemic: a.force_std_epistemic[r.clone()].to_vec(),
                 pred_energy_std: a.energy_std[i],
                 err_force: a.err_force[r.clone()].to_vec(),
-                teacher_force: a.teacher_force[r].to_vec(),
+                teacher_force: a.teacher_force[r.clone()].to_vec(),
                 err_energy: a.err_energy[i],
                 n_atoms: n,
                 model_gen: a.model_gen[i] as u64,
@@ -564,6 +593,7 @@ impl AuditHistory {
                 fit_id,
                 flags,
                 energy_std_epistemic,
+                model_force: model_force.as_ref().map_or(Vec::new(), |f| f[i].clone()),
             });
             at += n;
         }
@@ -617,6 +647,18 @@ impl AuditHistory {
             arrays.push(bytes[at..len].chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().expect("8 bytes"))).collect());
             at = len;
         }
+        // version 2's optional fourth trust array, the model's force magnitudes (module doc)
+        let model_force = if v2 && at < bytes.len() {
+            let prefix = bytes.get(at..at + 8).ok_or_else(|| format!("file ends before array {}", HistoryArrays::MODEL_FORCE))?;
+            let n = u64::from_le_bytes(prefix.try_into().expect("8 bytes"));
+            at += 8;
+            let len = usize::try_from(n).ok().and_then(|n| n.checked_mul(8)).and_then(|b| b.checked_add(at)).filter(|&e| e <= bytes.len()).ok_or_else(|| format!("file ends inside array {}", HistoryArrays::MODEL_FORCE))?;
+            let v: Vec<f64> = bytes[at..len].chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().expect("8 bytes"))).collect();
+            at = len;
+            v
+        } else {
+            Vec::new()
+        };
         if at != bytes.len() {
             return Err(format!("{} trailing bytes after the last array", bytes.len() - at));
         }
@@ -628,7 +670,7 @@ impl AuditHistory {
             Default::default()
         };
         let species = if arrays.len() > HistoryArrays::NAMES.len() { arrays.pop().expect("eleven") } else { Vec::new() };
-        let a = HistoryArrays { species, fit, flags, energy_std_epistemic, ..HistoryArrays::from_vecs(arrays.try_into().expect("ten arrays")) };
+        let a = HistoryArrays { species, fit, flags, energy_std_epistemic, model_force, ..HistoryArrays::from_vecs(arrays.try_into().expect("ten arrays")) };
         Self::from_arrays(&a, recorded, Unrecorded { no_variance, box_affected, draft, unfit })
     }
 }
@@ -638,7 +680,9 @@ impl AuditHistory {
 fn encode_arrays(a: &HistoryArrays, recorded: u64, unrecorded: Unrecorded) -> Vec<u8> {
     let trust = a.trust_fields();
     let slices = a.as_slices();
-    let arrays: Vec<&[f64]> = slices.iter().map(|(_, v)| *v).chain([&a.species[..]]).chain(trust.iter().flatten().map(|(_, v)| *v)).collect();
+    // the optional model-force array only after the three (version 2)
+    let model_force = (trust.is_some() && !a.model_force.is_empty()).then_some(&a.model_force[..]);
+    let arrays: Vec<&[f64]> = slices.iter().map(|(_, v)| *v).chain([&a.species[..]]).chain(trust.iter().flatten().map(|(_, v)| *v)).chain(model_force).collect();
     let body: usize = arrays.iter().map(|v| 8 + 8 * v.len()).sum();
     let mut out = Vec::with_capacity(8 + 5 * 8 + body);
     out.extend_from_slice(if trust.is_some() { MAGIC } else { MAGIC_V1 });
@@ -689,6 +733,36 @@ fn decode_trust_fields(a: &HistoryArrays) -> Result<Option<Vec<(Option<u64>, Poi
             return Err(format!("{}[{i}] = {s} is not an energy std (finite and non-negative, or -1 when absent)", HistoryArrays::ENERGY_STD_EPI));
         };
         out.push((fit_id, PointFlags(g as u8), std));
+    }
+    Ok(Some(out))
+}
+
+/// The optional `audit_model_force` array (module doc, "Trust-tightening fields") into per-point
+/// magnitudes; `None` when absent. Strict: only beside the three version-2 arrays, one entry per
+/// atom, and per point either −1 for every atom (not recorded) or finite and ≥ 0 for every atom.
+fn decode_model_force(v: &[f64], atoms: &[f64], total: usize, trust: bool) -> Result<Option<Vec<Vec<f64>>>, String> {
+    let name = HistoryArrays::MODEL_FORCE;
+    if v.is_empty() {
+        return Ok(None);
+    }
+    if !trust {
+        return Err(format!("{name} without the version-2 arrays"));
+    }
+    if v.len() != total {
+        return Err(format!("{name} has {} entries, audit_atoms sums to {total}", v.len()));
+    }
+    let mut at = 0usize;
+    let mut out = Vec::with_capacity(atoms.len());
+    for (i, &n) in atoms.iter().enumerate() {
+        let f = &v[at..at + n as usize];
+        at += n as usize;
+        if f.iter().all(|&x| x == ABSENT) {
+            out.push(Vec::new());
+        } else if f.iter().all(|&x| x.is_finite() && x >= 0.0) {
+            out.push(f.to_vec());
+        } else {
+            return Err(format!("{name}: point {i} is neither absent (-1 for every atom) nor finite and non-negative for every atom"));
+        }
     }
     Ok(Some(out))
 }
@@ -754,6 +828,7 @@ mod tests {
             fit_id: None,
             flags: PointFlags::default(),
             energy_std_epistemic: None,
+            model_force: Vec::new(),
         }
     }
 
@@ -874,6 +949,56 @@ mod tests {
     /// alike, bit for bit; a history that carries any of them is written under the version-2 magic
     /// with the three arrays for every point (−1 for an absent id or std), one that carries none is
     /// written as version 1, as before.
+    /// Task 5 fix round 1: the model's per-atom force magnitudes ride along as the optional
+    /// `audit_model_force` after the three version-2 arrays — −1 for every atom of a point without
+    /// them — and read back equal through the arrays and the standalone form; a version-2 history
+    /// none of whose points carries them is written without the array, bit for bit as before; a
+    /// point mixing −1 and a value, a wrong length, a negative or non-finite magnitude, and the
+    /// array without the version-2 arrays are refused; `push` refuses a magnitude it could not write.
+    #[test]
+    fn the_model_force_rides_along_and_reads_absent() {
+        assert_eq!(HistoryArrays::MODEL_FORCE, "audit_model_force");
+        let mut h = AuditHistory::default();
+        h.push(AuditPoint { model_force: vec![0.0, 0.05, 1.25], ..point_ext(3, 1, Some(4), 4, None) });
+        h.push(point_ext(2, 2, Some(5), 0, None));
+        h.push(AuditPoint { model_force: vec![3e-3], ..point_ext(1, 3, None, 0, None) });
+        let a = h.to_arrays();
+        assert_eq!(a.model_force, vec![0.0, 0.05, 1.25, -1.0, -1.0, 3e-3]);
+        assert_eq!(AuditHistory::from_arrays(&a, h.recorded(), h.unrecorded).unwrap(), h);
+        let enc = h.encode();
+        assert_eq!(&enc[..8], MAGIC);
+        let back = AuditHistory::decode(&enc).unwrap();
+        assert_eq!(back, h);
+        assert!(back.iter().nth(1).unwrap().model_force.is_empty());
+        // without any: no array, the bytes of before
+        let mut old = AuditHistory::default();
+        old.push(point_ext(2, 2, Some(5), 0, None));
+        let a = old.to_arrays();
+        assert!(a.model_force.is_empty());
+        let enc_old = old.encode();
+        // 48 header bytes, then the fourteen arrays and nothing after them
+        let fourteen: usize = a.as_slices().iter().map(|(_, v)| v.len()).sum::<usize>() + a.species.len() + 3;
+        assert_eq!(enc_old.len(), 48 + 14 * 8 + 8 * fourteen, "the fourteen arrays only");
+        assert_eq!(AuditHistory::decode(&enc_old).unwrap(), old);
+        // refused
+        let good = h.to_arrays();
+        for (what, f) in [
+            ("mixed", (|a: &mut HistoryArrays| a.model_force[3] = 0.1) as fn(&mut HistoryArrays)),
+            ("short", |a| { a.model_force.pop(); }),
+            ("negative", |a| a.model_force[0] = -0.5),
+            ("NaN", |a| a.model_force[1] = f64::NAN),
+            ("infinite", |a| a.model_force[5] = f64::INFINITY),
+            ("without the version-2 arrays", |a| { a.fit.clear(); a.flags.clear(); a.energy_std_epistemic.clear(); }),
+        ] {
+            let mut a = good.clone();
+            f(&mut a);
+            let e = AuditHistory::from_arrays(&a, 3, Unrecorded::default()).unwrap_err();
+            assert!(e.contains("audit_model_force"), "{what}: {e}");
+        }
+        let bad = std::panic::catch_unwind(|| AuditHistory::default().push(AuditPoint { model_force: vec![f64::NAN, 0.0, 0.0], ..point_ext(3, 1, None, 0, None) }));
+        assert!(bad.is_err(), "push refuses a NaN magnitude");
+    }
+
     #[test]
     fn the_new_fields_round_trip() {
         assert_eq!(MAGIC, b"ASAUDIT2");
