@@ -93,13 +93,44 @@
 //!   (what new samples shrink). The provider's force rule compares the second (M6 Task 11; the
 //!   energy rule already removes its floor).
 //!
-//! Cost: one `describe` plus 3N + 1 triangular solves of size Q′ (the independent columns,
-//! `Basis::n_independent_columns`), O(Q′²) each.
+//! ## On the scene's support (spec `2026-11-20-variance-support-design.md`)
+//!
+//! A scene's query vectors are non-zero on few of the Q′ columns (H₂ in the H/O/P collection
+//! basis: 52 of 1 902 — the H-centre features with H neighbours). Let S contain the support of
+//! every query vector of the call (an entry that is exactly 0.0 adds nothing to any product, so
+//! leaving it out is exact). With A = L_A L_Aᵀ the posterior precision, the block-inverse rule
+//! gives
+//!
+//!   φ̃ᵀA⁻¹φ̃ = φ̃_Sᵀ (A⁻¹)_SS φ̃_S = ‖R φ̃_S‖²,   (A⁻¹)_SS = XᵀX = RᵀR,   X = L_A⁻¹E_S,
+//!
+//! the same quantity at |S|²/2 per vector instead of Q′²/2. R v_S is not formed by multiplying:
+//! in f64 its products cancel (the unit columns L_A⁻¹e_s carry the prior's variance ~1/λ, a query
+//! in a direction the data pin down has a variance orders of magnitude smaller; measured up to
+//! 3.5e-11 relative on fitted factors for the spec's f64 QR of X, against ≤ 2.2e-13 for the full
+//! substitution). `linalg::support_factor` builds R in double-double and keeps W = R⁻¹ (in
+//! reversed order, a lower triangle), so the forms are one more batched substitution
+//! (`cholesky_quad_forms` of size |S|) — componentwise stable like the full one, and agreeing
+//! with it to its own rounding (≤ 4.4e-13 relative on the stds in the tests).
+//!
+//! The model caches S and the factor (`Model::variance_support`, a [`SupportCache`]). A call whose
+//! support is inside S uses it; one that is not grows S to the union and rebuilds, so S grows to
+//! the composition's reachable set instead of churning as neighbours come and go. When the union
+//! would exceed Q′/2 the call takes the full factor (the support gains little there; the cached
+//! entry stays for the smaller calls), and so does every call of a model without a posterior
+//! (none is asked for). The value depends on S only at rounding level: the same geometry can read
+//! a last-bit-different std before and after S grows; every trust rule compares against bounds
+//! many orders wider.
+//!
+//! Cost: one `describe`, then the forms: on the support |S|²/2 multiply-adds per vector (1 + 3N
+//! of them) and a rebuild when S grows (double-double, Σ_s (Q′ − s)²/2 + Q′|S|²/2 and O(|S|³):
+//! 9.5 ms at |S| = 52, 57 ms at 282, 0.26 s at 950 for Q′ = 1 902); on the full factor 3N + 1
+//! triangular solves of size Q′ (the independent columns, `Basis::n_independent_columns`),
+//! O(Q′²) each.
 
 use crate::descriptor::{describe, gaunt, pair_geometry, t4_channels, AtomicBasisScratch, Basis, Body4Term, DescribeError, Gaunt};
 use crate::basis::radial;
-use crate::linalg::cholesky_quad_forms;
-use std::sync::OnceLock;
+use crate::linalg::{cholesky_quad_forms, support_factor};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// Settings the training data were produced with; a model is only valid for a scene solved with
 /// the same ones (the Kohn-Sham surface depends on grid, σ and tolerance). `masses` is a
@@ -383,6 +414,11 @@ pub struct Model {
     /// per class); derived data, `OnceLock::new()` in a constructor. Replace the cell if `basis`
     /// is changed in place.
     pub representatives: OnceLock<Vec<usize>>,
+    /// Lazily cached factor of the predictive variance on the scenes' support (module doc,
+    /// "Predictive variance"); derived data of `sigma_inv_chol` and `representatives`,
+    /// `SupportCache::new()` in a constructor. Replace the cell if `sigma_inv_chol` or `basis` is
+    /// changed in place.
+    pub variance_support: SupportCache,
 }
 
 /// Energy (Hartree, total including Σ ref_energy) and forces (Hartree/Bohr), with the
@@ -449,59 +485,26 @@ impl Model {
         pos: &[[f64; 3]],
         z: &[u8],
     ) -> Result<(f64, Vec<f64>, Vec<f64>), DescribeError> {
-        let basis = &self.basis;
-        let p = basis.n_features();
-        let q = basis.n_species() * p;
-        // The posterior lives on the independent columns (`fit` docs, "Tied columns"): restrict
-        // every query vector to the class representatives before the quadratic form.
-        let rep = self.representatives();
-        let qr = rep.len();
+        self.predictive_std_with(l, pos, z, VariancePath::Auto)
+    }
+
+    /// [`Model::predictive_std`] with the quadratic forms on the support when it is small enough
+    /// (`Auto`, module doc) or always on the full factor (`Full`, the oracle of the tests).
+    fn predictive_std_with(
+        &self,
+        l: &[f64],
+        pos: &[[f64; 3]],
+        z: &[u8],
+        path: VariancePath,
+    ) -> Result<(f64, Vec<f64>, Vec<f64>), DescribeError> {
+        let qr = self.representatives().len();
         assert_eq!(l.len(), qr * qr, "Model.sigma_inv_chol: Q′×Q′ over Basis::column_classes()");
-        let s = basis.species_indices(z)?;
-        let desc = describe(basis, pos, z)?;
-        let inv_scale = self.inverse_scale();
         let n = pos.len();
-        let mut reduced = vec![0.0; qr];
-        fn restrict(dst: &mut [f64], rep: &[usize], v: &[f64]) {
-            for (r, &c) in dst.iter_mut().zip(rep) {
-                *r = v[c];
-            }
-        }
-
-        // Energy: φ̃ = Σ_i φ̃_i.
-        let mut phi = vec![0.0; q];
-        for (i, d) in desc.iter().enumerate() {
-            let block = &mut phi[s[i] * p..(s[i] + 1) * p];
-            for k in 0..p {
-                block[k] += d.b[k] * inv_scale[k];
-            }
-        }
-        restrict(&mut reduced, rep, &phi);
-
-        // Forces: g̃_{j,a} = −Σ_i ∂B̃_i/∂r_{j,a}, gathered from every centre's gradient list.
-        let mut rows = vec![vec![0.0; q]; 3 * n];
-        for (i, d) in desc.iter().enumerate() {
-            let off = s[i] * p;
-            for (j, g) in &d.grad {
-                for k in 0..p {
-                    let gk = g[k];
-                    let sc = inv_scale[k];
-                    rows[3 * j][off + k] -= gk[0] * sc;
-                    rows[3 * j + 1][off + k] -= gk[1] * sc;
-                    rows[3 * j + 2][off + k] -= gk[2] * sc;
-                }
-            }
-        }
-        // every quadratic form of the step in one batched substitution (`cholesky_quad_forms`: bit
-        // for bit the one-at-a-time values, L read once per eight rows; 2026-11-17)
-        let mut restricted = Vec::with_capacity(1 + 3 * n);
-        restricted.push(reduced);
-        for row in &rows {
-            let mut r = vec![0.0; qr];
-            restrict(&mut r, rep, row);
-            restricted.push(r);
-        }
-        let quad = cholesky_quad_forms(l, qr, &restricted.iter().map(|v| &v[..]).collect::<Vec<_>>());
+        let restricted = self.query_vectors(pos, z)?;
+        let quad = match path {
+            VariancePath::Auto => self.variance_support.quad_forms(l, qr, &restricted),
+            VariancePath::Full => full_quad_forms(l, qr, &restricted),
+        };
         let floor_e = if self.energy_per_atom {
             (n as f64 * self.sigma_e).powi(2)
         } else {
@@ -520,6 +523,54 @@ impl Model {
             force_std_epistemic.push(epistemic.sqrt());
         }
         Ok((energy_std, force_std, force_std_epistemic))
+    }
+
+    /// The 1 + 3N query vectors of the predictive variance on the Q′ independent columns (module
+    /// doc): the energy's φ̃, then g̃_{j,a} for j = 0..N, a = x, y, z. Accumulated straight onto
+    /// the class representatives (`representatives`): each entry sees the same additions in the
+    /// same order as a full-width row restricted afterwards, so the values are those bit for bit
+    /// (`query_vectors_are_the_restricted_full_rows`).
+    fn query_vectors(&self, pos: &[[f64; 3]], z: &[u8]) -> Result<Vec<Vec<f64>>, DescribeError> {
+        let basis = &self.basis;
+        let p = basis.n_features();
+        let q = basis.n_species() * p;
+        // The posterior lives on the independent columns (`fit` docs, "Tied columns"): only the
+        // class representatives' entries are formed.
+        let rep = self.representatives();
+        let qr = rep.len();
+        let mut reduced_of = vec![usize::MAX; q];
+        for (r, &c) in rep.iter().enumerate() {
+            reduced_of[c] = r;
+        }
+        let s = basis.species_indices(z)?;
+        let desc = describe(basis, pos, z)?;
+        let inv_scale = self.inverse_scale();
+        let n = pos.len();
+        let mut out = vec![vec![0.0; qr]; 1 + 3 * n];
+        for (i, d) in desc.iter().enumerate() {
+            let block = &reduced_of[s[i] * p..(s[i] + 1) * p];
+            // Energy: φ̃ = Σ_i φ̃_i.
+            for k in 0..p {
+                if block[k] != usize::MAX {
+                    out[0][block[k]] += d.b[k] * inv_scale[k];
+                }
+            }
+            // Forces: g̃_{j,a} = −Σ_i ∂B̃_i/∂r_{j,a}, gathered from every centre's gradient list.
+            for (j, g) in &d.grad {
+                for k in 0..p {
+                    let r = block[k];
+                    if r == usize::MAX {
+                        continue;
+                    }
+                    let gk = g[k];
+                    let sc = inv_scale[k];
+                    out[1 + 3 * j][r] -= gk[0] * sc;
+                    out[2 + 3 * j][r] -= gk[1] * sc;
+                    out[3 + 3 * j][r] -= gk[2] * sc;
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Effective coefficients c̃_{s,k} = c_{s,k}/scale'_k and per-species offsets
@@ -558,6 +609,186 @@ impl Model {
         assert_eq!(self.mean.len(), p, "Model.mean: one entry per feature");
         assert_eq!(self.scale.len(), p, "Model.scale: one entry per feature");
         assert_eq!(self.ref_energy.len(), s, "Model.ref_energy: one entry per species");
+    }
+}
+
+/// Which factor the predictive variance's quadratic forms use (module doc, "Predictive
+/// variance").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VariancePath {
+    /// The cached support's factor when the call's support fits (|S| ≤ Q′/2), else the full L.
+    Auto,
+    /// Always the full factor L (the tests' oracle; `Auto` falls back to the same code).
+    #[cfg_attr(not(test), allow(dead_code))]
+    Full,
+}
+
+/// ‖L⁻¹v‖² of every query vector: every quadratic form of the step in one batched substitution
+/// (`cholesky_quad_forms`: bit for bit the one-at-a-time values, L read once per eight rows;
+/// 2026-11-17).
+fn full_quad_forms(l: &[f64], qr: usize, vs: &[Vec<f64>]) -> Vec<f64> {
+    cholesky_quad_forms(l, qr, &vs.iter().map(|v| &v[..]).collect::<Vec<_>>())
+}
+
+/// The predictive variance's factor on the scenes' support (module doc, "Predictive variance"):
+/// the support S (reduced column indices, ascending) and its factor F (`linalg::support_factor`:
+/// the R of L⁻¹E_S built in double-double and kept as R⁻¹, solved rather than multiplied). Derived
+/// data of the model's `sigma_inv_chol` and `representatives`, built lazily by `predict`.
+///
+/// * **Growth.** A call whose support is not inside S replaces the entry by one on the union, so
+///   S only grows (to the composition's reachable set) and never churns as neighbours come and
+///   go. A call whose support is inside S uses the entry as it is.
+/// * **Threads.** The model is shared with the auditor's thread: the entry is an immutable
+///   `Arc` behind a `Mutex` that is held only to read or swap the `Arc`, never while F is built,
+///   so a build can use the thread pool and nothing waits on another thread's build (no lock is
+///   held across a call into rayon, where a stolen job could re-enter `predict`). Two threads
+///   that grow S at once may both build; the entry installed is always a superset of the one it
+///   replaces (a build that is not is merged and rebuilt), and a reader holds a whole entry, so
+///   no F is ever torn. A poisoned lock is recovered: the entry is only ever replaced whole.
+/// * **Equality and clone.** Not part of `PartialEq` (two models equal in their fields are equal
+///   whatever they cached); `Clone` copies the entry (the `Arc`), valid because the clone's L is
+///   the same bit for bit — replace the cell if `sigma_inv_chol` or `basis` is then changed in
+///   place. A refit makes a new `Model` and so a new, empty cache.
+pub struct SupportCache {
+    state: Mutex<SupportState>,
+}
+
+#[derive(Clone, Default)]
+struct SupportState {
+    entry: Option<Arc<SupportFactor>>,
+    builds: u64,
+}
+
+/// S and its factor (module doc).
+struct SupportFactor {
+    /// Reduced column indices, ascending.
+    support: Vec<usize>,
+    /// Whether each reduced column is in S (length Q′).
+    member: Vec<bool>,
+    /// The |S| × |S| lower factor F of `linalg::support_factor` (row-major, S reversed).
+    factor: Vec<f64>,
+}
+
+impl SupportFactor {
+    fn covers(&self, call: &[usize]) -> bool {
+        call.iter().all(|&k| self.member[k])
+    }
+
+    /// The factor on `support` (ascending; `linalg::support_factor`).
+    fn build(l: &[f64], qr: usize, support: Vec<usize>) -> SupportFactor {
+        let factor = support_factor(l, qr, &support);
+        let mut member = vec![false; qr];
+        for &k in &support {
+            member[k] = true;
+        }
+        SupportFactor { support, member, factor }
+    }
+
+    /// vᵀA⁻¹v = ‖F⁻¹ J v_S‖² for every query vector (each supported on S): the entries on S
+    /// gathered in reverse order, then one batched substitution of size |S|.
+    fn quad_forms(&self, vs: &[Vec<f64>]) -> Vec<f64> {
+        let gathered: Vec<Vec<f64>> = vs.iter().map(|v| self.support.iter().rev().map(|&k| v[k]).collect()).collect();
+        cholesky_quad_forms(&self.factor, self.support.len(), &gathered.iter().map(|v| &v[..]).collect::<Vec<_>>())
+    }
+}
+
+impl SupportCache {
+    /// An empty cache (nothing built).
+    pub fn new() -> SupportCache {
+        SupportCache { state: Mutex::new(SupportState::default()) }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, SupportState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The cached support S (reduced column indices, ascending), `None` before the first build.
+    pub fn support(&self) -> Option<Vec<usize>> {
+        self.state().entry.as_ref().map(|e| e.support.clone())
+    }
+
+    /// How many factors this cache has built (a measure of the rebuilds; the tests count them).
+    pub fn builds(&self) -> u64 {
+        self.state().builds
+    }
+
+    /// vᵀA⁻¹v for every query vector (each of length Q′), on the support when the union of the
+    /// cached S and the call's support has |S| ≤ Q′/2, else on the full factor (module doc).
+    fn quad_forms(&self, l: &[f64], qr: usize, vs: &[Vec<f64>]) -> Vec<f64> {
+        // the call's support: a value that is exactly 0.0 adds nothing to any product
+        let call: Vec<usize> = (0..qr).filter(|&k| vs.iter().any(|v| v[k] != 0.0)).collect();
+        if call.is_empty() {
+            // every vector is zero: ‖L⁻¹0‖² = 0 exactly, as the full path gives
+            return vec![0.0; vs.len()];
+        }
+        let Some(entry) = self.entry_covering(l, qr, &call) else {
+            return full_quad_forms(l, qr, vs);
+        };
+        entry.quad_forms(vs)
+    }
+
+    /// The entry whose S covers `call`, built (on the union with the current S) if need be;
+    /// `None` when that union exceeds Q′/2 (the full path; the cached entry is kept for the
+    /// smaller calls).
+    fn entry_covering(&self, l: &[f64], qr: usize, call: &[usize]) -> Option<Arc<SupportFactor>> {
+        let mut current = self.state().entry.clone();
+        loop {
+            if let Some(e) = current.as_ref().filter(|e| e.covers(call)) {
+                return Some(e.clone());
+            }
+            let mut union: Vec<usize> = current.as_ref().map_or_else(Vec::new, |e| e.support.clone());
+            union.extend_from_slice(call);
+            union.sort_unstable();
+            union.dedup();
+            if 2 * union.len() > qr {
+                return None;
+            }
+            // built without the lock (struct doc, "Threads")
+            let built = Arc::new(SupportFactor::build(l, qr, union));
+            let mut st = self.state();
+            st.builds += 1;
+            match &st.entry {
+                // another thread installed a superset of ours meanwhile (it covers this call)
+                Some(e) if e.covers(&built.support) => return Some(e.clone()),
+                // the two grew apart: merge with the installed one and build again
+                Some(e) if !built.covers(&e.support) => {
+                    current = Some(e.clone());
+                    continue;
+                }
+                // ours contains the installed one, or nothing is installed: install it
+                _ => {
+                    st.entry = Some(built.clone());
+                    return Some(built);
+                }
+            }
+        }
+    }
+}
+
+impl Default for SupportCache {
+    fn default() -> SupportCache {
+        SupportCache::new()
+    }
+}
+
+impl Clone for SupportCache {
+    /// The same entry (the clone's L is the same; struct doc).
+    fn clone(&self) -> SupportCache {
+        SupportCache { state: Mutex::new(self.state().clone()) }
+    }
+}
+
+impl PartialEq for SupportCache {
+    /// Always equal: derived data takes no part in a model's equality (struct doc).
+    fn eq(&self, _: &SupportCache) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for SupportCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let st = self.state();
+        f.debug_struct("SupportCache").field("support_len", &st.entry.as_ref().map(|e| e.support.len())).field("builds", &st.builds).finish()
     }
 }
 
@@ -778,6 +1009,7 @@ mod tests {
                 ionic: "none".into(),
             },
             representatives: OnceLock::new(),
+            variance_support: SupportCache::new(),
         }
     }
 
@@ -837,5 +1069,317 @@ mod tests {
         let mut m = tiny_model();
         m.mean.pop();
         m.check_shapes();
+    }
+
+    // ---- the predictive variance on the support (spec 2026-11-20-variance-support-design.md) ----
+
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    fn provenance() -> Provenance {
+        tiny_model().provenance
+    }
+
+    /// A model on `species` (body-3 on or off) with seeded random coefficients and scales and a
+    /// posterior factor L = chol(λI + BBᵀ/k) over its Q′ independent columns (B random Q′ × k).
+    fn random_posterior_model(rng: &mut StdRng, species: &[u8], body3: bool) -> Model {
+        let mut basis = Basis::new(species);
+        basis.body3 = body3;
+        let p = basis.n_features();
+        let s = basis.n_species();
+        let q = basis.n_independent_columns();
+        let k = 24;
+        let b: Vec<f64> = (0..q * k).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let mut a = vec![0.0; q * q];
+        for i in 0..q {
+            for j in 0..=i {
+                let d: f64 = (0..k).map(|t| b[i * k + t] * b[j * k + t]).sum::<f64>() / k as f64;
+                a[i * q + j] = d;
+                a[j * q + i] = d;
+            }
+            a[i * q + i] += 1e-2;
+        }
+        crate::linalg::cholesky_in_place(&mut a, q).unwrap();
+        Model {
+            basis,
+            coeffs: (0..s).map(|_| (0..p).map(|_| rng.gen_range(-1.0..1.0)).collect()).collect(),
+            mean: vec![0.0; p],
+            scale: (0..p).map(|_| rng.gen_range(0.5..2.0)).collect(),
+            ref_energy: (0..s).map(|_| rng.gen_range(-80.0..-0.4)).collect(),
+            sigma_e: 1e-4,
+            sigma_f: 1e-3,
+            energy_per_atom: true,
+            lambda: 1e-2,
+            sigma_inv_chol: Some(a),
+            n_samples: 0,
+            provenance: provenance(),
+            representatives: OnceLock::new(),
+            variance_support: SupportCache::new(),
+        }
+    }
+
+    /// A seeded geometry of `n` atoms drawn from `species`, every pair at least 0.9 Bohr apart,
+    /// in a 3.5 Bohr box (inside r_cut, so every atom neighbours every other).
+    fn random_scene(rng: &mut StdRng, species: &[u8], n: usize) -> (Vec<[f64; 3]>, Vec<u8>) {
+        loop {
+            let pos: Vec<[f64; 3]> = (0..n).map(|_| [rng.gen_range(0.0..3.5), rng.gen_range(0.0..3.5), rng.gen_range(0.0..3.5)]).collect();
+            let ok = (0..n).all(|i| (i + 1..n).all(|j| (0..3).map(|a| (pos[i][a] - pos[j][a]).powi(2)).sum::<f64>() > 0.81));
+            if ok {
+                return (pos, (0..n).map(|_| species[rng.gen_range(0..species.len())]).collect());
+            }
+        }
+    }
+
+    /// A model fitted by `fit` to a seeded random linear teacher with noise (`samples` scenes of
+    /// 2–4 atoms over `species`): the posterior factor of a real fit, its conditioning included.
+    fn fitted_model(rng: &mut StdRng, species: &[u8], body3: bool, samples: usize) -> Model {
+        let teacher = {
+            let mut t = random_posterior_model(rng, species, body3);
+            t.sigma_inv_chol = None;
+            t.scale = vec![1.0; t.basis.n_features()];
+            t
+        };
+        let mut store = crate::fit::SampleStore::new(provenance());
+        for _ in 0..samples {
+            let n = rng.gen_range(2..=4);
+            let (pos, z) = random_scene(rng, species, n);
+            let (e, f) = energy_and_forces(&teacher, &pos, &z).unwrap();
+            let e = e + 1e-4 * rng.gen_range(-1.0..1.0);
+            let f = f
+                .iter()
+                .map(|v| [v[0] + 1e-3 * rng.gen_range(-1.0..1.0), v[1] + 1e-3 * rng.gen_range(-1.0..1.0), v[2] + 1e-3 * rng.gen_range(-1.0..1.0)])
+                .collect();
+            store.push(crate::fit::Sample::new(pos, z, e, f, crate::fit::SampleTag::Perturbation, 1.0)).unwrap();
+        }
+        let (m, _) = crate::fit::fit(&store, &teacher.basis, &teacher.ref_energy, &crate::fit::FitOptions::default()).unwrap();
+        assert!(m.sigma_inv_chol.is_some());
+        m
+    }
+
+    /// The largest relative difference of the support path's three outputs to the full path's,
+    /// asserting the spec's bound |a − b| ≤ 1e-12|b| + 1e-15 on each.
+    fn assert_matches_full(m: &Model, pos: &[[f64; 3]], z: &[u8], what: &str) -> f64 {
+        let l = m.sigma_inv_chol.as_ref().unwrap();
+        let (e_s, f_s, fe_s) = m.predictive_std_with(l, pos, z, VariancePath::Auto).unwrap();
+        let (e_f, f_f, fe_f) = m.predictive_std_with(l, pos, z, VariancePath::Full).unwrap();
+        let mut worst = 0.0f64;
+        let mut check = |a: f64, b: f64, name: &str| {
+            assert!((a - b).abs() <= 1e-12 * b.abs() + 1e-15, "{what}: {name} {a:e} (support) vs {b:e} (full)");
+            if b != 0.0 {
+                worst = worst.max((a - b).abs() / b.abs());
+            }
+        };
+        check(e_s, e_f, "energy_std");
+        for j in 0..pos.len() {
+            check(f_s[j], f_f[j], "force_std");
+            check(fe_s[j], fe_f[j], "force_std_epistemic");
+        }
+        // and `predict` itself reports the support path's numbers
+        let pred = m.predict(pos, z, true).unwrap();
+        assert_eq!(pred.energy_std.unwrap().to_bits(), e_s.to_bits(), "{what}: predict takes the same path");
+        worst
+    }
+
+    #[test]
+    fn support_variance_matches_the_full_path() {
+        let mut rng = StdRng::seed_from_u64(2026_11_20);
+        let mut worst = 0.0f64;
+        // (model species, body-3, the scenes' species): the scenes touch a part of the basis
+        let cases: [(&[u8], bool, &[u8]); 5] = [
+            (&[1, 8], false, &[1]),
+            (&[1, 8], true, &[1]),
+            (&[1, 8], true, &[8]),
+            (&[1, 8, 15], true, &[1, 8]),
+            (&[1, 6, 8], true, &[6]),
+        ];
+        let mut supported = 0;
+        let mut n_models = 0;
+        for (k, &(species, body3, scene_species)) in cases.iter().enumerate() {
+            // a fit on a three-species body-3 basis (Q′ 543) takes minutes: those cases fit the
+            // body-2 basis of the same species instead (the posterior's conditioning is the fit's)
+            let models = [random_posterior_model(&mut rng, species, body3), fitted_model(&mut rng, species, body3 && species.len() < 3, 30)];
+            n_models += models.len();
+            for (which, m) in models.iter().enumerate() {
+                for t in 0..6 {
+                    let n = 2 + t % 3;
+                    let (pos, z) = random_scene(&mut rng, scene_species, n);
+                    worst = worst.max(assert_matches_full(m, &pos, &z, &format!("case {k} model {which} scene {t}")));
+                }
+                if m.variance_support.support().is_some() {
+                    supported += 1;
+                }
+            }
+        }
+        assert_eq!(supported, n_models, "every model ran on the support path");
+        println!("support variance vs full path: worst relative difference {worst:.2e}");
+    }
+
+    #[test]
+    fn the_support_grows_and_never_shrinks() {
+        let mut rng = StdRng::seed_from_u64(41);
+        // three species, so H₂ with an O stays within Q′/2 (with two, it does not); body-2, as a
+        // three-species body-3 fit takes minutes
+        let m = fitted_model(&mut rng, &[1, 8, 15], false, 30);
+        let q = m.basis.n_independent_columns();
+        let h2 = (vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.4]], vec![1u8, 1]);
+        let h2_o = (vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.4], [2.5, 0.3, 0.7]], vec![1u8, 1, 8]);
+        assert!(m.variance_support.support().is_none());
+        assert_matches_full(&m, &h2.0, &h2.1, "H2");
+        let s1 = m.variance_support.support().expect("H2 is on the support path");
+        let b1 = m.variance_support.builds();
+        assert_matches_full(&m, &h2_o.0, &h2_o.1, "H2 + O");
+        let s2 = m.variance_support.support().unwrap();
+        assert!(s2.len() > s1.len() && s1.iter().all(|k| s2.contains(k)), "S grows to a strict superset: {} -> {}", s1.len(), s2.len());
+        assert!(2 * s2.len() <= q, "|S| {} still within Q′/2 = {}", s2.len(), q / 2);
+        let b2 = m.variance_support.builds();
+        assert!(b2 > b1);
+        // plain H₂ again, at another bond length: the grown factor answers it without a rebuild
+        assert_matches_full(&m, &[[0.0, 0.0, 0.0], [0.1, 0.0, 1.6]], &[1, 1], "H2 again");
+        assert_eq!(m.variance_support.support().unwrap(), s2, "S never shrinks");
+        assert_eq!(m.variance_support.builds(), b2, "no rebuild for a covered support");
+        println!("|S|: H2 {}, H2 + O {} (Q′ {q}); builds {b1}, {b2}", s1.len(), s2.len());
+    }
+
+    #[test]
+    fn a_new_model_starts_with_an_empty_cache() {
+        let mut rng = StdRng::seed_from_u64(43);
+        let m1 = fitted_model(&mut rng, &[1, 8], true, 30);
+        let (pos, z) = random_scene(&mut rng, &[1], 3);
+        assert_matches_full(&m1, &pos, &z, "first fit");
+        assert!(m1.variance_support.support().is_some());
+        // a clone has the same L, so it shares the built support factor (derived data of equal inputs)
+        let c = m1.clone();
+        assert_eq!(c.variance_support.support(), m1.variance_support.support());
+        assert_eq!(c, m1, "the cache takes no part in equality");
+        // a refit (here a fit to more data, as a background refit's fork makes) is a new Model
+        let m2 = fitted_model(&mut StdRng::seed_from_u64(43), &[1, 8], true, 45);
+        assert_ne!(m2.sigma_inv_chol, m1.sigma_inv_chol);
+        assert!(m2.variance_support.support().is_none(), "a new model starts with an empty cache");
+        assert_eq!(m2.variance_support.builds(), 0);
+        assert_matches_full(&m2, &pos, &z, "the refit");
+        let fresh = m2.clone();
+        assert_matches_full(&fresh, &pos, &z, "a clone of the refit");
+    }
+
+    #[test]
+    fn large_support_uses_the_full_path() {
+        let mut rng = StdRng::seed_from_u64(47);
+        // one species: an H₄ cluster touches almost every column
+        let m = random_posterior_model(&mut rng, &[1], true);
+        let q = m.basis.n_independent_columns();
+        let (pos, z) = random_scene(&mut rng, &[1], 4);
+        let l = m.sigma_inv_chol.as_ref().unwrap();
+        let auto = m.predictive_std_with(l, &pos, &z, VariancePath::Auto).unwrap();
+        let full = m.predictive_std_with(l, &pos, &z, VariancePath::Full).unwrap();
+        assert!(m.variance_support.support().is_none(), "|S| > Q′/2 = {}: nothing cached", q / 2);
+        assert_eq!(m.variance_support.builds(), 0);
+        assert_eq!(auto.0.to_bits(), full.0.to_bits());
+        assert!(auto.1.iter().zip(&full.1).all(|(a, b)| a.to_bits() == b.to_bits()));
+        assert!(auto.2.iter().zip(&full.2).all(|(a, b)| a.to_bits() == b.to_bits()));
+        // a model with a small support cached keeps it while a large call takes the full path
+        let m3 = random_posterior_model(&mut rng, &[1, 8, 15], true);
+        let (p_small, z_small) = random_scene(&mut rng, &[1], 2);
+        assert_matches_full(&m3, &p_small, &z_small, "small first");
+        let s = m3.variance_support.support().unwrap();
+        let p_big = vec![[0.0, 0.0, 0.0], [1.5, 0.0, 0.0], [0.0, 1.6, 0.0], [0.0, 0.0, 1.7], [1.4, 1.5, 1.6], [-1.2, 0.8, 0.3]];
+        let z_big = vec![1u8, 8, 15, 1, 8, 15];
+        let l3 = m3.sigma_inv_chol.as_ref().unwrap();
+        let a = m3.predictive_std_with(l3, &p_big, &z_big, VariancePath::Auto).unwrap();
+        let f = m3.predictive_std_with(l3, &p_big, &z_big, VariancePath::Full).unwrap();
+        assert_eq!(a.0.to_bits(), f.0.to_bits(), "the large call is the full path bit for bit");
+        assert!(a.1.iter().zip(&f.1).all(|(x, y)| x.to_bits() == y.to_bits()));
+        assert_eq!(m3.variance_support.support().unwrap(), s, "the small support stays cached");
+    }
+
+    /// The model is shared with the auditor's thread: concurrent calls that grow S in different
+    /// directions neither deadlock nor see a torn factor; every answer matches the full path.
+    #[test]
+    fn concurrent_calls_agree_with_the_full_path() {
+        let mut rng = StdRng::seed_from_u64(53);
+        let m = random_posterior_model(&mut rng, &[1, 8, 15], true);
+        let kinds: [&[u8]; 4] = [&[1], &[8], &[15], &[1, 8]];
+        let scenes: Vec<(Vec<[f64; 3]>, Vec<u8>)> = (0..24).map(|t| random_scene(&mut rng, kinds[t % 4], 2 + t % 2)).collect();
+        std::thread::scope(|sc| {
+            for w in 0..4 {
+                let (m, scenes) = (&m, &scenes);
+                sc.spawn(move || {
+                    for (t, (pos, z)) in scenes.iter().enumerate().skip(w).chain(scenes.iter().enumerate()) {
+                        assert_matches_full(m, pos, z, &format!("thread {w} scene {t}"));
+                    }
+                });
+            }
+        });
+        assert!(m.variance_support.support().is_some());
+    }
+
+    /// The query vectors as built before 2026-11-20: full-width rows, restricted afterwards.
+    fn query_vectors_by_full_rows(m: &Model, pos: &[[f64; 3]], z: &[u8]) -> Result<Vec<Vec<f64>>, DescribeError> {
+        let basis = &m.basis;
+        let p = basis.n_features();
+        let q = basis.n_species() * p;
+        // The posterior lives on the independent columns (`fit` docs, "Tied columns"): restrict
+        // every query vector to the class representatives before the quadratic form.
+        let rep = m.representatives();
+        let qr = rep.len();
+        let s = basis.species_indices(z)?;
+        let desc = describe(basis, pos, z)?;
+        let inv_scale = m.inverse_scale();
+        let n = pos.len();
+        let mut reduced = vec![0.0; qr];
+        fn restrict(dst: &mut [f64], rep: &[usize], v: &[f64]) {
+            for (r, &c) in dst.iter_mut().zip(rep) {
+                *r = v[c];
+            }
+        }
+
+        // Energy: φ̃ = Σ_i φ̃_i.
+        let mut phi = vec![0.0; q];
+        for (i, d) in desc.iter().enumerate() {
+            let block = &mut phi[s[i] * p..(s[i] + 1) * p];
+            for k in 0..p {
+                block[k] += d.b[k] * inv_scale[k];
+            }
+        }
+        restrict(&mut reduced, rep, &phi);
+
+        // Forces: g̃_{j,a} = −Σ_i ∂B̃_i/∂r_{j,a}, gathered from every centre's gradient list.
+        let mut rows = vec![vec![0.0; q]; 3 * n];
+        for (i, d) in desc.iter().enumerate() {
+            let off = s[i] * p;
+            for (j, g) in &d.grad {
+                for k in 0..p {
+                    let gk = g[k];
+                    let sc = inv_scale[k];
+                    rows[3 * j][off + k] -= gk[0] * sc;
+                    rows[3 * j + 1][off + k] -= gk[1] * sc;
+                    rows[3 * j + 2][off + k] -= gk[2] * sc;
+                }
+            }
+        }
+        let mut restricted = Vec::with_capacity(1 + 3 * n);
+        restricted.push(reduced);
+        for row in &rows {
+            let mut r = vec![0.0; qr];
+            restrict(&mut r, rep, row);
+            restricted.push(r);
+        }
+        Ok(restricted)
+    }
+
+    #[test]
+    fn query_vectors_are_the_restricted_full_rows() {
+        let mut rng = StdRng::seed_from_u64(61);
+        for (species, body3) in [(&[1u8, 8][..], false), (&[1, 8], true), (&[1, 8, 15], true)] {
+            let m = random_posterior_model(&mut rng, species, body3);
+            for t in 0..4 {
+                let (pos, z) = random_scene(&mut rng, species, 2 + t);
+                let got = m.query_vectors(&pos, &z).unwrap();
+                let want = query_vectors_by_full_rows(&m, &pos, &z).unwrap();
+                assert_eq!(got.len(), want.len());
+                for (g, w) in got.iter().zip(&want) {
+                    assert!(g.iter().zip(w).all(|(a, b)| a.to_bits() == b.to_bits()), "{species:?} scene {t}");
+                }
+            }
+        }
     }
 }

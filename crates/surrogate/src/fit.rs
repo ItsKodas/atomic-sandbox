@@ -1264,6 +1264,7 @@ impl Accumulator {
             n_samples: self.n_samples,
             provenance: provenance.clone(),
             representatives: OnceLock::new(),
+            variance_support: crate::model::SupportCache::new(),
         };
         let report = FitReport {
             rmse_energy_per_atom: if n_e > 0.0 { (sol.rss_e / n_e).sqrt() } else { 0.0 },
@@ -2598,6 +2599,7 @@ mod tests {
             n_samples: 0,
             provenance: provenance(),
             representatives: OnceLock::new(),
+            variance_support: crate::model::SupportCache::new(),
         }
     }
 

@@ -91,6 +91,7 @@ fn random_model(rng: &mut StdRng, basis: Basis, zero_mean: bool) -> Model {
         n_samples: 0,
         provenance: provenance(),
         representatives: std::sync::OnceLock::new(),
+        variance_support: surrogate::model::SupportCache::new(),
     }
 }
 

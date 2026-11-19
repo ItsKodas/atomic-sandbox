@@ -38,7 +38,7 @@ pub use envelope::Envelope;
 pub use fit::{
     fit, Accumulator, FitError, FitOptions, FitReport, RefitKind, Sample, SampleStore, SampleTag, SearchStart, StoreError, Sums,
 };
-pub use model::{energy_and_forces, Model, Prediction, Provenance, SurfaceKey};
+pub use model::{energy_and_forces, Model, Prediction, Provenance, SupportCache, SurfaceKey};
 pub use collection::{Collection, CollectionReference, REFIT_TIMES_FILE, CollectionSample, ImportReport, OpenReport, PurgeOutcome, ReferenceOutcome};
 pub use grade::ActiveSet;
 pub use history::{AuditHistory, AuditPoint, EnvKey, HISTORY_CAP};

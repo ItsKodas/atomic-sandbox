@@ -1285,6 +1285,7 @@ mod tests {
                     ionic: "none".into(),
                 },
                 representatives: std::sync::OnceLock::new(),
+                variance_support: crate::model::SupportCache::new(),
             };
             m.coeffs[row][b.body2_index(block, 0)] = 1.0; // n = 0: R_0 f_c = f_c
             m
@@ -1550,6 +1551,7 @@ mod tests {
                     n_samples: 0,
                     provenance: crate::model::Provenance { grid_n: 1, h: 1.0, sigma: 1.0, tol: 1.0, charge: 0, multiplicity: None, teacher: String::new(), masses: Vec::new(), ionic: "none".into() },
                     representatives: std::sync::OnceLock::new(),
+                    variance_support: crate::model::SupportCache::new(),
                 };
                 let (_, f) = crate::model::energy_and_forces(&m, &pos, &z).unwrap();
                 let fmax = f.iter().flat_map(|v| v.iter()).fold(0.0f64, |a, v| a.max(v.abs()));

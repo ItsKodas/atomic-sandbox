@@ -1306,6 +1306,7 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         n_samples: h.get("n_samples")?.usize()?,
         provenance,
         representatives: OnceLock::new(),
+        variance_support: crate::model::SupportCache::new(),
     };
 
     let mut acc = Accumulator::new(&basis);
@@ -2149,6 +2150,7 @@ pub(crate) mod tests {
                 ionic: "none".into(),
             },
             representatives: OnceLock::new(),
+            variance_support: crate::model::SupportCache::new(),
         };
         let report = FitReport {
             rmse_energy_per_atom: 1.26e-5,
