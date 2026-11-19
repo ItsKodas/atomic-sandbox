@@ -2562,7 +2562,8 @@ mod tests {
         assert_eq!(c.samples.len(), 1);
 
         // a file with no face-density array at all (written before the box rule, like
-        // models/SiH4.model): every sample's box status is unknown, each refused by name
+        // the SiH4.model that shipped until the Fermi–Dirac switch): every sample's box status is unknown, each refused
+        // by name
         let mut big_box = prov();
         big_box.grid_n = 81;
         let f = samples_file(&dir, "old.model", &set(big_box, vec![h2(7), h2(8)], vec![], vec![]));
