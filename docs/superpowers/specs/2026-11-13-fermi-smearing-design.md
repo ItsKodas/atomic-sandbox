@@ -894,6 +894,19 @@ review.
    - it is never converted to code 1, so it never enters the recovery's holds or its cap. The trust rework's "no
      ratchet" invariant (G2 of its spec) stays intact.
 
+**Not judged (plan Task 15, review M1).** "Every code-9 sample" means every one a candidate can hold:
+- **A sample with stray atoms** (atoms with no neighbour within the cutoff) is not judged. A stray composition is
+  never fitted unmeasured (the stray-atom spec, 2026-11-18), so it cannot be in the candidate. It waits at 9: out of
+  the fit, not fencing, never reviewed. `migration.txt` lists it on a `waiting` line, the review's note counts it
+  ("N waiting (stray atoms)"), and the state stays "complete" while any waits; "reviewed" means every code-9 sample
+  has a verdict. This is a known limit. A follow-up could judge it by plain prediction and release it to the
+  stray-atom hold rather than to 0.
+- **A sample whose box lacks its isolated-atom references** waits too: its energy is the teacher's raw one. The
+  reference's arrival rebases it, which changes the store, so the next refit reviews it.
+
+The review also repeats when the bounds it reads (the policy's energy and force bounds) or the basis (degree cap,
+body-4 degree) change (review M3). Its note appears only when the verdicts change (M4).
+
 **Why this rule.**
 - *Automatic and rule-based, as the user prefers.* It uses the trust machinery's own reading, the leave-one-out ratio,
   against the policy's own bounds, with nothing new to calibrate.
@@ -901,6 +914,12 @@ review.
   together, such as every near-linear OH or every auto-multiplicity O₂, a fit without any of them cannot reproduce
   any of them, so release-by-reproduction would never fire. With the siblings in the candidate, each is judged by
   whether its neighbours predict it, which is the same question the class rule asks.
+- The opposite error is the single-pass screen's swamping: gross outliers among the code-9 samples inflate their
+  neighbours' ratios. Measured on the analytic fixture (plan Task 15): ten consistent siblings read 0.02–0.11 alone,
+  0.42–0.55 beside one 50 mHa outlier, and 0.89–1.02 beside two, so 3 of 10 were kept. The error is on the safe side
+  (kept samples fence, so DFT answers nearby) and heals itself: fresh answers there join the next candidate, and
+  ruling B settles a kept sample at the first agreeing answer. An iterated screen (refit without the kept ones,
+  re-judge them) is a possible refinement.
 - A set of mutually consistent but wrong re-solves would pass. A wrong re-solve here means a teacher pathology, and the
   solver checks in section 7.3 step 2 guard against that. The released samples then face every check any fitted
   sample faces.

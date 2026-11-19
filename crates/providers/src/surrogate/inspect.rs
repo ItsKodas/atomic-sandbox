@@ -73,7 +73,7 @@ fn state_name(code: Option<u8>, below_prefix: bool) -> &'static str {
         Some(Q_DRAFT) => "held out (draft guess)",
         Some(Q_LONE) => "held out (lone atoms)",
         Some(Q_STRAY) => "held out (stray atoms, until measured)",
-        Some(Q_RESOLVED) => "held out (re-solved for the new solver; reviewed by the leave-one-out rule)",
+        Some(Q_RESOLVED) => "re-solved for the new solver, awaiting review",
         _ if !below_prefix => "unfitted",
         _ => "fitted",
     }
@@ -510,7 +510,12 @@ impl SurrogateKs {
         }
         let mut by_comp: BTreeMap<String, Comp> = BTreeMap::new();
         for (i, s) in samples.iter().enumerate() {
-            let st = state_name(self.quarantine.get(i).copied(), i < self.accumulated);
+            let st = match self.quarantine.get(i).copied() {
+                // a re-solved sample (spec §7.6): which of its three states (Task 15 review M8)
+                Some(Q_RESOLVED) if self.fences(i) => "re-solved for the new solver, kept by its review (fences)",
+                Some(Q_RESOLVED) if self.resolved_stray(i) => "re-solved for the new solver, not reviewed (stray atoms)",
+                code => state_name(code, i < self.accumulated),
+            };
             *by_tag.entry(format!("{:?}", s.tag)).or_default().entry(st).or_default() += 1;
             let c = by_comp.entry(composition(&s.z)).or_default();
             *c.states.entry(st).or_default() += 1;

@@ -71,7 +71,7 @@
 
 Later tasks name these by role. The implementer uses the right-hand column.
 
-Rows 2, 3 and 10 are settled by preflight F4 (spec §8 amendment): a reviewed-and-failed code 9 is in `fences()`, not in `fencing()` or the held cap, purge's lift votes never lift it, and it never joins the misfit set M. Task 2 fills in the names; it does not re-decide this.
+Rows 2, 3 and 10 are settled by preflight F4 (spec §8 amendment): a reviewed-and-failed code 9 is in `fences()`, not in `fencing()` or the held cap, purge's lift votes never lift it, and it never joins the misfit set M. Task 2 fills in the names; it does not re-decide this. (Controller rulings before Task 15, spec §8: **A** — the fence's on-switch is a separate "any sample fences" predicate, `any_fences()`, so `fencing()` keeps its codes; **B** — a failed code 9 is moved like a held sample: one agreeing fresh teacher answer releases or supersedes it through `admit`. The lift votes still never lift it.)
 
 **Task 2 findings on the merged tree (for the controller; spec §8 "Amendment (plan Task 2)").**
 - **A. `fencing()` is the fence's on-switch, not a cap.** On `main` (and on both branches before it) `fencing()` (`quarantine.rs` l. 483) has no meaning beyond "how many samples fence": its only readers are the early returns `if self.fencing() == 0 { return Vec::new() }` of `quarantine_distances` (l. 958) and `quarantine_distances_cached` (l. 973), and `views.rs` `any_fence` (l. 225) and `training_views`' descriptor-cache fill (l. 241). A failed code 9 that is in `fences()` but not counted by `fencing()` would fence **nothing** whenever no code 1 or 7 sample exists (the distance scan returns empty before it reads `fences()`), and the views would not re-judge their cached points. So F4's "not counted by `fencing()`" cannot hold together with "joins the quarantine fence". Nothing in `fencing()` feeds the held cap (row 3: `quarantined() + forgotten()`), so counting a failed 9 there costs nothing F4 protects. Needs a ruling before Task 15: (a) `fencing()` stays "the count of `fences(i)`" and so counts a failed 9 (smallest change; F4's intent — out of the cap, the lift and M — holds by rows 3 and 10), or (b) `fencing()` keeps its codes and the four gates read a separate "any sample fences" predicate. Behaviour is identical.
@@ -924,13 +924,14 @@ pub struct MigrationStatus { pub source: String, pub samples: usize, pub done: u
 - Produces: `fn review_resolved(&mut self) -> Option<ReviewOutcome>`, where `ReviewOutcome { released: Vec<usize>, kept: Vec<(usize, f64)> }`. It runs inside a refit only when all of the following hold:
   - the migration state is Complete or Reviewed;
   - a code-9 sample exists;
-  - the store changed since the last review.
+  - the store changed since the last review (as built, Task 15 review M3: the stamp also covers the policy's bounds, `degree_cap` and `body4_degree`).
 
   The procedure:
   1. Fit a candidate on the fit's members plus every code-9 sample.
   2. A sample whose ratio ≤ 1 goes 9 → 0.
   3. A sample with ratio > 1 stays at 9. Its verdict is written to `migration.txt`'s review log and read back on attach (ruling R13).
-  4. A reviewed-and-failed code-9 sample joins the quarantine fence: `fences()` is true for it (F4; spec §7.6 step 4 and §8). It is not counted by `fencing()` or the held cap, purge's lift votes never lift it, it never joins the misfit set M, and it is never converted to code 1.
+  4. A reviewed-and-failed code-9 sample joins the quarantine fence: `fences()` is true for it (F4; spec §7.6 step 4 and §8). It is not counted by `fencing()` or the held cap, purge's lift votes never lift it, it never joins the misfit set M, and it is never converted to code 1. Like a held sample (ruling B), one agreeing fresh answer next to it releases or supersedes it.
+  6. As built (Task 15 review M1): a code-9 sample with stray atoms is not judged; it waits at 9, listed in the log's `waiting` lines, and the log stays at Complete while any waits.
   5. A purge of the new folder after the pass remaps the review log's indices through `PurgeOutcome::map` and rewrites `migration.txt` (F3).
 
 - [ ] **Step 1: Write the failing tests:**
@@ -939,7 +940,8 @@ pub struct MigrationStatus { pub source: String, pub samples: usize, pub done: u
   - `code9_before_review_does_not_fence`;
   - `review_releases_siblings_its_neighbours_predict`: 10 code-9 samples on a smooth analytic surface, all shifted consistently → all released;
   - `review_keeps_an_inconsistent_sample_and_it_is_refused_near`: one sample offset by 50 mHa → stays 9; `fences()` holds for it and a geometry near it is refused; its code is never 1; a later review can still release it;
-  - `failed_code9_is_not_lifted_by_purge_votes` (F4): three agreeing answers near a failed code-9 sample leave it at 9 and fencing;
+  - `failed_code9_is_not_lifted_by_purge_votes` (F4, as built under ruling B): next to a failed code 9 and a forgotten sample, the first agreeing answer moves the code 9 (superseded) and casts no lift vote; the agreeing answers after it lift only the forgotten sample (code 8); the code 9 is never 8 at any step;
+  - `a_fresh_agreeing_answer_moves_a_failed_code9` (ruling B): one agreeing answer next to a failed code 9 supersedes it;
   - `purge_after_review_remaps_the_review_log` (F3): purge forgotten samples that precede reviewed ones → every review-log entry names the same sample at its new index;
   - `no_review_while_the_pass_is_running` (Review Focus 3): a refit with the log at Running leaves every code 9 unchanged;
   - `review_repeats_only_when_the_store_changed`;

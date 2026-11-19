@@ -363,6 +363,10 @@ impl SurrogateKs {
         self.note_lone_held_out(&format!("shared collection {slug}"), lone, r_cut);
         self.note_stray_held_out(&format!("shared collection {slug}"), stray, r_cut);
         self.find_migration();
+        #[cfg(test)]
+        if self.attach_refit_off {
+            return Ok(());
+        }
         if self.no_model().is_some_and(|nm| nm.missing.is_empty() && nm.retry) {
             if let Err(e) = SurrogateKs::refit(self) {
                 self.last_fit_error = Some(e.to_string());

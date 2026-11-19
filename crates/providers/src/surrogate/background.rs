@@ -464,6 +464,7 @@ impl SurrogateKs {
         if f.review_log_dirty {
             if let (Some(live), Some(fl)) = (self.migration.as_mut().and_then(|m| m.log.as_mut()), f.migration.as_ref().and_then(|m| m.log.as_ref())) {
                 live.review = fl.review.clone();
+                live.waiting = fl.waiting.clone();
                 live.state = fl.state;
                 self.review_log_dirty = true;
             }

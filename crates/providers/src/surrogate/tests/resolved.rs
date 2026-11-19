@@ -98,6 +98,7 @@ fn set_migration(s: &mut SurrogateKs, state: MigrationState) {
         references: Vec::new(),
         class_u_max: (0.0, 0.0),
         review: Vec::new(),
+        waiting: Vec::new(),
         pending: None,
         orphaned: Vec::new(),
     };
@@ -476,6 +477,51 @@ fn review_repeats_only_when_the_store_changed() {
     s.add_sample_answer(smp, &sc, Some(0.0), Some(1)).unwrap();
     s.refit().unwrap();
     assert_eq!(s.reviews_run, 2, "a sample was added");
+    // the note only when the verdicts change (Task 15 review M4): the second review kept the same one
+    let notes = |s: &SurrogateKs| s.user_notes.iter().filter(|n| n.contains("re-solved for the new solver reviewed")).count();
+    assert_eq!(notes(&s), 1, "{:?}", s.user_notes);
+    // a policy change re-judges the verdicts (M3): the bounds a ratio is read against moved
+    let p = FallbackPolicy { energy_std_per_atom: 1.5e-3, ..s.policy.clone() };
+    s.set_policy(p);
+    s.refit().unwrap();
+    assert_eq!(s.reviews_run, 3, "the policy's bounds changed");
+    s.refit().unwrap();
+    assert_eq!(s.reviews_run, 3, "and nothing since");
+}
+
+/// Task 15 review M1 (spec §7.6, "Not judged"): a code-9 sample with stray atoms is not judged by the review — it waits
+/// at 9, not fencing, listed in the log's waiting list, and the log stays "complete" while it remains; the note counts
+/// it separately. Its siblings are reviewed as usual.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn a_stray_code9_waits_and_the_log_stays_complete() {
+    let dir = collection_root("code9-stray");
+    let (mut s, _) = super::forget::small_collection(&dir);
+    let mut rng = StdRng::seed_from_u64(42);
+    let nine = siblings(&mut s, &mut rng);
+    // H₂ (the changed state) and an H 8 Bohr from its centre: beyond every cutoff, a stray atom
+    let (_, mut smp) = answer(2.7, 0.0, true, &mut rng);
+    let mid: [f64; 3] = std::array::from_fn(|a| 0.5 * (smp.pos[0][a] + smp.pos[1][a]));
+    smp.pos.push([mid[0], mid[1] + 8.0, mid[2]]);
+    smp.z.push(1);
+    smp.energy += SpeciesMorse::atom(1);
+    smp.forces.push([0.0; 3]);
+    let k = take_resolved(&mut s, smp);
+    assert!(s.resolved_stray(k), "the premise: stray atoms");
+    set_migration(&mut s, MigrationState::Complete);
+    s.refit().unwrap();
+    assert!(nine.iter().all(|&i| s.quarantine.get(i).copied().unwrap_or(Q_NONE) == Q_NONE), "the siblings are released");
+    assert_eq!(s.quarantine[k], Q_RESOLVED, "not judged");
+    assert!(!s.fences(k) && !s.review_kept.contains(&k));
+    assert_eq!(verdict(&s, k), None, "no verdict");
+    let log = disk_log(&s);
+    assert_eq!((log.state, log.waiting.clone()), (MigrationState::Complete, vec![coll_index(&s, k)]), "complete while one waits");
+    assert!(s.user_notes.iter().any(|n| n.contains("reviewed: 10 rejoined") && n.contains("1 waiting (stray atoms")), "{:?}", s.user_notes);
+    // a later refit with nothing changed: no review, no note
+    let before = s.user_notes.len();
+    s.refit().unwrap();
+    assert_eq!(s.reviews_run, 1);
+    assert!(!s.user_notes[before..].iter().any(|n| n.contains("re-solved for the new solver reviewed")));
 }
 
 /// §7.6: a code-9 sample is not the user's — Forget and Restore refuse it (one or in a batch), nothing changed.
@@ -518,10 +564,14 @@ fn a_kept_verdict_is_read_back_on_attach() {
     let k_coll = coll_index(&s, k);
     drop(s);
     let (mut t, _) = pair_student();
+    // the attach alone (no refit after it, Task 15 review M6): its read-back runs after the codes are loaded
+    t.attach_refit_off = true;
     t.attach_collection(&dir, &h2(1.4)).unwrap();
     let k2 = t.shared.as_ref().unwrap().link.iter().position(|l| *l == Link::In(k_coll)).unwrap();
     assert_eq!(t.quarantine[k2], Q_RESOLVED);
-    // the read-back itself (attach may also have refitted and reviewed again)
+    assert_eq!((t.review_kept.iter().copied().collect::<Vec<_>>(), t.reviews_run), (vec![k2], 0), "read back at attach, no review");
+    assert!(t.fences(k2));
+    // and the read-back again by hand
     t.review_kept.clear();
     t.find_migration();
     assert_eq!(t.review_kept.iter().copied().collect::<Vec<_>>(), vec![k2], "only the kept one, read back");

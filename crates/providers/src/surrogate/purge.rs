@@ -276,8 +276,9 @@ impl SurrogateKs {
                 // `migration.txt`'s review log names samples of the new folder by index (F3, spec §8): each entry
                 // follows its sample through the collection's map — one whose sample was purged (released, then
                 // forgotten) goes with it; the caller writes the file (`flush_migration_log`)
-                if let Some(log) = self.migration.as_mut().and_then(|m| m.log.as_mut()).filter(|l| !l.review.is_empty()) {
+                if let Some(log) = self.migration.as_mut().and_then(|m| m.log.as_mut()).filter(|l| !l.review.is_empty() || !l.waiting.is_empty()) {
                     log.review = log.review.iter().filter_map(|&(k, r, rel)| cm.get(k).copied().flatten().map(|j| (j, r, rel))).collect();
+                    log.waiting = log.waiting.iter().filter_map(|&k| cm.get(k).copied().flatten()).collect();
                     self.review_log_dirty = true;
                 }
             }

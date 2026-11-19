@@ -5841,11 +5841,15 @@ forms — the first run without O failed `MissingReference(8)`) and 16 cold solv
 (every coordinate N(0, 0.01²) Bohr, seed `0x7e570915`) as live code-0 samples; the next refit reviews H₄. The neighbours'
 F lie within −2.86 / +2.57 mHa of the migrated label, their TS 1.3555–1.3855e-2 Ha (the symmetric ensemble's, the
 label's 1.3836e-2). **H₄ is released: leave-one-out ratio 4.91e-3** in the candidate (state "reviewed", code 0 in the
-collection) — its neighbours on the new surface predict the re-solved label. The test took 310 s alone (the migration's
+collection) — its neighbours on the new surface predict the re-solved label. **V7 is the review's no-sibling limit**
+(Task 15 review M7): H₄ is the only code 9, so the candidate without it is the plain fit and the ratio is
+release-by-reproduction on the real teacher. It tests the pipeline and the label's consistency with the new surface (a
+broken-symmetry landing 14.5 mHa off would read ρ ≈ 3.6, kept), not the sibling mechanism, which only the analytic
+providers tests below cover. The test took 310 s alone (the migration's
 three solves, the two reference scans and the 16 neighbours).
 
 **The providers tests** (`surrogate::tests::resolved`, the 40 pair-Morse H₂ samples of `forget::small_collection` and
-re-solved samples on an analytic changed state E_Morse + 0.06·(r − 2.3)² beyond the window, 12 tests, < 2 s):
+re-solved samples on an analytic changed state E_Morse + 0.06·(r − 2.3)² beyond the window, 13 tests, < 2 s; fix round 1 added the stray-atom wait, the policy re-review and the attach order):
 ten siblings on r ∈ [2.5, 3.0], none reproduced by the fit without them, are all released at ρ 0.02–0.11; a sample
 50 mHa off the Morse curve inside the window is kept at ρ = 26.3 and refused next to it by `NearQuarantine`; a sample
 beyond the siblings in a second change of state (+0.1·(r − 3)²) is kept at ρ = 14.2 and released at ρ = 0.18 by the

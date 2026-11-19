@@ -306,6 +306,7 @@ impl Migrator {
             references: Vec::new(),
             class_u_max: (0.0, 0.0),
             review: Vec::new(),
+            waiting: Vec::new(),
             pending: None,
             orphaned: Vec::new(),
         };

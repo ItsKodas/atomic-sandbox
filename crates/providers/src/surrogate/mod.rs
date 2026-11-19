@@ -917,7 +917,10 @@
 //! (controller ruling B) — and a later review can still release it. Its verdict is in `migration.txt`'s review log
 //! (collection indices, the latest per sample), read back at attach (ruling R13), renumbered by a purge (F3), and
 //! written at the refit's end after the status records it names. Judged by the review: code-9 samples whose box has
-//! its references and that have no stray atoms (one with stray atoms waits at 9, unreviewed: a known limit).
+//! its references and that have no stray atoms. One with stray atoms waits at 9, unreviewed and not fencing (a known
+//! limit, spec §7.6 "Not judged"): the log lists it as `waiting` and stays "complete" while it remains, and the note
+//! counts it. The review repeats when the store, the policy's bounds or the basis (degree cap, body-4 degree) changed;
+//! its note only when the verdicts changed.
 //!
 //! **Box-affected answers** (fix round 4; threshold Task 9, h-scaled by ruling S17): a teacher
 //! answer whose reported face density (`EvalStats::face_density`: max ρ on the outermost grid
@@ -1678,6 +1681,9 @@ pub struct SurrogateKs {
     /// Tests only: how many reviews of the re-solved samples ran (`review_resolved`).
     #[cfg(test)]
     pub(super) reviews_run: usize,
+    /// Tests only: an attach runs no refit (`shared::attach_inner`), so what the attach itself installed is seen.
+    #[cfg(test)]
+    pub(super) attach_refit_off: bool,
     /// Tests only: a collection fitted without the body-4 block (the basis collections had before
     /// M8a Task 5 — the user's stuck collection's repro is pinned to it).
     #[cfg(test)]
@@ -1928,6 +1934,8 @@ impl SurrogateKs {
             review_log_dirty: false,
             #[cfg(test)]
             reviews_run: 0,
+            #[cfg(test)]
+            attach_refit_off: false,
             #[cfg(test)]
             body4_off: false,
             #[cfg(test)]
