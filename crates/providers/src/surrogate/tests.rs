@@ -8968,8 +8968,10 @@ fn a_class_refused_for_one_outlier_earns_the_calibrated_verdict_and_holds() {
     assert!(l.trusted, "the class did not earn trust: {l:?}");
     assert!(l.calibration >= 1.0 && l.evidence >= calibrate::MIN_EVIDENCE && l.trusted_since.is_some(), "{l:?}");
     assert!(l.force_max > 1.0, "the outlier is still in the fit: {l:?}");
-    assert_eq!(first, Some(119), "the floor: the 12th fit's comparisons open it");
-    assert!(answered >= 80, "{answered} answered");
+    // refits every 10 steps, each a new fit id: the 12th fit stands at steps 110-119 and the refit at 119 meets
+    // the floor; every step before entry falls back, every step after is answered (it holds)
+    assert_eq!(first, Some(10 * calibrate::FLOOR_FITS - 1), "the floor: the 12th fit's comparisons open it");
+    assert_eq!(answered, 200 - (first.unwrap() + 1), "every step after entry is answered");
 }
 
 /// The hysteresis memory through the provider (M8a Task 2, `class_memory`): the verdict a refit
@@ -9343,8 +9345,10 @@ fn a_compressed_trimer_does_not_flip_the_many_body_verdict() {
     assert!(flips <= 1, "the verdict flipped {flips} times: {verdicts:?}");
     assert!(l.trusted && l.evidence >= calibrate::MIN_EVIDENCE && l.measured.is_some(), "judged by its evidence: {l:?}");
     assert!(l.force_max > 1.0, "the compressed sample is still in the fit: {l:?}");
-    assert_eq!(verdicts.iter().position(|&t| t), Some(119), "the floor: the 12th fit's comparisons open it");
-    assert!(answered >= 80, "{answered} answered");
+    // as the outlier test: the 12th fit's refit at step 119 meets the floor; every step after entry is answered
+    let first = verdicts.iter().position(|&t| t);
+    assert_eq!(first, Some(10 * calibrate::FLOOR_FITS - 1), "the floor: the 12th fit's comparisons open it");
+    assert_eq!(answered, 200 - (first.unwrap() + 1), "every step after entry is answered");
 }
 
 

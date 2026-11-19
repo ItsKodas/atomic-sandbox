@@ -401,7 +401,7 @@ pub const LEAVE: f64 = 1.0;
 pub const MIN_EVIDENCE: usize = 3;
 /// One jurisdiction point in the window with an atom's measured force error beyond this many
 /// times its bound keeps an untrusted class from entering (at every evidence count) and, with
-/// fewer than [`MIN_EVIDENCE`] points, makes a trusted one leave: P(χ²₃/3 > 9) = 5.9e-6 per atom
+/// its key below the evidence floor ([`FLOOR_FITS`] fits and [`FLOOR_POINTS`] points), makes a trusted one leave: P(χ²₃/3 > 9) = 5.9e-6 per atom
 /// for a calibrated posterior at std = bound.
 pub const WORST_ATOM: f64 = 3.0;
 /// The evidence window (module doc, "The evidence window"): the newest whole generations of a
