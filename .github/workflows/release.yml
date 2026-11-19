@@ -2,6 +2,10 @@
 # docs/superpowers/specs/2026-11-12-installer-updater-design.md; the checklist and the one-time
 # setup are docs/dev-reference.md "Releasing").
 #
+# Since 2026-11-20 releases are built and signed on the developer's PC (scripts/package.ps1,
+# scripts/release-assets.ps1, a hand minisign -S), and the tag trigger below is off: this workflow is
+# a build-only check by hand (workflow_dispatch) unless the trigger is restored.
+#
 # Jobs:
 #
 # - build (every run; read-only token; no secret is referenced in it): the tag check, the app build,
@@ -30,8 +34,11 @@
 name: Release
 
 on:
-  push:
-    tags: ['v*']
+  # Releases are built and signed locally since 2026-11-20 (docs/dev-reference.md "Releasing"), so a
+  # pushed tag no longer starts this workflow. To build and sign here again, restore:
+  #   push:
+  #     tags: ['v*']
+  # (the sign and release jobs below run only for a pushed tag). workflow_dispatch stays build-only.
   workflow_dispatch:
 
 permissions: {}
