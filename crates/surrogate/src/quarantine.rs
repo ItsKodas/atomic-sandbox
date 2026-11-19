@@ -95,8 +95,14 @@ pub fn is_forgotten_code(code: u8) -> bool {
 /// envelope, the grade, the leave-one-out and the class statistics like a held sample, but it is
 /// not a misfit hold (the recovery's 10 % cap does not count it) and not the user's (Forget and
 /// Restore do not apply). Before its review it does not fence; the review (a candidate fit with
-/// every code-9 sibling, by the leave-one-out ratio) releases it to [`Q_NONE`] or keeps it here,
-/// fencing from then on. What reads and acts on it is the provider's.
+/// every code-9 sibling, by the leave-one-out ratio, once the migration pass is complete) releases
+/// it to [`Q_NONE`] or keeps it here, fencing from then on (preflight F4: in the quarantine fence,
+/// not in the provider's `fencing()` count or the held cap, never in the misfit set, never lifted by
+/// the fence's lift votes, never converted to [`Q_HELD`]). A kept one moves like a held sample when
+/// a fresh teacher answer next to it agrees with the model — released, or [`Q_SUPERSEDED`] — and a
+/// later review can still release it. Which samples were kept is not in the code (9 either way):
+/// it is the review log of the folder's `migration.txt` ([`crate::migration`]). What reads and acts
+/// on it is the provider's (`providers::surrogate`, "Re-solved samples").
 ///
 /// **A collection code only** ([`is_collection_code`]; ruling R12): written as a collection status
 /// record, never into a sidecar — a sidecar writer leaves code-9 samples out (ruling R11: the

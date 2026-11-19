@@ -11391,6 +11391,10 @@ mod purge;
 /// 2026-11-14: a forgotten sample's fence lifts after agreeing answers (`fence_lift.rs`).
 mod fence_lift;
 
+/// Fermi–Dirac spec §7.6 (plan 2026-11-13 Task 15): code 9 in the trust machinery and its leave-one-out review
+/// (`resolved.rs`).
+mod resolved;
+
 /// Scoped-trust study step 3 (2026-11-13): the block downdate by a suspect set and its shift on
 /// the stored scenes, a measurement only (`scope_measure.rs`).
 mod scope_measure;

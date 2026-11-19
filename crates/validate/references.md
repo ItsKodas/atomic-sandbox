@@ -5807,7 +5807,7 @@ another worktree's `providers` suite, timings only):
   ensemble, not a broken-symmetry landing (TS ≈ 0 there). **Rule 7: the migration replaces a lower-F label at this
   geometry** — the shared-shell release found the broken-symmetry integer state 14.5 mHa below the state the cold FD
   solve reaches (spec §4.7(e)); the new label is the new teacher's converged state, not the lowest.
-- The old folder's files hash identical after the pass. The code-9 review is Task 15's.
+- The old folder's files hash identical after the pass. The code-9 review is Task 15's (below).
 
 **The providers tests** (`sampling::tests::migration`, synthetic pair-Morse teacher with the FD breakdown, 14 tests,
 0.4 s): `classify_thresholds`, `migrated_code_table`, `predecessor_by_exact_key`, `old_folder_bytes_identical_after_pass`,
@@ -5825,6 +5825,34 @@ cases (I2); fix round 2: `a_stale_pending_status_never_lands_on_a_live_sample` (
 energy bits and an FNV-1a print of its atoms, positions and forces, and an append that writes nothing drops it). Six
 mutations of the engine (the (8, S) code, the duplicate rule, the fingerprint restart, the warning check, the purge
 refusal, an all-atom force comparison cut to one atom) each fail their test.
+
+### Task 15: code 9 in the trust machinery and its leave-one-out review (plan 2026-11-13 Task 15, 2026-11-20, release, RX 7900 XTX)
+
+The review is `providers::surrogate` `review_resolved` (module doc, "Re-solved samples"; spec §7.6, §8 rulings A and B):
+inside a refit, after its first fit and before the trust judgement, once `migration.txt` is "complete" or "reviewed",
+while a code-9 sample remains and the store changed since the last review. A candidate is fitted on the fit's members
+plus every code-9 sample; each one's leave-one-out ratio ρ in it (`loo_ratio`, its own energy and force bounds) releases
+it at ρ ≤ 1 (9 → 0) or keeps it at 9 (fencing, not counted by `fencing()` or the held cap, never M, never code 1, never
+lifted; one agreeing fresh answer moves it like a held sample, ruling B). Verdicts: `migration.txt`'s review log.
+
+**V7's review** (`migration_classifies_h2_oh_h4`, extended): three samples form no model, so the new folder gets the H
+and O references of the 61³ box (H −0.47781324, O −16.11546232 Ha; every species in the store needs one before a fit
+forms — the first run without O failed `MissingReference(8)`) and 16 cold solves of the new teacher about the H₄ geometry
+(every coordinate N(0, 0.01²) Bohr, seed `0x7e570915`) as live code-0 samples; the next refit reviews H₄. The neighbours'
+F lie within −2.86 / +2.57 mHa of the migrated label, their TS 1.3555–1.3855e-2 Ha (the symmetric ensemble's, the
+label's 1.3836e-2). **H₄ is released: leave-one-out ratio 4.91e-3** in the candidate (state "reviewed", code 0 in the
+collection) — its neighbours on the new surface predict the re-solved label. The test took 310 s alone (the migration's
+three solves, the two reference scans and the 16 neighbours).
+
+**The providers tests** (`surrogate::tests::resolved`, the 40 pair-Morse H₂ samples of `forget::small_collection` and
+re-solved samples on an analytic changed state E_Morse + 0.06·(r − 2.3)² beyond the window, 12 tests, < 2 s):
+ten siblings on r ∈ [2.5, 3.0], none reproduced by the fit without them, are all released at ρ 0.02–0.11; a sample
+50 mHa off the Morse curve inside the window is kept at ρ = 26.3 and refused next to it by `NearQuarantine`; a sample
+beyond the siblings in a second change of state (+0.1·(r − 3)²) is kept at ρ = 14.2 and released at ρ = 0.18 by the
+review after six fresh answers of its state arrive. **The candidate's sensitivity** (measured while writing the tests,
+not asserted): one 50 mHa outlier beyond the siblings raised their ratios from 0.02–0.11 to 0.42–0.55 (all still
+released); with a second outlier inside the window they rose to 0.89–1.02 and three of ten consistent siblings were
+kept — the safe side (kept → DFT nearby), until the store changes.
 
 ## Live orbitals (Harris display; spec 2026-11-14)
 

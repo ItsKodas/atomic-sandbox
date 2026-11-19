@@ -73,6 +73,7 @@ fn state_name(code: Option<u8>, below_prefix: bool) -> &'static str {
         Some(Q_DRAFT) => "held out (draft guess)",
         Some(Q_LONE) => "held out (lone atoms)",
         Some(Q_STRAY) => "held out (stray atoms, until measured)",
+        Some(Q_RESOLVED) => "held out (re-solved for the new solver; reviewed by the leave-one-out rule)",
         _ if !below_prefix => "unfitted",
         _ => "fitted",
     }

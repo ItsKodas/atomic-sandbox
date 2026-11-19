@@ -409,7 +409,11 @@ impl SurrogateKs {
     /// (its lock released). `None` when none was attached.
     pub(super) fn detach_collection(&mut self) -> Option<Collection> {
         self.flush_collection();
+        self.flush_migration_log();
         self.migration = None;
+        self.review_kept.clear();
+        self.review_stamp = None;
+        self.review_log_dirty = false;
         self.shared.take().map(|s| s.coll)
     }
 
@@ -623,6 +627,10 @@ impl SurrogateKs {
             }
             let code = self.quarantine.get(i).copied().filter(|&q| q != Q_REF_WAIT).unwrap_or(Q_NONE);
             match *link {
+                // only a code a collection holds is written (`is_collection_code`: 0–3, 7, 8, 9); the provider's own and
+                // the draft code (its tag carries it) leave the collection's code standing — `set_status` refuses them,
+                // and a refusal is no write failure (Task 13 review, with code 9's writer)
+                Link::In(_) if !surrogate::quarantine::is_collection_code(code) => {}
                 Link::In(k) => {
                     if sh.coll.quarantine.get(k).is_some_and(|&c| c != code) {
                         if let Err(e) = sh.coll.set_status(k, code) {
@@ -658,6 +666,9 @@ impl SurrogateKs {
         let code = self.quarantine.get(i).copied().filter(|&q| q != Q_REF_WAIT).unwrap_or(Q_NONE);
         let Some(sh) = self.shared.as_mut() else { return Ok(false) };
         let Some(&Link::In(k)) = sh.link.get(i) else { return Ok(false) };
+        if !surrogate::quarantine::is_collection_code(code) {
+            return Err(format!("status code {code} is the provider's own, not one a collection holds"));
+        }
         if sh.coll.read_only {
             return Err("the collection is read-only (another process holds its lock)".into());
         }
@@ -1324,7 +1335,9 @@ fn plain_component(name: &str) -> bool {
 }
 
 /// The attached collection's migration (module doc, "The migration"): its predecessor folder, what was read of it, and
-/// the new folder's `migration.txt` (`None`: not started — the offer).
+/// the new folder's `migration.txt` (`None`: not started — the offer). Cloned into a background refit's copy, whose
+/// review of the re-solved samples writes its log (`background` module doc).
+#[derive(Clone)]
 pub(crate) struct MigrationSlot {
     pub(super) source: PathBuf,
     /// The predecessor's samples (whole records), as read at attach or at the pass's start.
@@ -1356,6 +1369,10 @@ impl SurrogateKs {
     /// predecessor with samples (the offer). Called at attach; a source that cannot be read is said once.
     pub(super) fn find_migration(&mut self) {
         self.migration = None;
+        // the review's state is the attached folder's: read back below (ruling R13), reviewed again at the next refit
+        self.review_kept.clear();
+        self.review_stamp = None;
+        self.review_log_dirty = false;
         let Some(sh) = self.shared.as_ref() else { return };
         let dir = sh.coll.folder().to_path_buf();
         let Some(root) = dir.parent().map(Path::to_path_buf) else { return };
@@ -1423,6 +1440,48 @@ impl SurrogateKs {
             return;
         }
         self.migration = Some(MigrationSlot { source, samples, sample_boxes, reference_boxes, log });
+        self.read_back_review();
+    }
+
+    /// The re-solved samples a review **kept** (ruling R13; Fermi–Dirac spec §7.6 step 4): every "kept" entry of the
+    /// attached migration's review log whose sample is still at code 9 fences again ([`SurrogateKs::fences`]). An entry
+    /// whose sample moved since (released, superseded by a fresh answer — controller ruling B) is history only.
+    fn read_back_review(&mut self) {
+        let Some(log) = self.migration.as_ref().and_then(|m| m.log.as_ref()) else { return };
+        let Some(sh) = self.shared.as_ref() else { return };
+        let kept: Vec<usize> = log
+            .review
+            .iter()
+            .filter(|e| !e.2)
+            .filter_map(|e| sh.link.iter().position(|l| *l == Link::In(e.0)))
+            .filter(|&i| self.quarantine.get(i) == Some(&surrogate::quarantine::Q_RESOLVED))
+            .collect();
+        self.review_kept.extend(kept);
+    }
+
+    /// Writes `migration.txt` when the review changed its log (`review_log_dirty`): at the end of a refit, after the
+    /// status records its verdicts name, after a background refit's install, and after a purge renumbered it (F3). A
+    /// read-only collection writes nothing; a failed write is said and tried again next time.
+    pub(super) fn flush_migration_log(&mut self) {
+        if !self.review_log_dirty || self.refit_fork {
+            return;
+        }
+        let Some(sh) = self.shared.as_ref() else {
+            self.review_log_dirty = false;
+            return;
+        };
+        if sh.coll.read_only {
+            return;
+        }
+        let (dir, slug) = (sh.coll.folder().to_path_buf(), sh.coll.key.slug());
+        let Some(log) = self.migration.as_ref().and_then(|m| m.log.as_ref()) else {
+            self.review_log_dirty = false;
+            return;
+        };
+        match surrogate::write_migration(&dir, log) {
+            Ok(()) => self.review_log_dirty = false,
+            Err(e) => self.user_notes.push(format!("shared collection {slug}: its {} could not be rewritten with the review ({e}) — tried again at the next refit", surrogate::migration::MIGRATION_FILE)),
+        }
     }
 
     /// A pending status (`find_migration`): collection sample `index` takes `code` when it exists, **is the sample the
@@ -1693,5 +1752,6 @@ impl Drop for SurrogateKs {
     /// The attached collection's audit history and README are written before its lock is released.
     fn drop(&mut self) {
         self.flush_collection();
+        self.flush_migration_log();
     }
 }

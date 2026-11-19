@@ -191,7 +191,13 @@
 //!   `V7_TS_BAND` = 3 % of the fixture's `fd_ts` 1.3836e-2 (Task 10 review M4: a broken-symmetry landing has TS ≈ 0) —
 //!   and F_new > E_DS: **the migration replaces a lower-F label at this geometry** (rule 7; the shared-shell release
 //!   found the broken-symmetry integer state, 14.5 mHa lower, that the cold Fermi–Dirac solve does not reach, spec
-//!   §4.7(e)). The old folder hashes identical. Task 15 adds the code-9 review's assertions.
+//!   §4.7(e)). The old folder hashes identical. The review (plan Task 15, spec §7.6): three samples form no model, so
+//!   the folder then gets the H and O references of the samples' box and `V7_REVIEW_NEIGHBOURS` = 16 cold solves of the new
+//!   teacher about the H₄ geometry (each coordinate displaced by N(0, 0.01²) Bohr, seeded) as live code-0 samples; the
+//!   next refit reviews H₄ by its leave-one-out ratio in the candidate with them. Asserted: the log at "reviewed", H₄
+//!   **released** (ratio ≤ 1: its neighbours on the new surface predict the re-solved label) and at code 0 in the
+//!   collection; the ratio is printed and recorded in `references.md` ("Fermi–Dirac migration", V7). A kept outcome
+//!   is a failure to investigate, never a re-pin.
 //! - Stray atoms (spec 2026-11-18 §6; plan Task 7; `references.md`, "Stray atoms"). The grid is 81³ × 0.20 (a 16 Bohr
 //!   cube, `ionic accepted`), not the plan's 61³: at 61³ the stray H on the body diagonal is 3.44 Bohr from a face (the
 //!   floor refuses below 4) and every solve is box-affected (`stray_box_probe`, `--ignored`).
@@ -2105,13 +2111,20 @@ fn read_ds_fixture() -> DsFixture {
 /// TS ≈ 4 kT·e^{−Δ/kT} ≈ 0 there. Any branch but the fixture's lands far outside a few per cent; the cold GPU solve is
 /// bit-reproducible, so the expected deviation is the fixture's own (the same teacher, measured on this branch).
 const V7_TS_BAND: f64 = 0.03;
+/// V7's review (plan Task 15): the cold solves of the new teacher about the H₄ geometry that the review judges the
+/// migrated H₄ by, the displacement σ of every coordinate (Bohr) and the seed. A neighbourhood, not a pass: σ keeps the
+/// aspect within about ±2 % of the fixture's, where the frontier pair stays split by ≲ kT (the symmetric ensemble).
+const V7_REVIEW_NEIGHBOURS: usize = 16;
+const V7_REVIEW_SIGMA: f64 = 0.01;
+const V7_REVIEW_SEED: u64 = 0x7e57_0915;
 
 /// Spec §9 V7 (plan Task 14, F13): a predecessor folder built from Task 10's DS-era labels under the legacy tag
 /// (policy `Accepted`, 61³ × 0.20, σ = h, tol 1e-6 — the fixture's) is migrated by the real GPU teacher. H₂ → U, linear
 /// OH → T (ΔF = −2 kT ln 2 within 1e-5, E and forces within ε), the near-square H₄ → S at code 9 (|ΔE| ≥ 3 ε_E; its TS
 /// within a few % of the fixture's `fd_ts`, so a broken-symmetry landing fails loudly — review M4). The migration
 /// replaces a LOWER-F label at the H₄ geometry (rule 7; `providers::sampling::migrate` module doc). The old folder hashes
-/// identical. Task 15 adds the review's assertions.
+/// identical. Then the review (plan Task 15): with the H and O references and 16 cold neighbours of the new teacher about H₄
+/// in the folder, the next refit releases H₄ (its leave-one-out ratio in the candidate ≤ 1; module doc).
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn migration_classifies_h2_oh_h4() {
@@ -2203,6 +2216,49 @@ fn migration_classifies_h2_oh_h4() {
     assert_eq!(r.energy.to_bits(), c.samples[2].sample.energy.to_bits(), "the cold solve is bit-reproducible: the migrated label");
     assert!((r.stats.energy.ts / fd_ts - 1.0).abs() <= V7_TS_BAND, "H₄ TS {:.6e} vs the fixture's {fd_ts:.6e}", r.stats.energy.ts);
     assert!(d_h4 > 0.0, "the DS label is the lower-F state at this geometry (fixture: +1.45e-2)");
+    // ---- the review (plan Task 15; spec §7.6) ----
+    // Three samples form no model, so the pass's own refit did not run (the fit floor) and nothing was reviewed. The
+    // review judges a code-9 sample by its neighbours on the new surface: the new folder gets the H and O references of
+    // the samples' box and V7_REVIEW_NEIGHBOURS cold solves of the new teacher about the H₄ geometry (every coordinate
+    // displaced by N(0, V7_REVIEW_SIGMA²), seeded) — live samples, code 0, as the folder may hold beside the migrated
+    // ones — and the next refit reviews H₄ (state complete, a code-9 sample, a changed store).
+    assert_eq!(mlog.state, surrogate::MigrationState::Complete);
+    let e_h4 = c.samples[2].sample.energy;
+    // every species of the store needs its reference before a fit can form (the OH sample's O too)
+    let cell = sim::Cell { n: fx.grid_n, h: fx.h };
+    for z in [1u8, 8] {
+        let mass = Nucleus::new(z, [0.0; 3]).mass;
+        let r = sim::references::solve_atom(Trainable::teacher_mut(&mut s), &cell, None, IonicPolicy::Accepted, z, mass, &mut never()).unwrap_or_else(|e| panic!("the Z = {z} reference: {e}"));
+        println!("  reference Z = {z} in {}³: {:.8} Ha", fx.grid_n, r.energy);
+        s.set_reference_solved(z, r.energy, fx.grid_n, r.face_density);
+    }
+    let mut rng = StdRng::seed_from_u64(V7_REVIEW_SEED);
+    for j in 0..V7_REVIEW_NEIGHBOURS {
+        let mut sc = scene_of(h4);
+        for n in sc.nuclei.iter_mut() {
+            for c in 0..3 {
+                // Box–Muller: N(0, σ²)
+                let (u1, u2): (f64, f64) = (rng.gen_range(1e-12..1.0), rng.gen_range(0.0..1.0));
+                n.pos[c] += V7_REVIEW_SIGMA * (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            }
+        }
+        let t = Trainable::teacher_mut(&mut s);
+        t.reset();
+        let r = t.evaluate(&sc, &mut never()).unwrap_or_else(|e| panic!("neighbour {j}: {e}"));
+        let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+        let smp = surrogate::Sample::new(pos, sc.nuclei.iter().map(|n| n.z).collect(), r.energy, r.forces.clone(), surrogate::SampleTag::Perturbation, 1.0);
+        s.add_sample_answer(smp, &sc, r.stats.face_density, r.stats.multiplicity).unwrap();
+        println!("  H₄ neighbour {j}: F {:.8} Ha (label − H₄'s {:+.3e}), TS {:.4e} Ha", r.energy, r.energy - e_h4, r.stats.energy.ts);
+    }
+    s.refit().expect("the refit that reviews");
+    let c = s.collection().unwrap();
+    let mlog = surrogate::read_migration(&new_dir).unwrap().expect("migration.txt");
+    let review: Vec<(usize, f64, bool)> = mlog.review.iter().filter(|e| e.0 == 2).copied().collect();
+    println!("V7 review: {review:?} (index, leave-one-out ratio, released); state {:?}; H₄ code now {}", mlog.state, c.quarantine[2]);
+    assert_eq!(mlog.state, surrogate::MigrationState::Reviewed, "the refit reviewed");
+    let [(_, ratio, released)] = review[..] else { panic!("one verdict for H₄: {:?}", mlog.review) };
+    assert!(released && ratio <= 1.0, "H₄ is released: its neighbours on the new surface predict it (ratio {ratio}); a kept outcome is a failure to investigate, never a re-pin");
+    assert_eq!(c.quarantine[2], Q_NONE, "9 → 0, written as a status record");
     drop(s);
     assert_eq!(files(&old_dir), before, "the old folder is byte-identical");
     let wall = t0.elapsed();

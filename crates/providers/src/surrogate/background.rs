@@ -56,6 +56,14 @@
 //! started with, as a fit does between a forget and the next refit. Pinned by
 //! `a_forget_during_a_background_refit_survives_its_install`.
 //!
+//! # The review of the re-solved samples
+//!
+//! The copy holds the migration's state (`MigrationSlot`, cloned), the kept set and the review's stamp, so its refit
+//! reviews the code-9 samples as a synchronous one would (`review_resolved`). The codes it moves (9 → 0) are the copy's
+//! and are installed with the others; the kept set, the stamp and the log's review entries and state are taken at the
+//! install, and `migration.txt` is written there after the status records. A live change of a code-9 sample's code
+//! while it ran (a fresh agreeing answer moving a kept one, controller ruling B) is a conflict like any code change.
+//!
 //! The misfit set M (`trust` module doc) is the copy's too: a sample forgotten while the copy ran
 //! and in the copy's M stays in the installed M — its `NearMisfit` refusal, its count against M's
 //! limit and its share of the class rule's RMS terms — until the next refit, which `pending_refit`
@@ -214,6 +222,11 @@ impl SurrogateKs {
         f.last_fit_error = self.last_fit_error.clone();
         f.collection_r_cut = self.collection_r_cut;
         f.shared = self.shared.as_ref().map(|sh| sh.detached());
+        // the re-solved samples' review (`review_resolved`) reads the migration's state and writes its log: the copy's,
+        // taken at the install
+        f.migration = self.migration.clone();
+        f.review_kept = self.review_kept.clone();
+        f.review_stamp = self.review_stamp;
         // the probe's refit phase is the live provider's to begin and end (`BackgroundRefit`)
         f.refit_fork = true;
         #[cfg(test)]
@@ -444,6 +457,17 @@ impl SurrogateKs {
         self.recovery = f.recovery.take();
         self.last_fit_error = f.last_fit_error.take();
         self.teach_rounds = std::mem::take(&mut f.teach_rounds);
+        // the copy's review of the re-solved samples: its verdicts (the codes above), the kept set, the stamp, and the
+        // log it wrote (`migration.txt`, written below after the status records)
+        self.review_kept = std::mem::take(&mut f.review_kept);
+        self.review_stamp = f.review_stamp;
+        if f.review_log_dirty {
+            if let (Some(live), Some(fl)) = (self.migration.as_mut().and_then(|m| m.log.as_mut()), f.migration.as_ref().and_then(|m| m.log.as_ref())) {
+                live.review = fl.review.clone();
+                live.state = fl.state;
+                self.review_log_dirty = true;
+            }
+        }
         // the copy's descriptor cache when it filled one under the new basis (its active set did),
         // else the live one (`ensure_desc_cache` re-checks the basis and extends it)
         if f.desc_basis.is_some() && f.desc_cache.len() >= p.min(self.desc_cache.len()) {
@@ -494,6 +518,7 @@ impl SurrogateKs {
         }
         self.sync_collection_status();
         self.flush_collection();
+        self.flush_migration_log();
         // evidence that arrived while the copy ran is read as it would have been after a
         // synchronous refit: between refits (`rejudge_classes` — it can make a key leave, never
         // enter, until the next refit's own judgement)

@@ -887,6 +887,10 @@ review.
    - it fences like a held sample (the quarantine fence, `fences()`; section 8, preflight F4). It never joins the
      misfit set M, is not counted by `fencing()`, and `purge-forgotten`'s lift votes never lift it;
    - a later review can still release it;
+   - like a held sample (code 1), one fresh teacher answer next to it that agrees with the model settles it: it is
+     released when the model reproduces it, else superseded (controller ruling B, plan Task 15; `admit`'s release and
+     supersede of the fencing samples next to an agreeing answer). Purge's lift votes still never lift it: they lift
+     forgotten samples only, and a fence that also holds a non-forgotten sample casts no lift vote;
    - it is never converted to code 1, so it never enters the recovery's holds or its cap. The trust rework's "no
      ratchet" invariant (G2 of its spec) stays intact.
 
@@ -1034,6 +1038,14 @@ preflight F4 assumed, and need the controller's ruling before plan Task 15 (no m
 - **A fresh agreeing answer moves fencing samples.** `admit` releases (when the model reproduces it) or supersedes
   every non-forgotten fencing sample next to a fresh answer that agrees with the model. Section 7.6 does not say
   whether a failed code 9 is moved that way (like a held sample) or only by a later review (like a forgotten one).
+
+**Controller rulings on the two points (plan Task 15).**
+- **A:** a reviewed-and-failed code 9 fences. The readers that returned early on `fencing() == 0` (the quarantine
+  distance scan, cached or not, and the views' "any fence" checks) read a separate "any sample fences" predicate
+  (`any_fences()`) that includes it; `fencing()` stays the count of codes 1 and 7, so code 9 stays out of it and out
+  of the held cap, as F4 says.
+- **B:** a failed code 9 is moved like a held sample (code 1): one agreeing fresh teacher answer releases or
+  supersedes it through `admit` (section 7.6 step 4). Purge's lift votes still never lift it.
 
 ## 9. Validation (rule 6; one heavy job at a time)
 

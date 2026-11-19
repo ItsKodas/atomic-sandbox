@@ -144,6 +144,8 @@ impl SurrogateKs {
             keep[i] = false;
         }
         self.remap_after_purge(&keep, cmap.as_deref());
+        // the review log renumbered with the collection (F3): `migration.txt` rewritten now
+        self.flush_migration_log();
         let purged = gone.len();
         let collection_mode = self.shared.is_some();
         let where_ = match (&backup, collection_mode) {
@@ -193,6 +195,8 @@ impl SurrogateKs {
         retain_by(&mut self.desc_cache, keep);
         retain_by(&mut self.face, keep);
         self.lone_codes = std::mem::take(&mut self.lone_codes).into_iter().filter_map(|(i, c)| m(i).map(|j| (j, c))).collect();
+        // the re-solved samples a review kept (a code-9 sample is never purged: it is not forgotten)
+        self.review_kept = std::mem::take(&mut self.review_kept).into_iter().filter_map(m).collect();
         // fences and votes: a purged sample fences nothing
         for v in &mut self.fence_votes {
             v.near = v.near.iter().filter_map(|&i| m(i)).collect();
@@ -269,6 +273,13 @@ impl SurrogateKs {
                     }
                 }
                 sh.pass_start = sh.pass_start.map(|p| cm[..p.min(cm.len())].iter().filter(|x| x.is_some()).count());
+                // `migration.txt`'s review log names samples of the new folder by index (F3, spec §8): each entry
+                // follows its sample through the collection's map — one whose sample was purged (released, then
+                // forgotten) goes with it; the caller writes the file (`flush_migration_log`)
+                if let Some(log) = self.migration.as_mut().and_then(|m| m.log.as_mut()).filter(|l| !l.review.is_empty()) {
+                    log.review = log.review.iter().filter_map(|&(k, r, rel)| cm.get(k).copied().flatten().map(|j| (j, r, rel))).collect();
+                    self.review_log_dirty = true;
+                }
             }
         }
         // the views' cached curves name no sample, but their per-sample states are rebuilt

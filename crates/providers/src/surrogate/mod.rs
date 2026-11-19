@@ -899,6 +899,26 @@
 //! for good — from the store and the shared collection's file — once the refit after the last
 //! Forget has run; no refit, the fit bitwise unchanged, every index the provider holds remapped.
 //!
+//! **Re-solved samples** (code 9, `Q_RESOLVED`; Fermi–Dirac spec §7.5–7.6 and §8, plan 2026-11-13 Task 15): a sample
+//! the collection migration re-solved for the new solver whose state changed (class S). Out of the fit, the envelope,
+//! the grade, the leave-one-out and the class statistics like a held sample (`excluded` is "code ≠ 0"); **not**
+//! counted by the recovery's 10 % held cap (`quarantined() + forgotten()`) nor by `fencing()` — it is no misfit hold —
+//! and **not the user's**: Forget and Restore refuse it. Before its review it does not fence: the fit simply has no
+//! data there. **The review** (`review_resolved`) runs inside a refit, after its first fit and before the trust
+//! judgement (votes, release, recovery), only once the migration pass is complete (`migration.txt` at "complete" or
+//! "reviewed": every sibling present), while a code-9 sample remains and the store changed since the last review: a
+//! candidate is fitted on the fit's members plus every code-9 sample, each one's leave-one-out ratio in it
+//! (`loo_ratio`, against its own bounds) is read, ≤ 1 releases it (9 → 0; the refit is rebuilt with it and the trust
+//! machinery judges it as any new data), > 1 keeps it at 9. A **kept** one is a stored label the model cannot
+//! reproduce: it fences like a held sample (`fences()`, F4; the fence's on-switch is `any_fences()`, controller ruling
+//! A, since `fencing()` does not count it) — but never joins M (it is not fitted), is never code 1 (no ratchet), and
+//! purge's lift votes never lift it (they take code 7 only). Like a held sample, one fresh teacher answer next to it
+//! that agrees with the model settles it in `admit` — released when the model reproduces it, else superseded
+//! (controller ruling B) — and a later review can still release it. Its verdict is in `migration.txt`'s review log
+//! (collection indices, the latest per sample), read back at attach (ruling R13), renumbered by a purge (F3), and
+//! written at the refit's end after the status records it names. Judged by the review: code-9 samples whose box has
+//! its references and that have no stray atoms (one with stray atoms waits at 9, unreviewed: a known limit).
+//!
 //! **Box-affected answers** (fix round 4; threshold Task 9, h-scaled by ruling S17): a teacher
 //! answer whose reported face density (`EvalStats::face_density`: max ρ on the outermost grid
 //! plane, one spacing h inside the Dirichlet wall) exceeds [`box_affected_face_density`]`(h)` =
@@ -1644,6 +1664,20 @@ pub struct SurrogateKs {
     /// The attached collection's migration from its predecessor (`shared` module doc, "The migration"; plan 2026-11-13
     /// Task 14): the offer, or the `migration.txt` it keeps. `None` without a collection or anything to migrate.
     migration: Option<shared::MigrationSlot>,
+    /// The re-solved samples (code 9, `Q_RESOLVED`) whose last review **kept** them (`quarantine` module,
+    /// `review_resolved`; Fermi–Dirac spec §7.6 step 4): store indices. Such a sample fences (`fences`) while its code
+    /// is 9. Read back from `migration.txt`'s review log at attach (`shared::find_migration`, ruling R13), remapped by a
+    /// purge, cleared with the collection.
+    review_kept: std::collections::BTreeSet<usize>,
+    /// The store's stamp (`review_stamp_now`) when the re-solved samples were last reviewed: the review repeats only
+    /// when it moved. `None`: not reviewed in this session (an attach starts here).
+    review_stamp: Option<u64>,
+    /// The migration log's review entries (or its state) changed since `migration.txt` was written
+    /// (`flush_migration_log`).
+    review_log_dirty: bool,
+    /// Tests only: how many reviews of the re-solved samples ran (`review_resolved`).
+    #[cfg(test)]
+    pub(super) reviews_run: usize,
     /// Tests only: a collection fitted without the body-4 block (the basis collections had before
     /// M8a Task 5 — the user's stuck collection's repro is pinned to it).
     #[cfg(test)]
@@ -1889,6 +1923,11 @@ impl SurrogateKs {
             pass_coverage: None,
             shared: None,
             migration: None,
+            review_kept: std::collections::BTreeSet::new(),
+            review_stamp: None,
+            review_log_dirty: false,
+            #[cfg(test)]
+            reviews_run: 0,
             #[cfg(test)]
             body4_off: false,
             #[cfg(test)]

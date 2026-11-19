@@ -235,7 +235,7 @@ impl SurrogateKs {
     /// Whether any fence can refuse (a quarantined sample, a misfit atom, an audit or a shell
     /// fence): the views re-judge the cached answered points only then.
     fn any_fence(&self) -> bool {
-        self.fencing() > 0 || self.misfit_fence_stands() || !self.audit_fences.is_empty()
+        self.any_fences() || self.misfit_fence_stands() || !self.audit_fences.is_empty()
     }
 
     /// The model generation (`model_gen`): changes at every installed, restored or forgotten
@@ -251,7 +251,7 @@ impl SurrogateKs {
     /// Both caches decide nothing.
     pub fn training_views(&mut self) -> Option<TrainingViews> {
         let t0 = Instant::now();
-        if self.fencing() > 0 || self.misfit_fence_stands() {
+        if self.any_fences() || self.misfit_fence_stands() {
             self.ensure_desc_cache();
         }
         if self.curve_cache.as_ref().is_none_or(|c| c.model_gen != self.model_gen) {
@@ -324,6 +324,9 @@ impl SurrogateKs {
                 Q_STRAY => SampleState::HeldOut,
                 // waiting for its box's reference (collection mode): not in the fit yet
                 Q_REF_WAIT => SampleState::Unfitted,
+                // re-solved for the new solver (Fermi–Dirac spec §7.6): held out until its review; kept by it, it fences
+                Q_RESOLVED if self.fences(i) => SampleState::Quarantined,
+                Q_RESOLVED => SampleState::HeldOut,
                 Q_NONE if i < *fit_n && fit_q.get(i).copied().unwrap_or(Q_NONE) == Q_NONE => SampleState::Fitted,
                 Q_NONE => SampleState::Unfitted,
                 // a code the sidecar does not write (it validates 0–3): excluded, as `excluded`

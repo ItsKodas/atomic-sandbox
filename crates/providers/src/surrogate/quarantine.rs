@@ -108,6 +108,12 @@ pub(super) const Q_FORGOTTEN: u8 = surrogate::quarantine::Q_FORGOTTEN;
 /// released or superseded, restorable, purgeable — but no longer fencing.
 pub(super) const Q_FORGOTTEN_UNFENCED: u8 = surrogate::quarantine::Q_FORGOTTEN_UNFENCED;
 
+/// A sample the collection migration re-solved whose state changed ([`surrogate::quarantine::Q_RESOLVED`];
+/// Fermi–Dirac spec §7.5–7.6; `surrogate` module doc, "Re-solved samples"): excluded like a held sample, never counted
+/// by [`SurrogateKs::fencing`] or the held cap, not the user's (Forget and Restore refuse it); it fences only once a
+/// review kept it ([`SurrogateKs::review_resolved`]).
+pub(super) const Q_RESOLVED: u8 = surrogate::quarantine::Q_RESOLVED;
+
 /// Quarantine rounds per refit (`surrogate` module doc).
 pub const QUARANTINE_ROUNDS: usize = 5;
 
@@ -248,6 +254,16 @@ pub(super) fn loo_ratio(p: &FallbackPolicy, per_atom: bool, n_e: usize, s: &Samp
     let channel = if e > force_tier { Channel::Energy } else { Channel::Force };
     let undefined_is_worst = |x: f64| if x.is_nan() { f64::INFINITY } else { x };
     (undefined_is_worst(own), undefined_is_worst(tier), channel)
+}
+
+/// What one review of the re-solved samples decided ([`SurrogateKs::review_resolved`]; Fermi–Dirac spec §7.6): store
+/// indices.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ReviewOutcome {
+    /// Released into the fit (9 → 0): each one's leave-one-out ratio in the candidate was ≤ 1.
+    pub(super) released: Vec<usize>,
+    /// Kept at code 9, fencing from now on: (store index, its ratio > 1).
+    pub(super) kept: Vec<(usize, f64)>,
 }
 
 /// Which of a leave-one-out ratio's two channels attains it ([`loo_ratio`]'s third number).
@@ -496,9 +512,22 @@ impl SurrogateKs {
     }
 
     /// Whether stored sample `i` fences its neighbourhood (geometries within the quarantine radius
-    /// fall back): a quarantined ([`Q_HELD`]) or a forgotten ([`Q_FORGOTTEN`]) sample.
+    /// fall back): a quarantined ([`Q_HELD`]) or a forgotten ([`Q_FORGOTTEN`]) sample, or a re-solved one
+    /// ([`Q_RESOLVED`]) its last review kept (Fermi–Dirac spec §7.6 step 4, preflight F4: "a stored label the model
+    /// cannot reproduce"). Before its review a re-solved sample does not fence.
     pub(super) fn fences(&self, i: usize) -> bool {
-        matches!(self.quarantine.get(i), Some(&Q_HELD) | Some(&Q_FORGOTTEN))
+        match self.quarantine.get(i) {
+            Some(&Q_HELD) | Some(&Q_FORGOTTEN) => true,
+            Some(&Q_RESOLVED) => self.review_kept.contains(&i),
+            _ => false,
+        }
+    }
+
+    /// Whether any stored sample fences ([`fences`](Self::fences)): the quarantine fence's on-switch (the distance
+    /// scan, the views' re-judge). [`fencing`](Self::fencing) does not count a kept re-solved sample (F4), so this
+    /// reads those too (controller ruling A).
+    pub(super) fn any_fences(&self) -> bool {
+        self.fencing() > 0 || self.review_kept.iter().any(|&i| self.quarantine.get(i) == Some(&Q_RESOLVED))
     }
 
     /// Whether stored sample `i` is one of the standing fit's members (`fit_members`: below its
@@ -520,12 +549,16 @@ impl SurrogateKs {
         let d = QUARANTINE_FRACTION * self.policy.max_descriptor_distance;
         if self.fence_is_forgotten(near) {
             format!("surrogate: within {d:.2} training spreads of samples you forgot (Model tab, Worst-fitting samples): the model answers here again once {FENCE_VOTES} fresh teacher answers in a row agree with it, or Restore the samples")
+        } else if near.iter().any(|&i| self.quarantine.get(i) == Some(&Q_RESOLVED)) {
+            format!("surrogate: within {d:.2} training spreads of a sample held out of the fit (quarantined: the rest of the data could not predict it, or the fit could not reproduce it; or forgotten by the user; or re-solved for the new solver and not predicted by the samples around it)")
         } else {
             format!("surrogate: within {d:.2} training spreads of a sample held out of the fit (quarantined: the rest of the data could not predict it, or the fit could not reproduce it; or forgotten by the user)")
         }
     }
 
-    /// How many stored samples fence ([`fences`](Self::fences)).
+    /// How many quarantined ([`Q_HELD`]) and forgotten ([`Q_FORGOTTEN`]) samples fence. A re-solved sample its
+    /// review kept fences too but is **not** counted here (preflight F4: it is no misfit hold); "does anything
+    /// fence" is [`any_fences`](Self::any_fences) (controller ruling A).
     pub(super) fn fencing(&self) -> usize {
         self.quarantine.iter().filter(|&&q| q == Q_HELD || q == Q_FORGOTTEN).count()
     }
@@ -707,7 +740,8 @@ impl SurrogateKs {
     }
 
     /// Whether stored sample `i` is left out of the fit (quarantined, superseded, box-excluded, a
-    /// held-out draft guess, waiting for its box's reference, lone atoms, or forgotten by the user).
+    /// held-out draft guess, waiting for its box's reference, lone atoms, forgotten by the user, or re-solved
+    /// for the new solver and not released by its review — `Q_RESOLVED`, Fermi–Dirac spec §8 touch point 1).
     pub(super) fn excluded(&self, i: usize) -> bool {
         self.quarantine.get(i).is_some_and(|&q| q != Q_NONE)
     }
@@ -1054,6 +1088,150 @@ impl SurrogateKs {
         back.len()
     }
 
+    /// Whether the attached collection's migration lets its re-solved samples be reviewed: its pass is complete
+    /// (`migration.txt` at "complete" or "reviewed"), so every sibling of a sample is present before any is judged
+    /// (Fermi–Dirac spec §7.6; Review Focus 3: never while the pass runs, paused or not).
+    pub(super) fn review_open(&self) -> bool {
+        self.migration.as_ref().and_then(|m| m.log.as_ref()).is_some_and(|l| matches!(l.state, surrogate::MigrationState::Complete | surrogate::MigrationState::Reviewed))
+    }
+
+    /// The store as the review sees it (`review_stamp`): FNV-1a 64 over the sample count and each sample's code and
+    /// energy bits — a sample added or purged, a code moved (a hold, a release, a Forget, a reference wait) or a label
+    /// rebased changes it.
+    pub(super) fn review_stamp_now(&self) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut eat = |bytes: &[u8]| {
+            for &b in bytes {
+                h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        let n = self.samples();
+        eat(&(n as u64).to_le_bytes());
+        if let Some(st) = self.store.as_ref() {
+            for (i, s) in st.samples.iter().enumerate() {
+                eat(&[self.quarantine.get(i).copied().unwrap_or(Q_NONE)]);
+                eat(&s.energy.to_bits().to_le_bytes());
+            }
+        }
+        h
+    }
+
+    /// **The review of the re-solved samples** (Fermi–Dirac spec §7.6; `surrogate` module doc, "Re-solved samples"),
+    /// run by a refit after its first fit and before the trust judgement (touch point 4). Only when the migration pass
+    /// is complete ([`review_open`](Self::review_open)), a code-9 sample can be judged, and the store changed since the
+    /// last review (`review_stamp`); else `None`, nothing changed.
+    ///
+    /// 1. A **candidate** is fitted on the current fit's members plus every code-9 sample judged now.
+    /// 2. Each one's leave-one-out ratio ρ in it ([`loo_ratio`]'s first number: how far the candidate without the sample
+    ///    misses it, against its own energy and force bounds — the reading the recovery ranks offenders by).
+    /// 3. ρ ≤ 1: **released** (9 → 0, or the reference wait); the refit goes on with it as an ordinary fitted sample.
+    /// 4. ρ > 1 (an undefined residual is ∞): **kept** at 9 — from now on a stored label the model cannot reproduce:
+    ///    it fences ([`fences`](Self::fences); F4), is not counted by [`fencing`](Self::fencing) or the held cap, never
+    ///    lifted by purge's votes (they take code 7 only), never in M (an excluded sample is not fitted), never code 1.
+    ///    A later review can still release it.
+    ///
+    /// The fit the refit stands on is restored after the candidate (its accumulator, model, verdicts and codes), so
+    /// the candidate decides the codes only. Judged now: every code-9 sample whose box has its references (one waiting
+    /// for them holds the teacher's raw energy) and that has no stray atoms (a stray composition is never fitted
+    /// unmeasured, `stray` module doc; it waits at 9, unreviewed — a known limit). The verdicts go to `migration.txt`'s
+    /// review log (collection indices, the latest per sample; state "reviewed"), written at the refit's end
+    /// (`flush_migration_log`); the codes as status records (`sync_collection_status`). A candidate that does not fit
+    /// decides nothing (the store's stamp is taken, so the next try waits for a change).
+    pub(super) fn review_resolved(&mut self) -> Option<ReviewOutcome> {
+        if !self.review_open() {
+            return None;
+        }
+        let r_cut = self.cutoff();
+        let judged: Vec<usize> = {
+            let store = self.store.as_ref()?;
+            (0..store.len())
+                .filter(|&i| self.quarantine.get(i) == Some(&Q_RESOLVED) && self.released_code(i) == Q_NONE && super::stray::split(&store.samples[i].pos, r_cut).is_none())
+                .collect()
+        };
+        if judged.is_empty() {
+            return None;
+        }
+        let stamp = self.review_stamp_now();
+        if self.review_stamp == Some(stamp) {
+            return None;
+        }
+        let _prof = surrogate::prof::span("P2 review_resolved (candidate fit + leave-one-out)");
+        #[cfg(test)]
+        {
+            self.reviews_run += 1;
+        }
+        // 1. the candidate: the fit's members and every code-9 sample judged
+        let (entry, flags, dirty) = (self.save_state(), self.quarantine.clone(), self.species_dirty);
+        for &i in &judged {
+            self.quarantine[i] = Q_NONE;
+        }
+        self.species_dirty = true;
+        let ratios: Option<Vec<f64>> = match self.fit_store_deferred() {
+            Ok(_) => {
+                let (model, store) = (self.model.as_ref().expect("just fitted"), self.store.as_ref().expect("stored"));
+                let samples: Vec<&Sample> = judged.iter().map(|&i| &store.samples[i]).collect();
+                // 2. each one's leave-one-out ratio in the candidate
+                let loos = surrogate::loo::leave_one_out_many(model, &samples);
+                Some(samples.iter().zip(&loos).map(|(s, l)| loo_ratio(&self.policy, model.energy_per_atom, surrogate::energy_row_atoms(&model.basis, &s.pos), s, l.as_ref()).0).collect())
+            }
+            Err(_) => None,
+        };
+        // the fit the refit stands on, and its codes
+        self.restore_state(entry);
+        self.quarantine = flags;
+        self.species_dirty = dirty;
+        let Some(ratios) = ratios else {
+            self.review_stamp = Some(stamp);
+            self.user_notes.push(format!("surrogate: the review of {} re-solved samples could not fit its candidate — they stay held out until the samples change", judged.len()));
+            return None;
+        };
+        // 3. and 4.
+        let mut out = ReviewOutcome { released: Vec::new(), kept: Vec::new() };
+        for (&i, &rho) in judged.iter().zip(&ratios) {
+            if rho <= 1.0 {
+                self.quarantine[i] = self.released_code(i);
+                self.review_kept.remove(&i);
+                out.released.push(i);
+            } else {
+                self.review_kept.insert(i);
+                out.kept.push((i, rho));
+            }
+        }
+        if !out.released.is_empty() {
+            self.species_dirty = true; // rebuild with them
+        }
+        self.log_review(&judged, &ratios);
+        self.review_stamp = Some(self.review_stamp_now());
+        let (r, k) = (out.released.len(), out.kept.len());
+        self.user_notes.push(format!(
+            "surrogate: {} re-solved for the new solver reviewed: {r} rejoined the fit (the model without each predicts it within its bound), {k} kept out{}",
+            if judged.len() == 1 { "1 sample".to_string() } else { format!("{} samples", judged.len()) },
+            if k > 0 { " — the model falls back to DFT near them" } else { "" }
+        ));
+        Some(out)
+    }
+
+    /// The review's verdicts on `judged` (store indices, their `ratios`) into the attached migration's review log:
+    /// by collection index, the latest per sample, in index order; the state "reviewed". Written at the refit's end
+    /// (`flush_migration_log`). A sample the collection does not hold has no entry.
+    fn log_review(&mut self, judged: &[usize], ratios: &[f64]) {
+        let Some(sh) = self.shared.as_ref() else { return };
+        let entries: Vec<(usize, f64, bool)> = judged
+            .iter()
+            .zip(ratios)
+            .filter_map(|(&i, &rho)| match sh.link.get(i) {
+                Some(&super::shared::Link::In(k)) => Some((k, rho, rho <= 1.0)),
+                _ => None,
+            })
+            .collect();
+        let Some(log) = self.migration.as_mut().and_then(|m| m.log.as_mut()) else { return };
+        log.review.retain(|e| !entries.iter().any(|x| x.0 == e.0));
+        log.review.extend(entries);
+        log.review.sort_by_key(|e| e.0);
+        log.state = surrogate::MigrationState::Reviewed;
+        self.review_log_dirty = true;
+    }
+
     /// The quarantined (fencing) samples within the quarantine radius of the geometry: for each
     /// held sample, the worst query atom's distance to that sample's nearest atom of its species
     /// (training-spread units, L∞ over features). One description of the query for all of them
@@ -1067,7 +1245,7 @@ impl SurrogateKs {
     /// ([`fences`](Self::fences)) — from the geometry (`near_quarantined`). Fills the descriptor
     /// cache, then reads it ([`quarantine_distances_cached`](Self::quarantine_distances_cached)).
     pub(super) fn quarantine_distances(&mut self, pos: &[[f64; 3]], z: &[u8]) -> Vec<(usize, f64)> {
-        if self.fencing() == 0 {
+        if !self.any_fences() {
             return Vec::new();
         }
         self.ensure_desc_cache();
@@ -1082,7 +1260,7 @@ impl SurrogateKs {
     /// numbers either way, only slower. Without a model there is nothing to fence with (the
     /// filling path's cache basis is the model's, `None` without one).
     pub(super) fn quarantine_distances_cached(&self, pos: &[[f64; 3]], z: &[u8]) -> Vec<(usize, f64)> {
-        if self.fencing() == 0 {
+        if !self.any_fences() {
             return Vec::new();
         }
         let (Some(model), Some(env), Some(store)) = (self.model.as_ref(), self.envelope.as_ref(), self.store.as_ref()) else { return Vec::new() };
@@ -1596,6 +1774,8 @@ impl SurrogateKs {
             if !movable.is_empty() {
                 for i in movable {
                     let s = self.store.as_ref().expect("a quarantined sample is stored").samples[i].clone();
+                    // a re-solved sample its review kept moves as a held one does (controller ruling B, spec §7.6)
+                    self.review_kept.remove(&i);
                     if self.reproduces_sample(&s) {
                         self.quarantine[i] = self.released_code(i);
                         released += 1;
@@ -1781,6 +1961,7 @@ impl SurrogateKs {
         match self.quarantine.get(i).copied().unwrap_or(Q_NONE) {
             Q_NONE => Ok(()),
             Q_FORGOTTEN | Q_FORGOTTEN_UNFENCED => Err(format!("sample #{i} is forgotten already")),
+            Q_RESOLVED => Err(Self::resolved_refusal(i, "Forget")),
             q => Err(format!(
                 "sample #{i} is not in the fit ({}): only a sample in the fit can be forgotten",
                 match q {
@@ -1795,6 +1976,23 @@ impl SurrogateKs {
                 }
             )),
         }
+    }
+
+    /// Whether stored sample `i` may be restored: only a forgotten one; else the refusal — a re-solved sample
+    /// ([`Q_RESOLVED`]) in the words of [`resolved_refusal`](Self::resolved_refusal).
+    fn restorable(&self, i: usize) -> Result<(), String> {
+        if self.is_forgotten(i) {
+            return Ok(());
+        }
+        match self.quarantine.get(i).copied() {
+            Some(Q_RESOLVED) => Err(Self::resolved_refusal(i, "Restore")),
+            _ => Err(format!("sample #{i} is not forgotten")),
+        }
+    }
+
+    /// Why Forget or Restore (`verb`) refuses re-solved sample `i` (Fermi–Dirac spec §7.6: it is not the user's).
+    fn resolved_refusal(i: usize, verb: &str) -> String {
+        format!("sample #{i} was re-solved for the new solver and waits for its review (it rejoins the fit when the samples around it predict it) — {verb} does not apply to it")
     }
 
     /// The batch's store indices (2026-11-14, the batched forget): every id checked
@@ -1893,7 +2091,7 @@ impl SurrogateKs {
         if let [id] = ids {
             return self.restore_sample(*id);
         }
-        let idx = self.batch_indices(ids, |s, i| if s.is_forgotten(i) { Ok(()) } else { Err(format!("sample #{i} is not forgotten")) })?;
+        let idx = self.batch_indices(ids, |s, i| s.restorable(i))?;
         let written: Vec<String> = idx
             .iter()
             .map(|&i| {
@@ -1918,9 +2116,7 @@ impl SurrogateKs {
     /// `Err`, nothing changed: the id no longer names the sample (M8), or it is not forgotten.
     pub fn restore_sample(&mut self, id: sim::SampleId) -> Result<(), String> {
         let i = self.check_id(id)?;
-        if !self.is_forgotten(i) {
-            return Err(format!("sample #{i} is not forgotten"));
-        }
+        self.restorable(i)?;
         let code = self.released_code(i);
         let written = self.set_user_code(i, code);
         self.user_notes.push(format!("surrogate: sample #{i} restored — back in the fit at the refit{written}"));
