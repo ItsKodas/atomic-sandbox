@@ -691,8 +691,9 @@ pub fn mat_vec_fast(a: &[f64], n: usize, x: &[f64], y: &mut [f64]) {
 // N block meets a zero right-hand side (y_N = 0 exactly) and drops out. F is that block computed
 // in double-double and rounded once to f64; the forms are in the full path's accuracy class.
 // That is a statement of class, not a derived bound: the agreement is **measured** (the stds
-// within 4.4e-13 relative of the full path's in the `model` tests, the forms within 2× the full
-// substitution's own error on a posterior-shaped factor in the tests below), and every new factor
+// within 4.4e-13 relative of the full path's in the `model` tests and 1.9e-12 on the user's BEST
+// fit; the forms within about 2× the full substitution's own error against double-double, on a
+// posterior-shaped factor in the tests below and on BEST: 3.2e-12 vs 1.7e-12), and every new factor
 // is self-checked against the full path at build (`model::SupportCache`, bound 1e-10).
 //
 // **Why double-double.** Built in f64, F loses digits to cancellation: the unit columns L⁻¹e_s

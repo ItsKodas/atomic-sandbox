@@ -4974,19 +4974,24 @@ H₂ near 1.4 Bohr, 400 Model-only steps (draft on, audits off), 100 of them var
 
 The batched substitution alone (`quad_forms_speed`, `#[ignore]`d: 7 rows at n = 1 902): 27.5 ms one at a time → 1.70 ms. The status's `readiness` at a geometry the last step did not evaluate (96 ms in "Status cache" above) runs the same two pieces, and so do the training views' `predict(…, true)` per curve point.
 
-### The variance on the scene's support (2026-11-20; branch `variance-support`, spec `2026-11-20-variance-support-design.md`; `surrogate` unit tests and `tests/variance_timing.rs`, `#[ignore]`d measurement; release, Ryzen 7 9800X3D, other agents' cargo runs throughout)
+### The variance on the composition's support (2026-11-20; branch `variance-support`, spec `2026-11-20-variance-support-design.md` and its physics review round 1; `surrogate` unit tests, `tests/variance_timing.rs` and `model::tests::support_accuracy_on_a_model_file`, `#[ignore]`d measurements; release, Ryzen 7 9800X3D, other agents' cargo runs throughout)
 
-`Model::predictive_std` forms its 1 + 3N quadratic forms on the union S of the query vectors' non-zero columns (exact: a zero entry adds nothing), φ̃ᵀA⁻¹φ̃ = φ̃_Sᵀ(A⁻¹)_SS φ̃_S, when |S| ≤ Q′/2; S and its factor are cached on the model and only grow. **Accuracy, against a double-double reference** (fitted [H, O] factors, the `model` tests): the full substitution ≤ 2.2e-13 relative on the forms; the spec's f64 route (R from the QR of X = L⁻¹E_S, then ‖R v_S‖²) up to 3.5e-11, and f64 Schur-complement factors by Householder / Givens elimination of L up to 1.8e-10 / 5.9e-12 — the products cancel (the unit columns of L⁻¹ carry the prior's variance, a trained query's is orders smaller). So `linalg::support_factor` builds R in double-double and keeps W = R⁻¹ (reversed, lower triangular): the forms are a triangular solve of size |S|, componentwise stable like the full one. Tests: the stds agree with the full path to **≤ 4.4e-13 relative** (spec bound 1e-12 + 1e-15); a posterior-shaped factor whose multiply amplification is 7e6 gives the support solve 1.43e-11 against the full solve's 1.09e-11 (both against double-double); |S| > Q′/2 is the full path bit for bit.
+`Model::predictive_std` forms its 1 + 3N quadratic forms on S(C), every reduced column whose centre and channel species lie in the scene's species set C (exact: a feature of an absent channel species is an empty sum, +0.0), φ̃ᵀA⁻¹φ̃ = φ̃_Sᵀ(A⁻¹)_SS φ̃_S, when |S(C)| ≤ Q′/2; one factor per composition is cached on the model, so a std is a pure function of (L, geometry, species set). On the H/O/P collection basis |S({H})| = 52, a pair 468, all three 1 902 (the full path). The factor F is the trailing Cholesky block of A ordered (N, reversed S), built in double-double (`linalg::support_factor`): in f64 its cancellation cost, on fitted [H, O] factors against a double-double reference, up to 3.5e-11 relative (the spec's f64 QR of X = L⁻¹E_S) and 1.8e-10 / 5.9e-12 (f64 Householder / Givens elimination of L), where the full substitution is ≤ 2.2e-13. Every new factor is self-checked against the full path at build (bound 1e-10). `describe` skips the body-3/4 terms of absent channel species (bit for bit, tested).
 
-The user's BEST model copy (format v9) is newer than main's sidecar reader (v1–v8), so the timing is on a synthetic model of its shape (H/O/P, body-4 at degree 3, Q′ 1 902, seeded coefficients, L = chol(λI + BBᵀ)); H₂ at 1.4 Bohr, 2 000 calls each, **|S| = 52**:
+**Accuracy, measured** (the class claim is the reordering identity; nothing is a derived bound):
+- unit tests (random and 30-sample fitted posteriors): the stds agree with the full path to ≤ 4.4e-13 relative; a posterior-shaped factor with multiply amplification 7e6 gives the support forms 1.43e-11 against the full forms' 1.09e-11, both against double-double;
+- **the user's BEST fit** (H/O/P, Q′ 1 902, 1 624 samples; its v9 sidecar read on `scf-stall` and rebuilt as a model-only file for this build, measurement only): 1 000 seeded H₂/H₃ geometries, worst relative std difference support vs full **1.93e-12**; for the 10 most different, the forms against double-double through L are within **3.2e-12** on the support path and **1.7e-12** on the full one, so on this posterior the full path is itself ~1e-12 from the exact value and the support path within 2× of it. Self-check maximum 6.2e-13.
+
+**Timing**, H₂ at 1.4 Bohr, 2 000 calls each, |S| = 52:
 
 | | before | after |
 |---|---|---|
-| `predict(…, false)` | 48.5 µs | 42–46 µs (unchanged code) |
-| `predict(…, true)` | 560 µs | **87–105 µs** |
-| first `predict(…, true)` (checks L, builds the factor) | 4.1 ms | 11–14 ms |
+| BEST fit, `predict(…, false)` | 50 µs (the user's measurement) | 38–41 µs (unchanged code) |
+| BEST fit, `predict(…, true)` | 679 µs (the user's measurement) | **66–75 µs** |
+| BEST fit, first `predict(…, true)` (checks L, builds {H}) | — | 13–15 ms |
+| synthetic BEST-shaped model, `predict(…, true)` | 560 µs | 73–82 µs |
 
-The remainder of a variance call is the descriptor: `describe` with gradients 28–38 µs, the query vectors' accumulation ~6 µs, the forms ~6 µs (the support scan, the gather, a 52-wide substitution). The spec's target (≤ 60 µs with variance) is not met: `energy_and_forces` and `describe` alone take ~75 µs here, the descriptor cost the spec leaves out. Factor builds (`support_factor_build_cost`, n = 1 902): 9.5 ms at |S| = 52, 57 ms at 282 (an H₂O), 0.26 s at 950.
+The remainder is the descriptor (`describe` with gradients 17–24 µs after the composition skip) and `energy_and_forces` (~40 µs, unchanged); the spec's ≤ 60 µs target is not met. Factor builds (`support_factor_build_cost`, n = 1 902): 9.5 ms at |S| = 52, 57 ms at 282, 0.26 s at 950 (a two-species composition, 468, is about 0.1–0.15 s, once per model and composition).
 
 ## Warm-started recovery trials (2026-11-17; branch `recovery-warm`, spec `2026-11-17-recovery-warm-start-design.md`, option B; `providers` `surrogate::tests::refit_golden` with its `fit_log` line, `#[ignore]`d; release, Ryzen 7 9800X3D, other agents' test binaries running throughout)
 

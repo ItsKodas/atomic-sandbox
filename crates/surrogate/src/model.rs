@@ -108,7 +108,9 @@
 //! double-double: in f64 the cancellation that block carries cost up to 3.5e-11 relative on fitted
 //! factors). The forms are the full path's own substitution through a reordered exact factor, at
 //! |S|²/2 per vector instead of Q′²/2; their agreement with the full path is measured (≤ 4.4e-13
-//! relative on the stds in the tests) and self-checked at every build (`SupportCache`). On the
+//! relative on the stds in the tests; 1.9e-12 on the user's BEST fit, where the full path is
+//! itself up to 1.7e-12 from a double-double evaluation and the support path 3.2e-12) and
+//! self-checked at every build (`SupportCache`). On the
 //! H/O/P collection basis (Q′ 1 902): |S({H})| = 52, a pair 468, all three 1 902.
 //!
 //! The model caches one factor per composition (`Model::variance_support`, a [`SupportCache`]).
@@ -1738,8 +1740,10 @@ mod tests {
     }
 
     /// The support path against the full one on a real fit (review I3b): 1 000 seeded H₂ and H₃
-    /// geometries on the model in `MODEL_FILE`; prints the largest relative difference of every
-    /// std and the self-check's. A measurement.
+    /// geometries on the model in `MODEL_FILE`. Prints the largest relative difference of every
+    /// std between the paths, the self-check's, and for the 10 geometries that differ most each
+    /// path's error against a double-double evaluation of the same forms through L (which of the
+    /// two the difference is). A measurement.
     /// `MODEL_FILE=<a model sidecar> cargo test -p surrogate --release --lib support_accuracy_on_a_model_file -- --ignored --nocapture`
     #[test]
     #[ignore = "a measurement on a model file (MODEL_FILE)"]
@@ -1747,9 +1751,12 @@ mod tests {
         let path = std::path::PathBuf::from(std::env::var("MODEL_FILE").expect("MODEL_FILE"));
         let m = crate::sidecar::read(&path).expect("a readable model sidecar").model;
         let l = m.sigma_inv_chol.clone().expect("a posterior");
+        let qr = m.representatives().len();
         let mut rng = StdRng::seed_from_u64(0xbe57);
-        let (mut worst, mut at) = (0.0f64, String::new());
         let t = std::time::Instant::now();
+        // the stds' squares minus their floors are the forms; compare the forms themselves
+        let mut rows: Vec<(f64, usize, Vec<[f64; 3]>, Vec<u8>)> = Vec::new();
+        let mut worst_std = 0.0f64;
         for k in 0..1000 {
             let n = if k % 2 == 0 { 2 } else { 3 };
             let mut pos = vec![[0.0; 3]; n];
@@ -1761,20 +1768,41 @@ mod tests {
             let a = m.predictive_std_with(&l, &pos, &z, VariancePath::Auto).unwrap();
             let f = m.predictive_std_with(&l, &pos, &z, VariancePath::Full).unwrap();
             let pairs = std::iter::once((a.0, f.0)).chain(a.1.iter().copied().zip(f.1.iter().copied())).chain(a.2.iter().copied().zip(f.2.iter().copied()));
-            for (x, y) in pairs {
-                let d = if x == y { 0.0 } else { (x - y).abs() / y.abs() };
-                if d > worst {
-                    worst = d;
-                    at = format!("geometry {k} (N = {n}): {x:e} vs {y:e}");
-                }
-            }
+            let d = pairs.map(|(x, y)| if x == y { 0.0 } else { (x - y).abs() / y.abs() }).fold(0.0, f64::max);
+            worst_std = worst_std.max(d);
+            rows.push((d, k, pos, z));
         }
         println!(
-            "Q′ {}, |S({{H}})| {:?}: 1000 H₂/H₃ geometries, worst relative std difference support vs full {worst:.2e} ({at}); self-check max {:.2e}; {:.1} s",
-            m.representatives().len(),
+            "Q′ {qr}, |S({{H}})| {:?}: 1000 H₂/H₃ geometries, worst relative std difference support vs full {worst_std:.2e}; self-check max {:.2e}; {:.1} s",
             m.variance_support.support_for(&[0]).map(|s| s.len()),
             m.variance_support.self_check_max(),
             t.elapsed().as_secs_f64()
         );
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let entry = match m.variance_support.state().entries.get(&1).cloned() {
+            Some(Slot::Support(e)) => e,
+            _ => panic!("{{H}} is on the support path"),
+        };
+        let (mut ws, mut wf) = (0.0f64, 0.0f64);
+        for (d, k, pos, z) in rows.iter().take(10) {
+            let s = m.basis.species_indices(z).unwrap();
+            let desc = describe(&m.basis, pos, z).unwrap();
+            let q = QueryInputs { species: &s, desc: &desc, inv_scale: m.inverse_scale() };
+            let full_vs = m.full_query_vectors(&q);
+            let on_s = accumulate_query_vectors(&m.basis, &q, &entry.map, entry.support.len()).unwrap();
+            let (sup, full) = (entry.quad_forms(&on_s), full_quad_forms(&l, qr, &full_vs));
+            let (mut es, mut ef) = (0.0f64, 0.0f64);
+            for (j, v) in full_vs.iter().enumerate() {
+                let exact = crate::linalg::tests::quad_form_dd(&l, qr, v);
+                if exact > 0.0 {
+                    es = es.max((sup[j] - exact).abs() / exact);
+                    ef = ef.max((full[j] - exact).abs() / exact);
+                }
+            }
+            ws = ws.max(es);
+            wf = wf.max(ef);
+            println!("  geometry {k}: std difference {d:.2e}; forms against double-double: support {es:.2e}, full {ef:.2e}");
+        }
+        println!("  the 10 most different: worst form error against double-double, support {ws:.2e}, full {wf:.2e}");
     }
 }
