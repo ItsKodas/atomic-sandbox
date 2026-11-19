@@ -1186,18 +1186,28 @@ const REENTRY_XH: f64 = -0.6;
 const REENTRY_S0: f64 = 3.9;
 /// The H's speed as path length per step (Bohr; 0.03 at dt 0.25 fs: v = 2.9e-3 a.u., K_H = 7.7 mHa).
 const REENTRY_STEP: f64 = 0.03;
+/// The edge check before the run (controller ruling 13: a region answers no nearer the bonded part, nor a face, than its
+/// passes put the stray atom): the H `REENTRY_EDGE_D` Bohr from the nearer H₂ atom and `REENTRY_EDGE_FACE` Bohr from a
+/// face, on the path's side of H₂ — nearer than the path's model steps reach on both counts (the path keeps x = 3.9, 6.1
+/// Bohr from the x faces while the model answers; the teacher's steps may deflect it), so the model answers the path
+/// down to 6.05 Bohr.
+const REENTRY_EDGE_D: f64 = 6.05;
+const REENTRY_EDGE_FACE: f64 = 5.6;
 
 /// Spec §6 "Dynamics" (review M3): an NVE run in which a stray H comes back within r_cut of a cleared H₂ and leaves
 /// again, under the surrogate (strict mode, H₂ + H cleared on the real teacher first; `common::surrogate`). Outside
 /// r_cut the model answers (its bonded part + E_ref(H), F_H = 0); within it the stray H is no longer stray and the
 /// ordinary rules send the step to the teacher (rule 5b); each switch of surface is booked by the provider's
 /// `transition_jump` into W (`sim::dynamics` "Energy bookkeeping"), so `E_conserved` must stay within the suite's
-/// drift bound `DRIFT_BOUND` across both switches. The booked jumps are reported separately (each against the
-/// composition check's energy tolerance, 1 mHa × 1 stray atom — reported, not asserted: the brief's ruling).
+/// drift bound `DRIFT_BOUND` across both switches. The booked jumps are reported separately, and each is asserted within
+/// the composition check's energy tolerance, `energy_std_per_atom` × 1 stray atom = 1 mHa (spec §6; final review I3,
+/// controller ruling 13). Since ruling 13 the region answers the stray H no nearer H₂ (or a face) than a pass put it,
+/// so an edge check at 6.05 Bohr (`REENTRY_EDGE_D`) runs before the NVE: the model answers the path down to it, the
+/// steps between it and r_cut fall back on rule 5a (a check is queued there), and the switch in is that boundary's.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test dynamics")]
 fn stray_h_returning_conserves_energy() {
-    use common::surrogate::{accepted, clear_h2_h, stray_student, train_h2, STRAY_CHECK_R, STRAY_H, STRAY_R0};
+    use common::surrogate::{accepted, clear_h2_h, stray_check, stray_student, train_h2, STRAY_CHECK_R, STRAY_H, STRAY_R0};
     use sim::Source;
     let Some(ctx) = gpu() else { return };
     let t_test = Instant::now();
@@ -1208,6 +1218,17 @@ fn stray_h_returning_conserves_energy() {
     train_h2(&mut s, REENTRY_N, STRAY_R0, seed(), &mut out);
     let passed = clear_h2_h(&mut s, REENTRY_N, &STRAY_CHECK_R, &mut out);
     let _ = writeln!(out, "  H₂ + H cleared by the checks at r = {passed:?}");
+    // the edge check (ruling 13): the H on the path's side of H₂ (x = REENTRY_EDGE_FACE from the +x face, y = z = e)
+    // with its nearer H₂ atom (z = +r/2) REENTRY_EDGE_D away: 2e² − r e + r²/4 + (x − x_H)² − D² = 0
+    let edge = {
+        let x = sim::Cell { n: REENTRY_N, h: STRAY_H }.half_extent() - REENTRY_EDGE_FACE;
+        let (z0, dx) = (0.5 * STRAY_R0, x - REENTRY_XH);
+        let e = 0.5 * (z0 + (z0 * z0 - 2.0 * (z0 * z0 + dx * dx - REENTRY_EDGE_D * REENTRY_EDGE_D)).sqrt());
+        accepted(REENTRY_N, STRAY_H, vec![Nucleus::new(1, [REENTRY_XH, 0.0, 0.5 * STRAY_R0]), Nucleus::new(1, [REENTRY_XH, 0.0, -0.5 * STRAY_R0]), Nucleus::new(1, [x, e, e])])
+    };
+    let _ = writeln!(out, "  the edge check: H at ({:.3}, {:.3}, {:.3}), {REENTRY_EDGE_D} Bohr from the nearer H₂ atom, {REENTRY_EDGE_FACE} from a face:", edge.nuclei[2].pos[0], edge.nuclei[2].pos[1], edge.nuclei[2].pos[2]);
+    let ev = stray_check(&mut s, &edge, &mut out).unwrap_or_else(|| panic!("the edge check was not queued\n{out}"));
+    assert!(matches!(ev.outcome, sim::activity::TeachOutcome::StrayCheckingNew), "the edge check must pass and extend the region: {ev:?}\n{out}");
     let v = REENTRY_STEP / units::fs_to_au_time(DT_FS);
     let (c, w) = (std::f64::consts::FRAC_1_SQRT_2, REENTRY_S0);
     let mut h = Nucleus::new(1, [REENTRY_X, w, w]);
@@ -1326,6 +1347,10 @@ fn stray_h_returning_conserves_energy() {
     assert_eq!(kinds.last(), Some(&Source::Surrogate), "stray again at the end: the model's\n{out}");
     assert!(kinds.contains(&Source::Fallback), "within r_cut: the teacher's\n{out}");
     assert!(!jumps.is_empty(), "each switch of surface is booked\n{out}");
+    // spec §6 (final review I3): each booked jump within the check's energy tolerance, 1 mHa × 1 stray atom
+    for (i, j, from, to, r) in &jumps {
+        assert!(j.abs() <= tol, "step {i}: the booked jump {from:?} → {to:?} at {r:.3} Bohr is {:+.4} mHa, beyond the check's tolerance {:.3} mHa\n{out}", j * 1e3, tol * 1e3);
+    }
     assert_eq!(restarts, 0, "no unbooked surface change restarted the history\n{out}");
     assert!(tl.warnings.iter().all(|w| !w.contains("box too small")), "a clean path (the suite's NVE rule): {:?}\n{out}", tl.warnings);
     assert!(drift.abs() <= DRIFT_BOUND, "E_conserved drift {drift:+.3e} Ha/ps (bound {DRIFT_BOUND:.0e})\n{out}");

@@ -2213,8 +2213,12 @@ fn migration_classifies_h2_oh_h4() {
 
 // ---- stray atoms (spec 2026-11-18 §6; plan Task 7; module doc and `references.md`, "Stray atoms") ----
 
-/// Unchecked bond lengths for the in-region answer, the first one the provider's own verdict (`would_answer`) answers.
-const STRAY_PROBE_R: [f64; 8] = [1.37, 1.50, 1.27, 1.65, 1.40, 1.55, 1.20, 1.70];
+/// The bond scan for the in-region answer (final review I2(b), controller ruling 13): `would_answer` at every
+/// `STRAY_SCAN_STEP` from `STRAY_SCAN_LO` to `STRAY_SCAN_HI` (Bohr); the fourth geometry is the answered bond farthest from
+/// every check.
+const STRAY_SCAN_LO: f64 = 0.9;
+const STRAY_SCAN_HI: f64 = 2.3;
+const STRAY_SCAN_STEP: f64 = 1e-3;
 /// The stretched bond (Bohr; spec §6: r ≥ 2.5) and the report's scan.
 const STRETCHED_R: f64 = 2.5;
 const STRETCHED_SCAN: [f64; 4] = [STRAY_R0, 2.0, STRETCHED_R, 3.0];
@@ -2345,21 +2349,63 @@ fn stray_h_clears_and_matches_dft() {
             .collect();
         let _ = writeln!(out, "  around the check at r = {r}: {}", verdicts.join(", "));
     }
-    // the fourth geometry: never checked, inside the region by the provider's own verdict (no step, so no check)
-    let mut r4 = None;
-    for r in STRAY_PROBE_R {
+    // the fourth geometry (final review I2(b), ruling 13): the scan's answered bond farthest from every check — not the
+    // first candidate of a list, which favours the nearest. Covered by the region = not refused by rule 5a; the place of
+    // the stray atom (its distance to the nearer H₂ atom and to a face) moves with r in this geometry, so an interval's
+    // edge is also reported against the region's place (the smallest of the passes')
+    let verdict = |s: &SurrogateKs, r: f64| {
         let sc = h2_and_h(r);
         let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = sc.nuclei.iter().map(|n| n.z).collect();
-        let v = s.would_answer(&pos, &z, &s.provenance_for(&sc));
-        let _ = writeln!(out, "  candidate r = {r}: would_answer {v:?}");
-        if v.is_ok() {
-            r4 = Some(r);
-            break;
+        s.would_answer(&pos, &z, &s.provenance_for(&sc))
+    };
+    let place = |r: f64| {
+        let sc = h2_and_h(r);
+        let d = |a: [f64; 3], b: [f64; 3]| (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>().sqrt();
+        let reach = d(sc.nuclei[2].pos, sc.nuclei[0].pos).min(d(sc.nuclei[2].pos, sc.nuclei[1].pos));
+        let face = sc.cell.half_extent() - sc.nuclei[2].pos.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+        (reach, face)
+    };
+    let region_place = passed.iter().map(|&c| place(c)).fold((f64::INFINITY, f64::INFINITY), |(a, b), (r, f)| (a.min(r), b.min(f)));
+    let n_scan = ((STRAY_SCAN_HI - STRAY_SCAN_LO) / STRAY_SCAN_STEP).round() as usize;
+    let scan: Vec<(f64, Result<(), (sim::activity::TeachRule, Option<usize>)>)> = (0..=n_scan).map(|k| STRAY_SCAN_LO + STRAY_SCAN_STEP * k as f64).map(|r| (r, verdict(&s, r))).collect();
+    let covered = |v: &Result<(), (sim::activity::TeachRule, Option<usize>)>| !matches!(v, Err((sim::activity::TeachRule::IsolatedAtom, _)));
+    let _ = writeln!(out, "  the region's place (the passes' nearest stray–H distance, face distance): {:.4} / {:.4} Bohr", region_place.0, region_place.1);
+    for &c in &passed {
+        let k0 = scan.iter().position(|(r, _)| (r - c).abs() < 0.5 * STRAY_SCAN_STEP).expect("the check on the scan");
+        let (mut lo, mut hi) = (k0, k0);
+        while lo > 0 && covered(&scan[lo - 1].1) {
+            lo -= 1;
         }
+        while hi + 1 < scan.len() && covered(&scan[hi + 1].1) {
+            hi += 1;
+        }
+        let why = |k: Option<usize>| {
+            k.map_or("the scan's end".to_string(), |k| {
+                let (r, v) = &scan[k];
+                let (reach, face) = place(*r);
+                let clipped = if reach < region_place.0 { " — the stray atom nearer H₂ than every pass" } else if face < region_place.1 { " — the stray atom nearer a face than every pass" } else { "" };
+                format!("{r:.3}: {v:?} (stray–H {reach:.4}, face {face:.4}){clipped}")
+            })
+        };
+        let _ = writeln!(
+            out,
+            "  about the check at r = {c}: covered {:.3}–{:.3} Bohr (−{:.3} / +{:.3}); beyond: {} | {}",
+            scan[lo].0,
+            scan[hi].0,
+            c - scan[lo].0,
+            scan[hi].0 - c,
+            why(lo.checked_sub(1)),
+            why((hi + 1 < scan.len()).then_some(hi + 1))
+        );
     }
-    let r4 = r4.unwrap_or_else(|| panic!("no unchecked candidate of {STRAY_PROBE_R:?} lies in the cleared region\n{out}"));
-    assert!(!passed.contains(&r4), "an unchecked geometry");
+    let far = |r: f64| passed.iter().map(|&c| (r - c).abs()).fold(f64::INFINITY, f64::min);
+    let answered: Vec<f64> = scan.iter().filter(|(_, v)| v.is_ok()).map(|(r, _)| *r).collect();
+    let _ = writeln!(out, "  answered: {} of {} scanned bonds ({STRAY_SCAN_LO}–{STRAY_SCAN_HI} Bohr by {STRAY_SCAN_STEP})", answered.len(), scan.len());
+    let r4 = answered.iter().copied().fold(None, |best: Option<f64>, r| if best.is_none_or(|b| far(r) > far(b)) { Some(r) } else { best });
+    let r4 = r4.unwrap_or_else(|| panic!("no scanned bond lies in the cleared region\n{out}"));
+    let _ = writeln!(out, "  the fourth geometry: r = {r4:.3}, {:.3} Bohr from the nearest check (the farthest answered bond)", far(r4));
+    assert!(far(r4) >= 0.5 * STRAY_SCAN_STEP, "an unchecked geometry");
     let sc = h2_and_h(r4);
     s.discontinuity();
     let ans = s.evaluate(&sc, &mut never()).unwrap_or_else(|e| panic!("r = {r4}: {e}"));
@@ -2395,7 +2441,7 @@ fn stray_h_clears_and_matches_dft() {
     let _ = writeln!(out, "  r = {r4} again: source {:?}", again.stats.source);
     let _ = writeln!(out, "  teacher: {}\n  auditor: {}\n  wall {:.0} s", snapshot(&log).summary(), snapshot(&alog).summary(), t_test.elapsed().as_secs_f64());
     println!("{out}");
-    record(&ctx, timing_row("stray_h_clears_and_matches_dft", "H₂ + H", STRAY_N, TOL_H2, &snapshot(&log), t_test.elapsed(), &format!("cleared at {passed:?}; r = {r4}: |ΔE|/2 {:.3} mHa", gap.abs() / 2.0 * 1e3)));
+    record(&ctx, timing_row("stray_h_clears_and_matches_dft", "H₂ + H", STRAY_N, TOL_H2, &snapshot(&log), t_test.elapsed(), &format!("cleared at {passed:?}; r = {r4:.3} ({:.3} from a check): |ΔE|/2 {:.3} mHa", far(r4), gap.abs() / 2.0 * 1e3)));
     assert_eq!(ans.stats.source, Source::Surrogate, "an in-region step is the model's\n{out}");
     assert!(note.is_some(), "the stray-atom note\n{out}");
     assert_eq!(ans.forces[2], [0.0; 3], "a stray atom's model force is exactly 0");
