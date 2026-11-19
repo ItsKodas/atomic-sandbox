@@ -139,9 +139,19 @@ pub(in crate::surrogate) struct StrayCheck {
     pub grid_n: usize,
 }
 
-/// "H2 + H": the bonded part's formula and the stray atoms' (the Activity's and the notes' label of a signature).
+/// "H2 + H", "H2 + 2 H", "H2O + O": the bonded part's formula, then the stray atoms as separate atoms — a count and
+/// the element per species, never a formula (two stray H are not an H₂: Task 6 review I1) — the Activity's, the notes'
+/// and the Model tab's label of a signature. The app writes the bonded part's counts as subscripts.
 pub(in crate::surrogate) fn signature_label(sig: &Signature) -> String {
-    format!("{} + {}", super::shared::formula(&sig.bonded_z), super::shared::formula(&sig.stray_z))
+    let mut stray: Vec<(u8, usize)> = Vec::new();
+    for &z in &sig.stray_z {
+        match stray.iter_mut().find(|(zi, _)| *zi == z) {
+            Some((_, k)) => *k += 1,
+            None => stray.push((z, 1)),
+        }
+    }
+    let atoms: Vec<String> = stray.iter().map(|&(z, k)| if k == 1 { symbol(z).to_string() } else { format!("{k} {}", symbol(z)) }).collect();
+    format!("{} + {}", super::shared::formula(&sig.bonded_z), atoms.join(" + "))
 }
 
 impl SurrogateKs {
@@ -504,6 +514,8 @@ impl SurrogateKs {
             Err(e) => {
                 // the solves this check made: the parts answered so far and this failed one (one row, Task 6)
                 let solves = 1 + u32::from(p.frag.is_some()) + p.atoms.iter().filter(|a| a.is_some()).count() as u32;
+                // and their time together, as the row's solves (review minor 2)
+                let solve_ms = p.ms + ans.ms;
                 self.drop_stray_check();
                 let what = if ans.job.kind == JobKind::Fragment { "the bonded part alone" } else { "a stray atom alone" };
                 let then = if attributing { "the failed audit it was attributing counts against the model" } else { "not counted, the next fallback checks again" };
@@ -514,7 +526,7 @@ impl SurrogateKs {
                 let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::IsolatedAtom, TeachOutcome::Failed);
                 ev.detail = note.clone();
                 ev.n_atoms = ans.job.scene.nuclei.len();
-                ev.solve_ms = ans.ms;
+                ev.solve_ms = solve_ms;
                 ev.solves = solves;
                 self.push_event(ev);
                 return self.pending_notes.push(note);

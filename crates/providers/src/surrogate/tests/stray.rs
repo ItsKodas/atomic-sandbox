@@ -2348,3 +2348,14 @@ fn a_stray_misfit_is_named_in_the_words() {
     s.misfit.as_mut().unwrap().samples.push(i);
     assert!(s.misfit_scenes().ends_with("; 1 with stray atoms, whose energy rows per bonded atom also carry the composition and the stray atoms' box term"), "{}", s.misfit_scenes());
 }
+
+/// Task 6 review I1: a signature's label writes the stray atoms as separate atoms — two stray H are "2 H", never the
+/// formula "H2" (which reads as a hydrogen molecule).
+#[test]
+fn a_signature_label_names_stray_atoms_as_atoms() {
+    let sig = |bonded: &[u8], stray: &[u8]| Signature { bonded_z: bonded.to_vec(), stray_z: stray.to_vec(), charge: 0, surface: String::new() };
+    assert_eq!(signature_label(&sig(&[1, 1], &[1])), "H2 + H");
+    assert_eq!(signature_label(&sig(&[1, 1], &[1, 1])), "H2 + 2 H");
+    assert_eq!(signature_label(&sig(&[1, 1, 8], &[8])), "H2O + O");
+    assert_eq!(signature_label(&sig(&[1, 1], &[1, 8])), "H2 + H + O");
+}

@@ -454,6 +454,9 @@ pub struct Sampler {
     /// Samples added with stray atoms, held out of the fit until a composition check measures them
     /// (`surrogate::stray`, `PassKeep::Kept { held: true }`; the finish note beside the box-affected one).
     stray_held: usize,
+    /// `added` when this pass was resumed from a checkpoint (`None` for a fresh pass): `stray_held` is not in the
+    /// checkpoint, so its finish note counts against the samples added since the resume.
+    added_at_resume: Option<usize>,
     /// Geometries the cell guard skipped (the burst's tail included), and scan points skipped
     /// beyond a failed one (`SamplingProgress::skipped` counts both, and the untrainable answers).
     cell_skipped: usize,
@@ -668,6 +671,7 @@ impl Sampler {
             added: 0,
             boxed: 0,
             stray_held: 0,
+            added_at_resume: None,
             cell_skipped: 0,
             tail_skipped: 0,
             collection_skipped: 0,
@@ -722,6 +726,7 @@ impl Sampler {
             added: 0,
             boxed: 0,
             stray_held: 0,
+            added_at_resume: None,
             cell_skipped: 0,
             tail_skipped: 0,
             collection_skipped: 0,
@@ -1935,9 +1940,13 @@ impl Sampler {
             ));
         }
         if self.stray_held > 0 {
+            let of = match self.added_at_resume {
+                Some(a0) => format!("{} samples kept since the resume", self.added.saturating_sub(a0)),
+                None => format!("{} samples", self.added),
+            };
             self.notes.push(format!(
-                "sampling: {} of {} samples have stray atoms (no neighbour within the model's cutoff) — kept, held out of the fit until a composition check measures that the molecule and its free atoms add up",
-                self.stray_held, self.added
+                "sampling: {} of {of} have stray atoms (no neighbour within the model's cutoff) — kept, held out of the fit until a composition check measures that the molecule and its free atoms add up",
+                self.stray_held
             ));
         }
     }

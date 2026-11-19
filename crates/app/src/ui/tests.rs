@@ -5845,8 +5845,15 @@ mod activity_words {
         for o in [K::StrayChecking { n: 3, of: 3 }, K::StrayCheckingNew, K::StrayRefused, K::StrayNotKept, K::KeptStrayHeld, K::StrayAuditAttributed { model: true }, K::StrayAuditAttributed { model: false }] {
             assert!(!outcome_sentence(o).is_empty(), "{o:?}");
         }
-        // the rule reads "5a lone atom" for every isolated-atom row: "5a lone atom · composition fails"
+        // rule 5a reads "5a stray atom" on the stray path (spec §5: "5a stray atom · composition fails"), "5a lone atom"
+        // for the isolated-atom refusal outside it
         assert_eq!(activity::words::rule_label(sim::activity::TeachRule::IsolatedAtom, None), "5a lone atom");
+        for o in [K::StrayChecking { n: 1, of: 3 }, K::StrayCheckingNew, K::StrayRefused, K::StrayNotKept, K::KeptStrayHeld] {
+            let e = sim::TeachEvent::new(sim::activity::TeachOrigin::Fallback, sim::activity::TeachRule::IsolatedAtom, o);
+            assert_eq!(activity::log::rule_cell(&e), "5a stray atom", "{o:?}");
+        }
+        let lone = sim::TeachEvent::new(sim::activity::TeachOrigin::Fallback, sim::activity::TeachRule::IsolatedAtom, K::Kept);
+        assert_eq!(activity::log::rule_cell(&lone), "5a lone atom");
         let mut e = sim::TeachEvent::new(sim::activity::TeachOrigin::Audit, sim::activity::TeachRule::IsolatedAtom, K::StrayChecking { n: 1, of: 3 });
         e.solve_ms = 840.0;
         assert_eq!(activity::log::solve_cell(&e), "840 ms");
@@ -7914,6 +7921,13 @@ fn the_trust_card_lists_stray_signatures() {
             ("7 stray-atom samples held out of the fit until measured".to_string(), false),
         ]
     );
+    // Task 6 review I1: stray atoms are separate atoms — only the bonded part's counts are subscripts — and one held
+    // sample is singular
+    let one = |label: &str| ModelStatus { stray: vec![(label.into(), "refused (spin)".into())], stray_held_out: 1, ..model() };
+    assert_eq!(stray_lines(&one("H2 + 2 H"))[0].0, "Stray atoms: H₂ + 2 H refused (spin)");
+    assert_eq!(stray_lines(&one("H2O + O"))[0].0, "Stray atoms: H₂O + O refused (spin)");
+    assert_eq!(stray_lines(&one("H2 + H"))[0].0, "Stray atoms: H₂ + H refused (spin)");
+    assert_eq!(stray_lines(&one("H2 + H"))[1].0, "1 stray-atom sample held out of the fit until measured");
     // drawn on the card, sending nothing
     let scene = Scene::preset("h2").unwrap();
     let cam = camera();

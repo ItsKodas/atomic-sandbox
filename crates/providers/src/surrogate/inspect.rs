@@ -298,8 +298,9 @@ impl SurrogateKs {
             }
         };
         // per energy-row atom (`audit_n`, ruling 9a): n without a stray atom, the bonded atoms with some
-        let n = self.audit_n(&pos) as f64;
-        let per = if self.audit_n(&pos) == pos.len().max(1) { "/atom" } else { " per bonded atom" };
+        let n_e = self.audit_n(&pos);
+        let n = n_e as f64;
+        let per = if n_e == pos.len().max(1) { "/atom" } else { " per bonded atom" };
         let e_ref: f64 = z.iter().map(|zi| self.refs.get(zi).copied().unwrap_or(f64::NAN)).sum();
         let fmax = pred.forces.iter().map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt()).fold(0.0f64, f64::max);
         let _ = writeln!(

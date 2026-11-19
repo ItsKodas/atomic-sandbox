@@ -735,10 +735,18 @@ fn verdict_card(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, m: Option
 /// refusal: amber).
 pub fn stray_lines(m: &ModelStatus) -> Vec<(String, bool)> {
     const SUB: [char; 10] = ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'];
+    // the bonded part's formula gets subscripts; the stray atoms after its " + " are counts of separate atoms
+    // ("H₂ + 2 H", never "H₂ + H₂": Task 6 review I1), left as they are
     let sub = |s: &str| s.chars().map(|c| c.to_digit(10).map_or(c, |d| SUB[d as usize])).collect::<String>();
-    let mut v: Vec<(String, bool)> = m.stray.iter().map(|(label, state)| (format!("Stray atoms: {} {state}", sub(label)), state.starts_with("refused"))).collect();
-    if m.stray_held_out > 0 {
-        v.push((format!("{} stray-atom samples held out of the fit until measured", m.stray_held_out), false));
+    let label = |l: &str| match l.split_once(" + ") {
+        Some((bonded, stray)) => format!("{} + {stray}", sub(bonded)),
+        None => sub(l),
+    };
+    let mut v: Vec<(String, bool)> = m.stray.iter().map(|(l, state)| (format!("Stray atoms: {} {state}", label(l)), state.starts_with("refused"))).collect();
+    match m.stray_held_out {
+        0 => {}
+        1 => v.push(("1 stray-atom sample held out of the fit until measured".to_string(), false)),
+        k => v.push((format!("{k} stray-atom samples held out of the fit until measured"), false)),
     }
     v
 }

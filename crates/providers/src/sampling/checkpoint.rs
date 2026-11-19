@@ -391,8 +391,9 @@ fn parse(text: &str) -> Result<(Sampler, CheckpointInfo), String> {
         added: c[1],
         boxed: c[2],
         // not in the checkpoint's counters line (its format is unchanged): a resumed pass's finish note counts the
-        // stray-atom samples it held since the resume
+        // stray-atom samples it held since the resume, against the samples added since (`added_at_resume`)
         stray_held: 0,
+        added_at_resume: Some(c[1]),
         cell_skipped: c[3],
         tail_skipped: c[4],
         collection_skipped: 0,

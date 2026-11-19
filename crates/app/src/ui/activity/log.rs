@@ -133,6 +133,12 @@ pub fn admits(f: &LogFilter, e: &sim::TeachEvent) -> bool {
 
 /// The rule cell: the code, with an audit's verdict (`8 audit (passed)`).
 pub fn rule_cell(e: &sim::TeachEvent) -> String {
+    use sim::activity::TeachOutcome as K;
+    // rule 5a on the stray-atom path (spec 2026-11-18 §5): a molecule plus stray atoms, not a scene of lone atoms
+    let stray = matches!(e.outcome, K::StrayNotKept | K::StrayChecking { .. } | K::StrayCheckingNew | K::StrayRefused | K::KeptStrayHeld);
+    if e.rule == sim::activity::TeachRule::IsolatedAtom && stray {
+        return "5a stray atom".into();
+    }
     let base = words::rule_label(e.rule, e.burst_t);
     match (e.rule, e.audit) {
         (sim::activity::TeachRule::Audit, Some(v)) => {
@@ -572,7 +578,8 @@ fn row(ui: &mut Ui, id: egui::Id, rect: Rect, r: &LogRow, widths: &[f32; 7], mon
     let e = &r.event;
     let (step, step_hover) = step_cell(e);
     let (origin, origin_colour) = origin_style(e.origin);
-    let cx = RowCtx { box_affected: e.box_affected, near_face: r.near_face, kept: e.outcome.is_kept() };
+    // a held stray-atom sample is in the store but not in the fit: not "kept" for the box clause's words
+    let cx = RowCtx { box_affected: e.box_affected, near_face: r.near_face, kept: e.outcome.is_kept() && e.outcome != TeachOutcome::KeptStrayHeld };
     let outcome_colour = match e.outcome {
         o if o.is_kept() => theme::INK,
         TeachOutcome::Failed | TeachOutcome::StoreRefused => RED,
