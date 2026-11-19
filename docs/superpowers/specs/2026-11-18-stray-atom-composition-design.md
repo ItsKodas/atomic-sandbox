@@ -151,7 +151,7 @@ nothing towards K but extends the region's reach. A check void for a box-affecte
 signature until the stray atoms are farther from the faces. A failing check takes back the samples its region released
 (review minor 1); a basis change drops the regions and keeps the refusals (minor 2); a change of the check's tolerances
 (`energy_std_per_atom`, `force_std_abs`, `force_std_rel`, `max_descriptor_distance`) drops the regions (minor 5); a
-model with a nonzero feature mean answers no stray scene (minor 8). The ledger's ruling 13 has the full list.
+model with a nonzero feature mean answers no stray scene (minor 8). The ledger's ruling 13 has the full list. **Known limits (scoped re-review, ruling 14, parked):** the reach and face distances are single numbers, blind to direction — an induction term is 4× larger on a polar fragment's dipole axis than beside it at the same r, so a pass beside the axis admits an unmeasured answer on it (H₂O + Mg estimate: −1.5 mHa at 6.05 Bohr, inside the audit tier); the direction-aware rule (cover only when, for some pass, every stray-to-bonded-atom distance is at least that pass's) is queued. Samples a dropped region released stay in the fit.
 
 **Samples (review C1).** A scene sample containing a stray atom is **held out of the fit** (an in-memory status like
 `Q_LONE`, never written) unless its own check passed or its bonded geometry lies in a cleared region of its signature.

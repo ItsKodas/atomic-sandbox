@@ -196,7 +196,14 @@
 //! also records **where its passes put the stray atoms**: the smallest stray-to-bonded-atom distance (`reach`) and the
 //! smallest stray-to-face distance (`face`) of any pass. A step is answered, and a held sample released, only with
 //! every stray atom at least that far from the bonded part and from the faces — no slack. The interaction tails are
-//! monotone in distance in the separated regime, so the nearest pass bounds the measured range; the box term ε_pos
+//! monotone in distance *along a ray* in the separated regime, so the nearest pass bounds the measured range in that
+//! direction only. **Known limit (scoped re-review I1, controller ruling 14, parked):** `reach` and `face` are single
+//! numbers, blind to direction. An induction term is 4× larger on a polar fragment's dipole axis than beside it at the
+//! same r (−αμ²(1 + 3cos²θ)/2r⁶), so a pass beside the axis at 6.05 Bohr admits an answer on the axis at 6.05: for the
+//! H₂O + Mg estimate, −1.5 mHa that no check measured (0.5 mHa per bonded atom, inside the audit tier, so the audit
+//! passes and the sample is released). Likewise a corner d from three faces can carry ~3× the ε_pos of a pass d from
+//! one (≤ ~0.7 mHa for H at d ≥ 5 Bohr). The direction-aware fix — cover a step only when, for some pass, every
+//! stray-to-bonded-atom distance is at least that pass's — is queued, not built. The box term ε_pos
 //! grows toward a face, and a clean check needs about 5 Bohr to a face for an H (`references.md`, "The box"), so the
 //! band between the floor's 4 Bohr and the nearest clean pass is never answered (there the teacher differs from E_ref
 //! by up to ε_pos ≈ 1.8 mHa, and a check cannot be clean).
@@ -1008,7 +1015,10 @@ impl StrayBook {
     /// Forget every region and void mark, keeping the refusals (final review minor 2 and 5, controller ruling 13): a
     /// basis change (the regions live in the old basis's feature space) or a policy change of the check's tolerances
     /// (the regions were cleared under the old ones). A refusal is a measured fact of the teacher (a failed check, a
-    /// failed audit) or the floor's, and stays for the session.
+    /// failed audit) or the floor's, and stays for the session. **Samples a dropped region already released stay in the
+    /// fit** (scoped re-review minor 2, controller ruling 14, parked): after a tightened tolerance they carry composition
+    /// errors up to the old tolerance until a new pass or a failed check holds them; holding the signature here
+    /// (`hold_stray_signature`, as a failed check does) is the queued fix.
     pub(super) fn clear_regions(&mut self) {
         self.map.retain(|_, st| matches!(st, StrayState::Refused(_)));
         self.boxed.clear();
