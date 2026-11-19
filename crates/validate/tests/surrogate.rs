@@ -199,14 +199,11 @@
 //!   background auditor) at H₂ + H 8 Bohr until K = 3 passes clear the signature; at an unchecked bond length the
 //!   provider's own `would_answer` puts inside the region, the step must be the model's and |E_model − E_DFT|/n_bonded
 //!   ≤ the audit tier (`energy_std_per_atom`); then a stretched-bond check through the provider, its verdict and the
-//!   next step's source required to agree. **Fails on this branch (2026-11-19)**: before controller ruling 10 the levels
-//!   test refused at r = 1.434 (↑ box-state LUMOs) and every check at 1.8–2.3 was void (the stray H's empty ↓ channel had
-//!   no level); with ruling 10 (the 27.6 kT window about the scene's μ_σ, one unoccupied level per part channel)
-//!   1.434 and 1.15 pass and 1.75 is refused (the H's empty 1s↓, 25 kT above μ↓, 4.3 mHa lower beside H₂ at every box
-//!   size); with ruling 11 (a 13.8 kT window) all three pass and H₂ + H clears, but the region (a per-feature box of
-//!   oscillating radial features) holds only the checked bonds themselves: `would_answer` refuses at ±0.005 Bohr and at
-//!   every unchecked bond tried (`references.md`, "Stray atoms"). The test prints the provider's verdict around each
-//!   check. `stray_li_beside_f2_is_refused`: the charge-transfer case measured as the check measures it (three clean
+//!   next step's source required to agree. Rulings 10–12 (2026-11-19; `references.md`, "Stray atoms"): the levels test
+//!   compares frontier levels within 13.8 kT of the scene's μ_σ (box states and the far H's empty 1s↓ are outside), each
+//!   part solve asks for one unoccupied level per channel, and a region covers its box or the thinning radius of a
+//!   passed check. Run of record: checks 1.434 / 1.15 / 1.75 clear; r = 1.37 is the model's, |ΔE|/2 = 0.201 mHa; the
+//!   test prints the provider's verdict around each check. `stray_li_beside_f2_is_refused`: the charge-transfer case measured as the check measures it (three clean
 //!   cold solves) at 107³ × 0.15 — F's h_req; the recipe refuses F at 0.20 (asserted) and Li runs all-electron under
 //!   `Accepted` — asserting that the check's energy, force or margin test fails; the provider path is not exercised
 //!   here (a model with Li and F in its basis at that grid costs hours of passes). `stretched_h2_margin_is_reported`:

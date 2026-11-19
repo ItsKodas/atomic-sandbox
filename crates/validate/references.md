@@ -6069,7 +6069,7 @@ The second refit with nothing new: 192.6 → 10.6 s. What is left: `NullSpace::o
   (σ_F: the force std and its epistemic part, per atom.) The relative 3.4e-3 of the first report was a value of 3.7e-6 moving by 1.3e-8: the absolute differences are at most 0.4 % of a tier.
 - **Across machines.** faer picks its SIMD kernels at run time (AVX-512 here, AVX2 elsewhere), so a refit on a CPU with another instruction set differs from this one by the same ~κε spread — never in a verdict measured here, but a golden compares bit for bit only on the same ISA (the thread count never matters: `dense::SPLIT`).
 
-## Stray atoms (plan 2026-11-18 Task 7, 2026-11-19; spec `2026-11-18-stray-atom-composition-design.md` §6; `tests/surrogate.rs` and `tests/dynamics.rs`, release, RX 7900 XTX, teacher GpuKs tol 1e-6, `ionic accepted`, σ = h) — **BLOCKED: H₂ + H does not clear before ruling 11; after it, the cleared region holds only the checked geometries**
+## Stray atoms (plan 2026-11-18 Task 7, 2026-11-19; spec `2026-11-18-stray-atom-composition-design.md` §6; `tests/surrogate.rs` and `tests/dynamics.rs`, release, RX 7900 XTX, teacher GpuKs tol 1e-6, `ionic accepted`, σ = h) — **H₂ + H clears and is answered after rulings 10–12; F₂ + Li refused; NVE re-entry conserves**
 
 Geometry (`common::surrogate::diatomic_and_atom`): the diatomic's centre and the third atom on the cube's body diagonal,
 8 Bohr apart, the diatomic's axis ⊥ the diagonal, placed so the stray atom and the diatomic's outer atoms are equally far
@@ -6164,6 +6164,44 @@ r = 1.434 + 0.001: b2[n=6] 0.8555 ∉ [0.6051, 0.8554], the checked bond sits at
 within the thinning radius of a check is "not distinct", so it queues no check either: it falls back for the session
 and the region never grows to it. The clears test cannot find its fourth geometry, and an NVE run's H₂ (which moves
 off its checked bond at the first step) would never be answered.
+
+**After controller ruling 12 (2026-11-19: a region covers its per-feature box or the thinning radius of a passed check,
+in the distinctness metric) — `stray_h_clears_and_matches_dft` PASSES.** `cargo test -p validate --release --test
+surrogate stray_h_clears_and_matches_dft -- --nocapture` (222 s; pass 272 samples; teacher 280 solves, auditor 8):
+checks at 1.434 / 1.15 / 1.75 pass and clear (residuals 0.089 / 0.074 / 0.105 mHa, margins 282 / 307 / 257 mHa);
+`would_answer` is `Ok` at ±0.005 Bohr around each check. The fourth, unchecked geometry — the first of the candidate
+list the provider answers — is **r = 1.37** (outside the box, within the radius of the 1.434 check): source
+`Surrogate`, the stray-atom note, E_model −1.61377446 Ha.
+
+| quantity | value |
+|---|---|
+| E_DFT − E_model | **+0.4027 mHa** = gap_frag +0.0943 + comp −0.0857 + ε_pos +0.3942 (sum +0.4027) |
+| per bonded atom (asserted ≤ the audit tier 1.000 mHa) | **0.2014 mHa** |
+| worst bonded force difference | 7.86e-5 Ha/Bohr (the policy's bound 2.21e-3) |
+| stray atom: DFT force / model force | 4.64e-4 Ha/Bohr / 0 exactly |
+| then H₂ (2.5) + H through the provider | check passes (residual 0.137 mHa, margin 181 mHa), region grows (4 checks); r = 1.37 still the model's |
+
+The largest term is the stray H's own box term ε_pos (its confinement at 5.4 Bohr from a face against the centre
+reference, +0.39 mHa), as the module doc predicts; the composition itself is −0.09 mHa.
+
+**`stray_h_returning_conserves_energy` (dynamics) — PASSES at 101³ × 0.20.** `cargo test -p validate --release --test
+dynamics stray_h_returning_conserves_energy -- --nocapture` (833 s: pass 296 s, 270 samples; NVE 218 s; the control 288 s).
+The H's path (3.9, s, s), s from +3.9 to −3.9, 0.03 Bohr/step (v 2.90e-3 a.u.), past H₂ (1.434, at rest, at x = −0.6):
+
+| run | phases (steps) | closest | E_conserved drift (bound 2e-4 Ha/ps) | detrended p-p | switches (ΔE_conserved) | booked jumps (check tolerance 1 mHa) |
+|---|---|---|---|---|---|---|
+| **101³ (20 Bohr), asserted** | model 36 → teacher 268 → model 57 | 4.22 Bohr | **+1.085e-5 Ha/ps** (driver +1.13e-5) | 7.44e-6 Ha | +5.6e-9, −3.9e-9 Ha | −0.365 mHa at 5.995 Bohr, +0.458 at 6.010 (both within) |
+| 101³ teacher phase alone | steps 36–303 | | −2.52e-5 Ha/ps (Δ +1.5e-6 Ha) | 8.41e-6 | | |
+| 101³ control (teacher only, same start, 360 steps) | | | +2.80e-5 Ha/ps (Δ +4.8e-6) | 7.05e-6 | | |
+| 81³ (16 Bohr), the first design | model 36 → teacher 288 → model 34 | 3.61 Bohr | **−6.815e-4 Ha/ps (fails)** | 6.43e-5 | +4.6e-8, −5.4e-9 Ha | **+1.444 mHa (beyond)** at 5.995, −0.639 at 6.017 |
+| 81³ teacher phase alone | steps 36–323 | | −5.34e-4 Ha/ps (Δ −6.65e-5 Ha) | 6.82e-5 | | |
+| 81³ control | | | −6.1e-5 Ha/ps (Δ −3.7e-5) | **1.21e-4**, 23 solves "box too small" | | |
+
+The model phases conserve E_conserved to 1e-10 Ha and each switch to ≤ 5e-8 Ha (the `transition_jump` booking); at 81³
+the whole drift was the teacher's own, with the path 4.1 Bohr from the x faces (the floor's edge): the control without
+any surrogate swung 1.2e-4 Ha peak to peak with face-density warnings. At 101³ every atom of the path stays ≥ 6.1 Bohr
+from every face, no teacher solve warns (asserted, the suite's NVE rule), and the run drifts 18× under the bound. The
+81³ entry jump (+1.44 mHa) carried the stray H's box term there; at 101³ both jumps are within the check's tolerance.
 
 **`stray_li_beside_f2_is_refused` — passes** (`cargo test -p validate --release --test surrogate stray_li_beside_f2_is_refused -- --nocapture`;
 3 cold solves, GPU 214 s: scene 68 s, F₂ 15 s, Li 115 s). The recipe refuses F at h = 0.20 ("h_req = 0.15", asserted),
