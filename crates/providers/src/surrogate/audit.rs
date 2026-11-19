@@ -237,8 +237,12 @@ pub(super) struct AuditJob {
     pub(super) shares: Option<Arc<ShareTables>>,
     /// An audit's history flags from the step that dispatched it (`SurrogateKs::dispatch_flags`;
     /// module doc, "The history's flags"): its cadence-fresh and fenced bits. Empty for every other
-    /// kind.
+    /// kind. `TICK` on a calibration tick's audit (`SurrogateKs` module doc, "Calibration ticks").
     pub(super) flags: surrogate::history::PointFlags,
+    /// A calibration tick alone, not rule 8's audit (`SurrogateKs::dispatch_tick_only`): judged as
+    /// an audit, but a box-affected answer does not make rule 8 audit again. False for every other
+    /// kind and for a rule-8 audit that is a tick as well.
+    pub(super) tick_only: bool,
     /// The isolated-atom profiles a [`JobKind::HarrisDisplay`] job superposes (`None` for every
     /// other kind).
     pub(super) harris: Option<Arc<sim::HarrisAtoms>>,
@@ -615,7 +619,8 @@ impl SurrogateKs {
         let view = OrbitalViewRequest { force_every_step: force, ..self.orbital_view.clone() };
         let draft_guess = std::mem::take(&mut self.dispatch_draft_guess);
         let flags = std::mem::take(&mut self.dispatch_flags);
-        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view, interrupt: self.display_interrupt.clone(), core: self.display_core, draft_guess, shares: self.share_tables.clone(), harris, flags };
+        let tick_only = std::mem::take(&mut self.dispatch_tick_only);
+        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view, interrupt: self.display_interrupt.clone(), core: self.display_core, draft_guess, shares: self.share_tables.clone(), harris, flags, tick_only };
         match a.jobs.as_ref().map(|tx| tx.send(job)) {
             Some(Ok(())) => {
                 a.busy = Some(kind);
@@ -626,6 +631,7 @@ impl SurrogateKs {
                 // `side_job_in_flight` would hold forever); the references asked for are answered
                 self.auditor = None;
                 self.audit_due = false;
+                self.skip_tick_in_flight();
                 self.fail_references(None, "the background teacher is gone");
                 self.side_queue.clear();
                 self.harris_queued = None;
@@ -747,6 +753,8 @@ impl SurrogateKs {
         self.failed_audits.clear();
         self.audit_fences.clear();
         self.audit_burst = 0;
+        // an abandoned tick counts as skipped (module doc, "Calibration ticks")
+        self.skip_tick_in_flight();
         self.streak = 0;
         self.streak_reason = None;
         self.streak_gap = None;
@@ -756,23 +764,46 @@ impl SurrogateKs {
 
     /// Hands an audit that fell due to the background auditor (`surrogate` module doc, "Audit"); `false`
     /// when there is none (the audit then runs in the step). A busy auditor defers it to the
-    /// next answered step.
+    /// next answered step. A calibration tick at the step (`dispatch_flags` carries `TICK`; module
+    /// doc, "Calibration ticks") rides on the same job, or is the job alone (`dispatch_tick_only`):
+    /// it never sets or clears rule 8's `audit_due`, and is never deferred — a busy auditor skips it
+    /// (which `evaluate` has already decided before the variance: it dispatches a tick only to a
+    /// free auditor).
     pub(super) fn dispatch_audit(&mut self, scene: &Scene, prov: &Provenance) -> bool {
         let every = self.policy.audit_every;
+        let tick = self.dispatch_flags.has(surrogate::history::PointFlags::TICK);
+        let tick_only = self.dispatch_tick_only;
         let Some(a) = self.auditor.as_ref() else { return false };
         if a.busy.is_some() {
-            self.audit_due = true;
+            if !tick_only {
+                self.audit_due = true;
+            }
+            self.ticks_skipped += u64::from(tick);
             return true;
         }
         self.side_jobs += 1;
         if self.send_job(scene.clone(), prov.clone(), JobKind::Audit, self.side_jobs, None) {
-            self.audit_due = false;
-            self.pending_notes.push(format!("surrogate audit dispatched to the background teacher (every {every} answered steps; the model answers meanwhile)"));
+            if !tick_only {
+                self.audit_due = false;
+                self.pending_notes.push(format!("surrogate audit dispatched to the background teacher (every {every} answered steps; the model answers meanwhile)"));
+            }
+            if tick {
+                self.tick_in_flight = true;
+                self.pending_notes.push(format!("surrogate calibration tick dispatched to the background teacher (every {} in-envelope steps; the model answers meanwhile)", self.tick_every));
+            }
             true
         } else {
             // the thread is gone (`send_job` dropped it): audit in the step from now on
             self.side_jobs -= 1;
             false
+        }
+    }
+
+    /// A calibration tick's job on the auditor will not be judged — abandoned by a Forget or an
+    /// installed model, or its thread gone: counted as skipped (module doc, "Calibration ticks").
+    pub(super) fn skip_tick_in_flight(&mut self) {
+        if std::mem::take(&mut self.tick_in_flight) {
+            self.ticks_skipped += 1;
         }
     }
 
@@ -799,6 +830,7 @@ impl SurrogateKs {
                 let busy = a.busy;
                 self.auditor = None;
                 self.audit_due = false;
+                self.skip_tick_in_flight();
                 self.fail_references(busy, "the background teacher stopped");
                 // nothing queued can run any more (review minor 4)
                 self.side_queue.clear();
@@ -844,6 +876,12 @@ impl SurrogateKs {
             return; // the model it was for was forgotten or replaced
         }
         let positions = || ans.job.scene.nuclei.iter().map(|n| n.pos).collect::<Vec<[f64; 3]>>();
+        // a calibration tick's answer, of this generation (an older one's was counted skipped when
+        // it was abandoned): taken once judged, else skipped (module doc, "Calibration ticks")
+        let tick = ans.job.kind == JobKind::Audit && ans.job.flags.has(surrogate::history::PointFlags::TICK);
+        if tick {
+            self.tick_in_flight = false;
+        }
         match (ans.job.kind, ans.result) {
             (JobKind::Atom(z), Ok(Solved { display: Some(d), .. })) => return self.atom_densities.push((z, d)),
             (JobKind::Refresh, Ok(Solved { display: Some(d), orbitals, .. })) => {
@@ -882,13 +920,21 @@ impl SurrogateKs {
                 ev.solve_ms = ans.ms;
                 ev.audit_lag = Some(self.answered.saturating_sub(ans.job.answered));
                 self.push_event(ev);
+                self.ticks_skipped += u64::from(tick);
                 return self.pending_notes.push(note);
             }
             (JobKind::Audit, Ok(Solved { energy, forces, face, multiplicity, display, orbitals, unfit })) => {
                 if let Some(d) = display {
                     self.side_display = Some(SideDisplay { display: Some(d), orbitals, kind: SideKind::Audit, job: ans.job.id, positions: positions() });
                 }
-                self.judge_audit(ans.job, energy, forces, face, multiplicity, unfit, ans.ms, ans.scf_steps, ans.ts);
+                let judged = self.judge_audit(ans.job, energy, forces, face, multiplicity, unfit, ans.ms, ans.scf_steps, ans.ts);
+                if tick {
+                    if judged {
+                        self.ticks_taken += 1;
+                    } else {
+                        self.ticks_skipped += 1;
+                    }
+                }
             }
         }
     }
@@ -896,11 +942,13 @@ impl SurrogateKs {
     /// A background audit's verdict (`surrogate` module doc, "Audit"): the sample is admitted like any
     /// teacher answer, the gap recorded; a failed audit untrusts the model and books the flip at
     /// the next evaluation. One activity event either way: judged (the verdict, the admission's
-    /// outcome) or discarded (plan review S11).
+    /// outcome) or discarded (plan review S11). Returns whether the answer was judged (a verdict
+    /// taken, box-affected included): `false` when discarded (the model changed settings or
+    /// species) or inside a fenced shell band — what a calibration tick's count reads.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, multiplicity: Option<u32>, unfit: Option<&str>, ms: f64, scf_steps: Option<usize>, ts: Option<f64>) {
+    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, multiplicity: Option<u32>, unfit: Option<&str>, ms: f64, scf_steps: Option<usize>, ts: Option<f64>) -> bool {
         let unaudited = self.answered.saturating_sub(job.answered);
-        let AuditJob { scene, prov, draft_guess, flags: dispatched, .. } = job;
+        let AuditJob { scene, prov, draft_guess, flags: dispatched, tick_only, .. } = job;
         let tag = if draft_guess { SampleTag::DraftAudit } else { SampleTag::Audit };
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
@@ -927,7 +975,7 @@ impl SurrogateKs {
             ev.audit_lag = Some(unaudited);
             self.push_event(ev);
             self.pending_notes.push(note.into());
-            return;
+            return false;
         };
         // inside a fenced shell band (the shell fence; final review I1, the coordinator's ruling):
         // strict mode refuses the geometry, so the answer is no judgement of the model — not
@@ -945,7 +993,7 @@ impl SurrogateKs {
             ev.audit_lag = Some(unaudited);
             self.push_event(ev);
             self.pending_notes.push(note);
-            return;
+            return false;
         }
         let n = pos.len().max(1) as f64;
         let gap = energy - pred.energy;
@@ -976,8 +1024,9 @@ impl SurrogateKs {
         notes.insert(0, match verdict {
             AuditVerdict::Passed => format!("surrogate audit passed (background teacher, judged {unaudited} answered steps after its dispatch): teacher − model {gap:+.2e} Ha"),
             AuditVerdict::BoxAffected => format!(
-                "surrogate audit not judged: the teacher's answer is box-affected (face density {:.1e} > {rule:.1e}) — its teacher − model {gap:+.2e} Ha is the box's confinement as much as the model's error; the next answered step is audited again",
-                box_rho.unwrap_or(0.0)
+                "surrogate audit not judged: the teacher's answer is box-affected (face density {:.1e} > {rule:.1e}) — its teacher − model {gap:+.2e} Ha is the box's confinement as much as the model's error{}",
+                box_rho.unwrap_or(0.0),
+                if tick_only { " (a calibration tick: rule 8's cadence is unchanged)" } else { "; the next answered step is audited again" }
             ),
             // a draft guess's audit (a geometry strict mode refuses): recorded, held out of the
             // strict fit, and not a verdict on the strict model (module doc, "Draft mode")
@@ -1009,12 +1058,16 @@ impl SurrogateKs {
         self.last_audit_fit = self.fits;
         // a box-affected audit judged nothing (M8a Task 2, the Task 1 physics review's I4): it
         // does not satisfy the cadence — the next answered step dispatches another — and the
-        // checklist counts it; the model's surface and trust are untouched (the gap is the box's)
-        if verdict == AuditVerdict::BoxAffected {
-            self.audit_due = true;
-            self.box_audits_unjudged += 1;
-        } else {
-            self.box_audits_unjudged = 0;
+        // checklist counts it; the model's surface and trust are untouched (the gap is the box's).
+        // A calibration tick alone is not rule 8's audit: neither satisfied nor missed, its cadence
+        // and the checklist's count stay as they were (module doc, "Calibration ticks")
+        match (tick_only, verdict == AuditVerdict::BoxAffected) {
+            (true, _) => {}
+            (false, true) => {
+                self.audit_due = true;
+                self.box_audits_unjudged += 1;
+            }
+            (false, false) => self.box_audits_unjudged = 0,
         }
         // the history's point (M8a Task 1)
         let stds = match (pred.energy_std, pred.force_std.as_ref(), pred.force_std_epistemic.as_ref()) {
@@ -1036,6 +1089,7 @@ impl SurrogateKs {
         ev.audit_lag = Some(unaudited);
         self.push_event(ev);
         self.pending_notes.extend(notes);
+        true
     }
 }
 

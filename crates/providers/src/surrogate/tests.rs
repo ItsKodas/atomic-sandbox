@@ -3534,6 +3534,9 @@ fn one_tail_sample_no_longer_lets_a_free_atom_in() {
 /// largest per-step change, Verlet's, switches).
 fn excursion(dt: f64, live: &dyn Fn() -> Box<dyn ForceProvider>) -> (f64, f64, f64, f64, usize, f64, f64) {
     let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    // no in-step audits, as `audit_every` 0 says: the calibration ticks (trust tightening Task 7)
+    // are in-step audits here too (no auditor), and the run measures the envelope's switches alone
+    s.tick_every = 0;
     s.teacher = live();
     let mut probe = live();
     let mut scene = h2(2.0);
@@ -3801,11 +3804,15 @@ fn a_noisy_fit_loses_trust_recovers_and_a_clean_one_never_cycles() {
     // a clean model near equilibrium: answered on every consultation, no cycle
     s.discontinuity();
     let mut answered = 0;
+    let ticks0 = s.ticks_in_step();
     for k in 0..200 {
         let r = 1.4 + 0.08 * (k as f64 * 0.3).sin();
         answered += (s.evaluate(&h2(r), &mut never()).unwrap().stats.source == Source::Surrogate) as usize;
     }
-    assert_eq!(answered, 200);
+    // (trust tightening Task 7) every 25th in-envelope step is a calibration tick served in the
+    // step (no auditor): 8 of the 200, the rest answered
+    let ticks = s.ticks_in_step() - ticks0;
+    assert_eq!((answered, ticks), (200 - 8, 8));
 }
 
 // ---- M6 Task 11 round 2 (controller ruling on concern 1): unspanned directions, the
@@ -4540,6 +4547,10 @@ fn scripted_session_with(views: bool) -> String {
     let mut t = String::new();
     let policy = FallbackPolicy { audit_every: 7, ..FallbackPolicy::default() };
     let mut s = SurrogateKs::new(Box::new(SessionMorse), policy).with_teacher_tol(1e-6);
+    // the decisions pinned before the calibration ticks (trust tightening Task 7): with ticks off
+    // the golden is unchanged, so moving the envelope, class and fences ahead of the variance moved
+    // nothing; the ticks themselves are pinned by their own tests (`…tick…`)
+    s.tick_every = 0;
     for (i, r) in [1.5, 1.55, 1.6].into_iter().enumerate() {
         peek(&mut s, Some(&h2(r)));
         let out = s.evaluate(&h2(r), &mut never());
@@ -4630,7 +4641,7 @@ fn scripted_session_with(views: bool) -> String {
     let (mut s, h, _open, _calls) = with_gated_auditor(0, 0.0);
     let answer = |s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>| {
         let generation = s.auditor.as_ref().expect("an auditor").generation.load(Ordering::Relaxed);
-        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: Default::default() };
+        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: Default::default(), tick_only: false };
         AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps: None, ts: None }
     };
     let mut teacher = MorseDimer::h2();
@@ -5036,7 +5047,7 @@ fn solved(r: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>)
 /// fields; the tests below hand its answer to `handle_answer` directly).
 fn audit_answer(s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>) -> AuditAnswer {
     let generation = s.auditor.as_ref().expect("an auditor").generation();
-    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: Default::default() };
+    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: Default::default(), tick_only: false };
     let scf_steps = result.is_ok().then_some(5);
     AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps, ts: None }
 }
@@ -5804,6 +5815,9 @@ fn pos_z(sc: &Scene) -> (Vec<[f64; 3]>, Vec<u8>) {
 fn would_answer_agrees_with_evaluate() {
     let policy = FallbackPolicy { variance_cadence: 1, audit_every: 0, ..FallbackPolicy::default() };
     let (mut s, h) = trained(1.2, 2.2, 120, policy);
+    // no in-step audits, as `audit_every` 0 says: `would_answer` is the answer decision, and a
+    // calibration tick (trust tightening Task 7) is an in-step audit on top of an answer here
+    s.tick_every = 0;
     let mut rng = StdRng::seed_from_u64(0x5EED);
     let mut scenes = Vec::new();
     for _ in 0..150 {
@@ -8466,7 +8480,7 @@ fn nothing_inside_a_fenced_band_is_fitted_or_judged() {
     // a background audit landing in the band, its answer 0.5 Ha off the model
     let scene = h2(5.5);
     let prov = s.provenance_for(&scene);
-    let job = AuditJob { scene, prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: Default::default() };
+    let job = AuditJob { scene, prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: Default::default(), tick_only: false };
     s.judge_audit(job, t.energy - 0.5, t.forces.clone(), None, None, None, 1.0, Some(10), None);
     let note = s.pending_notes.last().cloned().unwrap_or_default();
     println!("{note}");
@@ -8492,7 +8506,7 @@ fn judged_audits_are_recorded_in_the_history() {
     let (pos, z) = pos_z(&scene);
     let pred = s.model().unwrap().predict(&pos, &z, true).unwrap();
     let prov = s.provenance_for(&scene);
-    let job = || AuditJob { scene: scene.clone(), prov: prov.clone(), generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: Default::default() };
+    let job = || AuditJob { scene: scene.clone(), prov: prov.clone(), generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: Default::default(), tick_only: false };
     s.judge_audit(job(), t.energy, t.forces.clone(), None, None, None, 1.0, Some(10), None);
     assert_eq!(s.audit_history().len(), 1);
     let p = s.audit_history().iter().next().unwrap().clone();
@@ -8974,7 +8988,10 @@ fn a_class_refused_for_one_outlier_earns_the_calibrated_verdict_and_holds() {
     // refits every 10 steps, each a new fit id: the 12th fit stands at steps 110-119 and the refit at 119 meets
     // the floor; every step before entry falls back, every step after is answered (it holds)
     assert_eq!(first, Some(10 * calibrate::FLOOR_FITS - 1), "the floor: the 12th fit's comparisons open it");
-    assert_eq!(answered, 200 - (first.unwrap() + 1), "every step after entry is answered");
+    // (trust tightening Task 7) every step after entry is answered, but every 25th in-envelope one
+    // is a calibration tick served in the step (no auditor): 80 steps, 3 ticks
+    assert_eq!(s.ticks_in_step(), ((200 - (first.unwrap() + 1)) / TICK_EVERY) as u64, "the ticks after entry");
+    assert_eq!(answered + s.ticks_in_step() as usize, 200 - (first.unwrap() + 1), "every step after entry is answered or a tick");
 }
 
 /// The hysteresis memory through the provider (M8a Task 2, `class_memory`): the verdict a refit
@@ -9351,7 +9368,10 @@ fn a_compressed_trimer_does_not_flip_the_many_body_verdict() {
     // as the outlier test: the 12th fit's refit at step 119 meets the floor; every step after entry is answered
     let first = verdicts.iter().position(|&t| t);
     assert_eq!(first, Some(10 * calibrate::FLOOR_FITS - 1), "the floor: the 12th fit's comparisons open it");
-    assert_eq!(answered, 200 - (first.unwrap() + 1), "every step after entry is answered");
+    // (trust tightening Task 7) every step after entry is answered, but every 25th in-envelope one
+    // is a calibration tick served in the step (no auditor): 80 steps, 3 ticks
+    assert_eq!(s.ticks_in_step(), ((200 - (first.unwrap() + 1)) / TICK_EVERY) as u64, "the ticks after entry");
+    assert_eq!(answered + s.ticks_in_step() as usize, 200 - (first.unwrap() + 1), "every step after entry is answered or a tick");
 }
 
 
@@ -12342,7 +12362,7 @@ fn the_recorded_epistemic_energy_std_matches_the_prediction() {
     let want = expected(&b, &sc);
     let ta = MorseDimer::h2().evaluate(&sc, &mut never()).unwrap();
     let prov = b.provenance_for(&sc);
-    let job = AuditJob { scene: sc.clone(), prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: PointFlags(PointFlags::CADENCE_FRESH) };
+    let job = AuditJob { scene: sc.clone(), prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: PointFlags(PointFlags::CADENCE_FRESH), tick_only: false };
     b.judge_audit(job, ta.energy, ta.forces.clone(), None, None, None, 1.0, Some(10), None);
     let p = last_point(&b);
     assert_eq!((p.kind, p.flags), (PointKind::Audit, PointFlags(PointFlags::CADENCE_FRESH)));
@@ -12409,7 +12429,7 @@ fn a_judged_audit_carries_its_fit_and_its_kept_answer_makes_the_next_fit() {
     let audit = |s: &mut SurrogateKs, sc: &Scene, flags: PointFlags| {
         let t = MorseDimer::h2().evaluate(sc, &mut never()).unwrap();
         let prov = s.provenance_for(sc);
-        let job = AuditJob { scene: sc.clone(), prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags };
+        let job = AuditJob { scene: sc.clone(), prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags, tick_only: false };
         s.judge_audit(job, t.energy, t.forces.clone(), None, None, None, 1.0, Some(10), None);
     };
     let samples = s.samples();
@@ -13368,8 +13388,12 @@ fn a_nan_inflation_refuses() {
 /// locked steps keep leaving history points (code 24, not in P_A: the factor never reads its own
 /// refusals), a tick at one of them would be in P_A, and recalibrating on them changes nothing.
 /// Once 300 newer answer-sample points have moved the window past the bad tick, the next
-/// calibration lifts λ_T and the step is answered again. (Ticks are generated from plan Task 7
-/// on; here they are recorded as Task 7 records them.)
+/// calibration lifts λ_T and the step is answered again. The ticks here are pushed by hand; the
+/// same lock on ticks `evaluate` takes is `a_key_locked_by_its_tail_inflation_keeps_measuring_on_real_ticks`
+/// (Task 7). This version is kept for what the real one cannot reach: the per-atom verdicts
+/// (`atom_verdicts`) of the locked key, and a lift whose newer window meets the evidence floor
+/// (300 ticks over 16 fits, so λ_T's rms condition applies; a real run of locked steps carries one
+/// or two fit ids).
 #[test]
 fn a_key_locked_by_its_tail_inflation_says_so_and_keeps_measuring() {
     use sim::activity::TeachRule as R;
@@ -13545,4 +13569,423 @@ fn rule_6_applies_each_atoms_own_tail_inflation() {
     let v = s.variance_check(&model, &pred, e, &f, &pos, &z).atoms;
     assert_eq!((v[0], v[2]), (f64::INFINITY, f64::INFINITY), "the pair atoms: {v:?}");
     assert_eq!(v[1].to_bits(), base[1].to_bits(), "the many-body atom keeps its own factor: {v:?}");
+}
+
+// ---- trust tightening Task 7 (spec 2026-11-18 §4): calibration ticks ----
+
+/// The tick tests' step `i`: an in-envelope dimer at 1.5, 1.6 or 1.7 Bohr, and on every 10th step
+/// H₂ at 4.0 Bohr, which rule 5c refuses (outside the envelope: not counted toward a tick).
+fn tick_scene(i: usize) -> Scene {
+    if i % 10 == 9 {
+        h2(4.0)
+    } else {
+        h2(1.5 + 0.1 * (i % 3) as f64)
+    }
+}
+
+/// The steps among the first `n` of [`tick_scene`] at which every `every`-th in-envelope step falls.
+fn expected_tick_steps(n: usize, every: usize) -> Vec<usize> {
+    let mut c = 0;
+    (0..n)
+        .filter(|&i| {
+            if i % 10 == 9 {
+                return false;
+            }
+            c += 1;
+            c % every == 0
+        })
+        .collect()
+}
+
+/// The tick tests' dimer model: [`trained`] on 40 Morse dimers r ∈ [1.2, 2.2] (its pair class judged
+/// and trusted), rule 8 every `audit_every` answered steps, its epistemic stds scaled so the
+/// largest rule-6/7 ratio over the in-envelope [`tick_scene`]s is 0.5 of the limit and the smallest
+/// above 0.1 — every one of them answered at ×1 and refused at ×10.
+fn tick_fixture(audit_every: usize) -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
+    let (mut s, h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every, ..FallbackPolicy::default() });
+    assert!(s.class_judge.is_some() && s.class_loo()[0].trusted, "the premise: a judged, trusted pair class");
+    let ratio = |s: &SurrogateKs, i: usize| {
+        let (r6, r7, _) = sum_ratios(s, &tick_scene(i));
+        r6.max(r7)
+    };
+    let worst = (0..3).map(|i| ratio(&s, i)).fold(0.0, f64::max);
+    scale_epistemic(&mut s, 0.5 / worst);
+    let least = (0..3).map(|i| ratio(&s, i)).fold(f64::INFINITY, f64::min);
+    assert!(least > 0.1, "the premise: ×10 refuses every in-envelope scene ({least})");
+    s.last_variance = None;
+    (s, h)
+}
+
+/// A gated auditor on the fixture's teacher (`Gated`): (the provider, the gate, its call count).
+#[allow(clippy::type_complexity)]
+fn with_tick_auditor(s: SurrogateKs, h: &Arc<Mutex<MorseDimer>>, open: bool) -> (SurrogateKs, Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicUsize>) {
+    let gate = Arc::new(std::sync::atomic::AtomicBool::new(open));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let auditor = Gated { inner: h.clone(), open: gate.clone(), rho: 0.0, calls: calls.clone() };
+    (s.with_auditor(Box::new(auditor)), gate, calls)
+}
+
+/// Waits (≤ 5 s) until the auditor has no job in flight and its answer is taken in (held for the
+/// next `evaluate`, or handled), so every step of a test sees a free auditor.
+fn settle(s: &mut SurrogateKs) {
+    let t0 = Instant::now();
+    while s.auditor.as_ref().is_some_and(|a| a.busy.is_some()) {
+        assert!(t0.elapsed().as_secs_f64() < 5.0, "the auditor did not answer within 5 s");
+        s.poll_side_jobs();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// One step: its source, its notes, and the history points it left (newest last).
+fn tick_step(s: &mut SurrogateKs, sc: &Scene) -> (Source, Vec<String>, Vec<surrogate::AuditPoint>) {
+    let before = s.audit_history().recorded();
+    let r = s.evaluate(sc, &mut never()).unwrap();
+    let new = (s.audit_history().recorded() - before) as usize;
+    let mut points: Vec<surrogate::AuditPoint> = s.audit_history().iter().rev().take(new).cloned().collect();
+    points.reverse();
+    (r.stats.source, r.stats.notes, points)
+}
+
+/// Spec §4 ("Ticks on their own cadence"), test 10: the tick decision never reads the std. Every
+/// 25th in-envelope step is a tick — steps 26, 54 and 82 of 100, the 4.0 Bohr steps (rule 5c) not
+/// counted.
+/// - **No auditor**, σ ×1 (every in-envelope step answered) and ×10 (none answered): the same tick
+///   steps; at ×1 each is served **in the step** (an audit point with `TICK`, one teacher solve, the
+///   tick's own note), at ×10 at the fallback (its point with `TICK`, no extra solve). Every tick
+///   point is in P_A and carries the stds the tick forces.
+/// - **A busy auditor** (a display job held at its gate), ×1 for 50 steps then ×10: every due tick
+///   is skipped and counted — the one at an answered step and the two at fallbacks alike — none is
+///   served in the step (answered steps stay the model's, no extra teacher solve) and none leaves a
+///   `TICK` point.
+/// - **A free auditor**, ×1: the ticks go to it (the model answers, no in-step solve), and each
+///   comes back as a judged audit point with `TICK`.
+#[test]
+fn a_calibration_tick_does_not_read_the_std() {
+    use std::sync::atomic::Ordering::SeqCst;
+    use surrogate::history::{PointFlags, PointKind};
+    let n = 100;
+    let want = expected_tick_steps(n, TICK_EVERY);
+    assert_eq!(want, [26, 54, 82]);
+    let tick_of = |points: &[surrogate::AuditPoint]| points.iter().find(|p| p.flags.has(PointFlags::TICK)).cloned();
+    // no auditor
+    for scale in [1.0, 10.0] {
+        let (mut s, h) = tick_fixture(0);
+        scale_epistemic(&mut s, scale);
+        let mut ticks = Vec::new();
+        for i in 0..n {
+            let calls0 = calls(&h);
+            let (src, notes, points) = tick_step(&mut s, &tick_scene(i));
+            if i % 10 == 9 {
+                assert_eq!(src, Source::Fallback, "the envelope refuses 4.0 Bohr: {notes:?}");
+            } else {
+                assert_eq!(src == Source::Surrogate, scale == 1.0 && !want.contains(&i), "step {i} at ×{scale}: {notes:?}");
+            }
+            let Some(p) = tick_of(&points) else { continue };
+            ticks.push(i);
+            assert!(calibrate::in_answer_sample(&p) && p.energy_std_epistemic.is_some() && p.pred_force_std_epistemic.len() == 2, "step {i}: {p:?}");
+            assert_eq!(calls(&h), calls0 + 1, "one teacher solve at step {i}");
+            if scale == 1.0 {
+                assert!(p.kind == PointKind::Audit && notes[0].starts_with("surrogate calibration tick (every 25 in-envelope steps"), "in the step: {notes:?}");
+            } else {
+                assert!(matches!(p.kind, PointKind::Fallback { rule } if rule != HISTORY_RULE_TAIL_INFLATION), "at the fallback: {p:?}");
+            }
+        }
+        println!("×{scale}: tick steps {ticks:?}, taken {} skipped {} in the step {}", s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step());
+        assert_eq!(ticks, want, "×{scale}: the same steps");
+        assert_eq!((s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step()), (3, 0, if scale == 1.0 { 3 } else { 0 }));
+    }
+    // a busy auditor: skipped whatever answers the step
+    let (s, h) = tick_fixture(0);
+    let (mut s, gate, auditor_calls) = with_tick_auditor(s, &h, false);
+    assert!(s.request_display(&h2(1.6)) && !s.auditor_idle(), "the premise: the auditor is busy");
+    assert!(want.iter().any(|&i| i < 50) && want.iter().any(|&i| i >= 50), "ticks fall at answered and refused steps");
+    for i in 0..n {
+        if i == 50 {
+            scale_epistemic(&mut s, 10.0);
+            s.last_variance = None;
+        }
+        let calls0 = calls(&h);
+        let (src, notes, points) = tick_step(&mut s, &tick_scene(i));
+        assert!(tick_of(&points).is_none(), "step {i}: no tick while the auditor is busy");
+        if i % 10 != 9 {
+            let answered = i < 50;
+            assert_eq!(src == Source::Surrogate, answered, "step {i}: never served in the step ({notes:?})");
+            assert_eq!(calls(&h), calls0 + usize::from(!answered), "step {i}: no extra teacher solve");
+        }
+    }
+    println!("busy: taken {} skipped {} in the step {}", s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step());
+    assert_eq!((s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step()), (0, 3, 0));
+    assert_eq!(auditor_calls.load(SeqCst), 0);
+    gate.store(true, SeqCst);
+    // a free auditor: the answered steps' ticks go to it
+    let (s, h) = tick_fixture(0);
+    let (mut s, _gate, _) = with_tick_auditor(s, &h, true);
+    let (mut dispatched, mut judged) = (Vec::new(), 0);
+    for i in 0..n + 1 {
+        settle(&mut s);
+        let calls0 = calls(&h);
+        let (src, notes, points) = tick_step(&mut s, &tick_scene(i));
+        if notes.iter().any(|n| n.starts_with("surrogate calibration tick dispatched to the background teacher (every 25 in-envelope steps")) {
+            dispatched.push(i);
+            assert_eq!((src, calls(&h)), (Source::Surrogate, calls0), "step {i}: the model answers");
+        }
+        if let Some(p) = tick_of(&points) {
+            assert!(p.kind == PointKind::Audit && calibrate::in_answer_sample(&p), "{p:?}");
+            judged += 1;
+        }
+    }
+    assert_eq!((dispatched, judged), (want.clone(), 3));
+    assert_eq!((s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step()), (3, 0, 0));
+}
+
+/// Review Focus 4 (calibration starves at full speed): with the auditor kept busy, 100 due ticks give
+/// 100 skips — `ticks_skipped()` = 100, the Model tab's "calibration checks skipped" (Task 8) — and
+/// none is served in the step: all 2500 in-envelope steps are the model's, no teacher solve, no
+/// history point.
+#[test]
+fn skipped_ticks_are_counted_and_shown() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (s, h) = tick_fixture(0);
+    let (mut s, gate, auditor_calls) = with_tick_auditor(s, &h, false);
+    assert!(s.request_display(&h2(1.6)) && !s.auditor_idle(), "the premise: the auditor is busy");
+    let calls0 = calls(&h);
+    for i in 0..100 * TICK_EVERY {
+        let r = s.evaluate(&h2(1.5 + 0.1 * (i % 3) as f64), &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Surrogate, "step {i}: {:?}", r.stats.notes);
+    }
+    println!("taken {} skipped {} in the step {}", s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step());
+    assert_eq!((s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step()), (0, 100, 0));
+    assert_eq!((calls(&h), s.audit_history().recorded(), auditor_calls.load(SeqCst)), (calls0, 0, 0));
+    gate.store(true, SeqCst);
+}
+
+/// Spec §4: rule 8's own cadence is unchanged by the ticks. 150 steps of [`tick_scene`] with rule 8
+/// every 10 answered steps, ticks on (every 25 in-envelope steps: 5 of them, two on a rule-8 step,
+/// where one audit serves both) and off: rule 8 falls due on the same steps and the answered count
+/// ends equal — in the step (no auditor) and on a free auditor alike.
+#[test]
+fn rule_8s_cadence_is_unchanged_by_ticks() {
+    for asynchronous in [false, true] {
+        let mut runs = Vec::new();
+        for every in [TICK_EVERY, 0] {
+            let (mut s, h) = tick_fixture(10);
+            s.tick_every = every;
+            let mut s = if asynchronous { with_tick_auditor(s, &h, true).0 } else { s };
+            let mut rule_8 = Vec::new();
+            for i in 0..150 {
+                settle(&mut s);
+                let r = s.evaluate(&tick_scene(i), &mut never()).unwrap();
+                let notes = &r.stats.notes;
+                let due = match asynchronous {
+                    true => notes.iter().any(|n| n.starts_with("surrogate audit dispatched to the background teacher (every 10 answered steps")),
+                    false => notes.first().is_some_and(|n| n.starts_with("surrogate audit (every 10 answered steps)")),
+                };
+                if due {
+                    rule_8.push(i);
+                }
+            }
+            settle(&mut s);
+            println!("asynchronous {asynchronous}, ticks every {every}: rule 8 at {rule_8:?}, answered {}; ticks taken {}", s.answered, s.ticks_taken());
+            assert_eq!(s.ticks_taken(), if every > 0 { 5 } else { 0 });
+            assert_eq!(s.ticks_skipped(), 0);
+            runs.push((rule_8, s.answered));
+        }
+        assert_eq!(runs[0].0.len(), 13, "the premise: 135 answered steps, rule 8 at every 10th");
+        assert_eq!(runs[0], runs[1], "asynchronous {asynchronous}: rule 8's steps with ticks on and off");
+    }
+}
+
+/// The Task 5 review's carried MUST: a tick off the variance cadence forces the novelty (5d) and the
+/// stds for its point, read-only. H₂ + H under an H₂-only model (the spread envelope and 5e off, as
+/// in `a_novel_geometry_is_flagged_…`), its classes held trusted, on a reused accepting verdict off
+/// the cadence (count 13, k = 4): as a tick the step is an in-step audit whose point carries `TICK`
+/// and `NOVEL` (not cadence-fresh) with its stds, and is **not** in P_A; not a tick, the model
+/// answers and nothing is recorded. The verdict is reused either way (no variance check is
+/// counted): nothing decided moves.
+#[test]
+fn an_off_cadence_tick_records_the_novelty_and_the_stds() {
+    use surrogate::history::{PointFlags, PointKind};
+    let mut s = dimer_model_three_atom_teacher();
+    s.set_policy(FallbackPolicy { max_descriptor_distance: f64::INFINITY, audit_every: 0, variance_cadence: 4, ..FallbackPolicy::default() });
+    s.active_set = None;
+    s.ensure_desc_cache();
+    // every class trusted, so rule 4b does not refuse (without a class judge a key answers by its
+    // class's verdict)
+    s.class_judge = None;
+    for c in &mut s.class_loo {
+        (c.trusted, c.refusal) = (true, None);
+        for k in &mut c.species {
+            (k.trusted, k.refusal) = (true, None);
+        }
+    }
+    let sc = h2_plus_h(3.0);
+    let (pos, z) = pos_z(&sc);
+    let nu = s.null_space.as_ref().unwrap().novelty(&pos, &z).unwrap().0;
+    assert!(nu > 1.0, "the premise: novel (ν {nu:.2e})");
+    for tick in [false, true] {
+        // an accepting verdict at `sc`, as a reused one would be, off the cadence
+        let model = s.model().unwrap().clone();
+        let pred = model.predict(&pos, &z, true).unwrap();
+        let mut v = s.variance_check(&model, &pred, pred.energy_std.unwrap(), pred.force_std_epistemic.as_ref().unwrap(), &pos, &z);
+        (v.accept, v.reason, v.novel) = (true, None, false);
+        s.last_variance = Some(v);
+        s.verdict_counts = neighbour_counts(&pos, model.basis.r_cut * model.basis.r_cut);
+        s.consults = 0;
+        s.cadence_steps = 13;
+        s.tick_steps = if tick { TICK_EVERY as u64 - 1 } else { 0 };
+        let checks = s.variance_checks();
+        let (src, notes, points) = tick_step(&mut s, &sc);
+        println!("tick {tick}: {src:?} {notes:?} {points:?}");
+        assert_eq!(s.variance_checks(), checks, "the verdict was reused");
+        if !tick {
+            assert!(src == Source::Surrogate && points.is_empty(), "answered, nothing recorded");
+            continue;
+        }
+        let [p] = &points[..] else { panic!("one point: {points:?}") };
+        assert_eq!((src, p.kind), (Source::Fallback, PointKind::Audit), "{notes:?}");
+        assert_eq!(p.flags, PointFlags(PointFlags::TICK | PointFlags::NOVEL), "{p:?}");
+        assert!(p.energy_std_epistemic.is_some() && p.pred_force_std_epistemic.len() == 3, "the stds: {p:?}");
+        assert!(!calibrate::in_answer_sample(p), "a novel tick is not in P_A");
+        assert_eq!((s.ticks_taken(), s.ticks_in_step()), (1, 1));
+    }
+}
+
+/// The Task 5 review's carried MUST: a tick in draft mode never sets `TICK` (draft points stay out
+/// of P_A). In draft mode, with a free auditor and rule 8 every 5 steps, 100 steps at ×10 (strict
+/// mode would refuse every in-envelope one: the draft audits are ordinary, recorded audits): no
+/// tick is due, taken or skipped, the count does not move, and no recorded point carries `TICK`.
+/// Back in strict mode the count starts where it stood: the first tick is the 25th strict
+/// in-envelope step.
+#[test]
+fn a_tick_in_draft_mode_is_never_taken() {
+    use surrogate::history::PointFlags;
+    let (s, h) = tick_fixture(5);
+    let (mut s, _gate, _) = with_tick_auditor(s, &h, true);
+    scale_epistemic(&mut s, 10.0);
+    let strict = *s.policy();
+    s.set_policy(FallbackPolicy { never_fallback: true, ..strict });
+    let mut recorded = 0;
+    for i in 0..100 {
+        settle(&mut s);
+        let (src, notes, points) = tick_step(&mut s, &tick_scene(i));
+        assert_eq!(src, Source::Surrogate, "draft: {notes:?}");
+        assert!(points.iter().all(|p| !p.flags.has(PointFlags::TICK)), "{points:?}");
+        recorded += points.len();
+    }
+    settle(&mut s);
+    println!("draft: {recorded} points recorded; tick count {}", s.tick_steps);
+    assert!(recorded > 0, "the premise: draft audits were recorded");
+    assert_eq!((s.tick_steps, s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step()), (0, 0, 0, 0));
+    s.set_policy(strict);
+    let mut first = None;
+    for i in 0..30 {
+        settle(&mut s);
+        let (_, _, points) = tick_step(&mut s, &h2(1.5 + 0.1 * (i % 3) as f64));
+        if first.is_none() && points.iter().any(|p| p.flags.has(PointFlags::TICK)) {
+            first = Some(i);
+        }
+    }
+    assert_eq!(first, Some(TICK_EVERY - 1), "strict: the 25th in-envelope step");
+}
+
+/// Spec §4 (Task 7 brief): an abandoned tick job counts as skipped. A tick dispatched to an auditor
+/// held at its gate is in flight (counted neither way); a Forget abandons it — one skip, and its
+/// answer, arriving once the gate opens, is discarded and counted no further. Unabandoned, the same
+/// tick is taken once its answer is judged (an audit point carrying `TICK`).
+#[test]
+fn an_abandoned_tick_counts_as_skipped() {
+    use std::sync::atomic::Ordering::SeqCst;
+    use surrogate::history::{PointFlags, PointKind};
+    for forget in [true, false] {
+        let (s, h) = tick_fixture(0);
+        let (mut s, gate, auditor_calls) = with_tick_auditor(s, &h, false);
+        s.tick_steps = TICK_EVERY as u64 - 1;
+        let (src, notes, _) = tick_step(&mut s, &h2(1.6));
+        assert!(src == Source::Surrogate && notes.iter().any(|n| n.starts_with("surrogate calibration tick dispatched")), "{notes:?}");
+        assert!(s.audit_in_flight() && s.tick_in_flight);
+        assert_eq!((s.ticks_taken(), s.ticks_skipped()), (0, 0), "in flight: neither");
+        if forget {
+            s.forget();
+            assert_eq!((s.ticks_taken(), s.ticks_skipped()), (0, 1), "abandoned: skipped");
+        }
+        gate.store(true, SeqCst);
+        settle(&mut s);
+        let _ = s.evaluate(&h2(1.6), &mut never()).unwrap();
+        println!("forget {forget}: taken {} skipped {}; auditor calls {}", s.ticks_taken(), s.ticks_skipped(), auditor_calls.load(SeqCst));
+        if forget {
+            assert_eq!((s.ticks_taken(), s.ticks_skipped()), (0, 1), "the stale answer is not counted again");
+            assert_eq!(s.audit_history().recorded(), 0);
+        } else {
+            assert_eq!((s.ticks_taken(), s.ticks_skipped()), (1, 0));
+            let p = last_point(&s);
+            assert!(p.kind == PointKind::Audit && p.flags.has(PointFlags::TICK) && calibrate::in_answer_sample(&p), "{p:?}");
+        }
+    }
+}
+
+/// Review Focus 3 on real ticks (the Task 6 review's M3): a key locked by λ_T = ∞ keeps measuring on
+/// ticks `evaluate` takes, and lifts when the window turns over on them, with no hand-pushed point
+/// but the lock's own. That one point (an H{H} tick at a code-15 fallback, std 0 and errors 4× the
+/// bound) is pushed: a real posterior's std is never exactly 0, and λ_T = ∞ needs r = 0 — the case
+/// `a_key_locked_by_its_tail_inflation_says_so_and_keeps_measuring` keeps for its words.
+/// - **Locked, measuring.** 100 steps at H₂ 1.6 Bohr, every one a code-24 fallback: the 25th, 50th,
+///   75th and 100th in-envelope steps are ticks (their points carry `TICK` and are in P_A), the rest
+///   are not in P_A. Recalibrating on them leaves λ_T = ∞: the window still holds the bad point.
+/// - **The window turns over.** A refit starts a new generation (λ_T still ∞: its window reaches
+///   back to the bad point while the new generation holds fewer than 300 points); 300 ticks land in
+///   it; the next refit's window holds only them, λ_T = 1 and the step is answered again. Those 300
+///   are taken at one tick per locked step (`tick_every` = 1): at 25 steps per tick the 7500 locked
+///   steps' code-24 points would push the bad point off the 4096-point history ring first — a lift
+///   by the ring, not by the window this test is about.
+#[test]
+fn a_key_locked_by_its_tail_inflation_keeps_measuring_on_real_ticks() {
+    use sim::activity::TeachRule as R;
+    use surrogate::history::PointFlags;
+    let mut s = inflations_fixture();
+    let (k, sc) = (hk_pair(), h2(1.6));
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    assert_eq!((src, code), (Source::Surrogate, None), "the premise: answered ({note})");
+    let (g, fit) = (s.model_gen, s.fit_id());
+    let code_15 = history_rule_code(R::EnergyUncertainty);
+    s.audit_history.push(surrogate::AuditPoint { model_gen: g, ..answer_point(Some(code_15), 0.0, 4.0, fit, PointFlags::TICK, None) });
+    s.refresh_class_loo();
+    assert_eq!(s.key_inflations(&k).0, f64::INFINITY);
+    assert!(s.class_loo()[0].trusted, "the panel says trusted");
+    // locked, measuring on real ticks
+    let start = s.tick_steps;
+    let mut ticks = 0;
+    for i in 0..100u64 {
+        let (src, code, note) = inflation_step(&mut s, &sc);
+        assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "step {i}: {note}");
+        let p = last_point(&s);
+        let tick = (start + i + 1) % TICK_EVERY as u64 == 0;
+        assert_eq!((p.flags.has(PointFlags::TICK), calibrate::in_answer_sample(&p)), (tick, tick), "step {i}: {p:?}");
+        ticks += usize::from(tick);
+    }
+    assert_eq!((ticks, s.ticks_taken(), s.ticks_skipped()), (4, 4, 0));
+    s.refresh_class_loo();
+    assert_eq!(s.key_inflations(&k).0, f64::INFINITY, "the window still holds the bad point");
+    // the window turns over
+    s.refit().expect("refit");
+    assert!(s.model_gen > g);
+    assert_eq!(s.key_inflations(&k).0, f64::INFINITY, "a new generation alone does not age it");
+    s.tick_every = 1;
+    let taken = s.ticks_taken();
+    while s.ticks_taken() < taken + WINDOW_POINTS as u64 {
+        let (src, code, note) = inflation_step(&mut s, &sc);
+        assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "{note}");
+        assert!(calibrate::in_answer_sample(&last_point(&s)));
+    }
+    assert!(s.audit_history().iter().any(|p| p.model_gen == g && p.err_force[0] > 0.0 && p.pred_force_std_epistemic[0] == 0.0), "the bad point is still on the ring");
+    s.refit().expect("refit");
+    let kf = s.key_factors(&k);
+    println!("after {} real ticks in a newer generation and a refit: {kf:?}", WINDOW_POINTS);
+    assert_eq!(kf.tail, 1.0, "{kf:?}");
+    // back at the real cadence, on a step that is not a tick (one would be an in-step audit)
+    s.tick_every = TICK_EVERY;
+    while (s.tick_steps + 1) % TICK_EVERY as u64 == 0 {
+        s.tick_steps += 1;
+    }
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    assert_eq!((src, code), (Source::Surrogate, None), "lifted: answered again ({note})");
 }
