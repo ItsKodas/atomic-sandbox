@@ -89,6 +89,27 @@ use predicates::*;
 pub(super) fn max_nan(a: f64, b: f64) -> f64 {
     if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) }
 }
+/// A model's coefficients, bit for bit (the species, the feature count, the coefficients, the
+/// standardisation and the reference energies — everything its predictions read but the basis
+/// layout, which the species and the feature count pin): a refit whose standing model has the same
+/// fingerprint as the one before re-solved the same coefficients, and is not a new fit (`refit`,
+/// the fit id; spec 2026-11-18 §3).
+fn coefficient_fingerprint(m: &surrogate::Model) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    m.basis.species.hash(&mut h);
+    m.basis.n_features().hash(&mut h);
+    for row in &m.coeffs {
+        row.len().hash(&mut h);
+        row.iter().for_each(|x| x.to_bits().hash(&mut h));
+    }
+    for v in [&m.mean, &m.scale, &m.ref_energy] {
+        v.len().hash(&mut h);
+        v.iter().for_each(|x| x.to_bits().hash(&mut h));
+    }
+    h.finish()
+}
+
 /// The misfit row's limit: `QUARANTINE_MAX_FRACTION` of the fitted samples M was counted over.
 fn misfit_limit(m: &Misfit) -> f64 {
     QUARANTINE_MAX_FRACTION * m.fitted as f64
@@ -464,6 +485,8 @@ pub(super) struct FitState {
     /// only when they were that fit's (`restore_state`).
     pub(super) loo_ratios: Option<LooRatios>,
     pub(super) model_gen: u64,
+    /// The saved fit's id: a restore brings it back (spec 2026-11-18 §3).
+    pub(super) fit_id: u64,
 }
 
 impl SurrogateKs {
@@ -1292,7 +1315,19 @@ impl SurrogateKs {
         });
         // the stages (`sim::refit_eta`): a background copy's are read at the install
         self.refit_counts = Some(sim::RefitStages::default());
+        let (id_before, coeffs_before) = (self.fit_id, self.model.as_ref().map(coefficient_fingerprint));
         let r = self.refit_inner();
+        // the fit id (spec 2026-11-18 §3): one new id per refit whose standing model holds new
+        // coefficients — past the history's ids, so ids stay unique across sessions (plan
+        // 2026-11-19, the rulings) — whatever its intermediate fits did (the recovery's trial fits
+        // and restores); a refit that re-solved the same coefficients, or left the model that
+        // stood, is not a new fit
+        let coeffs_after = self.model.as_ref().map(coefficient_fingerprint);
+        self.fit_id = if coeffs_after.is_some() && coeffs_after != coeffs_before {
+            id_before.max(self.audit_history.max_fit_id().unwrap_or(0)) + 1
+        } else {
+            id_before
+        };
         let counts = if self.refit_fork { self.refit_counts } else { self.refit_counts.take() };
         // the refit history (a copy's is the live provider's to record, at the install)
         if let (false, Ok(_), Some(c)) = (self.refit_fork, r.as_ref(), counts) {
@@ -1799,6 +1834,7 @@ impl SurrogateKs {
             deferred_trust: self.deferred_trust,
             loo_ratios: self.loo_ratios.clone(),
             model_gen: self.model_gen,
+            fit_id: self.fit_id,
         }
     }
 
@@ -1823,6 +1859,8 @@ impl SurrogateKs {
         self.body4_degree = s.body4_degree;
         self.fit_members = s.fit_members;
         self.deferred_trust = s.deferred_trust;
+        // the restored fit's own id, never a new one (spec 2026-11-18 §3)
+        self.fit_id = s.fit_id;
         self.model_gen += 1; // a view cache key: the model moved back
         // the restored model is the saved one: its leave-one-out ratios, when the cache held that
         // fit's, are this generation's (`fit_members` is restored with it; re-checked at every read)

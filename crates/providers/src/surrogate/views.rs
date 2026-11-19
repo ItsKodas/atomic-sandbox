@@ -231,6 +231,13 @@ impl SurrogateKs {
         self.model_gen
     }
 
+    /// The fit id (trust tightening, spec 2026-11-18 §3; the field's doc): the id a history point
+    /// recorded now carries. Unlike [`model_generation`](Self::model_generation) it moves only with
+    /// a refit that solved new coefficients; 0 before any fit.
+    pub fn fit_id(&self) -> u64 {
+        self.fit_id
+    }
+
     /// The training views (module doc); `None` without a fitted model and a store. Rebuilds the
     /// curve cache when the model generation moved, fills the fence's descriptor cache while
     /// samples are quarantined or M has misfit atoms (review m4: the fences work without it

@@ -1473,6 +1473,14 @@ pub struct SurrogateKs {
     /// leaves the model untrusted, which the surface `epoch` does not see. The views' cache key
     /// and their age line; it decides nothing.
     model_gen: u64,
+    /// The fit id (trust tightening, spec 2026-11-18 §3): the id a history point records for the
+    /// fit that judged it (`record_history_point`). Bumped only by a refit that solved new
+    /// coefficients — to max(this, the history's largest id) + 1, so ids stay unique across
+    /// sessions (`refit`) — never by a policy change, a forget, a restore (it brings back the
+    /// restored fit's own id), an install (the file's id, else its history's largest), an attach
+    /// (the collection history's largest; the attach's own refit re-solves that fit) or a fork
+    /// (the copy's refit brings its id back at the install). 0 = no fit yet.
+    fit_id: u64,
     /// (`accumulated`, quarantine codes) when the standing fit was installed: what the training
     /// views call `Fitted` (Task 4 review, the released-sample ruling). A readout only.
     fit_members: (usize, Vec<u8>),
@@ -1791,6 +1799,7 @@ impl SurrogateKs {
             fits: 0,
             last_audit_fit: 0,
             model_gen: 0,
+            fit_id: 0,
             fit_members: (0, Vec::new()),
             curve_cache: None,
             pending_notes: Vec::new(),

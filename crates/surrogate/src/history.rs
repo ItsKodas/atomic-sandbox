@@ -457,6 +457,13 @@ impl AuditHistory {
         self.recorded
     }
 
+    /// The largest fit id among the points held (`None` when no point carries one): the base a
+    /// refit's next id must pass, so that ids stay unique across sessions (plan 2026-11-19, the
+    /// rulings: a refit takes max(its own, this) + 1).
+    pub fn max_fit_id(&self) -> Option<u64> {
+        self.ring.iter().filter_map(|p| p.fit_id).max()
+    }
+
     /// The arrays of the serialised form (module doc): the ten, the species array and — only when
     /// some point carries a trust-tightening field — the three version-2 arrays, for every point.
     pub fn to_arrays(&self) -> HistoryArrays {
@@ -833,6 +840,21 @@ mod tests {
     /// A [`point`] carrying the three trust-tightening fields (plan 2026-11-19 Task 1).
     fn point_ext(n: usize, gen: u64, fit_id: Option<u64>, flags: u8, epi: Option<f64>) -> AuditPoint {
         AuditPoint { fit_id, flags: PointFlags(flags), energy_std_epistemic: epi, ..point(n, gen) }
+    }
+
+    /// Trust tightening Task 2: the largest fit id among the points held, `None` when no point
+    /// carries one (a legacy or empty history).
+    #[test]
+    fn max_fit_id_is_the_largest_id_held() {
+        let mut h = AuditHistory::default();
+        assert_eq!(h.max_fit_id(), None);
+        h.push(point(2, 1));
+        assert_eq!(h.max_fit_id(), None, "a legacy point carries no id");
+        for id in [3, 40, 7] {
+            h.push(point_ext(2, 1, Some(id), 0, None));
+        }
+        h.push(point(2, 1));
+        assert_eq!(h.max_fit_id(), Some(40));
     }
 
     /// The standalone bytes of a history's arrays (the writer's own path, for hand-altered arrays).

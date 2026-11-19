@@ -630,6 +630,20 @@ Moved pins are physics-reviewed.
   per-key LOO statistics are not public.
 - **Fit ids across sessions.** The spec does not say how ids stay unique. A refit takes
   max(own, history max) + 1, and an install or restore brings back the fit's own id (Task 2).
+  Task 2's rulings where the brief met the code:
+  - The id is stamped once per `refit` (at its end), not per solve: a refit's intermediate fits
+    (the recovery's trials and restores) do not count, and a refit whose standing model has the
+    same coefficients, bit for bit, as the one before is not a new fit (the spec's "solved new
+    coefficients"; a user's repeated Refit or a refit whose new samples are all held out adds none).
+  - An install's rebuild (`fit_store`, lone atoms or a membership mismatch) stamps nothing: the
+    file's id stands.
+  - The attach's own refit keeps the collection history's largest id (Review Focus 5: a re-attach
+    or a re-spawn adds no fit); the next refit takes the one after. If the collection grew after its
+    newest audited fit, that refit is a new fit under the old id: an under-count, the conservative
+    side of the floor. An attach that cannot fit at once leaves its first later refit to take the
+    next id even when it re-solves that fit (an over-count by one per such re-attach).
+  - The sidecar's `fit_id` header key is optional and bumps no version (every reader ignores header
+    keys it does not read); a file without it installs at its history's largest id.
 - **The magic values read (Task 1 step 1).**
   - The standalone history: `surrogate::history::MAGIC` = `ASAUDIT1`, the only version. Its decoder
     refuses anything after the optional species array ("trailing bytes after the last array"), so

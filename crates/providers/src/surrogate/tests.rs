@@ -11837,3 +11837,181 @@ fn key_class_stats_match_the_verdicts_inputs() {
         assert_eq!(v.samples, st.samples, "the verdict's own sample count: {k:?}");
     }
 }
+
+// ---- the fit id (trust tightening Task 2; spec 2026-11-18 §3, plan 2026-11-19 Review Focus 5) ----
+
+/// Records one judged audit at `scene` through the asynchronous path (`judge_audit`), the answer
+/// `teacher`'s: one history point of the current fit.
+fn record_audit(s: &mut SurrogateKs, scene: &Scene, teacher: &mut dyn ForceProvider) {
+    let t = teacher.evaluate(scene, &mut never()).unwrap();
+    let prov = s.provenance_for(scene);
+    let job = AuditJob { scene: scene.clone(), prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
+    let before = s.audit_history().recorded();
+    s.judge_audit(job, t.energy, t.forces.clone(), None, None, None, 1.0, Some(10), None);
+    assert_eq!(s.audit_history().recorded(), before + 1, "the audit is recorded: {:?}", s.user_notes);
+}
+
+/// The distinct fit ids the history's points carry (what the floor's n_fit counts), and whether
+/// every point carries one.
+fn fit_ids(s: &SurrogateKs) -> (std::collections::BTreeSet<u64>, bool) {
+    (s.audit_history().iter().filter_map(|p| p.fit_id).collect(), s.audit_history().iter().all(|p| p.fit_id.is_some()))
+}
+
+/// Adds H₂ dimers at `rs` (random orientations) to `s`.
+fn add_dimers(s: &mut SurrogateKs, rs: &[f64], seed: u64) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    for &r in rs {
+        let sc = dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1);
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+}
+
+/// A provider over a stub teacher of the file's teacher name holding `sc` (`install_sidecar`).
+fn installed(sc: surrogate::Sidecar) -> SurrogateKs {
+    let name: &'static str = Box::leak(sc.model.provenance.teacher.clone().into_boxed_str());
+    let mut s = SurrogateKs::new(Box::new(NamedStub(name)), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(sc.model.provenance.tol);
+    s.install_sidecar(sc).unwrap();
+    s
+}
+
+/// Spec §3: the fit id is bumped only by a refit that solved new coefficients, by one per refit;
+/// a history point carries the id of the fit that judged it; a refit that re-solves the same
+/// coefficients, a forget and a policy change leave it; a background refit's install brings the id
+/// it was solved under.
+#[test]
+fn a_refit_advances_the_fit_id_and_nothing_else_does() {
+    let (s0, _h0) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    assert_eq!(s0.fit_id(), 0, "no fit yet");
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    assert_eq!(s.fit_id(), 1, "the first refit");
+    // the same coefficients again (nothing new to fit): not a new fit
+    s.refit().unwrap();
+    assert_eq!(s.fit_id(), 1, "a refit that re-solved the same coefficients");
+    record_audit(&mut s, &h2(1.5), &mut MorseDimer::h2());
+    assert_eq!(s.audit_history().iter().last().unwrap().fit_id, Some(1), "a point carries the fit that judged it");
+    // new samples (the audit's answer is one): one refit, one new id
+    add_dimers(&mut s, &[1.5, 1.7, 1.9, 2.1], 9);
+    s.refit().unwrap();
+    assert_eq!(s.fit_id(), 2);
+    record_audit(&mut s, &h2(1.6), &mut MorseDimer::h2());
+    assert_eq!(fit_ids(&s), ([1, 2].into(), true));
+    // a policy change: nothing
+    s.set_policy(FallbackPolicy { audit_every: 3, ..FallbackPolicy::default() });
+    assert_eq!(s.fit_id(), 2);
+    // a background refit: the install brings the id the copy solved under
+    add_dimers(&mut s, &[1.3, 1.45, 2.0], 10);
+    assert!(s.begin_background_refit());
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Installed(Ok(_))));
+    assert_eq!(s.fit_id(), 3, "the copy's refit");
+    record_audit(&mut s, &h2(1.55), &mut MorseDimer::h2());
+    assert_eq!(fit_ids(&s).0, [1, 2, 3].into());
+    // a forget leaves the counter: the next fit is a new one
+    SurrogateKs::forget(&mut s);
+    assert_eq!(s.fit_id(), 3, "a forget");
+    s.set_reference_energy(1, MorseDimer::h2().e_atom);
+    add_dimers(&mut s, &(0..40).map(|i| 1.2 + i as f64 / 39.0).collect::<Vec<_>>(), 11);
+    s.refit().unwrap();
+    assert_eq!(s.fit_id(), 4);
+}
+
+/// Review Focus 5: reloads manufacture no fits. The fit id — the id a new point carries — and the
+/// distinct ids the history holds are the same before and after a sidecar save + load, a restore of
+/// the fit state, a fork for a background refit with the carried model, 12 policy changes, a
+/// collection's detach + attach, and a re-spawned provider attaching it again; a later refit with
+/// new samples still advances it.
+#[test]
+fn reloading_reattaching_and_respawning_add_no_fit() {
+    // per scene: save + load (the worker's re-spawn carries the model through the autosave)
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    add_dimers(&mut s, &[1.5, 1.7, 1.9, 2.1], 9);
+    s.refit().unwrap();
+    record_audit(&mut s, &h2(1.5), &mut MorseDimer::h2());
+    let (id, ids) = (s.fit_id(), fit_ids(&s));
+    assert_eq!((id, ids.clone()), (2, ([2].into(), true)));
+    let path = std::env::temp_dir().join(format!("fit-id-reload-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let (mut back, _, _) = installed_from(&path);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!((back.fit_id(), fit_ids(&back)), (id, ids.clone()), "a save + load");
+    record_audit(&mut back, &h2(1.6), &mut MorseDimer::h2());
+    assert_eq!(fit_ids(&back), ids, "a point after the load is the same fit's");
+    // a restore of the fit state, a fork with the carried model, 12 policy changes
+    let st = s.save_state();
+    s.restore_state(st);
+    assert_eq!(s.fit_id(), id, "a restore");
+    assert_eq!(s.fork_for_refit().fit_id(), id, "a fork carries the model's id");
+    for k in 0..12 {
+        s.set_policy(FallbackPolicy { audit_every: k % 4, never_fallback: k % 2 == 1, ..FallbackPolicy::default() });
+    }
+    assert_eq!(s.fit_id(), id, "12 policy changes");
+    record_audit(&mut s, &h2(1.7), &mut MorseDimer::h2());
+    assert_eq!(fit_ids(&s), ids);
+
+    // a collection: detach + attach, then a re-spawned provider attaching it
+    let dir = collection_root("fit-id");
+    let (mut c, _t) = pair_student();
+    c.attach_collection(&dir, &h2(1.4)).unwrap();
+    c.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));
+    let mut rng = StdRng::seed_from_u64(31);
+    for i in 0..40 {
+        c.evaluate(&h2_at(1.1 + 1.2 * i as f64 / 39.0, &mut rng), &mut never()).unwrap();
+    }
+    c.refit().unwrap();
+    record_audit(&mut c, &h2(1.5), &mut SpeciesMorse::new());
+    let (id, ids) = (c.fit_id(), fit_ids(&c));
+    assert!(id >= 1 && ids == ([id].into(), true), "{id} {ids:?}");
+    SurrogateKs::forget(&mut c);
+    c.attach_collection(&dir, &h2(1.4)).unwrap();
+    assert!(c.model().is_some(), "the attach fits: {:?}", c.no_model());
+    assert_eq!((c.fit_id(), fit_ids(&c)), (id, ids.clone()), "a detach + attach");
+    record_audit(&mut c, &h2(1.6), &mut SpeciesMorse::new());
+    assert_eq!(fit_ids(&c), ids, "a point after the attach is the same fit's");
+    drop(c);
+    let (mut r, _t2) = pair_student();
+    r.attach_collection(&dir, &h2(1.4)).unwrap();
+    assert_eq!((r.fit_id(), fit_ids(&r)), (id, ids.clone()), "a re-spawned provider attaching the collection");
+    // a refit with new samples is a new fit, past every id the collection holds
+    for i in 0..6 {
+        r.evaluate(&h2_at(1.15 + 0.3 * i as f64, &mut rng), &mut never()).unwrap();
+    }
+    r.refit().unwrap();
+    assert_eq!(r.fit_id(), id + 1);
+}
+
+/// The plan's ruling (fit ids across sessions): a refit takes max(its own id, the history's largest)
+/// + 1, and an install takes the file's id — or, from a file without one, the history's largest. A
+/// history holding ids up to 40 under a provider at 1: the next refit is 41.
+#[test]
+fn fit_ids_stay_unique_across_an_install() {
+    use surrogate::history::PointKind;
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    assert_eq!(s.fit_id(), 1);
+    for id in 1..=40u64 {
+        s.audit_history.push(surrogate::AuditPoint { fit_id: Some(id), ..history_point_full(PointKind::Audit, 2, 1, 1e-4, 0.0) });
+    }
+    let path = std::env::temp_dir().join(format!("fit-id-unique-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let file = surrogate::sidecar::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!((file.fit_id, file.audit_history.max_fit_id()), (Some(1), Some(40)), "the writer's own id, and the history's");
+    // the file's id; the next refit passes the history's ids
+    let mut own = installed(file.clone());
+    assert_eq!(own.fit_id(), 1, "the file's id");
+    add_dimers(&mut own, &[1.5, 1.7, 1.9, 2.1], 9);
+    own.refit().unwrap();
+    assert_eq!(own.fit_id(), 41);
+    // a file without the key: the history's largest
+    let mut old = installed(surrogate::Sidecar { fit_id: None, ..file.clone() });
+    assert_eq!(old.fit_id(), 40);
+    add_dimers(&mut old, &[1.5, 1.7, 1.9, 2.1], 9);
+    old.refit().unwrap();
+    assert_eq!(old.fit_id(), 41);
+    record_audit(&mut old, &h2(1.6), &mut MorseDimer::h2());
+    assert_eq!(old.audit_history().iter().last().unwrap().fit_id, Some(41));
+    // a file whose id is past the history's: its own
+    let mut ahead = installed(surrogate::Sidecar { fit_id: Some(45), ..file });
+    assert_eq!(ahead.fit_id(), 45);
+    add_dimers(&mut ahead, &[1.5, 1.7, 1.9, 2.1], 9);
+    ahead.refit().unwrap();
+    assert_eq!(ahead.fit_id(), 46);
+}

@@ -241,7 +241,8 @@ impl SurrogateKs {
         let audits: Vec<surrogate::sidecar::AuditCase> = self.failed_audits.iter().map(|c| case(c, false)).chain(self.audit_fences.iter().map(|c| case(c, true))).collect();
         // and the audit history (version 7, M8a Task 1) with the class verdict's hysteresis memory
         // (M8a Task 2 fix round 2: a reload keeps a verdict inside the band)
-        surrogate::sidecar::write_full_with_memory(path, model, acc, self.report.as_ref(), samples, rule, &flags, &face, Some(&solves), &audits, &self.audit_history, &self.class_memory.iter().map(|(k, &(t, g))| (k.clone(), t, g)).collect::<Vec<_>>())
+        // and the fit id its points carry (trust tightening Task 2: a reload brings it back)
+        surrogate::sidecar::write_full_with_fit_id(path, model, acc, self.report.as_ref(), samples, rule, &flags, &face, Some(&solves), &audits, &self.audit_history, &self.class_memory.iter().map(|(k, &(t, g))| (k.clone(), t, g)).collect::<Vec<_>>(), Some(self.fit_id))
     }
 
     /// Replaces everything learned with a samples-only file's contents (`surrogate::sidecar`
@@ -322,7 +323,7 @@ impl SurrogateKs {
     /// count starting at zero, with a note for the unreadable one), set only once the install
     /// succeeded (plan review N11: a refused file leaves them alone).
     pub fn install_sidecar(&mut self, sc: surrogate::Sidecar) -> Result<(), String> {
-        let surrogate::Sidecar { model, accumulator, report, samples, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits, audit_history, class_memory, .. } = sc;
+        let surrogate::Sidecar { model, accumulator, report, samples, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits, audit_history, class_memory, fit_id, .. } = sc;
         // a model file is a per-scene model: a shared collection is let go (`shared` module doc;
         // `Trainable::load` keeps the handle to restore it when the install fails)
         self.detach_collection();
@@ -444,6 +445,10 @@ impl SurrogateKs {
         // moves past all of them — the calibrated verdict's evidence window compares generations
         // as numbers (`calibrate`, "The evidence window"; M8a Task 2 fix round 2)
         let newest = audit_history.iter().map(|p| p.model_gen).chain(class_memory.iter().filter_map(|m| m.2)).max().unwrap_or(0);
+        // the fit id (spec 2026-11-18 §3: an install adds no fit): the file's own, else — a file
+        // written before the key — its history's largest; a rebuild below re-solves the file's fit
+        // and keeps it (`fit_store` stamps nothing: only a `refit` does)
+        self.fit_id = fit_id.unwrap_or_else(|| audit_history.max_fit_id().unwrap_or(0));
         self.audit_history = audit_history;
         self.model = Some(model);
         self.report = Some(report);

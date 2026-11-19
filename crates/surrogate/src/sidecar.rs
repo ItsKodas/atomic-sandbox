@@ -256,6 +256,14 @@
 //! would refuse the three as undeclared — it refuses the file as "format version 10 is newer than
 //! this build" instead, and the app's downgrade warnings name it (`app::update::formats`).
 //!
+//! **The fit id** (trust tightening Task 2): a fitted model's file may carry the header key
+//! `fit_id` (a JSON integer below 2⁵³, after `class_memory`), the id of the fit it holds — the id
+//! its history points carry (`crate::history`, "Trust-tightening fields") and the one an install
+//! takes back, so a reload adds no fit. Optional, under version 9 or 10 alike: it bumps nothing,
+//! since every reader ignores header keys it does not read; absent, the header is the older
+//! writer's byte for byte and the field reads `None`. Strict when present: anything but such an
+//! integer (or null) is refused.
+//!
 //! **Code 9 is never written** (`crate::quarantine::Q_RESOLVED`, re-solved for the new solver and
 //! awaiting review, ruling R11): every writer leaves a sample whose quarantine code is 9 out of the
 //! file — its flag, face density, mask and box with it, the later samples moving down; a failed
@@ -388,6 +396,9 @@ pub struct Sidecar {
     /// (trusted, the model generation it was entered at) — header key `class_memory` (version 7;
     /// module doc). Empty when absent.
     pub class_memory: ClassMemory,
+    /// The writer's fit id (header key `fit_id`, optional; module doc, "Version 10"): the id its
+    /// history points carry for this fit. `None` when absent (a file written before the key).
+    pub fit_id: Option<u64>,
 }
 
 /// What a version-6 file holds: training samples taught before any fit formed (module doc,
@@ -527,6 +538,13 @@ pub fn write_full_with_history(path: &Path, model: &Model, acc: &Accumulator, re
 /// `class_memory`, written only when `memory` is not empty — module doc, "Version 7").
 #[allow(clippy::too_many_arguments)]
 pub fn write_full_with_memory(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory, memory: &[(EnvKey, bool, Option<u64>)]) -> io::Result<()> {
+    write_full_with_fit_id(path, model, acc, report, samples, reference_rule, quarantine, face_density, solves, audits, history, memory, None)
+}
+
+/// [`write_full_with_memory`] with the writer's fit id (header key `fit_id`, written only when
+/// `fit_id` is `Some`; module doc, "Version 10"). `InvalidInput` for an id of 2⁵³ or more.
+#[allow(clippy::too_many_arguments)]
+pub fn write_full_with_fit_id(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory, memory: &[(EnvKey, bool, Option<u64>)], fit_id: Option<u64>) -> io::Result<()> {
     if !quarantine.is_empty() && quarantine.len() != samples.len() {
         return Err(invalid_input(format!("sidecar: {} quarantine flags for {} samples", quarantine.len(), samples.len())));
     }
@@ -535,12 +553,12 @@ pub fn write_full_with_memory(path: &Path, model: &Model, acc: &Accumulator, rep
     }
     // ruling R11: code-9 samples stay in the collection, never in a file (module doc, "Version 9")
     let bytes = match resolved_left_out(quarantine) {
-        None => encode(model, acc, report, samples, reference_rule, quarantine, face_density, solves, audits, history, memory)?,
+        None => encode(model, acc, report, samples, reference_rule, quarantine, face_density, solves, audits, history, memory, fit_id)?,
         Some(map) => {
             // a failed audit naming a kept sample follows it; one naming a left-out sample keeps no
             // index (its answer is not in this file)
             let audits: Vec<AuditCase> = audits.iter().map(|a| AuditCase { index: a.index.and_then(|i| map.get(i).copied().unwrap_or(Some(i))), ..a.clone() }).collect();
-            encode(model, acc, report, &kept(samples, &map), reference_rule, &kept(quarantine, &map), &kept(face_density, &map), solves, &audits, history, memory)?
+            encode(model, acc, report, &kept(samples, &map), reference_rule, &kept(quarantine, &map), &kept(face_density, &map), solves, &audits, history, memory, fit_id)?
         }
     };
     write_atomic(path, &bytes)
@@ -719,7 +737,10 @@ fn invalid_input(msg: String) -> io::Error {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory, memory: &[(EnvKey, bool, Option<u64>)]) -> io::Result<Vec<u8>> {
+fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory, memory: &[(EnvKey, bool, Option<u64>)], fit_id: Option<u64>) -> io::Result<Vec<u8>> {
+    if fit_id.is_some_and(|id| id >= FIT_ID_LIMIT) {
+        return Err(invalid_input(format!("sidecar: fit id {} is not below 2^53", fit_id.unwrap_or(0))));
+    }
     let basis = &model.basis;
     let body3 = basis.body3;
     // the body this file carries under the version-9 magic (module doc, "Version 9")
@@ -917,6 +938,10 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
             })
             .collect();
         pairs.push(("class_memory", format!("[{}]", list.join(","))));
+    }
+    // optional (module doc, "Version 10"): absent, the header is byte-identical to the older writer's
+    if let Some(id) = fit_id {
+        pairs.push(("fit_id", id.to_string()));
     }
     // optional (module doc): absent, the header is byte-identical to the older writer's
     if let Some(t) = solves {
@@ -1539,7 +1564,25 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
             AuditHistory::from_arrays(&a, recorded, unrecorded).map_err(|e| format!("audit_history: {e}"))?
         }
     };
-    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits, audit_history, class_memory })
+    let fit_id = decode_fit_id(&h)?;
+    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits, audit_history, class_memory, fit_id })
+}
+
+/// Fit ids are below 2⁵³ (`crate::history`, "Trust-tightening fields": every id is exact in the
+/// history's f64 array).
+const FIT_ID_LIMIT: u64 = 1u64 << 53;
+
+/// The optional header key `fit_id` (module doc, "Version 10"): absent or null = `None`; strict
+/// when present (an integer below 2⁵³), like `class_memory`.
+fn decode_fit_id(h: &Json) -> Result<Option<u64>, String> {
+    match h.get("fit_id") {
+        Err(_) | Ok(Json::Null) => Ok(None),
+        Ok(v) => match v.u64() {
+            Ok(id) if id < FIT_ID_LIMIT => Ok(Some(id)),
+            Ok(id) => Err(format!("fit_id {id} is not below 2^53")),
+            Err(e) => Err(format!("fit_id: {e}")),
+        },
+    }
 }
 
 /// The version-7 header key `class_memory` (module doc): per environment key (class, z,
@@ -2354,7 +2397,7 @@ pub(crate) mod tests {
                 }
             })
             .collect();
-        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()), quarantine: Vec::new(), face_density: Vec::new(), teacher_solves: None, teacher_solves_note: None, failed_audits: Vec::new(), audit_history: AuditHistory::default(), class_memory: Vec::new() }
+        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()), quarantine: Vec::new(), face_density: Vec::new(), teacher_solves: None, teacher_solves_note: None, failed_audits: Vec::new(), audit_history: AuditHistory::default(), class_memory: Vec::new(), fit_id: None }
     }
 
     /// A body-2 fixture and a directory of its own for test `name`.
@@ -2500,6 +2543,55 @@ pub(crate) mod tests {
         std::fs::write(&pb, b).unwrap();
         let e = read(&pb).unwrap_err().to_string();
         assert!(e.contains("class_memory"), "{e}");
+    }
+
+    /// Trust tightening Task 2: the optional header key `fit_id` (the writer's fit id) round-trips
+    /// under the version-9 magic (it bumps nothing: older readers ignore header keys they do not
+    /// read); absent, it reads `None` and the header is the older writer's, byte for byte; an id
+    /// that is not an integer below 2⁵³ is refused, naming the key.
+    #[test]
+    fn the_fit_id_key_round_trips() {
+        use crate::history::AuditHistory;
+        let orig = random_sidecar(49, false);
+        let header_of = |bytes: &[u8]| {
+            let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+            (std::str::from_utf8(&bytes[16..16 + hl]).unwrap().to_string(), hl)
+        };
+        let path = tmp("fit-id.model");
+        write_full_with_fit_id(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &AuditHistory::default(), &[], Some(41)).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..8], MAGIC_V9, "the key alone does not bump the version");
+        let (header, hl) = header_of(&bytes);
+        assert!(header.contains("\"fit_id\":41"), "{header}");
+        assert_eq!(read(&path).unwrap().fit_id, Some(41));
+        // absent: None, and the bytes are the older writer's
+        let plain = tmp("fit-id-none.model");
+        let older = tmp("fit-id-older.model");
+        write_full_with_fit_id(&plain, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &AuditHistory::default(), &[], None).unwrap();
+        write_full_with_memory(&older, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &AuditHistory::default(), &[]).unwrap();
+        assert_eq!(std::fs::read(&plain).unwrap(), std::fs::read(&older).unwrap());
+        assert_eq!(read(&plain).unwrap().fit_id, None);
+        // malformed: refused, naming the key
+        for bad in ["\"fit_id\":-1", "\"fit_id\":1.5", "\"fit_id\":\"41\"", "\"fit_id\":9007199254740992"] {
+            let h = header.replacen("\"fit_id\":41", bad, 1);
+            let mut b = bytes[..8].to_vec();
+            b.extend_from_slice(&(h.len() as u64).to_le_bytes());
+            b.extend_from_slice(h.as_bytes());
+            b.extend_from_slice(&bytes[16 + hl..]);
+            let pb = tmp("fit-id-bad.model");
+            std::fs::write(&pb, b).unwrap();
+            let e = read(&pb).unwrap_err().to_string();
+            assert!(e.contains("fit_id"), "{bad}: {e}");
+        }
+        // the largest id below 2⁵³ reads back
+        let h = header.replacen("\"fit_id\":41", "\"fit_id\":9007199254740991", 1);
+        let mut b = bytes[..8].to_vec();
+        b.extend_from_slice(&(h.len() as u64).to_le_bytes());
+        b.extend_from_slice(h.as_bytes());
+        b.extend_from_slice(&bytes[16 + hl..]);
+        let pb = tmp("fit-id-max.model");
+        std::fs::write(&pb, b).unwrap();
+        assert_eq!(read(&pb).unwrap().fit_id, Some((1u64 << 53) - 1));
     }
 
     #[test]

@@ -677,8 +677,9 @@ impl SurrogateKs {
             n_atoms: n,
             model_gen: self.model_gen,
             species,
-            // the trust-tightening fields (plan 2026-11-19): recorded from Task 3 on
-            fit_id: None,
+            // the fit that judged it (trust tightening Task 2; `fit_id`: a point without one does
+            // not count toward the floor); the flags and the epistemic std from Task 3 on
+            fit_id: self.model.is_some().then_some(self.fit_id),
             flags: surrogate::history::PointFlags::default(),
             energy_std_epistemic: None,
         });
