@@ -1183,7 +1183,7 @@ mod tests {
 
     /// The largest relative difference of the support path's three outputs to the full path's,
     /// asserting the spec's bound |a − b| ≤ 1e-12|b| + 1e-15 on each.
-    fn assert_matches_full(m: &Model, pos: &[[f64; 3]], z: &[u8], what: &str) -> f64 {
+    fn assert_matches_full_with(m: &Model, pos: &[[f64; 3]], z: &[u8], what: &str, concurrent: bool) -> f64 {
         let l = m.sigma_inv_chol.as_ref().unwrap();
         let (e_s, f_s, fe_s) = m.predictive_std_with(l, pos, z, VariancePath::Auto).unwrap();
         let (e_f, f_f, fe_f) = m.predictive_std_with(l, pos, z, VariancePath::Full).unwrap();
@@ -1199,10 +1199,17 @@ mod tests {
             check(f_s[j], f_f[j], "force_std");
             check(fe_s[j], fe_f[j], "force_std_epistemic");
         }
-        // and `predict` itself reports the support path's numbers
+        // and `predict` itself reports the support path's numbers (bit for bit when no other
+        // thread can grow S in between: the value depends on S at rounding level; module doc)
         let pred = m.predict(pos, z, true).unwrap();
-        assert_eq!(pred.energy_std.unwrap().to_bits(), e_s.to_bits(), "{what}: predict takes the same path");
+        if !concurrent {
+            assert_eq!(pred.energy_std.unwrap().to_bits(), e_s.to_bits(), "{what}: predict takes the same path");
+        }
         worst
+    }
+
+    fn assert_matches_full(m: &Model, pos: &[[f64; 3]], z: &[u8], what: &str) -> f64 {
+        assert_matches_full_with(m, pos, z, what, false)
     }
 
     #[test]
@@ -1329,7 +1336,7 @@ mod tests {
                 let (m, scenes) = (&m, &scenes);
                 sc.spawn(move || {
                     for (t, (pos, z)) in scenes.iter().enumerate().skip(w).chain(scenes.iter().enumerate()) {
-                        assert_matches_full(m, pos, z, &format!("thread {w} scene {t}"));
+                        assert_matches_full_with(m, pos, z, &format!("thread {w} scene {t}"), true);
                     }
                 });
             }
