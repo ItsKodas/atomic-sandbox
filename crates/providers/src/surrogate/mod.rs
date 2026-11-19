@@ -1543,6 +1543,9 @@ pub struct SurrogateKs {
     /// Failed stray-atom audits waiting for their attribution check while another is in flight (`stray`,
     /// "Audits of a cleared answer"; Task 5 fix round 1, M4), oldest first.
     stray_attributions: std::collections::VecDeque<stray::AttributionRequest>,
+    /// The signatures whose fallbacks were told "no background teacher, so no composition check runs" this session:
+    /// the note is written once per signature, not at every step (Task 6, the Task 3 review's minor).
+    stray_no_auditor: std::collections::HashSet<stray::Signature>,
     /// The scene-edit generation: bumped by `reset` and `discontinuity` (the driver's edit
     /// signals, `Dynamics::after_edit`); a composition check queued before an edit is dropped.
     scene_gen: u64,
@@ -1841,6 +1844,7 @@ impl SurrogateKs {
             stray_pending: None,
             stray_checks: 0,
             stray_attributions: std::collections::VecDeque::new(),
+            stray_no_auditor: std::collections::HashSet::new(),
             scene_gen: 0,
             face: Vec::new(),
             fence_votes: Vec::new(),
@@ -2072,8 +2076,10 @@ impl SurrogateKs {
             let kept = outcome.is_kept().then(|| self.samples().saturating_sub(1));
             let label = stray::signature_label(&sig);
             if self.auditor.is_none() {
-                // controller ruling C: a synchronous fragment solve would stall the step
-                notes.push(format!("surrogate: stray atoms ({label}) — no background teacher, so no composition check runs; DFT answers"));
+                // controller ruling C: a synchronous fragment solve would stall the step; said once per signature
+                if self.stray_no_auditor.insert(sig) {
+                    notes.push(format!("surrogate: stray atoms ({label}) — no background teacher, so no composition check runs; DFT answers (said once this session)"));
+                }
             } else if self.queue_stray_check(scene, part, split, sig, kept) {
                 notes.push(format!("surrogate: stray atoms ({label}) — a composition check (the bonded part alone, each stray atom alone) is queued on the background teacher"));
             }
@@ -3560,6 +3566,8 @@ impl Trainable for SurrogateKs {
             retry_fit: self.pass.is_none() && self.no_model().is_some_and(|n| n.retry),
             model_source: self.model_source(),
             lone_note: lone_atoms_note(&scene.nuclei.iter().map(|n| n.pos).collect::<Vec<_>>(), self.cutoff()),
+            stray: self.stray_status(),
+            stray_held_out: self.stray_held_out(),
         }
     }
 

@@ -23,7 +23,7 @@ pub fn counters(ui: &mut Ui, st: &ActivityState, m: Option<&crate::sim::ModelSta
             tips.push(format!("samples in the model: {} held{fitted} (the store; the Model tab shows the same number)", m.samples));
             let earlier = if c.unrecorded_before { " (earlier solves unrecorded)" } else { "" };
             tips.push(format!(
-                "teacher solves for this model: {total}{earlier} — pass {} · fallback {} · audit {} · relax checks {} — kept {}, not kept {} (references, similar answers, box-affected, failed, discarded audits, …). Completed or failed teaching solves; a cancelled solve is not counted",
+                "teacher solves for this model: {total}{earlier} — pass {} · fallback {} · audit {} · relax checks {} — kept {}, not kept {} (references, similar answers, box-affected, failed, discarded audits, …). Completed or failed teaching solves; a cancelled solve is not counted. A stray-atom composition check is one row and 1 + n_stray audit solves (the molecule alone, each stray atom alone)",
                 c.pass,
                 c.fallback,
                 c.audit,
@@ -175,6 +175,8 @@ pub fn solve_cell(e: &sim::TeachEvent) -> String {
 /// [`solve_cell`] without the −TS.
 fn solve_cell_time(e: &sim::TeachEvent) -> String {
     let t = if e.solve_ms >= 10_000.0 { format!("{:.1} s", e.solve_ms / 1e3) } else { format!("{:.0} ms", e.solve_ms) };
+    // a composition check's row: its parts' solves together (the bonded part alone, each stray atom alone)
+    let t = if e.solves > 1 { format!("{t} · {} solves", e.solves) } else { t };
     match (e.scf_steps.filter(|&n| n > 0), e.scf_end) {
         (Some(n), None | Some(sim::ScfEnd::Converged)) => format!("{t} · {n} it"),
         (Some(n), Some(end)) => format!("{t} · {n} {}", end.word()),

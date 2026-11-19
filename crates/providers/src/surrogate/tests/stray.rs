@@ -718,7 +718,7 @@ fn a_stray_fallback_queues_fragment_and_atom_jobs() {
     let r = s.evaluate(&sc, &mut never()).unwrap();
     assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
     let ev = s.take_events();
-    assert_eq!(ev.last().map(|e| (e.rule, e.outcome)), Some((TeachRule::IsolatedAtom, TeachOutcome::Kept)), "{ev:?}");
+    assert_eq!(ev.last().map(|e| (e.rule, e.outcome)), Some((TeachRule::IsolatedAtom, TeachOutcome::KeptStrayHeld)), "{ev:?}");
     assert!(r.stats.notes.iter().any(|n| n.contains("stray atoms (H2 + H) — a composition check") && n.contains("queued")), "{:?}", r.stats.notes);
     assert!(r.stats.notes.iter().any(|n| n.contains("held out of the fit — stray atoms (H2 + H)")), "{:?}", r.stats.notes);
     let i = s.samples() - 1;
@@ -927,6 +927,12 @@ fn no_auditor_no_check_but_held_out() {
     assert!(s.stray_pending.is_none() && s.side_queue.is_empty());
     let i = s.samples() - 1;
     assert_eq!((s.quarantine[i], s.stray_held_out()), (Q_STRAY, 1));
+    // Task 6: the note once per signature, not at every step; the held sample's event says it is held, not "kept"
+    let ev = s.take_events();
+    assert_eq!(ev.last().map(|e| e.outcome), Some(TeachOutcome::KeptStrayHeld), "{ev:?}");
+    let again = s.evaluate(&h2_with(CHECKS[1], &[STRAY_AT]), &mut never()).unwrap();
+    assert_eq!(again.stats.source, Source::Fallback);
+    assert!(!again.stats.notes.iter().any(|n| n.contains("no background teacher")), "{:?}", again.stats.notes);
     s.species_dirty = true;
     assert_eq!(s.refit().unwrap().n_samples, 40, "held out of the fit");
 }

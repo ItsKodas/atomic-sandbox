@@ -297,12 +297,14 @@ impl SurrogateKs {
                 return o;
             }
         };
-        let n = pos.len().max(1) as f64;
+        // per energy-row atom (`audit_n`, ruling 9a): n without a stray atom, the bonded atoms with some
+        let n = self.audit_n(&pos) as f64;
+        let per = if self.audit_n(&pos) == pos.len().max(1) { "/atom" } else { " per bonded atom" };
         let e_ref: f64 = z.iter().map(|zi| self.refs.get(zi).copied().unwrap_or(f64::NAN)).sum();
         let fmax = pred.forces.iter().map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt()).fold(0.0f64, f64::max);
         let _ = writeln!(
             o,
-            "    model: E {:.6} Ha (E − Σ E_ref = {:+.5} Ha, {:+.5}/atom), max |F| {fmax:.4} Ha/Bohr, energy std {:?}",
+            "    model: E {:.6} Ha (E − Σ E_ref = {:+.5} Ha, {:+.5}{per}), max |F| {fmax:.4} Ha/Bohr, energy std {:?}",
             pred.energy,
             pred.energy - e_ref,
             (pred.energy - e_ref) / n,
@@ -520,7 +522,8 @@ impl SurrogateKs {
                 c.boxed += 1;
             }
             if let Ok(pr) = model.predict(&s.pos, &s.z, false) {
-                let n = s.pos.len().max(1) as f64;
+                // per energy-row atom, as the fit's row (`surrogate::energy_row_atoms`, ruling 9a)
+                let n = surrogate::energy_row_atoms(&model.basis, &s.pos).max(1) as f64;
                 c.e_max = super::trust::max_nan(c.e_max, (pr.energy - s.energy).abs() / n);
                 for (fm, fs) in pr.forces.iter().zip(&s.forces) {
                     let (d, bd) = p.force_residual(fm, fs);

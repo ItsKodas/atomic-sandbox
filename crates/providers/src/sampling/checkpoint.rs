@@ -390,6 +390,9 @@ fn parse(text: &str) -> Result<(Sampler, CheckpointInfo), String> {
         notes: Vec::new(),
         added: c[1],
         boxed: c[2],
+        // not in the checkpoint's counters line (its format is unchanged): a resumed pass's finish note counts the
+        // stray-atom samples it held since the resume
+        stray_held: 0,
         cell_skipped: c[3],
         tail_skipped: c[4],
         collection_skipped: 0,

@@ -818,6 +818,11 @@ impl SurrogateKs {
         if refused {
             return TeachOutcome::StoreRefused;
         }
+        // kept, but held out of the fit until a composition check measures its stray atoms (`stray` module doc, "The
+        // hold-out"): the event says so rather than "kept" (Task 6; any release or lift `admit` made is in its note)
+        if a.kept && a.outcome.is_kept() && self.samples().checked_sub(1).and_then(|i| self.quarantine.get(i)) == Some(&Q_STRAY) {
+            return TeachOutcome::KeptStrayHeld;
+        }
         a.outcome
     }
 }

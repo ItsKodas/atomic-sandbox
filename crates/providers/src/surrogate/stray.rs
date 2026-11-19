@@ -110,6 +110,16 @@
 //! **One failing check refuses the signature for the session.** Session-only state (spec §4.6). The region lives in
 //! the descriptor space of the basis it was built with: a model with another basis must clear the book.
 //!
+//! **What the region covers, honestly** (Task 4 review, ruling 7; Task 6). The region is a per-feature box, and the
+//! descriptor features are not monotonic in the geometry (a radial basis function rises and falls with r), so the box
+//! spanned by checks at distant bonded geometries need not contain the geometries between them: a bond stretched
+//! halfway between two checked lengths can fall outside it. That is the conservative side — it falls back and checks
+//! once more, and each such pass grows the region — but a signature can take **more than 3 checks** before the
+//! geometries a run visits are covered. **The book clears on any basis change**, a collection's body-4 degree growing
+//! with its samples included (`stray_book_current`): the regions live in the old basis's feature space, so every
+//! signature's checks are re-earned under the new model (its held samples stay held until then; nothing is released
+//! by the clear).
+//!
 //! # Answering inside a region (spec §4.4; plan Task 4)
 //!
 //! [`stray_cleared`](SurrogateKs::stray_cleared) decides, before the envelope: the scene splits, every stray species is
@@ -225,10 +235,13 @@
 //!   teacher's synchronous audits) no check runs: a synchronous fragment solve would stall the step (plan ruling).
 //! - **Judged.** When every part has answered, [`judge`] gives the verdict and [`StrayBook::record`] books it at the
 //!   bonded descriptors under the model's basis; one Activity event says what it did (`TeachOutcome::StrayChecking`,
-//!   `StrayCheckingNew`, `StrayRefused`; a void check `Discarded`, a failed part solve `Failed`).
+//!   `StrayCheckingNew`, `StrayRefused`; a void check `Discarded`, a failed part solve `Failed`). That one row stands
+//!   for 1 + n_stray teacher solves (`TeachEvent::solves`: the bonded part alone and each stray atom alone), and every
+//!   solve counter adds them so. Without an auditor the fallback's note says so once per signature this session.
 //! - **The hold-out.** A kept sample with stray atoms (`keep_sample_masked`) is held out of the fit
-//!   (`quarantine::Q_STRAY`, never written) unless a cleared region of its signature covers its bonded geometry; a
-//!   floor-refused one is never kept (`TeachOutcome::StrayNotKept`). A pass releases the check's own sample; a cleared
+//!   (`quarantine::Q_STRAY`, never written; its event `TeachOutcome::KeptStrayHeld`, "held until measured") unless a
+//!   cleared region of its signature covers its bonded geometry; a floor-refused one is never kept
+//!   (`TeachOutcome::StrayNotKept`). A pass releases the check's own sample; a cleared
 //!   signature releases every held sample of it its region covers
 //!   ([`release_stray_samples`](SurrogateKs::release_stray_samples)); a refused one holds them for good. Loaded
 //!   samples are held the same way (`hold_out_stray`), never rewritten. The sampling pass's samples go through the
@@ -742,6 +755,21 @@ impl StrayBook {
     /// Forget every signature (a new model, a surface change, a reset).
     pub(super) fn clear(&mut self) {
         self.map.clear();
+    }
+
+    /// Every signature booked this session with its state (unordered).
+    pub(super) fn entries(&self) -> impl Iterator<Item = (&Signature, &StrayState)> {
+        self.map.iter()
+    }
+}
+
+/// A state in the Model tab's words (`sim::TrainableStatus::stray`; spec §5): "checking (1 of 3)", "cleared (3
+/// checks)", "refused (why)".
+pub(super) fn state_words(st: &StrayState) -> String {
+    match st {
+        StrayState::Checking { passes, .. } => format!("checking ({passes} of {STRAY_CHECKS})"),
+        StrayState::Cleared { passes, .. } => format!("cleared ({passes} check{})", if *passes == 1 { "" } else { "s" }),
+        StrayState::Refused(why) => format!("refused ({why})"),
     }
 }
 

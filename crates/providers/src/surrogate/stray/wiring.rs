@@ -213,6 +213,22 @@ impl SurrogateKs {
         true
     }
 
+    /// The session's stray-atom signatures for the Model tab (`sim::TrainableStatus::stray`; spec §5): (label, state
+    /// words), sorted by label. Empty when the book is not the standing model's (it is cleared lazily, at the next
+    /// step: [`stray_book_current`](Self::stray_book_current)), so a stale region is never shown as cleared.
+    pub(in crate::surrogate) fn stray_status(&self) -> Vec<(String, String)> {
+        let current = match (self.model.as_ref(), self.stray_key.as_ref()) {
+            (Some(m), Some((b, s))) => m.basis == *b && reference_settings_key(&m.provenance) == *s,
+            _ => false,
+        };
+        if !current {
+            return Vec::new();
+        }
+        let mut v: Vec<(String, String)> = self.stray_book.entries().map(|(sig, st)| (signature_label(sig), super::state_words(st))).collect();
+        v.sort();
+        v
+    }
+
     /// Drops the check in flight and its queued parts (an answer already on its way is told apart by its job id). An
     /// attribution check's failed audit then counts against the model (the conservative side; parent module doc,
     /// "Audits of a cleared answer"): its check did not complete (a part solve failed, an answer matched no stray atom).
@@ -486,6 +502,8 @@ impl SurrogateKs {
         let solved = match ans.result {
             Ok(s) => s,
             Err(e) => {
+                // the solves this check made: the parts answered so far and this failed one (one row, Task 6)
+                let solves = 1 + u32::from(p.frag.is_some()) + p.atoms.iter().filter(|a| a.is_some()).count() as u32;
                 self.drop_stray_check();
                 let what = if ans.job.kind == JobKind::Fragment { "the bonded part alone" } else { "a stray atom alone" };
                 let then = if attributing { "the failed audit it was attributing counts against the model" } else { "not counted, the next fallback checks again" };
@@ -497,6 +515,7 @@ impl SurrogateKs {
                 ev.detail = note.clone();
                 ev.n_atoms = ans.job.scene.nuclei.len();
                 ev.solve_ms = ans.ms;
+                ev.solves = solves;
                 self.push_event(ev);
                 return self.pending_notes.push(note);
             }
@@ -538,6 +557,7 @@ impl SurrogateKs {
         let atoms: Vec<PartAnswer> = atoms.into_iter().map(|a| a.expect("complete")).collect();
         let label = signature_label(&sig);
         let n_atoms = pos.len();
+        let n_stray = atoms.len() as u32;
         if let Some(a) = attribution {
             return self.attribute_stray_audit(a, &label, &split, &scene, &frag, &atoms, &pos, &z, ms);
         }
@@ -554,6 +574,8 @@ impl SurrogateKs {
             ev.detail = detail;
             ev.n_atoms = n_atoms;
             ev.solve_ms = ms;
+            // the bonded part alone and each stray atom alone: 1 + n_stray solves in this one row (Task 6)
+            ev.solves = 1 + n_stray;
             ev
         };
         let (outcome, detail) = match verdict.clone() {
@@ -723,6 +745,7 @@ impl SurrogateKs {
         ev.gap = Some(gap);
         ev.n_atoms = pos.len();
         ev.solve_ms = ms;
+        ev.solves = 1 + atoms.len() as u32;
         self.push_event(ev);
         self.pending_notes.push(detail);
         self.next_attribution();

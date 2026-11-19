@@ -451,6 +451,9 @@ pub struct Sampler {
     added: usize,
     /// Samples added whose teacher answer was box-affected (module doc, "Box-affected samples").
     boxed: usize,
+    /// Samples added with stray atoms, held out of the fit until a composition check measures them
+    /// (`surrogate::stray`, `PassKeep::Kept { held: true }`; the finish note beside the box-affected one).
+    stray_held: usize,
     /// Geometries the cell guard skipped (the burst's tail included), and scan points skipped
     /// beyond a failed one (`SamplingProgress::skipped` counts both, and the untrainable answers).
     cell_skipped: usize,
@@ -664,6 +667,7 @@ impl Sampler {
             notes,
             added: 0,
             boxed: 0,
+            stray_held: 0,
             cell_skipped: 0,
             tail_skipped: 0,
             collection_skipped: 0,
@@ -717,6 +721,7 @@ impl Sampler {
             notes: Vec::new(),
             added: 0,
             boxed: 0,
+            stray_held: 0,
             cell_skipped: 0,
             tail_skipped: 0,
             collection_skipped: 0,
@@ -1734,9 +1739,16 @@ impl Sampler {
                     self.boxed += 1;
                 }
                 if held {
+                    self.stray_held += 1;
                     detail.push_str(" — kept, held out of the fit until a composition check measures its stray atoms");
                 }
-                if boxed { TeachOutcome::KeptBoxAffected } else { TeachOutcome::Kept }
+                if held {
+                    TeachOutcome::KeptStrayHeld
+                } else if boxed {
+                    TeachOutcome::KeptBoxAffected
+                } else {
+                    TeachOutcome::Kept
+                }
             }
             Err(e) => {
                 self.progress.failed += 1;
@@ -1920,6 +1932,12 @@ impl Sampler {
                 self.boxed,
                 self.added,
                 box_affected_face_density(self.scene.cell.h)
+            ));
+        }
+        if self.stray_held > 0 {
+            self.notes.push(format!(
+                "sampling: {} of {} samples have stray atoms (no neighbour within the model's cutoff) — kept, held out of the fit until a composition check measures that the molecule and its free atoms add up",
+                self.stray_held, self.added
             ));
         }
     }

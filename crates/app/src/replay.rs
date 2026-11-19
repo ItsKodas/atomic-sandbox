@@ -931,7 +931,8 @@ fn counters_check(a: &crate::ui::activity::ActivityState, model: Option<&ModelSt
     let m = model.ok_or("no model: the counters have nothing to compare with")?;
     let new = (a.rows_seen - since.rows_seen) as usize;
     let rows = || a.rows.iter().rev().take(new);
-    let counted = rows().filter(|r| r.event.counts_for_model()).count() as u64;
+    // a composition check's row stands for its parts' solves (`TeachEvent::solves`), as the ledger counts it
+    let counted: u64 = rows().filter(|r| r.event.counts_for_model()).map(|r| u64::from(r.event.solves)).sum();
     let ledger = m.solves.total().saturating_sub(since.model_solves);
     if ledger < counted || (a.dropped == 0 && new <= a.rows.len() && ledger != counted) {
         return Err(format!("the model's solve ledger grew by {ledger}, the log has {counted} rows that count for it since the mark"));

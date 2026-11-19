@@ -612,6 +612,11 @@ pub enum TeachOutcome {
     KeptBoxAffected,
     KeptByVote,
     KeptReleased { released: u32, superseded: u32 },
+    /// Kept in the store but held out of the fit: the answer has stray atoms (no neighbour within the
+    /// model's cutoff) whose composition no check has measured at this geometry yet
+    /// (`providers::surrogate::stray`, "The hold-out"; spec 2026-11-18 §4.3). A check's pass, or a
+    /// cleared region that covers it, releases it into the fit.
+    KeptStrayHeld,
     /// Kept: the last of `FENCE_VOTES` consecutive, mutually consistent fresh answers near forgotten
     /// samples that agree with the model — the fence of `lifted` forgotten samples is lifted
     /// (`providers::surrogate`, "Lifting a forgotten sample's fence"; 2026-11-14).
@@ -671,7 +676,10 @@ pub enum TeachOutcome {
 
 impl TeachOutcome {
     pub fn is_kept(self) -> bool {
-        matches!(self, TeachOutcome::Kept | TeachOutcome::KeptBoxAffected | TeachOutcome::KeptByVote | TeachOutcome::KeptReleased { .. } | TeachOutcome::FenceLifted { .. })
+        matches!(
+            self,
+            TeachOutcome::Kept | TeachOutcome::KeptBoxAffected | TeachOutcome::KeptByVote | TeachOutcome::KeptReleased { .. } | TeachOutcome::FenceLifted { .. } | TeachOutcome::KeptStrayHeld
+        )
     }
 }
 
@@ -742,6 +750,10 @@ pub struct TeachEvent {
     /// dof): the Verlet velocities v(t + dt) at the solved geometry, before the CSVR thermostat
     /// rescales them (plan review S6).
     pub burst_t: Option<f64>,
+    /// The teacher solves this row stands for: 1, except a stray-atom composition check — the bonded part alone
+    /// and each stray atom alone, 1 + n_stray solves in one row (`providers::surrogate::stray`). Every counter of
+    /// solves ([`SolveCounts`], the Activity tab's) adds this, never 1 per row.
+    pub solves: u32,
 }
 
 impl TeachEvent {
@@ -765,6 +777,7 @@ impl TeachEvent {
             audit: None,
             audit_lag: None,
             burst_t: None,
+            solves: 1,
         }
     }
 
@@ -808,11 +821,12 @@ impl SolveCounts {
         if !e.counts_for_model() {
             return;
         }
+        let k = u64::from(e.solves);
         match e.origin {
-            TeachOrigin::Pass => self.pass += 1,
-            TeachOrigin::Fallback => self.fallback += 1,
-            TeachOrigin::Audit => self.audit += 1,
-            TeachOrigin::Verification => self.verification += 1,
+            TeachOrigin::Pass => self.pass += k,
+            TeachOrigin::Fallback => self.fallback += k,
+            TeachOrigin::Audit => self.audit += k,
+            TeachOrigin::Verification => self.verification += k,
         }
         if e.outcome.is_kept() {
             self.kept += 1;
@@ -1215,5 +1229,19 @@ mod tests {
         let mut c = SolveCounts::default();
         c.count(&e);
         assert_eq!((c.audit, c.kept, c.not_kept()), (1, 0, 1));
+    }
+
+    /// Stray atoms (spec 2026-11-18 §5, the Task 3 review's minor): a composition check is the bonded part's solve
+    /// and each stray atom's in one row, counted as that many solves, none kept; a held stray-atom sample is kept
+    /// (in the store), only held out of the fit.
+    #[test]
+    fn a_composition_check_counts_its_solves_and_a_held_stray_sample_is_kept() {
+        let mut e = TeachEvent::new(TeachOrigin::Audit, TeachRule::IsolatedAtom, TeachOutcome::StrayChecking { n: 1, of: 3 });
+        assert_eq!(e.solves, 1, "one solve per row by default");
+        e.solves = 2;
+        let mut c = SolveCounts::default();
+        c.count(&e);
+        assert_eq!((c.audit, c.total(), c.kept, c.not_kept()), (2, 2, 0, 2));
+        assert!(TeachOutcome::KeptStrayHeld.is_kept());
     }
 }

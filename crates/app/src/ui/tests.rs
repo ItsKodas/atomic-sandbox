@@ -192,7 +192,7 @@ pub(crate) fn model() -> ModelStatus {
         pending: 0,
         box_affected: 0,
         trust_floor: Some(70),
-        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0, 0, 0, 0, 0)),
+        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0, 0, 0, 0, 0, 0)),
         audits_background: true,
         audit_in_flight: true,
         last_audit: Some(sim::AuditRecord {
@@ -219,6 +219,8 @@ pub(crate) fn model() -> ModelStatus {
         retry_fit: false,
         source: sim::ModelSource::None,
         lone_note: None,
+        stray: Vec::new(),
+        stray_held_out: 0,
         collections: false,
         last_import: None,
         purge_refusal: None,
@@ -1331,7 +1333,7 @@ fn the_worst_fitting_samples_forget_and_restore_one() {
     assert_eq!(crate::replay::unreplayable_kind(&Action::ForgetSample(id)), Some("forget-sample"));
     assert_eq!(crate::replay::unreplayable_kind(&Action::RestoreSample(id)), Some("restore-sample"));
     // the forgotten count beside the held one
-    assert_eq!(crate::sim::fit_vs_held(270, 273, 0, 2, 0, 1, 0, 0, 0, 0), "270 of 273 held: 2 quarantined, 1 forgotten");
+    assert_eq!(crate::sim::fit_vs_held(270, 273, 0, 2, 0, 1, 0, 0, 0, 0, 0), "270 of 273 held: 2 quarantined, 1 forgotten");
     // no ranking yet (a model, no list), and no model: the section says why
     for (m, why) in [
         (ModelStatus { suspects: Vec::new(), forgotten_samples: Vec::new(), ..model() }, super::dock::model::SUSPECTS_NO_RANKING),
@@ -5826,6 +5828,31 @@ mod activity_words {
         assert_eq!(rule_sentence(sim::activity::TeachRule::NearMisfit, Some(0), RowCtx::default()), "an atom here is next to a training sample the model cannot reproduce");
         assert_eq!(outcome_label(sim::activity::TeachOutcome::MisfitDisagrees), "not kept: misfit");
     }
+
+    /// Stray atoms (spec 2026-11-18 §5): the composition checks' outcomes in the spec's words; a held sample's row says
+    /// it is held until measured, never "kept"; a check's row counts its parts' solves in its solve cell.
+    #[test]
+    fn stray_outcomes_have_their_words() {
+        use activity::words::{outcome_label, outcome_sentence};
+        use sim::activity::TeachOutcome as K;
+        assert_eq!(outcome_label(K::StrayChecking { n: 1, of: 3 }), "checking composition 1 of 3");
+        assert_eq!(outcome_label(K::StrayChecking { n: 2, of: 3 }), "checking composition 2 of 3");
+        assert_eq!(outcome_label(K::StrayCheckingNew), "checking composition (new geometry)");
+        assert_eq!(outcome_label(K::StrayRefused), "composition fails");
+        assert_eq!(outcome_label(K::StrayNotKept), "not kept: stray atoms");
+        assert_eq!(outcome_label(K::KeptStrayHeld), "held: stray atoms (until measured)");
+        assert!(!outcome_label(K::KeptStrayHeld).contains("kept") && outcome_sentence(K::KeptStrayHeld).starts_with("held until measured"));
+        for o in [K::StrayChecking { n: 3, of: 3 }, K::StrayCheckingNew, K::StrayRefused, K::StrayNotKept, K::KeptStrayHeld, K::StrayAuditAttributed { model: true }, K::StrayAuditAttributed { model: false }] {
+            assert!(!outcome_sentence(o).is_empty(), "{o:?}");
+        }
+        // the rule reads "5a lone atom" for every isolated-atom row: "5a lone atom · composition fails"
+        assert_eq!(activity::words::rule_label(sim::activity::TeachRule::IsolatedAtom, None), "5a lone atom");
+        let mut e = sim::TeachEvent::new(sim::activity::TeachOrigin::Audit, sim::activity::TeachRule::IsolatedAtom, K::StrayChecking { n: 1, of: 3 });
+        e.solve_ms = 840.0;
+        assert_eq!(activity::log::solve_cell(&e), "840 ms");
+        e.solves = 2;
+        assert_eq!(activity::log::solve_cell(&e), "840 ms · 2 solves", "a check: the bonded part alone and the stray atom alone");
+    }
 }
 
 /// The status chip's headline and the toolbar's progress bar (activity spec §3.1, §3.2).
@@ -7859,6 +7886,51 @@ fn rewind_and_reverse_velocities_have_their_homes() {
     let rev = search::ENTRIES.iter().find(|e| e.name == "Reverse velocities").expect("searchable");
     assert_eq!(rev.place, search::Place::Menu(menus::MenuId::Physics));
     assert!(rewind::ago(std::time::Duration::from_secs(130)) == "2 min ago");
+}
+
+/// Stray atoms (spec 2026-11-18 §5): the Model tab's verdict card lists this session's stray-atom signatures — "Stray
+/// atoms: H₂ + H cleared (3 checks)", "… refused (why)" — and counts the stray-atom samples held out of the fit;
+/// nothing without any. The "fit vs held" line names them too.
+#[test]
+fn the_trust_card_lists_stray_signatures() {
+    use crate::ui::dock::model::stray_lines;
+    assert!(stray_lines(&model()).is_empty(), "no signature, nothing held: no line");
+    let m = ModelStatus {
+        stray: vec![
+            ("H2 + H".into(), "cleared (3 checks)".into()),
+            ("H2O + H".into(), "refused (composition fails: |ΔE| = 4.1 mHa)".into()),
+            ("C2H4 + H".into(), "checking (1 of 3)".into()),
+        ],
+        stray_held_out: 7,
+        ..model()
+    };
+    let lines = stray_lines(&m);
+    assert_eq!(
+        lines,
+        vec![
+            ("Stray atoms: H₂ + H cleared (3 checks)".to_string(), false),
+            ("Stray atoms: H₂O + H refused (composition fails: |ΔE| = 4.1 mHa)".to_string(), true),
+            ("Stray atoms: C₂H₄ + H checking (1 of 3)".to_string(), false),
+            ("7 stray-atom samples held out of the fit until measured".to_string(), false),
+        ]
+    );
+    // drawn on the card, sending nothing
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    st.open_tab(DockTab::Model);
+    let snap = snapshot(&scene, Backend::Estimated, Some(m));
+    let inp = input(&scene, Some(&snap), &cam);
+    PROBES.with(|p| p.borrow_mut().clear());
+    for _ in 0..3 {
+        assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+    }
+    for k in 0..4 {
+        assert!(probed_rect(&format!("model-stray-{k}")).width() > 0.0, "line {k} drawn");
+    }
 }
 
 /// The Model tab's amber lone-atom note (`ModelStatus::lone_note`) is drawn by Start sampling and

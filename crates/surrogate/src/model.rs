@@ -482,8 +482,9 @@ impl Model {
         restrict(&mut reduced, rep, &phi);
         let epistemic_e = cholesky_quad_form(l, qr, &mut reduced);
         let floor_e = if self.energy_per_atom {
-            // N_e: the atoms the energy row is per (`crate::energy_row_atoms`; = n without an isolated atom)
-            (crate::energy_row_atoms(basis, pos) as f64 * self.sigma_e).powi(2)
+            // N_e: the atoms the energy row is per (`crate::energy_row_atoms`; = n without an isolated atom), counted
+            // over the descriptors already in hand — the same test, no second pair pass
+            (crate::descriptor::energy_row_atoms_described(basis, &desc) as f64 * self.sigma_e).powi(2)
         } else {
             self.sigma_e.powi(2)
         };

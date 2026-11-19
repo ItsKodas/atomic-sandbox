@@ -356,7 +356,9 @@ impl SurrogateKs {
                 parity_omitted += 1;
                 continue;
             }
-            let n = smp.pos.len() as f64;
+            // per energy-row atom, as the fit's own row (`surrogate::energy_row_atoms`, ruling 9a): n for every sample
+            // without a stray atom (bit for bit), the bonded atoms at one with stray atoms
+            let n = surrogate::energy_row_atoms(&model.basis, &smp.pos).max(1) as f64;
             let st = state(i);
             // a capped segment (M8a Task 10): no energy point (its energy is not fitted: it holds
             // the caps), the interior atoms' forces only

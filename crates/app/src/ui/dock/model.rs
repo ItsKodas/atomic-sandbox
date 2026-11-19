@@ -12,6 +12,9 @@
 //!    and the sample count. While Forget / Restore changes wait for their refit, the pending-refit
 //!    banner ([`refit_banner`]: "2 changes pending · refit in 8 s" with **Refit now**, or "refitting
 //!    · 1 more pending after this one") sits under the reason (2026-11-14, the batched forget).
+//!    Under it, the stray-atom lines ([`stray_lines`]; spec 2026-11-18 §5): one per signature this session —
+//!    "Stray atoms: H₂ + H cleared (3 checks)" or "… refused (why)" — and the count of stray-atom samples held
+//!    out of the fit until measured.
 //! 2. **Teach next** (open): what blocks or helps teaching — the refused autoload, the box advice,
 //!    "no model yet" with Retry, Teach around blockers, the running pass's progress, the first-pass
 //!    offer — then the environment keys not learned yet ([`gaps`]: the scene's first, the others
@@ -685,6 +688,11 @@ fn verdict_card(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, m: Option
         // the user's Forget / Restore waiting for their refit (2026-11-14, the batched forget)
         if let Some(m) = m.filter(|_| st.backend == Backend::Estimated) {
             refit_banner_row(ui, m, input.sampling(), input.probe.as_ref().and_then(|p| p.refit.as_ref()), acts);
+            // the stray-atom signatures of this session and the samples they hold out (spec 2026-11-18 §5)
+            for (k, (line, warn)) in stray_lines(m).into_iter().enumerate() {
+                let text = RichText::new(line).size(11.5).color(if warn { AMBER } else { theme::INK_DIM });
+                super::super::probed(&format!("model-stray-{k}"), ui.add(egui::Label::new(text).wrap())).on_hover_text(STRAY_TIP);
+            }
         }
         // the failed residual check's worst sample, with the Worst-fitting rows' Forget
         if let Some(id) = m.filter(|m| m.fitted).and_then(|m| trust(Some(m), input.scene, st).forget) {
@@ -720,6 +728,23 @@ fn verdict_card(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, m: Option
     });
     probe_rect("model-verdict", r.response.rect);
 }
+
+/// The verdict card's stray-atom lines (spec 2026-11-18 §5): per signature this session "Stray atoms: {label}
+/// {state}" — "cleared (3 checks)", "checking (1 of 3)" or "refused (why)", the label's counts as subscripts —
+/// and "{k} stray-atom samples held out of the fit until measured" when some are. Each with whether it warns (a
+/// refusal: amber).
+pub fn stray_lines(m: &ModelStatus) -> Vec<(String, bool)> {
+    const SUB: [char; 10] = ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'];
+    let sub = |s: &str| s.chars().map(|c| c.to_digit(10).map_or(c, |d| SUB[d as usize])).collect::<String>();
+    let mut v: Vec<(String, bool)> = m.stray.iter().map(|(label, state)| (format!("Stray atoms: {} {state}", sub(label)), state.starts_with("refused"))).collect();
+    if m.stray_held_out > 0 {
+        v.push((format!("{} stray-atom samples held out of the fit until measured", m.stray_held_out), false));
+    }
+    v
+}
+
+/// The stray lines' hover: what a signature's state means.
+const STRAY_TIP: &str = "stray atoms: atoms with no neighbour within the model's cutoff, beside a molecule. The model answers such a scene as the molecule plus free atoms only after composition checks on the background teacher (the molecule alone, each stray atom alone, in the same box) have measured, at 3 distinct geometries of the molecule, that DFT's energy splits that way — no charge moving between them, the levels unchanged. A failed check keeps that combination on DFT for the session; samples with stray atoms stay out of the fit until a check measures their geometry. Session-only: a new model or settings start the checks again";
 
 /// One gap row: its label (wrapping), a small progress bar of `have` / `need` and the short words.
 fn gap_row(ui: &mut Ui, g: &Gap) {

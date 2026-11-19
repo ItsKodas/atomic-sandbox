@@ -1485,7 +1485,8 @@ pub struct TrainableStatus {
     /// of the stored species' basis, the trust floor); `None` with an empty store.
     pub trust_floor: Option<usize>,
     /// Samples kept since the last refit (not in the fit yet). Right after a refit
-    /// `samples` = fit samples + `quarantined` + `superseded` + `forgotten` + `box_excluded` + `held_out` + `lone` + `unfitted`
+    /// `samples` = fit samples + `quarantined` + `superseded` + `forgotten` + `box_excluded` + `held_out` + `lone` +
+    /// `stray_held_out` + `unfitted`
     /// exactly (M6 Task 11: the panel's "fit vs held" reconciliation).
     pub unfitted: usize,
     /// Of `unfitted`, the samples in the next fit's codes (no quarantine code: not forgotten, held,
@@ -1544,6 +1545,13 @@ pub struct TrainableStatus {
     /// (`providers::surrogate::lone_atoms_note`): all of them — a pass is refused; some — they are
     /// not learned. `None` when every atom has a neighbour. Informational.
     pub lone_note: Option<String>,
+    /// The stray-atom signatures of this session (`providers::surrogate::stray`, spec 2026-11-18 §5): per signature its
+    /// label ("H2 + H": the bonded part's formula + the stray atoms') and its state in words — "checking (1 of 3)",
+    /// "cleared (3 checks)" or "refused (why)". Session-only; empty without a model or a check.
+    pub stray: Vec<(String, String)>,
+    /// Stored samples with stray atoms held out of the fit until a composition check measures them
+    /// (`providers::surrogate`, `Q_STRAY`): with the counts above, what the store holds beyond the fit.
+    pub stray_held_out: usize,
 }
 
 /// Where a [`Trainable`]'s model comes from (M8a Task 4a; [`TrainableStatus::model_source`]): the

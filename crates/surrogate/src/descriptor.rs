@@ -986,6 +986,18 @@ pub fn energy_row_atoms_at(r_cut: f64, pos: &[[f64; 3]]) -> usize {
     }
 }
 
+/// [`energy_row_atoms`] from descriptors already computed (`describe`'s, of the same geometry): the atoms that are not
+/// [`isolated_atom`](crate::envelope::isolated_atom), N when all are — the same count without the pair pass (Task 6:
+/// `Model::predict` holds the descriptors). Equal to [`energy_row_atoms`] (tested).
+pub fn energy_row_atoms_described(basis: &Basis, desc: &[AtomDescriptor]) -> usize {
+    let seen = desc.iter().filter(|d| !crate::envelope::isolated_atom(basis, &d.b)).count();
+    if seen == 0 {
+        desc.len()
+    } else {
+        seen
+    }
+}
+
 /// The descriptor values B_i alone — what [`describe`] puts in `AtomDescriptor::b`, bit for bit
 /// (the same sums in the same order), without the gradient lists: the surrogate's per-step
 /// envelope and quarantine checks need only the values, and the gradients cost about twice the
@@ -1087,6 +1099,8 @@ mod tests {
             let z: Vec<u8> = (0..n).map(|_| if rng.gen_bool(0.5) { 1 } else { 8 }).collect();
             let k = energy_row_atoms(&basis, &pos);
             assert_eq!(k, counted(&pos, &z), "{pos:?}");
+            // the count from `describe`'s descriptors (`Model::predict`'s, Task 6) is the same
+            assert_eq!(energy_row_atoms_described(&basis, &describe(&basis, &pos, &z).unwrap()), k, "{pos:?}");
             if k < n { with_isolated += 1 } else { without += 1 }
         }
         assert!(with_isolated > 50 && without > 50, "the premise: both kinds drawn ({with_isolated}, {without})");
