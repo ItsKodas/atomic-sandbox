@@ -518,8 +518,9 @@ impl SurrogateKs {
             }
         }
         self.sync_collection_status();
-        self.flush_collection();
+        // the log before the README, which carries its summary (Task 16 re-review R2)
         self.flush_migration_log();
+        self.flush_collection();
         // evidence that arrived while the copy ran is read as it would have been after a
         // synchronous refit: between refits (`rejudge_classes` — it can make a key leave, never
         // enter, until the next refit's own judgement)

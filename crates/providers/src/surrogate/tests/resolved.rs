@@ -278,6 +278,33 @@ fn review_releases_siblings_its_neighbours_predict() {
     assert!(s.review_kept.is_empty());
 }
 
+/// Spec §7.8 (plan Task 16 re-review R2): after a review the collection's `README.txt` carries the same migration
+/// summary as the Model tab (`Trainable::migration().summary`) — the refit writes the reviewed `migration.txt` before
+/// the README, so the README is never one review behind.
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn the_readme_migration_summary_matches_the_model_tab_after_a_review() {
+    let dir = collection_root("code9-readme");
+    let (mut s, _) = super::forget::small_collection(&dir);
+    let mut rng = StdRng::seed_from_u64(34);
+    siblings(&mut s, &mut rng);
+    set_migration(&mut s, MigrationState::Complete);
+    // the ten siblings are the pass's class S: the summary's state-changed line reads differently before and after
+    let mut log = disk_log(&s);
+    log.counts = [40, 0, SIBLINGS, 0];
+    log.cursor = 40 + SIBLINGS;
+    surrogate::write_migration(s.collection().unwrap().folder(), &log).unwrap();
+    s.find_migration();
+    let before = sim::Trainable::migration(&s).and_then(|m| m.summary).unwrap();
+    assert!(before.contains("the next refit reviews them"), "{before}");
+    s.refit().unwrap();
+    assert_eq!(disk_log(&s).state, MigrationState::Reviewed, "the review ran");
+    let tab = sim::Trainable::migration(&s).and_then(|m| m.summary).expect("a summary once complete");
+    assert!(tab.contains("re-solved and reviewed:"), "{tab}");
+    let readme = std::fs::read_to_string(s.collection().unwrap().folder().join("README.txt")).unwrap();
+    assert!(readme.contains(&tab), "the README's summary is the Model tab's:\n{readme}\n--- tab:\n{tab}");
+}
+
 /// §7.6 step 4: a sample 50 mHa off its region's state stays at 9 — its verdict is "kept" with its ratio — and fences
 /// (`fences()`, F4). Inside the stored window (r = 1.62, the trusted Morse fit) a geometry next to it is refused by the
 /// quarantine fence (`would_answer` names `NearQuarantine`), and it is never converted to code 1, by this refit or the

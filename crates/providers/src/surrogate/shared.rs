@@ -412,8 +412,9 @@ impl SurrogateKs {
     /// Writes the audit history and the README of the attached collection, then lets it go
     /// (its lock released). `None` when none was attached.
     pub(super) fn detach_collection(&mut self) -> Option<Collection> {
-        self.flush_collection();
+        // the log before the README, which carries its summary (Task 16 re-review R2)
         self.flush_migration_log();
+        self.flush_collection();
         self.migration = None;
         self.review_kept.clear();
         self.review_stamp = None;
@@ -1803,7 +1804,8 @@ pub fn legacy_model_refusal(tag: &str) -> Option<String> {
 impl Drop for SurrogateKs {
     /// The attached collection's audit history and README are written before its lock is released.
     fn drop(&mut self) {
-        self.flush_collection();
+        // the log before the README, which carries its summary (Task 16 re-review R2)
         self.flush_migration_log();
+        self.flush_collection();
     }
 }

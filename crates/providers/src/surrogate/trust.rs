@@ -1292,9 +1292,10 @@ impl SurrogateKs {
         // provider does after the install (`background` module doc)
         if !self.refit_fork {
             self.sync_collection_status();
-            self.flush_collection();
-            // the review's verdicts after the status records they name (`flush_migration_log`)
+            // the review's verdicts after the status records they name (`flush_migration_log`), and before the README,
+            // which carries the migration summary of the log on disk (Task 16 re-review R2)
             self.flush_migration_log();
+            self.flush_collection();
         }
         r
     }

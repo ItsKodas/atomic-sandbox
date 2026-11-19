@@ -6,7 +6,7 @@
 //! the collection's `README.txt` carries too).
 //!
 //! The copy is the spec's, verbatim where §7.8 gives it. Numbers are grouped as the spec writes them ("2 412",
-//! "1 579 K"), with a narrow no-break space so a label never wraps mid-number; the electronic temperature is
+//! "1 579 K"), with a no-break space (U+00A0) so a label never wraps mid-number; the electronic temperature is
 //! `ui::pseudo::t_el_kelvin` (kT = `qm::ELECTRON_KT`, plan ruling R19). A time is "1 h 30 min" ([`hm`]).
 
 use sim::{MigrationPhase, MigrationStatus};
@@ -18,7 +18,7 @@ pub const OFFER_BUTTONS: [&str; 2] = ["Re-solve now", "Later"];
 /// The progress line's head (spec §7.8) and the Activity tab's pass-card title.
 pub const RESOLVING: &str = "Re-solving for the new solver";
 
-/// "2 412" for 2412, with a narrow no-break space (U+202F; review M8): `surrogate::migration`'s, which the summary uses.
+/// "2 412" for 2412, with a no-break space (U+00A0; review M8, re-review R1): `surrogate::migration`'s, which the summary uses.
 pub use surrogate::migration::spaced;
 
 /// A GPU time as the offer and the progress line word it: "1 h 30 min" (from an hour on, to 5 min: it is an
@@ -39,6 +39,16 @@ pub fn hm(s: f64) -> String {
     }
 }
 
+/// `hm(s)` after an approximation word — "About 1 h 30 min", "≈ 52 min" — but never before "under a minute", which is
+/// approximate already: "Under a minute" / "under a minute" (the word's case kept; Task 16 re-review R3).
+pub fn approx(s: f64, word: &str) -> String {
+    match hm(s) {
+        w if w == "under a minute" && word.starts_with(char::is_uppercase) => "Under a minute".into(),
+        w if w == "under a minute" => w,
+        w => format!("{word} {w}"),
+    }
+}
+
 /// "H, N, O".
 fn species(z: &[u8]) -> String {
     z.iter().map(|&z| units::elements::symbol(z)).collect::<Vec<_>>().join(", ")
@@ -53,7 +63,7 @@ pub fn offer_shown(m: Option<&MigrationStatus>) -> bool {
 /// The offer's text after its title (spec §7.8).
 pub fn offer_body(m: &MigrationStatus) -> String {
     let what = if m.species.is_empty() { format!("{} samples", spaced(m.samples as u64)) } else { format!("{} · {} samples", species(&m.species), spaced(m.samples as u64)) };
-    let time = m.eta_s.map_or(String::new(), |s| format!(" About {} of GPU time.", hm(s)));
+    let time = m.eta_s.map_or(String::new(), |s| format!(" {} of GPU time.", approx(s, "About")));
     format!(
         "Atomic Sandbox now fills electron levels with Fermi–Dirac smearing at {} K, which fixes SCF stalls on loose clusters. Your collection \"{what}\" (models/collections/{}) was taught with the old rule. Its samples need one re-solve with the new solver before the model uses them. Most will come back identical within solver noise. Open-shell and nearly degenerate ones change by up to a few mHa; those are checked against the rest before they rejoin the fit.{time} You can pause it and keep working. The original folder is kept unchanged, and older versions keep using it.",
         spaced(u64::from(super::pseudo::t_el_kelvin())),
@@ -69,7 +79,7 @@ pub fn offer_text(m: &MigrationStatus) -> String {
 
 /// The offer folded by **Later**: one line, beside its Re-solve now.
 pub fn later_line(m: &MigrationStatus) -> String {
-    let time = m.eta_s.map_or(String::new(), |s| format!(" (about {} of GPU time)", hm(s)));
+    let time = m.eta_s.map_or(String::new(), |s| format!(" ({} of GPU time)", approx(s, "about")));
     format!("This collection was taught with the previous solver: {} samples need one re-solve with the new solver{time}.", spaced(m.samples as u64))
 }
 
@@ -79,12 +89,9 @@ fn class_counts(m: &MigrationStatus) -> String {
     format!("{u} identical · {t} changed only by −TS · {s} changed state · {n} not migrated")
 }
 
-/// "≈ 52 min left", "under a minute left" (no "≈" before words that are already approximate).
+/// "≈ 52 min left", "under a minute left" ([`approx`]).
 fn left(s: f64) -> String {
-    match hm(s) {
-        w if w == "under a minute" => format!("{w} left"),
-        w => format!("≈ {w} left"),
-    }
+    format!("{} left", approx(s, "≈"))
 }
 
 /// The progress line's counts after its head, without the time left: "sample 412 of 2 412 · 380 identical · … · 0 not
@@ -103,7 +110,7 @@ pub fn progress_line(m: &MigrationStatus) -> String {
 /// A pass started and stopped (Cancel, or the app closed): where it goes on — "sample k of n", k the next sample to
 /// re-solve, as the provider's note numbers it (review M3) — and that it goes on.
 pub fn stopped_line(m: &MigrationStatus) -> String {
-    let left = m.eta_s.map_or(String::new(), |s| format!(" (about {} of GPU time left)", hm(s)));
+    let left = m.eta_s.map_or(String::new(), |s| format!(" ({} of GPU time left)", approx(s, "about")));
     format!(
         "{RESOLVING} stopped at sample {} of {} ({}). It goes on from there at the next start of the app, or now with Resume{left}.",
         spaced(m.done as u64 + 1),
@@ -123,9 +130,9 @@ mod tests {
     use super::*;
     use surrogate::{MigrationLog, MigrationState, NotMigrated};
 
-    /// "2 412" with the narrow no-break space (review M8).
+    /// "2 412" with the no-break space (review M8, re-review R1).
     fn g(s: &str) -> String {
-        s.replace("_", "\u{202f}")
+        s.replace("_", "\u{a0}")
     }
 
     /// The fixture predecessor of spec §7.8: "H, N, O · 2 412 samples", 1 h 30 min a priori.
@@ -160,7 +167,23 @@ mod tests {
         assert_eq!(hm(7260.0), "2 h");
         assert_eq!(hm(5530.0), "1 h 30 min", "an hour and more: to 5 min");
         assert_eq!(hm(20.0), "under a minute");
-        assert_eq!(spaced(2412), "2\u{202f}412", "a narrow no-break space: never wrapped mid-number");
+        // never "about under a minute" (re-review R3): the offer, Later and the stopped line for a small collection
+        let small = MigrationStatus { samples: 12, eta_s: Some(20.0), ..m.clone() };
+        assert!(offer_body(&small).contains(" Under a minute of GPU time. "), "{}", offer_body(&small));
+        assert!(later_line(&small).ends_with("(under a minute of GPU time)."), "{}", later_line(&small));
+        let stopped = MigrationStatus { state: MigrationPhase::Paused, ..small.clone() };
+        assert!(stopped_line(&stopped).ends_with("(under a minute of GPU time left)."), "{}", stopped_line(&stopped));
+        for t in [offer_body(&small), later_line(&small), stopped_line(&stopped), progress_line(&MigrationStatus { state: MigrationPhase::Running, ..small })] {
+            assert!(!t.contains("about under") && !t.contains("About under") && !t.contains("≈ under"), "{t}");
+        }
+        assert_eq!((approx(5400.0, "About"), approx(20.0, "About"), approx(20.0, "≈")), ("About 1 h 30 min".into(), "Under a minute".into(), "under a minute".into()));
+        assert_eq!(spaced(2412), "2\u{a0}412", "a no-break space: never wrapped mid-number");
+        // epaint 0.36's row-break candidates are `c.is_whitespace() && c != '\u{a0}'` (text_layout.rs): a grouped
+        // number holds none, so a wrapping label never breaks it (re-review R1: U+202F is whitespace, so it would)
+        for n in [2412u64, 1_234_567, 1579] {
+            assert!(!spaced(n).chars().any(|c| c.is_whitespace() && c != '\u{a0}'), "{:?}", spaced(n));
+        }
+        assert!('\u{202f}'.is_whitespace(), "why not U+202F: epaint wraps at it");
         assert_eq!(spaced(412), "412");
         assert_eq!(spaced(1_234_567), g("1_234_567"));
         // Later folds it into one line, the count and the estimate kept

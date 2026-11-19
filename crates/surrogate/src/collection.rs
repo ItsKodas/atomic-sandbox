@@ -1807,9 +1807,9 @@ impl Collection {
             count(Q_DRAFT),
             count(crate::quarantine::Q_FORGOTTEN) + count(crate::quarantine::Q_FORGOTTEN_UNFENCED)
         ));
-        // re-solved for the new solver and awaiting their review (code 9; Fermi–Dirac spec §7.6)
+        // re-solved and not back in the fit: kept out by the review, or awaiting it (code 9; spec §7.6; re-review R2)
         if count(crate::quarantine::Q_RESOLVED) > 0 {
-            t.push_str(&format!("{} of them re-solved for the new solver, awaiting their review (out of the fit until then)\n", count(crate::quarantine::Q_RESOLVED)));
+            t.push_str(&format!("{} of them re-solved for the new solver and not yet back in the fit (kept out, or awaiting their review)\n", count(crate::quarantine::Q_RESOLVED)));
         }
         let mut tags: BTreeMap<String, usize> = BTreeMap::new();
         for s in &self.samples {
@@ -2628,7 +2628,7 @@ mod tests {
         c.write_readme().unwrap();
         let before = std::fs::read_to_string(folder.join("README.txt")).unwrap();
         assert!(!before.contains("migration (") , "no migration.txt, no paragraph:\n{before}");
-        assert!(before.contains("1 of them re-solved for the new solver, awaiting their review"), "{before}");
+        assert!(before.contains("1 of them re-solved for the new solver and not yet back in the fit (kept out, or awaiting their review)"), "{before}");
         let mut log = MigrationLog {
             source_slug: "lsda-old".into(),
             source_key: String::new(),

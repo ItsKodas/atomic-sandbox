@@ -981,7 +981,7 @@ pub struct MigrationStatus { pub source: String, pub samples: usize, pub done: u
   - `migration_summary_text`: the §7.8 summary, including "identical within solver noise", "kept out" and the old slug.
   - `no_offer_without_samples_to_migrate`: a predecessor with 0 samples, or a complete log → no offer.
   - `downgrade_line_names_the_pre_migration_folder`: present only while the log's source folder exists. The text follows §7.7.
-  - `legacy_tag_model_refused_with_reason`: "taught with the solver before <version> (integer / shared occupations); this version uses Fermi–Dirac smearing: re-teach it, or open it in <version>", with both `<version>`s `LAST_PRE_FD_RELEASE` (ruling R17, revised at fix round 1).
+  - `legacy_tag_model_refused_with_reason`: "taught with the solver of <version> or earlier (integer / shared occupations); this version uses Fermi–Dirac smearing: re-teach it, or open it in <version>", with both `<version>`s `LAST_PRE_FD_RELEASE` (0.2.0-beta.5) (ruling R17, revised at fix round 1).
   - `apply_settings_offer_omits_occupations`.
   - `start_migration_is_an_action`: recorded with `--record`; skipped in replay.
 - [ ] **Step 2: Run them to check they fail.** Run `cargo test -p app --release --bin app -- migration downgrade legacy_tag apply_settings`. Expected: FAIL.

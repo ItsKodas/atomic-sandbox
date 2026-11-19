@@ -497,7 +497,7 @@ fn sampling_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInpu
                     // one estimate, the migration's own (review M2): the bar and the counts of the progress line
                     Some(mg) => {
                         let frac = if mg.samples > 0 { mg.done as f32 / mg.samples as f32 } else { 0.0 };
-                        let left = mg.eta_s.filter(|_| !p.paused).map_or(String::new(), |s| format!(" — about {} left", crate::ui::migration::hm(s)));
+                        let left = mg.eta_s.filter(|_| !p.paused).map_or(String::new(), |s| format!(" — {} left", crate::ui::migration::approx(s, "about")));
                         let paused = if p.paused { "paused · " } else { "" };
                         ui.add(egui::ProgressBar::new(frac).show_percentage().text(format!("{paused}{}{left}", crate::ui::migration::progress_counts(mg))));
                         theme::note(ui, "Each old sample is solved once, cold, with the new solver; Pause keeps its place, Cancel stops it and it goes on from there later.");

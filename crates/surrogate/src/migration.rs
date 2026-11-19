@@ -238,14 +238,14 @@ impl NotMigrated {
     }
 }
 
-/// "2 412" for 2412: thousands grouped as spec §7.8 prints them, with a narrow no-break space (U+202F), so a wrapping
+/// "2 412" for 2412: thousands grouped as spec §7.8 prints them, with a no-break space (U+00A0, the one space egui never wraps at; Task 16 re-review R1), so a wrapping
 /// label never breaks a number.
 pub fn spaced(n: u64) -> String {
     let d = n.to_string();
     let mut out = String::with_capacity(d.len() + d.len());
     for (i, c) in d.chars().enumerate() {
         if i > 0 && (d.len() - i) % 3 == 0 {
-            out.push('\u{202f}');
+            out.push('\u{a0}');
         }
         out.push(c);
     }
