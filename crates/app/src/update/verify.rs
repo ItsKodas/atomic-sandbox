@@ -9,8 +9,9 @@
 //! release workflow signs with `minisign -t "atomic-sandbox <tag>"`), so a valid signature can't be
 //! replayed onto another release's sums.
 //!
-//! The release key (`crates/app/release-key.pub`, compiled in as [`RELEASE_KEY`]) is a placeholder
-//! comment until installer Task 6; a build carrying it installs nothing ([`NO_RELEASE_KEY`]). The
+//! The release key (`crates/app/release-key.pub`, compiled in as [`RELEASE_KEY`]) is the real public
+//! key since 0.2.0-beta.3 (key id 329732E46C9D2E07). Builds before it carried a placeholder comment
+//! and install nothing ([`NO_RELEASE_KEY`]), so the first signed release is installed by hand. The
 //! tests sign with the committed `fixtures/TEST-ONLY.*` pair, which signs nothing real.
 
 /// The public key releases are signed with: the text of `crates/app/release-key.pub` (minisign's
@@ -164,20 +165,23 @@ mod tests {
         assert!(e.contains("isn't signed"), "{e}");
     }
 
-    /// While `crates/app/release-key.pub` is the placeholder, nothing verifies and the refusal says
-    /// "this build has no release key".
-    ///
-    /// **Whoever commits the real public key into `release-key.pub` replaces this test** (it then
-    /// fails on its first assertion, on purpose) with one that checks the real key parses:
-    /// `has_key(RELEASE_KEY)`, `minisign_verify::PublicKey::from_base64(key_line(RELEASE_KEY).unwrap())`
-    /// is `Ok`, and the TEST-ONLY fixture signature is refused under it ("isn't signed"). Keep the
-    /// `verify(.., "")` → [`NO_RELEASE_KEY`] check. Releasing: `docs/dev-reference.md` "Releasing".
+    /// The committed release key is a real minisign public key: exactly minisign's two lines (the
+    /// release job's `minisign -V -p` takes nothing else), its key line decodes, and the TEST-ONLY
+    /// fixture signature is refused under it ("isn't signed"). A key that is no key (the old
+    /// placeholder, or nothing) still refuses with [`NO_RELEASE_KEY`]. Releasing:
+    /// `docs/dev-reference.md` "Releasing".
     #[test]
-    fn placeholder_key_installs_nothing() {
-        assert_eq!(RELEASE_KEY.trim(), "# no release key yet", "Task 6 replaces the placeholder");
+    fn the_release_key_is_real_and_refuses_the_test_signature() {
+        let lines: Vec<&str> = RELEASE_KEY.lines().collect();
+        assert_eq!(lines.len(), 2, "release-key.pub must be minisign's two lines and nothing else");
+        assert!(lines[0].starts_with("untrusted comment: "), "{}", lines[0]);
+        assert!(has_key(RELEASE_KEY));
+        assert!(minisign_verify::PublicKey::from_base64(key_line(RELEASE_KEY).unwrap()).is_ok());
         let good = sha256(FIXTURE_SETUP);
-        assert_eq!(verify(SUMS, SIG, TAG, SETUP, &good, RELEASE_KEY), Err(NO_RELEASE_KEY.to_string()));
+        let e = verify(SUMS, SIG, TAG, SETUP, &good, RELEASE_KEY).unwrap_err();
+        assert!(e.contains("isn't signed"), "{e}");
         assert_eq!(verify(SUMS, SIG, TAG, SETUP, &good, ""), Err(NO_RELEASE_KEY.to_string()));
+        assert_eq!(verify(SUMS, SIG, TAG, SETUP, &good, "# no release key yet\n"), Err(NO_RELEASE_KEY.to_string()));
         assert_eq!(NO_RELEASE_KEY, "this build has no release key");
     }
 
