@@ -97,6 +97,38 @@
 //!
 //! `Pass { residual, margin }` carries the absolute energy residual and the smallest margin (Ha).
 //!
+//! # The levels and the frontier window (controller ruling 10, Task 7 on the real teacher)
+//!
+//! **The window.** The frontier levels (HOMO, LUMO) are compared only when the scene's or the parts' level lies within
+//! W = 27.6 kT (= [`frontier_margin_min`], 138 mHa) of the **scene's** μ_σ (`Frontier::mu`, the final SCF step's): a
+//! level at |ε − μ_σ| ≥ W has f ≤ 1/(1 + e^{27.6}) ≈ 1e-12 (or 1 − f as small), so it can neither give nor take charge
+//! at kT = 5 mHa, and a shift of it is no transfer. The scene's μ_σ is the one a transfer would happen at (one μ_σ spans
+//! the cell); the parts' μ_σ are each part's own and say nothing about where the scene fills. What the window drops is
+//! what the real teacher showed must be dropped: an unoccupied level above zero is a box (continuum) state — H₂'s σu↑ at
+//! +28.4 mHa and the stray H's ↑ LUMO at +36.5 at 1.434 Bohr in a 16 Bohr box — and the scene's lowest such state spreads
+//! over both wells and lies 2.9–3.7 mHa below the parts' (81³–91³ × 0.20), moving with the whole box, not the composition
+//! (`references.md`, "Stray atoms"). The margin test already covers the window's edges: a donor and an acceptor of
+//! different parts closer than W fail it. **Partial levels** are compared as before, unfiltered: each lies within
+//! ln(1/`PARTIAL_OCCUPATION_MIN`) kT = 13.8 kT of its own μ_σ, so inside the window by construction, and a part's
+//! partial level the scene's window would exclude has changed its occupation — a transfer the test exists to see. A
+//! level present on one side only is never skipped: an occupied one on one side only fails (the channel's electrons
+//! moved), an unoccupied one not computed on one side keeps the check void. Without a μ_σ (an aufbau teacher, or a
+//! provider that does not report it) every level is compared, as before the window.
+//!
+//! **An empty spin channel** stores no orbital, so a stray H alone (1↑ 0↓) has no ↓ level at all, while the scene's ↓
+//! LUMO is that H's empty 1s↓ (−95 mHa at 81³ × 0.20; a real acceptor for the margin). The parts' solves therefore ask
+//! the teacher for one unoccupied level per channel through its orbital view ([`part_view`]: the unoccupied-orbitals
+//! option the orbital views use, a display eigensolve after the SCF, no solver change), and [`with_unoccupied`] completes
+//! each channel's LUMO from it. Taking an absent LUMO as "above every computed level" would be anti-conservative in the
+//! margin for exactly this case (ruling 10b), so an absent level still voids the check.
+//!
+//! **The box (measured; ruling 10c).** No 12 Bohr cube — the app's Accurate default 81³ × 0.15 included — holds a clean
+//! H₂ + H check at 8 Bohr: an H must be ≈ 5 Bohr from every face for its face density to pass the box rule, and with the
+//! 4 Bohr floor a stray atom there is floor-refused (on the body diagonal of 61³ × 0.20 it is 3.44 Bohr from a face, the
+//! solves' face densities 1.8–3.0e-5 against the rule's 1.28e-5; `validate` `stray_box_probe`). The feature applies in
+//! larger boxes (16 Bohr: 5.44 Bohr, face densities ≤ 8e-7); in the default box such scenes stay on DFT, floor-refused
+//! with the reason shown.
+//!
 //! # The cleared region (spec §4.3, "Clearance is local"; [`Region`], [`StrayBook`])
 //!
 //! A [`Signature`] (sorted bonded Z, sorted stray Z, charge, the surface's reference settings; the multiplicity is
@@ -279,6 +311,30 @@ pub(super) fn frontier_margin_min() -> f64 {
 /// The occupation-matching tolerance of a partial level: [`STRAY_LEVEL_TOL`] / (2 kT) (module doc, "Levels").
 pub(super) fn level_occupation_tol() -> f64 {
     STRAY_LEVEL_TOL / (2.0 * qm::ELECTRON_KT)
+}
+
+/// The orbital view a composition check's part solves ask for (module doc, "The levels and the frontier window";
+/// controller ruling 10b): the list with one unoccupied level per spin channel, at every evaluation — through the
+/// teacher's existing unoccupied-orbitals option (the orbital views'), no solver change.
+pub(super) fn part_view() -> sim::OrbitalViewRequest {
+    sim::OrbitalViewRequest { what: sim::OrbitalRequest::List, unoccupied: 1, force_every_step: true }
+}
+
+/// `frontier` with each channel's LUMO completed from the orbital payload's rows with f < ½ (the display eigensolve's
+/// unoccupied levels): the lower of the SCF block's LUMO and the payload's lowest. A channel without electrons stores no
+/// orbital, so its LUMO comes from the payload alone; without a payload (no orbital producer, an interrupted display
+/// solve) the frontier is unchanged and a missing level keeps the check void, never passed.
+pub(super) fn with_unoccupied(frontier: [Frontier; 2], orbitals: Option<&sim::OrbitalDisplay>) -> [Frontier; 2] {
+    let Some(o) = orbitals else { return frontier };
+    let mut out = frontier;
+    for (ch, spin) in [sim::Spin::Up, sim::Spin::Down].into_iter().enumerate() {
+        let low = o.rows.iter().filter(|r| r.spin == spin && r.occupation < 0.5).map(|r| r.energy).reduce(f64::min);
+        out[ch].lumo = match (out[ch].lumo, low) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    }
+    out
 }
 
 /// A scene's atoms split into the bonded part and the stray atoms (indices into the scene, ascending).
@@ -582,19 +638,28 @@ pub(super) fn judge(policy: &FallbackPolicy, scene: &PartAnswer, frag: &PartAnsw
                 ));
             }
         }
-        // frontier levels: the scene's HOMO the parts' highest, its LUMO their lowest
+        // frontier levels inside the window about the scene's μ_σ (module doc, "The levels and the frontier window"):
+        // the scene's HOMO the parts' highest, its LUMO their lowest — compared when either side's level lies within
+        // 27.6 kT of μ_σ; without a μ_σ (an aufbau teacher) every level is compared
+        let mu = scene.frontier[spin].mu;
+        let window = frontier_margin_min();
+        let inside = |e: Option<f64>| e.is_some_and(|e| mu.is_none_or(|m| (e - m).abs() < window));
         let homo = parts.iter().filter_map(|p| p.frontier[spin].homo).reduce(f64::max);
-        match (scene.frontier[spin].homo, homo) {
-            (None, None) => {}
-            (Some(s), Some(u)) if (s - u).abs() <= STRAY_LEVEL_TOL => {}
-            (s, u) => return CheckVerdict::Fail(format!("levels: the scene's HOMO {word} is {}, the parts' {}", level_words(s), level_words(u))),
+        let s_homo = scene.frontier[spin].homo;
+        // (an occupied level on one side only is a failure wherever it lies: the channel's electrons moved)
+        if inside(s_homo) || inside(homo) || s_homo.is_some() != homo.is_some() {
+            match (s_homo, homo) {
+                (Some(s), Some(u)) if (s - u).abs() <= STRAY_LEVEL_TOL => {}
+                (s, u) => return CheckVerdict::Fail(format!("levels: the scene's HOMO {word} is {}, the parts' {}{}", level_words(s), level_words(u), mu_words(mu))),
+            }
         }
         let lumos: Option<Vec<f64>> = parts.iter().map(|p| p.frontier[spin].lumo).collect();
         match (scene.frontier[spin].lumo, lumos.and_then(|l| l.into_iter().reduce(f64::min))) {
-            (Some(s), Some(u)) if !((s - u).abs() <= STRAY_LEVEL_TOL) => {
-                return CheckVerdict::Fail(format!("levels: the scene's LUMO {word} is {}, the parts' {}", level_words(Some(s)), level_words(Some(u))));
+            (Some(s), Some(u)) if (inside(Some(s)) || inside(Some(u))) && !((s - u).abs() <= STRAY_LEVEL_TOL) => {
+                return CheckVerdict::Fail(format!("levels: the scene's LUMO {word} is {}, the parts' {}{}", level_words(Some(s)), level_words(Some(u)), mu_words(mu)));
             }
             (Some(_), Some(_)) => {}
+            // a level not computed on one side: never compared as if it were absent (it may lie in the window)
             _ => missing = true,
         }
     }
@@ -624,6 +689,11 @@ fn acceptor(p: &PartAnswer, spin: usize) -> Option<f64> {
 fn crowded(levels: &[&PartialLevel], k: usize) -> bool {
     let near = |j: usize| levels.get(j).is_some_and(|l| (l.eps - levels[k].eps).abs() <= 2.0 * STRAY_LEVEL_TOL);
     (k > 0 && near(k - 1)) || near(k + 1)
+}
+
+/// ", μ … mHa" for a failure's words (empty without a μ).
+fn mu_words(mu: Option<f64>) -> String {
+    mu.map_or(String::new(), |m| format!(" (μ {:.1} mHa)", m * 1e3))
 }
 
 fn level_words(e: Option<f64>) -> String {

@@ -6069,7 +6069,7 @@ The second refit with nothing new: 192.6 → 10.6 s. What is left: `NullSpace::o
   (σ_F: the force std and its epistemic part, per atom.) The relative 3.4e-3 of the first report was a value of 3.7e-6 moving by 1.3e-8: the absolute differences are at most 0.4 % of a tier.
 - **Across machines.** faer picks its SIMD kernels at run time (AVX-512 here, AVX2 elsewhere), so a refit on a CPU with another instruction set differs from this one by the same ~κε spread — never in a verdict measured here, but a golden compares bit for bit only on the same ISA (the thread count never matters: `dense::SPLIT`).
 
-## Stray atoms (plan 2026-11-18 Task 7, 2026-11-19; spec `2026-11-18-stray-atom-composition-design.md` §6; `tests/surrogate.rs` and `tests/dynamics.rs`, release, RX 7900 XTX, teacher GpuKs tol 1e-6, `ionic accepted`, σ = h) — **BLOCKED: H₂ + H never clears on the real teacher**
+## Stray atoms (plan 2026-11-18 Task 7, 2026-11-19; spec `2026-11-18-stray-atom-composition-design.md` §6; `tests/surrogate.rs` and `tests/dynamics.rs`, release, RX 7900 XTX, teacher GpuKs tol 1e-6, `ionic accepted`, σ = h) — **BLOCKED: H₂ + H does not clear on the real teacher (before and after ruling 10)**
 
 Geometry (`common::surrogate::diatomic_and_atom`): the diatomic's centre and the third atom on the cube's body diagonal,
 8 Bohr apart, the diatomic's axis ⊥ the diagonal, placed so the stray atom and the diatomic's outer atoms are equally far
@@ -6090,8 +6090,8 @@ The residual is box-independent from 81³ on (−0.086 mHa: LSDA's overlap tail 
 energy is not (−0.477741 Ha at 81³, −0.478069 at 91³). **The stray tests run at 81³ × 0.20.** A 12 Bohr cube (the
 plan's 61³ × 0.20, and the app's Accurate default 81³ × 0.15) cannot hold a clean H₂ + H check at all: an H must be
 ≈ 5 Bohr from every face for its face density to pass the rule, so two parts more than r_cut = 6 apart cannot both be
-clean (a design consequence for the app: in the default box the composition check is void or floor-refused for every
-H₂ + H; the "estimated box size" item would change that).
+clean. **Ruling 10c: the feature applies in larger boxes; in the default box (and any 12 Bohr cube) such scenes stay on
+DFT, floor-refused with the reason shown** (stray module doc, README); the "estimated box size" item would change that.
 
 **`stray_h_clears_and_matches_dft` — FAILS (blocked; not loosened, rule 6).** Default H₂ pass at 81³ × 0.20 (seed 7):
 272 samples, 216–253 s, Q′ 29, rmse 3.0e-7 Ha/atom, 8.6e-6 Ha/Bohr, E_ref(H) −0.478139 Ha, trusted. Composition checks
@@ -6119,6 +6119,36 @@ Options for the controller (not taken here: each changes the check's criterion):
 level / within reach of μ (the partial-level and margin tests already cover the charge-moving levels), and let an empty
 channel's absent LUMO count as "above every computed level" (as `acceptor` already does) — or have the solver store one
 level in an empty channel. `stray_h_returning_conserves_energy` (dynamics) needs the same clearing and was not run.
+
+**After controller ruling 10 (2026-11-19: frontier levels compared only within 27.6 kT of the scene's μ_σ; each part
+solve asks for one unoccupied level per channel through the orbital view; `sim::Frontier::mu`) — still FAILS, blocked
+on the window's width.** Same pass (272 samples, 273 s); the checks:
+
+| H₂ bond | check verdict |
+|---|---|
+| 1.434 | **passes** — residual 0.089 mHa, margin 282 mHa (1 of 3) |
+| 1.15 | **passes** — residual 0.074 mHa, margin 307 mHa (2 of 3) |
+| 1.75 | **refused — "levels: the scene's LUMO ↓ is −95.4 mHa, the parts' −91.1 mHa (μ −221.7 mHa)"** |
+
+The ↓ LUMO is the stray H's empty 1s↓ (now computed through the part's unoccupied level). It lies 126.3 mHa = 25.3 kT
+above μ↓ — inside the 27.6 kT window, so it is compared, and f there is ~e^−25 ≈ 1e-11 (no charge can move). The shift
+is not a box effect (a measurement with the unoccupied row requested on every solve; Ha × 10³, ↓ LUMO and μ↓):
+
+| grid (cube) | r | scene ↓ LUMO | H alone ↓ LUMO | shift | scene μ↓ | ↓ LUMO − μ↓ | scene ↑ LUMO / H₂ / H | μ↑ |
+|---|---|---|---|---|---|---|---|---|
+| 81³ (16.0) | 1.434 | −95.0 | −91.3 | −3.7 | −234.3 | **139.3 (outside by 1.3)** | +25.5 / +28.4 / +36.5 | −121.5 |
+| 81³ | 1.75 | −95.4 | −91.1 | −4.3 | −221.7 | **126.3 (inside)** | −4.6 / −3.6 / +36.4 | −135.7 |
+| 91³ (18.0) | 1.434 | −98.1 | −94.5 | −3.6 | −236.0 | 137.9 | +17.4 / +20.6 / +28.7 | −126.0 |
+| 91³ | 1.75 | −98.6 | −94.4 | −4.2 | −223.6 | 125.0 | −9.7 / −8.5 / +28.6 | −138.9 |
+| 101³ (20.0) | 1.434 | −99.2 | −95.6 | −3.6 | −236.6 | 137.4 | +12.6 / +16.1 / +23.2 | −128.5 |
+| 101³ | 1.75 | −99.7 | −95.6 | −4.1 | −224.2 | 124.5 | −12.3 / −11.0 / +23.2 | −140.4 |
+
+The empty 1s↓ of an LSDA H (κ = √(2·0.091) ≈ 0.43 Bohr⁻¹, its density decaying over ~1.2 Bohr) sits 3.6–4.3 mHa lower
+beside H₂ at 8 Bohr, at every box: a composition shift of an empty level ~25 kT from μ↓, not a transfer. μ↓ sits near
+the middle of the ↓ gap (σg↓ to 1s↓), so the 1s↓ lies 125–139 mHa from it — at the window's edge — and rises into it
+as the bond stretches (σg rises). The ↑ box states (LUMO ↑, 145–150 mHa above μ↑ at 1.434) now drop out as intended.
+For the controller: a window of ln(1/`PARTIAL_OCCUPATION_MIN`) kT = 13.8 kT (69 mHa) — the occupation threshold that
+defines a partial level — would leave this level out (f < 1e-6 beyond it); the margin keeps its 27.6 kT.
 
 **`stray_li_beside_f2_is_refused` — passes** (`cargo test -p validate --release --test surrogate stray_li_beside_f2_is_refused -- --nocapture`;
 3 cold solves, GPU 214 s: scene 68 s, F₂ 15 s, Li 115 s). The recipe refuses F at h = 0.20 ("h_req = 0.15", asserted),

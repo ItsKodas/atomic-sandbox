@@ -243,6 +243,9 @@ impl ForceProvider for Locked {
         self.inner.sample_density(points)
     }
     fn scf_tol(&self) -> Option<f64> { self.inner.scf_tol() }
+    // the orbital view (and its unoccupied orbitals): a composition check's part solves ask for one unoccupied level per
+    // channel through it (stray-atoms Task 7, controller ruling 10 b)
+    fn set_orbital_view(&mut self, request: sim::OrbitalViewRequest) { self.inner.set_orbital_view(request) }
     fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
         let log = self.side_log.as_ref()?.clone();
         let mut inner = GpuKs::new(self.ctx.clone(), self.tol);

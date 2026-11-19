@@ -199,11 +199,11 @@
 //!   background auditor) at H₂ + H 8 Bohr until K = 3 passes clear the signature; at an unchecked bond length the
 //!   provider's own `would_answer` puts inside the region, the step must be the model's and |E_model − E_DFT|/n_bonded
 //!   ≤ the audit tier (`energy_std_per_atom`); then a stretched-bond check through the provider, its verdict and the
-//!   next step's source required to agree. **Fails on this branch (2026-11-19): the check never clears H₂ + H on the
-//!   real teacher** — at r = 1.434 the levels test refuses (the scene's ↑ LUMO 25.5 mHa against the parts' 28.4: both
-//!   positive, box continuum states), and at r = 1.8–2.3 every check is void ("frontier level not computed": the stray
-//!   H's empty ↓ channel stores no orbital, so it has no LUMO, while the scene's ↓ LUMO is the H's empty 1s↓ at
-//!   −95 mHa). `stray_li_beside_f2_is_refused`: the charge-transfer case measured as the check measures it (three clean
+//!   next step's source required to agree. **Fails on this branch (2026-11-19)**: before controller ruling 10 the levels
+//!   test refused at r = 1.434 (↑ box-state LUMOs) and every check at 1.8–2.3 was void (the stray H's empty ↓ channel had
+//!   no level); with ruling 10 (the 27.6 kT window about the scene's μ_σ, one unoccupied level per part channel)
+//!   1.434 and 1.15 pass and 1.75 is refused — the H's empty 1s↓, 126 mHa above μ↓ (inside the window), sits 4.3 mHa
+//!   lower in the scene than alone, at every box size (`references.md`, "Stray atoms"). `stray_li_beside_f2_is_refused`: the charge-transfer case measured as the check measures it (three clean
 //!   cold solves) at 107³ × 0.15 — F's h_req; the recipe refuses F at 0.20 (asserted) and Li runs all-electron under
 //!   `Accepted` — asserting that the check's energy, force or margin test fails; the provider path is not exercised
 //!   here (a model with Li and F in its basis at that grid costs hours of passes). `stretched_h2_margin_is_reported`:
@@ -2229,15 +2229,17 @@ fn levels_line(r: &ForceResult, h: f64) -> String {
     let lv = |x: Option<f64>| x.map_or("—".to_string(), |e| format!("{:+.1}", e * 1e3));
     let partial: Vec<String> = r.stats.partial.iter().map(|l| format!("{}{} {:+.1} mHa f {:.4}", ["↑", "↓"][l.spin as usize], l.index, l.eps * 1e3, l.f)).collect();
     format!(
-        "E {:+.8} Ha, face {:.2e} (rule {:.2e}), M {:?}, ↑ HOMO/LUMO {}/{} mHa, ↓ {}/{} mHa, partial [{}], {} SCF steps, {} ms{}",
+        "E {:+.8} Ha, face {:.2e} (rule {:.2e}), M {:?}, ↑ HOMO/LUMO {}/{} mHa (μ {}), ↓ {}/{} mHa (μ {}), partial [{}], {} SCF steps, {} ms{}",
         r.energy,
         r.stats.face_density.unwrap_or(f64::NAN),
         providers::box_affected_face_density(h),
         r.stats.multiplicity,
         lv(r.stats.frontier[0].homo),
         lv(r.stats.frontier[0].lumo),
+        lv(r.stats.frontier[0].mu),
         lv(r.stats.frontier[1].homo),
         lv(r.stats.frontier[1].lumo),
+        lv(r.stats.frontier[1].mu),
         partial.join(", "),
         r.stats.scf_steps,
         r.stats.solve_ms,

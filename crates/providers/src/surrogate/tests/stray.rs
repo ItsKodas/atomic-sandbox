@@ -144,21 +144,21 @@ fn exact() -> (PartAnswer, PartAnswer, Vec<PartAnswer>, Split) {
     let frag = PartAnswer {
         energy: -1.137,
         forces: vec![[0.01, 0.0, 0.0], [-0.01, 0.0, 0.0]],
-        frontier: [Frontier { homo: Some(-0.37), lumo: Some(0.02) }, Frontier { homo: Some(-0.37), lumo: Some(0.02) }],
+        frontier: [Frontier { homo: Some(-0.37), lumo: Some(0.02), mu: None }, Frontier { homo: Some(-0.37), lumo: Some(0.02), mu: None }],
         partial: Vec::new(),
         clean: true,
     };
     let atom = PartAnswer {
         energy: -0.479,
         forces: vec![[0.0, 1e-4, 0.0]],
-        frontier: [Frontier { homo: Some(-0.27), lumo: Some(0.05) }, Frontier { homo: None, lumo: Some(-0.05) }],
+        frontier: [Frontier { homo: Some(-0.27), lumo: Some(0.05), mu: None }, Frontier { homo: None, lumo: Some(-0.05), mu: None }],
         partial: Vec::new(),
         clean: true,
     };
     let scene = PartAnswer {
         energy: frag.energy + atom.energy,
         forces: vec![frag.forces[0], frag.forces[1], atom.forces[0]],
-        frontier: [Frontier { homo: Some(-0.27), lumo: Some(0.02) }, Frontier { homo: Some(-0.37), lumo: Some(-0.05) }],
+        frontier: [Frontier { homo: Some(-0.27), lumo: Some(0.02), mu: None }, Frontier { homo: Some(-0.37), lumo: Some(-0.05), mu: None }],
         partial: Vec::new(),
         clean: true,
     };
@@ -290,9 +290,9 @@ fn judge_fails_a_stray_whose_partial_level_is_its_homo() {
     // 40 mHa above σg
     let (mut scene, frag, mut atoms, split) = exact();
     let o2p = |spin: u8| PartialLevel { spin, index: 2, eps: -0.33, f: 2.0 / 3.0 };
-    atoms[0].frontier = [Frontier { homo: Some(-0.33), lumo: Some(0.1) }; 2];
+    atoms[0].frontier = [Frontier { homo: Some(-0.33), lumo: Some(0.1), mu: None }; 2];
     atoms[0].partial = vec![o2p(0), o2p(1)];
-    scene.frontier = [Frontier { homo: Some(-0.33), lumo: Some(0.02) }; 2];
+    scene.frontier = [Frontier { homo: Some(-0.33), lumo: Some(0.02), mu: None }; 2];
     scene.partial = vec![PartialLevel { index: 3, ..o2p(0) }, PartialLevel { index: 3, ..o2p(1) }];
     match judge(&p, &scene, &frag, &atoms, &split) {
         CheckVerdict::Fail(why) => assert!(why.contains("margin") && why.contains("stray acceptor"), "{why}"),
@@ -308,11 +308,11 @@ fn judge_fails_a_stray_whose_partial_level_is_its_homo() {
     }
     // two parts both open in one channel fail one direction, however far apart their levels: one μ_σ is shared
     let (mut scene, mut frag, mut atoms, split) = exact();
-    frag.frontier[0] = Frontier { homo: Some(-0.5), lumo: Some(0.3) };
+    frag.frontier[0] = Frontier { homo: Some(-0.5), lumo: Some(0.3), mu: None };
     frag.partial = vec![PartialLevel { spin: 0, index: 0, eps: -0.5, f: 0.6 }];
-    atoms[0].frontier[0] = Frontier { homo: Some(0.0), lumo: Some(0.4) };
+    atoms[0].frontier[0] = Frontier { homo: Some(0.0), lumo: Some(0.4), mu: None };
     atoms[0].partial = vec![PartialLevel { spin: 0, index: 0, eps: 0.0, f: 0.6 }];
-    scene.frontier[0] = Frontier { homo: Some(0.0), lumo: Some(0.3) };
+    scene.frontier[0] = Frontier { homo: Some(0.0), lumo: Some(0.3), mu: None };
     scene.partial = vec![frag.partial[0].clone(), atoms[0].partial[0].clone()];
     match judge(&p, &scene, &frag, &atoms, &split) {
         CheckVerdict::Fail(why) => assert!(why.contains("margin"), "{why}"),
@@ -535,7 +535,7 @@ fn cluster_levels(pos: &[[f64; 3]], z: &[u8], r_cut: f64) -> [Frontier; 2] {
             break;
         }
     }
-    let mut out = [Frontier { homo: None, lumo: None }; 2];
+    let mut out = [Frontier { homo: None, lumo: None, mu: None }; 2];
     let mut roots: Vec<usize> = label.clone();
     roots.sort_unstable();
     roots.dedup();
@@ -2358,4 +2358,167 @@ fn a_signature_label_names_stray_atoms_as_atoms() {
     assert_eq!(signature_label(&sig(&[1, 1], &[1, 1])), "H2 + 2 H");
     assert_eq!(signature_label(&sig(&[1, 1, 8], &[8])), "H2O + O");
     assert_eq!(signature_label(&sig(&[1, 1], &[1, 8])), "H2 + H + O");
+}
+
+// ---- controller ruling 10 (Task 7 on the real teacher): the frontier window and the empty channel ----
+
+/// A failed verdict's words (panics on any other verdict).
+fn failed(v: CheckVerdict) -> String {
+    match v {
+        CheckVerdict::Fail(why) => why,
+        v => panic!("not a failure: {v:?}"),
+    }
+}
+
+/// Ruling 10a: the frontier levels are compared only within 27.6 kT of the scene's μ_σ. The real teacher's H₂ + H at
+/// 1.434 Bohr (81³ × 0.20, `references.md` "Stray atoms"): the ↑ LUMOs are box states — scene +25.5, H₂ σu +28.4,
+/// H +36.5 mHa, a 2.9 mHa mismatch — about 145 mHa above μ↑; they move with the box, not the composition.
+#[test]
+fn judge_compares_frontier_levels_only_within_the_window() {
+    let p = FallbackPolicy::default();
+    let box_states = || {
+        let (mut scene, mut frag, mut atoms, split) = exact();
+        frag.frontier[0].lumo = Some(0.0284);
+        frag.frontier[1].lumo = Some(0.0284);
+        atoms[0].frontier[0].lumo = Some(0.0365);
+        scene.frontier[0].lumo = Some(0.0255);
+        (scene, frag, atoms, split)
+    };
+    // without a μ (an aufbau teacher): every level compared, as before the window — the box states fail
+    let (scene, frag, atoms, split) = box_states();
+    let why = failed(judge(&p, &scene, &frag, &atoms, &split));
+    assert!(why.contains("LUMO ↑"), "{why}");
+    // the scene's μ↑ at −0.12 Ha: +25.5 mHa lies 145.5 mHa above it, outside 138 — not compared; μ↓ at −0.21 keeps the
+    // ↓ HOMO (−0.37) and LUMO (−0.05) 160 mHa away, outside too
+    let (mut scene, frag, atoms, split) = box_states();
+    scene.frontier[0].mu = Some(-0.12);
+    scene.frontier[1].mu = Some(-0.21);
+    assert!(matches!(judge(&p, &scene, &frag, &atoms, &split), CheckVerdict::Pass { .. }), "{:?}", judge(&p, &scene, &frag, &atoms, &split));
+    // a mismatch inside the window still fails: μ↑ at −0.08 puts +25.5 mHa 105.5 mHa above it
+    scene.frontier[0].mu = Some(-0.08);
+    let why = failed(judge(&p, &scene, &frag, &atoms, &split));
+    assert!(why.contains("LUMO ↑") && why.contains("μ"), "{why}");
+    // an in-window HOMO mismatch fails; one far below μ is not compared
+    let (mut scene, frag, atoms, split) = box_states();
+    scene.frontier[0].mu = Some(-0.12);
+    scene.frontier[1].mu = Some(-0.21);
+    scene.frontier[1].homo = Some(-0.37 - 5e-3);
+    assert!(matches!(judge(&p, &scene, &frag, &atoms, &split), CheckVerdict::Pass { .. }), "a HOMO 165 mHa below μ↓ is outside");
+    // μ↑ at −0.20: the scene's ↑ HOMO 5 mHa above the parts' (−0.265 against −0.27) lies 65 mHa below μ↑, inside
+    scene.frontier[0].mu = Some(-0.20);
+    scene.frontier[0].homo = Some(-0.27 + 5e-3);
+    assert!(failed(judge(&p, &scene, &frag, &atoms, &split)).contains("HOMO ↑"));
+}
+
+/// Ruling 10a: an occupied level on one side only fails wherever it lies (the channel's electrons moved), and the
+/// partial levels are compared unfiltered (each lies within 13.8 kT of its own μ_σ: inside the window by construction).
+#[test]
+fn judge_window_keeps_one_sided_and_partial_levels() {
+    let p = FallbackPolicy::default();
+    let (mut scene, mut frag, atoms, split) = exact();
+    scene.frontier[0].mu = Some(-0.12);
+    scene.frontier[1].mu = Some(-0.21);
+    frag.frontier[1].homo = None;
+    let why = failed(judge(&p, &scene, &frag, &atoms, &split));
+    assert!(why.contains("HOMO ↓"), "{why}");
+    let (mut scene, frag, atoms, split) = exact();
+    scene.frontier[0].mu = Some(-0.12);
+    scene.frontier[1].mu = Some(-0.21);
+    scene.partial = vec![PartialLevel { spin: 0, index: 1, eps: -0.12, f: 0.5 }];
+    let why = failed(judge(&p, &scene, &frag, &atoms, &split));
+    assert!(why.contains("partly occupied"), "{why}");
+}
+
+/// A part's orbital payload with one unoccupied row per channel (what [`part_view`] asks the teacher for): ↑ at
+/// `up`, ↓ at `down` (Ha), occupation 0.
+fn unoccupied_payload(up: f64, down: f64) -> sim::OrbitalDisplay {
+    let row = |spin: sim::Spin, energy: f64| sim::OrbitalInfo {
+        spin, index: 0, track: 0, slot: 0, energy, eps_range: (energy, energy), occupation: 0.0, label: sim::OrbitalLabel::Index(1),
+        cluster: None, rotated: false, grid_split: None, box_state: false, smeared_1s: false, residual: None, not_converged: false, l: None, touches_box: false, shares: None,
+    };
+    sim::OrbitalDisplay {
+        cell: Cell { n: 81, h: 0.25 }, origin: [0.0; 3], positions: Vec::new(), rows: vec![row(sim::Spin::Up, up), row(sim::Spin::Down, down)],
+        field: None, spin: sim::SpinSummary::default(), unoccupied: None, notes: Vec::new(), what: sim::OrbitalRequest::List,
+        lone_atom: sim::LoneAtomLabels::NotLoneAtom, share_z: None, kind: sim::OrbitalKind::Converged,
+    }
+}
+
+/// Ruling 10b: a stray H alone stores no ↓ orbital, so its ↓ channel has no level and the check is void for good; the
+/// part's requested unoccupied level ([`with_unoccupied`]) completes it and the check is judged — a real acceptor
+/// (the empty 1s↓) in the margin, never "above every computed level".
+#[test]
+fn an_empty_channel_is_judged_with_its_requested_unoccupied_level() {
+    assert_eq!(part_view(), sim::OrbitalViewRequest { what: sim::OrbitalRequest::List, unoccupied: 1, force_every_step: true });
+    let p = FallbackPolicy::default();
+    let (scene, frag, mut atoms, split) = exact();
+    atoms[0].frontier[1] = Frontier::default();
+    match judge(&p, &scene, &frag, &atoms, &split) {
+        CheckVerdict::Void(why) => assert!(why.contains("not computed"), "{why}"),
+        v => panic!("an empty channel without its level is void: {v:?}"),
+    }
+    // the payload's ↑ row lies above the SCF block's LUMO (kept), its ↓ row is the channel's only level
+    atoms[0].frontier = with_unoccupied(atoms[0].frontier, Some(&unoccupied_payload(0.06, -0.05)));
+    assert_eq!((atoms[0].frontier[0].lumo, atoms[0].frontier[1].lumo, atoms[0].frontier[1].homo), (Some(0.05), Some(-0.05), None));
+    assert!(matches!(judge(&p, &scene, &frag, &atoms, &split), CheckVerdict::Pass { .. }), "{:?}", judge(&p, &scene, &frag, &atoms, &split));
+    // the completed level is an acceptor in the margin: a stray 1s↓ within 138 mHa of the fragment's σg fails it
+    let (mut scene, frag, mut atoms, split) = exact();
+    atoms[0].frontier[1] = Frontier::default();
+    atoms[0].frontier = with_unoccupied(atoms[0].frontier, Some(&unoccupied_payload(0.06, -0.30)));
+    scene.frontier[1].lumo = Some(-0.30);
+    let why = failed(judge(&p, &scene, &frag, &atoms, &split));
+    assert!(why.contains("margin") && why.contains("stray acceptor"), "{why}");
+    // a lower payload level replaces the SCF block's; no payload leaves the frontier as it was
+    let f = [Frontier { homo: Some(-0.3), lumo: Some(0.2), mu: Some(-0.1) }, Frontier::default()];
+    assert_eq!(with_unoccupied(f, Some(&unoccupied_payload(0.1, 0.3)))[0].lumo, Some(0.1));
+    assert_eq!(with_unoccupied(f, None), f);
+}
+
+/// A [`Composing`] auditor that reports what the real teacher does (Task 7): a one-electron solve (a stray H alone)
+/// stores no ↓ orbital, so its ↓ channel has no level — unless its orbital view asks for unoccupied orbitals, when the
+/// payload carries the empty 1s↓ (−0.05) and the ↑ 2s (0.0). Every view it is given is recorded.
+struct EmptyChannel {
+    inner: Composing,
+    view: sim::OrbitalViewRequest,
+    views: Arc<Mutex<Vec<sim::OrbitalViewRequest>>>,
+}
+
+impl ForceProvider for EmptyChannel {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        let mut r = self.inner.evaluate(scene, should_abort)?;
+        let electrons: u32 = scene.nuclei.iter().map(|n| n.z as u32).sum();
+        if electrons == 1 {
+            r.stats.frontier[1] = Frontier::default();
+            if self.view.unoccupied >= 1 {
+                r.orbitals = Some(unoccupied_payload(0.0, -0.05));
+            }
+        }
+        Ok(r)
+    }
+
+    fn name(&self) -> &'static str {
+        "composing morse"
+    }
+
+    fn reset(&mut self) {}
+
+    fn set_orbital_view(&mut self, request: sim::OrbitalViewRequest) {
+        self.views.lock().unwrap().push(request.clone());
+        self.view = request;
+    }
+}
+
+/// Ruling 10b through the provider: the auditor's part jobs carry [`part_view`], so an auditor whose lone H has no ↓
+/// level unless asked is judged (a pass), not void; the view is set for the part jobs only.
+#[test]
+fn part_solves_ask_for_an_unoccupied_level_per_channel() {
+    let (s, _, _) = student(0.0, &TRAINED, 40, false);
+    let views = Arc::new(Mutex::new(Vec::new()));
+    let mut s = s.with_auditor(Box::new(EmptyChannel { inner: Composing::new(0.0), view: sim::OrbitalViewRequest::default(), views: views.clone() }));
+    let sc = h2_with(CHECKS[0], &[STRAY_AT]);
+    assert_eq!(s.evaluate(&sc, &mut never()).unwrap().stats.source, Source::Fallback);
+    settle(&mut s);
+    let ev = s.take_events();
+    let check: Vec<&sim::TeachEvent> = ev.iter().filter(|e| e.origin == TeachOrigin::Audit).collect();
+    assert_eq!(check.iter().map(|e| e.outcome).collect::<Vec<_>>(), [TeachOutcome::StrayChecking { n: 1, of: 3 }], "{check:?}");
+    assert_eq!(views.lock().unwrap().as_slice(), [part_view()], "set once for the parts, kept across both");
 }

@@ -700,11 +700,15 @@ pub struct PartialLevel {
 }
 
 /// One spin channel's frontier levels (Ha; [`EvalStats::frontier`]): `homo` the highest eigenvalue with occupation
-/// f ≥ ½, `lumo` the lowest with f < ½ among the computed block; `None` when the channel has no such level.
+/// f ≥ ½, `lumo` the lowest with f < ½ among the computed block; `None` when the channel has no such level. `mu`: the
+/// channel's chemical potential μ_σ (Ha) of the final SCF step under Fermi–Dirac occupations (`qm::ScfStats::mu`; the
+/// stray-atom check's frontier window is centred on the scene's, controller ruling 10a); `None` under integer aufbau, for
+/// a channel without electrons, and from a provider without electrons.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Frontier {
     pub homo: Option<f64>,
     pub lumo: Option<f64>,
+    pub mu: Option<f64>,
 }
 
 /// What the generator recorded for one pseudised species, for the badge, the Selection tab and the

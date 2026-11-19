@@ -4517,7 +4517,11 @@ fn fnv1a(text: &str) -> u64 {
 /// prints through `{:?}`. Removing exactly the `, frontier: [Frontier { … }, Frontier { … }]` segment from every line of
 /// the 907-line trace at 7de3906f gives a trace byte-identical to the one at 92000979 (diffed line by line) — no decision,
 /// answer, note, sample or draw moved; Task 6 (d6574521) gives the same digest.
-const SCRIPTED_SESSION_DIGEST: u64 = 0xa884_6d6b_4b9f_771f;
+/// Re-pinned 2026-11-19 (stray-atoms Task 7, controller ruling 10a; 0xa884_6d6b_4b9f_771f → below): `sim::Frontier` gained
+/// `mu` (each channel's μ_σ; the analytic teacher reports none). Removing exactly the 682 occurrences of ", mu: None" from
+/// the 907-line trace (and from the views trace) gives traces byte-identical to the ones at bb8e17b5, whose digest is the
+/// previous pin — no decision, answer, note, sample or draw moved.
+const SCRIPTED_SESSION_DIGEST: u64 = 0x2043_2825_e75d_6a93;
 
 /// A fixed session through every decision path the providers' tests reach without a thread:
 /// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's

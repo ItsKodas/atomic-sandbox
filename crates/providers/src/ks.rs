@@ -581,7 +581,12 @@ fn elapsed_ms(t0: Instant) -> u64 {
 /// core overlaps — and the per-spin `frontier` levels of the converged state ([`frontier`]).
 fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec<String>, eig_tol_used: f64, system: &System, frontier: [sim::Frontier; 2]) -> EvalStats {
     let setup = system.ionic.as_deref();
-    let ScfStats { iterations, energy, boundary_density, max_eigen_residual, poisson_residual, warnings, core_overlaps, partial, tol_used, .. } = stats;
+    let ScfStats { iterations, energy, boundary_density, max_eigen_residual, poisson_residual, warnings, core_overlaps, partial, tol_used, mu, .. } = stats;
+    // each channel's μ_σ beside its frontier levels (stray-atoms Task 7, controller ruling 10a)
+    let mut frontier = frontier;
+    for (f, m) in frontier.iter_mut().zip(mu) {
+        f.mu = m;
+    }
     EvalStats {
         source: Source::Dft,
         uncertainty: None,
@@ -633,7 +638,7 @@ fn frontier(evals: &[f64], occ: &[f64]) -> sim::Frontier {
             lumo = Some(lumo.map_or(e, |l| l.min(e)));
         }
     }
-    sim::Frontier { homo, lumo }
+    sim::Frontier { homo, lumo, mu: None }
 }
 
 /// The `branch_jump` guard on one finished evaluation (module doc, "The branch_jump guard"; spec 2026-11-13 §6.3):
@@ -2067,10 +2072,10 @@ pub(crate) mod tests {
     #[test]
     fn frontier_picks_the_half_occupation_split() {
         let f = frontier(&[-0.2, -0.5, 0.1, 0.05], &[0.5, 1.0, 1e-9, 0.49]);
-        assert_eq!(f, sim::Frontier { homo: Some(-0.2), lumo: Some(0.05) });
-        assert_eq!(frontier(&[-0.5, -0.3], &[1.0, 1.0]), sim::Frontier { homo: Some(-0.3), lumo: None }, "no unoccupied level");
-        assert_eq!(frontier(&[0.2], &[1e-12]), sim::Frontier { homo: None, lumo: Some(0.2) }, "no occupied level");
-        assert_eq!(frontier(&[], &[]), sim::Frontier { homo: None, lumo: None });
+        assert_eq!(f, sim::Frontier { homo: Some(-0.2), lumo: Some(0.05), mu: None });
+        assert_eq!(frontier(&[-0.5, -0.3], &[1.0, 1.0]), sim::Frontier { homo: Some(-0.3), lumo: None, mu: None }, "no unoccupied level");
+        assert_eq!(frontier(&[0.2], &[1e-12]), sim::Frontier { homo: None, lumo: Some(0.2), mu: None }, "no occupied level");
+        assert_eq!(frontier(&[], &[]), sim::Frontier { homo: None, lumo: None, mu: None });
     }
 
     /// The frontier levels of H₂ at 1.4 Bohr (41³ × 0.25, automatic multiplicity): the closed shell's ↑ and ↓ HOMO agree,

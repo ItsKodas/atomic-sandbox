@@ -321,8 +321,18 @@ impl Auditor {
                         }
                         last_atom = atom;
                     }
-                    // the one orbital producer: on for audits, refreshes and Harris, off for an atom
-                    let want = if atom { OrbitalViewRequest::default() } else { job.view.clone() };
+                    // the one orbital producer: on for audits, refreshes and Harris, off for an atom — except a composition
+                    // check's parts, which ask for one unoccupied level per spin channel (`stray` module doc, "The
+                    // levels"; controller ruling 10b): an empty channel stores no orbital, so without it a stray H's empty
+                    // 1s↓ — a real acceptor — would have no level and the check would be void for good
+                    let part = matches!(job.kind, JobKind::Fragment | JobKind::AtomAt(_));
+                    let want = if part {
+                        super::stray::part_view()
+                    } else if atom {
+                        OrbitalViewRequest::default()
+                    } else {
+                        job.view.clone()
+                    };
                     if want != view {
                         teacher.set_orbital_view(want.clone());
                         view = want;
@@ -373,6 +383,7 @@ impl Auditor {
                                 .evaluate(&job.scene, &mut || current.load(Ordering::Relaxed) != g)
                                 .map(|r| {
                                     (scf_steps, ts) = (Some(r.stats.scf_steps), Some(r.stats.energy.ts));
+                                    let frontier = if part { super::stray::with_unoccupied(r.stats.frontier, r.orbitals.as_ref()) } else { r.stats.frontier };
                                     Solved {
                                         energy: r.energy,
                                         forces: r.forces,
@@ -381,7 +392,7 @@ impl Auditor {
                                         unfit: r.stats.untrainable(),
                                         display: r.display,
                                         orbitals: r.orbitals,
-                                        frontier: r.stats.frontier,
+                                        frontier,
                                         warned: !r.stats.warnings.is_empty(),
                                         partial: r.stats.partial,
                                     }
