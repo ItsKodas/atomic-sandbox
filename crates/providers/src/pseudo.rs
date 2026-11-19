@@ -312,6 +312,15 @@ pub fn is_all_electron_tag(tag: &str) -> bool {
     tag == "none" || tag.starts_with("none/")
 }
 
+/// Whether `tag` is a surface tag of a build before the Fermi–Dirac switch (spec 2026-11-13 §7.9): its first word a
+/// policy this build knows and no `fd…` part — the legacy all-electron `"none"`, a shared-shell tag
+/// (`…/shared1e-3/1e-1/stop2x5e-8`, [`legacy_tag_of`]) or an older pseudopotential tag with no occupation part. A model
+/// file carrying one is refused on load with its reason (`providers::surrogate::legacy_model_refusal`).
+pub fn is_pre_fermi_dirac_tag(tag: &str) -> bool {
+    let mut parts = tag.split('/');
+    parts.next().and_then(IonicPolicy::parse).is_some() && !parts.any(|w| w.starts_with("fd"))
+}
+
 /// `τ` and `τ_c` of the last shared-shell build's tags (its decision threshold τ = 1e-3 Ha and candidate window
 /// = `qm::WITNESS_GAP` = 0.1 Ha), frozen here: [`legacy_tag_of`] keeps producing the strings that build wrote now the
 /// scheme and its constants are deleted (plan 2026-11-13 Task 10).

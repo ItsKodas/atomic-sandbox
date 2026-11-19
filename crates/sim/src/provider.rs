@@ -1614,6 +1614,18 @@ pub struct MigrationStatus {
     /// once it has made 20 (`None` when complete).
     pub eta_s: Option<f64>,
     pub state: MigrationPhase,
+    /// The predecessor's species (Z ascending; the offer's words), as read of it before the pass ends; empty once the
+    /// migration is complete (the source is no longer read).
+    pub species: Vec<u8>,
+    /// The day the migration started (YYYY-MM-DD; `migration.txt`'s date), empty before it starts.
+    pub date: String,
+    /// The code-9 review so far (spec §7.6): released (rejoined the fit), kept out, waiting unjudged (stray atoms).
+    pub review: [usize; 3],
+    /// The reason of each sample not migrated, in source order (`migration.txt`'s `not_migrated` lines).
+    pub not_migrated: Vec<String>,
+    /// The references re-solved: (Z, grid points per side, the old energy, the new; Hartree), either missing when there
+    /// was none or it did not solve.
+    pub references: Vec<(u8, usize, Option<f64>, Option<f64>)>,
 }
 
 /// What [`Trainable::purge_forgotten`] did (plain data of the provider's purge).

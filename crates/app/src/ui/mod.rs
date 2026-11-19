@@ -33,6 +33,7 @@ mod icons;
 pub mod knowledge;
 pub mod logbook;
 mod menus;
+pub mod migration;
 pub mod model_offer;
 mod overlays;
 pub mod pseudo;
@@ -745,6 +746,9 @@ pub struct UiState {
     pub plan: SamplingPlan,
     /// The first click on "Forget model" (a second within [`FORGET_CONFIRM`] forgets).
     pub forget_armed: Option<Instant>,
+    /// The collection migration's offer was put off ("Later", `Action::MigrationLater`; Fermi–Dirac spec §7.3): it
+    /// stays as one line in the Model tab's collection section instead of its card. For this session.
+    pub migration_later: bool,
     /// "Purge forgotten (N)…" was clicked: its inline confirmation shows (Purge / Cancel).
     pub purge_confirm: bool,
     /// The Worst-fitting rows checked for "Forget N selected", and the forgotten rows checked for
@@ -1050,6 +1054,7 @@ impl UiState {
             wall_half_width: default_wall_half_width(scene),
             plan: SamplingPlan::default(),
             forget_armed: None,
+            migration_later: false,
             purge_confirm: false,
             forget_selection: Vec::new(),
             restore_selection: Vec::new(),

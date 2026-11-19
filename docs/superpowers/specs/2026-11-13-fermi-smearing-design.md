@@ -991,6 +991,21 @@ body-4 degree) change (review M3). Its note appears only when the verdicts chang
 The wording says "identical within solver noise", not "identical". It says "kept out", not "discarded". It names the
 old folder.
 
+As built (plan Task 16, `app::ui::migration`):
+- Code-9 samples the review cannot judge (stray atoms, §7.6) get their own clause in the state-changed line, in the
+  same style: "…; 2 waiting (stray atoms)". State-changed samples with no verdict and not waiting (they kept code 7
+  or 2, or wait for an isolated-atom reference) are "N not reviewed (…)". Before the first review the line says what
+  the review will do.
+- The references line reads "References re-solved (the new F against the old E): O −9.5 mHa": the log holds the old
+  and new values only, and their difference is −TS only where E did not move, so it is labelled as what it is.
+- The not-migrated reasons are worded from the pass's reasons ("stalled", "now box-affected", "not converged", …).
+- Numbers are grouped with a space as above ("2 412", "1 579 K"); times are "1 h 30 min", to 5 min from an hour on.
+- **Later** folds the offer into one line of the Model tab's *Model file* section, which keeps Re-solve now; there the
+  section shows the progress line while the pass runs, "stopped at sample k of n … It goes on from there at the next
+  start of the app, or now with Resume" for a stopped pass, and the summary once complete. A stopped pass is started
+  again by the worker when it next attaches the collection (§7.3, "Resume").
+- The `README.txt` paragraph is not written yet (the collection's README writer is `surrogate::collection`).
+
 ### 7.9 Model files
 
 - **The shipped models** (`models/hydrogen.model`, `h2o.model`, `h3+.model`, `SiH4.model`) carry old tags, so the new

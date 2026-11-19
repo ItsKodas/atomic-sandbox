@@ -1197,7 +1197,9 @@ impl SurrogateKs {
     pub(super) fn load_specialised(&mut self, path: &Path, set: surrogate::SampleSet, scene: &Scene) -> Result<(), String> {
         let want = self.provenance_for(scene);
         let refused = |why: String| format!("specialised model {} refused: {why}", path.display());
-        let why = if want.charge != 0 {
+        let why = if let Some(why) = legacy_model_refusal(&set.provenance.ionic) {
+            Some(why)
+        } else if want.charge != 0 {
             Some(format!("the scene has charge {:+} — a specialised model is cut from a neutral collection (collections are neutral until M9)", want.charge))
         } else if let Some(m) = want.multiplicity {
             Some(format!("the scene forces multiplicity {m} — a specialised model is taught at the automatic multiplicity"))
@@ -1350,6 +1352,9 @@ pub(crate) struct MigrationSlot {
     /// multiplicity), for the a-priori estimate (`migrate::prior_solve_s`); empty once complete.
     sample_boxes: Vec<usize>,
     reference_boxes: Vec<usize>,
+    /// The predecessor's species (Z ascending), as read at attach: the offer's words (`sim::MigrationStatus::species`);
+    /// empty once complete.
+    species: Vec<u8>,
     pub(super) log: Option<MigrationLog>,
 }
 
@@ -1422,20 +1427,21 @@ impl SurrogateKs {
             }
         }
         let done = log.as_ref().is_some_and(|l| l.state != MigrationState::Running);
-        let (samples, sample_boxes, reference_boxes) = if done {
-            (log.as_ref().map_or(0, |l| l.counts.iter().sum()), Vec::new(), Vec::new())
+        let (samples, sample_boxes, reference_boxes, species) = if done {
+            (log.as_ref().map_or(0, |l| l.counts.iter().sum()), Vec::new(), Vec::new(), Vec::new())
         } else {
             match Collection::open_read_only(&source) {
                 Ok(ro) => {
                     let refs = ro.references.iter().flat_map(|&(z, n, _)| std::iter::repeat_n(n, allowed_multiplicities(z as u32).len())).collect();
-                    (ro.samples.len(), ro.samples.iter().map(|s| s.grid_n).collect(), refs)
+                    let species: std::collections::BTreeSet<u8> = ro.samples.iter().flat_map(|s| s.sample.z.iter().copied()).collect();
+                    (ro.samples.len(), ro.samples.iter().map(|s| s.grid_n).collect(), refs, species.into_iter().collect())
                 }
                 Err(e) => {
                     let old = source.file_name().map_or_else(|| source.display().to_string(), |f| f.to_string_lossy().into_owned());
                     self.user_notes.push(format!("shared collection {slug}: the previous solver's collection {old} can't be read now ({e}) — its re-solve for the new solver waits until it can"));
                     match &log {
                         None => return,
-                        Some(l) => (l.cursor, Vec::new(), Vec::new()),
+                        Some(l) => (l.cursor, Vec::new(), Vec::new(), Vec::new()),
                     }
                 }
             }
@@ -1443,7 +1449,7 @@ impl SurrogateKs {
         if log.is_none() && samples == 0 {
             return;
         }
-        self.migration = Some(MigrationSlot { source, samples, sample_boxes, reference_boxes, log });
+        self.migration = Some(MigrationSlot { source, samples, sample_boxes, reference_boxes, species, log });
         self.read_back_review();
     }
 
@@ -1525,7 +1531,19 @@ impl SurrogateKs {
         let source = slot.source.file_name().map_or_else(|| slot.source.display().to_string(), |f| f.to_string_lossy().into_owned());
         let running = self.pass.as_ref().and_then(|p| p.migrator());
         let Some(log) = running.map(|m| m.log()).or(slot.log.as_ref()) else {
-            return Some(sim::MigrationStatus { source, samples: slot.samples, done: 0, counts: [0; 4], eta_s: Some(slot.prior_s(0)), state: sim::MigrationPhase::Offered });
+            return Some(sim::MigrationStatus {
+                source,
+                samples: slot.samples,
+                done: 0,
+                counts: [0; 4],
+                eta_s: Some(slot.prior_s(0)),
+                state: sim::MigrationPhase::Offered,
+                species: slot.species.clone(),
+                date: String::new(),
+                review: [0; 3],
+                not_migrated: Vec::new(),
+                references: Vec::new(),
+            });
         };
         let state = match log.state {
             MigrationState::Running if running.is_some() => sim::MigrationPhase::Running,
@@ -1539,7 +1557,20 @@ impl SurrogateKs {
             _ => None,
         };
         let samples = running.map_or(slot.samples, |m| m.source_samples());
-        Some(sim::MigrationStatus { source, samples, done: log.cursor, counts: log.counts, eta_s, state })
+        let released = log.review.iter().filter(|e| e.2).count();
+        Some(sim::MigrationStatus {
+            source,
+            samples,
+            done: log.cursor,
+            counts: log.counts,
+            eta_s,
+            state,
+            species: slot.species.clone(),
+            date: log.date.clone(),
+            review: [released, log.review.len() - released, log.waiting.len()],
+            not_migrated: log.not_migrated.iter().map(|(_, why)| why.clone()).collect(),
+            references: log.references.clone(),
+        })
     }
 
     /// Starts or resumes the re-solve pass (`Trainable::start_migration`; module doc, "The migration"). `Err` with the
@@ -1677,6 +1708,7 @@ impl SurrogateKs {
             if log.state != MigrationState::Running {
                 slot.sample_boxes.clear();
                 slot.reference_boxes.clear();
+                slot.species.clear();
             }
         }
         self.teacher.discontinuity();
@@ -1751,6 +1783,15 @@ impl SurrogateKs {
 
 /// Why an interrupted pass of the previous solver never resumes (spec §7.7, the `training/pass.ckpt` row).
 pub const PASS_STARTED_WITH_PREVIOUS_SOLVER: &str = "the interrupted pass was started with the previous solver";
+
+/// Why a model file taught before the Fermi–Dirac switch is refused on load (spec §7.9; plan 2026-11-13 Task 16): `Some`
+/// with the reason when its ionic tag is one of the previous solver's (`pseudo::is_pre_fermi_dirac_tag`). `<version>`
+/// is this build's `CARGO_PKG_VERSION` (plan ruling R17; the workspace's one version). Migrating model files in the app
+/// is a non-goal (spec §7.9): the reason says to re-teach the model, or to open it in that version.
+pub fn legacy_model_refusal(tag: &str) -> Option<String> {
+    let v = env!("CARGO_PKG_VERSION");
+    crate::pseudo::is_pre_fermi_dirac_tag(tag).then(|| format!("taught with the solver before {v} (integer / shared occupations); this version uses Fermi–Dirac smearing: re-teach it, or open it in {v}"))
+}
 
 impl Drop for SurrogateKs {
     /// The attached collection's audit history and README are written before its lock is released.

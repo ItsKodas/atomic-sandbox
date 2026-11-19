@@ -165,6 +165,15 @@ pub enum Action {
     /// replayable (`# not replayable: purge-forgotten`, a replay refuses it like Forget: it rewrites
     /// the shared collection's file and the purged samples stop fencing).
     PurgeForgotten(usize),
+    /// The Model tab's **Re-solve now** (Fermi–Dirac spec §7.8): the attached collection's re-solve pass for the new
+    /// solver starts, or goes on from its cursor (`DynCommand::StartMigration`; a pass of the sampling machinery's
+    /// kind: Pause, Resume and Cancel on its card). Recorded, not replayable (plan ruling R16: a replay never starts a
+    /// migration, as it never sets up PySCF — `# not replayable: start-migration`, skipped with a warning).
+    StartMigration,
+    /// The migration offer's **Later**: the card folds into one line of the Model tab's collection section, which
+    /// keeps its Re-solve now (`UiState::migration_later`; nothing starts, nothing reaches the worker). Display
+    /// only, recorded and replayable ("migration-later").
+    MigrationLater,
     /// The estimated solver's audit cadence (answered steps; 0 = never).
     SetAudit(usize),
     /// Density: 0 = volume, 1 = isosurface.
@@ -641,6 +650,15 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
         Action::ContinueSampling => out.commands.push(dyn_(DynCommand::ContinueSampling)),
         Action::TeachAroundBlockers => out.commands.push(dyn_(DynCommand::StartTeaching)),
         Action::RetryFit => out.commands.push(dyn_(DynCommand::RetryFit)),
+        Action::StartMigration => {
+            if input.sampling() {
+                out.error = Some("a pass is running: cancel it first, then re-solve the collection for the new solver".into());
+            } else {
+                out.commands.push(dyn_(DynCommand::StartMigration));
+                st.set_status("re-solving the collection for the new solver (Pause and Cancel on its card in the Activity tab)");
+            }
+        }
+        Action::MigrationLater => st.migration_later = true,
         Action::StartOffered(plan) => out.commands.push(dyn_(DynCommand::StartSampling(plan))),
         Action::ResumeTraining => {
             if input.sampling() {
@@ -1248,6 +1266,7 @@ impl Action {
             ColourScale { physical } => format!("colour-scale {}", if *physical { "physical" } else { "peak" }),
             WarpFields(on) => format!("warp-fields {on}"),
             CancelCompare => "cancel-compare".into(),
+            MigrationLater => "migration-later".into(),
             ColourLook(l) => format!(
                 "colour-look {} {} {}",
                 match l.enclose {
@@ -1267,7 +1286,7 @@ impl Action {
                     super::TempUnits::F => "f",
                 }
             ),
-            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | ForgetSample(_) | RestoreSample(_) | ForgetSamples(_) | RestoreSamples(_) | ForgetByRule(..) | RefitNow | PurgeForgotten(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) | ImportData(_) | CheckUpdates | InstallVersion(_) | RestartToUpdate | CancelUpdateDownload => return None,
+            ApplyGrid | SaveScene | LoadScene { .. } | SaveModel | LoadModel | ApplyModelSettings | ApplyModelSettingsOnly(_) | CancelModelOffer | Sample { .. } | StartOffered(_) | ResumeTraining | DiscardTraining | UseCollection | ImportModel(_) | SaveSpecialised(_) | ForgetSample(_) | RestoreSample(_) | ForgetSamples(_) | RestoreSamples(_) | ForgetByRule(..) | RefitNow | PurgeForgotten(_) | SampleAfterRefusal | TeachAroundBlockers | RetryFit | StartMigration | CompareReference { .. } | SetupPyscf | CancelSetup | Builder(_) | TrainSegment(_) | OpenSegment | CancelSegment | BackToScene | Screenshot | Record(_) | ImportData(_) | CheckUpdates | InstallVersion(_) | RestartToUpdate | CancelUpdateDownload => return None,
         })
     }
 
@@ -1291,7 +1310,7 @@ impl Action {
             _ => Err(format!("action {head}: expected true/false (or on/off), got '{w}'")),
         };
         Ok(match head {
-            "toggle-play" | "play" | "pause" | "step" | "reverse-velocities" | "deselect" | "focus" | "forget" | "cancel-sampling" | "pause-sampling" | "continue-sampling" | "relax" | "stop-relax" | "orbital-include-reset" | "cancel-compare" => {
+            "toggle-play" | "play" | "pause" | "step" | "reverse-velocities" | "deselect" | "focus" | "forget" | "cancel-sampling" | "pause-sampling" | "continue-sampling" | "relax" | "stop-relax" | "orbital-include-reset" | "cancel-compare" | "migration-later" => {
                 want(0)?;
                 match head {
                     "toggle-play" => TogglePlay,
@@ -1309,6 +1328,7 @@ impl Action {
                     "refresh-bonds" => RefreshBonds,
                     "orbital-include-reset" => IncludeAllOccupied,
                     "cancel-compare" => CancelCompare,
+                    "migration-later" => MigrationLater,
                     _ => StopRelax,
                 }
             }

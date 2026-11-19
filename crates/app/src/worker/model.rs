@@ -223,6 +223,9 @@ pub struct ModelStatus {
     /// The species the model in use knows (`Trainable::model_species`): the specialised-model
     /// picker offers them beside the scene's.
     pub model_species: Vec<u8>,
+    /// The attached collection's migration from its predecessor folder (`Trainable::migration`; Fermi–Dirac spec
+    /// §7.8): the Model tab's offer, progress line and summary, and the Activity tab's progress line.
+    pub migration: Option<sim::MigrationStatus>,
 }
 
 /// The Model tab's source line (M8a Task 4b): "model: shared — <slug> · N samples" (with
@@ -686,7 +689,23 @@ impl Worker {
                 format!("this scene ({why}) cannot learn into the shared collection {slug} — collections are neutral until M9 — so it learns per-scene; the collection stays on disk and comes back when the scene is neutral again")
             })
         } else {
-            t.attach_collection(&root, &scene).err().map(|e| format!("shared collection not attached: {e}"))
+            match t.attach_collection(&root, &scene) {
+                Err(e) => Some(format!("shared collection not attached: {e}")),
+                Ok(()) => {
+                    // a re-solve pass started and not finished goes on at the next attach (Fermi–Dirac spec §7.3,
+                    // "Resume"): a collection newly attached — at app start, a worker re-spawn, another surface —
+                    // never the one already attached (a Cancel keeps it stopped until then)
+                    let now = match t.model_source() {
+                        sim::ModelSource::Collection { slug, .. } => Some(slug),
+                        _ => None,
+                    };
+                    let paused = t.migration().is_some_and(|m| m.state == sim::MigrationPhase::Paused) && !t.pass_active();
+                    if now.is_some() && now != attached && paused {
+                        self.dy.apply(DynCommand::StartMigration);
+                    }
+                    None
+                }
+            }
         };
         if let Some(n) = note {
             self.dy.add_note(n);
@@ -1096,6 +1115,7 @@ impl Worker {
             source_is_autosave,
             specialised: s.specialised(),
             model_species: s.model_species(),
+            migration: s.migration(),
         })
     }
 

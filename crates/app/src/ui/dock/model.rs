@@ -36,6 +36,7 @@
 //! recorded; a Ctrl K reveal unfolds the fold holding its anchor (it stays open).
 use super::super::actions::{expire_arming, forget_armed, sample_button, SampleButton};
 use super::super::sampling_presets as presets;
+use super::super::migration;
 use super::super::{
     duration_label, keyed, probe_rect, search, source_colour, source_label, theme, trust, Action, PanelInput, TrustKind, UiState, AMBER, GREEN, RED, source_tip,
 };
@@ -557,6 +558,12 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         return;
     }
     let sampling = input.sampling();
+    // the collection migration's offer (Fermi–Dirac spec §7.8), until Re-solve now or Later (which folds it into
+    // the collection section's line)
+    if let Some(mg) = m.and_then(|m| m.migration.as_ref()).filter(|mg| migration::offer_shown(Some(mg)) && !st.migration_later) {
+        ui.add_space(2.0);
+        super::group(ui, st, "d-model-migration", |ui, _| migration_offer(ui, mg, sampling, acts));
+    }
     ui.add_space(2.0);
     // 2. Teach next (the new samples from the knowledge map, rebuilt live during a pass)
     let pending = st.activity.knowledge.clone();
@@ -1076,6 +1083,9 @@ fn source_row(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling: 
     if attached {
         specialise_row(ui, st, m, scene_z, acts);
     }
+    if let Some(mg) = m.migration.as_ref() {
+        migration_row(ui, st, mg, sampling, acts);
+    }
     let can_import = attached && !read_only && !sampling;
     if super::super::probed("import-model", ui.add_enabled(can_import, egui::Button::new("Import a model file…")))
         .on_disabled_hover_text("needs the shared collection attached and writable, and no pass running")
@@ -1103,6 +1113,67 @@ fn source_row(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling: 
         }
         Some(Err(e)) => warnbox(ui, &format!("import refused: {e}")),
         None => {}
+    }
+}
+
+/// The collection migration's offer card (Fermi–Dirac spec §7.8; `ui::migration`): its title, its words, **Re-solve
+/// now** (`Action::StartMigration`; disabled while a pass runs) and **Later** (`Action::MigrationLater`).
+fn migration_offer(ui: &mut Ui, mg: &sim::MigrationStatus, sampling: bool, acts: &mut Vec<Action>) {
+    egui::Frame::new()
+        .fill(AMBER.gamma_multiply(0.07))
+        .stroke(egui::Stroke::new(1.0, AMBER.gamma_multiply(0.45)))
+        .corner_radius(7)
+        .inner_margin(egui::Margin::symmetric(9, 7))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.add(egui::Label::new(RichText::new(migration::OFFER_TITLE).strong().size(12.5).color(AMBER)).wrap());
+            ui.add(egui::Label::new(RichText::new(migration::offer_body(mg)).size(11.5)).wrap());
+            ui.horizontal_wrapped(|ui| {
+                if migration_button(ui, sampling, migration::OFFER_BUTTONS[0]).clicked() {
+                    acts.push(Action::StartMigration);
+                }
+                if super::super::probed("migration-later", ui.button(migration::OFFER_BUTTONS[1]))
+                    .on_hover_text("keep using the collection as it is (the new solver teaches into it as usual); the offer stays in the Model file section")
+                    .clicked()
+                {
+                    acts.push(Action::MigrationLater);
+                }
+            });
+        });
+}
+
+/// The migration's Re-solve now (or Resume) button, probed "migration-resolve": disabled while a pass runs.
+fn migration_button(ui: &mut Ui, sampling: bool, label: &str) -> egui::Response {
+    let b = egui::Button::new(RichText::new(label).strong().color(Color32::from_rgb(0x1c, 0x14, 0x05))).fill(AMBER);
+    super::super::probed("migration-resolve", ui.add_enabled(!sampling, b))
+        .on_disabled_hover_text("a pass is running: cancel it first")
+        .on_hover_text("re-solve the previous solver's samples for this collection, one cold GPU solve each — a pass like a sampling pass: the dynamics pause, Pause, Resume and Cancel on its card in the Activity tab; stopped, it goes on from where it was")
+}
+
+/// The migration in the collection section (Fermi–Dirac spec §7.8; `ui::migration`): the offer folded by Later with
+/// its Re-solve now, the progress line while the pass runs, the stopped line with Resume, or the summary.
+fn migration_row(ui: &mut Ui, st: &mut UiState, mg: &sim::MigrationStatus, sampling: bool, acts: &mut Vec<Action>) {
+    let text = |ui: &mut Ui, t: String| {
+        ui.add(egui::Label::new(RichText::new(t).size(11.5)).wrap());
+    };
+    match mg.state {
+        sim::MigrationPhase::Offered if migration::offer_shown(Some(mg)) && st.migration_later => {
+            text(ui, migration::later_line(mg));
+            if migration_button(ui, sampling, migration::OFFER_BUTTONS[0]).clicked() {
+                acts.push(Action::StartMigration);
+            }
+        }
+        sim::MigrationPhase::Offered => {}
+        sim::MigrationPhase::Running => text(ui, migration::progress_line(mg)),
+        sim::MigrationPhase::Paused => {
+            text(ui, migration::stopped_line(mg));
+            if migration_button(ui, sampling, "Resume").clicked() {
+                acts.push(Action::StartMigration);
+            }
+        }
+        sim::MigrationPhase::Complete | sim::MigrationPhase::Reviewed => {
+            ui.add(egui::Label::new(RichText::new(migration::summary_text(mg)).size(11.0).color(theme::INK_DIM)).wrap());
+        }
     }
 }
 

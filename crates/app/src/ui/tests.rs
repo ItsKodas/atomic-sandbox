@@ -233,6 +233,7 @@ pub(crate) fn model() -> ModelStatus {
         source_is_autosave: false,
         specialised: Vec::new(),
         model_species: Vec::new(),
+        migration: None,
     }
 }
 
@@ -13764,4 +13765,78 @@ mod fermi_smearing_words {
     fn iteration_energy_is_f_hf() {
         assert!(activity::jobs::ITERATION_ENERGY_TIP.contains("F_HF") && activity::jobs::ITERATION_ENERGY_TIP.contains("T_el"));
     }
+}
+
+/// The collection migration (Fermi–Dirac spec §7.8; plan 2026-11-13 Task 16, ruling R16): **Re-solve now** is
+/// `Action::StartMigration` — one `DynCommand::StartMigration` to the driver, refused while a pass runs — recorded by
+/// `--record` as `# not replayable: start-migration`, which a replay skips (it never starts a migration); **Later**
+/// (`Action::MigrationLater`, display only, replayable) folds the card into one line of the collection section that
+/// keeps its Re-solve now. Clicked as a user would, in the Model tab.
+#[test]
+fn start_migration_is_an_action() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let offered = sim::MigrationStatus {
+        source: "lsda-old".into(),
+        samples: 2412,
+        done: 0,
+        counts: [0; 4],
+        eta_s: Some(5400.0),
+        state: sim::MigrationPhase::Offered,
+        species: vec![1, 7, 8],
+        date: String::new(),
+        review: [0; 3],
+        not_migrated: Vec::new(),
+        references: Vec::new(),
+    };
+    let shared = sim::ModelSource::Collection { slug: "lsda-new".into(), samples: 0, read_only: false };
+    let m = ModelStatus { migration: Some(offered.clone()), source: shared, collections: true, use_collection: true, ..model() };
+    let snap = snapshot(&scene, Backend::Estimated, Some(m));
+    let inp = input(&scene, Some(&snap), &cam);
+    // the action alone: one driver command; refused while a pass runs
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    assert!(matches!(one_dyn(&act(&mut st, &inp, Action::StartMigration)), DynCommand::StartMigration));
+    let mut busy = snapshot(&scene, Backend::Estimated, Some(model()));
+    busy.dynamics.sampling = Some(sim::SamplingProgress { done: 1, total: 4, stage: "perturbations", target: None, last_energy: f64::NAN, cancelled: false, skipped: 0, failed: 0, finished: false, paused: false });
+    let out = act(&mut st, &input(&scene, Some(&busy), &cam), Action::StartMigration);
+    assert!(out.commands.is_empty() && out.error.as_deref().is_some_and(|e| e.contains("a pass is running")), "{:?}", out.error);
+    // recorded, never replayed: a comment a replay skips with a warning
+    assert_eq!(Action::StartMigration.describe(), None);
+    assert_eq!(crate::replay::unreplayable_kind(&Action::StartMigration), Some("start-migration"));
+    let line = crate::replay::write_line(&crate::replay::Line::Action(Action::StartMigration));
+    assert!(line.starts_with("# not replayable: start-migration"), "{line}");
+    let parsed = crate::replay::parse_numbered(&line).unwrap();
+    assert!(matches!(parsed.as_slice(), [(1, crate::replay::Line::NotReplayable(k))] if k == "start-migration"), "{parsed:?}");
+    assert!(crate::replay::is_harmless("start-migration"), "a replay skips it (ruling R16)");
+    // Later: display only, a script word of its own
+    assert_eq!(Action::MigrationLater.describe().as_deref(), Some("migration-later"));
+    assert_eq!(Action::parse(&["migration-later"]).unwrap(), Action::MigrationLater);
+    let out = act(&mut st, &inp, Action::MigrationLater);
+    assert!(out.commands.is_empty() && st.migration_later);
+    // the card in the Model tab: its words, Re-solve now and Later clicked
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    alone(&mut st, DockTab::Model);
+    let all = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    let t = texts_in(&ctx, &mut st, &inp, 1400.0, all);
+    assert!(t.contains(super::migration::OFFER_TITLE) && t.contains("About 1 h 30 min of GPU time"), "{t}");
+    let outs = click_widget(&ctx, &mut st, &inp, "migration-resolve");
+    assert!(matches!(dyn_commands(&outs).as_slice(), [DynCommand::StartMigration]), "{:?}", dyn_commands(&outs));
+    assert!(matches!(actions(&outs).as_slice(), [Action::StartMigration]));
+    let outs = click_widget(&ctx, &mut st, &inp, "migration-later");
+    assert!(matches!(actions(&outs).as_slice(), [Action::MigrationLater]) && dyn_commands(&outs).is_empty());
+    assert!(st.migration_later);
+    // folded: the card's text is gone, the line keeps its Re-solve now (in the collection section's fold)
+    for (section, open) in [(dock::model::Section::Teach, false), (dock::model::Section::Health, false), (dock::model::Section::File, true)] {
+        st.model_sections.set(section, open);
+    }
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    let t = texts_in(&ctx, &mut st, &inp, 1400.0, all);
+    assert!(!t.contains("Atomic Sandbox now fills electron levels") && t.contains(&super::migration::later_line(&offered)), "{t}");
+    let outs = click_widget(&ctx, &mut st, &inp, "migration-resolve");
+    assert!(matches!(actions(&outs).as_slice(), [Action::StartMigration]));
 }

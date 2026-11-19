@@ -458,17 +458,28 @@ fn sampling_card(ctx: &egui::Context, view: Rect, bottom: f32, input: &PanelInpu
         .show(ctx, |ui| {
             theme::card().show(ui, |ui| {
                 ui.set_width(520.0f32.min(view.width() - 40.0));
+                // the collection migration's re-solve pass (Fermi–Dirac spec §7.8) is a pass of the same kind
+                let mg = input.model().and_then(|m| m.migration.as_ref()).filter(|m| m.state == sim::MigrationPhase::Running);
+                let title = if mg.is_some() { crate::ui::migration::RESOLVING } else { "Sampling pass" };
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(if p.paused { "Sampling pass · paused" } else { "Sampling pass" }).strong());
+                    ui.label(RichText::new(if p.paused { format!("{title} · paused") } else { title.to_string() }).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Cancel").on_hover_text("end the pass now: what it sampled is kept; it is refitted only once there are enough samples to fit (Q′, the model's number of directions), else the Log says so and Sample more adds to them").clicked() {
+                        let tip = if mg.is_some() {
+                            "stop the re-solve now: what it re-solved is kept, and it goes on from there at the next start of the app (or with Resume in the Model tab)"
+                        } else {
+                            "end the pass now: what it sampled is kept; it is refitted only once there are enough samples to fit (Q′, the model's number of directions), else the Log says so and Sample more adds to them"
+                        };
+                        if ui.button("Cancel").on_hover_text(tip).clicked() {
                             acts.push(Action::CancelSampling);
                         }
                         pause_button(ui, p.paused, "sampling-card", acts);
                     });
                 });
                 dock::progress(ui, p, input.model());
-                theme::note(ui, "Stages: isolated-atom references, perturbations, pair scans, hot MD burst.");
+                match mg {
+                    Some(mg) => theme::note(ui, &crate::ui::migration::progress_line(mg)),
+                    None => theme::note(ui, "Stages: isolated-atom references, perturbations, pair scans, hot MD burst."),
+                };
             });
         });
     Some(r.response.rect.top())

@@ -1254,7 +1254,7 @@ mod policy;
 mod purge;
 mod quarantine;
 mod shared;
-pub use shared::{predecessor_of, COLLECTION_CHECKPOINT_PREFIX, PASS_STARTED_WITH_PREVIOUS_SOLVER};
+pub use shared::{legacy_model_refusal, predecessor_of, COLLECTION_CHECKPOINT_PREFIX, PASS_STARTED_WITH_PREVIOUS_SOLVER};
 pub use purge::PURGE_WAIT_MIGRATION;
 mod store;
 pub(crate) use store::PassKeep;
@@ -3470,6 +3470,12 @@ impl Trainable for SurrogateKs {
             surrogate::sidecar::Contents::Samples(set) if !set.specialised.is_empty() => return self.load_specialised(path, set, scene),
             surrogate::sidecar::Contents::Samples(set) => return self.load_samples(path, set, scene),
         };
+        // a model of the previous solver (spec §7.9): its reason, never the generic "another surface"
+        if let Some(why) = legacy_model_refusal(&sc.model.provenance.ionic) {
+            let msg = format!("model {} refused: {why}", path.display());
+            self.user_notes.push(msg.clone());
+            return Err(msg);
+        }
         let want = self.provenance_for(scene);
         if sc.model.provenance != want {
             let msg = format!(
@@ -3753,6 +3759,11 @@ impl SurrogateKs {
     /// checked against `scene` as for a model, then `install_samples` — which fits when it can —
     /// and its S9 references seeded into the cache (a later pass skips their scans).
     fn load_samples(&mut self, path: &std::path::Path, set: surrogate::SampleSet, scene: &Scene) -> Result<(), String> {
+        if let Some(why) = legacy_model_refusal(&set.provenance.ionic) {
+            let msg = format!("samples {} refused: {why}", path.display());
+            self.user_notes.push(msg.clone());
+            return Err(msg);
+        }
         let want = self.provenance_for(scene);
         if set.provenance != want {
             let msg = format!(

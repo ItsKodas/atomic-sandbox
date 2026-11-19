@@ -423,6 +423,7 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::CompareReference { relax: false, .. } => "compare-reference",
         Action::CompareReference { relax: true, .. } => "compare-reference-relax",
         Action::SetupPyscf => "setup-pyscf",
+        Action::StartMigration => "start-migration",
         Action::CancelSetup => "cancel-setup",
         Action::Builder(_) => "builder",
         Action::TrainSegment(_) | Action::OpenSegment | Action::CancelSegment | Action::BackToScene => "segment",
@@ -444,13 +445,15 @@ pub fn is_harmless(kind: &str) -> bool {
 
 fn harmless(kind: &str) -> bool {
     // the reference comparison never feeds the run (its "relax both" does relax ours: not harmless)
-    // nor does setting up PySCF (a replay never installs software: skipped), nor a capture (display only),
+    // nor does setting up PySCF (a replay never installs software: skipped), nor starting the collection migration's
+    // re-solve pass (plan ruling R16: a replay never starts one — it re-solves the user's collection for an hour; headless
+    // runs attach no collection, so nothing would diverge), nor a capture (display only),
     // nor an import of data folders (it copies files into the installed build's root; a replay never does),
     // nor the updater's check, download and restart (a replay never touches the network or installs);
     // a purge of forgotten samples is not harmless (refused, like Forget and Restore and their
     // batches): the purged samples stop fencing, so the replayed run would diverge; nor is Refit now
     // (it moves when the model changes)
-    matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup" | "capture" | "import-data" | "update")
+    matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup" | "start-migration" | "capture" | "import-data" | "update")
 }
 
 /// One line's text (the inverse of the parser; an action without a script form becomes a comment).
