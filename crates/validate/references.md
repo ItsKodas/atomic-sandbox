@@ -6069,7 +6069,7 @@ The second refit with nothing new: 192.6 → 10.6 s. What is left: `NullSpace::o
   (σ_F: the force std and its epistemic part, per atom.) The relative 3.4e-3 of the first report was a value of 3.7e-6 moving by 1.3e-8: the absolute differences are at most 0.4 % of a tier.
 - **Across machines.** faer picks its SIMD kernels at run time (AVX-512 here, AVX2 elsewhere), so a refit on a CPU with another instruction set differs from this one by the same ~κε spread — never in a verdict measured here, but a golden compares bit for bit only on the same ISA (the thread count never matters: `dense::SPLIT`).
 
-## Stray atoms (plan 2026-11-18 Task 7, 2026-11-19; spec `2026-11-18-stray-atom-composition-design.md` §6; `tests/surrogate.rs` and `tests/dynamics.rs`, release, RX 7900 XTX, teacher GpuKs tol 1e-6, `ionic accepted`, σ = h) — **H₂ + H clears and is answered after rulings 10–12; F₂ + Li refused; NVE re-entry conserves**
+## Stray atoms (plan 2026-11-18 Task 7, 2026-11-19; spec `2026-11-18-stray-atom-composition-design.md` §6; `tests/surrogate.rs` and `tests/dynamics.rs`, release, RX 7900 XTX, teacher GpuKs tol 1e-6, `ionic accepted`, σ = h) — **H₂ + H clears and is answered after rulings 10–13; F₂ + Li refused; NVE re-entry conserves, every booked jump within 1 mHa**
 
 Geometry (`common::surrogate::diatomic_and_atom`): the diatomic's centre and the third atom on the cube's body diagonal,
 8 Bohr apart, the diatomic's axis ⊥ the diagonal, placed so the stray atom and the diatomic's outer atoms are equally far
@@ -6235,3 +6235,63 @@ orbital here (no projection is computed).
 
 At 2.5 Bohr the margin passes by 43 mHa; by 3.0 Bohr the stretched bond's σu has come within 27.6 kT of the H's 1s and
 the check would refuse by margin (the onset the margin test exists for).
+
+**After controller ruling 13 (2026-11-19, the final review's fix round: the region covers the stray atoms only as near
+the bonded part, and a face, as a pass put them; the thinning radius frozen at each pass; every booked NVE jump
+asserted) — both tests PASS.** Gates on 3f9a3149: `cargo test -p providers --release` 566/0; `--test surrogate` 11/1
+(the known `the_stuck_escape_repro_is_answered_honestly`, owned by the trust-tighten branch); `--test dynamics` 7/0.
+
+`stray_h_clears_and_matches_dft` (677 s; pass 272 samples; teacher 280 solves, auditor 8). The checks at 1.434 / 1.15 /
+1.75 pass and clear as before (0.089 / 0.074 / 0.105 mHa; margins 282 / 307 / 257 mHa). The region's place — the
+passes' smallest stray-to-H distance and face distance — is 8.0206 Bohr (the 1.15 check) and 5.3812 Bohr (the 1.75
+check): in `diatomic_and_atom` the stray atom moves with the bond (8 Bohr from H₂'s centre, so its distance to the
+nearer H grows with r and its face distance shrinks), so bonds below 1.15 and above 1.75 are refused by the place, not
+by the radius. `would_answer` scanned over 0.9–2.3 Bohr by 0.001 (312 of 1401 bonds answered); **the covered interval
+about each check** (the box and the frozen radius, on this run's model envelope):
+
+| check (Bohr) | covered | reach −/+ (Bohr) | what ends it below / above |
+|---|---|---|---|
+| 1.15 | 1.150–1.198 | 0.000 / **0.048** | the place (stray–H 8.0206 < the passes') / the radius |
+| 1.434 | 1.353–1.523 | **0.081 / 0.089** | the radius / the radius |
+| 1.75 | 1.659–1.750 | **0.091** / 0.000 | the radius / the place (face 5.3811 < 5.3812) |
+
+The radius reaches 0.05–0.09 Bohr of bond length on this model (0.75 training spreads). **The fourth geometry, the
+answered bond farthest from every check: r = 1.659** (0.091 Bohr from the 1.75 check; the test before ruling 13 took
+the first answered candidate, 1.37, 0.064 Bohr from a check): source `Surrogate`, the stray-atom note.
+
+| quantity | value |
+|---|---|
+| E_DFT − E_model | **+0.4621 mHa** = gap_frag +0.1337 + comp −0.1002 + ε_pos +0.4286 (sum +0.4621) |
+| per bonded atom (asserted ≤ the audit tier 1.000 mHa) | **0.2311 mHa** |
+| worst bonded force difference | 1.07e-4 Ha/Bohr (the policy's bound 5.04e-3) |
+| stray atom: DFT force / model force | 5.13e-4 Ha/Bohr / 0 exactly |
+| then H₂ (2.5) + H through the provider | queued (face 5.25 < the place's 5.38), passes (0.137 mHa, margin 181 mHa), region grows (4 checks); r = 1.659 still the model's |
+
+The CPU counterpart (`providers` `the_region_covers_the_thinning_radius_of_its_checks`, the default H basis, an H₂
+envelope over 1.0–2.5 Bohr, no place): about 1.15 −0.082 / +0.109 Bohr, about a check at 2.5 −0.109 / +0.105 (it stops
+at 2.605, short of 3.0 where σu − 1s falls under the 138 mHa floor — asserted), about 1.434 and 1.75 one joined
+interval 1.285–1.960.
+
+`stray_h_returning_conserves_energy` (2569 s: pass 271 samples, 1085 s; NVE 1107 s; the control). After the three
+checks at 8 Bohr, **an edge check** — the H 6.05 Bohr from the nearer H₂ atom and 5.6 Bohr from a face, at (4.400,
+2.740, 2.740) — passes: residual **0.437 mHa** (the H₂–H tail at 6 Bohr, within the 1 mHa test), margin 280 mHa,
+ε_pos +0.131 mHa; the region grows (4 checks). Same path as before (101³ × 0.20):
+
+| phases (steps) | closest | E_conserved drift (bound 2e-4 Ha/ps) | detrended p-p | switches (ΔE_conserved) | booked jumps (each asserted ≤ 1.000 mHa) |
+|---|---|---|---|---|---|
+| model 34 → teacher 272 → model 55 | 4.215 Bohr | **+1.071e-5 Ha/ps** (driver +1.11e-5) | 7.41e-6 Ha | +5.9e-9, −1.8e-9 Ha | **−0.3477 mHa** at 6.034 Bohr (model → teacher: the edge, rule 5a, still stray), **+0.4399 mHa** at 6.052 (teacher → model) |
+
+The control (the teacher alone, same start): +2.80e-5 Ha/ps; over the teacher's steps of the run −9.2e-6 Ha/ps. The
+switch in now happens at the region's edge (6.05 Bohr), not at r_cut: the step at 6.034 is still stray but nearer
+than every pass, so it falls back on rule 5a and queues a check (the auditor made 13 solves: 8 for the four checks
+before the run, 5 during it — not broken down here). Every teacher solve was clean (no "box too small").
+
+**Parked by ruling 13 (documented, not fixed):**
+- *Minor 3 — a thermal run may not clear on its own.* Before the region opens, a geometry within the radius of a pass
+  neither counts nor is covered. The radius above is 0.05–0.09 Bohr of H–H; an H₂ at 300 K changes its bond by about
+  0.05 Bohr rms (k = μω² ≈ 0.37 Ha/Bohr², kT = 0.95 mHa), so it may never visit three mutually distinct bonds, and
+  "H₂ + a drifting H runs on the model" (spec §1) may stay on DFT until a wider move. Both GPU tests clear with
+  synthetic bonds (1.434 / 1.15 / 1.75). Not measured with a thermal run.
+- *Minor 4 — the NVE test exercises two switch kinds only*: the r_cut crossing and now the place edge (stray distance).
+  A bonded geometry leaving coverage (a vibrating H₂) and an audit of a cleared answer are not in it; later.
+- *Minor 6 — a reach change has nothing enforcing the re-mask* (`mask_stray_atoms`' doc): for the long-reach branch.
