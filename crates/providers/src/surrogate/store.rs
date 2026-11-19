@@ -76,7 +76,7 @@ impl SurrogateKs {
         let prov = self.scene_provenance(scene);
         let held = match self.stray_split(&s.pos, &s.z, &prov) {
             Some((_, _, Some(why))) => return Ok(PassKeep::StrayNotKept(why)),
-            Some((split, sig, None)) => !self.stray_covered(&s.pos, &s.z, &split, &sig),
+            Some((split, sig, None)) => !self.stray_covered(&s.pos, &s.z, &split, &sig, &prov),
             None => false,
         };
         self.push_sample_coded(masked_by(s, scene), &prov, face.unwrap_or(f64::NAN), multiplicity, if held { Q_STRAY } else { Q_NONE })?;
@@ -724,7 +724,7 @@ impl SurrogateKs {
                 notes.push(stray_not_kept(&why));
                 return false;
             }
-            Some((split, sig, None)) => (!self.stray_covered(pos, z, &split, &sig)).then(|| stray::signature_label(&sig)),
+            Some((split, sig, None)) => (!self.stray_covered(pos, z, &split, &sig, prov)).then(|| stray::signature_label(&sig)),
             None => None,
         };
         self.since_kept = 0;

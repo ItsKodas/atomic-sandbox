@@ -53,6 +53,8 @@
 //!   to hold for that pair;
 //! - a stray atom within [`STRAY_FACE_MARGIN`] = 4 Bohr of a face (the box rule's edge: +1.8e-3 Ha of confinement
 //!   for a lone H there, `lone` module doc), before a solve; after one, a box-affected face density voids the check.
+//!   The floor is the outer edge only: a region answers no nearer a face than its passes measured ("Where the stray
+//!   atoms sit" below), so the band between 4 Bohr and a clean check's distance (≈ 5 Bohr for an H) is never answered.
 //!
 //! # The composition check (spec §4.3; [`judge`])
 //!
@@ -140,14 +142,20 @@
 //! A [`Signature`] (sorted bonded Z, sorted stray Z, charge, the surface's reference settings; the multiplicity is
 //! automatic, the floor refuses the rest) is cleared only **inside a region**: the per-feature envelope (min, max per
 //! species, the existing `surrogate::Envelope`) of the bonded-part descriptors of its passing checks, and the thinning radius
-//! of each (ruling 12, "What the region covers" below). The region opens
+//! of each (ruling 12, "What the region covers" below) — **and only with the stray atoms where its passes put them**
+//! (ruling 13, "Where the stray atoms sit" below). The region opens
 //! after [`STRAY_CHECKS`] = 3 passes, each at a bonded geometry beyond the store's thinning radius from the others
 //! (`THIN_FRACTION` × `max_descriptor_distance` training spreads, the store's per-sample metric: the worst atom's
 //! nearest same-species counterpart, L∞ in the model's training-spread units, `quarantine::spread_distance`). A pass
 //! differing only in stray distance has the same bonded descriptors and does not count. Each check tests an identity,
 //! so a fourth adds no statistical power; the region is the geometry coverage. A pass outside an open region grows it.
-//! **One failing check refuses the signature for the session.** Session-only state (spec §4.6). The region lives in
-//! the descriptor space of the basis it was built with: a model with another basis must clear the book.
+//! **One failing check refuses the signature for the session**, and takes every sample of it in the fit back out of it
+//! — the ones its region released included, as a failed audit does (final review minor 1; spec §4.3: a refused
+//! signature covers nothing). Session-only state (spec §4.6), never written. The region lives in the descriptor space of
+//! the basis it was built with: a model with another basis drops it (the refusals stay, below). It was cleared under
+//! the policy's tolerances — the check's energy and force tests and the thinning radius (`energy_std_per_atom`,
+//! `force_std_abs`, `force_std_rel`, `max_descriptor_distance`): a change of any of them drops every region (the
+//! refusals stay), a change of anything else (the audit cadence, draft mode) keeps them (final review minor 5).
 //!
 //! **What the region covers** (controller ruling 12; Task 7 on the real teacher). A bonded geometry is covered when it
 //! lies inside the per-feature box of the passed checks **or within the thinning radius of one of them**, measured
@@ -163,17 +171,59 @@
 //! spreads, the worst atom's L∞ distance to its counterpart), and each check tests an identity at its geometry, so a
 //! geometry that close is measured by it. A geometry beyond both (outside the box, farther than the radius from every
 //! check) falls back and checks once more, and its pass grows the region.
-//! **The book clears on any basis change**, a collection's body-4 degree growing
-//! with its samples included (`stray_book_current`): the regions live in the old basis's feature space, so every
+//!
+//! **The radius is frozen at the pass** (controller ruling 13, final review I2): each passed check keeps the model's
+//! training spreads and the thinning radius of the moment it passed, and both the radius and the distinctness test
+//! measure in those (one definition of the spread units: the check's own). Measured at query time instead, a refit that
+//! changes a feature's spread would cover or uncover geometries with no new check, and the releases (run only at a
+//! pass) would drift apart from the answers. The radius is a statistical scale (0.75 training spreads), not a
+//! physical one. The covered bond intervals (box and radius together), measured with the default H basis and an H₂
+//! training envelope over 1.0–2.5 Bohr (`the_region_covers_the_thinning_radius_of_its_checks`): about the 1.15 check
+//! −0.082 / +0.109 Bohr, about a stretched check at 2.5 Bohr −0.109 / +0.105 (it stops at 2.605, short of 3.0 where the
+//! frontier margin crosses the floor), and about the 1.434 and 1.75 checks one joined interval, 1.285–1.960. On the real teacher the clears test records the reach
+//! about its checks (`references.md`, "Stray atoms").
+//! **Before the region opens** a geometry within the radius of a pass neither counts nor is covered: an H₂ vibrating
+//! at 300 K (rms bond change ≈ 0.05 Bohr) may visit too narrow a range to give three mutually distinct checks, so a
+//! thermal run may not clear on its own (final review minor 3, parked: a known limit, `references.md`).
+//!
+//! # Where the stray atoms sit (controller ruling 13; final review I1, I3; [`StrayPlace`])
+//!
+//! The region describes the bonded part, but (C) is an identity *at a configuration*: the residual
+//! E_scene − E_frag − Σ E_atom holds whatever interaction the bonded part and a stray atom keep beyond r_cut, and that
+//! grows as the stray atom comes nearer. The shell-check fence guards it pairwise only (atom–atom); a molecule-level
+//! term — the induction of a polarisable stray atom by a polar fragment, −2αμ²/r⁶ on the dipole axis — is seen by no
+//! fence (an estimate from literature constants for H₂O + Mg: −0.14 mHa at 9 Bohr, −1.6 mHa at 6.05). So each region
+//! also records **where its passes put the stray atoms**: the smallest stray-to-bonded-atom distance (`reach`) and the
+//! smallest stray-to-face distance (`face`) of any pass. A step is answered, and a held sample released, only with
+//! every stray atom at least that far from the bonded part and from the faces — no slack. The interaction tails are
+//! monotone in distance in the separated regime, so the nearest pass bounds the measured range; the box term ε_pos
+//! grows toward a face, and a clean check needs about 5 Bohr to a face for an H (`references.md`, "The box"), so the
+//! band between the floor's 4 Bohr and the nearest clean pass is never answered (there the teacher differs from E_ref
+//! by up to ε_pos ≈ 1.8 mHa, and a check cannot be clean).
+//!
+//! A stray atom nearer than every pass (or nearer a face) falls back and **queues a check even when the bonded geometry
+//! is covered**; its pass counts nothing towards [`STRAY_CHECKS`] (its bonded geometry is not distinct) but extends the
+//! place, in the Checking state too. A check void for a **box-affected** solve marks its signature with the stray
+//! atoms' face distance: no check is queued again until they are farther from the faces than that (one void per
+//! signature, not one per fallback — each void costs 1 + n_stray solves; a void for any other reason is retried as
+//! before). The cost of the rule: more checks near r_cut and near the faces, and a stray atom drifting steadily toward
+//! the bonded part or a face is never answered (each step is nearer than the last pass). A dynamics run that should be
+//! answered near r_cut first checks a geometry there (`validate` `stray_h_returning_conserves_energy`).
+//!
+//! **A basis change drops the regions and keeps the refusals** (final review minor 2), a collection's body-4 degree
+//! growing with its samples included (`stray_book_current`): the regions live in the old basis's feature space, so every
 //! signature's checks are re-earned under the new model (its held samples stay held until then; nothing is released
-//! by the clear).
+//! by the drop), while a failed check or a failed audit is a fact of the teacher (or the floor's) and keeps its
+//! signature refused. A new surface, a Forget and an installed model clear the whole book.
 //!
 //! # Answering inside a region (spec §4.4; plan Task 4)
 //!
 //! [`stray_cleared`](SurrogateKs::stray_cleared) decides, before the envelope: the scene splits, every stray species is
-//! in the model's basis (rule 2), the signature is `Cleared`, the floor passes **at these positions** (the signature
-//! does not carry a forced multiplicity, a stray atom's distance to a face or a shell fence since, so the floor is
-//! re-checked every step) and the region covers the bonded part's descriptors. Then the strict rules judge the scene
+//! in the model's basis (rule 2), the signature is `Cleared`, the model's mean is 0 (the answer identity's premise —
+//! offset_s = −Σ_k c̃_{s,k} mean_k — a guard in every build: a model without it answers no stray scene; final review
+//! minor 8), the stray atoms sit where the passes measured them (ruling 13), the floor passes **at these positions**
+//! (the signature does not carry a forced multiplicity, a stray atom's distance to a face or a shell fence since, so
+//! the floor is re-checked every step) and the region covers the bonded part's descriptors. Then the strict rules judge the scene
 //! with the stray atoms exempt and the bonded part on its own (`evaluate`, mirrored by `would_answer`, `atom_verdicts`,
 //! the readiness readout and `geometry_refusal`):
 //!
@@ -228,6 +278,11 @@
 //!   H₂ from H₂ + a stray H), the teach-around pass's and the shell check's ratios, a failed audit's re-judgement
 //!   (`trust::judge_case`'s callers) and the calibration's history points (recorded over the bonded part: n_atoms
 //!   n_bonded). Divided by the scene's n, the composite gap would pass at a tier × n_stray larger.
+//!
+//! One change reaches scenes without a stray atom (final review minor 7): `quarantine::spread_distance` takes a NaN gap
+//! (a non-finite descriptor) as infinitely far, where `f64::max` used to drop it. It is unreachable for finite
+//! descriptors (every descriptor the model builds), so no trace moves (the scripted-session digest is unchanged), and
+//! it is the conservative side for every caller (thinning keeps the sample; no fence calls it near).
 //!
 //! A **failed** audit at a scene with stray atoms (not a draft guess's) does three things, in this order
 //! ([`stray_audit_failed`](SurrogateKs::stray_audit_failed)):
@@ -288,10 +343,11 @@
 //!   solve counter adds them so. Without an auditor the fallback's note says so once per signature this session.
 //! - **The hold-out.** A kept sample with stray atoms (`keep_sample_masked`) is held out of the fit
 //!   (`quarantine::Q_STRAY`, never written; its event `TeachOutcome::KeptStrayHeld`, "held until measured") unless a
-//!   cleared region of its signature covers its bonded geometry; a floor-refused one is never kept
-//!   (`TeachOutcome::StrayNotKept`). A pass releases the check's own sample; a cleared
+//!   cleared region of its signature covers its bonded geometry and its stray atoms' place; a floor-refused one is
+//!   never kept (`TeachOutcome::StrayNotKept`). A pass releases the check's own sample; a cleared
 //!   signature releases every held sample of it its region covers
-//!   ([`release_stray_samples`](SurrogateKs::release_stray_samples)); a refused one holds them for good. Loaded
+//!   ([`release_stray_samples`](SurrogateKs::release_stray_samples)); a refused one holds them for good, and a failing
+//!   check takes back the ones in the fit (minor 1). Loaded
 //!   samples are held the same way (`hold_out_stray`), never rewritten. The sampling pass's samples go through the
 //!   same rules (`add_pass_sample`: a floor refusal is not kept, any other is held unless covered).
 //! - **What a released sample carries (rule 7, physics honesty).** Its fit label E − Σ_i E_ref(Z_i) holds, besides the
@@ -300,9 +356,10 @@
 //!   the stray atom has no features, so the fit attributes it to the bonded part's coefficients. It is bounded by the
 //!   box rule (a stray atom ≥ 4 Bohr from a face, the check's solves within `box_affected_face_density`): of order
 //!   1 mHa (1.8 mHa for a lone H at the 4-Bohr edge, `lone` module doc), the size of any trained sample's box error.
-//! - **The book's lifetime.** Session-only (spec §4.6), and built in one basis's descriptor space: a model with
-//!   another basis or surface, a Forget and an installed model clear it, drop the check in flight and release
-//!   nothing ([`stray_book_current`](SurrogateKs::stray_book_current); controller ruling B).
+//! - **The book's lifetime.** Session-only (spec §4.6), never written (so no file can hold a region without its place
+//!   or frozen radii), and built in one basis's descriptor space: a model with another basis drops the regions and keeps
+//!   the refusals; another surface, a Forget and an installed model clear it; each drops the check in flight and
+//!   releases nothing ([`stray_book_current`](SurrogateKs::stray_book_current); controller rulings B and 13).
 use super::lone::{closed_spin_channels, compensated_sum, reference_settings_key};
 use super::quarantine::spread_distance;
 use super::*;
@@ -517,7 +574,8 @@ pub(super) fn floor_refusal(
 
 /// One solve of a composition check: the scene's own, the bonded part's alone or one stray atom's alone (forces in the
 /// part's atom order: the bonded part's in [`Split::bonded`]'s order, an atom's one force). `clean`: no warning,
-/// trainable, face density within the box rule.
+/// trainable, face density within the box rule; `boxed`: the face density is not within the box rule (one reason
+/// `clean` is false — the one a nearer face makes, controller ruling 13).
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct PartAnswer {
     pub energy: f64,
@@ -525,6 +583,7 @@ pub(super) struct PartAnswer {
     pub frontier: [Frontier; 2],
     pub partial: Vec<PartialLevel>,
     pub clean: bool,
+    pub boxed: bool,
 }
 
 /// A composition check's verdict (module doc): `Pass` with the absolute energy residual and the smallest frontier margin
@@ -723,65 +782,123 @@ fn level_words(e: Option<f64>) -> String {
     e.map_or_else(|| "absent".into(), |e| format!("{:.1} mHa", e * 1e3))
 }
 
+/// Where a geometry's stray atoms sit (Bohr; module doc, "Where the stray atoms sit"): `reach` the smallest distance
+/// of a stray atom to a bonded atom, `face` the smallest distance of a stray atom to a face of the cell (the floor's
+/// measure, `half_extent − max |coordinate|`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct StrayPlace {
+    pub reach: f64,
+    pub face: f64,
+}
+
+impl StrayPlace {
+    /// The place of `split`'s stray atoms at `pos`, in a cell of half-extent `half` (Bohr; centred at the origin, as
+    /// the floor's face test).
+    pub(super) fn of(pos: &[[f64; 3]], split: &Split, half: f64) -> StrayPlace {
+        let dist = |a: [f64; 3], b: [f64; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+        let reach = split.stray.iter().flat_map(|&s| split.bonded.iter().map(move |&b| (s, b))).map(|(s, b)| dist(pos[s], pos[b])).fold(f64::INFINITY, f64::min);
+        let face = split.stray.iter().map(|&s| half - pos[s].iter().fold(0.0f64, |m, x| m.max(x.abs()))).fold(f64::INFINITY, f64::min);
+        StrayPlace { reach, face }
+    }
+
+    /// The stray atoms sit where the passed checks measured them (controller ruling 13, no slack): at least as far from
+    /// the bonded part as the nearest of `measured`, and at least as far from a face. A NaN is never within.
+    pub(super) fn within(&self, measured: &StrayPlace) -> bool {
+        self.reach >= measured.reach && self.face >= measured.face
+    }
+}
+
+/// One passed check of a region: its bonded atoms (species index, descriptor), and the training spreads (`units`, the
+/// model's envelope) and thinning radius (`thin`, in those spreads) **at its pass** — its radius is frozen there
+/// (controller ruling 13; module doc, "What the region covers"), so a later refit moves no coverage.
+#[derive(Clone, Debug)]
+struct Point {
+    atoms: Vec<(usize, Vec<f64>)>,
+    units: Envelope,
+    thin: f64,
+}
+
+impl Point {
+    /// The geometry's distance to this point in the store's thinning metric, in the point's frozen spreads: the worst
+    /// query atom's distance to its nearest same-species counterpart, L∞ in training spreads (`spread_distance`); a
+    /// species the spreads never saw is infinitely far.
+    fn distance<D: AsRef<[f64]>>(&self, bonded_desc: &[D], species: &[usize]) -> f64 {
+        species.iter().zip(bonded_desc).fold(0.0f64, |worst, (&qs, qd)| {
+            worst.max(self.atoms.iter().filter(|(t, _)| *t == qs).map(|(t, b)| spread_distance(&self.units, *t, qd.as_ref(), b)).fold(f64::INFINITY, f64::min))
+        })
+    }
+}
+
 /// A signature's cleared region (module doc): the per-feature envelope of the bonded-part descriptors of its passing
-/// checks, and the points themselves (per point, per bonded atom: its species index and descriptor) for the
-/// distinctness test.
+/// checks, the checks themselves (each with its frozen thinning radius) for the radius and the distinctness test, and
+/// the place of the stray atoms the passes measured ([`StrayPlace`]: the smallest reach and face distance of any pass;
+/// +∞ until the first, so an empty region covers nothing).
 #[derive(Clone, Debug)]
 pub(super) struct Region {
     env: Envelope,
-    points: Vec<Vec<(usize, Vec<f64>)>>,
+    points: Vec<Point>,
+    place: StrayPlace,
 }
 
 impl Region {
     pub(super) fn new(basis: &Basis) -> Region {
-        Region { env: Envelope::new(basis), points: Vec::new() }
+        Region { env: Envelope::new(basis), points: Vec::new(), place: StrayPlace { reach: f64::INFINITY, face: f64::INFINITY } }
     }
 
-    /// Add one bonded geometry: its atoms' descriptors and species indices (the region's basis).
-    pub(super) fn add(&mut self, bonded_desc: &[Vec<f64>], species: &[usize]) {
+    /// Where the passes measured the stray atoms: the smallest stray–bonded distance and stray–face distance of any pass
+    /// booked (Bohr).
+    pub(super) fn place(&self) -> StrayPlace {
+        self.place
+    }
+
+    /// Add one bonded geometry: its atoms' descriptors and species indices (the region's basis), with the model's
+    /// training spreads `units` and the store's thinning radius `thin` (in those spreads) at this pass, frozen with it.
+    pub(super) fn add(&mut self, bonded_desc: &[Vec<f64>], species: &[usize], units: &Envelope, thin: f64) {
+        debug_assert_eq!(self.env.n_features, units.n_features, "Region::add: the units envelope is of another basis");
         for (&s, b) in species.iter().zip(bonded_desc) {
             self.env.add_atom(s, b);
         }
-        self.points.push(species.iter().copied().zip(bonded_desc.iter().cloned()).collect());
+        self.points.push(Point { atoms: species.iter().copied().zip(bonded_desc.iter().cloned()).collect(), units: units.clone(), thin });
     }
 
-    /// The geometry lies beyond `thin` from every stored point in the store's thinning metric (module doc): per point,
-    /// the worst atom's distance to its nearest same-species counterpart, L∞ in `units`' training spreads (the model's
-    /// envelope, as `nearest_stored`). A species `units` never saw cannot be measured: not distinct (the conservative
-    /// side: such a check never counts towards [`STRAY_CHECKS`]).
-    pub(super) fn distinct(&self, bonded_desc: &[Vec<f64>], species: &[usize], units: &Envelope, thin: f64) -> bool {
-        debug_assert_eq!(self.env.n_features, units.n_features, "Region::distinct: the units envelope is of another basis");
+    /// A pass measured the stray atoms at `p`: the region's place is the smallest reach and face distance of its passes.
+    pub(super) fn measured(&mut self, p: StrayPlace) {
+        self.place = StrayPlace { reach: self.place.reach.min(p.reach), face: self.place.face.min(p.face) };
+    }
+
+    /// The geometry lies beyond every stored point's thinning radius in the store's thinning metric (module doc): per
+    /// point, the worst atom's distance to its nearest same-species counterpart, L∞ in the training spreads frozen at
+    /// that point's pass ([`Point::distance`]). A species the model's current envelope `units` never saw cannot be
+    /// measured: not distinct (the conservative side: such a check never counts towards [`STRAY_CHECKS`]).
+    pub(super) fn distinct(&self, bonded_desc: &[Vec<f64>], species: &[usize], units: &Envelope) -> bool {
         if species.iter().any(|&s| units.count.get(s).is_none_or(|&c| c == 0)) {
             return false;
         }
-        self.points.iter().all(|point| {
-            let d = species.iter().zip(bonded_desc).fold(0.0f64, |worst, (&qs, qd)| {
-                worst.max(point.iter().filter(|(t, _)| *t == qs).map(|(t, b)| spread_distance(units, *t, qd, b)).fold(f64::INFINITY, f64::min))
-            });
-            d > thin
-        })
+        self.points.iter().all(|p| p.distance(bonded_desc, species) > p.thin)
     }
 
-    /// The geometry lies within `thin` of some stored point in the metric of [`distinct`](Self::distinct) — exactly its
-    /// complement on measurable species; a species `units` never saw is not near (and not distinct: neither covered nor
-    /// checkable, the conservative side).
-    pub(super) fn near<D: AsRef<[f64]>>(&self, bonded_desc: &[D], species: &[usize], units: &Envelope, thin: f64) -> bool {
-        if bonded_desc.is_empty() || species.len() != bonded_desc.len() || species.iter().any(|&s| units.count.get(s).is_none_or(|&c| c == 0)) {
+    /// The geometry lies within some stored point's frozen thinning radius, in the metric of
+    /// [`distinct`](Self::distinct) — exactly its complement on measurable species (one definition of the spread units:
+    /// each point's own).
+    pub(super) fn near<D: AsRef<[f64]>>(&self, bonded_desc: &[D], species: &[usize]) -> bool {
+        if bonded_desc.is_empty() || species.len() != bonded_desc.len() {
             return false;
         }
-        self.points.iter().any(|point| {
-            let d = species.iter().zip(bonded_desc).fold(0.0f64, |worst, (&qs, qd)| {
-                worst.max(point.iter().filter(|(t, _)| *t == qs).map(|(t, b)| spread_distance(units, *t, qd.as_ref(), b)).fold(f64::INFINITY, f64::min))
-            });
-            d <= thin
-        })
+        self.points.iter().any(|p| p.distance(bonded_desc, species) <= p.thin)
     }
 
-    /// The region covers the geometry (controller ruling 12; module doc, "The cleared region"): inside the per-feature
-    /// box, **or** within the thinning radius of a passed check ([`near`](Self::near), the distinctness metric) — so a
-    /// geometry is always either covered or checkable. `units`: the model's envelope (`None`: the box alone).
-    pub(super) fn covers<D: AsRef<[f64]>>(&self, bonded_desc: &[D], species: &[usize], units: Option<&Envelope>, thin: f64) -> bool {
-        self.contains(bonded_desc, species) || units.is_some_and(|u| self.near(bonded_desc, species, u, thin))
+    /// The bonded geometry is covered (controller ruling 12; module doc, "What the region covers"): inside the
+    /// per-feature box, **or** within the frozen thinning radius of a passed check ([`near`](Self::near), the
+    /// distinctness metric) — so a bonded geometry is always either covered or checkable.
+    pub(super) fn covers_bonded<D: AsRef<[f64]>>(&self, bonded_desc: &[D], species: &[usize]) -> bool {
+        self.contains(bonded_desc, species) || self.near(bonded_desc, species)
+    }
+
+    /// The region covers the geometry (controller rulings 12 and 13): its bonded part is covered
+    /// ([`covers_bonded`](Self::covers_bonded)) **and** its stray atoms sit where the passes measured them
+    /// ([`StrayPlace::within`]: no nearer the bonded part, no nearer a face).
+    pub(super) fn covers<D: AsRef<[f64]>>(&self, bonded_desc: &[D], species: &[usize], place: StrayPlace) -> bool {
+        place.within(&self.place) && self.covers_bonded(bonded_desc, species)
     }
 
     /// Every bonded atom lies within its species' per-feature [min, max] of the region; a species absent from the
@@ -809,10 +926,14 @@ pub(super) enum StrayState {
     Refused(String),
 }
 
-/// The session's signatures and their states (module doc; session-only, spec §4.6).
+/// The session's signatures and their states (module doc; session-only, spec §4.6, never written: nothing of it is
+/// loaded, so no older file can hold a region without its place or its frozen radii).
 #[derive(Clone, Debug, Default)]
 pub(super) struct StrayBook {
     map: HashMap<Signature, StrayState>,
+    /// Per signature, the largest stray face distance (Bohr) at which a check was void for a box-affected solve: no
+    /// check is queued again until the stray atoms are farther from the faces than that (controller ruling 13, I3).
+    boxed: HashMap<Signature, f64>,
 }
 
 impl StrayBook {
@@ -820,12 +941,15 @@ impl StrayBook {
         self.map.get(s)
     }
 
-    /// Book a check's verdict at bonded geometry `desc`/`species` (under `basis`; `units` the model's training envelope
-    /// and `thin` the store's thinning radius in its spreads, for [`Region::distinct`]). Pass: at a distinct geometry
-    /// one more pass and the region grows, opening at [`STRAY_CHECKS`]; an open region grows by any pass. Fail: refused
-    /// for the session. Void, or anything after a refusal: no change.
+    /// Book a check's verdict at bonded geometry `desc`/`species` with its stray atoms at `place` (under `basis`;
+    /// `units` the model's training envelope and `thin` the store's thinning radius in its spreads, frozen with the pass
+    /// and used by [`Region::distinct`]). Pass: the region's place takes it (the smallest reach and face distance of the
+    /// passes), and at a distinct geometry one more pass and the region grows, opening at [`STRAY_CHECKS`]; an open
+    /// region grows by any pass. A pass differing only in where the stray atoms sit counts nothing towards K (its
+    /// bonded geometry is not distinct) but extends the place. Fail: refused for the session. Void, or anything after a
+    /// refusal: no change.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn record(&mut self, s: Signature, v: CheckVerdict, desc: &[Vec<f64>], species: &[usize], basis: &Basis, units: &Envelope, thin: f64) {
+    pub(super) fn record(&mut self, s: Signature, v: CheckVerdict, desc: &[Vec<f64>], species: &[usize], place: StrayPlace, basis: &Basis, units: &Envelope, thin: f64) {
         let (r, m) = match v {
             CheckVerdict::Void(_) => return,
             CheckVerdict::Fail(why) => {
@@ -844,9 +968,10 @@ impl StrayBook {
             StrayState::Refused(why) => StrayState::Refused(why),
             StrayState::Checking { mut passes, mut region, residual, margin } => {
                 let (residual, margin) = (residual.max(r), margin.min(m));
-                if region.distinct(desc, species, units, thin) {
+                region.measured(place);
+                if region.distinct(desc, species, units) {
                     passes += 1;
-                    region.add(desc, species);
+                    region.add(desc, species, units, thin);
                 }
                 if passes >= STRAY_CHECKS {
                     StrayState::Cleared { region, residual, margin, passes }
@@ -855,7 +980,8 @@ impl StrayBook {
                 }
             }
             StrayState::Cleared { mut region, residual, margin, passes } => {
-                region.add(desc, species);
+                region.measured(place);
+                region.add(desc, species, units, thin);
                 StrayState::Cleared { region, residual: residual.max(r), margin: margin.min(m), passes: passes + 1 }
             }
         };
@@ -867,9 +993,31 @@ impl StrayBook {
         self.map.insert(s.clone(), StrayState::Refused(why));
     }
 
+    /// A check of `s` was void for a box-affected solve with its stray atoms `face` Bohr from the nearest face: none is
+    /// queued again while they are no farther (controller ruling 13, I3; [`boxed_void`](Self::boxed_void)).
+    pub(super) fn void_near_face(&mut self, s: &Signature, face: f64) {
+        let f = self.boxed.entry(s.clone()).or_insert(f64::NEG_INFINITY);
+        *f = f.max(face);
+    }
+
+    /// The largest stray face distance at which a check of `s` was void for a box-affected solve (Bohr), if any.
+    pub(super) fn boxed_void(&self, s: &Signature) -> Option<f64> {
+        self.boxed.get(s).copied()
+    }
+
+    /// Forget every region and void mark, keeping the refusals (final review minor 2 and 5, controller ruling 13): a
+    /// basis change (the regions live in the old basis's feature space) or a policy change of the check's tolerances
+    /// (the regions were cleared under the old ones). A refusal is a measured fact of the teacher (a failed check, a
+    /// failed audit) or the floor's, and stays for the session.
+    pub(super) fn clear_regions(&mut self) {
+        self.map.retain(|_, st| matches!(st, StrayState::Refused(_)));
+        self.boxed.clear();
+    }
+
     /// Forget every signature (a new model, a surface change, a reset).
     pub(super) fn clear(&mut self) {
         self.map.clear();
+        self.boxed.clear();
     }
 
     /// Every signature booked this session with its state (unordered).

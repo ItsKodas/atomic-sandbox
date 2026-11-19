@@ -15,6 +15,7 @@ pub(in crate::surrogate) fn part_answer(r: &ForceResult, energy: f64, h: f64) ->
         frontier: r.stats.frontier,
         partial: r.stats.partial.clone(),
         clean: clean_solve(!r.stats.warnings.is_empty(), r.stats.untrainable(), r.stats.face_density, h),
+        boxed: box_affected(r.stats.face_density, h),
     }
 }
 
@@ -31,7 +32,11 @@ pub(in crate::surrogate) fn part_answer(r: &ForceResult, energy: f64, h: f64) ->
 /// A whole sample's mask (`use_energy`: no other source of one) is **derived afresh** at `r_cut` (Task 5 fix round 1,
 /// M7): an atom no longer stray at this cutoff gets its force rows back, so a mask never outlives the cutoff it was a
 /// fact at. A reach change within a session must call this over the store before its refit (none exists yet: every
-/// basis has r_cut 6). A capped segment's own mask is only narrowed.
+/// basis has r_cut 6). A capped segment's own mask is only narrowed. **Nothing enforces that yet** (final review minor 6,
+/// parked for the long-reach branch, "Model reach 6/8/10"): that branch must re-mask the whole store and re-split the
+/// `Q_STRAY` codes at its new r_cut, and should hold it with a `debug_assert` in `fit_store` that every sample's mask is
+/// this function's at the basis r_cut. The stray-atom regions need no such step: a reach change is a basis change, which
+/// drops them (`stray` module doc).
 pub(in crate::surrogate) fn mask_stray_atoms(s: &mut Sample, r_cut: f64) {
     let n = s.pos.len();
     if s.use_energy {
@@ -111,7 +116,13 @@ pub(in crate::surrogate) enum StrayAudit {
 /// A check's solve is clean ([`PartAnswer::clean`]): no warning, trainable, its face density (if reported) within the
 /// box rule at grid spacing `h` (a NaN density is not within it).
 fn clean_solve(warned: bool, unfit: Option<&str>, face: Option<f64>, h: f64) -> bool {
-    !warned && unfit.is_none() && face.is_none_or(|rho| rho <= box_affected_face_density(h))
+    !warned && unfit.is_none() && !box_affected(face, h)
+}
+
+/// A solve's face density (if reported) is not within the box rule at grid spacing `h` ([`PartAnswer::boxed`]; a NaN
+/// density is not within it).
+fn box_affected(face: Option<f64>, h: f64) -> bool {
+    face.is_some_and(|rho| !(rho <= box_affected_face_density(h)))
 }
 
 /// The composition check in flight on the auditor (module doc, "The checks on the auditor"): the signature and split,
@@ -137,6 +148,9 @@ pub(in crate::surrogate) struct StrayCheck {
     pub attribution: Option<Attribution>,
     /// The scene's box (grid points per side): the stray atoms' box references are of it (ε_pos, ruling 9a's log).
     pub grid_n: usize,
+    /// Where the scene's stray atoms sit (Bohr; controller ruling 13): what a pass adds to the region's place, and the
+    /// face distance a box-affected void is marked at.
+    pub place: StrayPlace,
 }
 
 /// "H2 + H", "H2 + 2 H", "H2O + O": the bonded part's formula, then the stray atoms as separate atoms — a count and
@@ -213,7 +227,17 @@ impl SurrogateKs {
         if same {
             return false;
         }
-        self.stray_book.clear();
+        // a basis change under the same surface keeps the refusals (final review minor 2: a failed check or audit is a
+        // fact of the teacher, not of the basis); anything else (a new surface, no model) forgets the book
+        let basis_only = match (self.model.as_ref(), self.stray_key.as_ref()) {
+            (Some(m), Some((_, s))) => reference_settings_key(&m.provenance) == *s,
+            _ => false,
+        };
+        if basis_only {
+            self.stray_book.clear_regions();
+        } else {
+            self.stray_book.clear();
+        }
         let surface = self.model.as_ref().map(|m| reference_settings_key(&m.provenance));
         let attributing = self.stray_pending.as_ref().and_then(|p| p.attribution.as_ref()).is_some_and(|a| Some(&a.surface) == surface.as_ref());
         if !attributing {
@@ -300,7 +324,7 @@ impl SurrogateKs {
             "surrogate: stray atoms ({label}) — the audit of the model's answer failed ({why}): DFT answers this combination for the session and its samples stay out of the fit{}",
             if held > 0 { format!(" ({held} taken back out)") } else { String::new() }
         );
-        let ans = PartAnswer { energy: raw_energy, forces: forces.to_vec(), frontier: [Frontier::default(); 2], partial: Vec::new(), clean: true };
+        let ans = PartAnswer { energy: raw_energy, forces: forces.to_vec(), frontier: [Frontier::default(); 2], partial: Vec::new(), clean: true, boxed: false };
         let surface = self.model.as_ref().map_or_else(String::new, |m| reference_settings_key(&m.provenance));
         let a = Attribution { case: case.clone(), grid_n: prov.grid_n, gap, why, surface, fits: self.fits };
         let busy = self.stray_pending.as_ref().is_some_and(|p| p.attribution.is_some());
@@ -382,9 +406,12 @@ impl SurrogateKs {
 
     /// The model may answer this scene as "bonded part + free atoms" (parent module doc, "Answering inside a region";
     /// spec §4.4): it splits at the model's cutoff, every stray species is in the model's basis (rule 2, review M2), its
-    /// signature is `Cleared`, the floor still passes at these positions (a stray atom drifting within
-    /// [`STRAY_FACE_MARGIN`] of a face, a forced multiplicity, a shell fence since — the signature does not carry them)
-    /// and the region covers the bonded part's descriptors. The split, the region's worst energy residual and smallest
+    /// signature is `Cleared`, the model's per-species offsets are 0 (mean 0: the answer identity's premise; final
+    /// review minor 8 — a guard in every build, never only a `debug_assert`), the floor still passes at these positions
+    /// (a stray atom drifting within [`STRAY_FACE_MARGIN`] of a face, a forced multiplicity, a shell fence since — the
+    /// signature does not carry them) and the region covers the bonded part's descriptors **and** the stray atoms'
+    /// place (no nearer the bonded part or a face than a pass measured; controller ruling 13). The split, the region's
+    /// worst energy residual and smallest
     /// frontier margin (Ha) and its passing checks so far (the step note's numbers; fix round 1 M1); `None` otherwise.
     /// Read-only: a book built under another basis or surface than the model's
     /// covers nothing (it is cleared at the next `stray_book_current`, controller ruling B).
@@ -413,32 +440,45 @@ impl SurrogateKs {
         if model.basis != *basis || reference_settings_key(&model.provenance) != *key {
             return None;
         }
+        // the answer E = E_model(bonded) + Σ E_ref(Z_s) needs offset_s = −Σ_k c̃_{s,k} mean_k = 0: mean 0 (every fit and
+        // sidecar path writes it so); a model that does not have it falls back (minor 8)
+        if model.mean.iter().any(|&m| m != 0.0) {
+            return None;
+        }
+        // the stray atoms where the passes measured them (cheaper than the descriptors)
+        let place = StrayPlace::of(pos, &split, sim::Cell { n: prov.grid_n, h: prov.h }.half_extent());
+        if !place.within(&region.place()) {
+            return None;
+        }
         if self.stray_floor(pos, z, prov, &split).is_some() {
             return None;
         }
         let bz: Vec<u8> = split.bonded.iter().map(|&i| z[i]).collect();
         let species = model.basis.species_indices(&bz).ok()?;
-        let (units, thin) = (self.envelope.as_ref(), THIN_FRACTION * self.policy.max_descriptor_distance);
         let inside = match desc.filter(|d| d.len() == pos.len()) {
-            Some(d) => region.covers(&split.bonded.iter().map(|&i| &d[i]).collect::<Vec<_>>(), &species, units, thin),
-            None => self.bonded_descriptors(pos, z, &split).is_some_and(|(d, _)| region.covers(&d, &species, units, thin)),
+            Some(d) => region.covers(&split.bonded.iter().map(|&i| &d[i]).collect::<Vec<_>>(), &species, place),
+            None => self.bonded_descriptors(pos, z, &split).is_some_and(|(d, _)| region.covers(&d, &species, place)),
         };
         inside.then_some((split, *residual, *margin, *passes))
     }
 
-    /// Whether a cleared region of `sig` covers the bonded geometry of `pos` (module doc, "The hold-out").
-    pub(in crate::surrogate) fn stray_covered(&mut self, pos: &[[f64; 3]], z: &[u8], split: &Split, sig: &Signature) -> bool {
+    /// Whether a cleared region of `sig` covers the geometry `pos` solved at `prov` (module doc, "The hold-out"): its
+    /// bonded part, and its stray atoms' place in `prov`'s cell (controller ruling 13).
+    pub(in crate::surrogate) fn stray_covered(&mut self, pos: &[[f64; 3]], z: &[u8], split: &Split, sig: &Signature, prov: &Provenance) -> bool {
         self.stray_book_current();
         let Some(StrayState::Cleared { region, .. }) = self.stray_book.state(sig) else { return false };
-        let (units, thin) = (self.envelope.as_ref(), THIN_FRACTION * self.policy.max_descriptor_distance);
-        self.bonded_descriptors(pos, z, split).is_some_and(|(d, s)| region.covers(&d, &s, units, thin))
+        let place = StrayPlace::of(pos, split, sim::Cell { n: prov.grid_n, h: prov.h }.half_extent());
+        self.bonded_descriptors(pos, z, split).is_some_and(|(d, s)| region.covers(&d, &s, place))
     }
 
     /// Queues the composition check of `scene` (module doc, "The checks on the auditor"): `ans` is the scene's own
     /// fallback answer, `split` and `sig` its split and signature (the floor passed: the caller's), `kept` the store
     /// index of its kept sample. True when queued; false without a background auditor (controller ruling C), while
-    /// another check of this scene is in flight, for a refused signature, inside a cleared region, at a geometry that
-    /// would not count, or without a model to measure the geometry with.
+    /// another check of this scene is in flight, for a refused signature, inside a cleared region (its bonded part and
+    /// its stray atoms' place: a stray atom nearer the bonded part or a face than every pass is checked, the bonded
+    /// geometry covered or not; controller ruling 13), at a bonded geometry that would not count before the region
+    /// opens, with the stray atoms no farther from the faces than at a box-affected void of this signature (one void
+    /// per signature until they move away, ruling 13), or without a model to measure the geometry with.
     pub(in crate::surrogate) fn queue_stray_check(&mut self, scene: &Scene, ans: PartAnswer, split: Split, sig: Signature, kept: Option<usize>) -> bool {
         if self.auditor.is_none() {
             return false;
@@ -451,13 +491,16 @@ impl SurrogateKs {
         }
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
+        let place = StrayPlace::of(&pos, &split, scene.cell.half_extent());
+        if self.stray_book.boxed_void(&sig).is_some_and(|f| !(place.face > f)) {
+            return false;
+        }
         let Some((desc, species)) = self.bonded_descriptors(&pos, &z, &split) else { return false };
         let Some(units) = self.envelope.as_ref() else { return false };
-        let thin = THIN_FRACTION * self.policy.max_descriptor_distance;
         match self.stray_book.state(&sig) {
             Some(StrayState::Refused(_)) => return false,
-            Some(StrayState::Cleared { region, .. }) if region.covers(&desc, &species, Some(units), thin) => return false,
-            Some(StrayState::Checking { region, .. }) if !region.distinct(&desc, &species, units, thin) => return false,
+            Some(StrayState::Cleared { region, .. }) if region.covers(&desc, &species, place) => return false,
+            Some(StrayState::Checking { region, .. }) if !region.distinct(&desc, &species, units) => return false,
             _ => {}
         }
         self.enqueue_stray_check(scene, ans, split, sig, kept, None);
@@ -492,8 +535,9 @@ impl SurrogateKs {
         }
         let sample_key = kept.and_then(|i| self.store.as_ref().and_then(|st| st.samples.get(i)).map(sample_key));
         let atoms = vec![None; split.stray.len()];
+        let place = StrayPlace::of(&pos, &split, scene.cell.half_extent());
         self.stray_pending =
-            Some(StrayCheck { sig, split, scene: ans, frag: None, atoms, scene_gen: self.scene_gen, sample: kept.filter(|_| sample_key.is_some()), sample_key, pos, z, id, ms: 0.0, attribution, grid_n: prov.grid_n });
+            Some(StrayCheck { sig, split, scene: ans, frag: None, atoms, scene_gen: self.scene_gen, sample: kept.filter(|_| sample_key.is_some()), sample_key, pos, z, id, ms: 0.0, attribution, grid_n: prov.grid_n, place });
         self.pump_side_queue();
     }
 
@@ -535,7 +579,8 @@ impl SurrogateKs {
             }
         };
         let clean = clean_solve(solved.warned, solved.unfit, solved.face, ans.job.prov.h);
-        let part = PartAnswer { energy: solved.energy, forces: solved.forces, frontier: solved.frontier, partial: solved.partial, clean };
+        let boxed = box_affected(solved.face, ans.job.prov.h);
+        let part = PartAnswer { energy: solved.energy, forces: solved.forces, frontier: solved.frontier, partial: solved.partial, clean, boxed };
         p.ms += ans.ms;
         match ans.job.kind {
             JobKind::Fragment => p.frag = Some(part),
@@ -566,7 +611,7 @@ impl SurrogateKs {
 
     /// Judges a complete check, books its verdict and releases what it covers (module doc).
     fn judge_stray_check(&mut self, p: StrayCheck) {
-        let StrayCheck { sig, split, scene, frag, atoms, sample, sample_key: key, pos, z, ms, attribution, grid_n, .. } = p;
+        let StrayCheck { sig, split, scene, frag, atoms, sample, sample_key: key, pos, z, ms, attribution, grid_n, place, .. } = p;
         let frag = frag.expect("complete");
         let atoms: Vec<PartAnswer> = atoms.into_iter().map(|a| a.expect("complete")).collect();
         let label = signature_label(&sig);
@@ -593,10 +638,29 @@ impl SurrogateKs {
             ev
         };
         let (outcome, detail) = match verdict.clone() {
+            // a box-affected solve: no check can be clean this near a face, so none is queued again until the stray
+            // atoms are farther from the faces (controller ruling 13, I3: one void per signature, not one per fallback)
+            CheckVerdict::Void(why) if scene.boxed || frag.boxed || atoms.iter().any(|a| a.boxed) => {
+                self.stray_book.void_near_face(&sig, place.face);
+                (
+                    TeachOutcome::Discarded,
+                    format!(
+                        "surrogate: stray atoms ({label}) — composition check void ({why}; a solve's density on the box faces, the stray atoms {:.2} Bohr from a face); not counted, and no check is queued again until they are farther from the faces{eps}",
+                        place.face
+                    ),
+                )
+            }
             CheckVerdict::Void(why) => (TeachOutcome::Discarded, format!("surrogate: stray atoms ({label}) — composition check void ({why}); not counted, the next fallback checks again{eps}")),
             CheckVerdict::Fail(why) => {
                 self.stray_book.refuse(&sig, why.clone());
-                (TeachOutcome::StrayRefused, format!("surrogate: stray atoms ({label}) — composition fails: {why}; DFT answers this combination for the session and its samples stay out of the fit{eps}"))
+                // the samples its region released (and any other of it in the fit) go back out, as after a failed audit
+                // (final review minor 1; spec §4.3: after a refusal no cleared region covers them)
+                let held = self.hold_stray_signature(&sig);
+                if held > 0 {
+                    self.arm_stray_refit();
+                }
+                let back = if held > 0 { format!(" ({held} taken back out)") } else { String::new() };
+                (TeachOutcome::StrayRefused, format!("surrogate: stray atoms ({label}) — composition fails: {why}; DFT answers this combination for the session and its samples stay out of the fit{back}{eps}"))
             }
             CheckVerdict::Pass { residual, margin } => {
                 let measured = self.bonded_descriptors(&pos, &z, &split);
@@ -609,7 +673,7 @@ impl SurrogateKs {
                 let (basis, units) = (model.basis.clone(), units.clone());
                 let was_cleared = matches!(self.stray_book.state(&sig), Some(StrayState::Cleared { .. }));
                 let thin = THIN_FRACTION * self.policy.max_descriptor_distance;
-                self.stray_book.record(sig.clone(), verdict, &desc, &species, &basis, &units, thin);
+                self.stray_book.record(sig.clone(), verdict, &desc, &species, place, &basis, &units, thin);
                 // the check's own sample is measured (unless the signature was refused while it was in flight); a cleared
                 // signature releases every held sample its region covers
                 let mut released = 0;
@@ -773,8 +837,6 @@ impl SurrogateKs {
         self.stray_book_current();
         let Some(StrayState::Cleared { region, .. }) = self.stray_book.state(sig) else { return 0 };
         let region = region.clone();
-        let (units, thin) = (self.envelope.clone(), THIN_FRACTION * self.policy.max_descriptor_distance);
-        let units = units.as_ref();
         let Some(store) = self.store.as_ref() else { return 0 };
         let r_cut = self.cutoff();
         let mut release = Vec::new();
@@ -787,7 +849,9 @@ impl SurrogateKs {
             if Signature::new(&s.z, &sp, prov.charge, &prov) != *sig {
                 continue;
             }
-            if self.bonded_descriptors(&s.pos, &s.z, &sp).is_some_and(|(d, k)| region.covers(&d, &k, units, thin)) {
+            // the bonded part and the stray atoms' place in the sample's own cell (controller ruling 13)
+            let place = StrayPlace::of(&s.pos, &sp, sim::Cell { n: prov.grid_n, h: prov.h }.half_extent());
+            if self.bonded_descriptors(&s.pos, &s.z, &sp).is_some_and(|(d, k)| region.covers(&d, &k, place)) {
                 release.push(i);
             }
         }
@@ -813,7 +877,7 @@ impl SurrogateKs {
         match self.stray_split(pos, z, prov) {
             None => false,
             Some((_, _, Some(_))) => true,
-            Some((split, sig, None)) => !self.stray_covered(pos, z, &split, &sig),
+            Some((split, sig, None)) => !self.stray_covered(pos, z, &split, &sig, prov),
         }
     }
 

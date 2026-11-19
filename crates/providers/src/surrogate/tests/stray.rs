@@ -147,6 +147,7 @@ fn exact() -> (PartAnswer, PartAnswer, Vec<PartAnswer>, Split) {
         frontier: [Frontier { homo: Some(-0.37), lumo: Some(0.02), mu: None }, Frontier { homo: Some(-0.37), lumo: Some(0.02), mu: None }],
         partial: Vec::new(),
         clean: true,
+        boxed: false,
     };
     let atom = PartAnswer {
         energy: -0.479,
@@ -154,6 +155,7 @@ fn exact() -> (PartAnswer, PartAnswer, Vec<PartAnswer>, Split) {
         frontier: [Frontier { homo: Some(-0.27), lumo: Some(0.05), mu: None }, Frontier { homo: None, lumo: Some(-0.05), mu: None }],
         partial: Vec::new(),
         clean: true,
+        boxed: false,
     };
     let scene = PartAnswer {
         energy: frag.energy + atom.energy,
@@ -161,6 +163,7 @@ fn exact() -> (PartAnswer, PartAnswer, Vec<PartAnswer>, Split) {
         frontier: [Frontier { homo: Some(-0.27), lumo: Some(0.02), mu: None }, Frontier { homo: Some(-0.37), lumo: Some(-0.05), mu: None }],
         partial: Vec::new(),
         clean: true,
+        boxed: false,
     };
     (scene, frag, vec![atom], Split { bonded: vec![0, 1], stray: vec![2] })
 }
@@ -373,6 +376,9 @@ fn sig() -> Signature {
 
 const PASS: CheckVerdict = CheckVerdict::Pass { residual: 1e-4, margin: 0.29 };
 
+/// Where the pure tests' checks put the stray atom (Bohr): 8 from the bonded part, 5 from a face.
+const PLACE: StrayPlace = StrayPlace { reach: 8.0, face: 5.0 };
+
 fn thin() -> f64 {
     THIN_FRACTION * FallbackPolicy::default().max_descriptor_distance
 }
@@ -385,7 +391,7 @@ fn region_clears_after_three_distinct_passes() {
     for (k, r) in [1.35, 1.45, 1.55].into_iter().enumerate() {
         let (d, s) = h2_desc(&basis, r);
         let v = if k == 1 { CheckVerdict::Pass { residual: 3e-4, margin: 0.2 } } else { PASS };
-        book.record(sig(), v, &d, &s, &basis, &env, thin());
+        book.record(sig(), v, &d, &s, PLACE, &basis, &env, thin());
         match (k, book.state(&sig())) {
             (0 | 1, Some(StrayState::Checking { passes, .. })) => assert_eq!(*passes, k + 1),
             (2, Some(StrayState::Cleared { residual, margin, .. })) => {
@@ -399,7 +405,7 @@ fn region_clears_after_three_distinct_passes() {
     let (d, s) = h2_desc(&basis, 1.25);
     let Some(StrayState::Cleared { region, .. }) = book.state(&sig()) else { unreachable!() };
     assert!(!region.contains(&d, &s));
-    book.record(sig(), CheckVerdict::Pass { residual: 5e-4, margin: 0.25 }, &d, &s, &basis, &env, thin());
+    book.record(sig(), CheckVerdict::Pass { residual: 5e-4, margin: 0.25 }, &d, &s, PLACE, &basis, &env, thin());
     let Some(StrayState::Cleared { region, residual, margin, .. }) = book.state(&sig()) else { panic!() };
     assert!(region.contains(&d, &s));
     assert_eq!((*residual, *margin), (5e-4, 0.2));
@@ -416,33 +422,34 @@ fn passes_at_one_geometry_do_not_clear() {
     // the same bonded geometry three times (a check differing only in stray distance has the same bonded descriptors)
     let (d, s) = h2_desc(&basis, 1.45);
     for _ in 0..3 {
-        book.record(sig(), PASS, &d, &s, &basis, &env, thin());
+        book.record(sig(), PASS, &d, &s, PLACE, &basis, &env, thin());
     }
     assert!(matches!(book.state(&sig()), Some(StrayState::Checking { passes: 1, .. })), "{:?}", book.state(&sig()));
     // nor within the thinning radius of it
     let (near, _) = h2_desc(&basis, 1.451);
-    book.record(sig(), PASS, &near, &s, &basis, &env, thin());
+    book.record(sig(), PASS, &near, &s, PLACE, &basis, &env, thin());
     assert!(matches!(book.state(&sig()), Some(StrayState::Checking { passes: 1, .. })));
     // and a species the training never saw cannot be measured for distinctness: never counted
     let empty = Envelope::new(&basis);
     let (far, _) = h2_desc(&basis, 1.9);
-    book.record(sig(), PASS, &far, &s, &basis, &empty, thin());
+    book.record(sig(), PASS, &far, &s, PLACE, &basis, &empty, thin());
     assert!(matches!(book.state(&sig()), Some(StrayState::Checking { passes: 1, .. })));
     // a void changes nothing
     let (d2, _) = h2_desc(&basis, 1.55);
-    book.record(sig(), CheckVerdict::Void("x".into()), &d2, &s, &basis, &env, thin());
+    book.record(sig(), CheckVerdict::Void("x".into()), &d2, &s, PLACE, &basis, &env, thin());
     assert!(matches!(book.state(&sig()), Some(StrayState::Checking { passes: 1, .. })));
 }
 
 #[test]
 fn region_contains_its_points_and_not_beyond() {
     let basis = Basis::new(&[1, 8]);
+    let env = units(&basis);
     let mut region = Region::new(&basis);
     let (d0, s) = h2_desc(&basis, 1.45);
     assert!(!region.contains(&d0, &s), "an empty region contains nothing");
     for r in [1.35, 1.45, 1.55] {
         let (d, s) = h2_desc(&basis, r);
-        region.add(&d, &s);
+        region.add(&d, &s, &env, thin());
     }
     for r in [1.35, 1.45, 1.55] {
         let (d, s) = h2_desc(&basis, r);
@@ -455,10 +462,9 @@ fn region_contains_its_points_and_not_beyond() {
     // a species absent from the region: the O index with an H descriptor
     assert!(!region.contains(&d0, &[1, 1]));
     // the distinctness of a point from itself is 0
-    let env = units(&basis);
-    assert!(!region.distinct(&d0, &s, &env, thin()));
+    assert!(!region.distinct(&d0, &s, &env));
     let (far, _) = h2_desc(&basis, 1.9);
-    assert!(region.distinct(&far, &s, &env, thin()));
+    assert!(region.distinct(&far, &s, &env));
 }
 
 #[test]
@@ -467,21 +473,21 @@ fn one_fail_refuses_for_good() {
     let env = units(&basis);
     let mut book = StrayBook::default();
     let geoms: Vec<_> = [1.35, 1.45, 1.55, 1.25].iter().map(|&r| h2_desc(&basis, r)).collect();
-    book.record(sig(), PASS, &geoms[0].0, &geoms[0].1, &basis, &env, thin());
-    book.record(sig(), CheckVerdict::Fail("energy: 2.00 mHa".into()), &geoms[1].0, &geoms[1].1, &basis, &env, thin());
+    book.record(sig(), PASS, &geoms[0].0, &geoms[0].1, PLACE, &basis, &env, thin());
+    book.record(sig(), CheckVerdict::Fail("energy: 2.00 mHa".into()), &geoms[1].0, &geoms[1].1, PLACE, &basis, &env, thin());
     assert_eq!(book.state(&sig()).map(|s| matches!(s, StrayState::Refused(w) if w.contains("energy"))), Some(true));
     for (d, s) in &geoms {
-        book.record(sig(), PASS, d, s, &basis, &env, thin());
+        book.record(sig(), PASS, d, s, PLACE, &basis, &env, thin());
     }
     assert!(matches!(book.state(&sig()), Some(StrayState::Refused(_))), "passes after a fail do not count");
     // a cleared signature is refused by one fail too
     let mut other = sig();
     other.stray_z = vec![1, 1];
     for (d, s) in &geoms[..3] {
-        book.record(other.clone(), PASS, d, s, &basis, &env, thin());
+        book.record(other.clone(), PASS, d, s, PLACE, &basis, &env, thin());
     }
     assert!(matches!(book.state(&other), Some(StrayState::Cleared { .. })));
-    book.record(other.clone(), CheckVerdict::Fail("margin".into()), &geoms[3].0, &geoms[3].1, &basis, &env, thin());
+    book.record(other.clone(), CheckVerdict::Fail("margin".into()), &geoms[3].0, &geoms[3].1, PLACE, &basis, &env, thin());
     assert!(matches!(book.state(&other), Some(StrayState::Refused(_))));
     // a refusal by hand (the floor, a failed audit), on a signature never checked
     let mut third = sig();
@@ -558,18 +564,23 @@ fn cluster_levels(pos: &[[f64; 3]], z: &[u8], r_cut: f64) -> [Frontier; 2] {
 
 /// A composing teacher for the checks: [`SpeciesMorse`] (cut off smoothly at r_cut, so the energy splits exactly into
 /// the parts') with [`cluster_levels`], face density 0 and the automatic multiplicity (or the scene's). `offset` (Ha)
-/// is added whenever the scene has a stray atom — a composite error the parts alone never show (the spin or
-/// charge-transfer case the check exists for). `open` gates the answer (the auditor's instance), `calls` counts solves.
+/// is added whenever the scene has a stray atom within `offset_near` (Bohr) of a bonded atom — a composite error the
+/// parts alone never show (the spin or charge-transfer case the check exists for; an induction-like term that grows as
+/// the stray atom comes nearer, final review I1, when `offset_near` is finite). `boxed_within` (Bohr): every solve with
+/// an atom nearer than this to a face reports a face density 10× the box rule (box-affected; final review I3), 0 never.
+/// `open` gates the answer (the auditor's instance), `calls` counts solves.
 #[derive(Clone)]
 struct Composing {
     offset: f64,
+    offset_near: f64,
+    boxed_within: f64,
     open: Arc<AtomicBool>,
     calls: Arc<AtomicUsize>,
 }
 
 impl Composing {
     fn new(offset: f64) -> Composing {
-        Composing { offset, open: Arc::new(AtomicBool::new(true)), calls: Arc::new(AtomicUsize::new(0)) }
+        Composing { offset, offset_near: f64::INFINITY, boxed_within: 0.0, open: Arc::new(AtomicBool::new(true)), calls: Arc::new(AtomicUsize::new(0)) }
     }
 }
 
@@ -586,13 +597,19 @@ impl ForceProvider for Composing {
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
         let r_cut = Basis::new(&[1]).r_cut;
         let (mut energy, forces) = SpeciesMorse::energy_and_forces(&pos, &z);
-        if split(&pos, r_cut).is_some() {
-            energy += self.offset;
+        if let Some(sp) = split(&pos, r_cut) {
+            let d = |a: [f64; 3], b: [f64; 3]| (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>().sqrt();
+            let reach = sp.stray.iter().flat_map(|&i| sp.bonded.iter().map(move |&j| (i, j))).map(|(i, j)| d(pos[i], pos[j])).fold(f64::INFINITY, f64::min);
+            if reach < self.offset_near {
+                energy += self.offset;
+            }
         }
         let electrons = z.iter().map(|&x| x as i64).sum::<i64>() - scene.charge as i64;
         let mut stats = EvalStats::default();
         stats.energy.total = energy;
-        stats.face_density = Some(0.0);
+        let half = scene.cell.half_extent();
+        let face = pos.iter().map(|p| half - p.iter().fold(0.0f64, |m, x| m.max(x.abs()))).fold(f64::INFINITY, f64::min);
+        stats.face_density = Some(if face < self.boxed_within { 10.0 * box_affected_face_density(scene.cell.h) } else { 0.0 });
         stats.multiplicity = Some(scene.multiplicity.unwrap_or((electrons.rem_euclid(2) + 1) as u32));
         stats.frontier = cluster_levels(&pos, &z, r_cut);
         Ok(ForceResult { energy, forces, stats, display: None, orbitals: None })
@@ -617,7 +634,12 @@ fn exact_sample(sc: &Scene) -> Sample {
 /// cell, refitted; with a background auditor (a second instance, gated by the returned flag; its solve count) when
 /// `auditor`. No audits (`audit_every` 0): every step of these tests is a fallback.
 fn student(offset: f64, ranges: &[(f64, f64)], n: usize, auditor: bool) -> (SurrogateKs, Arc<AtomicBool>, Arc<AtomicUsize>) {
-    let mut s = SurrogateKs::new(Box::new(Composing::new(offset)), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    student_of(&Composing::new(offset), ranges, n, auditor)
+}
+
+/// [`student`] of the teacher `c` (its offset, `offset_near` and `boxed_within`; the teacher and the auditor alike).
+fn student_of(c: &Composing, ranges: &[(f64, f64)], n: usize, auditor: bool) -> (SurrogateKs, Arc<AtomicBool>, Arc<AtomicUsize>) {
+    let mut s = SurrogateKs::new(Box::new(c.clone()), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
     s.set_reference_energy(1, SpeciesMorse::atom(1));
     let mut rng = StdRng::seed_from_u64(0x57a);
     for &(lo, hi) in ranges {
@@ -633,7 +655,7 @@ fn student(offset: f64, ranges: &[(f64, f64)], n: usize, auditor: bool) -> (Surr
     let gate = Arc::new(AtomicBool::new(true));
     let calls = Arc::new(AtomicUsize::new(0));
     if auditor {
-        s = s.with_auditor(Box::new(Composing { offset, open: gate.clone(), calls: calls.clone() }));
+        s = s.with_auditor(Box::new(Composing { open: gate.clone(), calls: calls.clone(), ..c.clone() }));
     }
     (s, gate, calls)
 }
@@ -674,10 +696,10 @@ fn assert_distinct(s: &mut SurrogateKs, rs: &[f64]) {
     for (a, &ra) in rs.iter().enumerate() {
         let mut region = Region::new(&basis);
         let (d, sp) = h2_desc(&basis, ra);
-        region.add(&d, &sp);
+        region.add(&d, &sp, &units, thin);
         for &rb in &rs[a + 1..] {
             let (d, sp) = h2_desc(&basis, rb);
-            assert!(region.distinct(&d, &sp, &units, thin), "the premise: H–H {ra} and {rb} are distinct geometries");
+            assert!(region.distinct(&d, &sp, &units), "the premise: H–H {ra} and {rb} are distinct geometries");
         }
         let h2 = big(dimer(ra, [1.0, 0.0, 0.0], H2_AT, 1, 1));
         let d = s.nearest_stored(&positions(&h2), &zs(&h2));
@@ -955,6 +977,11 @@ fn the_book_is_cleared_with_the_models_basis() {
     // the file of this model, for the install below (its stray samples were released, code 0)
     let path = std::env::temp_dir().join(format!("stray-book-{}.model", std::process::id()));
     s.save_sidecar(&path).unwrap();
+    // final review minor 2 (ruling 13): a refusal is a fact of the teacher, not of the basis — it survives the basis
+    // change below (only the regions, in the old basis's feature space, are dropped)
+    let mut other = sig.clone();
+    other.stray_z = vec![1, 1];
+    s.stray_book.refuse(&other, "test".into());
     // another basis: a He sample makes the next refit's species H, He
     s.set_reference_energy(2, SpeciesMorse::atom(2));
     let he = {
@@ -968,6 +995,7 @@ fn the_book_is_cleared_with_the_models_basis() {
     let codes = s.quarantine.clone();
     assert!(s.stray_book_current(), "another basis clears the book");
     assert!(s.stray_book.state(&sig).is_none());
+    assert!(matches!(s.stray_book.state(&other), Some(StrayState::Refused(w)) if w == "test"), "a refusal survives a basis change: {:?}", s.stray_book.state(&other));
     assert_eq!(s.quarantine, codes, "nothing released or held anew");
     // a Forget clears it
     s.stray_book.refuse(&sig, "test".into());
@@ -1058,7 +1086,9 @@ fn clear_by_hand(s: &mut SurrogateKs, sig: &Signature) {
     let thin = THIN_FRACTION * s.policy().max_descriptor_distance;
     for &r in &CHECKS {
         let (d, sp) = h2_desc(&basis, r);
-        s.stray_book.record(sig.clone(), CheckVerdict::Pass { residual: 0.0, margin: 0.32 }, &d, &sp, &basis, &units, thin);
+        let sc = h2_with(r, &[STRAY_AT]);
+        let place = StrayPlace::of(&positions(&sc), &Split { bonded: vec![0, 1], stray: vec![2] }, sc.cell.half_extent());
+        s.stray_book.record(sig.clone(), CheckVerdict::Pass { residual: 0.0, margin: 0.32 }, &d, &sp, place, &basis, &units, thin);
     }
     assert!(matches!(s.stray_book.state(sig), Some(StrayState::Cleared { .. })));
 }
@@ -1266,7 +1296,12 @@ fn covers(s: &SurrogateKs, sig: &Signature, r: f64) -> bool {
 /// training data: it must pass rules 5b–5e on its own), its events drained; the book survives the refit (same basis),
 /// and its region covers [`INSIDE`] and not [`OUTSIDE`] (asserted).
 fn cleared_student() -> (SurrogateKs, Signature) {
-    let (mut s, _, _) = student(0.0, &TRAINED, 40, true);
+    cleared_student_of(&Composing::new(0.0))
+}
+
+/// [`cleared_student`] of the teacher `c` (its checks at [`STRAY_AT`] must pass: no offset there, not box-affected).
+fn cleared_student_of(c: &Composing) -> (SurrogateKs, Signature) {
+    let (mut s, _, _) = student_of(c, &TRAINED, 40, true);
     assert_distinct(&mut s, &CHECKS);
     let sig = sig_of(&s, &h2_with(CHECKS[0], &[STRAY_AT]));
     for &r in &CHECKS {
@@ -1385,9 +1420,11 @@ fn outside_the_region_falls_back_and_checks() {
 /// a face (rule 5a refuses, the stray atom not exempt) the variance refuses on rule 7 too.
 #[test]
 fn rule7_uses_n_bonded() {
-    let (mut s, _) = cleared_student();
+    let (mut s, sig) = cleared_student();
     let p = *s.policy();
     s.set_policy(FallbackPolicy { energy_std_per_atom: 5e-4, force_std_abs: 1e-2, ..p });
+    // a policy change drops the region (final review minor 5): its three checks booked again under the new tiers
+    clear_by_hand(&mut s, &sig);
     assert!(s.trusted(), "the premise: {:?}", s.untrusted_reason());
     let sc = h2_with(INSIDE, &[STRAY_AT]);
     let (pos, z) = (positions(&sc), zs(&sc));
@@ -1431,7 +1468,8 @@ fn rule7_uses_n_bonded() {
     let near_face = h2_with(INSIDE, &[[0.0, 6.5, 0.0]]);
     assert_eq!(judged_step(&mut s, &near_face).stats.source, Source::Fallback);
     assert!(s.last_variance.as_ref().is_some_and(|v| !v.accept), "rule 7 per energy-row atom refuses there too");
-    let back = h2_with(INSIDE, &[[0.0, 5.9, 0.0]]);
+    // (back where the checks measured it: 5 Bohr from the face, 8.05 from the nearer H₂ atom — ruling 13's place)
+    let back = h2_with(INSIDE, &[[0.0, 5.0, 0.5]]);
     let r = judged_step(&mut s, &back);
     assert!(r.stats.notes.iter().any(|n| n.contains("epistemic energy std 6.25e-4")), "judged afresh per bonded atom: {:?}", r.stats.notes);
 }
@@ -1470,7 +1508,15 @@ impl ForceProvider for Shifted {
 /// way in's fallbacks.
 #[test]
 fn reentry_and_exit_book_every_switch() {
-    let (mut s, _) = cleared_student();
+    let (mut s, sig) = cleared_student();
+    // since ruling 13 the region reaches the stray atom no nearer than its passes: a check at the path's nearest stray
+    // point (6 Bohr from H₂'s centre, 6.04 from its atoms) extends it there before the run
+    let edge = h2_with(INSIDE, &[[H2_AT[0], H2_AT[1] + R_CUT, H2_AT[2]]]);
+    let r = judged_step(&mut s, &edge);
+    assert!(r.stats.source == Source::Fallback && queued(&r), "{:?}", r.stats.notes);
+    settle(&mut s);
+    assert!(matches!(s.stray_book.state(&sig), Some(StrayState::Cleared { region, .. }) if (region.place().reach - (0.49f64 + 36.0).sqrt()).abs() < 1e-9));
+    s.refit().unwrap();
     s.teacher = Box::new(Shifted { inner: Composing::new(0.0), shift: 1e-2 });
     let mut path: Vec<f64> = (0..=24).map(|k| 8.0 - 0.125 * k as f64).collect();
     path.extend((1..=24).map(|k| 5.0 + 0.125 * k as f64));
@@ -1519,12 +1565,17 @@ fn reentry_and_exit_book_every_switch() {
 
 /// Review Focus 3: a stray atom drifting toward a face during a cleared run falls back as soon as it is within the
 /// floor's 4 Bohr of a face — the floor is re-checked at every step, the reason shown in the step's notes — and the
-/// model answers again once it is back.
+/// model answers again once it is back. (Since ruling 13 the region itself reaches no nearer a face than its passes:
+/// a check at 4.1 Bohr from the face extends it there first.)
 #[test]
 fn a_stray_near_a_face_falls_back_inside_a_cleared_region() {
-    let (mut s, _) = cleared_student();
+    let (mut s, sig) = cleared_student();
     // the 81³ cell's half-extent is 10 Bohr: at y = 5.9 the stray H is 4.1 Bohr from a face, at 6.5 3.5 Bohr
-    // every step is a switch of surface (the clearance's last step was a fallback), each booked (fix round 1 M3)
+    let r = judged_step(&mut s, &h2_with(INSIDE, &[[0.0, 5.9, 0.0]]));
+    assert!(r.stats.source == Source::Fallback && queued(&r), "nearer a face than the checks: a check first: {:?}", r.stats.notes);
+    settle(&mut s);
+    assert!(matches!(s.stray_book.state(&sig), Some(StrayState::Cleared { region, .. }) if (region.place().face - 4.1).abs() < 1e-9));
+    // every step is a switch of surface (the last step was a fallback), each booked (fix round 1 M3)
     for (y, model) in [(5.9, true), (6.5, false), (5.9, true)] {
         let sc = h2_with(INSIDE, &[[0.0, y, 0.0]]);
         let r = judged_step(&mut s, &sc);
@@ -1966,9 +2017,11 @@ fn an_unattributable_stray_audit_counts_against_the_model() {
 /// teacher shifted 1.25 mHa: 0.42 mHa per scene atom, 0.62 mHa per bonded atom.
 #[test]
 fn over_tier_uses_n_bonded() {
-    let (mut s, _) = cleared_student();
+    let (mut s, sig) = cleared_student();
     let p = *s.policy();
     s.set_policy(FallbackPolicy { energy_std_per_atom: 5e-4, force_std_abs: 1e-2, ..p });
+    // a policy change drops the region (final review minor 5): its three checks booked again under the new tiers
+    clear_by_hand(&mut s, &sig);
     let sc = h2_with(INSIDE, &[STRAY_AT]);
     let (pos, z) = (positions(&sc), zs(&sc));
     let m = s.model().unwrap();
@@ -2548,6 +2601,11 @@ fn a_far_level_mismatch_passes_and_an_in_window_one_fails() {
 /// check, in the distinctness metric — so every geometry of a measurable species is covered or distinct (checkable).
 /// The real teacher's checks (H–H 1.434, 1.15, 1.75 Bohr) under the default H basis: 1.435 lies outside the box (1.434
 /// sits at b2[n=6]'s maximum) yet within the radius of the 1.434 check — covered, not distinct.
+///
+/// Final review I2(a) (ruling 13): the covered bond interval about each check, printed and asserted, with the
+/// stretched check at 2.5 Bohr added (the GPU clears test's fourth check). The frontier margin σu − 1s falls from
+/// 181 mHa at 2.5 to 136.9 at 3.0, under the 138 mHa floor (`references.md`, "Stray atoms"): the 2.5 check's reach must
+/// stop short of 3.0. Units: an H₂ training envelope over 1.0–2.5 Bohr, frozen at each check.
 #[test]
 fn the_region_covers_the_thinning_radius_of_its_checks() {
     let basis = Basis::new(&[1]);
@@ -2561,21 +2619,20 @@ fn the_region_covers_the_thinning_radius_of_its_checks() {
     let mut region = Region::new(&basis);
     for r in [1.434, 1.15, 1.75] {
         let (d, s) = h2_desc(&basis, r);
-        region.add(&d, &s);
+        region.add(&d, &s, &env, thin());
     }
     let (d, s) = h2_desc(&basis, 1.435);
     assert!(!region.contains(&d, &s), "the premise: 1.435 leaves the box (the dead zone)");
-    assert!(region.near(&d, &s, &env, thin()) && region.covers(&d, &s, Some(&env), thin()), "within the radius: covered");
-    assert!(!region.distinct(&d, &s, &env, thin()), "…and not checkable");
-    assert!(!region.covers(&d, &s, None, thin()), "without the units, the box alone");
+    assert!(region.near(&d, &s) && region.covers_bonded(&d, &s), "within the radius: covered");
+    assert!(!region.distinct(&d, &s, &env), "…and not checkable");
     // covered ∪ distinct is everything, and the two never overlap outside the box
     let mut beyond = None;
     for k in 0..=200 {
         let r = 0.9 + 0.01 * k as f64;
         let (d, s) = h2_desc(&basis, r);
-        let (covered, distinct) = (region.covers(&d, &s, Some(&env), thin()), region.distinct(&d, &s, &env, thin()));
+        let (covered, distinct) = (region.covers_bonded(&d, &s), region.distinct(&d, &s, &env));
         assert!(covered || distinct, "r = {r}: neither covered nor checkable");
-        assert!(!(distinct && region.near(&d, &s, &env, thin())), "r = {r}");
+        assert!(!(distinct && region.near(&d, &s)), "r = {r}");
         if !covered && beyond.is_none() && r > 1.75 {
             beyond = Some(r);
         }
@@ -2583,10 +2640,85 @@ fn the_region_covers_the_thinning_radius_of_its_checks() {
     // a geometry beyond both is not covered and is distinct: it falls back and queues a check
     let r = beyond.expect("a stretched bond beyond the box and the radius");
     let (d, s) = h2_desc(&basis, r);
-    assert!(!region.covers(&d, &s, Some(&env), thin()) && region.distinct(&d, &s, &env, thin()), "r = {r}");
-    // a species the units never saw is neither near nor covered by the radius
+    assert!(!region.covers_bonded(&d, &s) && region.distinct(&d, &s, &env), "r = {r}");
+    // a species the units never saw is never measurable (not distinct), and nothing near it
     let empty = Envelope::new(&basis);
-    assert!(!region.near(&d, &s, &empty, thin()));
+    assert!(!region.distinct(&d, &s, &empty));
+    // the covered interval about each check (steps of 1e-3 Bohr outward until a bond is not covered; the box and the
+    // radius together): the three checks, then with the stretched check
+    let intervals = |region: &Region, checks: &[f64]| {
+        let covered = |r: f64| {
+            let (d, s) = h2_desc(&basis, r);
+            region.covers_bonded(&d, &s)
+        };
+        let edge = |c: f64, dir: f64| (1..=3000).map(|k| c + dir * 1e-3 * k as f64).take_while(|&r| covered(r)).last().unwrap_or(c);
+        let mut lines = Vec::new();
+        for &c in checks {
+            let (lo, hi) = (edge(c, -1.0), edge(c, 1.0));
+            lines.push(format!("check {c}: covered {lo:.3}–{hi:.3} Bohr (−{:.3} / +{:.3})", c - lo, hi - c));
+            assert!(lo <= c && c <= hi && hi - lo < 1.0, "{}", lines.last().unwrap());
+        }
+        lines.join("; ")
+    };
+    println!("the covered bond intervals, 3 checks (default H basis, units H₂ 1.0–2.5): {}", intervals(&region, &[1.15, 1.434, 1.75]));
+    let (d, s) = h2_desc(&basis, 2.5);
+    region.add(&d, &s, &env, thin());
+    println!("the covered bond intervals, with the 2.5 check: {}", intervals(&region, &[1.15, 1.434, 1.75, 2.5]));
+    let covered = |r: f64| {
+        let (d, s) = h2_desc(&basis, r);
+        region.covers_bonded(&d, &s)
+    };
+    let edge = |c: f64, dir: f64| (1..=3000).map(|k| c + dir * 1e-3 * k as f64).take_while(|&r| covered(r)).last().unwrap_or(c);
+    let stretched_hi = edge(2.5, 1.0);
+    assert!(stretched_hi < 3.0, "the 2.5 Bohr check's reach stops short of 3.0, where the margin crosses the floor: {stretched_hi}");
+    assert!(!covered(3.0), "3.0 Bohr is not covered");
+}
+
+/// Ruling 13 (final review I1, I3): a region covers a geometry only with its stray atoms where the passes measured
+/// them — no nearer the bonded part than the nearest pass, no nearer a face — the bonded geometry covered or not, with
+/// no slack; a pass at a nearer place extends it in the Checking state too (it counts nothing towards K), and an empty
+/// region covers nothing.
+#[test]
+fn a_region_covers_the_stray_atoms_only_where_its_passes_put_them() {
+    let basis = Basis::new(&[1, 8]);
+    let env = units(&basis);
+    let mut book = StrayBook::default();
+    let places = [StrayPlace { reach: 8.5, face: 6.0 }, StrayPlace { reach: 8.0, face: 5.5 }, StrayPlace { reach: 9.0, face: 5.2 }];
+    for (r, p) in [1.35, 1.45, 1.55].into_iter().zip(places) {
+        let (d, s) = h2_desc(&basis, r);
+        book.record(sig(), PASS, &d, &s, p, &basis, &env, thin());
+    }
+    let Some(StrayState::Cleared { region, .. }) = book.state(&sig()) else { panic!("{:?}", book.state(&sig())) };
+    assert_eq!(region.place(), StrayPlace { reach: 8.0, face: 5.2 }, "the smallest of the passes'");
+    let (d, s) = h2_desc(&basis, 1.45);
+    for (p, want) in [
+        (StrayPlace { reach: 8.0, face: 5.2 }, true),
+        (StrayPlace { reach: 20.0, face: 9.0 }, true),
+        (StrayPlace { reach: 7.999, face: 6.0 }, false),
+        (StrayPlace { reach: 9.0, face: 5.199 }, false),
+        (StrayPlace { reach: f64::NAN, face: 6.0 }, false),
+    ] {
+        assert_eq!(region.covers(&d, &s, p), want, "{p:?}");
+    }
+    // a pass differing only in where the stray atom sits extends the place (an open region)
+    book.record(sig(), PASS, &d, &s, StrayPlace { reach: 7.0, face: 5.2 }, &basis, &env, thin());
+    let Some(StrayState::Cleared { region, .. }) = book.state(&sig()) else { panic!() };
+    assert!(region.covers(&d, &s, StrayPlace { reach: 7.0, face: 5.2 }));
+    // in the Checking state too, while counting nothing towards K
+    let mut other = sig();
+    other.charge = -1;
+    let (d0, s0) = h2_desc(&basis, 1.35);
+    book.record(other.clone(), PASS, &d0, &s0, PLACE, &basis, &env, thin());
+    book.record(other.clone(), PASS, &d0, &s0, StrayPlace { reach: 6.5, face: 4.5 }, &basis, &env, thin());
+    let Some(StrayState::Checking { passes: 1, region, .. }) = book.state(&other) else { panic!("{:?}", book.state(&other)) };
+    assert_eq!(region.place(), StrayPlace { reach: 6.5, face: 4.5 });
+    // an empty region covers nothing, wherever the stray atoms sit
+    let empty = Region::new(&basis);
+    assert!(!empty.covers(&d, &s, StrayPlace { reach: f64::INFINITY, face: f64::INFINITY }));
+    // the place of a scene: the nearest stray–bonded pair and the stray atom nearest a face (half-extent 10)
+    let pos = [[0.0, -3.0, 0.0], [1.4, -3.0, 0.0], [0.0, 5.0, 0.0], [-6.0, 2.0, -8.5]];
+    let p = StrayPlace::of(&pos, &Split { bonded: vec![0, 1], stray: vec![2, 3] }, 10.0);
+    assert!((p.reach - 8.0).abs() < 1e-12 && (p.face - 1.5).abs() < 1e-12, "{p:?}");
 }
 
 /// Ruling 12 through the provider: after the three checks clear H₂ + H, a step at a bond within the thinning radius of
@@ -2595,7 +2727,6 @@ fn the_region_covers_the_thinning_radius_of_its_checks() {
 fn a_step_near_a_check_is_answered_and_one_beyond_queues_a_check() {
     let (mut s, sig) = cleared_student();
     let Some(StrayState::Cleared { region, .. }) = s.stray_book.state(&sig).cloned() else { panic!("cleared: {:?}", s.stray_book.state(&sig)) };
-    let units = s.envelope().unwrap().clone();
     let split = Split { bonded: vec![0, 1], stray: vec![2] };
     let desc = |s: &SurrogateKs, r: f64| {
         let sc = h2_with(r, &[STRAY_AT]);
@@ -2605,11 +2736,11 @@ fn a_step_near_a_check_is_answered_and_one_beyond_queues_a_check() {
     // both
     let near = (1..=2000).map(|k| CHECKS[2] + 1e-4 * k as f64).find(|&r| {
         let (d, sp) = desc(&s, r);
-        !region.contains(&d, &sp) && region.near(&d, &sp, &units, thin())
+        !region.contains(&d, &sp) && region.near(&d, &sp)
     });
     let beyond = (1..=2000).map(|k| CHECKS[2] + 1e-3 * k as f64).find(|&r| {
         let (d, sp) = desc(&s, r);
-        !region.covers(&d, &sp, Some(&units), thin())
+        !region.covers_bonded(&d, &sp)
     });
     let (near, beyond) = (near.expect("the premise: a dead-zone bond near the 1.55 check"), beyond.expect("a bond beyond both"));
     let _ = s.take_events();
@@ -2621,4 +2752,193 @@ fn a_step_near_a_check_is_answered_and_one_beyond_queues_a_check() {
     let r = s.evaluate(&h2_with(beyond, &[STRAY_AT]), &mut never()).unwrap();
     assert_eq!(r.stats.source, Source::Fallback, "H–H {beyond}");
     assert!(r.stats.notes.iter().any(|n| n.contains("composition check") && n.contains("queued")), "H–H {beyond}: {:?}", r.stats.notes);
+}
+
+// ---- the final review's fix round (controller ruling 13): where the stray atoms sit, the frozen radius, minors ----
+
+/// Whether the step at `sc` would be answered as a cleared stray-atom scene (`stray_cleared`: the book, the floor, the
+/// region with the stray atoms' place).
+fn cleared_at(s: &SurrogateKs, sc: &Scene) -> bool {
+    s.stray_cleared(&positions(sc), &zs(sc), &s.provenance_for(sc)).is_some()
+}
+
+/// The step queued a composition check (its note; a void's words "no check is queued again" are not one).
+fn queued(r: &ForceResult) -> bool {
+    r.stats.notes.iter().any(|n| n.contains("a composition check (the bonded part alone, each stray atom alone) is queued"))
+}
+
+/// Final review I1 (ruling 13): the region covers the stray atoms only as near the bonded part as a passed check put
+/// them. The checks' stray H ([`STRAY_AT`]) is 8.03 Bohr from the nearer H₂ atom; at y = 4 it is 7.03 Bohr away (and
+/// 6 Bohr from a face, farther than the checks' 5): the bonded geometry is covered, the stray atom is not — the step
+/// falls back on rule 5a, its sample is held, and a check is queued even though the bonded geometry is inside the
+/// region. Its pass lowers the region's reach to 7.03: the step there is then the model's, one nearer still is not.
+#[test]
+fn a_stray_atom_nearer_than_every_check_falls_back_and_checks() {
+    let (mut s, sig) = cleared_student();
+    let near = h2_with(INSIDE, &[[0.0, 4.0, 0.0]]);
+    assert!(cleared_at(&s, &h2_with(INSIDE, &[STRAY_AT])), "the premise: the bonded geometry is covered");
+    assert!(!cleared_at(&s, &near), "a stray atom nearer than every check is not covered");
+    // its sample is held out of the fit (the same rule)
+    let (pos, z) = (positions(&near), zs(&near));
+    let (e, f) = SpeciesMorse::energy_and_forces(&pos, &z);
+    let mut notes = Vec::new();
+    let prov = s.provenance_for(&near);
+    assert!(s.keep_sample(&pos, &z, e, &f, Some(0.0), Some(2), &prov, SampleTag::Fallback, &mut notes), "{notes:?}");
+    let held = s.samples() - 1;
+    assert_eq!(s.quarantine[held], Q_STRAY, "held: {notes:?}");
+    let r = judged_step(&mut s, &near);
+    assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.contains("isolated atom — atom 2")), "{:?}", r.stats.notes);
+    assert!(queued(&r), "a check is queued although the bonded geometry is covered: {:?}", r.stats.notes);
+    settle(&mut s);
+    let ev = s.take_events();
+    assert!(ev.iter().any(|e| e.outcome == TeachOutcome::StrayCheckingNew), "{ev:?}");
+    let Some(StrayState::Cleared { region, .. }) = s.stray_book.state(&sig) else { panic!("{:?}", s.stray_book.state(&sig)) };
+    let reach = region.place().reach;
+    println!("the region's reach after the nearer pass: {reach:.4} Bohr (the face distance {:.2})", region.place().face);
+    assert!((reach - (0.49f64 + 49.0).sqrt()).abs() < 1e-9, "the nearest stray–bonded distance of the passes: {reach}");
+    assert_eq!(s.quarantine[held], Q_NONE, "the held sample is released by the region that now reaches it");
+    assert_eq!(judged_step(&mut s, &near).stats.source, Source::Surrogate);
+    let nearer = h2_with(INSIDE, &[[0.0, 3.9, 0.0]]);
+    assert_eq!(judged_step(&mut s, &nearer).stats.source, Source::Fallback, "nearer still: not measured");
+}
+
+/// Final review I3 (ruling 13): the region covers a stray atom only as near a face as a passed check put one, and a
+/// check voided by a box-affected solve is not queued again until the stray atom is farther from the faces than at
+/// that void. The teacher here is box-affected within 4.5 Bohr of a face; the checks' stray H sits 5 Bohr from one.
+#[test]
+fn a_stray_atom_nearer_a_face_than_every_check_falls_back_and_a_boxed_void_waits() {
+    let mut c = Composing::new(0.0);
+    c.boxed_within = 4.5;
+    let (mut s, sig) = cleared_student_of(&c);
+    let at = |y: f64| h2_with(INSIDE, &[[0.0, y, 0.0]]);
+    // 4.4 Bohr from a face: the floor (4) passes, no check measured it
+    assert!(!cleared_at(&s, &at(5.6)), "nearer a face than every check: not covered");
+    let r = judged_step(&mut s, &at(5.6));
+    assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+    assert!(queued(&r), "{:?}", r.stats.notes);
+    settle(&mut s);
+    let ev = s.take_events();
+    let void = ev.iter().find(|e| e.outcome == TeachOutcome::Discarded).unwrap_or_else(|| panic!("a void check: {ev:?}"));
+    assert!(void.detail.contains("composition check void") && void.detail.contains("4.40 Bohr"), "{}", void.detail);
+    // the same place and nearer the face: no check (one void per signature until the stray atom moves away)
+    for y in [5.6, 5.7] {
+        let r = judged_step(&mut s, &at(y));
+        assert_eq!(r.stats.source, Source::Fallback);
+        assert!(!queued(&r) && s.stray_pending.is_none() && s.side_queue.is_empty(), "y = {y}: {:?}", r.stats.notes);
+    }
+    // farther from the face than the void: checked again — 4.5 Bohr from a face is clean here, so it passes
+    let r = judged_step(&mut s, &at(5.5));
+    assert!(queued(&r), "{:?}", r.stats.notes);
+    settle(&mut s);
+    assert!(s.take_events().iter().any(|e| e.outcome == TeachOutcome::StrayCheckingNew));
+    let Some(StrayState::Cleared { region, .. }) = s.stray_book.state(&sig) else { panic!() };
+    assert!((region.place().face - 4.5).abs() < 1e-9, "{:?}", region.place());
+    assert_eq!(judged_step(&mut s, &at(5.5)).stats.source, Source::Surrogate);
+}
+
+/// Final review minor 1 (ruling 13): a failed check takes back every sample of its signature in the fit — the ones its
+/// region released included — as a failed audit does (spec §4.3: after a refusal no region covers them). The teacher's
+/// composite offset (5 mHa) applies only with a stray atom within 7.5 Bohr of the bonded part, so the checks at 8.03
+/// clear and a check with the stray H 7.03 Bohr away fails.
+#[test]
+fn a_failed_check_takes_back_what_its_region_released() {
+    let mut c = Composing::new(5e-3);
+    c.offset_near = 7.5;
+    let (mut s, sig) = cleared_student_of(&c);
+    let released: Vec<usize> = (0..s.samples()).filter(|&i| s.store().unwrap().samples[i].pos.len() == 3).collect();
+    assert_eq!(released.len(), 3, "the premise: the checks' samples");
+    assert!(released.iter().all(|&i| s.quarantine[i] == Q_NONE), "the premise: in the fit");
+    let r = judged_step(&mut s, &h2_with(OUTSIDE, &[[0.0, 4.0, 0.0]]));
+    assert!(queued(&r), "{:?}", r.stats.notes);
+    settle(&mut s);
+    assert!(matches!(s.stray_book.state(&sig), Some(StrayState::Refused(w)) if w.starts_with("energy")), "{:?}", s.stray_book.state(&sig));
+    let ev = s.take_events();
+    let refused = ev.iter().find(|e| e.outcome == TeachOutcome::StrayRefused).expect("a refusal");
+    assert!(refused.detail.contains("taken back out"), "{}", refused.detail);
+    assert!(released.iter().all(|&i| s.quarantine[i] == Q_STRAY), "{:?}", released.iter().map(|&i| s.quarantine[i]).collect::<Vec<_>>());
+    assert!(s.pending_refit, "the refit is armed");
+}
+
+/// Final review minor 5 (ruling 13): a region was cleared under the policy's tolerances (the check's energy and force
+/// tests, the thinning radius); a change of any of them drops every region (the signatures are checked again), never a
+/// refusal. A change that judges no check (the audit cadence, draft mode) keeps them.
+#[test]
+fn a_policy_change_drops_the_regions_not_the_refusals() {
+    let (mut s, sig) = cleared_student();
+    let mut other = sig.clone();
+    other.stray_z = vec![1, 1];
+    s.stray_book.refuse(&other, "test".into());
+    let p = *s.policy();
+    s.set_policy(FallbackPolicy { audit_every: 7, ..p });
+    s.set_policy(FallbackPolicy { never_fallback: true, ..p });
+    s.set_policy(p);
+    assert!(matches!(s.stray_book.state(&sig), Some(StrayState::Cleared { .. })), "the cadence and draft mode keep the region");
+    s.set_policy(FallbackPolicy { energy_std_per_atom: 5e-4, ..p });
+    assert!(s.stray_book.state(&sig).is_none(), "a tighter energy tier drops the region: {:?}", s.stray_book.state(&sig));
+    assert!(matches!(s.stray_book.state(&other), Some(StrayState::Refused(_))), "a refusal stays");
+    for q in [FallbackPolicy { force_std_abs: 1e-3, ..p }, FallbackPolicy { force_std_rel: 0.05, ..p }, FallbackPolicy { max_descriptor_distance: 2.0, ..p }] {
+        let (mut s, sig) = cleared_student();
+        s.set_policy(q);
+        assert!(s.stray_book.state(&sig).is_none(), "{q:?}");
+    }
+}
+
+/// Final review minor 8 (ruling 13): the answer identity E = E_model(bonded) + Σ E_ref needs every per-species offset 0
+/// (mean 0); a model with a nonzero mean answers no stray-atom scene — in a release build too (a guard, not a
+/// `debug_assert`): the step falls back.
+#[test]
+fn a_model_with_a_nonzero_mean_answers_no_stray_scene() {
+    let (mut s, _) = cleared_student();
+    let sc = h2_with(INSIDE, &[STRAY_AT]);
+    assert!(cleared_at(&s, &sc), "the premise");
+    for m in s.model.as_mut().unwrap().mean.iter_mut() {
+        *m = 1e-3;
+    }
+    assert!(s.model().unwrap().effective_coefficients().1.iter().any(|&o| o != 0.0), "the premise: a per-species offset");
+    assert!(!cleared_at(&s, &sc), "no cleared answer");
+    s.discontinuity();
+    assert_eq!(s.evaluate(&sc, &mut never()).unwrap().stats.source, Source::Fallback);
+}
+
+/// Final review I2(c) (ruling 13): the thinning radius of a check is frozen in the descriptor units of its pass, so a
+/// later change of the model's training spreads (a refit) moves no coverage. Here the model's envelope is widened (H₂
+/// 0.8–3.0 Bohr): a bond just beyond the 1.55 check's radius stays uncovered (stepped and held alike), and one within
+/// it stays covered. (Narrower spreads cannot be shown on this fixture: the spread floor, 0.1 × the feature's RMS, already
+/// holds the training units at their smallest.)
+#[test]
+fn the_thinning_radius_is_frozen_at_the_checks() {
+    let (mut s, sig) = cleared_student();
+    let basis = s.model().unwrap().basis.clone();
+    let units = s.envelope().unwrap().clone();
+    let thin = THIN_FRACTION * s.policy().max_descriptor_distance;
+    let gap = |env: &Envelope, a: f64, b: f64| {
+        let (da, sa) = h2_desc(&basis, a);
+        let (db, _) = h2_desc(&basis, b);
+        da.iter().zip(&db).zip(&sa).map(|((x, y), &k)| super::super::quarantine::spread_distance(env, k, x, y)).fold(0.0f64, f64::max)
+    };
+    let covered = |s: &SurrogateKs, r: f64| cleared_at(s, &h2_with(r, &[STRAY_AT]));
+    let near = (1..=2000).map(|k| CHECKS[2] + 1e-4 * k as f64).find(|&r| !covers(&s, &sig, r) && gap(&units, r, CHECKS[2]) <= thin).expect("a bond in the radius");
+    let beyond = (1..=2000).map(|k| CHECKS[2] + 1e-3 * k as f64).find(|&r| !covered(&s, r)).expect("a bond beyond");
+    assert!(covered(&s, near) && !covered(&s, beyond), "the premise: {near} covered, {beyond} not");
+    let mut wide = units.clone();
+    for k in 0..=22 {
+        let (d, sp) = h2_desc(&basis, 0.8 + 0.1 * k as f64);
+        for (si, b) in sp.iter().zip(&d) {
+            wide.add_atom(*si, b);
+        }
+    }
+    assert!(gap(&wide, beyond, CHECKS[2]) <= thin, "the premise: in the wider spreads {beyond} would be within the radius");
+    s.envelope = Some(wide);
+    assert!(!covered(&s, beyond), "a wider envelope does not widen the region");
+    assert!(covered(&s, near), "…nor moves what it covers");
+    // the hold-out reads the same frozen radius: a held sample at `beyond` stays held under the wider spreads
+    let sc = h2_with(beyond, &[STRAY_AT]);
+    let (pos, z) = (positions(&sc), zs(&sc));
+    let (e, f) = SpeciesMorse::energy_and_forces(&pos, &z);
+    let prov = s.provenance_for(&sc);
+    let mut notes = Vec::new();
+    assert!(s.keep_sample(&pos, &z, e, &f, Some(0.0), Some(2), &prov, SampleTag::Fallback, &mut notes));
+    assert_eq!(s.quarantine[s.samples() - 1], Q_STRAY, "{notes:?}");
+    assert_eq!(s.release_stray_samples(&sig), 0);
 }

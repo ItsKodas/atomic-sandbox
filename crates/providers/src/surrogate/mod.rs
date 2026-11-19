@@ -2731,8 +2731,8 @@ impl ForceProvider for SurrogateKs {
         stats.energy.total = pred.energy;
         stats.solve_ms = t0.elapsed().as_millis() as u64;
         if let Some((_, residual, margin, passes)) = cleared {
-            // the answer identity E = E_model(bonded) + Σ E_ref needs offset_s = 0 (mean 0, no intercept; fix round 1 M5)
-            debug_assert!(self.model.as_ref().is_some_and(|m| m.effective_coefficients().1.iter().all(|&o| o == 0.0)), "a cleared answer needs every per-species offset 0");
+            // the answer identity E = E_model(bonded) + Σ E_ref needs offset_s = 0 (mean 0, no intercept): `stray_cleared`
+            // answers no stray scene with a nonzero mean, in every build (final review minor 8)
             // rule 7 of the doc's honesty (review M6): what answered, and on what measurement — the passing checks booked
             stats.notes.push(format!(
                 "stray atoms: model for the bonded part + free atoms (composition measured, {passes} checks; worst residual {:.2} mHa, frontier margin {:.0} mHa)",

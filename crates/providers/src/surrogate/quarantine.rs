@@ -415,6 +415,9 @@ pub(super) fn quarantine_words(held: usize, added: usize, h: Held, ranking: Rank
 /// audit fences do not call it near, and the envelope's own distance (rule 5c) refuses every
 /// query of a species with no training atom first (`Envelope::distance`: ∞ at count 0); the
 /// cleared region's distinctness refuses such a species before measuring (`Region::distinct`).
+/// The NaN gap was a behaviour change for every caller (before, `f64::max` dropped it): unreachable
+/// for finite descriptors, so no scene without a stray atom moves (the scripted-session digest is
+/// unchanged; `stray` module doc, final review minor 7).
 pub(super) fn spread_distance(env: &Envelope, s: usize, a: &[f64], b: &[f64]) -> f64 {
     let mut worst = 0.0f64;
     for (k, (x, y)) in a.iter().zip(b).enumerate() {

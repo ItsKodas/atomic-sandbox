@@ -341,6 +341,13 @@ impl SurrogateKs {
     /// Replaces the policy; the variance cadence restarts and the training residuals are
     /// re-judged against the new thresholds.
     pub fn set_policy(&mut self, p: FallbackPolicy) {
+        // a stray-atom region was cleared under the check's tolerances (its energy and force tests) and the thinning
+        // radius: when one of them changes, every region is checked again; a refusal stays (final review minor 5,
+        // controller ruling 13; `stray` module doc, "The cleared region")
+        let judged = |q: &FallbackPolicy| (q.energy_std_per_atom, q.force_std_abs, q.force_std_rel, q.max_descriptor_distance);
+        if judged(&p) != judged(&self.policy) {
+            self.stray_book.clear_regions();
+        }
         self.policy = p;
         self.model_gen += 1; // the views' cache key: the verdicts read the policy
         self.consults = 0;
