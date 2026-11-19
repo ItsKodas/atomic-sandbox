@@ -98,7 +98,7 @@ fn predict_cost_on_a_model_file() {
     }
     let desc = t.elapsed().as_secs_f64() / calls as f64 * 1e6;
     println!("first predict(.., true): {first_ms:.2} ms; describe alone {desc:.1} µs");
-    println!("support: {:?}", model.variance_support.support().map(|s| s.len()));
+    println!("support: {:?}", model.variance_support.support_for(&[0]).map(|s| s.len()));
     println!("predict(.., false): {plain:.1} µs, predict(.., true): {var:.1} µs (mean of {calls})");
     println!("energy_std {:e}, force_std {:?}", first.energy_std.unwrap(), first.force_std.unwrap());
 }

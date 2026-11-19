@@ -63,6 +63,9 @@ fn always_unsure(s: &mut SurrogateKs) {
     for x in m.sigma_inv_chol.as_mut().expect("a posterior").iter_mut() {
         *x *= 1e-9;
     }
+    // L changed in place: its derived support factors with it (the model's field rule; the
+    // cache's fingerprint would catch it too)
+    m.variance_support = surrogate::SupportCache::new();
     s.last_variance = None;
 }
 
@@ -11729,6 +11732,9 @@ mod step_cost;
 
 /// A policy change's cost on a collection (quiet refits round 2; a measurement).
 mod policy_cost;
+
+/// 2026-11-20: decisions on the variance's support path equal the full path's (review I3a).
+mod support_decisions;
 
 // ---- M8a Task 10: masked scenes (a capped segment teaches only its interior atoms) ----
 

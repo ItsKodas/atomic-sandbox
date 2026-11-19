@@ -761,8 +761,28 @@ pub fn describe(
     pos: &[[f64; 3]],
     z: &[u8],
 ) -> Result<Vec<AtomDescriptor>, DescribeError> {
+    describe_with(basis, pos, z, true)
+}
+
+/// [`describe`], with `skip_absent` the composition skip (review Q3, 2026-11-20): a body-3/4 term
+/// with a channel species the scene lacks is left at its initial +0.0, value and gradients. That
+/// is exactly what the term would compute: its A factor of that channel is +0.0 throughout (no
+/// neighbour was added to it), so every product is ±0 and a sum that starts at +0.0 and adds only
+/// signed zeros stays +0.0; its gradient entries are +0.0 likewise, and subtracting +0.0 from the
+/// self entry leaves it unchanged. Bit for bit for finite positions
+/// (`the_composition_skip_changes_no_bit`); `false` is the unskipped loop, the test's oracle.
+fn describe_with(
+    basis: &Basis,
+    pos: &[[f64; 3]],
+    z: &[u8],
+    skip_absent: bool,
+) -> Result<Vec<AtomDescriptor>, DescribeError> {
     assert_eq!(pos.len(), z.len(), "describe: pos and z lengths differ");
     let s = basis.species_indices(z)?;
+    let mut present = vec![!skip_absent; basis.n_species()];
+    for &si in &s {
+        present[si] = true;
+    }
     let p = basis.n_features();
     let p2 = basis.n_body2();
     let n_max = basis.n_max;
@@ -779,6 +799,9 @@ pub fn describe(
     let mut scratch = (basis.body3 || basis.body4).then(|| AtomicBasisScratch::new(basis, n));
     let p4 = p2 + basis.n_body3();
     let terms4: Vec<(Body4Term, &[Gaunt])> = basis.body4_terms().into_iter().map(|t| (t, gaunt(t.l))).collect();
+    // the terms whose channel species are all in the scene (the others stay +0.0; `describe_with`)
+    let active3: Vec<usize> = (0..terms.len()).filter(|&q| present[terms[q].t1] && present[terms[q].t2]).collect();
+    let active4: Vec<usize> = (0..terms4.len()).filter(|&q| terms4[q].0.t.iter().all(|&t| present[t])).collect();
     for i in 0..n {
         if let Some(sc) = scratch.as_mut() {
             sc.clear();
@@ -817,7 +840,8 @@ pub fn describe(
             continue;
         };
         // Body-3 values: B = Σ_m A_{c₁,lm} A_{c₂,lm}.
-        for (q, t) in terms.iter().enumerate() {
+        for &q in &active3 {
+            let t = &terms[q];
             let (a1, a2) = (sc.a(basis.body2_index(t.t1, t.n1)), sc.a(basis.body2_index(t.t2, t.n2)));
             let mut b = 0.0;
             for lm in AtomicBasisScratch::l_range(t.l) {
@@ -835,7 +859,8 @@ pub fn describe(
             let gj = &mut rest[slot].1;
             debug_assert_eq!(rest[slot].0, j);
             let self_g = &mut self_entry[0].1;
-            for (q, t) in terms.iter().enumerate() {
+            for &q in &active3 {
+                let t = &terms[q];
                 if t.t1 != tj && t.t2 != tj {
                     continue;
                 }
@@ -866,7 +891,8 @@ pub fn describe(
             }
         }
         // Body-4 values and gradients (module doc): the product rule through the three factors.
-        for (q, (t, entries)) in terms4.iter().enumerate() {
+        for &q in &active4 {
+            let (t, entries) = &terms4[q];
             let c = t4_channels(basis, t);
             atom.b[p4 + q] = body4_value(entries, sc.a(c[0]), sc.a(c[1]), sc.a(c[2]));
         }
@@ -875,7 +901,8 @@ pub fn describe(
             let (self_entry, rest) = atom.grad.split_at_mut(1);
             let gj = &mut rest[slot].1;
             let self_g = &mut self_entry[0].1;
-            for (q, (t, entries)) in terms4.iter().enumerate() {
+            for &q in &active4 {
+                let (t, entries) = &terms4[q];
                 if !t.t.contains(&tj) {
                     continue;
                 }
@@ -1038,6 +1065,41 @@ pub(crate) fn pair_geometry(ri: [f64; 3], rj: [f64; 3], r_cut: f64) -> Option<(f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The composition skip in `describe` (review Q3) changes no bit: descriptors and every
+    /// gradient entry with the skip on and off, over seeded scenes of every sub-composition of a
+    /// three-species body-3 + body-4 basis (some atoms beyond r_cut of the others).
+    #[test]
+    fn the_composition_skip_changes_no_bit() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(0x05c1);
+        let mut basis = Basis::new(&[1, 8, 15]);
+        basis.body4 = true;
+        basis.body4_degree = 3;
+        let subsets: [&[u8]; 7] = [&[1], &[8], &[15], &[1, 8], &[1, 15], &[8, 15], &[1, 8, 15]];
+        let mut compared = 0usize;
+        for t in 0..42 {
+            let sp = subsets[t % 7];
+            let n = 2 + t % 4;
+            let side = if t % 3 == 0 { 9.0 } else { 3.5 };
+            let pos: Vec<[f64; 3]> = (0..n).map(|_| [rng.gen_range(0.0..side), rng.gen_range(0.0..side), rng.gen_range(0.0..side)]).collect();
+            let z: Vec<u8> = (0..n).map(|_| sp[rng.gen_range(0..sp.len())]).collect();
+            let on = describe_with(&basis, &pos, &z, true).unwrap();
+            let off = describe_with(&basis, &pos, &z, false).unwrap();
+            assert_eq!(on.len(), off.len());
+            for (i, (a, b)) in on.iter().zip(&off).enumerate() {
+                assert!(a.b.iter().zip(&b.b).all(|(x, y)| x.to_bits() == y.to_bits()), "scene {t} atom {i}: values");
+                assert_eq!(a.grad.len(), b.grad.len());
+                for ((ja, ga), (jb, gb)) in a.grad.iter().zip(&b.grad) {
+                    assert_eq!(ja, jb);
+                    assert!(ga.iter().zip(gb).all(|(x, y)| (0..3).all(|k| x[k].to_bits() == y[k].to_bits())), "scene {t} atom {i}: gradient wrt {ja}");
+                    compared += ga.len();
+                }
+            }
+        }
+        assert!(compared > 0);
+    }
 
     #[test]
     fn basis_defaults_sort_and_dedup_species_and_lay_out_body2_features() {

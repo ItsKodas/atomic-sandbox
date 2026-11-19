@@ -673,34 +673,36 @@ pub fn mat_vec_fast(a: &[f64], n: usize, x: &[f64], y: &mut [f64]) {
     }
 }
 
-// ---- the predictive variance on a support (spec 2026-11-20-variance-support-design.md) ----
+/// ---- the predictive variance on a support (spec 2026-11-20-variance-support-design.md) ----
 //
-// For a lower factor L of A = L Lᵀ (n × n) and an ascending set S of m indices, every v supported
-// on S has
+// For a lower factor L of A = L Lᵀ (n × n) and an ascending set S of m indices (N the rest),
+// every v supported on S has
 //
 //   vᵀA⁻¹v = v_Sᵀ G v_S,   G = (A⁻¹)_SS = XᵀX,   X = L⁻¹E_S (n × m; column j is L⁻¹ e_{S_j}),
 //
-// and with G = RᵀR (R upper triangular, the R of X's thin QR up to signs) the value is the sum of
-// squares ‖R v_S‖², at m²/2 per vector instead of the full substitution's n²/2.
+// and with G = RᵀR (R upper triangular) the value is the sum of squares ‖R v_S‖², at m²/2 per
+// vector instead of the full substitution's n²/2.
 //
-// **Why the factor is built in double-double and kept as R⁻¹.** In f64 the products R v_S cancel:
-// the unit columns L⁻¹e_s carry the prior's variance (of order 1/λ) while a query in a direction
-// the data determine has a variance many orders smaller, so ‖R v_S‖² is a small difference of
-// large terms and its rounding is ε‖R‖²‖v‖² rather than ε‖R v‖². Measured on fitted factors
-// against a double-double reference (2026-11-20, `model` tests): the full substitution ≤ 2.2e-13
-// relative, R from the f64 QR of X up to 3.5e-11, the Schur complement's factor by f64 Householder
-// or Givens elimination of L up to 1.8e-10 and 5.9e-12 (orthogonal eliminations are only
-// row-normwise stable, and C = (A⁻¹)_SS⁻¹ is a cancelling difference of A_SS). So:
+// **What F is (review M1).** With W = R⁻¹ and J the reversal of S, F = J W J is lower triangular
+// with a positive diagonal and F Fᵀ = J G⁻¹ J = J C J, C = A_SS − A_SN A_NN⁻¹ A_NS the Schur
+// complement. So F is the Cholesky factor of J C J: the trailing |S| × |S| block of the Cholesky
+// factor of A with its indices ordered (N, reversed S). The support forms ‖F⁻¹ J v_S‖² are then
+// the full path's own forward substitution through a reordered exact factor of the same A, whose
+// N block meets a zero right-hand side (y_N = 0 exactly) and drops out. F is that block computed
+// in double-double and rounded once to f64; the forms are in the full path's accuracy class.
+// That is a statement of class, not a derived bound: the agreement is **measured** (the stds
+// within 4.4e-13 relative of the full path's in the `model` tests, the forms within 2× the full
+// substitution's own error on a posterior-shaped factor in the tests below), and every new factor
+// is self-checked against the full path at build (`model::SupportCache`, bound 1e-10).
 //
-// 1. X, G = XᵀX, R = chol(G)ᵀ and W = R⁻¹ are computed in double-double arithmetic (≈ 2⁻¹⁰⁶;
-//    Dekker's products and Knuth's sums, no FMA, so the result is the same on every CPU), which
-//    leaves W correct to f64 rounding entry by entry (κ(G)·2⁻¹⁰⁶ ≪ 2⁻⁵³ for κ(G) ≲ 1e15);
-// 2. W is stored in f64, and R v_S = y is found by SOLVING W y = v_S — a triangular substitution,
-//    componentwise backward stable like the full path's L y = v, so its error is relative to y
-//    and not to ‖R‖‖v‖. W is upper triangular; with J the reversal of S, J W J is lower triangular
-//    (the Cholesky factor of J C J, C = W Wᵀ = (A⁻¹)_SS⁻¹ the Schur complement of A_NN in A), and
-//    ‖y‖² = ‖(J W J)⁻¹ J v_S‖² is one more `cholesky_quad_forms` of size m.
-
+// **Why double-double.** Built in f64, F loses digits to cancellation: the unit columns L⁻¹e_s
+// carry the prior's variance (of order 1/λ) while a query in a direction the data determine has
+// a variance many orders smaller, and C is a cancelling difference of A_SS. Measured on fitted
+// factors against a double-double reference (2026-11-20): the full substitution ≤ 2.2e-13
+// relative, ‖R v_S‖² with R from the f64 QR of X (the spec's first form) up to 3.5e-11, C's factor
+// by f64 Householder or Givens elimination of L up to 1.8e-10 and 5.9e-12. X, G, R and W are
+// therefore computed in double-double arithmetic (≈ 2⁻¹⁰⁶; Dekker's products and Knuth's sums,
+// no FMA, so the result is the same on every CPU and for every thread count).
 /// Double-double arithmetic for [`support_factor`]: a value hi + lo with |lo| ≤ ulp(hi)/2.
 /// Error-free transformations by Knuth (sum) and Dekker/Veltkamp (product); Rust never contracts
 /// a multiply and an add, so every operation is the same on every CPU.
@@ -954,7 +956,8 @@ fn unit_solves_lanes_kernel(l: &[f64], n: usize, cols: &[usize], xh: &mut [f64],
 /// The m × m lower factor F (row-major, in the REVERSED order of `support`) with
 /// vᵀ(L Lᵀ)⁻¹v = ‖F⁻¹ (J v_S)‖² for every v supported on the ascending index set S = `support`,
 /// J v_S = (v_{S_{m−1}}, …, v_{S_0}) — so [`cholesky_quad_forms`]`(F, m, …)` of the reversed
-/// gathered vectors gives the quadratic forms (section comment above). Built in double-double:
+/// gathered vectors gives the quadratic forms (section comment above: F is the trailing
+/// Cholesky block of A ordered (N, reversed S)). Built in double-double:
 /// X = L⁻¹E_S by unit-column substitutions started at row S_j (the columns in parallel),
 /// G = XᵀX, G = L_G L_Gᵀ, and F_ab = (L_G⁻¹)_{m−1−b, m−1−a} (F = J L_G⁻ᵀ J), rounded once to f64.
 /// Σ_j (n − S_j)²/2 + n m²/2 double-double multiply-adds and O(m³).
