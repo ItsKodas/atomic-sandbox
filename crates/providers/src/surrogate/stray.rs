@@ -97,23 +97,29 @@
 //!
 //! `Pass { residual, margin }` carries the absolute energy residual and the smallest margin (Ha).
 //!
-//! # The levels and the frontier window (controller ruling 10, Task 7 on the real teacher)
+//! # The levels and the frontier window (controller rulings 10 and 11, Task 7 on the real teacher)
 //!
 //! **The window.** The frontier levels (HOMO, LUMO) are compared only when the scene's or the parts' level lies within
-//! W = 27.6 kT (= [`frontier_margin_min`], 138 mHa) of the **scene's** μ_σ (`Frontier::mu`, the final SCF step's): a
-//! level at |ε − μ_σ| ≥ W has f ≤ 1/(1 + e^{27.6}) ≈ 1e-12 (or 1 − f as small), so it can neither give nor take charge
-//! at kT = 5 mHa, and a shift of it is no transfer. The scene's μ_σ is the one a transfer would happen at (one μ_σ spans
-//! the cell); the parts' μ_σ are each part's own and say nothing about where the scene fills. What the window drops is
-//! what the real teacher showed must be dropped: an unoccupied level above zero is a box (continuum) state — H₂'s σu↑ at
-//! +28.4 mHa and the stray H's ↑ LUMO at +36.5 at 1.434 Bohr in a 16 Bohr box — and the scene's lowest such state spreads
-//! over both wells and lies 2.9–3.7 mHa below the parts' (81³–91³ × 0.20), moving with the whole box, not the composition
-//! (`references.md`, "Stray atoms"). The margin test already covers the window's edges: a donor and an acceptor of
-//! different parts closer than W fail it. **Partial levels** are compared as before, unfiltered: each lies within
-//! ln(1/`PARTIAL_OCCUPATION_MIN`) kT = 13.8 kT of its own μ_σ, so inside the window by construction, and a part's
-//! partial level the scene's window would exclude has changed its occupation — a transfer the test exists to see. A
-//! level present on one side only is never skipped: an occupied one on one side only fails (the channel's electrons
-//! moved), an unoccupied one not computed on one side keeps the check void. Without a μ_σ (an aufbau teacher, or a
-//! provider that does not report it) every level is compared, as before the window.
+//! W = ln(1/`PARTIAL_OCCUPATION_MIN`) kT = 13.8 kT ([`level_window`], 69 mHa at kT = 5 mHa) of the **scene's** μ_σ
+//! (`Frontier::mu`, the final SCF step's). A level farther than W from μ_σ holds, or lacks, less than 1e-6 e — the same
+//! threshold that defines a partial level — so it cannot carry the fractional transfer this test exists to catch
+//! (review I1); a whole-electron transfer moves the energy, which the energy test catches, and the frontier **margin**
+//! keeps its 27.6 kT buffer (unchanged) to guard levels approaching μ across the region. The scene's μ_σ is the one a
+//! transfer would happen at (one μ_σ spans the cell); the parts' μ_σ are each part's own and say nothing about where
+//! the scene fills. What the window drops, measured on the real teacher (`references.md`, "Stray atoms"):
+//! - **box states**: an unoccupied level above zero is a continuum state of the box — H₂'s σu↑ at +28.4 mHa and the
+//!   stray H's ↑ LUMO at +36.5 at 1.434 Bohr in a 16 Bohr box; the scene's lowest such state spreads over both wells and
+//!   lies 2.9–3.7 mHa below the parts' (81³–91³ × 0.20), moving with the whole box, not the composition;
+//! - **the neighbour's potential on a far empty level**: the stray H's empty 1s↓ lies 3.6–4.3 mHa lower in the scene
+//!   than alone (r = 1.434–1.75 Bohr), the same at 81³, 91³ and 101³ — box-independent, the H₂'s potential perturbing a
+//!   level 124–139 mHa (≈ 25 kT, f ≈ 1e-11) above μ↓: physical, and no composition failure.
+//!
+//! **Partial levels** are compared as before, unfiltered: the scene's all lie within W of its μ_σ by definition
+//! (min(f, 1 − f) ≥ 1e-6), so restricting them to the window changes nothing on the scene's side, and a part's partial
+//! level that falls outside the scene's window has changed its occupation in the scene — a transfer the test must see,
+//! so it is never filtered away. A level present on one side only is never skipped: an occupied one on one side only
+//! fails (the channel's electrons moved), an unoccupied one not computed on one side keeps the check void. Without a
+//! μ_σ (an aufbau teacher, or a provider that does not report it) every level is compared, as before the window.
 //!
 //! **An empty spin channel** stores no orbital, so a stray H alone (1↑ 0↓) has no ↓ level at all, while the scene's ↓
 //! LUMO is that H's empty 1s↓ (−95 mHa at 81³ × 0.20; a real acceptor for the margin). The parts' solves therefore ask
@@ -306,6 +312,13 @@ pub(super) const STRAY_LEVEL_TOL: f64 = 1.8e-3;
 /// The frontier margin (Ha): 27.6 kT = 2 ln(1/`PARTIAL_OCCUPATION_MIN`) kT, 138 mHa at kT = 5 mHa (module doc).
 pub(super) fn frontier_margin_min() -> f64 {
     27.6 * qm::ELECTRON_KT
+}
+
+/// The levels test's window about the scene's μ_σ (Ha): ln(1/`PARTIAL_OCCUPATION_MIN`) kT = 13.8 kT, 69 mHa at
+/// kT = 5 mHa — a level farther from μ holds or lacks less than 1e-6 e (module doc, "The levels and the frontier window";
+/// controller ruling 11).
+pub(super) fn level_window() -> f64 {
+    (1.0 / qm::PARTIAL_OCCUPATION_MIN).ln() * qm::ELECTRON_KT
 }
 
 /// The occupation-matching tolerance of a partial level: [`STRAY_LEVEL_TOL`] / (2 kT) (module doc, "Levels").
@@ -640,9 +653,9 @@ pub(super) fn judge(policy: &FallbackPolicy, scene: &PartAnswer, frag: &PartAnsw
         }
         // frontier levels inside the window about the scene's μ_σ (module doc, "The levels and the frontier window"):
         // the scene's HOMO the parts' highest, its LUMO their lowest — compared when either side's level lies within
-        // 27.6 kT of μ_σ; without a μ_σ (an aufbau teacher) every level is compared
+        // 13.8 kT of μ_σ (ruling 11); without a μ_σ (an aufbau teacher) every level is compared
         let mu = scene.frontier[spin].mu;
-        let window = frontier_margin_min();
+        let window = level_window();
         let inside = |e: Option<f64>| e.is_some_and(|e| mu.is_none_or(|m| (e - m).abs() < window));
         let homo = parts.iter().filter_map(|p| p.frontier[spin].homo).reduce(f64::max);
         let s_homo = scene.frontier[spin].homo;

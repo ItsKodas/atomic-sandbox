@@ -2370,7 +2370,7 @@ fn failed(v: CheckVerdict) -> String {
     }
 }
 
-/// Ruling 10a: the frontier levels are compared only within 27.6 kT of the scene's μ_σ. The real teacher's H₂ + H at
+/// Rulings 10a and 11: the frontier levels are compared only within 13.8 kT (69 mHa) of the scene's μ_σ. The real teacher's H₂ + H at
 /// 1.434 Bohr (81³ × 0.20, `references.md` "Stray atoms"): the ↑ LUMOs are box states — scene +25.5, H₂ σu +28.4,
 /// H +36.5 mHa, a 2.9 mHa mismatch — about 145 mHa above μ↑; they move with the box, not the composition.
 #[test]
@@ -2388,14 +2388,14 @@ fn judge_compares_frontier_levels_only_within_the_window() {
     let (scene, frag, atoms, split) = box_states();
     let why = failed(judge(&p, &scene, &frag, &atoms, &split));
     assert!(why.contains("LUMO ↑"), "{why}");
-    // the scene's μ↑ at −0.12 Ha: +25.5 mHa lies 145.5 mHa above it, outside 138 — not compared; μ↓ at −0.21 keeps the
+    // the scene's μ↑ at −0.12 Ha: +25.5 mHa lies 145.5 mHa above it, outside 69 — not compared; μ↓ at −0.21 keeps the
     // ↓ HOMO (−0.37) and LUMO (−0.05) 160 mHa away, outside too
     let (mut scene, frag, atoms, split) = box_states();
     scene.frontier[0].mu = Some(-0.12);
     scene.frontier[1].mu = Some(-0.21);
     assert!(matches!(judge(&p, &scene, &frag, &atoms, &split), CheckVerdict::Pass { .. }), "{:?}", judge(&p, &scene, &frag, &atoms, &split));
-    // a mismatch inside the window still fails: μ↑ at −0.08 puts +25.5 mHa 105.5 mHa above it
-    scene.frontier[0].mu = Some(-0.08);
+    // a mismatch inside the window still fails: μ↑ at −0.03 puts +25.5 mHa 55.5 mHa above it
+    scene.frontier[0].mu = Some(-0.03);
     let why = failed(judge(&p, &scene, &frag, &atoms, &split));
     assert!(why.contains("LUMO ↑") && why.contains("μ"), "{why}");
     // an in-window HOMO mismatch fails; one far below μ is not compared
@@ -2521,4 +2521,24 @@ fn part_solves_ask_for_an_unoccupied_level_per_channel() {
     let check: Vec<&sim::TeachEvent> = ev.iter().filter(|e| e.origin == TeachOrigin::Audit).collect();
     assert_eq!(check.iter().map(|e| e.outcome).collect::<Vec<_>>(), [TeachOutcome::StrayChecking { n: 1, of: 3 }], "{check:?}");
     assert_eq!(views.lock().unwrap().as_slice(), [part_view()], "set once for the parts, kept across both");
+}
+
+/// Ruling 11: the real teacher's stray H's empty 1s↓, 4.3 mHa lower in the scene than alone (−95.4 against −91.1 mHa at
+/// r = 1.75 Bohr, 81³ × 0.20) and 126.3 mHa ≈ 25 kT above the scene's μ↓ (−221.7): outside the 13.8 kT window, so not
+/// compared — the check passes; the same mismatch within 13.8 kT of μ↓ fails.
+#[test]
+fn a_far_level_mismatch_passes_and_an_in_window_one_fails() {
+    let p = FallbackPolicy::default();
+    assert!((level_window() - 13.8155 * qm::ELECTRON_KT).abs() < 1e-4 * qm::ELECTRON_KT, "ln(1e6) kT");
+    let (mut scene, frag, mut atoms, split) = exact();
+    atoms[0].frontier[1].lumo = Some(-0.0911);
+    scene.frontier[1].lumo = Some(-0.0954);
+    scene.frontier[0].mu = Some(-0.1357);
+    scene.frontier[1].mu = Some(-0.2217);
+    assert!((-0.0954f64 - -0.2217) / qm::ELECTRON_KT > 25.0, "the premise: ≈ 25 kT out");
+    assert!(matches!(judge(&p, &scene, &frag, &atoms, &split), CheckVerdict::Pass { .. }), "{:?}", judge(&p, &scene, &frag, &atoms, &split));
+    // μ↓ at −0.15: the 1s↓ lies 54.6 mHa ≈ 10.9 kT above it, inside the window — the 4.3 mHa mismatch fails
+    scene.frontier[1].mu = Some(-0.15);
+    let why = failed(judge(&p, &scene, &frag, &atoms, &split));
+    assert!(why.contains("LUMO ↓"), "{why}");
 }

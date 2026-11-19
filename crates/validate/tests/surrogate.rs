@@ -202,8 +202,11 @@
 //!   next step's source required to agree. **Fails on this branch (2026-11-19)**: before controller ruling 10 the levels
 //!   test refused at r = 1.434 (↑ box-state LUMOs) and every check at 1.8–2.3 was void (the stray H's empty ↓ channel had
 //!   no level); with ruling 10 (the 27.6 kT window about the scene's μ_σ, one unoccupied level per part channel)
-//!   1.434 and 1.15 pass and 1.75 is refused — the H's empty 1s↓, 126 mHa above μ↓ (inside the window), sits 4.3 mHa
-//!   lower in the scene than alone, at every box size (`references.md`, "Stray atoms"). `stray_li_beside_f2_is_refused`: the charge-transfer case measured as the check measures it (three clean
+//!   1.434 and 1.15 pass and 1.75 is refused (the H's empty 1s↓, 25 kT above μ↓, 4.3 mHa lower beside H₂ at every box
+//!   size); with ruling 11 (a 13.8 kT window) all three pass and H₂ + H clears, but the region (a per-feature box of
+//!   oscillating radial features) holds only the checked bonds themselves: `would_answer` refuses at ±0.005 Bohr and at
+//!   every unchecked bond tried (`references.md`, "Stray atoms"). The test prints the provider's verdict around each
+//!   check. `stray_li_beside_f2_is_refused`: the charge-transfer case measured as the check measures it (three clean
 //!   cold solves) at 107³ × 0.15 — F's h_req; the recipe refuses F at 0.20 (asserted) and Li runs all-electron under
 //!   `Accepted` — asserting that the check's energy, force or margin test fails; the provider path is not exercised
 //!   here (a model with Li and F in its basis at that grid costs hours of passes). `stretched_h2_margin_is_reported`:
@@ -2332,6 +2335,19 @@ fn stray_h_clears_and_matches_dft() {
     train_h2(&mut s, STRAY_R0, SEED, &mut out);
     let passed = clear_h2_h(&mut s, &STRAY_CHECK_R, &mut out);
     let _ = writeln!(out, "  cleared by the checks at r = {passed:?} (tried in the order {STRAY_CHECK_R:?})");
+    // the region's reach about the checked bonds (report): the provider's verdict at each checked bond and ±0.005 Bohr
+    for &r in &passed {
+        let verdicts: Vec<String> = [-0.005, 0.0, 0.005]
+            .iter()
+            .map(|dr| {
+                let sc = h2_and_h(r + dr);
+                let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+                let z: Vec<u8> = sc.nuclei.iter().map(|n| n.z).collect();
+                format!("{:+.3}: {:?}", dr, s.would_answer(&pos, &z, &s.provenance_for(&sc)))
+            })
+            .collect();
+        let _ = writeln!(out, "  around the check at r = {r}: {}", verdicts.join(", "));
+    }
     // the fourth geometry: never checked, inside the region by the provider's own verdict (no step, so no check)
     let mut r4 = None;
     for r in STRAY_PROBE_R {

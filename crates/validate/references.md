@@ -6069,7 +6069,7 @@ The second refit with nothing new: 192.6 → 10.6 s. What is left: `NullSpace::o
   (σ_F: the force std and its epistemic part, per atom.) The relative 3.4e-3 of the first report was a value of 3.7e-6 moving by 1.3e-8: the absolute differences are at most 0.4 % of a tier.
 - **Across machines.** faer picks its SIMD kernels at run time (AVX-512 here, AVX2 elsewhere), so a refit on a CPU with another instruction set differs from this one by the same ~κε spread — never in a verdict measured here, but a golden compares bit for bit only on the same ISA (the thread count never matters: `dense::SPLIT`).
 
-## Stray atoms (plan 2026-11-18 Task 7, 2026-11-19; spec `2026-11-18-stray-atom-composition-design.md` §6; `tests/surrogate.rs` and `tests/dynamics.rs`, release, RX 7900 XTX, teacher GpuKs tol 1e-6, `ionic accepted`, σ = h) — **BLOCKED: H₂ + H does not clear on the real teacher (before and after ruling 10)**
+## Stray atoms (plan 2026-11-18 Task 7, 2026-11-19; spec `2026-11-18-stray-atom-composition-design.md` §6; `tests/surrogate.rs` and `tests/dynamics.rs`, release, RX 7900 XTX, teacher GpuKs tol 1e-6, `ionic accepted`, σ = h) — **BLOCKED: H₂ + H does not clear before ruling 11; after it, the cleared region holds only the checked geometries**
 
 Geometry (`common::surrogate::diatomic_and_atom`): the diatomic's centre and the third atom on the cube's body diagonal,
 8 Bohr apart, the diatomic's axis ⊥ the diagonal, placed so the stray atom and the diatomic's outer atoms are equally far
@@ -6149,6 +6149,21 @@ the middle of the ↓ gap (σg↓ to 1s↓), so the 1s↓ lies 125–139 mHa fro
 as the bond stretches (σg rises). The ↑ box states (LUMO ↑, 145–150 mHa above μ↑ at 1.434) now drop out as intended.
 For the controller: a window of ln(1/`PARTIAL_OCCUPATION_MIN`) kT = 13.8 kT (69 mHa) — the occupation threshold that
 defines a partial level — would leave this level out (f < 1e-6 beyond it); the margin keeps its 27.6 kT.
+
+**After controller ruling 11 (2026-11-19: the window is ln(1/`PARTIAL_OCCUPATION_MIN`) kT = 13.8 kT = 69 mHa about the
+scene's μ_σ; the margin keeps 27.6 kT) — H₂ + H clears, then blocked on the region's reach.** The shift of the stray H's
+empty 1s↓ above is the H₂'s potential perturbing a level ≈ 25 kT above μ↓ (f ≈ 1e-11), box-independent across
+81³/91³/101³: physical, not a composition failure, and now outside the window. The checks (pass 272 samples, 198 s):
+1.434 passes (0.089 mHa, margin 282), 1.15 passes (0.074, 307), **1.75 passes (0.105 mHa, margin 257) — cleared (3
+checks)**. But the cleared region holds **only the checked geometries themselves**: the provider's `would_answer` is
+`Ok` at r = 1.434, 1.15 and 1.75 exactly and refuses (rule 5a) at r ± 0.005 Bohr around each, and at every unchecked
+bond tried (1.37, 1.50, 1.27, 1.65, 1.40, 1.55, 1.20, 1.70). Cause (a CPU measurement of the default H basis: r_cut 6,
+n_max 8, l_max 3, body-3, 29 features): the radial features oscillate in r, so a point between the checks leaves the
+three checks' per-feature box in 1–3 features (r = 1.4: b2[n=3] −0.8656 ∉ [−0.8630, −0.7727] and b3[n=1,n=1,l=1];
+r = 1.434 + 0.001: b2[n=6] 0.8555 ∉ [0.6051, 0.8554], the checked bond sits at that feature's maximum). A geometry
+within the thinning radius of a check is "not distinct", so it queues no check either: it falls back for the session
+and the region never grows to it. The clears test cannot find its fourth geometry, and an NVE run's H₂ (which moves
+off its checked bond at the first step) would never be answered.
 
 **`stray_li_beside_f2_is_refused` — passes** (`cargo test -p validate --release --test surrogate stray_li_beside_f2_is_refused -- --nocapture`;
 3 cold solves, GPU 214 s: scene 68 s, F₂ 15 s, Li 115 s). The recipe refuses F at h = 0.20 ("h_req = 0.15", asserted),
