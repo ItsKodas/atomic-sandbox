@@ -8715,6 +8715,9 @@ fn history_point_full(kind: surrogate::history::PointKind, n: usize, code: u8, e
         n_atoms: n,
         model_gen: 1,
         species: Vec::new(),
+        fit_id: None,
+        flags: surrogate::history::PointFlags::default(),
+        energy_std_epistemic: None,
     }
 }
 

@@ -630,4 +630,23 @@ Moved pins are physics-reviewed.
   per-key LOO statistics are not public.
 - **Fit ids across sessions.** The spec does not say how ids stay unique. A refit takes
   max(own, history max) + 1, and an install or restore brings back the fit's own id (Task 2).
-- (Filled in by Task 1 step 1: the magic values read.)
+- **The magic values read (Task 1 step 1).**
+  - The standalone history: `surrogate::history::MAGIC` = `ASAUDIT1`, the only version. Its decoder
+    refuses anything after the optional species array ("trailing bytes after the last array"), so
+    it bumps: `ASAUDIT2` (n + 1 = 2). The `history` format number goes from 1 to 2.
+  - The sidecar: `surrogate::sidecar::MAGICS.len()` = 9, newest `ASMODEL9` (bodies 6, 7, 8). Its
+    reader takes exactly the declared arrays its layout names (`read_arrays`: "N arrays declared,
+    format version V has M"), so three more history arrays are refused by a version-9 build: it
+    bumps too. K + 1 = 10, whose magic under the layout fixed in version 9 is `ASMOD010`. The
+    `sidecar` format number goes from 9 to 10.
+  - Both bumps apply only when the new arrays are written: a history none of whose points carries
+    a fit id, a flag or an epistemic energy std is still written as `ASAUDIT1` / `ASMODEL9`, bit for
+    bit (the version-8 precedent: a basis without body-4 stayed version 7). An older build keeps
+    reading every file that holds nothing it cannot read.
+  - An absent fit id or energy std is stored as **−1** in its array (any other negative, a NaN or an
+    infinity is refused); an absent flags word is 0.
+  - This build refuses an audit history of a newer build (`ASAUD…` that is not `ASAUDIT1`/`2`) and
+    never overwrites it: the collection opens with an empty history and a note, and
+    `save_history` leaves `history.bin` as it is (Review Focus 1). The downgrade warning says so for
+    a target whose `history` number is 2 or more; older targets still overwrite, and are warned as
+    before.

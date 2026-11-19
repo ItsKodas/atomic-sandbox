@@ -14,7 +14,7 @@
 //! | `key.txt` | the key, human-readable ([`SurfaceKey::to_text`]); checked on every open, so a slug collision is refused, never mixed |
 //! | `samples.bin` | the samples: magic [`MAGIC`], then append-only records (below) |
 //! | `references.txt` | isolated-atom energies **per box**, one `Z E n ρ` line per (species, box) (Hartree, the solve's grid points per side — the box length (n − 1)·h at the key's h —, its face density in e/Bohr³ or `-`; shortest round-trip decimals; "References" below) |
-//! | `history.bin` | the audit history ([`AuditHistory::encode`]) |
+//! | `history.bin` | the audit history ([`AuditHistory::encode`]); one written by a newer build (`crate::history::written_by_newer_build`) is never overwritten: the open starts an empty history and says so, and [`Collection::save_history`] leaves the file as it is (trust-tightening plan, Review Focus 1); one that is damaged is replaced at the next save |
 //! | `README.txt` | what it knows, for people: species, pairs, counts, scenes ([`Collection::write_readme`]) |
 //! | `refit_times.csv` | the provider's refit history, for the time estimate only ([`Collection::save_refit_times`]; its format is `sim::refit_eta`'s — the collection stores the text) |
 //! | `.lock` | the owning process id while a writer has it open |
@@ -347,6 +347,9 @@ pub struct Collection {
     pub references: BTreeMap<(u8, usize), CollectionReference>,
     /// The audit history ([`save_history`](Self::save_history) writes it).
     pub history: AuditHistory,
+    /// `history.bin` was written by a newer build (`crate::history::written_by_newer_build`): the
+    /// open started an empty history and [`save_history`](Self::save_history) never overwrites it.
+    history_newer: bool,
     /// Another live handle holds the lock: everything reads, nothing writes.
     pub read_only: bool,
     folder: PathBuf,
@@ -1159,8 +1162,15 @@ impl Collection {
             Err(e) => return Err(at(e)),
         }
 
-        // history.bin
+        // history.bin (module doc): a newer build's is kept, never overwritten (Review Focus 1 of
+        // the trust-tightening plan); a damaged one of this build's versions is replaced at the save
+        let mut history_newer = false;
         let history = match std::fs::read(folder.join("history.bin")) {
+            Ok(b) if crate::history::written_by_newer_build(&b) => {
+                history_newer = true;
+                report.notes.push(format!("history.bin was written by a newer build ({}): this build starts an empty audit history, does not save it, and leaves history.bin as it is", String::from_utf8_lossy(&b[..8])));
+                AuditHistory::default()
+            }
             Ok(b) => AuditHistory::decode(&b).unwrap_or_else(|e| {
                 report.notes.push(format!("history.bin unreadable ({e}): starting an empty audit history"));
                 AuditHistory::default()
@@ -1183,6 +1193,7 @@ impl Collection {
             quarantine: parsed.quarantine,
             references,
             history,
+            history_newer,
             read_only,
             folder,
             file,
@@ -1402,6 +1413,7 @@ impl Collection {
             quarantine: self.quarantine.clone(),
             references: self.references.clone(),
             history: AuditHistory::default(),
+            history_newer: self.history_newer,
             read_only: true,
             folder: self.folder.clone(),
             file: None,
@@ -1699,9 +1711,14 @@ impl Collection {
         write_atomic(&path, text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    /// Writes [`history`](Self::history) to `history.bin`.
+    /// Writes [`history`](Self::history) to `history.bin` — except over a newer build's
+    /// `history.bin` (module doc), which it leaves as it is: `Ok` without writing (the open said so
+    /// in its report).
     pub fn save_history(&self) -> Result<(), String> {
         self.writable()?;
+        if self.history_newer {
+            return Ok(());
+        }
         let path = self.folder.join("history.bin");
         write_atomic(&path, &self.history.encode()).map_err(|e| format!("{}: {e}", path.display()))
     }
@@ -2088,7 +2105,7 @@ mod tests {
             c.set_status(4, crate::quarantine::Q_FORGOTTEN).unwrap();
             assert!(c.set_status(5, Q_HELD).is_err(), "no sample 5");
             c.set_reference(1, CollectionReference { energy: -0.478_123_456_789_012_3, grid_n: Some(49), face_density: Some(1.25e-9) }).unwrap();
-            c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2] });
+            c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2], fit_id: None, flags: Default::default(), energy_std_epistemic: None });
             c.save_history().unwrap();
             assert_eq!(c.append(cs(2)), Err(REFUSE_DUPLICATE.to_string()), "an identical sample is refused");
             let mut retagged = cs(2);
@@ -2112,6 +2129,42 @@ mod tests {
         let folder = dir.join(key.slug());
         assert_eq!(SurfaceKey::from_text(&std::fs::read_to_string(folder.join("key.txt")).unwrap()).unwrap(), key);
         assert_eq!(&std::fs::read(folder.join("samples.bin")).unwrap()[..8], MAGIC);
+    }
+
+    /// Review Focus 1 (trust tightening Task 1): a `history.bin` written by a newer build (the next
+    /// history magic) is refused at the open — the collection opens, writable, with an empty audit
+    /// history and a note saying why — and `save_history` leaves the file's bytes as they were, at
+    /// that open and the next. A damaged history of this build's own version is still replaced
+    /// (the existing behaviour).
+    #[test]
+    fn a_newer_history_is_never_overwritten_by_this_reader() {
+        let dir = root("newer-history");
+        let key = prov().surface_key();
+        {
+            let (mut c, _) = Collection::open(&dir, &key).unwrap();
+            c.append(cs(0)).unwrap();
+        }
+        let path = dir.join(key.slug()).join("history.bin");
+        let mut newer = format!("ASAUDIT{}", crate::history::MAGICS.len() + 1).into_bytes();
+        newer.extend_from_slice(b" whatever a later build keeps after its magic, of any length");
+        std::fs::write(&path, &newer).unwrap();
+        let point = || AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2], fit_id: Some(3), flags: crate::history::PointFlags(5), energy_std_epistemic: Some(1e-5) };
+        for _ in 0..2 {
+            let (mut c, r) = Collection::open(&dir, &key).unwrap();
+            assert!(!c.read_only && c.history.is_empty());
+            assert!(r.notes.iter().any(|n| n.contains("history.bin") && n.contains("newer build") && n.contains("leaves")), "{:?}", r.notes);
+            c.history.push(point());
+            c.save_history().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), newer, "a newer build's history is never overwritten");
+            c.append(cs(c.samples.len())).unwrap();
+        }
+        // this build's own magic, damaged: replaced as before
+        std::fs::write(&path, b"ASAUDIT2 torn").unwrap();
+        let (mut c, r) = Collection::open(&dir, &key).unwrap();
+        assert!(r.notes.iter().any(|n| n.contains("unreadable")), "{:?}", r.notes);
+        c.history.push(point());
+        c.save_history().unwrap();
+        assert_eq!(crate::history::AuditHistory::decode(&std::fs::read(&path).unwrap()).unwrap(), c.history);
     }
 
     #[test]
@@ -2325,7 +2378,7 @@ mod tests {
         c.set_status(6, Q_SUPERSEDED).unwrap();
         c.set_status(1, Q_NONE).unwrap();
         c.set_reference(1, CollectionReference { energy: -0.478, grid_n: Some(49), face_density: Some(1e-9) }).unwrap();
-        c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2] });
+        c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2], fit_id: None, flags: Default::default(), energy_std_epistemic: None });
         c.save_history().unwrap();
     }
 
@@ -2726,7 +2779,7 @@ mod tests {
         c.set_reference(1, solved(-0.478, 49, 1e-9)).unwrap();
         c.set_reference(1, solved(-0.4785, 57, 2e-10)).unwrap();
         c.set_reference(8, CollectionReference { energy: -15.8, grid_n: Some(57), face_density: None }).unwrap();
-        c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2] });
+        c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2], fit_id: None, flags: Default::default(), energy_std_epistemic: None });
         c.save_history().unwrap();
         c.write_readme().unwrap();
         c.save_refit_times("refit\n").unwrap();

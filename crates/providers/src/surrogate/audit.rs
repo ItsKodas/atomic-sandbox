@@ -677,6 +677,10 @@ impl SurrogateKs {
             n_atoms: n,
             model_gen: self.model_gen,
             species,
+            // the trust-tightening fields (plan 2026-11-19): recorded from Task 3 on
+            fit_id: None,
+            flags: surrogate::history::PointFlags::default(),
+            energy_std_epistemic: None,
         });
         // new verdict evidence re-judges the class verdicts now, not at the next refit (user-test
         // fix 2, the controller's ruling 3: a parked scene whose fallbacks are all "similar" never
