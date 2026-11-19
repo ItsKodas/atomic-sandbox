@@ -282,10 +282,14 @@ enter P_A. A tick decides before the variance is computed and forces it.
   - A tick at a fallback needs no solve: the teacher's answer and the model's std are both at hand.
   - A tick at an answered step is an extra audit, judged by rule 8 as well.
   - **In-step ticks exist only on paths with no auditor:** the CPU in-step path and the harness.
-- **The effective cadence** is max(25, t_solve/t_step) in-envelope steps:
-  - ≈ 25 at 12 ms/step;
-  - 50–55 at 5 ms/step (solves of 130–270 ms);
-  - a trusted key's window turns over in 7500–16000 steps.
+- **The effective cadence** (rev. after the Task 7 re-review, R2) is 25 + D in-envelope steps after
+  every tick, D ≈ t_solve/t_step with an auditor (the dead time below), 0 without one:
+  - 36–48 at 12 ms/step (solves of 130–270 ms: D = 11–23);
+  - 51–79 at 5 ms/step (D = 26–54);
+  - 25 in the step (no auditor: the harness, the CPU path);
+  - a trusted key's window (300 tick points) turns over in ≈ 300 × (25 + D) = 10800–23700 steps
+    with an auditor, 7500 without — or earlier, by the 4096-point history ring, when fallbacks
+    flood it (Task 7 review M4).
 - **Cost.**
   - Wall time ≈ 0, plus contention for the GPU.
   - σ-coupling ≈ 1 %: the auditor is otherwise busy only with rule-8 audits and their bursts, at
@@ -294,7 +298,16 @@ enter P_A. A tick decides before the variance is computed and forces it.
     acceptable because the floor and the class-refused points do most of the catching.
 - **Rejected: ticks only for keys near their bound.** Choosing by nearness reads σ.
 - Rule 8's own cadence is unchanged.
-- **Amendment (Task 7 review I1, controller's ruling, 2026-11-20):** `TICK_EVERY` counts in-envelope steps from the previous tick's *completion*; steps taken while a tick's audit job is in flight do not count, so an answered tick and a refused one both start the next interval when their measurement ends, and only non-tick auditor work (rule 8, displays, references) can make a due tick skip (counted apart as `skipped_busy`).
+- **Amendment (Task 7 review I1 and re-review R1, the controller's re-ruling, 2026-11-20): an
+  outcome-independent dead time.** After *every* due tick, answered or refused, taken or skipped,
+  the count pauses for D in-envelope steps; then 25 counted steps make the next one due. D is
+  σ-blind: ⌈EMA(auditor job wall time, every job of every kind) / EMA(in-envelope step wall time,
+  every in-envelope step)⌉, 0 without an auditor; tests fix it. A due tick that finds the auditor
+  busy — an answered tick's job outliving D, or rule-8 work — is skipped and counted
+  (`skipped_busy`). (The round-1 ruling, counting from the previous tick's completion, paused only
+  after answered ticks: refused stretches were over-weighted by (25 + T)/25, T = t_solve/t_step.)
+  The diagnostic is the answered share among due ticks against the answered share of all
+  in-envelope steps (`TickCounts::population_answered / population`).
 
 **Left out of P_A**, because λ selects them:
 

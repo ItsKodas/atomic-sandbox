@@ -13617,12 +13617,16 @@ fn tick_fixture(audit_every: usize) -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
 }
 
 /// A gated auditor on the fixture's teacher (`Gated`): (the provider, the gate, its call count).
+/// The ticks' dead time is fixed at 0 (a test that needs another sets `tick_dead_fixed`).
 #[allow(clippy::type_complexity)]
 fn with_tick_auditor(s: SurrogateKs, h: &Arc<Mutex<MorseDimer>>, open: bool) -> (SurrogateKs, Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicUsize>) {
     let gate = Arc::new(std::sync::atomic::AtomicBool::new(open));
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let auditor = Gated { inner: h.clone(), open: gate.clone(), rho: 0.0, calls: calls.clone() };
-    (s.with_auditor(Box::new(auditor)), gate, calls)
+    let mut s = s.with_auditor(Box::new(auditor));
+    // a deterministic schedule: no dead time after a tick (the timed one follows wall clocks)
+    s.tick_dead_fixed = Some(0);
+    (s, gate, calls)
 }
 
 /// Waits (≤ 5 s) until the auditor has no job in flight and its answer is taken in (held for the
@@ -13759,7 +13763,7 @@ fn skipped_ticks_are_counted_and_shown() {
     }
     println!("taken {} skipped {} in the step {}", s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step());
     assert_eq!((s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step()), (0, 100, 0));
-    assert_eq!(s.tick_counts(), TickCounts { skipped_busy: 100, answered_due: 100, answered_skipped_busy: 100, ..TickCounts::default() }, "skipped because the auditor was busy (with other work), every one at an answered step");
+    assert_eq!(s.tick_counts(), TickCounts { skipped_busy: 100, due: 100, answered_due: 100, answered_skipped_busy: 100, population: 2500, population_answered: 2500, ..TickCounts::default() }, "skipped because the auditor was busy (with other work), every one at an answered step");
     assert_eq!((calls(&h), s.audit_history().recorded(), auditor_calls.load(SeqCst)), (calls0, 0, 0));
     gate.store(true, SeqCst);
 }
@@ -13912,7 +13916,7 @@ fn an_abandoned_tick_counts_as_skipped() {
         if forget {
             s.forget();
             assert_eq!((s.ticks_taken(), s.ticks_skipped()), (0, 1), "abandoned: skipped");
-            assert_eq!(s.tick_counts(), TickCounts { lost: 1, answered_due: 1, ..TickCounts::default() }, "lost, not busy");
+            assert_eq!(s.tick_counts(), TickCounts { lost: 1, due: 1, answered_due: 1, population: 1, population_answered: 1, ..TickCounts::default() }, "lost, not busy");
         }
         gate.store(true, SeqCst);
         settle(&mut s);
@@ -13998,73 +14002,67 @@ fn a_key_locked_by_its_tail_inflation_keeps_measuring_on_real_ticks() {
 
 // ---- Task 7 fix round 1 (review I1, M1, M2) ----
 
-/// The Task 7 review's I1 (the controller's ruling): `TICK_EVERY` counts in-envelope steps from the
-/// previous tick's **completion** — a step taken while a tick's audit job is in flight is not
-/// counted — so the tick-eligible steps do not depend on the previous tick's σ outcome. An auditor
-/// whose every solve takes 40 steps (held at its gate, longer than 25), 300 in-envelope steps, no
-/// rule 8:
-/// - σ ×1: every tick is answered, so it is a job on the auditor, completed when its answer is
-///   handled 40 steps later (the poll at the start of that step's `evaluate`, so that step is the
-///   first counted);
-/// - σ ×10: every tick is refused, so it is served at its own step (no job), completed there.
+/// The Task 7 re-review's R1 and the controller's re-ruling: after **every** due tick, answered or
+/// refused, the count pauses for a σ-blind dead time D, so the ticks sample answered steps at their
+/// share of the in-envelope population. The reviewer's check, on a slow-correlation schedule: σ ×1
+/// (every step answered) for 500 steps, then ×10 (every step refused) for 500, four times over
+/// (population share 0.5 exactly); an auditor whose every solve is held 40 steps (T); a fixed
+/// D = 40 ≥ T. The answered share among the ticks taken matches the population's within 0.05, and
+/// no tick is skipped (no job outlives D).
+/// - Under the round-1 rule (counting from the previous tick's completion, no dead time) an
+///   answered tick is followed by T uncounted steps and a refused one by none, so refused stretches
+///   are over-weighted by (25 + T)/25: the share is 0.29 (the re-review's simulation; its slow
+///   limit 0.278).
+/// - Under the original rule (count every step, no dead time) the tick due 25 steps after an
+///   answered one finds its job in flight and is skipped: 0.33.
 ///
-/// In both runs every tick is the 25th counted step after the previous completion (the first the
-/// 25th step of the run), and none is skipped. Under the old count (in-flight steps counted) the
-/// ×1 run's next tick falls due 25 steps after its predecessor, while that job is still in flight:
-/// skipped — answered ticks starved their successors, refused ones did not.
+/// Both fail this test (mutations in the Task 7 report). The diagnostic counters agree: `due`,
+/// `answered_due`, `population` and `population_answered` give the same two shares.
 #[test]
-fn a_tick_counts_from_the_previous_ticks_completion() {
+fn a_tick_samples_answered_steps_at_their_population_share() {
     use std::sync::atomic::Ordering::SeqCst;
-    use surrogate::history::PointFlags;
-    let hold = 40;
-    let mut intervals = Vec::new();
-    for scale in [1.0, 10.0] {
-        let (s, h) = tick_fixture(0);
-        let (mut s, gate, _) = with_tick_auditor(s, &h, false);
-        scale_epistemic(&mut s, scale);
-        s.last_variance = None;
-        let (mut ticks, mut completions, mut gaps) = (Vec::new(), Vec::new(), Vec::new());
-        let mut release_at = None;
-        for i in 0..300 {
-            if release_at == Some(i) {
-                // the job's solve ends: its answer arrives and waits for this step's evaluate
-                gate.store(true, SeqCst);
-                settle(&mut s);
-                gate.store(false, SeqCst);
-                release_at = None;
-            }
-            let in_flight = s.tick_in_flight;
-            let (src, notes, points) = tick_step(&mut s, &h2(1.5 + 0.1 * (i % 3) as f64));
-            if in_flight && !s.tick_in_flight {
-                completions.push(i); // handled before this step's decision: the first counted step
-            }
-            let dispatched = notes.iter().any(|n| n.starts_with("surrogate calibration tick dispatched"));
-            let at_fallback = points.iter().any(|p| p.flags.has(PointFlags::TICK) && matches!(p.kind, surrogate::history::PointKind::Fallback { .. }));
-            if dispatched || at_fallback {
-                assert_eq!(src == Source::Surrogate, scale == 1.0, "step {i}: {notes:?}");
-                // counted steps since the previous completion, this one included
-                let from = match (scale == 1.0, ticks.last(), completions.last()) {
-                    (_, None, _) => 0,
-                    (true, Some(_), Some(&c)) => c,
-                    (false, Some(&t), _) => t + 1,
-                    (true, Some(_), None) => unreachable!("a second tick before the first completed"),
-                };
-                gaps.push(i + 1 - from);
-                ticks.push(i);
-                if dispatched {
-                    release_at = Some(i + hold);
-                }
-            }
+    use surrogate::history::{PointFlags, PointKind};
+    let (hold, period, n) = (40usize, 1000usize, 4000usize);
+    let (s, h) = tick_fixture(0);
+    let (mut s, gate, _) = with_tick_auditor(s, &h, false);
+    s.tick_dead_fixed = Some(hold as u64);
+    let (mut scaled, mut release_at) = (false, None);
+    let (mut answered_ticks, mut refused_ticks) = (Vec::new(), Vec::new());
+    for i in 0..n {
+        let answered_stretch = i % period < period / 2;
+        if answered_stretch == scaled {
+            scale_epistemic(&mut s, if scaled { 0.1 } else { 10.0 });
+            scaled = !scaled;
+            s.last_variance = None;
         }
-        println!("×{scale}: ticks at {ticks:?}; completions {completions:?}; counted steps per tick {gaps:?}; {:?}", s.tick_counts());
-        assert!(ticks.len() >= 4, "×{scale}: {ticks:?}");
-        assert!(gaps.iter().all(|&g| g == TICK_EVERY), "×{scale}: every tick is the 25th counted step after the previous completion: {gaps:?}");
-        assert_eq!(s.ticks_skipped(), 0, "×{scale}: no tick waits on its predecessor");
-        intervals.push(gaps);
-        gate.store(true, SeqCst);
+        if release_at == Some(i) {
+            // the job's solve ends: its answer arrives and waits for this step's evaluate
+            gate.store(true, SeqCst);
+            settle(&mut s);
+            gate.store(false, SeqCst);
+            release_at = None;
+        }
+        let (src, notes, points) = tick_step(&mut s, &h2(1.5 + 0.1 * (i % 3) as f64));
+        assert_eq!(src == Source::Surrogate, answered_stretch, "step {i}: the schedule ({notes:?})");
+        if notes.iter().any(|n| n.starts_with("surrogate calibration tick dispatched")) {
+            answered_ticks.push(i);
+            release_at = Some(i + hold);
+        }
+        if points.iter().any(|p| p.flags.has(PointFlags::TICK) && matches!(p.kind, PointKind::Fallback { .. })) {
+            refused_ticks.push(i);
+        }
     }
-    let n = intervals[0].len().min(intervals[1].len());
-    assert_eq!(intervals[0][..n], intervals[1][..n], "answered and refused ticks: the same counted steps");
+    gate.store(true, SeqCst);
+    let c = s.tick_counts();
+    let taken = answered_ticks.len() + refused_ticks.len();
+    let tick_share = answered_ticks.len() as f64 / taken as f64;
+    let population_share = c.population_answered as f64 / c.population as f64;
+    let due_share = c.answered_due as f64 / c.due as f64;
+    println!("D = {hold}, T = {hold}: {} answered and {} refused ticks, share {tick_share:.3}; due share {due_share:.3}; population share {population_share:.3}; {c:?}", answered_ticks.len(), refused_ticks.len());
+    assert_eq!((c.population, c.population_answered), (n as u64, (n / 2) as u64), "the population: every step in-envelope, half answered");
+    assert!((tick_share - population_share).abs() <= 0.05, "the answered share among ticks {tick_share:.3} vs the population's {population_share:.3}");
+    assert!((due_share - population_share).abs() <= 0.05, "the diagnostic's due share {due_share:.3}");
+    assert_eq!((s.ticks_skipped(), c.due, taken as u64 + u64::from(s.tick_in_flight)), (0, c.due, c.due), "no job outlives D: every due tick taken");
 }
 
 /// The Task 7 review's M2: a cancelled teacher solve on a counted step is a step that did not
@@ -14090,7 +14088,7 @@ fn a_cancelled_tick_is_retried_as_the_tick() {
         assert!(points.iter().any(|p| p.flags.has(PointFlags::TICK)), "×{scale}: the retry is the tick: {points:?}");
         assert_eq!((s.tick_steps, s.ticks_taken(), s.ticks_skipped()), (TICK_EVERY as u64, 1, 0));
         let answered = u64::from(scale == 1.0);
-        assert_eq!(s.tick_counts(), TickCounts { recorded: 1, in_step: answered, answered_due: answered, ..TickCounts::default() }, "×{scale}: booked once");
+        assert_eq!(s.tick_counts(), TickCounts { recorded: 1, in_step: answered, due: 1, answered_due: answered, population: 1, population_answered: answered, ..TickCounts::default() }, "×{scale}: booked once");
     }
 }
 
@@ -14111,6 +14109,6 @@ fn a_box_affected_tick_is_taken_without_a_point() {
     let (_, notes, points) = tick_step(&mut s, &h2(1.6));
     println!("{notes:?}; {:?}", s.tick_counts());
     assert!(points.is_empty() && notes.iter().any(|n| n.contains("box-affected") && n.contains("a calibration tick: rule 8's cadence is unchanged")), "{notes:?}");
-    assert_eq!(s.tick_counts(), TickCounts { unrecorded: 1, answered_due: 1, ..TickCounts::default() });
+    assert_eq!(s.tick_counts(), TickCounts { unrecorded: 1, due: 1, answered_due: 1, population: 2, population_answered: 2, ..TickCounts::default() });
     assert_eq!((s.ticks_taken(), s.ticks_skipped(), s.audit_due), (0, 0, false));
 }

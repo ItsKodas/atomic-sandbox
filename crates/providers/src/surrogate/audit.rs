@@ -829,6 +829,8 @@ impl SurrogateKs {
         match a.answers.try_recv() {
             Ok(ans) => {
                 a.busy = None;
+                // every job's wall time, whatever its kind and outcome: the ticks' dead time
+                self.time_auditor_job(ans.ms);
                 Some(ans)
             }
             Err(mpsc::TryRecvError::Empty) => None,

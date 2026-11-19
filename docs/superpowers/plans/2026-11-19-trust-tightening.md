@@ -607,11 +607,13 @@ Moved pins are physics-reviewed.
   `teaching_around_a_blocker_restores_its_class` must **not** move (spec §5). If it does, that is a
   finding to report, not a re-pin.
 - [ ] **Step 3b: Task 7's carried checks (Task 7 review I1, M4).**
-  - **I1:** in the repro's tick lines, compare the take rate of ticks due at answered steps against
-    those due at refused steps (`SurrogateKs::tick_counts`: recorded, unrecorded, skipped_busy,
-    lost, and `answered_due` / `answered_skipped_busy` for the answered side). After the I1 fix
-    only non-tick auditor work (rule 8) can skip a tick; a materially lower take rate at answered
-    steps is a σ-coupling to report.
+  - **I1/R1 (the dead time):** in the repro's tick lines (`SurrogateKs::tick_counts`), compare the
+    **population** answered share, `population_answered / population` (every in-envelope step), with
+    the answered share among **due** ticks, `answered_due / due`, and among taken ticks. Also
+    compare the take rates at answered steps (`answered_skipped_busy / answered_due`) and refused
+    ones. A due share materially off the population's is a σ-coupling of which steps become ticks;
+    a lower take rate at answered steps is one through skips (a job outliving D, or rule 8). Report
+    D (the timed dead time) beside them.
   - **M4:** check whether a parked locked key's λ_T lifts by the 4096-point history ring (code-24
     points evicting the bad tick) before the window ages it, and report which.
 - [ ] **Step 4: The measurements.**
