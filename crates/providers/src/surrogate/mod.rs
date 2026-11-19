@@ -1475,12 +1475,20 @@ pub struct SurrogateKs {
     model_gen: u64,
     /// The fit id (trust tightening, spec 2026-11-18 §3): the id a history point records for the
     /// fit that judged it (`record_history_point`). Bumped only by a refit that solved new
-    /// coefficients — to max(this, the history's largest id) + 1, so ids stay unique across
-    /// sessions (`refit`) — never by a policy change, a forget, a restore (it brings back the
-    /// restored fit's own id), an install (the file's id, else its history's largest), an attach
-    /// (the collection history's largest; the attach's own refit re-solves that fit) or a fork
-    /// (the copy's refit brings its id back at the install). 0 = no fit yet.
+    /// coefficients from new teacher data — to max(this, the history's largest id) + 1, so ids
+    /// stay unique across sessions (`refit`; `fit_id_samples`) — never by a policy change, a
+    /// forget, a restore (it brings back the restored fit's own id), an install (the file's id,
+    /// else its history's largest), an attach (the collection history's largest) or a fork (the
+    /// copy's refit brings its id back at the install). 0 only while no model has ever stood: a
+    /// standing model's id is always ≥ 1 (a legacy install or attach with no id on record takes
+    /// 1), so a point's `Some(0)` never occurs and an absent id is `None`, never 0.
     fit_id: u64,
+    /// The fit id's watermark (fix round 1, I1): the store length when the fit id was last taken
+    /// (the fitted prefix an install brought, the collection's length at an attach; 0 after a
+    /// forget). A refit takes a new id only when its standing fit holds a sample at or past it —
+    /// new teacher data — so forgetting and restoring a sample, a recovery's holds and releases or
+    /// a degree-cap retry re-solve old data and add no fit. It can only under-count.
+    fit_id_samples: usize,
     /// (`accumulated`, quarantine codes) when the standing fit was installed: what the training
     /// views call `Fitted` (Task 4 review, the released-sample ruling). A readout only.
     fit_members: (usize, Vec<u8>),
@@ -1800,6 +1808,7 @@ impl SurrogateKs {
             last_audit_fit: 0,
             model_gen: 0,
             fit_id: 0,
+            fit_id_samples: 0,
             fit_members: (0, Vec::new()),
             curve_cache: None,
             pending_notes: Vec::new(),

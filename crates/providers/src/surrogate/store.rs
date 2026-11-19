@@ -122,6 +122,8 @@ impl SurrogateKs {
         self.species_dirty = false;
         self.model = None;
         self.model_gen += 1;
+        // the fit id stays (the next fit takes a new one); every sample from here on is new data
+        self.fit_id_samples = 0;
         self.fit_members = (0, Vec::new());
         self.curve_cache = None;
         self.report = None;
@@ -446,9 +448,10 @@ impl SurrogateKs {
         // as numbers (`calibrate`, "The evidence window"; M8a Task 2 fix round 2)
         let newest = audit_history.iter().map(|p| p.model_gen).chain(class_memory.iter().filter_map(|m| m.2)).max().unwrap_or(0);
         // the fit id (spec 2026-11-18 §3: an install adds no fit): the file's own, else — a file
-        // written before the key — its history's largest; a rebuild below re-solves the file's fit
-        // and keeps it (`fit_store` stamps nothing: only a `refit` does)
-        self.fit_id = fit_id.unwrap_or_else(|| audit_history.max_fit_id().unwrap_or(0));
+        // written before the key — its history's largest, else 1 (a standing model's id is ≥ 1); a
+        // rebuild below re-solves the file's fit and keeps it (`fit_store` stamps nothing: only a
+        // `refit` does). Its watermark is set once the fit stands (below)
+        self.fit_id = fit_id.unwrap_or_else(|| audit_history.max_fit_id().unwrap_or(0)).max(1);
         self.audit_history = audit_history;
         self.model = Some(model);
         self.report = Some(report);
@@ -531,6 +534,10 @@ impl SurrogateKs {
             // held out already (quarantined, box-excluded) or not fitted yet: the fit stands
             self.note_lone_held_out("model file", lone, lone_cut);
         }
+        // the fit id's watermark (fix round 1, I1): the fit that stands is the file's — its fitted
+        // prefix (after a rebuild, every stored sample) is old data; samples the file holds past
+        // it were taught but not fitted, so the refit that fits them is a new fit
+        self.fit_id_samples = self.accumulated;
         // round 1, SHOULD-2: the failed audits it still held, re-judged on this fit (not counted
         // as a refit's re-judgement)
         let n_store = self.samples();

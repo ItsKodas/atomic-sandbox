@@ -205,6 +205,7 @@ impl SurrogateKs {
         f.model_gen = self.model_gen;
         // the carried model's id: the copy's refit takes the next one, a fork itself none
         f.fit_id = self.fit_id;
+        f.fit_id_samples = self.fit_id_samples;
         f.fit_members = self.fit_members.clone();
         f.fence_votes = self.fence_votes.clone();
         f.fence_kept = self.fence_kept.clone();
@@ -447,6 +448,7 @@ impl SurrogateKs {
         // history held, and the live points recorded meanwhile carry the id that stood (the
         // conflict test saw no live change of the model)
         self.fit_id = f.fit_id;
+        self.fit_id_samples = f.fit_id_samples;
         self.recovery = f.recovery.take();
         self.last_fit_error = f.last_fit_error.take();
         self.teach_rounds = std::mem::take(&mut f.teach_rounds);

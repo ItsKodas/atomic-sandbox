@@ -635,13 +635,21 @@ Moved pins are physics-reviewed.
     (the recovery's trials and restores) do not count, and a refit whose standing model has the
     same coefficients, bit for bit, as the one before is not a new fit (the spec's "solved new
     coefficients"; a user's repeated Refit or a refit whose new samples are all held out adds none).
+  - New coefficients count only from new teacher data (fix round 1, review I1): a watermark
+    `fit_id_samples` (the store length when the id was last taken) — a refit takes an id only when
+    its standing fit holds a member at or past it, then moves the watermark to the store length.
+    A forget + restore, the recovery's holds and releases or a degree-cap retry re-solve old data
+    and add no fit. Set at an install (the file's fitted prefix), an attach (the collection's
+    length), a restore (the saved value) and a forget (0). It can only under-count.
+  - A standing model's id is ≥ 1 (fix round 1, M1): a legacy install (no key, no id in the history)
+    takes 1, and a first fit — a collection with no id on record included — takes ≥ 1. So a
+    point's `Some(0)` never occurs; Task 3 on, `None` alone means absent.
   - An install's rebuild (`fit_store`, lone atoms or a membership mismatch) stamps nothing: the
     file's id stands.
-  - The attach's own refit keeps the collection history's largest id (Review Focus 5: a re-attach
-    or a re-spawn adds no fit); the next refit takes the one after. If the collection grew after its
-    newest audited fit, that refit is a new fit under the old id: an under-count, the conservative
-    side of the floor. An attach that cannot fit at once leaves its first later refit to take the
-    next id even when it re-solves that fit (an over-count by one per such re-attach).
+  - An attach keeps the collection history's largest id (Review Focus 5: a re-attach or a re-spawn
+    adds no fit), its own refit or a later one of what it holds included (the watermark); a refit
+    with new samples takes the next. If the collection grew after its newest audited fit, its fit is
+    a new one under the old id: an under-count, the conservative side of the floor.
   - The sidecar's `fit_id` header key is optional and bumps no version (every reader ignores header
     keys it does not read); a file without it installs at its history's largest id.
 - **The magic values read (Task 1 step 1).**

@@ -11840,15 +11840,17 @@ fn key_class_stats_match_the_verdicts_inputs() {
 
 // ---- the fit id (trust tightening Task 2; spec 2026-11-18 §3, plan 2026-11-19 Review Focus 5) ----
 
-/// Records one judged audit at `scene` through the asynchronous path (`judge_audit`), the answer
-/// `teacher`'s: one history point of the current fit.
+/// Records one audit point at `scene` (`record_history_point`, where every judged audit and
+/// fallback is recorded): the current model's prediction against `teacher`'s answer — one history
+/// point of the current fit, with no sample kept (so a later refit has no new data from it).
 fn record_audit(s: &mut SurrogateKs, scene: &Scene, teacher: &mut dyn ForceProvider) {
     let t = teacher.evaluate(scene, &mut never()).unwrap();
-    let prov = s.provenance_for(scene);
-    let job = AuditJob { scene: scene.clone(), prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
+    let (pos, z) = pos_z(scene);
+    let p = s.model().unwrap().predict(&pos, &z, true).unwrap();
+    let stds = (p.energy_std.unwrap(), p.force_std.clone().unwrap(), p.force_std_epistemic.clone().unwrap());
     let before = s.audit_history().recorded();
-    s.judge_audit(job, t.energy, t.forces.clone(), None, None, None, 1.0, Some(10), None);
-    assert_eq!(s.audit_history().recorded(), before + 1, "the audit is recorded: {:?}", s.user_notes);
+    s.record_history_point(surrogate::history::PointKind::Audit, &pos, &z, Some((stds.0, &stds.1[..], &stds.2[..])), p.energy, &p.forces, t.energy, &t.forces, false, false, false);
+    assert_eq!(s.audit_history().recorded(), before + 1, "the point is recorded");
 }
 
 /// The distinct fit ids the history's points carry (what the floor's n_fit counts), and whether
@@ -11889,7 +11891,7 @@ fn a_refit_advances_the_fit_id_and_nothing_else_does() {
     assert_eq!(s.fit_id(), 1, "a refit that re-solved the same coefficients");
     record_audit(&mut s, &h2(1.5), &mut MorseDimer::h2());
     assert_eq!(s.audit_history().iter().last().unwrap().fit_id, Some(1), "a point carries the fit that judged it");
-    // new samples (the audit's answer is one): one refit, one new id
+    // new samples: one refit, one new id
     add_dimers(&mut s, &[1.5, 1.7, 1.9, 2.1], 9);
     s.refit().unwrap();
     assert_eq!(s.fit_id(), 2);
@@ -11939,11 +11941,15 @@ fn reloading_reattaching_and_respawning_add_no_fit() {
     let st = s.save_state();
     s.restore_state(st);
     assert_eq!(s.fit_id(), id, "a restore");
+    s.refit().unwrap();
+    assert_eq!(s.fit_id(), id, "a refit after the restore, with no new samples");
     assert_eq!(s.fork_for_refit().fit_id(), id, "a fork carries the model's id");
     for k in 0..12 {
         s.set_policy(FallbackPolicy { audit_every: k % 4, never_fallback: k % 2 == 1, ..FallbackPolicy::default() });
     }
     assert_eq!(s.fit_id(), id, "12 policy changes");
+    s.refit().unwrap();
+    assert_eq!(s.fit_id(), id, "a refit after the policy changes, with no new samples");
     record_audit(&mut s, &h2(1.7), &mut MorseDimer::h2());
     assert_eq!(fit_ids(&s), ids);
 
@@ -12014,4 +12020,67 @@ fn fit_ids_stay_unique_across_an_install() {
     add_dimers(&mut ahead, &[1.5, 1.7, 1.9, 2.1], 9);
     ahead.refit().unwrap();
     assert_eq!(ahead.fit_id(), 46);
+}
+
+/// Fix round 1 (review I1): fits cannot be manufactured from old data. Forgetting a fitted sample
+/// and refitting (new coefficients B), then restoring it and refitting (A again), twelve times
+/// over, solves new coefficients 24 times from no new teacher data: the fit id stays. A refit after
+/// one new kept sample takes one new id, and the cycles after it none again.
+#[test]
+fn forget_restore_cycles_manufacture_no_fit() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let id = s.fit_id();
+    assert_eq!(id, 1);
+    let cycle = |s: &mut SurrogateKs, i: usize| {
+        let before = s.model().unwrap().coeffs.clone();
+        s.forget_sample(s.sample_id(i).unwrap()).unwrap();
+        s.refit().unwrap();
+        assert_ne!(s.model().unwrap().coeffs, before, "premise: the refit without sample {i} solved other coefficients");
+        s.restore_sample(s.sample_id(i).unwrap()).unwrap();
+        s.refit().unwrap();
+    };
+    for k in 0..12 {
+        cycle(&mut s, 3 + 2 * k);
+        assert_eq!(s.fit_id(), id, "cycle {k}: no new teacher data, no new fit");
+    }
+    add_dimers(&mut s, &[1.63], 12);
+    s.refit().unwrap();
+    assert_eq!(s.fit_id(), id + 1, "one new kept sample: one new fit");
+    for k in 0..3 {
+        cycle(&mut s, 4 + 2 * k);
+        assert_eq!(s.fit_id(), id + 1);
+    }
+}
+
+/// Fix round 1 (review M1): a standing model's id is never 0 — a file without a fit id and with no
+/// id in its history installs at 1, and a collection with no id on record takes 1 at the attach's
+/// fit; its refit of what it holds keeps it.
+#[test]
+fn a_legacy_install_or_attach_stands_at_fit_id_one() {
+    let (s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let path = std::env::temp_dir().join(format!("fit-id-legacy-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let file = surrogate::sidecar::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(file.audit_history.max_fit_id().is_none());
+    let mut legacy = installed(surrogate::Sidecar { fit_id: None, ..file.clone() });
+    assert_eq!(legacy.fit_id(), 1);
+    record_audit(&mut legacy, &h2(1.5), &mut MorseDimer::h2());
+    assert_eq!(legacy.audit_history().iter().last().unwrap().fit_id, Some(1));
+    assert_eq!(installed(surrogate::Sidecar { fit_id: Some(0), ..file }).fit_id(), 1, "a key of 0 too");
+    // a collection whose history carries no id (written before the key)
+    let dir = collection_root("fit-id-legacy");
+    let (mut c, _t) = pair_student();
+    c.attach_collection(&dir, &h2(1.4)).unwrap();
+    c.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));
+    let mut rng = StdRng::seed_from_u64(31);
+    for i in 0..40 {
+        c.evaluate(&h2_at(1.1 + 1.2 * i as f64 / 39.0, &mut rng), &mut never()).unwrap();
+    }
+    SurrogateKs::forget(&mut c);
+    c.attach_collection(&dir, &h2(1.4)).unwrap();
+    assert!(c.model().is_some() && c.audit_history().max_fit_id().is_none(), "{:?}", c.no_model());
+    assert_eq!(c.fit_id(), 1, "the attach's fit of a collection with no id on record");
+    c.refit().unwrap();
+    assert_eq!(c.fit_id(), 1, "its refit of what it holds");
 }

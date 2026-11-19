@@ -485,8 +485,9 @@ pub(super) struct FitState {
     /// only when they were that fit's (`restore_state`).
     pub(super) loo_ratios: Option<LooRatios>,
     pub(super) model_gen: u64,
-    /// The saved fit's id: a restore brings it back (spec 2026-11-18 §3).
+    /// The saved fit's id and its watermark: a restore brings them back (spec 2026-11-18 §3).
     pub(super) fit_id: u64,
+    pub(super) fit_id_samples: usize,
 }
 
 impl SurrogateKs {
@@ -1318,16 +1319,20 @@ impl SurrogateKs {
         let (id_before, coeffs_before) = (self.fit_id, self.model.as_ref().map(coefficient_fingerprint));
         let r = self.refit_inner();
         // the fit id (spec 2026-11-18 §3): one new id per refit whose standing model holds new
-        // coefficients — past the history's ids, so ids stay unique across sessions (plan
-        // 2026-11-19, the rulings) — whatever its intermediate fits did (the recovery's trial fits
+        // coefficients solved from new teacher data — a member at or past the watermark
+        // `fit_id_samples` (fix round 1, I1: a forget + restore, a recovery's holds and releases
+        // re-solve old data) — past the history's ids, so ids stay unique across sessions (plan
+        // 2026-11-19, the rulings), whatever its intermediate fits did (the recovery's trial fits
         // and restores); a refit that re-solved the same coefficients, or left the model that
-        // stood, is not a new fit
+        // stood, is not a new fit. A model never stands at 0 (a first model takes ≥ 1)
         let coeffs_after = self.model.as_ref().map(coefficient_fingerprint);
-        self.fit_id = if coeffs_after.is_some() && coeffs_after != coeffs_before {
-            id_before.max(self.audit_history.max_fit_id().unwrap_or(0)) + 1
+        let new_data = self.fit_member_indices().any(|i| i >= self.fit_id_samples);
+        if coeffs_after.is_some() && ((coeffs_after != coeffs_before && new_data) || id_before == 0) {
+            self.fit_id = id_before.max(self.audit_history.max_fit_id().unwrap_or(0)) + 1;
+            self.fit_id_samples = self.samples();
         } else {
-            id_before
-        };
+            self.fit_id = id_before;
+        }
         let counts = if self.refit_fork { self.refit_counts } else { self.refit_counts.take() };
         // the refit history (a copy's is the live provider's to record, at the install)
         if let (false, Ok(_), Some(c)) = (self.refit_fork, r.as_ref(), counts) {
@@ -1835,6 +1840,7 @@ impl SurrogateKs {
             loo_ratios: self.loo_ratios.clone(),
             model_gen: self.model_gen,
             fit_id: self.fit_id,
+            fit_id_samples: self.fit_id_samples,
         }
     }
 
@@ -1861,6 +1867,7 @@ impl SurrogateKs {
         self.deferred_trust = s.deferred_trust;
         // the restored fit's own id, never a new one (spec 2026-11-18 §3)
         self.fit_id = s.fit_id;
+        self.fit_id_samples = s.fit_id_samples;
         self.model_gen += 1; // a view cache key: the model moved back
         // the restored model is the saved one: its leave-one-out ratios, when the cache held that
         // fit's, are this generation's (`fit_members` is restored with it; re-checked at every read)

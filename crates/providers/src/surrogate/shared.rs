@@ -310,10 +310,14 @@ impl SurrogateKs {
         self.audit_history = c.history.clone();
         self.model_gen = self.model_gen.max(newest) + 1;
         // the fit id (spec 2026-11-18 §3: an attach adds no fit): the collection history's
-        // largest — the newest fit its points name; the attach's own refit below re-solves the
-        // collection's samples and keeps it, a later one takes the next
-        let fit_base = c.history.max_fit_id().unwrap_or(0);
-        self.fit_id = fit_base;
+        // largest — the newest fit its points name — and the watermark at the collection's length,
+        // so a refit of what it holds (the attach's own below, or a later one) keeps that id and
+        // only one with new samples takes the next (`refit`; a collection with no id on record
+        // takes 1 at its first fit: a standing model's id is ≥ 1). Should the collection have grown
+        // after its newest audited fit, its fit is a new one under that fit's id: an under-count,
+        // the conservative side of the floor
+        self.fit_id = c.history.max_fit_id().unwrap_or(0);
+        self.fit_id_samples = n;
         let slug = c.key.slug();
         // the collection's refit history for the time estimate (`sim::refit_eta`; none on file:
         // the session's stands, and is written with the next refit)
@@ -368,11 +372,6 @@ impl SurrogateKs {
             if let Err(e) = SurrogateKs::refit(self) {
                 self.last_fit_error = Some(e.to_string());
             }
-            // part of the attach, not a new fit (Review Focus 5: a re-attach or a worker's
-            // re-spawn must not manufacture fits). Should the collection have grown after its
-            // newest audited fit, this fit is a new one under that fit's id: an under-count, the
-            // conservative side of the floor
-            self.fit_id = fit_base;
         }
         Ok(())
     }
