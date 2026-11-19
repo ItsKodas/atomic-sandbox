@@ -382,11 +382,104 @@
 //! class: the teach prompt after `TEACH_PROMPT_STREAK` class fallbacks, or moving the scene.
 //! Measured on the Morse fixtures: a pair class refused for one outlier (LOO max 1.08×) now enters
 //! after 120 fallback steps — the 12th fit — instead of 10.
+//!
+//! # The tail-aware inflations (trust tightening, spec 2026-11-18 §4; plan Task 5)
+//!
+//! λ_sum (above) is a ratio of sums: it is dominated by the high-std points and cannot see a
+//! confident point's large error — the hot run's 4.48× answer needs λ ≈ 7.7 to be refused (spec
+//! §4; its std is not in the log), and with such an atom at s = 0.13 b among 80 benign points
+//! λ_sum is 1.21 (`the_tail_inflation_refuses_the_measured_tail`, where λ_T is 7.69). λ_T (forces)
+//! and λ_E (energy) ask the question rule 6/7 answer, of exactly the
+//! measured atoms (points) those rules would admit. Pure functions of the history's **answer
+//! sample** P_A ([`in_answer_sample`]) and the policy's bounds; they decide nothing here (rules 6
+//! and 7 read them from Task 6 on, as λ_F(j) = max(λ_sum(k), λ_T(k)) and max(max_j λ_F(j),
+//! max_k λ_E(k)) on σ_E,epi/N). All quantities are ratios, no unit enters:
+//!
+//! ```text
+//! forces, per P_A atom j of the key (bound units, b_j = force_bound(|F_t,j|) = min(max(2e-3, 10 %|F_t,j|), 1e-2) Ha/Bohr):
+//!   r_j = s_j / b_j,   s_j = σ_epi,j/√3       (the epistemic std per component — rule 6's number, uninflated)
+//!   e_j = ‖F_t,j − F_m,j‖/√3 / b_j            (the measured error per component)
+//! energy, per P_A point p holding the key (tier units, tier = energy_std_per_atom = 1e-3 Ha/atom; N_p its atoms):
+//!   r_p = σ_E,epi,p / N_p / tier,   e_p = |E_t − E_m| / N_p / tier      (the aleatoric floor not subtracted)
+//!
+//! A(λ) = { items with λ·r ≤ 1 }                 the measured items rule 6 (7) would admit at factor λ
+//! A good  ⇔  max_A e ≤ M                        M = WORST_ATOM = 3 for λ_T, ENERGY_MAX = 1 (1× the tier) for λ_E
+//!         ∧  (A meets the floor ⇒ √( Σ_{p∈A} ē_p² / n_A ) · (1 + 1/√(2 n_A)) ≤ ENTER)
+//!            ē_p² = the mean of e_j² over p's atoms in A (one draw per point; λ_E: e_p² itself),
+//!            n_A = the points with an item in A; the floor: ≥ FLOOR_FITS distinct fits and ≥ FLOOR_POINTS points
+//! λ = min{ λ ≥ 1 : A(λ′) good for every λ′ ≥ λ }
+//! ```
+//!
+//! **The one pass.** Sorted by r ascending, the items with r ≤ 1 form groups of equal r, and every
+//! A(λ), λ ≥ 1, is a prefix P_m of whole groups (P_m grows as λ falls; A(1) = every item with
+//! r ≤ 1). Let m* be the largest m with P_1 … P_m all good. If m* is every group, λ = 1. Else the
+//! first bad prefix P_{m*+1} must be excluded: λ·r_{m*+1} > 1, so λ = the next float above
+//! 1/r_{m*+1} (fl(1/r) is within half an ulp of 1/r, its successor strictly above), and ∞ when
+//! r_{m*+1} = 0 — no finite factor excludes an atom whose std is 0. Goodness is not monotone in
+//! the prefix (a later benign group can bring the rms back), which is why the *first* bad prefix
+//! decides: "for every λ′ ≥ λ". The max is a running max; the rms a compensated running sum of the
+//! per-point means, each point's old mean taken out and its new one put in as its atoms join; the
+//! floor is monotone in the set, so its first prefix is found by bisection. One sort and one pass.
+//!
+//! **Why the rms only at the floor** (the spec's addition to the review's definition): below it a
+//! single admitted atom at 0.8× the bound would fail the rms and make λ_T = ∞ — the knife edge of
+//! one draw. The max condition holds at every size. **Why bound (tier) units**: only errors that
+//! matter to the policy inflate — a harmless confident point (e = 0.3 b at r = 0.02, a mean of
+//! ratios 15) leaves λ_T = 1 (`a_harmless_confident_point_does_not_inflate`). **Why 1× the tier for
+//! λ_E** (rev. 2): the gate checks every answer's energy at 1× the tier, so an admitted energy
+//! beyond it is an answer already called wrong; rev. 1's 4.53 never fired on the hot run's
+//! energy-only failures (e_p 1.03–1.39), and their rms (≈ 0.26, below the floor anyway) gives 1.
+//!
+//! **NaN and zero (M1).** An item with e = r = 0 adds nothing: not to the max, an rms, a point
+//! count or the floor (it is no draw — counted, it would dilute a failing rms). Any NaN r or e in
+//! the sample, admitted or not, gives NaN (the inflation is undefined; rule 6/7 refuse a NaN
+//! factor). An infinite error is the worst item (∞ at r = 0, else the next float above 1/r). An
+//! item with r > 1 (r = ∞ included) is never admitted at λ ≥ 1 and decides nothing.
+//!
+//! **What it does not do** (C1, change 3): it bounds the tail *of what was measured*. An answer at
+//! a geometry like none in P_A is still unmeasured; rule 5's envelope and novelty are for that.
+//!
+//! # The answer sample P_A: chosen without reading σ or λ (spec §4, the self-reference guard)
+//!
+//! ```text
+//! p ∈ P_A  ⇔  ¬FENCED ∧ ¬NOVEL ∧ ( TICK ∨ (CADENCE_FRESH ∧ class-refused(p)) )
+//! class-refused(p)  ⇔  p is a fallback the class rule (4b) named: codes 5, 6 (the class codes) or 21 (the class with rule 6/7 failing too)
+//! ```
+//!
+//! The selection reads the point's flags word and kind only — never its stds, its errors or any λ.
+//! (i) **Class-refused in-envelope steps**: the class verdict is decided by measured errors and the
+//! LOO, never by this step's σ, and every such step is recorded. The rule that names a refusal is
+//! the first of envelope (rule 5: 5a/5b/5e, every step) → novelty (5d) → class (4b) → variance
+//! (6/7) → the fences; so a class code means "the class refused and neither the envelope nor the
+//! novelty did". The envelope is evaluated every step (σ-blind). The novelty is evaluated only
+//! with the variance, whose phase follows σ — so on a reused verdict a novel geometry the class
+//! refuses carries a class code, on a fresh one 5d's code 11. The provider therefore evaluates the
+//! novelty on **every cadence-fresh step**, read-only where the verdict was reused, and records
+//! `NOVEL` (Task 3 review MUST, carried; `surrogate` module doc, "The history's flags"): with the
+//! bit, a cadence-fresh point is in P_A exactly when the class refused it, the envelope and the
+//! novelty did not and no fence holds it — the predicate, whichever code the precedence chain
+//! wrote. Below the class rule only 6/7 remain, and 5/6 versus 21 (whether a stale or fresh
+//! variance verdict also refused) is inside P_A either way. (ii) **Calibration ticks** (Task 7):
+//! σ-blind by their own counter; a fenced or novel tick is still left out.
+//!
+//! **Left out**: ordinary audits, codes 14/15 and 24 (λ selects them), fenced points (`FENCED`:
+//! codes 5/6/21 can hold geometries the key will never answer), novel ones, and class-refused
+//! points fresh only by a refusal (not `CADENCE_FRESH`). **Draft mode**: a draft-mode step is never
+//! cadence-fresh for the history (its only consulted-model points are relax verifications, coded
+//! by the rule that fired first, and background audits), and a draft guess's audit is never
+//! recorded (`Unrecorded::draft`; its sample is a `DraftAudit`). **Legacy points** (flags 0) are
+//! never in P_A.
+//!
+//! **The window**: the same rule as the verdict's and λ_sum's — the newest whole generations of
+//! the key's (class's) own P_A points holding at least [`WINDOW_POINTS`] — over P_A itself.
+//! `ClassCalibration::answer_points` is the window's P_A count (the sparse-key rule, Task 6). Each
+//! point counts for every key it holds an atom of, like the LOO energy; the floor counts a point
+//! only with species and a fit id, like the evidence floor's.
 
 use sim::activity::{EnvClass, TeachRule};
 use sim::ClassKey;
-use std::collections::{BTreeMap, BTreeSet};
-use surrogate::history::{AuditHistory, AuditPoint, PointKind};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use surrogate::history::{AuditHistory, AuditPoint, PointFlags, PointKind};
 use surrogate::EnvKey;
 
 use super::FallbackPolicy;
@@ -470,6 +563,14 @@ pub struct ClassCalibration {
     /// The evidence floor's n_pts: the window's verdict points (audits and rule-4b fallbacks,
     /// uncapped) that carry species and a fit id.
     pub floor_points: usize,
+    /// λ_T, the tail-aware force inflation over the answer sample P_A (module doc, "The tail-aware
+    /// inflations"): ≥ 1, ∞ when a bad atom has s = 0, NaN when a comparison in P_A is NaN.
+    pub tail_inflation: f64,
+    /// λ_E, the tail-aware energy inflation over P_A's points with an epistemic energy std (module
+    /// doc): ≥ 1, ∞ / NaN as λ_T.
+    pub energy_inflation: f64,
+    /// The P_A points in λ_T's window (the sparse-key rule reads it: fewer than [`MIN_EVIDENCE`]).
+    pub answer_points: usize,
 }
 
 impl ClassCalibration {
@@ -591,9 +692,14 @@ fn in_posterior_jurisdiction(kind: PointKind) -> bool {
 /// The oldest generation of the window (module doc, "The evidence window"): from the newest
 /// generation back, whole generations until they hold [`WINDOW_POINTS`]; `None` = every point.
 fn window_from(points: &[&PointEvidence]) -> Option<u64> {
+    window_from_gens(points.iter().map(|p| p.gen))
+}
+
+/// [`window_from`] over the points' generations.
+fn window_from_gens(gens: impl Iterator<Item = u64>) -> Option<u64> {
     let mut per_gen: BTreeMap<u64, usize> = BTreeMap::new();
-    for p in points {
-        *per_gen.entry(p.gen).or_default() += 1;
+    for g in gens {
+        *per_gen.entry(g).or_default() += 1;
     }
     let mut held = 0usize;
     for (&gen, &n) in per_gen.iter().rev() {
@@ -642,11 +748,13 @@ fn point_evidence(p: &AuditPoint, atoms: &[usize], aleatoric: f64, policy: &Fall
     })
 }
 
-/// The verdict's and the posterior's evidence lists of one class or key.
+/// The verdict's and the posterior's evidence lists of one class or key, and its answer sample
+/// (module doc, "The answer sample P_A").
 #[derive(Default)]
 struct Lists {
     verdict: Vec<PointEvidence>,
     posterior: Vec<PointEvidence>,
+    answer: Vec<AnswerEvidence>,
 }
 
 impl Lists {
@@ -667,17 +775,32 @@ pub fn calibrate_with(history: &AuditHistory, policy: &FallbackPolicy, aleatoric
     let mut legacy: [Lists; 2] = Default::default();
     let mut by_key: BTreeMap<EnvKey, Lists> = BTreeMap::new();
     for p in history.iter() {
-        if !in_posterior_jurisdiction(p.kind) {
+        // the posterior's jurisdiction (λ_sum, the verdict) and the answer sample (λ_T, λ_E) are
+        // selected apart: a tick may be a point of either kind
+        let posterior = in_posterior_jurisdiction(p.kind);
+        let answer = in_answer_sample(p);
+        if !posterior && !answer {
             continue;
         }
         let verdict = in_jurisdiction(p.kind);
         for c in 0..2 {
             let code = c as u8 + 1;
             let atoms: Vec<usize> = (0..p.n_atoms).filter(|&j| p.classes[j] == code).collect();
-            let Some(e) = point_evidence(p, &atoms, aleatoric[c], policy) else { continue };
-            class[c].push(e, verdict);
-            if p.species.is_empty() {
-                legacy[c].push(e, verdict);
+            if posterior {
+                if let Some(e) = point_evidence(p, &atoms, aleatoric[c], policy) {
+                    class[c].push(e, verdict);
+                    if p.species.is_empty() {
+                        legacy[c].push(e, verdict);
+                    }
+                }
+            }
+            if answer {
+                if let Some(a) = answer_evidence(p, &atoms, policy) {
+                    if p.species.is_empty() {
+                        legacy[c].answer.push(a.clone());
+                    }
+                    class[c].answer.push(a);
+                }
             }
         }
         let mut atoms_of: BTreeMap<EnvKey, Vec<usize>> = BTreeMap::new();
@@ -688,16 +811,23 @@ pub fn calibrate_with(history: &AuditHistory, policy: &FallbackPolicy, aleatoric
         }
         for (k, atoms) in atoms_of {
             let c = (k.class - 1) as usize;
-            if let Some(e) = point_evidence(p, &atoms, aleatoric[c], policy) {
-                by_key.entry(k).or_default().push(e, verdict);
+            if posterior {
+                if let Some(e) = point_evidence(p, &atoms, aleatoric[c], policy) {
+                    by_key.entry(k.clone()).or_default().push(e, verdict);
+                }
+            }
+            if answer {
+                if let Some(a) = answer_evidence(p, &atoms, policy) {
+                    by_key.entry(k).or_default().answer.push(a);
+                }
             }
         }
     }
-    fn refs(l: &[PointEvidence]) -> Vec<&PointEvidence> {
+    fn refs<T>(l: &[T]) -> Vec<&T> {
         l.iter().collect()
     }
-    let per_class = std::array::from_fn(|c| summarise(&refs(&class[c].verdict), &refs(&class[c].posterior)));
-    let legacy_cal: [ClassCalibration; 2] = std::array::from_fn(|c| summarise(&refs(&legacy[c].verdict), &refs(&legacy[c].posterior)));
+    let per_class = std::array::from_fn(|c| summarise(&refs(&class[c].verdict), &refs(&class[c].posterior), &refs(&class[c].answer)));
+    let legacy_cal: [ClassCalibration; 2] = std::array::from_fn(|c| summarise(&refs(&legacy[c].verdict), &refs(&legacy[c].posterior), &refs(&legacy[c].answer)));
     let all: BTreeSet<EnvKey> = keys.iter().filter(|k| (1..=2).contains(&k.class)).cloned().chain(by_key.keys().cloned()).collect();
     let empty = Lists::default();
     let per_key = all
@@ -707,15 +837,18 @@ pub fn calibrate_with(history: &AuditHistory, policy: &FallbackPolicy, aleatoric
             let old = &legacy[(k.class - 1) as usize];
             let v: Vec<&PointEvidence> = own.verdict.iter().chain(&old.verdict).collect();
             let q: Vec<&PointEvidence> = own.posterior.iter().chain(&old.posterior).collect();
-            (k, summarise(&v, &q))
+            let a: Vec<&AnswerEvidence> = own.answer.iter().chain(&old.answer).collect();
+            (k, summarise(&v, &q, &a))
         })
         .collect();
     Calibration { per_class, per_key, legacy: legacy_cal }
 }
 
-/// One class's or key's calibration from its verdict and posterior evidence (module doc).
-fn summarise(all: &[&PointEvidence], posterior: &[&PointEvidence]) -> ClassCalibration {
+/// One class's or key's calibration from its verdict and posterior evidence and its answer sample
+/// (module doc).
+fn summarise(all: &[&PointEvidence], posterior: &[&PointEvidence], answer: &[&AnswerEvidence]) -> ClassCalibration {
     let (inflation_var, inflation_points, inflation_raw) = variance_inflation(posterior);
+    let (tail_inflation, energy_inflation, answer_points) = tail_inflations(answer);
     let from = window_from(all);
     let inside = |e: &&&PointEvidence| from.is_none_or(|g| e.gen >= g);
     let audits: Vec<&PointEvidence> = all.iter().filter(inside).filter(|e| e.audit).copied().collect();
@@ -729,7 +862,7 @@ fn summarise(all: &[&PointEvidence], posterior: &[&PointEvidence]) -> ClassCalib
     let floor_points = floor_ids.len();
     let fits = floor_ids.iter().collect::<BTreeSet<_>>().len();
     if points == 0 {
-        return ClassCalibration { factor: 1.0, audits: 0, fallbacks: 0, evidence: 0, points: 0, aged, window_from: None, z_rms: f64::NAN, measured: f64::NAN, measured_energy: f64::NAN, worst_atom: 0.0, inflation: inflation_var, inflation_points, inflation_raw, fits, floor_points };
+        return ClassCalibration { factor: 1.0, audits: 0, fallbacks: 0, evidence: 0, points: 0, aged, window_from: None, z_rms: f64::NAN, measured: f64::NAN, measured_energy: f64::NAN, worst_atom: 0.0, inflation: inflation_var, inflation_points, inflation_raw, fits, floor_points, tail_inflation, energy_inflation, answer_points };
     }
     // the fallbacks of the class together weigh at most the audits (never fewer than three);
     // the count in integers (review I1), the per-point weight only for the sums
@@ -743,7 +876,7 @@ fn summarise(all: &[&PointEvidence], posterior: &[&PointEvidence]) -> ClassCalib
     let measured = (sum(&|e| e.w2) / den).sqrt() * inflation;
     let measured_energy = (sum(&|e| e.e2) / den).sqrt() * inflation;
     let worst_atom = audits.iter().chain(&fallbacks).map(|e| e.worst).fold(0.0f64, |m, w| if w.is_nan() || m.is_nan() { f64::NAN } else { m.max(w) });
-    ClassCalibration { factor: z_rms.max(1.0) * inflation, audits: n_a, fallbacks: n_f, evidence, points, aged, window_from: from, z_rms, measured, measured_energy, worst_atom, inflation: inflation_var, inflation_points, inflation_raw, fits, floor_points }
+    ClassCalibration { factor: z_rms.max(1.0) * inflation, audits: n_a, fallbacks: n_f, evidence, points, aged, window_from: from, z_rms, measured, measured_energy, worst_atom, inflation: inflation_var, inflation_points, inflation_raw, fits, floor_points, tail_inflation, energy_inflation, answer_points }
 }
 
 /// λ_c (module doc, "The variance inflation"): over the class's points in the posterior's
@@ -773,6 +906,262 @@ fn variance_inflation(points: &[&PointEvidence]) -> (f64, usize, f64) {
     }
     let raw = (sw / ss).sqrt();
     (raw.max(1.0) * (1.0 + 1.0 / (2.0 * n as f64).sqrt()), n, raw)
+}
+
+
+// ---- the tail-aware inflations (module doc, "The tail-aware inflations"; spec 2026-11-18 §4) ----
+
+/// Whether `p` is in the answer sample P_A (module doc, "The answer sample P_A"): not fenced, not
+/// novel, and a calibration tick or a cadence-fresh class-refused point (codes 5, 6, 21). Reads the
+/// point's flags word and kind only — never a std, an error or a λ (the self-reference guard).
+pub(super) fn in_answer_sample(p: &AuditPoint) -> bool {
+    let f = p.flags;
+    let tick = f.has(PointFlags::TICK);
+    !f.has(PointFlags::FENCED) && !f.has(PointFlags::NOVEL) && (tick || (f.has(PointFlags::CADENCE_FRESH) && class_refused(p.kind)))
+}
+
+/// The class rule (4b) named the refusal: a class code (5, 6) or the class with rule 6/7 failing
+/// too (21) — from the provider's own code table, never literal numbers.
+fn class_refused(kind: PointKind) -> bool {
+    match kind {
+        PointKind::Audit => false,
+        PointKind::Fallback { rule } => in_jurisdiction(kind) || rule == super::HISTORY_RULE_CLASS_AND_VARIANCE,
+    }
+}
+
+/// One measured atom of the answer sample, in the policy's bound units (module doc): r = s_j/b_j,
+/// e = e_j/b_j (s_j = σ_epi,j/√3, e_j = ‖ΔF_j‖/√3), of point `point` judged by fit `fit` (`None`:
+/// it does not count toward the floor).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TailAtom {
+    pub point: usize,
+    pub fit: Option<u64>,
+    pub r: f64,
+    pub e: f64,
+}
+
+/// One measured point of the answer sample, in tier units (module doc): r = σ_E,epi/N/tier,
+/// e = |ΔE|/N/tier.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TailPoint {
+    pub point: usize,
+    pub fit: Option<u64>,
+    pub r: f64,
+    pub e: f64,
+}
+
+/// λ_E's max condition: an admitted point's measured energy error is at most 1× the tier (spec §4
+/// rev. 2 — the gate's own per-answer criterion).
+pub const ENERGY_MAX: f64 = 1.0;
+
+/// What [`tail_factor`] reads of an item.
+trait Tail: Copy {
+    fn point(&self) -> usize;
+    fn fit(&self) -> Option<u64>;
+    fn r(&self) -> f64;
+    fn e(&self) -> f64;
+}
+
+impl Tail for TailAtom {
+    fn point(&self) -> usize {
+        self.point
+    }
+    fn fit(&self) -> Option<u64> {
+        self.fit
+    }
+    fn r(&self) -> f64 {
+        self.r
+    }
+    fn e(&self) -> f64 {
+        self.e
+    }
+}
+
+impl Tail for TailPoint {
+    fn point(&self) -> usize {
+        self.point
+    }
+    fn fit(&self) -> Option<u64> {
+        self.fit
+    }
+    fn r(&self) -> f64 {
+        self.r
+    }
+    fn e(&self) -> f64 {
+        self.e
+    }
+}
+
+/// The evidence floor over a set of items: ≥ [`FLOOR_FITS`] distinct fits and ≥ [`FLOOR_POINTS`]
+/// distinct points among the items that carry a fit id. Monotone in the set.
+fn meets_floor<T: Tail>(items: &[T]) -> bool {
+    let mut points = BTreeSet::new();
+    let mut fits = BTreeSet::new();
+    for t in items {
+        if let Some(f) = t.fit() {
+            points.insert(t.point());
+            fits.insert(f);
+        }
+    }
+    fits.len() >= FLOOR_FITS && points.len() >= FLOOR_POINTS
+}
+
+/// The floor over a set of answer-sample atoms ([`tail_inflation`]'s `floor_met` in `calibrate`).
+pub fn atoms_meet_floor(atoms: &[TailAtom]) -> bool {
+    meets_floor(atoms)
+}
+
+/// The floor over a set of answer-sample points ([`energy_inflation`]'s `floor_met`).
+pub fn points_meet_floor(points: &[TailPoint]) -> bool {
+    meets_floor(points)
+}
+
+/// λ_T over a key's answer-sample atoms (module doc, "The tail-aware inflations"): the max
+/// condition at [`WORST_ATOM`] = 3, the rms condition at [`ENTER`] on the sets `floor_met` (monotone
+/// in the set) accepts. ≥ 1; ∞ when a bad atom has r = 0; NaN when any r or e is NaN.
+pub fn tail_inflation(atoms: &[TailAtom], floor_met: impl Fn(&[TailAtom]) -> bool) -> f64 {
+    tail_factor(atoms, WORST_ATOM, floor_met)
+}
+
+/// λ_E over a key's answer-sample points with an epistemic energy std: as [`tail_inflation`], the
+/// max condition at [`ENERGY_MAX`] = 1× the tier.
+pub fn energy_inflation(points: &[TailPoint], floor_met: impl Fn(&[TailPoint]) -> bool) -> f64 {
+    tail_factor(points, ENERGY_MAX, floor_met)
+}
+
+/// [`energy_inflation`] with another max condition: a test's counterfactual (rev. 1's 4.53).
+#[cfg(test)]
+pub(super) fn energy_inflation_with_max(points: &[TailPoint], max: f64, floor_met: impl Fn(&[TailPoint]) -> bool) -> f64 {
+    tail_factor(points, max, floor_met)
+}
+
+/// Neumaier's compensated running sum (CLAUDE.md rule 4): the rms condition's Σ of per-point means,
+/// whose terms are taken out and put back as a point's atoms join.
+#[derive(Clone, Copy, Default)]
+struct Compensated {
+    sum: f64,
+    c: f64,
+}
+
+impl Compensated {
+    fn add(&mut self, x: f64) {
+        let t = self.sum + x;
+        if self.sum.abs() >= x.abs() {
+            self.c += (self.sum - t) + x;
+        } else {
+            self.c += (x - t) + self.sum;
+        }
+        self.sum = t;
+    }
+
+    fn value(&self) -> f64 {
+        self.sum + self.c
+    }
+}
+
+/// The smallest λ ≥ 1 with A(λ′) good for every λ′ ≥ λ (module doc, "The tail-aware inflations",
+/// "The one pass"): `max` the max condition's limit, the rms condition at [`ENTER`] on the prefixes
+/// `floor_met` accepts.
+fn tail_factor<T: Tail>(items: &[T], max: f64, floor_met: impl Fn(&[T]) -> bool) -> f64 {
+    // any NaN, admitted or not: the inflation is undefined (M1)
+    if items.iter().any(|t| t.r().is_nan() || t.e().is_nan()) {
+        return f64::NAN;
+    }
+    // admitted at some λ ≥ 1 (λ·r ≤ 1 needs r ≤ 1), and not e = r = 0 (no draw: adds nothing)
+    let mut a: Vec<T> = items.iter().copied().filter(|t| t.r() <= 1.0 && !(t.r() == 0.0 && t.e() == 0.0)).collect();
+    a.sort_by(|x, y| x.r().total_cmp(&y.r()));
+    // the first prefix length that meets the floor (the floor is monotone in the set): bisection
+    let first_floor = {
+        let (mut lo, mut hi) = (0usize, a.len() + 1);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if floor_met(&a[..mid]) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        lo
+    };
+    let mut worst = 0.0f64;
+    // per point: Σ e² over its admitted atoms and their count; Σ over points of their means
+    let mut per_point: HashMap<usize, (Compensated, usize)> = HashMap::new();
+    let mut total = Compensated::default();
+    let mut i = 0;
+    while i < a.len() {
+        // the next group of equal r enters together
+        let r = a[i].r();
+        let mut j = i;
+        while j < a.len() && a[j].r() == r {
+            let e = a[j].e();
+            worst = worst.max(e); // no NaN here
+            let (sum, n) = per_point.entry(a[j].point()).or_default();
+            if *n > 0 {
+                total.add(-(sum.value() / *n as f64));
+            }
+            sum.add(sq(e));
+            *n += 1;
+            total.add(sum.value() / *n as f64);
+            j += 1;
+        }
+        // (an infinite e fails the max first, so a NaN the sum may then hold is never read)
+        let good = worst <= max && {
+            j < first_floor || {
+                let n_a = per_point.len() as f64;
+                let v = total.value() / n_a;
+                let v = if v < 0.0 { 0.0 } else { v }; // rounding below 0; a NaN stays NaN and fails
+                v.sqrt() * (1.0 + 1.0 / (2.0 * n_a).sqrt()) <= ENTER
+            }
+        };
+        if !good {
+            // λ·r > 1 excludes this group; no finite λ excludes r = 0
+            return if r <= 0.0 { f64::INFINITY } else { (1.0 / r).next_up() };
+        }
+        i = j;
+    }
+    1.0
+}
+
+/// One answer-sample point's measurements over the atoms of one class or key (module doc): per
+/// atom (r_j, e_j) in bound units, and (r_p, e_p) in tier units when it carries an epistemic
+/// energy std; its generation (the window) and its fit id when it counts toward the floor.
+#[derive(Clone)]
+struct AnswerEvidence {
+    gen: u64,
+    fit: Option<u64>,
+    atoms: Vec<(f64, f64)>,
+    energy: Option<(f64, f64)>,
+}
+
+fn answer_evidence(p: &AuditPoint, atoms: &[usize], policy: &FallbackPolicy) -> Option<AnswerEvidence> {
+    if atoms.is_empty() {
+        return None;
+    }
+    let per_atom = atoms
+        .iter()
+        .map(|&j| {
+            let bound = policy.force_bound(p.teacher_force[j]);
+            (p.pred_force_std_epistemic[j] / SQRT_3 / bound, p.err_force[j] / SQRT_3 / bound)
+        })
+        .collect();
+    let (n, tier) = (p.n_atoms.max(1) as f64, policy.energy_std_per_atom);
+    Some(AnswerEvidence {
+        gen: p.model_gen,
+        // as the evidence floor: a point counts only with species and a fit id
+        fit: p.fit_id.filter(|_| !p.species.is_empty()),
+        atoms: per_atom,
+        energy: p.energy_std_epistemic.map(|s| (s / n / tier, p.err_energy.abs() / n / tier)),
+    })
+}
+
+/// (λ_T, λ_E, the P_A points in the window) of one class or key: over its own window of the newest
+/// generations holding [`WINDOW_POINTS`] of its P_A points (module doc, "The window").
+fn tail_inflations(points: &[&AnswerEvidence]) -> (f64, f64, usize) {
+    let from = window_from_gens(points.iter().map(|p| p.gen));
+    let inside: Vec<&AnswerEvidence> = points.iter().filter(|p| from.is_none_or(|g| p.gen >= g)).copied().collect();
+    let atoms: Vec<TailAtom> = inside.iter().enumerate().flat_map(|(i, p)| p.atoms.iter().map(move |&(r, e)| TailAtom { point: i, fit: p.fit, r, e })).collect();
+    let energies: Vec<TailPoint> = inside.iter().enumerate().filter_map(|(i, p)| p.energy.map(|(r, e)| TailPoint { point: i, fit: p.fit, r, e })).collect();
+    (tail_inflation(&atoms, atoms_meet_floor), energy_inflation(&energies, points_meet_floor), inside.len())
 }
 
 /// What the refusal's words read (a `ClassLoo` holds all of it; `class_verdict` passes its own).

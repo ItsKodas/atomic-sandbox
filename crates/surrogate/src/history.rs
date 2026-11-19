@@ -98,18 +98,20 @@
 //!   the evidence floor's fits.
 //! - `AuditPoint::flags` ([`PointFlags`]): bit 1 a calibration tick, bit 2 fenced (inside a
 //!   quarantine, misfit or audit fence of its key), bit 4 cadence-fresh (by the never-reset
-//!   counter). 0 when absent. Bits above 7 are refused.
+//!   counter), bit 8 novel (rule 5d's null-space novelty above 1 at the geometry, evaluated on
+//!   every cadence-fresh step whether or not the variance verdict was reused; trust tightening
+//!   Task 5). 0 when absent. Bits above 15 are refused.
 //! - `AuditPoint::energy_std_epistemic`: Ha, the total-energy epistemic std (`pred_energy_std`
 //!   holds the total, aleatoric floor included). `None` when not recorded: such a point is not in
 //!   λ_E's sample.
 //!
 //! Serialised as three optional per-point arrays after the species array: `audit_fit` (−1 for an
-//! absent id, else an integer below 2⁵³), `audit_flags` (an integer 0–7), `audit_energy_std_epistemic`
+//! absent id, else an integer below 2⁵³), `audit_flags` (an integer 0–15), `audit_energy_std_epistemic`
 //! (−1 for absent, else finite and ≥ 0); any other value — another negative, a NaN, an infinity, a
 //! fraction — is refused, never read. The three are written together, for every point, only when
 //! some point carries one of the fields; otherwise none is written and the file is version 1, bit
 //! for bit. [`AuditHistory::push`] panics on a point whose fields could not be written (an id of 2⁵³
-//! or more, a flags word above 7, a non-finite or negative std): a programming error at the
+//! or more, a flags word above 15, a non-finite or negative std): a programming error at the
 //! recording site, like a class code beyond 2.
 //!
 //! # Standalone encoding ([`AuditHistory::encode`])
@@ -196,8 +198,13 @@ impl PointFlags {
     pub const FENCED: u8 = 2;
     /// The step was fresh by the never-reset cadence counter (a multiple of `variance_cadence`).
     pub const CADENCE_FRESH: u8 = 4;
+    /// Rule 5d's null-space novelty exceeded 1 at the geometry (an unspanned direction): the
+    /// provider evaluates it on every cadence-fresh step, read-only where the variance verdict was
+    /// reused, so on those steps the bit does not depend on the σ-coupled variance phase. Such a
+    /// point is excluded from P_A (rule 5 includes 5d: the geometry is not in the envelope).
+    pub const NOVEL: u8 = 8;
     /// Every bit this build defines.
-    pub const ALL: u8 = Self::TICK | Self::FENCED | Self::CADENCE_FRESH;
+    pub const ALL: u8 = Self::TICK | Self::FENCED | Self::CADENCE_FRESH | Self::NOVEL;
 
     /// Every bit of `bit` is set (one bit: that bit is set).
     pub fn has(self, bit: u8) -> bool {
@@ -320,7 +327,7 @@ impl AuditPoint {
             return Err(format!("audit point: fit id {id} is 2^53 or more"));
         }
         if self.flags.0 > PointFlags::ALL {
-            return Err(format!("audit point: flags word {} (bits 1 tick, 2 fenced, 4 cadence-fresh)", self.flags.0));
+            return Err(format!("audit point: flags word {} (bits 1 tick, 2 fenced, 4 cadence-fresh, 8 novel)", self.flags.0));
         }
         if let Some(s) = self.energy_std_epistemic.filter(|s| !(s.is_finite() && *s >= 0.0)) {
             return Err(format!("audit point: epistemic energy std {s} is not finite and non-negative"));
@@ -672,7 +679,7 @@ fn decode_trust_fields(a: &HistoryArrays) -> Result<Option<Vec<(Option<u64>, Poi
             return Err(format!("{}[{i}] = {f} is not a fit id (an integer below 2^53, or -1 when absent)", HistoryArrays::FIT));
         };
         if !(g.fract() == 0.0 && (0.0..=PointFlags::ALL as f64).contains(&g)) {
-            return Err(format!("{}[{i}] = {g} is not a flags word (an integer 0 to 7)", HistoryArrays::FLAGS));
+            return Err(format!("{}[{i}] = {g} is not a flags word (an integer 0 to 15)", HistoryArrays::FLAGS));
         }
         let std = if s == ABSENT {
             None
@@ -894,11 +901,11 @@ mod tests {
             assert_eq!(p.energy_std_epistemic.map(f64::to_bits), q.energy_std_epistemic.map(f64::to_bits));
             assert_eq!((p.fit_id, p.flags), (q.fit_id, q.flags));
         }
-        assert_eq!(back.iter().map(|p| p.flags.0).take(8).collect::<Vec<_>>(), (0..=7).collect::<Vec<u8>>());
+        assert_eq!(back.iter().map(|p| p.flags.0).take(16).collect::<Vec<_>>(), (0..=15).collect::<Vec<u8>>());
         // the bits
         let f = PointFlags(PointFlags::TICK | PointFlags::CADENCE_FRESH);
         assert!(f.has(PointFlags::TICK) && f.has(PointFlags::CADENCE_FRESH) && !f.has(PointFlags::FENCED));
-        assert_eq!((PointFlags::TICK, PointFlags::FENCED, PointFlags::CADENCE_FRESH, PointFlags::ALL), (1, 2, 4, 7));
+        assert_eq!((PointFlags::TICK, PointFlags::FENCED, PointFlags::CADENCE_FRESH, PointFlags::NOVEL, PointFlags::ALL), (1, 2, 4, 8, 15));
         assert_eq!(PointFlags::default(), PointFlags(0));
         // none of the three anywhere: version 1, the three arrays absent
         let mut old = AuditHistory::default();
@@ -965,7 +972,7 @@ mod tests {
     /// Trust tightening Task 1: hostile values in the three new arrays are refused, through the
     /// arrays and through the standalone bytes, naming the array — never a panic: a wrong length, a
     /// non-integral fit id or flags word, an id of 2⁵³ or more, a negative id other than −1, a flags
-    /// word above 7 or negative, a negative (other than −1), NaN or infinite energy std; a version-2
+    /// word above 15 or negative, a negative (other than −1), NaN or infinite energy std; a version-2
     /// file that ends before them, or whose length prefix runs past the end.
     #[test]
     fn hostile_new_arrays_are_rejected() {
@@ -988,7 +995,7 @@ mod tests {
             ("audit_fit", |a| a.fit[0] = -0.5),
             ("audit_fit", |a| a.fit[0] = f64::NAN),
             ("audit_fit", |a| a.fit[0] = f64::INFINITY),
-            ("audit_flags", |a| a.flags[0] = 8.0),
+            ("audit_flags", |a| a.flags[0] = 16.0),
             ("audit_flags", |a| a.flags[0] = 255.0),
             ("audit_flags", |a| a.flags[0] = 0.5),
             ("audit_flags", |a| a.flags[0] = -1.0),
@@ -1051,9 +1058,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "flags word 8")]
-    fn a_flags_word_above_7_is_a_programming_error_at_the_push() {
-        AuditHistory::default().push(point_ext(1, 0, None, 8, None));
+    #[should_panic(expected = "flags word 16")]
+    fn a_flags_word_above_15_is_a_programming_error_at_the_push() {
+        AuditHistory::default().push(point_ext(1, 0, None, 16, None));
     }
 
     #[test]

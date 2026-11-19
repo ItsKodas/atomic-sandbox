@@ -12631,3 +12631,417 @@ fn a_parked_key_below_the_floor_raises_the_teach_prompt_and_says_why() {
     println!("{p}");
     assert!(p.contains("two-atom environments are untrusted everywhere") && p.ends_with("teach around it"), "{p}");
 }
+
+// ---- trust tightening Task 5 (spec 2026-11-18 §4): λ_T and λ_E over the answer sample P_A ----
+
+/// The pair class's rule-4b code (5): a class-refused point of P_A.
+fn code_pair() -> u8 {
+    history_rule_code(TeachRule::Class(sim::activity::EnvClass::Pair))
+}
+
+/// An H–H dimer point of the pair key H{H}, both atoms alike: each atom's epistemic std is `r`× and
+/// its force error `e`× the absolute bound (2e-3 Ha/Bohr, teacher force 0), so s/b = r and e/b = e
+/// up to rounding; judged by fit `fit` with the flags word `flags`; `rule` `None` is an audit, else
+/// a fallback with that code. `energy` = (r_p, e_p) in tier units — σ_E,epi/N and |ΔE|/N over the
+/// 1e-3 Ha/atom tier — or `None` for a point without an epistemic energy std.
+fn answer_point(rule: Option<u8>, r: f64, e: f64, fit: u64, flags: u8, energy: Option<(f64, f64)>) -> surrogate::AuditPoint {
+    use surrogate::history::{PointFlags, PointKind};
+    let (b, tier, n) = (2e-3, 1e-3, 2usize);
+    let epi = r * 3f64.sqrt() * b;
+    let err = e * 3f64.sqrt() * b;
+    let kind = rule.map_or(PointKind::Audit, |rule| PointKind::Fallback { rule });
+    surrogate::AuditPoint {
+        kind,
+        classes: vec![1; n],
+        pred_force_std: vec![(epi * epi + 3e-8).sqrt(); n],
+        pred_force_std_epistemic: vec![epi; n],
+        pred_energy_std: energy.map_or(1e-5, |(rp, _)| ((rp * n as f64 * tier).powi(2) + 1e-10).sqrt()),
+        err_force: vec![err; n],
+        teacher_force: vec![0.0; n],
+        err_energy: energy.map_or(0.0, |(_, ep)| ep * n as f64 * tier),
+        n_atoms: n,
+        model_gen: 1,
+        species: vec![(1, vec![1]); n],
+        fit_id: Some(fit),
+        flags: PointFlags(flags),
+        energy_std_epistemic: energy.map(|(rp, _)| rp * n as f64 * tier),
+    }
+}
+
+/// `n` benign class-refused, cadence-fresh points of H{H} over `fits` fits: r from 0.05 to 0.9,
+/// e/b 0.1–0.5, energy r_p 0.1, e_p 0.05.
+fn benign_answers(n: usize, fits: usize) -> surrogate::AuditHistory {
+    use surrogate::history::PointFlags;
+    let mut h = surrogate::AuditHistory::default();
+    for i in 0..n {
+        let r = 0.05 + 0.85 * i as f64 / (n - 1) as f64;
+        let e = 0.1 * (1 + i % 5) as f64;
+        h.push(answer_point(Some(code_pair()), r, e, (i % fits) as u64 + 1, PointFlags::CADENCE_FRESH, Some((0.1, 0.05))));
+    }
+    h
+}
+
+/// Spec §4 (review C1): the measured tail the ratio of sums cannot see. 80 benign answer-sample
+/// points over 16 fits and one point whose atoms sit at r = s/b = 0.13 with e/b = 4.48 (the hot
+/// run's worst force ratio): every A(λ) that admits the 4.48× atoms breaks the max condition, so
+/// λ_T is the next float above 1/0.13 = 7.69 — rule 6 then refuses s ≥ b/7.69 — while λ_sum, a
+/// ratio of sums dominated by the high-std points, stays near 1.2.
+#[test]
+fn the_tail_inflation_refuses_the_measured_tail() {
+    use surrogate::history::PointFlags;
+    let pol = FallbackPolicy::default();
+    let base = calibrate::calibrate(&benign_answers(80, 16), &pol).key(&hk_pair());
+    println!("benign: λ_T {} λ_E {} λ_sum {:.4} over {} answer points", base.tail_inflation, base.energy_inflation, base.inflation, base.answer_points);
+    assert_eq!((base.tail_inflation, base.energy_inflation, base.answer_points), (1.0, 1.0, 80));
+    let mut h = benign_answers(80, 16);
+    h.push(answer_point(Some(code_pair()), 0.13, 4.48, 1, PointFlags::CADENCE_FRESH, Some((0.1, 0.05))));
+    let cal = calibrate::calibrate(&h, &pol);
+    let kc = cal.key(&hk_pair());
+    println!("with the tail: λ_T {:.15} (1/0.13 = {:.15}) λ_E {} λ_sum {:.4} over {} answer points", kc.tail_inflation, 1.0 / 0.13, kc.energy_inflation, kc.inflation, kc.answer_points);
+    let lo = 1.0 / 0.13;
+    assert!(kc.tail_inflation > lo && kc.tail_inflation <= lo * (1.0 + 1e-12), "{}", kc.tail_inflation);
+    assert!(kc.inflation >= 1.0 && kc.inflation < 2.0, "λ_sum {}", kc.inflation);
+    assert_eq!((kc.energy_inflation, kc.answer_points), (1.0, 81));
+    // the class-wide readout reads the same sample
+    assert_eq!(cal.per_class[0].tail_inflation, kc.tail_inflation);
+}
+
+/// Spec §4, "Why bound units": a confident point with an error harmless to the policy — e = 0.3 b
+/// at r = 0.02 (a mean of ratios e/s would read 15) — among 60 benign points over 12 fits leaves
+/// λ_T = 1 exactly: every A(λ) is good (max 0.5 ≤ 3; from the floor on, its rms × (1 + 1/√(2n))
+/// is ≈ 0.36 ≤ ENTER).
+#[test]
+fn a_harmless_confident_point_does_not_inflate() {
+    use surrogate::history::PointFlags;
+    let pol = FallbackPolicy::default();
+    let mut h = benign_answers(60, 12);
+    h.push(answer_point(Some(code_pair()), 0.02, 0.3, 3, PointFlags::CADENCE_FRESH, Some((0.1, 0.05))));
+    let kc = calibrate::calibrate(&h, &pol).key(&hk_pair());
+    println!("λ_T {} λ_E {} λ_sum {:.4} over {} answer points", kc.tail_inflation, kc.energy_inflation, kc.inflation, kc.answer_points);
+    assert_eq!((kc.tail_inflation, kc.energy_inflation, kc.answer_points), (1.0, 1.0, 61));
+}
+
+/// Spec §4 (rev. 2): the energy-only failures. 30 benign points (r_p 0.05–0.9 avoiding 0.2,
+/// e_p ≤ 0.1) and 7 at r_p = 0.2 with e_p 1.03–1.39 (the hot run's 485–489, 700, 701): 37 points,
+/// below the floor, so only the max condition can fire — at 1× the tier it does, and λ_E is the
+/// next float above 1/0.2 = 5. Rev. 1's max of 4.53 never fired on them: λ_E = 1. The forces are
+/// benign (λ_T = 1).
+#[test]
+fn the_energy_inflation_refuses_energy_only_failures() {
+    use calibrate::{energy_inflation, energy_inflation_with_max, TailPoint};
+    use surrogate::history::PointFlags;
+    let pol = FallbackPolicy::default();
+    let mut h = surrogate::AuditHistory::default();
+    let mut direct = Vec::new();
+    for i in 0..30 {
+        let rp = 0.05 + 0.85 * i as f64 / 29.0;
+        assert!((rp - 0.2).abs() > 1e-3);
+        let ep = 0.1 * (i % 4) as f64 / 3.0;
+        h.push(answer_point(Some(code_pair()), 0.3, 0.2, (i % 12) as u64 + 1, PointFlags::CADENCE_FRESH, Some((rp, ep))));
+        direct.push(TailPoint { point: i, fit: Some((i % 12) as u64 + 1), r: rp, e: ep });
+    }
+    for i in 0..7 {
+        let ep = 1.03 + 0.06 * i as f64;
+        h.push(answer_point(Some(code_pair()), 0.3, 0.2, i as u64 + 1, PointFlags::CADENCE_FRESH, Some((0.2, ep))));
+        direct.push(TailPoint { point: 30 + i, fit: Some(i as u64 + 1), r: 0.2, e: ep });
+    }
+    let kc = calibrate::calibrate(&h, &pol).key(&hk_pair());
+    println!("λ_E {:.17} λ_T {} over {} answer points", kc.energy_inflation, kc.tail_inflation, kc.answer_points);
+    assert!(kc.energy_inflation > 5.0 && kc.energy_inflation <= 5.0 * (1.0 + 1e-12), "{}", kc.energy_inflation);
+    assert_eq!((kc.tail_inflation, kc.answer_points), (1.0, 37));
+    let below = |_: &[TailPoint]| false;
+    assert_eq!(energy_inflation(&direct, below), 5.0f64.next_up(), "the max condition alone: just above 1/0.2");
+    assert_eq!(energy_inflation_with_max(&direct, 4.53, below), 1.0, "rev. 1's max 4.53 never fires on 1.03–1.39");
+}
+
+/// Spec §4, "The sample P_A": chosen without reading σ or λ. Points the inflations select or that
+/// a fence holds — codes 14, 15 and 24, ordinary audits, fenced class-refused points, class-refused
+/// points fresh only by a refusal (not cadence-fresh), novel ones (bit 8, and code 11 = 5d), the
+/// envelope's code 9, a fenced or novel tick — leave λ_T, λ_E and the count bit for bit, though
+/// each carries a 50× error at r = 0.01; the same point as a cadence-fresh code 5, 6 or 21, or as
+/// a tick (an audit or a code-14 fallback), moves both to ≈ 100.
+#[test]
+fn the_inflations_never_read_what_they_selected() {
+    use surrogate::history::PointFlags;
+    let pol = FallbackPolicy::default();
+    let (cf, fenced, novel, tick) = (PointFlags::CADENCE_FRESH, PointFlags::FENCED, PointFlags::NOVEL, PointFlags::TICK);
+    let bad = |rule: Option<u8>, flags: u8| answer_point(rule, 0.01, 50.0, 7, flags, Some((0.01, 50.0)));
+    let base = calibrate::calibrate(&benign_answers(80, 16), &pol).key(&hk_pair());
+    let bits = |k: &calibrate::ClassCalibration| (k.tail_inflation.to_bits(), k.energy_inflation.to_bits(), k.answer_points);
+    let left_out = [
+        ("code 14", bad(Some(14), cf)),
+        ("code 15", bad(Some(15), cf)),
+        ("code 24", bad(Some(24), cf)),
+        ("an ordinary audit", bad(None, cf)),
+        ("a fenced code 5", bad(Some(code_pair()), cf | fenced)),
+        ("a code 5 fresh only by a refusal", bad(Some(code_pair()), 0)),
+        ("a novel code 5", bad(Some(code_pair()), cf | novel)),
+        ("code 11 (5d)", bad(Some(11), cf | novel)),
+        ("code 9 (envelope)", bad(Some(9), cf)),
+        ("a fenced tick", bad(None, tick | cf | fenced)),
+        ("a novel tick", bad(None, tick | novel)),
+    ];
+    let mut all = benign_answers(80, 16);
+    for (what, p) in &left_out {
+        assert!(!calibrate::in_answer_sample(p), "{what}");
+        let mut h = benign_answers(80, 16);
+        h.push(p.clone());
+        all.push(p.clone());
+        assert_eq!(bits(&calibrate::calibrate(&h, &pol).key(&hk_pair())), bits(&base), "{what}");
+    }
+    assert_eq!(bits(&calibrate::calibrate(&all, &pol).key(&hk_pair())), bits(&base), "all of them together");
+    for (what, p) in [
+        ("a cadence-fresh code 5", bad(Some(code_pair()), cf)),
+        ("a cadence-fresh code 6", bad(Some(history_rule_code(TeachRule::Class(sim::activity::EnvClass::ManyBody))), cf)),
+        ("a cadence-fresh code 21", bad(Some(HISTORY_RULE_CLASS_AND_VARIANCE), cf)),
+        ("a tick at an audit", bad(None, tick)),
+        ("a tick at a code-14 fallback", bad(Some(14), tick)),
+    ] {
+        assert!(calibrate::in_answer_sample(&p), "{what}");
+        let mut h = benign_answers(80, 16);
+        h.push(p);
+        let k = calibrate::calibrate(&h, &pol).key(&hk_pair());
+        assert!(k.tail_inflation > 99.0 && k.tail_inflation < 101.0 && k.energy_inflation > 99.0 && k.energy_inflation < 101.0 && k.answer_points == 81, "{what}: {k:?}");
+    }
+}
+
+/// Spec §4: λ ≥ λ_sum ≥ 1 — no inflation ever shrinks the posterior's std. Over 1000 seeded random
+/// histories (random codes, flags, fits, generations, classes, r and e from 0 and 1e-3 to 10, energy
+/// stds present or not), every key's and class's λ_sum, λ_T and λ_E are numbers ≥ 1.
+#[test]
+fn no_inflation_shrinks_the_std() {
+    let pol = FallbackPolicy::default();
+    let mut rng = StdRng::seed_from_u64(0x7a11);
+    let codes = [None, Some(5u8), Some(6), Some(14), Some(15), Some(21), Some(24), Some(11), Some(17)];
+    let draw = |rng: &mut StdRng, hi: f64| if rng.gen_bool(0.05) { 0.0 } else { 10f64.powf(rng.gen_range(-3.0..hi.log10())) };
+    let (mut inflated_t, mut inflated_e, mut infinite, mut n) = (0usize, 0usize, 0usize, 0usize);
+    for _ in 0..1000 {
+        let mut h = surrogate::AuditHistory::default();
+        for _ in 0..rng.gen_range(0..120) {
+            let rule = codes[rng.gen_range(0..codes.len())];
+            let energy = rng.gen_bool(0.7).then(|| (draw(&mut rng, 3.0), draw(&mut rng, 10.0)));
+            let (r, e) = (draw(&mut rng, 3.0), draw(&mut rng, 10.0));
+            let mut p = answer_point(rule, r, e, rng.gen_range(1..20), rng.gen_range(0..16), energy);
+            p.model_gen = rng.gen_range(1..5);
+            if rng.gen_bool(0.3) {
+                p.classes = vec![2; 2];
+            }
+            h.push(p);
+        }
+        let cal = calibrate::calibrate(&h, &pol);
+        for k in cal.per_key.values().chain(cal.per_class.iter()) {
+            assert!(k.inflation >= 1.0, "λ_sum {k:?}");
+            assert!(k.tail_inflation >= 1.0 && k.inflation.max(k.tail_inflation) >= k.inflation, "λ_T {k:?}");
+            assert!(k.energy_inflation >= 1.0, "λ_E {k:?}");
+            inflated_t += (k.tail_inflation > 1.0) as usize;
+            inflated_e += (k.energy_inflation > 1.0) as usize;
+            infinite += (k.tail_inflation.is_infinite() || k.energy_inflation.is_infinite()) as usize;
+            n += 1;
+        }
+    }
+    println!("{n} calibrations: λ_T > 1 in {inflated_t}, λ_E > 1 in {inflated_e}, an infinite one in {infinite}");
+    assert!(inflated_t > 100 && inflated_e > 100 && infinite > 10, "the draws exercise the inflations");
+}
+
+/// The NaN and zero rules (plan M1, spec §4): an atom with e = s = 0 adds nothing (not to the
+/// max, the rms, the point count or the floor — 200 of them leave a floor-met set's failing rms
+/// failing); s = 0 with e/b > 3 gives ∞ (at e/b = 3 exactly the max holds); any NaN, admitted or
+/// not, gives NaN; an infinite error is the worst atom (∞ at s = 0, else the next float above
+/// 1/r); an atom never admitted at λ ≥ 1 (r > 1, or r = ∞) decides nothing; a tie group is
+/// admitted together. λ_E alike at 1× the tier. Through `calibrate`: a NaN force error gives
+/// λ_T = NaN, a NaN energy error with an epistemic std gives λ_E = NaN, and a point without that
+/// std is not in λ_E's sample.
+#[test]
+fn non_finite_and_zero_rules() {
+    use calibrate::{atoms_meet_floor, energy_inflation, points_meet_floor, tail_inflation, TailAtom, TailPoint};
+    use surrogate::history::PointFlags;
+    let at = |point: usize, r: f64, e: f64| TailAtom { point, fit: Some(point as u64 % 12 + 1), r, e };
+    let none = |_: &[TailAtom]| false;
+    assert_eq!(tail_inflation(&[], atoms_meet_floor), 1.0, "nothing measured");
+    // a floor-met set whose rms fails: 60 points over 12 fits at e 0.7, r 0.5 — 0.7 × (1 + 1/√120) = 0.764 > ENTER
+    let failing: Vec<TailAtom> = (0..60).map(|p| at(p, 0.5, 0.7)).collect();
+    assert!(atoms_meet_floor(&failing) && !atoms_meet_floor(&failing[..59]));
+    assert_eq!(tail_inflation(&failing, atoms_meet_floor), 2.0f64.next_up(), "the rms fails at the floor: λ just above 1/0.5");
+    let mut zeros = failing.clone();
+    zeros.extend((60..260).map(|p| at(p, 0.0, 0.0)));
+    assert_eq!(tail_inflation(&zeros, atoms_meet_floor), 2.0f64.next_up(), "e = s = 0 adds nothing (counted, 200 zeros would dilute the rms to 0.34)");
+    // s = 0
+    assert_eq!(tail_inflation(&[at(0, 0.0, 3.0)], none), 1.0, "e/b = 3 at s = 0: the max holds");
+    assert_eq!(tail_inflation(&[at(0, 0.0, 3.0f64.next_up())], none), f64::INFINITY, "s = 0 with e/b > 3");
+    assert_eq!(tail_inflation(&[at(0, 0.3, 0.1), at(1, 0.0, 4.0)], none), f64::INFINITY);
+    // NaN, anywhere
+    for bad in [at(0, f64::NAN, 0.1), at(0, 0.5, f64::NAN), at(0, 2.0, f64::NAN), at(0, f64::INFINITY, f64::NAN)] {
+        assert!(tail_inflation(&[at(1, 0.3, 0.1), bad], none).is_nan(), "{bad:?}");
+    }
+    // ∞ errors and stds
+    assert_eq!(tail_inflation(&[at(0, 0.5, f64::INFINITY)], none), 2.0f64.next_up());
+    assert_eq!(tail_inflation(&[at(0, 0.0, f64::INFINITY)], none), f64::INFINITY);
+    assert_eq!(tail_inflation(&[at(0, f64::INFINITY, 100.0), at(1, 2.0, 100.0), at(2, 1.0, 0.2)], none), 1.0, "never admitted at λ ≥ 1");
+    assert_eq!(tail_inflation(&[at(0, 1.0, 3.5)], none), 1.0f64.next_up(), "admitted at λ = 1 exactly (1·1 ≤ 1)");
+    // ties: the group enters together
+    assert_eq!(tail_inflation(&[at(0, 0.25, 0.1), at(1, 0.25, 9.0), at(2, 0.1, 0.1)], none), 4.0f64.next_up());
+    // λ_E at 1× the tier
+    let pt = |point: usize, r: f64, e: f64| TailPoint { point, fit: Some(1), r, e };
+    let nonep = |_: &[TailPoint]| false;
+    assert_eq!(energy_inflation(&[pt(0, 0.0, 1.0)], nonep), 1.0);
+    assert_eq!(energy_inflation(&[pt(0, 0.0, 1.0f64.next_up())], nonep), f64::INFINITY);
+    assert!(energy_inflation(&[pt(0, 0.4, 0.1), pt(1, 3.0, f64::NAN)], nonep).is_nan());
+    assert_eq!(energy_inflation(&[pt(0, 0.0, 0.0), pt(1, 0.5, 1.2)], points_meet_floor), 2.0f64.next_up());
+    // through `calibrate`
+    let pol = FallbackPolicy::default();
+    let cf = PointFlags::CADENCE_FRESH;
+    let mut h = benign_answers(20, 4);
+    let mut p = answer_point(Some(code_pair()), 0.3, 0.2, 1, cf, Some((0.2, 0.1)));
+    p.err_force[0] = f64::NAN;
+    h.push(p);
+    let k = calibrate::calibrate(&h, &pol).key(&hk_pair());
+    assert!(k.tail_inflation.is_nan() && k.energy_inflation == 1.0, "{k:?}");
+    let mut h = benign_answers(20, 4);
+    h.push(answer_point(Some(code_pair()), 0.3, 0.2, 1, cf, Some((0.2, f64::NAN))));
+    let k = calibrate::calibrate(&h, &pol).key(&hk_pair());
+    assert!(k.energy_inflation.is_nan() && k.tail_inflation == 1.0, "{k:?}");
+    let mut h = benign_answers(20, 4);
+    let mut p = answer_point(Some(code_pair()), 0.3, 0.2, 1, cf, None);
+    p.err_energy = 1.0; // 500× the tier per atom, but no epistemic std: not in λ_E's sample
+    h.push(p);
+    let k = calibrate::calibrate(&h, &pol).key(&hk_pair());
+    assert_eq!((k.energy_inflation, k.tail_inflation, k.answer_points), (1.0, 1.0, 21), "{k:?}");
+}
+
+/// Spec §4: the rms condition applies only to a set that meets the floor (12 fits, 60 points) —
+/// without that restriction one admitted atom at 0.8× the bound would make λ_T infinite. 80
+/// points over 16 fits, every atom at e/b = 0.8 (the max holds), r rising with the point: the first
+/// prefix to meet the floor holds 60 points, its rms × (1 + 1/√120) = 0.873 > ENTER, so λ_T is the
+/// next float above 1/r of the 60th point. With 59 points, or with 11 fits, the floor is never met
+/// and λ_T = 1.
+#[test]
+fn the_tail_inflation_applies_its_rms_only_where_the_set_meets_the_floor() {
+    use calibrate::{atoms_meet_floor, tail_inflation, TailAtom};
+    use surrogate::history::PointFlags;
+    let r_of = |i: usize| 0.1 + 0.8 * i as f64 / 79.0;
+    let atoms = |n: usize, fits: usize| -> Vec<TailAtom> { (0..n).flat_map(|i| [0, 1].map(|_| TailAtom { point: i, fit: Some((i % fits) as u64 + 1), r: r_of(i), e: 0.8 })).collect() };
+    assert_eq!(tail_inflation(&atoms(80, 16), atoms_meet_floor), (1.0 / r_of(59)).next_up());
+    assert_eq!(tail_inflation(&atoms(59, 16), atoms_meet_floor), 1.0);
+    assert_eq!(tail_inflation(&atoms(80, 11), atoms_meet_floor), 1.0);
+    // through `calibrate`: the same sample as history points
+    let pol = FallbackPolicy::default();
+    let mut h = surrogate::AuditHistory::default();
+    for i in 0..80 {
+        h.push(answer_point(Some(code_pair()), r_of(i), 0.8, (i % 16) as u64 + 1, PointFlags::CADENCE_FRESH, None));
+    }
+    let k = calibrate::calibrate(&h, &pol).key(&hk_pair());
+    println!("λ_T {:.15} (1/r₆₀ = {:.15}) over {} answer points; λ_E {}", k.tail_inflation, 1.0 / r_of(59), k.answer_points, k.energy_inflation);
+    assert!((k.tail_inflation / (1.0 / r_of(59)) - 1.0).abs() < 1e-12, "{k:?}");
+    assert_eq!(k.energy_inflation, 1.0, "no point carries an epistemic energy std");
+}
+
+/// Task 3 review MUST (carried): rule 5d's novelty is evaluated on every cadence-fresh step, read-only
+/// where the variance verdict was reused, and recorded as bit 8, so P_A's membership does not follow
+/// the σ-coupled variance phase. H₂ + H under an H₂-only model, the spread envelope and the per-atom
+/// grade (5e) off so that 5d alone sees the unspanned direction (as in
+/// `would_answer_agrees_with_evaluate_on_the_novelty_and_the_class`): (a) with the variance fresh,
+/// 5d names the refusal (code 11) and the point is NOVEL; (b) on a cadence-fresh step
+/// that reuses an accepting verdict, the class rule names it (a class code — in P_A by its code
+/// alone) and the read-only novelty marks it NOVEL; neither is in P_A. (c) Reused and not
+/// cadence-fresh, nothing is evaluated: no bit (and not in P_A, not being cadence-fresh). (d) A
+/// dimer the model knows, class-refused on a reused cadence-fresh step: no bit, in P_A. Nothing
+/// decided moves: the reused step's note is the class rule's.
+#[test]
+fn a_novel_geometry_is_flagged_on_every_cadence_fresh_step_whether_or_not_the_verdict_was_reused() {
+    use surrogate::history::{PointFlags, PointKind};
+    let class_codes = [code_pair(), history_rule_code(TeachRule::Class(sim::activity::EnvClass::ManyBody)), HISTORY_RULE_CLASS_AND_VARIANCE];
+    let mut s = dimer_model_three_atom_teacher();
+    s.set_policy(FallbackPolicy { max_descriptor_distance: f64::INFINITY, audit_every: 0, variance_cadence: 4, ..FallbackPolicy::default() });
+    s.active_set = None;
+    s.ensure_desc_cache();
+    // an accepting verdict at `sc` for its neighbour counts, as a reused one would be
+    let reuse = |s: &mut SurrogateKs, sc: &Scene, count: u64| {
+        let (pos, z) = pos_z(sc);
+        let model = s.model().unwrap().clone();
+        let pred = model.predict(&pos, &z, true).unwrap();
+        let mut v = s.variance_check(&model, &pred, pred.energy_std.unwrap(), pred.force_std_epistemic.as_ref().unwrap(), &pos, &z);
+        (v.accept, v.reason, v.novel) = (true, None, false);
+        s.last_variance = Some(v);
+        s.verdict_counts = neighbour_counts(&pos, model.basis.r_cut * model.basis.r_cut);
+        s.consults = 0;
+        s.cadence_steps = count;
+    };
+    let step = |s: &mut SurrogateKs, sc: &Scene| {
+        let (checks, recorded) = (s.variance_checks(), s.audit_history().recorded());
+        let r = s.evaluate(sc, &mut never()).unwrap();
+        assert_eq!((r.stats.source, s.audit_history().recorded()), (Source::Fallback, recorded + 1), "{:?}", r.stats.notes);
+        (last_point(s), s.variance_checks() > checks, r.stats.notes[0].clone())
+    };
+    let mut shown = 0;
+    for d in [2.0, 3.0, 5.0] {
+        let sc = h2_plus_h(d);
+        let (pos, z) = pos_z(&sc);
+        let nu = s.null_space.as_ref().unwrap().novelty(&pos, &z).unwrap().0;
+        assert!(nu > 1.0, "the premise: novel at {d} Bohr (ν {nu:.2e})");
+        // (a) the variance fresh, on a cadence-fresh step
+        s.last_variance = None;
+        s.cadence_steps = 8;
+        let (a, fresh, note) = step(&mut s, &sc);
+        println!("H₂ + H at {d}: fresh variance {fresh}, {:?} {:?}: {note}", a.kind, a.flags);
+        assert!(fresh && a.kind == PointKind::Fallback { rule: history_rule_code(TeachRule::NewEnvironment) }, "5d names it: {a:?}");
+        assert!(a.flags.has(PointFlags::NOVEL | PointFlags::CADENCE_FRESH) && !calibrate::in_answer_sample(&a), "{a:?}");
+        // (b) reused on a cadence-fresh step
+        reuse(&mut s, &sc, 12);
+        let (b, fresh, note) = step(&mut s, &sc);
+        println!("  reused: fresh variance {fresh}, {:?} {:?}: {note}", b.kind, b.flags);
+        assert!(!fresh, "the premise: the verdict was reused");
+        assert!(b.flags.has(PointFlags::NOVEL | PointFlags::CADENCE_FRESH) && !calibrate::in_answer_sample(&b), "{b:?}");
+        if matches!(b.kind, PointKind::Fallback { rule } if class_codes.contains(&rule)) {
+            assert!(note.contains("isn't learned well enough yet"), "the class rule decided, as before: {note}");
+            shown += 1;
+        }
+        // (c) reused, not cadence-fresh: not evaluated
+        reuse(&mut s, &sc, 13);
+        let (c, fresh, _) = step(&mut s, &sc);
+        assert!(!fresh && c.flags.0 & (PointFlags::NOVEL | PointFlags::CADENCE_FRESH) == 0 && !calibrate::in_answer_sample(&c), "{c:?}");
+    }
+    assert!(shown > 0, "a reused step at a novel geometry carried a class code (the σ-coupled case the bit closes)");
+    // (d) a dimer the model knows, its pair class refused, on a reused cadence-fresh step
+    pin_pair_class_refused(&mut s);
+    let sc = in_cell_65(h2(1.6));
+    reuse(&mut s, &sc, 16);
+    let (d, fresh, _) = step(&mut s, &sc);
+    assert!(!fresh && d.kind == PointKind::Fallback { rule: code_pair() } && d.flags == PointFlags(PointFlags::CADENCE_FRESH) && calibrate::in_answer_sample(&d), "{d:?}");
+}
+
+/// Plan Task 5: draft-mode points are not in P_A. Draft mode records a consulted step's point only
+/// at a relax verification (or a background audit), and the verification's code is the rule that
+/// fired before draft mode overrode it — a class code at a class-refused geometry. So a draft-mode
+/// step is never cadence-fresh for the history: the same verification in strict mode is in P_A,
+/// in draft mode it is not. (A draft guess's audit is never recorded at all: `Unrecorded::draft`.)
+#[test]
+fn draft_mode_points_are_not_in_the_answer_sample() {
+    use surrogate::history::{PointFlags, PointKind};
+    for draft in [false, true] {
+        let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, never_fallback: draft, ..FallbackPolicy::default() });
+        pin_pair_class_refused(&mut s);
+        s.force_teacher_next();
+        let before = s.audit_history().recorded();
+        let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+        assert_eq!((r.stats.source, s.audit_history().recorded()), (Source::Fallback, before + 1), "{:?}", r.stats.notes);
+        let p = last_point(&s);
+        println!("draft {draft}: {:?} {:?}", p.kind, p.flags);
+        assert_eq!(p.kind, PointKind::Fallback { rule: code_pair() }, "the class rule fired first");
+        assert_eq!((p.flags.has(PointFlags::CADENCE_FRESH), calibrate::in_answer_sample(&p)), (!draft, !draft), "draft {draft}");
+    }
+}
+
+/// Task 3 review minor: the cadence counter counts every step reaching the gate, the ones rules
+/// 1–4 refuse included, so its phase does not follow rule 4's untrust (audit failures on an
+/// answered-step cadence that σ-refusals shift). A step of a species the model never saw (rule 2)
+/// advances it.
+#[test]
+fn the_cadence_counter_counts_every_step_reaching_the_gate() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let c = s.cadence_steps;
+    let r = s.evaluate(&dimer(1.5, [1.0, 0.0, 0.0], [0.0; 3], 1, 3), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+    assert_eq!(s.cadence_steps, c + 1, "{:?}", r.stats.notes);
+    s.evaluate(&h2(1.6), &mut never()).unwrap();
+    assert_eq!(s.cadence_steps, c + 2);
+}

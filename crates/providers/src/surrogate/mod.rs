@@ -308,14 +308,24 @@
 //! and the total-energy epistemic std. Neither reads the step's σ or any λ to decide *which* step
 //! is flagged — the sample they select must be chosen blind to what it measures:
 //!
-//! * `CADENCE_FRESH`: a step is consulted when it passes the gate (rules 1–4) and reaches the
-//!   variance cadence. `cadence_steps` counts consulted steps from 0 and **nothing resets it** (not
-//!   a refit, an install, a policy change, an edit or a forget); a step is cadence-fresh when its
-//!   count c satisfies c mod k = 0, k = `variance_cadence` (≥ 1). `consults` is not used: it
-//!   restarts on every fresh variance, and a variance refused by rule 6/7 is fresh on the next
-//!   step, so its phase follows σ. The bit selects steps; it does not force the variance: on a
-//!   cadence-fresh step that `consults` does not make fresh, the last accepting verdict is reused
-//!   as before (rule 5d's novelty with it), so nothing any rule decides moves.
+//! * `CADENCE_FRESH`: `cadence_steps` counts every step that reaches the gate (rules 1–4; the ones
+//!   it refuses included — the Task 3 review's minor, so the phase does not follow rule 4's
+//!   untrust, which follows audit failures on an answered-step cadence σ-refusals shift) from 0,
+//!   and **nothing resets it** (not a refit, an install, a policy change, an edit or a forget); a
+//!   step is cadence-fresh when its count c satisfies c mod k = 0, k = `variance_cadence` (≥ 1).
+//!   `consults` is not used: it restarts on every fresh variance, and a variance refused by rule
+//!   6/7 is fresh on the next step, so its phase follows σ. The bit selects steps; it does not
+//!   force the variance: on a cadence-fresh step that `consults` does not make fresh, the last
+//!   accepting verdict is reused as before, so nothing any rule decides moves. A draft-mode step
+//!   is never cadence-fresh for the history (Task 5: draft-mode points are not in P_A).
+//! * `NOVEL` (Task 5; the Task 3 review's MUST): rule 5d's novelty ν > 1 at the geometry. It is
+//!   evaluated with every fresh variance (where 5d decides) and, **read-only**, on every
+//!   cadence-fresh step that reuses a verdict — where 5d decides nothing and the step may carry a
+//!   class code that a fresh verdict would have written as 5d's 11. So on every cadence-fresh
+//!   step the bit is a function of the geometry and the fit alone, and `calibrate`'s answer sample
+//!   leaves novel points out whichever code they carry. Off the cadence it is set only where the
+//!   variance was fresh (and P_A does not read those points). The cost: one null-space projection
+//!   per k-th consult at most, beside the variance it would otherwise share.
 //! * `FENCED`: the geometry is near a quarantined or forgotten sample (`near` non-empty), an atom
 //!   is near a misfit (`near_misfit`), or the shell or audit fence would refuse it. All three are
 //!   evaluated on every consulted step — the audit fence read-only (`audit_fence_refusal`) when an
@@ -1457,9 +1467,9 @@ pub struct SurrogateKs {
     last: Option<LastEval>,
     /// Consultations since the variance was last evaluated (the cadence, module doc).
     consults: usize,
-    /// Consulted steps so far, never reset (module doc, "The history's flags"): a step whose count
-    /// is a multiple of `variance_cadence` is cadence-fresh. Unlike `consults` its phase does not
-    /// follow σ.
+    /// Steps that reached the gate so far, never reset (module doc, "The history's flags"): a step
+    /// whose count is a multiple of `variance_cadence` is cadence-fresh. Unlike `consults` its phase
+    /// does not follow σ.
     cadence_steps: u64,
     last_variance: Option<VarianceVerdict>,
     /// The fit gates' floor, |∪ S_k| over the samples a fit would use in the basis it would build,
@@ -2427,6 +2437,18 @@ impl ForceProvider for SurrogateKs {
         // the strict policy's refusal here, before draft mode or the relax verification override
         // it: the readiness readout's (module doc, "Readiness")
         let mut strict_gate: Option<Refusal> = None;
+        // the history's cadence-fresh bit (module doc, "The history's flags"): this step's count on
+        // the never-reset counter, a multiple of k — not `consults`, whose phase a rule-6/7 refusal
+        // restarts. Every step reaching the gate counts (the Task 3 review's minor), so the phase
+        // does not follow rule 4's untrust either (audit failures, on an answered-step cadence that
+        // σ-refusals shift). A draft-mode step is never cadence-fresh for the history: its points
+        // are not in P_A (`calibrate`, "The answer sample P_A")
+        let cadence_fresh = {
+            let k = self.policy.variance_cadence.max(1) as u64;
+            let c = self.cadence_steps;
+            self.cadence_steps += 1;
+            c % k == 0 && !draft
+        };
         match self.gate(&z, &prov) {
             Err(Gate { reason, untrusted: true, .. }) if draft => {
                 strict_gate = Some(reason.clone());
@@ -2453,15 +2475,6 @@ impl ForceProvider for SurrogateKs {
         let counts = {
             let rc2 = self.model.as_ref().map_or(0.0, |m| m.basis.r_cut * m.basis.r_cut);
             neighbour_counts(&pos, rc2)
-        };
-        // the history's cadence-fresh bit (module doc, "The history's flags"): this consulted
-        // step's count on the never-reset counter, a multiple of k — not `consults`, whose phase
-        // a rule-6/7 refusal restarts
-        let cadence_fresh = {
-            let k = self.policy.variance_cadence.max(1) as u64;
-            let c = self.cadence_steps;
-            self.cadence_steps += 1;
-            c % k == 0
         };
         let with_variance = {
             let k = self.policy.variance_cadence.max(1);
@@ -2503,21 +2516,33 @@ impl ForceProvider for SurrogateKs {
             };
             return self.teach(scene, h, t0, should_abort);
         }
+        // rule 5d's novelty at this geometry: `Some((ν, atom))` when ν > 1
+        let novelty = |ns: Option<&surrogate::NullSpace>| ns.and_then(|ns| ns.novelty(&pos, &z).ok()).filter(|(nu, _)| *nu > 1.0);
+        // the history's novel bit (module doc, "The history's flags"): rule 5d's novelty wherever it
+        // is evaluated — with a fresh variance, and read-only on every cadence-fresh step that
+        // reuses a verdict (Task 3 review MUST), so a cadence-fresh point's bit does not follow the
+        // σ-coupled variance phase
+        let mut novel_bit = false;
         // rule 6 on the epistemic force std (σ_f excluded, as rule 7 excludes the energy floor)
         let variance = match (pred.energy_std, pred.force_std_epistemic.as_ref()) {
             (Some(e), Some(f)) => {
                 let mut v = self.variance_check(model, &pred, e, f, &pos, &z);
                 // rule 5d with the variance (the same cadence; a rejection is never reused)
-                if let Some((nu, at)) = self.null_space.as_ref().and_then(|ns| ns.novelty(&pos, &z).ok()).filter(|(nu, _)| *nu > 1.0) {
+                if let Some((nu, at)) = novelty(self.null_space.as_ref()) {
                     v.accept = false;
                     v.novel = true;
                     v.reason = Some(novelty_refusal(nu, at));
+                    novel_bit = true;
                 }
                 self.verdict_counts = counts.clone();
                 self.last_variance = Some(v.clone());
                 v
             }
-            _ => self.last_variance.clone().expect("a variance verdict exists when none is evaluated"),
+            _ => {
+                // read-only: the reused verdict and every rule's decision stay as they were
+                novel_bit = cadence_fresh && novelty(self.null_space.as_ref()).is_some();
+                self.last_variance.clone().expect("a variance verdict exists when none is evaluated")
+            }
         };
         let uncertainty = Some(variance.uncertainty);
         let atom_uncertainty = Some(variance.atoms.clone());
@@ -2605,7 +2630,9 @@ impl ForceProvider for SurrogateKs {
         // shell fence) asked read-only when an earlier rule refused before it was consulted
         let fenced = !near.is_empty() || near_misfit || by_shell_fence || by_audit_fence || (!audit_fence_checked && self.audit_fence_refusal(&pos, &z).is_some());
         let flags = surrogate::history::PointFlags(
-            if cadence_fresh { surrogate::history::PointFlags::CADENCE_FRESH } else { 0 } | if fenced { surrogate::history::PointFlags::FENCED } else { 0 },
+            if cadence_fresh { surrogate::history::PointFlags::CADENCE_FRESH } else { 0 }
+                | if fenced { surrogate::history::PointFlags::FENCED } else { 0 }
+                | if novel_bit { surrogate::history::PointFlags::NOVEL } else { 0 },
         );
         self.record_verdict(&pos, &z, strict_gate.clone().or_else(|| reason.clone()));
         // never at lone atoms the references answer (rule 0b — reached here in draft mode only): the

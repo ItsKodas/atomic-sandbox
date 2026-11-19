@@ -3084,7 +3084,7 @@ pub(crate) mod tests {
 
     /// A [`history_point`] carrying the trust-tightening fields (plan 2026-11-19 Task 1).
     fn trust_point(i: u64, n: usize) -> crate::history::AuditPoint {
-        crate::history::AuditPoint { fit_id: (i % 3 != 0).then_some(11 * i), flags: crate::history::PointFlags((i % 8) as u8), energy_std_epistemic: (i % 4 != 1).then_some(3e-6 * i as f64), ..history_point(i, n) }
+        crate::history::AuditPoint { fit_id: (i % 3 != 0).then_some(11 * i), flags: crate::history::PointFlags((i % 16) as u8), energy_std_epistemic: (i % 4 != 1).then_some(3e-6 * i as f64), ..history_point(i, n) }
     }
 
     /// The file `bytes` with `header` in place of its own and `magic` for its first eight bytes;
@@ -3112,7 +3112,7 @@ pub(crate) mod tests {
         assert_eq!(magic_version(MAGIC_V10), Some(10));
         for (what, body, orig) in [("body 7, body-2 basis", 7u8, random_sidecar(81, false)), ("body 7, body-3 basis", 7, random_sidecar(82, true)), ("body 8", 8, random_sidecar_with(83, true, true))] {
             let mut hist = AuditHistory::default();
-            for i in 0..12u64 {
+            for i in 0..16u64 {
                 hist.push(trust_point(i, 1 + (i % 3) as usize));
             }
             assert!((0..=PointFlags::ALL).all(|f| hist.iter().any(|p| p.flags.0 == f)), "every flags word");
@@ -3124,7 +3124,7 @@ pub(crate) mod tests {
             assert_eq!(&bytes[..8], MAGIC_V10, "{what}");
             let header = header_of(&bytes);
             assert!(header.starts_with(&format!("{{\"format\":\"ASMOD010\",\"body\":{body},\"created_by\":")), "{what}: {header}");
-            assert!(header.contains("[\"audit_fit\",12],[\"audit_flags\",12],[\"audit_energy_std_epistemic\",12]]"), "{what}: {header}");
+            assert!(header.contains("[\"audit_fit\",16],[\"audit_flags\",16],[\"audit_energy_std_epistemic\",16]]"), "{what}: {header}");
             let back = read(&p).unwrap();
             assert_eq!(back.audit_history, hist, "{what}");
             for (a, b) in back.audit_history.iter().zip(hist.iter()) {
@@ -3149,7 +3149,7 @@ pub(crate) mod tests {
     }
 
     /// Trust tightening Task 1: the sidecar holds the three new arrays to the history's rules —
-    /// a non-integral, too large or negative fit id, a flags word above 7, non-integral or
+    /// a non-integral, too large or negative fit id, a flags word above 15, non-integral or
     /// negative, a negative, NaN or infinite energy std, a wrong length are each refused as
     /// `InvalidData` naming the array, never a panic — and to its own layout: the three arrays
     /// under the version-9 magic, a version-10 file without them, without an audit history, or
@@ -3182,7 +3182,7 @@ pub(crate) mod tests {
             (0, 1, (1u64 << 53) as f64, "audit_fit"),
             (0, 2, -3.0, "audit_fit"),
             (0, 3, f64::NAN, "audit_fit"),
-            (1, 0, 8.0, "audit_flags"),
+            (1, 0, 16.0, "audit_flags"),
             (1, 4, 0.25, "audit_flags"),
             (1, 1, -1.0, "audit_flags"),
             (2, 0, -0.5, "audit_energy_std_epistemic"),
