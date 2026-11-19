@@ -418,9 +418,10 @@ impl SurrogateKs {
         }
         let bz: Vec<u8> = split.bonded.iter().map(|&i| z[i]).collect();
         let species = model.basis.species_indices(&bz).ok()?;
+        let (units, thin) = (self.envelope.as_ref(), THIN_FRACTION * self.policy.max_descriptor_distance);
         let inside = match desc.filter(|d| d.len() == pos.len()) {
-            Some(d) => region.contains(&split.bonded.iter().map(|&i| &d[i]).collect::<Vec<_>>(), &species),
-            None => self.bonded_descriptors(pos, z, &split).is_some_and(|(d, _)| region.contains(&d, &species)),
+            Some(d) => region.covers(&split.bonded.iter().map(|&i| &d[i]).collect::<Vec<_>>(), &species, units, thin),
+            None => self.bonded_descriptors(pos, z, &split).is_some_and(|(d, _)| region.covers(&d, &species, units, thin)),
         };
         inside.then_some((split, *residual, *margin, *passes))
     }
@@ -429,7 +430,8 @@ impl SurrogateKs {
     pub(in crate::surrogate) fn stray_covered(&mut self, pos: &[[f64; 3]], z: &[u8], split: &Split, sig: &Signature) -> bool {
         self.stray_book_current();
         let Some(StrayState::Cleared { region, .. }) = self.stray_book.state(sig) else { return false };
-        self.bonded_descriptors(pos, z, split).is_some_and(|(d, s)| region.contains(&d, &s))
+        let (units, thin) = (self.envelope.as_ref(), THIN_FRACTION * self.policy.max_descriptor_distance);
+        self.bonded_descriptors(pos, z, split).is_some_and(|(d, s)| region.covers(&d, &s, units, thin))
     }
 
     /// Queues the composition check of `scene` (module doc, "The checks on the auditor"): `ans` is the scene's own
@@ -454,7 +456,7 @@ impl SurrogateKs {
         let thin = THIN_FRACTION * self.policy.max_descriptor_distance;
         match self.stray_book.state(&sig) {
             Some(StrayState::Refused(_)) => return false,
-            Some(StrayState::Cleared { region, .. }) if region.contains(&desc, &species) => return false,
+            Some(StrayState::Cleared { region, .. }) if region.covers(&desc, &species, Some(units), thin) => return false,
             Some(StrayState::Checking { region, .. }) if !region.distinct(&desc, &species, units, thin) => return false,
             _ => {}
         }
@@ -771,6 +773,8 @@ impl SurrogateKs {
         self.stray_book_current();
         let Some(StrayState::Cleared { region, .. }) = self.stray_book.state(sig) else { return 0 };
         let region = region.clone();
+        let (units, thin) = (self.envelope.clone(), THIN_FRACTION * self.policy.max_descriptor_distance);
+        let units = units.as_ref();
         let Some(store) = self.store.as_ref() else { return 0 };
         let r_cut = self.cutoff();
         let mut release = Vec::new();
@@ -783,7 +787,7 @@ impl SurrogateKs {
             if Signature::new(&s.z, &sp, prov.charge, &prov) != *sig {
                 continue;
             }
-            if self.bonded_descriptors(&s.pos, &s.z, &sp).is_some_and(|(d, k)| region.contains(&d, &k)) {
+            if self.bonded_descriptors(&s.pos, &s.z, &sp).is_some_and(|(d, k)| region.covers(&d, &k, units, thin)) {
                 release.push(i);
             }
         }

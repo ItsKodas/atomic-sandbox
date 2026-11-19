@@ -114,11 +114,11 @@
 //!   along the bend), each test's doc and `references.md` say which. The `#[ignore]`d `v5_*` tests are the measurements
 //!   behind those terms. The two gates add ≈ 15 min (CPU) and ≈ 25 min (GPU) to the suite.
 //! - `stray_h_returning_conserves_energy` (stray atoms, spec 2026-11-18 §6 "Dynamics"; plan Task 7): after a default H₂
-//!   pass and K = 3 composition checks clear H₂ + H (81³ × 0.20, `ionic accepted`, a background auditor), NVE with a
-//!   stray H flying past H₂ through r_cut (closest 4.56 Bohr) and out: model → teacher (rule 5b) → model, each switch
-//!   booked by the provider's `transition_jump`; `E_conserved` drift within `DRIFT_BOUND`, the booked jumps reported
-//!   against the check's energy tolerance. **Blocked on this branch (2026-11-19)**: the clearing step fails on the real
-//!   teacher (`surrogate.rs` module doc, "Stray atoms").
+//!   pass and K = 3 composition checks clear H₂ + H (101³ × 0.20, a 20 Bohr cube, `ionic accepted`, a background
+//!   auditor), NVE with a stray H flying past H₂ through r_cut (closest ≈ 3.6 Bohr) and out: model → teacher (rule 5b) →
+//!   model, each switch booked by the provider's `transition_jump`; `E_conserved` drift within `DRIFT_BOUND`, no teacher
+//!   solve box-affected, the booked jumps and E_conserved across each switch reported, and a control run (the teacher
+//!   alone from the same start) printed beside it.
 //!
 //! The GPU work of concurrently running tests is serialised through `GPU`, one evaluation at a
 //! time, so the per-solve times in the timing rows are uncontended while the tests interleave.
@@ -1172,8 +1172,14 @@ fn fd_nve_conserves_f_plus_k_through_the_ts_swing() {
 
 // ---- stray atoms: NVE through re-entry (spec 2026-11-18 §6 "Dynamics"; plan Task 7; `references.md`, "Stray atoms") ----
 
+/// The re-entry run's grid (h = `STRAY_H`): 101³, a 20 Bohr cube, so every atom of the path stays ≥ 6.1 Bohr from every
+/// face. At the stray tests' 81³ (16 Bohr) the same path runs 4.1 Bohr from the x faces (the floor's edge): the teacher's
+/// solves there warn "density on box faces … box too small" and its own E_conserved swings by 1.2e-4 Ha peak to peak
+/// with no surrogate at all (the control), which put −5.3e-4 Ha/ps of drift into the teacher's phase of the run while the
+/// switches conserved E_conserved to 5e-8 Ha (`references.md`, "Stray atoms").
+const REENTRY_N: usize = 101;
 /// The returning H's path: the line (`REENTRY_X`, s, s), s from +`REENTRY_S0` to −`REENTRY_S0`, past H₂ centred at
-/// (`REENTRY_XH`, 0, 0) along z. Its ends are 4.1 Bohr from the faces (the stray floor's 4 Bohr edge) and 6.0 Bohr from
+/// (`REENTRY_XH`, 0, 0) along z. Its ends are 6.1 Bohr from the faces at `REENTRY_N` and 6.0 Bohr from
 /// the nearest H₂ atom at s = ±3.14 (r_cut 6): stray for |s| > 3.14, inside r_cut between, closest 4.56 Bohr at s ≈ 0.
 const REENTRY_X: f64 = 3.9;
 const REENTRY_XH: f64 = -0.6;
@@ -1191,28 +1197,28 @@ const REENTRY_STEP: f64 = 0.03;
 #[test]
 #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test dynamics")]
 fn stray_h_returning_conserves_energy() {
-    use common::surrogate::{accepted, clear_h2_h, stray_student, train_h2, STRAY_CHECK_R, STRAY_H, STRAY_N, STRAY_R0};
+    use common::surrogate::{accepted, clear_h2_h, stray_student, train_h2, STRAY_CHECK_R, STRAY_H, STRAY_R0};
     use sim::Source;
     let Some(ctx) = gpu() else { return };
     let t_test = Instant::now();
     let (mut s, log, alog) = stray_student(&ctx);
     let tol = s.policy().energy_std_per_atom;
     let mut out = String::new();
-    let _ = writeln!(out, "H₂ + a returning H, NVE, {STRAY_N}³ × {STRAY_H} (σ = h), accepted, tol {TOL_H2:e}, dt {DT_FS} fs:");
-    train_h2(&mut s, STRAY_R0, seed(), &mut out);
-    let passed = clear_h2_h(&mut s, &STRAY_CHECK_R, &mut out);
+    let _ = writeln!(out, "H₂ + a returning H, NVE, {REENTRY_N}³ × {STRAY_H} (σ = h), accepted, tol {TOL_H2:e}, dt {DT_FS} fs:");
+    train_h2(&mut s, REENTRY_N, STRAY_R0, seed(), &mut out);
+    let passed = clear_h2_h(&mut s, REENTRY_N, &STRAY_CHECK_R, &mut out);
     let _ = writeln!(out, "  H₂ + H cleared by the checks at r = {passed:?}");
     let v = REENTRY_STEP / units::fs_to_au_time(DT_FS);
     let (c, w) = (std::f64::consts::FRAC_1_SQRT_2, REENTRY_S0);
     let mut h = Nucleus::new(1, [REENTRY_X, w, w]);
     h.vel = [0.0, -v * c, -v * c];
-    let start = accepted(STRAY_N, STRAY_H, vec![Nucleus::new(1, [REENTRY_XH, 0.0, 0.5 * STRAY_R0]), Nucleus::new(1, [REENTRY_XH, 0.0, -0.5 * STRAY_R0]), h]);
+    let start = accepted(REENTRY_N, STRAY_H, vec![Nucleus::new(1, [REENTRY_XH, 0.0, 0.5 * STRAY_R0]), Nucleus::new(1, [REENTRY_XH, 0.0, -0.5 * STRAY_R0]), h]);
     let pos: Vec<[f64; 3]> = start.nuclei.iter().map(|n| n.pos).collect();
     let z: Vec<u8> = start.nuclei.iter().map(|n| n.z).collect();
     let premise = s.would_answer(&pos, &z, &s.provenance_for(&start));
     let _ = writeln!(out, "  start: H at ({REENTRY_X}, {w}, {w}) moving {REENTRY_STEP} Bohr/step (v {v:.3e} a.u.) along (0, −1, −1)/√2; H₂ ({STRAY_R0}) at rest at x = {REENTRY_XH}; would_answer {premise:?}");
     assert!(premise.is_ok(), "premise: the start is inside the cleared region\n{out}");
-    let mut d = Dynamics::new(start, Box::new(s), DT_FS, seed());
+    let mut d = Dynamics::new(start.clone(), Box::new(s), DT_FS, seed());
     let s0 = d.snapshot();
     assert!(s0.last_error.is_none(), "{:?}", s0.last_error);
     let nearest = |sc: &Scene| (0..2).map(|i| (0..3).map(|k| (sc.nuclei[2].pos[k] - sc.nuclei[i].pos[k]).powi(2)).sum::<f64>().sqrt()).fold(f64::INFINITY, f64::min);
@@ -1258,6 +1264,17 @@ fn stray_h_returning_conserves_energy() {
         }
     }
     let _ = writeln!(out, "  {n} steps ({:.1} fs); closest approach {r_min:.3} Bohr; phases {phases:?}; history restarts {restarts}", units::au_time_to_fs(t[n] - t[0]));
+    // per phase: E_conserved at its ends and its own drift (where the run's drift accrues)
+    let mut at = 0;
+    for (src, k) in &phases {
+        let (a, b) = (at, at + k - 1);
+        let (slope, fl, _) = if b > a + 2 { fit_line(&t[a..=b], &e_cons[a..=b]) } else { (0.0, 0.0, 0.0) };
+        let _ = writeln!(out, "  phase {src:?} steps {a}–{b}: E_conserved {:+.9} → {:+.9} (Δ {:+.3e} Ha), drift {:+.3e} Ha/ps, detrended p-p {fl:.2e}", e_cons[a], e_cons[b], e_cons[b] - e_cons[a], slope * au_per_ps());
+        if b + 1 <= n {
+            let _ = writeln!(out, "    switch at step {}: E_conserved {:+.9} → {:+.9} (Δ {:+.3e} Ha)", b + 1, e_cons[b], e_cons[b + 1], e_cons[b + 1] - e_cons[b]);
+        }
+        at = b + 1;
+    }
     let _ = writeln!(
         out,
         "  E_conserved: drift {drift:+.3e} Ha/ps (bound {DRIFT_BOUND:.0e}; the driver's {:?}), detrended peak-to-peak {fluct:.3e} Ha, raw {:.3e} Ha; start {:+.9}, end {:+.9}",
@@ -1270,10 +1287,38 @@ fn stray_h_returning_conserves_energy() {
     for (i, j, from, to, r) in &jumps {
         let _ = writeln!(out, "    step {i}: {from:?} → {to:?} at {r:.3} Bohr: {:+.4} mHa ({})", j * 1e3, if j.abs() <= tol { "within" } else { "BEYOND the check's tolerance" });
     }
+    // the control: the teacher alone (no surrogate) from the same start for the same steps — its own drift on this
+    // path, and over the steps the stray run handed to it
+    let (ctl, clog) = Locked::new(ctx.clone(), TOL_H2);
+    let mut dc = Dynamics::new(start, Box::new(ctl), DT_FS, seed());
+    let c0 = dc.snapshot();
+    let (mut ct, mut ce) = (vec![c0.sim_time], vec![c0.energy_conserved]);
+    for i in 1..=n {
+        dc.apply(DynCommand::Step(1));
+        let snap = dc.tick(f64::INFINITY, &mut never());
+        assert!(snap.last_error.is_none(), "control step {i}: {:?}", snap.last_error);
+        ct.push(snap.sim_time);
+        ce.push(snap.energy_conserved);
+    }
+    let (c_slope, c_fl, _) = fit_line(&ct, &ce);
+    let fb = phases.iter().position(|p| p.0 == Source::Fallback).map(|k| {
+        let a: usize = phases[..k].iter().map(|p| p.1).sum();
+        (a, a + phases[k].1 - 1)
+    });
+    let c_part = fb.filter(|&(a, b)| b > a + 2).map(|(a, b)| (fit_line(&ct[a..=b], &ce[a..=b]).0 * au_per_ps(), ce[b] - ce[a]));
+    let _ = writeln!(
+        out,
+        "  control (the teacher alone, same start, {n} steps): drift {:+.3e} Ha/ps, detrended p-p {c_fl:.2e} Ha, Δ {:+.3e} Ha; over the steps the stray run gave the teacher ({fb:?}): drift {:+.3e} Ha/ps, Δ {:+.3e} Ha; {}",
+        c_slope * au_per_ps(),
+        ce[n] - ce[0],
+        c_part.map_or(f64::NAN, |c| c.0),
+        c_part.map_or(f64::NAN, |c| c.1),
+        clog.lock().unwrap().summary()
+    );
     let tl = log.lock().unwrap().clone();
     let _ = writeln!(out, "  teacher: {}\n  auditor: {}\n  MD wall {:.0} s; test wall {:.0} s", tl.summary(), alog.lock().unwrap().summary(), md_wall.as_secs_f64(), t_test.elapsed().as_secs_f64());
     println!("{out}");
-    record(&ctx, timing_row("stray_h_returning", "H₂ + H", STRAY_N, TOL_H2, &tl, t_test.elapsed(), &format!("drift {drift:+.2e} Ha/ps, {} booked jumps Σ {:+.2e} Ha", jumps.len(), last.work_refit)));
+    record(&ctx, timing_row("stray_h_returning", "H₂ + H", REENTRY_N, TOL_H2, &tl, t_test.elapsed(), &format!("drift {drift:+.2e} Ha/ps, {} booked jumps Σ {:+.2e} Ha", jumps.len(), last.work_refit)));
     // model → teacher → model: the H came back within r_cut and left again (otherwise the test is vacuous)
     let kinds: Vec<Source> = phases.iter().map(|p| p.0).collect();
     assert!(r_min < 6.0, "the H re-entered r_cut\n{out}");
@@ -1282,5 +1327,6 @@ fn stray_h_returning_conserves_energy() {
     assert!(kinds.contains(&Source::Fallback), "within r_cut: the teacher's\n{out}");
     assert!(!jumps.is_empty(), "each switch of surface is booked\n{out}");
     assert_eq!(restarts, 0, "no unbooked surface change restarted the history\n{out}");
+    assert!(tl.warnings.iter().all(|w| !w.contains("box too small")), "a clean path (the suite's NVE rule): {:?}\n{out}", tl.warnings);
     assert!(drift.abs() <= DRIFT_BOUND, "E_conserved drift {drift:+.3e} Ha/ps (bound {DRIFT_BOUND:.0e})\n{out}");
 }

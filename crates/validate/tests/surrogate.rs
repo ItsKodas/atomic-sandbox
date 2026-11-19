@@ -2332,8 +2332,8 @@ fn stray_h_clears_and_matches_dft() {
     let tier = s.policy().energy_std_per_atom;
     let mut out = String::new();
     let _ = writeln!(out, "H₂ + H at {STRAY_D} Bohr, automatic (M = 2), {STRAY_N}³ × {STRAY_H} (σ = h), accepted, tol {TOL_H2:e}:");
-    train_h2(&mut s, STRAY_R0, SEED, &mut out);
-    let passed = clear_h2_h(&mut s, &STRAY_CHECK_R, &mut out);
+    train_h2(&mut s, STRAY_N, STRAY_R0, SEED, &mut out);
+    let passed = clear_h2_h(&mut s, STRAY_N, &STRAY_CHECK_R, &mut out);
     let _ = writeln!(out, "  cleared by the checks at r = {passed:?} (tried in the order {STRAY_CHECK_R:?})");
     // the region's reach about the checked bonds (report): the provider's verdict at each checked bond and ±0.005 Bohr
     for &r in &passed {

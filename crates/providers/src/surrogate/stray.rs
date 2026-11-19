@@ -139,7 +139,8 @@
 //!
 //! A [`Signature`] (sorted bonded Z, sorted stray Z, charge, the surface's reference settings; the multiplicity is
 //! automatic, the floor refuses the rest) is cleared only **inside a region**: the per-feature envelope (min, max per
-//! species, the existing `surrogate::Envelope`) of the bonded-part descriptors of its passing checks. The region opens
+//! species, the existing `surrogate::Envelope`) of the bonded-part descriptors of its passing checks, and the thinning radius
+//! of each (ruling 12, "What the region covers" below). The region opens
 //! after [`STRAY_CHECKS`] = 3 passes, each at a bonded geometry beyond the store's thinning radius from the others
 //! (`THIN_FRACTION` × `max_descriptor_distance` training spreads, the store's per-sample metric: the worst atom's
 //! nearest same-species counterpart, L∞ in the model's training-spread units, `quarantine::spread_distance`). A pass
@@ -148,12 +149,21 @@
 //! **One failing check refuses the signature for the session.** Session-only state (spec §4.6). The region lives in
 //! the descriptor space of the basis it was built with: a model with another basis must clear the book.
 //!
-//! **What the region covers, honestly** (Task 4 review, ruling 7; Task 6). The region is a per-feature box, and the
-//! descriptor features are not monotonic in the geometry (a radial basis function rises and falls with r), so the box
-//! spanned by checks at distant bonded geometries need not contain the geometries between them: a bond stretched
-//! halfway between two checked lengths can fall outside it. That is the conservative side — it falls back and checks
-//! once more, and each such pass grows the region — but a signature can take **more than 3 checks** before the
-//! geometries a run visits are covered. **The book clears on any basis change**, a collection's body-4 degree growing
+//! **What the region covers** (controller ruling 12; Task 7 on the real teacher). A bonded geometry is covered when it
+//! lies inside the per-feature box of the passed checks **or within the thinning radius of one of them**, measured
+//! exactly as the distinctness test measures it ([`Region::covers`], [`Region::near`]): covered ∪ checkable is every
+//! geometry of a measurable species, so nothing is left both uncovered and unable to earn coverage. The box alone has
+//! dead zones: the radial features oscillate with the bond length, so a geometry between the checks leaves the box in
+//! one or a few features, and one next to a check does too when the check sits at a feature's extremum. Measured with
+//! the default H basis (r_cut 6, n_max 8, l_max 3, body-3) and checks at H–H 1.434, 1.15, 1.75 Bohr: r = 1.4 leaves the
+//! box in b2[n=3] (−0.8656 against [−0.8630, −0.7727]) and in a body-3 feature, and 1.434 + 0.001 in b2[n=6] (1.434 sits
+//! at its maximum); on the GPU teacher the box-only region answered the three checked bonds exactly and refused ±0.005
+//! Bohr around each — and those geometries, not distinct, could never queue a check (`references.md`, "Stray atoms").
+//! The radius is the store's own notion of "the same geometry" (`THIN_FRACTION` × `max_descriptor_distance` training
+//! spreads, the worst atom's L∞ distance to its counterpart), and each check tests an identity at its geometry, so a
+//! geometry that close is measured by it. A geometry beyond both (outside the box, farther than the radius from every
+//! check) falls back and checks once more, and its pass grows the region.
+//! **The book clears on any basis change**, a collection's body-4 degree growing
 //! with its samples included (`stray_book_current`): the regions live in the old basis's feature space, so every
 //! signature's checks are re-earned under the new model (its held samples stay held until then; nothing is released
 //! by the clear).
@@ -750,6 +760,28 @@ impl Region {
             });
             d > thin
         })
+    }
+
+    /// The geometry lies within `thin` of some stored point in the metric of [`distinct`](Self::distinct) — exactly its
+    /// complement on measurable species; a species `units` never saw is not near (and not distinct: neither covered nor
+    /// checkable, the conservative side).
+    pub(super) fn near<D: AsRef<[f64]>>(&self, bonded_desc: &[D], species: &[usize], units: &Envelope, thin: f64) -> bool {
+        if bonded_desc.is_empty() || species.len() != bonded_desc.len() || species.iter().any(|&s| units.count.get(s).is_none_or(|&c| c == 0)) {
+            return false;
+        }
+        self.points.iter().any(|point| {
+            let d = species.iter().zip(bonded_desc).fold(0.0f64, |worst, (&qs, qd)| {
+                worst.max(point.iter().filter(|(t, _)| *t == qs).map(|(t, b)| spread_distance(units, *t, qd.as_ref(), b)).fold(f64::INFINITY, f64::min))
+            });
+            d <= thin
+        })
+    }
+
+    /// The region covers the geometry (controller ruling 12; module doc, "The cleared region"): inside the per-feature
+    /// box, **or** within the thinning radius of a passed check ([`near`](Self::near), the distinctness metric) — so a
+    /// geometry is always either covered or checkable. `units`: the model's envelope (`None`: the box alone).
+    pub(super) fn covers<D: AsRef<[f64]>>(&self, bonded_desc: &[D], species: &[usize], units: Option<&Envelope>, thin: f64) -> bool {
+        self.contains(bonded_desc, species) || units.is_some_and(|u| self.near(bonded_desc, species, u, thin))
     }
 
     /// Every bonded atom lies within its species' per-feature [min, max] of the region; a species absent from the

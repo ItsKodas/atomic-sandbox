@@ -1253,7 +1253,8 @@ fn in_collection_mode_a_check_reads_raw_energies_and_a_release_appends() {
 const INSIDE: f64 = 1.4;
 const OUTSIDE: f64 = 1.9;
 
-/// Whether `sig`'s region covers the bonded H₂ at H–H `r`.
+/// Whether `sig`'s region's per-feature box contains the bonded H₂ at H–H `r` (ruling 12 adds each check's thinning
+/// radius to the region: `Region::covers`).
 fn covers(s: &SurrogateKs, sig: &Signature, r: f64) -> bool {
     let sc = h2_with(r, &[STRAY_AT]);
     let (d, sp) = s.bonded_descriptors(&positions(&sc), &zs(&sc), &Split { bonded: vec![0, 1], stray: vec![2] }).unwrap();
@@ -2541,4 +2542,83 @@ fn a_far_level_mismatch_passes_and_an_in_window_one_fails() {
     scene.frontier[1].mu = Some(-0.15);
     let why = failed(judge(&p, &scene, &frag, &atoms, &split));
     assert!(why.contains("LUMO ↓"), "{why}");
+}
+
+/// Ruling 12: the region covers a geometry inside the per-feature box **or** within the thinning radius of a passed
+/// check, in the distinctness metric — so every geometry of a measurable species is covered or distinct (checkable).
+/// The real teacher's checks (H–H 1.434, 1.15, 1.75 Bohr) under the default H basis: 1.435 lies outside the box (1.434
+/// sits at b2[n=6]'s maximum) yet within the radius of the 1.434 check — covered, not distinct.
+#[test]
+fn the_region_covers_the_thinning_radius_of_its_checks() {
+    let basis = Basis::new(&[1]);
+    let mut env = Envelope::new(&basis);
+    for i in 0..41 {
+        let (d, s) = h2_desc(&basis, 1.0 + 1.5 * i as f64 / 40.0);
+        for (si, b) in s.iter().zip(&d) {
+            env.add_atom(*si, b);
+        }
+    }
+    let mut region = Region::new(&basis);
+    for r in [1.434, 1.15, 1.75] {
+        let (d, s) = h2_desc(&basis, r);
+        region.add(&d, &s);
+    }
+    let (d, s) = h2_desc(&basis, 1.435);
+    assert!(!region.contains(&d, &s), "the premise: 1.435 leaves the box (the dead zone)");
+    assert!(region.near(&d, &s, &env, thin()) && region.covers(&d, &s, Some(&env), thin()), "within the radius: covered");
+    assert!(!region.distinct(&d, &s, &env, thin()), "…and not checkable");
+    assert!(!region.covers(&d, &s, None, thin()), "without the units, the box alone");
+    // covered ∪ distinct is everything, and the two never overlap outside the box
+    let mut beyond = None;
+    for k in 0..=200 {
+        let r = 0.9 + 0.01 * k as f64;
+        let (d, s) = h2_desc(&basis, r);
+        let (covered, distinct) = (region.covers(&d, &s, Some(&env), thin()), region.distinct(&d, &s, &env, thin()));
+        assert!(covered || distinct, "r = {r}: neither covered nor checkable");
+        assert!(!(distinct && region.near(&d, &s, &env, thin())), "r = {r}");
+        if !covered && beyond.is_none() && r > 1.75 {
+            beyond = Some(r);
+        }
+    }
+    // a geometry beyond both is not covered and is distinct: it falls back and queues a check
+    let r = beyond.expect("a stretched bond beyond the box and the radius");
+    let (d, s) = h2_desc(&basis, r);
+    assert!(!region.covers(&d, &s, Some(&env), thin()) && region.distinct(&d, &s, &env, thin()), "r = {r}");
+    // a species the units never saw is neither near nor covered by the radius
+    let empty = Envelope::new(&basis);
+    assert!(!region.near(&d, &s, &empty, thin()));
+}
+
+/// Ruling 12 through the provider: after the three checks clear H₂ + H, a step at a bond within the thinning radius of
+/// a check but outside the box is the model's (no check queued), and one beyond both falls back and queues a check.
+#[test]
+fn a_step_near_a_check_is_answered_and_one_beyond_queues_a_check() {
+    let (mut s, sig) = cleared_student();
+    let Some(StrayState::Cleared { region, .. }) = s.stray_book.state(&sig).cloned() else { panic!("cleared: {:?}", s.stray_book.state(&sig)) };
+    let units = s.envelope().unwrap().clone();
+    let split = Split { bonded: vec![0, 1], stray: vec![2] };
+    let desc = |s: &SurrogateKs, r: f64| {
+        let sc = h2_with(r, &[STRAY_AT]);
+        s.bonded_descriptors(&positions(&sc), &zs(&sc), &split).unwrap()
+    };
+    // the first bond off the outer check (steps of 1e-4 Bohr) outside the box but within the radius, and the first beyond
+    // both
+    let near = (1..=2000).map(|k| CHECKS[2] + 1e-4 * k as f64).find(|&r| {
+        let (d, sp) = desc(&s, r);
+        !region.contains(&d, &sp) && region.near(&d, &sp, &units, thin())
+    });
+    let beyond = (1..=2000).map(|k| CHECKS[2] + 1e-3 * k as f64).find(|&r| {
+        let (d, sp) = desc(&s, r);
+        !region.covers(&d, &sp, Some(&units), thin())
+    });
+    let (near, beyond) = (near.expect("the premise: a dead-zone bond near the 1.55 check"), beyond.expect("a bond beyond both"));
+    let _ = s.take_events();
+    s.discontinuity();
+    let r = s.evaluate(&h2_with(near, &[STRAY_AT]), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate, "H–H {near}: {:?}", r.stats.notes);
+    assert!(s.stray_pending.is_none() && s.side_queue.is_empty(), "no check");
+    s.discontinuity();
+    let r = s.evaluate(&h2_with(beyond, &[STRAY_AT]), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback, "H–H {beyond}");
+    assert!(r.stats.notes.iter().any(|n| n.contains("composition check") && n.contains("queued")), "H–H {beyond}: {:?}", r.stats.notes);
 }

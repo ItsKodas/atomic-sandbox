@@ -202,7 +202,12 @@ pub fn diatomic_and_atom(n: usize, h: f64, za: u8, zb: u8, r: f64, zs: u8, d: f6
 
 /// H₂ (bond `r`) + H at `STRAY_D` on the stray tests' grid (`diatomic_and_atom`).
 pub fn h2_and_h(r: f64) -> Scene {
-    diatomic_and_atom(STRAY_N, STRAY_H, 1, 1, r, 1, STRAY_D)
+    h2_and_h_in(STRAY_N, r)
+}
+
+/// [`h2_and_h`] on an `n`³ × `STRAY_H` grid.
+pub fn h2_and_h_in(n: usize, r: f64) -> Scene {
+    diatomic_and_atom(n, STRAY_H, 1, 1, r, 1, STRAY_D)
 }
 
 /// The scene's atoms `idx` alone (neutral; `m` the multiplicity, `None` automatic), same cell, σ and policy.
@@ -232,10 +237,10 @@ pub fn stray_student(ctx: &GpuContext) -> (SurrogateKs, Arc<Mutex<EvalLog>>, Arc
 /// One default sampling pass (seed `seed`) on H₂ at `r` centred in the stray tests' grid, through the `Trainable`
 /// face (so the provider's reference cache holds H's scan, the stray floor's m_s source), and the refit the pass ends
 /// with (one more if the pass left it pending). Asserts a trusted model. The pass's line is appended to `out`.
-pub fn train_h2(s: &mut SurrogateKs, r: f64, seed: u64, out: &mut String) {
+pub fn train_h2(s: &mut SurrogateKs, n: usize, r: f64, seed: u64, out: &mut String) {
     use sim::Trainable;
     let t = Instant::now();
-    let sc = accepted(STRAY_N, STRAY_H, vec![Nucleus::new(1, [0.5 * r, 0.0, 0.0]), Nucleus::new(1, [-0.5 * r, 0.0, 0.0])]);
+    let sc = accepted(n, STRAY_H, vec![Nucleus::new(1, [0.5 * r, 0.0, 0.0]), Nucleus::new(1, [-0.5 * r, 0.0, 0.0])]);
     let plan = SamplingPlan { seed, ..SamplingPlan::default() };
     let mut refs = sim::AtomReferences::default();
     s.start_pass(&sc, &plan, &mut refs).unwrap_or_else(|e| panic!("start_pass: {e}"));
@@ -255,7 +260,7 @@ pub fn train_h2(s: &mut SurrogateKs, r: f64, seed: u64, out: &mut String) {
     let b = s.basis().expect("fitted");
     let _ = writeln!(
         out,
-        "  H₂ pass ({STRAY_N}³ × {STRAY_H}, accepted, seed {seed}): {} samples in {:.0} s; basis r_cut {}, species {:?}, Q′ {}; E_ref(H) {:+.6} Ha; trusted {} ({:?}); classes: {}",
+        "  H₂ pass ({n}³ × {STRAY_H}, accepted, seed {seed}): {} samples in {:.0} s; basis r_cut {}, species {:?}, Q′ {}; E_ref(H) {:+.6} Ha; trusted {} ({:?}); classes: {}",
         s.samples(),
         t.elapsed().as_secs_f64(),
         b.r_cut,
@@ -318,11 +323,11 @@ pub fn stray_check(s: &mut SurrogateKs, sc: &Scene, out: &mut String) -> Option<
 
 /// Clears H₂ + H's region: checks at the bond lengths `rs` in order until the signature is cleared (K = 3 passes at
 /// distinct geometries). Returns the bond lengths whose checks passed. Panics on a refusal or when `rs` runs out.
-pub fn clear_h2_h(s: &mut SurrogateKs, rs: &[f64], out: &mut String) -> Vec<f64> {
+pub fn clear_h2_h(s: &mut SurrogateKs, n: usize, rs: &[f64], out: &mut String) -> Vec<f64> {
     let mut passed = Vec::new();
     for &r in rs {
         let _ = writeln!(out, "  H₂ ({r}) + H at {STRAY_D}:");
-        let Some(ev) = stray_check(s, &h2_and_h(r), out) else { continue };
+        let Some(ev) = stray_check(s, &h2_and_h_in(n, r), out) else { continue };
         match ev.outcome {
             sim::activity::TeachOutcome::StrayChecking { n, of } => {
                 passed.push(r);
