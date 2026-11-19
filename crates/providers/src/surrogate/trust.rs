@@ -450,6 +450,29 @@ pub(super) struct ClassJudge {
     pub(super) between_refits: bool,
 }
 
+/// λ_T and λ_E of environment key `k` from the calibration `cal` (the last refit's: they never move
+/// on a step they decided), with `sum` as λ_sum: the key's own, and for a **sparse key** (fewer than
+/// `MIN_EVIDENCE` points of its own answer sample P_A in the window) its class's where larger or
+/// not a number (spec 2026-11-18 §4, M2) — [`SurrogateKs::key_factors`]' tail half, also what the
+/// Model tab shows (`sim::SpeciesVerdict::tail_inflation`, plan Task 8): one rule, never two copies.
+fn tail_factors(cal: &super::calibrate::Calibration, k: &surrogate::EnvKey, sum: f64) -> KeyFactors {
+    let c = (k.class as usize).wrapping_sub(1);
+    let own = cal.key(k);
+    let mut f = KeyFactors { sum, tail: own.tail_inflation, energy: own.energy_inflation, tail_cause: own.tail_cause, energy_cause: own.energy_cause, tail_from_class: false, energy_from_class: false };
+    if own.answer_points < super::calibrate::MIN_EVIDENCE {
+        if let Some(cl) = cal.per_class.get(c) {
+            // the class's factor (and its cause) where it is the larger, or not a number
+            if !(cl.tail_inflation <= f.tail) && !f.tail.is_nan() {
+                (f.tail, f.tail_cause, f.tail_from_class) = (cl.tail_inflation, cl.tail_cause, true);
+            }
+            if !(cl.energy_inflation <= f.energy) && !f.energy.is_nan() {
+                (f.energy, f.energy_cause, f.energy_from_class) = (cl.energy_inflation, cl.energy_cause, true);
+            }
+        }
+    }
+    f
+}
+
 /// The entry rule between refits (`ClassKey::Window`; `calibrate` "Per environment species"): a
 /// key that did not stand trusted and would now be trusted on fewer than `WINDOW_POINTS`
 /// comparisons is refused until the next refit's verdict or a full window.
@@ -847,6 +870,9 @@ impl SurrogateKs {
                         let refusal = entry_between_refits(refusal_of(verdict(*kc, kst, kq, was)), was, kc, j.between_refits);
                         let trusted = refusal.is_none();
                         let some = |x: f64| (kc.points > 0).then_some(x);
+                        // λ_T and λ_E as rules 6 and 7 read them (a sparse key's class floors
+                        // included; `key_factors`), for the Model tab (plan Task 8)
+                        let tail = tail_factors(&j.refit_cal, k, 1.0);
                         sim::SpeciesVerdict {
                             z: k.z,
                             neighbours: k.neighbours.clone(),
@@ -861,6 +887,10 @@ impl SurrogateKs {
                             inflation: j.refit_cal.key(k).inflation,
                             samples: kst.samples,
                             columns: kq,
+                            fits: kc.fits,
+                            floor_points: kc.floor_points,
+                            tail_inflation: tail.tail,
+                            energy_inflation: tail.energy,
                         }
                     })
                     .collect();
@@ -891,6 +921,8 @@ impl SurrogateKs {
                     evidence: cal.evidence,
                     trusted_since: if trusted { species.iter().filter_map(|s| s.trusted_since).max().or(Some(self.model_gen)) } else { None },
                     inflation: species.iter().map(|s| s.inflation).fold(j.refit_cal.per_class[c].inflation, f64::max),
+                    fits: cal.fits,
+                    floor_points: cal.floor_points,
                     species,
                 }
             })
@@ -934,19 +966,7 @@ impl SurrogateKs {
                 sum = max_nan(sum, cl.inflation);
             }
         }
-        let mut f = KeyFactors { sum, tail: own.tail_inflation, energy: own.energy_inflation, tail_cause: own.tail_cause, energy_cause: own.energy_cause, tail_from_class: false, energy_from_class: false };
-        if own.answer_points < super::calibrate::MIN_EVIDENCE {
-            if let Some(cl) = class {
-                // the class's factor (and its cause) where it is the larger, or not a number
-                if !(cl.tail_inflation <= f.tail) && !f.tail.is_nan() {
-                    (f.tail, f.tail_cause, f.tail_from_class) = (cl.tail_inflation, cl.tail_cause, true);
-                }
-                if !(cl.energy_inflation <= f.energy) && !f.energy.is_nan() {
-                    (f.energy, f.energy_cause, f.energy_from_class) = (cl.energy_inflation, cl.energy_cause, true);
-                }
-            }
-        }
-        f
+        tail_factors(&j.refit_cal, k, sum)
     }
 
     /// The class-wise trust numbers (module doc, "Class-wise trust"): for every fitted sample (the
@@ -1275,7 +1295,8 @@ impl SurrogateKs {
         // a class without per-species verdicts (no fitted atom of it) answers by its own verdict
         let class_wide = l.species.is_empty();
         let own = if class_wide {
-            Some(sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: l.trusted, refusal: l.refusal, calibration: l.calibration, measured: l.measured, measured_energy: l.measured_energy, worst_atom: l.worst_atom, evidence: l.evidence, trusted_since: l.trusted_since, inflation: l.inflation, samples: l.samples, columns: q })
+            let f = self.key_factors(k);
+            Some(sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: l.trusted, refusal: l.refusal, calibration: l.calibration, measured: l.measured, measured_energy: l.measured_energy, worst_atom: l.worst_atom, evidence: l.evidence, trusted_since: l.trusted_since, inflation: l.inflation, samples: l.samples, columns: q, fits: l.fits, floor_points: l.floor_points, tail_inflation: f.tail, energy_inflation: f.energy })
         } else {
             l.species.iter().find(|s| s.z == k.z && s.neighbours == k.neighbours).cloned()
         };
@@ -1292,7 +1313,8 @@ impl SurrogateKs {
                 };
                 let refusal = entry_between_refits(refusal, false, &kc, j.between_refits);
                 let some = |x: f64| (kc.points > 0).then_some(x);
-                sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: refusal.is_none(), refusal, calibration: kc.factor, measured: some(kc.measured), measured_energy: some(kc.measured_energy), worst_atom: some(kc.worst_atom), evidence: kc.evidence, trusted_since: None, inflation: j.refit_cal.key(k).inflation, samples: 0, columns: unseen_key_floor(j.q_prime) }
+                let tail = tail_factors(&j.refit_cal, k, 1.0);
+                sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: refusal.is_none(), refusal, calibration: kc.factor, measured: some(kc.measured), measured_energy: some(kc.measured_energy), worst_atom: some(kc.worst_atom), evidence: kc.evidence, trusted_since: None, inflation: j.refit_cal.key(k).inflation, samples: 0, columns: unseen_key_floor(j.q_prime), fits: kc.fits, floor_points: kc.floor_points, tail_inflation: tail.tail, energy_inflation: tail.energy }
             }
         };
         if s.trusted {

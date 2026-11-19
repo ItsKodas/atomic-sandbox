@@ -1375,7 +1375,7 @@ use lone::Lone;
 use policy::*;
 use quarantine::*;
 pub use audit::{history_rule_code, history_rule_name, AuditRecord, AuditVerdict, HISTORY_RULE_CLASS_AND_VARIANCE, HISTORY_RULE_TAIL_INFLATION};
-pub use calibrate::{calibrate, refusal_words, Calibration, ClassCalibration, ClassStats, ClassVerdict, WordsInput, ENTER, FLOOR_FITS, FLOOR_POINTS, LEAVE, MIN_EVIDENCE, WINDOW_POINTS, WORST_ATOM};
+pub use calibrate::{calibrate, floor_count, refusal_words, Calibration, ClassCalibration, ClassStats, ClassVerdict, WordsInput, ENTER, FLOOR_FITS, FLOOR_POINTS, LEAVE, MIN_EVIDENCE, WINDOW_POINTS, WORST_ATOM};
 pub use ledger::EVENT_QUEUE;
 pub(crate) use policy::PSEUDO_FORCE_NOISE;
 pub use policy::{box_affected_face_density, AtomVerdicts, FallbackPolicy, BOX_AFFECTED_FACE_DENSITY, FORCE_STD_BOUND_MAX, GRADE_MAX};
@@ -2251,6 +2251,14 @@ impl SurrogateKs {
     /// `recorded`, `unrecorded`, `skipped_busy` and `lost`, or still in flight. A readout.
     pub fn tick_counts(&self) -> TickCounts {
         self.ticks
+    }
+
+    /// The tick counts the readouts show ([`sim::TrainableStatus::ticks`], plan Task 8; Task 7
+    /// review M5: through the status, never a downcast): the outcomes with their causes, the
+    /// in-step ones and the due count.
+    pub fn calibration_ticks(&self) -> sim::CalibrationTicks {
+        let t = self.ticks;
+        sim::CalibrationTicks { recorded: t.recorded, unrecorded: t.unrecorded, skipped_busy: t.skipped_busy, lost: t.lost, in_step: t.in_step, due: t.due }
     }
 
     /// Books what became of a tick that fell due (the one place the counts move).
@@ -3952,6 +3960,7 @@ impl Trainable for SurrogateKs {
             retry_fit: self.pass.is_none() && self.no_model().is_some_and(|n| n.retry),
             model_source: self.model_source(),
             lone_note: lone_atoms_note(&scene.nuclei.iter().map(|n| n.pos).collect::<Vec<_>>(), self.cutoff()),
+            ticks: self.calibration_ticks(),
         }
     }
 

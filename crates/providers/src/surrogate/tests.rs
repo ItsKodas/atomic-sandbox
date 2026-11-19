@@ -5304,7 +5304,7 @@ fn the_class_verdict_names_its_failing_condition() {
     assert!(class_refusal(40, 16, f64::NAN, 0.4, 0.3).unwrap().1.is_nan(), "a failing check never shows a value inside its limit");
     let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
     assert!(s.class_loo().iter().all(|l| l.trusted == l.refusal.is_none()));
-    s.class_loo[0] = sim::ClassLoo { class: "pair", samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 110.0, energy_max: 1100.0, trusted: false, refusal: Some((ClassKey::Energy, 1100.0, 1.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: Vec::new() };
+    s.class_loo[0] = sim::ClassLoo { class: "pair", samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 110.0, energy_max: 1100.0, trusted: false, refusal: Some((ClassKey::Energy, 1100.0, 1.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, fits: 0, floor_points: 0, species: Vec::new() };
     let (r, short) = s.class_untrusted(&h_keys(&[1, 1])).unwrap();
     assert!(!short && r.text.contains("LOO energy error 1100.0× the tier"), "{}", r.text);
     assert_eq!(r.rule, sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair));
@@ -5528,7 +5528,7 @@ fn the_class_verdict_reproduces_the_pre_task3_rule_on_a_sweep() {
         let samples = [q.saturating_sub(1), q, q + 1, 0][rng.gen_range(0..4)];
         let (force_rms, force_max, energy_max) = (around(&mut rng, 1.0), around(&mut rng, 1.0), around(&mut rng, 1.0));
         let refusal = class_refusal(samples, q, force_rms, force_max, energy_max);
-        let l = sim::ClassLoo { class: ENV_CLASSES[0], samples, force_rms, force_max, energy_rms: energy_max, energy_max, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: Vec::new() };
+        let l = sim::ClassLoo { class: ENV_CLASSES[0], samples, force_rms, force_max, energy_rms: energy_max, energy_max, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, fits: 0, floor_points: 0, species: Vec::new() };
         let old = pre_task3_class_untrusted(&l, q);
         assert_eq!(l.trusted, old.is_none(), "round {i}: {l:?}");
         if let Some((key, value, limit)) = refusal {
@@ -7922,9 +7922,9 @@ fn a_short_class_is_never_an_acceptance() {
     use teach::tests_api::{teach_verdict, TeachVerdict};
     let class = |samples: usize, q: usize, f: f64, e: f64| {
         let refusal = super::trust::class_refusal(samples, q, f.min(1.0), f, e);
-        sim::ClassLoo { class: "pair", samples, force_rms: f.min(1.0), force_max: f, energy_rms: e, energy_max: e, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: Vec::new() }
+        sim::ClassLoo { class: "pair", samples, force_rms: f.min(1.0), force_max: f, energy_rms: e, energy_max: e, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, fits: 0, floor_points: 0, species: Vec::new() }
     };
-    let none = sim::ClassLoo { class: "many-body", samples: 0, force_rms: 0.0, force_max: 0.0, energy_rms: 0.0, energy_max: 0.0, trusted: false, refusal: Some((sim::ClassKey::Samples, 0.0, 344.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: Vec::new() };
+    let none = sim::ClassLoo { class: "many-body", samples: 0, force_rms: 0.0, force_max: 0.0, energy_rms: 0.0, energy_max: 0.0, trusted: false, refusal: Some((sim::ClassKey::Samples, 0.0, 344.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, fits: 0, floor_points: 0, species: Vec::new() };
     assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5), none.clone()], false, false, 0, 0, false), TeachVerdict::Accepted, "a class without samples is not involved");
     assert_eq!(teach_verdict(&[class(201, 344, 0.78, 0.48), none.clone()], false, false, 0, 0, false), TeachVerdict::NeedsSamples);
     assert_eq!(teach_verdict(&[class(201, 344, 1.6, 0.48), none.clone()], false, false, 0, 0, false), TeachVerdict::NotAccepted, "short AND leave-one-out beyond 1×");
@@ -12490,7 +12490,10 @@ fn a_class_below_the_floor_needs_its_leave_one_out_as_well() {
             match cal.key_verdict(&hk_pair(), &st, 29, was) {
                 ClassVerdict::Untrusted { key: ClassKey::Floor, value, limit, reason } => {
                     assert_eq!((value, limit), (3.07, 1.0));
-                    assert_eq!(reason, format!("within the bound over {fits} of 12 fits / {points} of 60 checks, and its leave-one-out is 3.1× the bound; 100 samples"));
+                    // a count at or over its floor never reads "80 of 60" (trust tightening Task 8;
+                    // the Task 4 review's minor 3)
+                    let counts = if fits < FLOOR_FITS { format!("{fits} of 12 fits / {points} checks (60 needed)") } else { format!("{fits} fits (12 needed) / {points} of 60 checks") };
+                    assert_eq!(reason, format!("within the bound over {counts}, and its leave-one-out is 3.1× the bound; 100 samples"));
                 }
                 v => panic!("{fits} fits / {points} points, was {was}: {v:?}"),
             }
@@ -12576,7 +12579,7 @@ fn the_worst_atom_guard_applies_both_ways_below_the_floor() {
             match stay {
                 ClassVerdict::Untrusted { key: ClassKey::WorstAtom, value, limit, reason } => {
                     assert!((value - w_of(12.0)).abs() < 1e-12 && limit == WORST_ATOM);
-                    assert_eq!(reason, "a DFT check found an atom's force 3.5× its bound, limit 3× while the class is below its evidence floor (11 of 12 fits / 81 of 60 checks); 100 samples");
+                    assert_eq!(reason, "a DFT check found an atom's force 3.5× its bound, limit 3× while the class is below its evidence floor: 11 of 12 fits / 81 checks (60 needed); 100 samples");
                 }
                 v => panic!("leaves below the floor: {v:?}"),
             }
@@ -13223,6 +13226,11 @@ fn inflation_step(s: &mut SurrogateKs, sc: &Scene) -> (Source, Option<u8>, Strin
     (r.stats.source, code, r.stats.notes.first().cloned().unwrap_or_default())
 }
 
+/// Key `k`'s verdict as the Model tab lists it (`class_loo().species`).
+fn key_verdict(s: &SurrogateKs, k: &surrogate::EnvKey) -> sim::SpeciesVerdict {
+    s.class_loo()[(k.class - 1) as usize].species.iter().find(|v| v.z == k.z && v.neighbours == k.neighbours).cloned().expect("the key's verdict")
+}
+
 /// Spec §4 (M2): a **sparse key** — fewer than 3 points of its own answer sample P_A in the window —
 /// takes its class's λ_T and λ_E as floors, as λ_sum takes its class's; with 3 it keeps its own, and
 /// one above its class keeps its own. A NaN class factor reaches a sparse key (`max_nan`, never
@@ -13247,6 +13255,10 @@ fn a_sparse_key_takes_its_class_inflations_as_floors() {
     for own in [0, 1, 2] {
         set_key_tail(&mut s, &k, (1.0, TailCause::None), (1.0, TailCause::None), own);
         assert_eq!(s.key_inflations(&k), (class_t.max(lsum), 3.0), "{own} own points: the class's floors");
+        // the Model tab's readout (plan Task 8) shows the factors the rules read, floors included
+        s.rejudge_classes();
+        let v = key_verdict(&s, &k);
+        assert_eq!((v.tail_inflation, v.energy_inflation), (class_t, 3.0), "{own} own points: the readout");
     }
     set_key_tail(&mut s, &k, (1.0, TailCause::None), (1.0, TailCause::None), 3);
     assert_eq!(s.key_inflations(&k), (lsum, 1.0), "3 own points: its own");
@@ -13412,6 +13424,10 @@ fn a_key_locked_by_its_tail_inflation_says_so_and_keeps_measuring() {
     println!("before: λ_F {lsum}, λ_E {le}; after the tick: {kf:?}");
     assert_eq!((kf.force(), kf.energy), (f64::INFINITY, 1.0), "{kf:?}");
     assert!(s.class_loo()[0].trusted, "the panel says trusted");
+    // … and shows the lock (plan Task 8: the readout carries λ_T, λ_E and the floor's counts)
+    let v = key_verdict(&s, &k);
+    let kc = s.class_judge.as_ref().unwrap().cal.key(&k);
+    assert_eq!((v.trusted, v.tail_inflation, v.energy_inflation, v.fits, v.floor_points), (true, f64::INFINITY, 1.0, kc.fits, kc.floor_points), "{v:?}");
     // every atom of the key is refused
     let v = s.atom_verdicts(&sc).unwrap();
     assert!(v.atoms.iter().all(|a| *a == Some(R::ForceUncertainty)), "{:?}", v.atoms);
@@ -13438,6 +13454,7 @@ fn a_key_locked_by_its_tail_inflation_says_so_and_keeps_measuring() {
     println!("after 300 newer ticks: {kf:?}");
     assert_eq!(kf.tail, 1.0, "{kf:?}");
     assert!(kf.force().is_finite());
+    assert_eq!(key_verdict(&s, &k).tail_inflation, 1.0, "the readout lifts with it");
     let (src, code, note) = inflation_step(&mut s, &sc);
     assert_eq!((src, code), (Source::Surrogate, None), "lifted: answered again ({note})");
 }

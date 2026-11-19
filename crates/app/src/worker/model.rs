@@ -192,6 +192,9 @@ pub struct ModelStatus {
     /// Atoms with no neighbour within the model's cutoff (`sim::TrainableStatus::lone_note`): the
     /// Model tab's amber note by Start sampling and the pass offer.
     pub lone_note: Option<String>,
+    /// The calibration ticks' counts (`sim::TrainableStatus::ticks`; trust tightening): the Model
+    /// tab's "calibration checks skipped", with their causes.
+    pub ticks: sim::CalibrationTicks,
     /// A collections folder is set ([`Command::Collections`]): the Model tab offers the switch.
     pub collections: bool,
     /// The last [`Command::ImportModel`]: what was taken and refused, or why nothing was.
@@ -1078,6 +1081,7 @@ impl Worker {
             retry_fit: st.retry_fit,
             source: st.model_source,
             lone_note: st.lone_note,
+            ticks: st.ticks,
             collections,
             last_import,
             purge_refusal: s.purge_refusal(),

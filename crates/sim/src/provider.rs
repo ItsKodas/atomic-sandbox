@@ -1530,6 +1530,44 @@ pub struct TrainableStatus {
     /// (`providers::surrogate::lone_atoms_note`): all of them — a pass is refused; some — they are
     /// not learned. `None` when every atom has a neighbour. Informational.
     pub lone_note: Option<String>,
+    /// The calibration ticks' counts (trust tightening, spec 2026-11-18 §4; the Model tab's
+    /// "calibration checks skipped"): plain data of the provider's own counters, so the app never
+    /// downcasts the provider (CLAUDE.md rule 5).
+    pub ticks: CalibrationTicks,
+}
+
+/// What became of the calibration ticks ([`TrainableStatus::ticks`]; `providers::surrogate`,
+/// "Calibration ticks": every 25th in-envelope step is checked against DFT whatever the model's
+/// std says). Every tick that fell due is in exactly one of `recorded`, `unrecorded`,
+/// `skipped_busy` and `lost`, or still in flight.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CalibrationTicks {
+    /// Taken, its point recorded.
+    pub recorded: u64,
+    /// Taken, no point (box-affected, unfit, no variance factor).
+    pub unrecorded: u64,
+    /// Skipped: the background teacher was busy with other work (an audit, a display, a
+    /// reference) when the tick fell due — never deferred, never served in the step.
+    pub skipped_busy: u64,
+    /// Lost: its job abandoned (Forget, an installed model, the teacher gone), returned failed or
+    /// unjudged, or nothing to compare.
+    pub lost: u64,
+    /// Of the taken ones, served by a teacher solve in the step (no background teacher).
+    pub in_step: u64,
+    /// Every tick that fell due.
+    pub due: u64,
+}
+
+impl CalibrationTicks {
+    /// Taken: recorded or not.
+    pub fn taken(&self) -> u64 {
+        self.recorded + self.unrecorded
+    }
+
+    /// Skipped, for either cause (`providers::surrogate::SurrogateKs::ticks_skipped`).
+    pub fn skipped(&self) -> u64 {
+        self.skipped_busy + self.lost
+    }
 }
 
 /// Where a [`Trainable`]'s model comes from (M8a Task 4a; [`TrainableStatus::model_source`]): the
@@ -1708,6 +1746,12 @@ pub struct ClassLoo {
     /// it before they are compared with their bounds. ≥ 1; 1 until the class has three
     /// comparisons where the posterior decides.
     pub inflation: f64,
+    /// The evidence floor's counts of the verdict's evidence window (trust tightening, spec
+    /// 2026-11-18 §3; `providers::surrogate::calibrate`, "The evidence floor"): n_fit, the distinct
+    /// fits, and n_pts, the attributed comparisons (audits and rule-4b fallbacks carrying species and
+    /// a fit id). Below 12 fits or 60 comparisons the calibrated verdict cannot open a key alone.
+    pub fits: usize,
+    pub floor_points: usize,
     /// The verdict per environment species of the class (M8a user-test fix 2,
     /// `providers::surrogate::calibrate` "Per environment species"): an atom answers by its own
     /// (central Z, neighbour species) key's verdict. The class's own `trusted` is all of them
@@ -1738,6 +1782,17 @@ pub struct SpeciesVerdict {
     /// its class's sample count and the whole basis's Q′.
     pub samples: usize,
     pub columns: usize,
+    /// The evidence floor's n_fit and n_pts for this key (trust tightening, spec 2026-11-18 §3;
+    /// [`ClassLoo::fits`]): the distinct fits and the attributed comparisons in its evidence window.
+    pub fits: usize,
+    pub floor_points: usize,
+    /// λ_T and λ_E, the tail-aware inflations rules 6 and 7 apply to this key's atoms (spec
+    /// 2026-11-18 §4; `providers::surrogate::calibrate`, "The tail-aware inflations"), with a sparse
+    /// key's class floors applied: ≥ 1, ∞ when a DFT check found an error beyond its limit where the
+    /// model's std was 0, NaN when a comparison was not a number. Rule 6 reads max(`inflation`,
+    /// `tail_inflation`); a step they refuse that passes at `inflation` alone is history code 24.
+    pub tail_inflation: f64,
+    pub energy_inflation: f64,
 }
 
 impl SpeciesVerdict {

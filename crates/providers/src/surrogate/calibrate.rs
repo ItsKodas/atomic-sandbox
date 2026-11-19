@@ -371,7 +371,8 @@
 //! fit id.
 //!
 //! **The refusal's name**: `ClassKey::Floor` — (the LOO ratio that decided, 1), "within the bound
-//! over n_fit of 12 fits / n_pts of 60 checks, and its leave-one-out is X× the bound" — only when the
+//! over n_fit of 12 fits / n_pts of 60 checks, and its leave-one-out is X× the bound" (a count that
+//! has reached its floor reads "80 checks (60 needed)", [`floor_count`]) — only when the
 //! calibrated verdict itself passes; when it fails, its own failing term is named (the floor is not
 //! why the key is shut, and the words would claim "within the bound"). The decision is the AND
 //! either way.
@@ -1237,6 +1238,15 @@ pub struct WordsInput {
 
 /// The words of a class refusal (key, value, limit): the part after "isn't learned well enough yet
 /// (<class>: " — the verdict's `reason` and the provider's Log note alike (one wording, review M2).
+/// One count of the evidence floor in words (trust tightening Task 8; the Task 4 review's minor 3:
+/// never "80 of 60 checks"): "11 of 12 fits" while it is short of its floor, "80 checks (60
+/// needed)" once it reaches it. `unit` may be empty ("4 of 60", "80 (60 needed)") where the
+/// sentence names it. The provider's refusal words and the app's panel read this one function.
+pub fn floor_count(n: usize, floor: usize, unit: &str) -> String {
+    let unit = if unit.is_empty() { String::new() } else { format!(" {unit}") };
+    if n < floor { format!("{n} of {floor}{unit}") } else { format!("{n}{unit} ({floor} needed)") }
+}
+
 /// The uncalibrated keys keep their words of before (pinned byte for byte by the refusal-string
 /// tests).
 pub fn refusal_words(key: ClassKey, value: f64, limit: f64, w: &WordsInput) -> String {
@@ -1256,8 +1266,9 @@ pub fn refusal_words(key: ClassKey, value: f64, limit: f64, w: &WordsInput) -> S
         ClassKey::EnergyRms => format!("LOO energy error RMS {value:.1}× the tier (training samples the model cannot reproduce included), {n} samples"),
         // the guard applies both ways below the evidence floor (trust tightening §3)
         ClassKey::WorstAtom if w.fits < FLOOR_FITS || w.floor_points < FLOOR_POINTS => format!(
-            "a DFT check found an atom's force {value:.1}× its bound, limit {limit:.0}× while the class is below its evidence floor ({} of {FLOOR_FITS} fits / {} of {FLOOR_POINTS} checks); {n} samples",
-            w.fits, w.floor_points
+            "a DFT check found an atom's force {value:.1}× its bound, limit {limit:.0}× while the class is below its evidence floor: {} / {}; {n} samples",
+            floor_count(w.fits, FLOOR_FITS, "fits"),
+            floor_count(w.floor_points, FLOOR_POINTS, "checks")
         ),
         ClassKey::WorstAtom => format!("a DFT check found an atom's force {value:.1}× its bound — the class does not enter while its recent evidence holds an atom beyond {limit:.0}×; {n} samples"),
         ClassKey::Calibrated => format!("DFT-measured force error {value:.2}× the bound over {over}, limit {limit:.2} (leave-one-out RMS {:.2}×){posterior}; {n} samples", w.force_rms),
@@ -1266,7 +1277,11 @@ pub fn refusal_words(key: ClassKey, value: f64, limit: f64, w: &WordsInput) -> S
             w.measured.map_or("—".to_string(), |m| format!("{m:.2}×"))
         ),
         ClassKey::MeasuredEnergy => format!("DFT-measured energy error {value:.2}× the tier over {over}, limit {limit:.2}; {n} samples"),
-        ClassKey::Floor => format!("within the bound over {} of {FLOOR_FITS} fits / {} of {FLOOR_POINTS} checks, and its leave-one-out is {value:.1}× the bound; {n} samples", w.fits, w.floor_points),
+        ClassKey::Floor => format!(
+            "within the bound over {} / {}, and its leave-one-out is {value:.1}× the bound; {n} samples",
+            floor_count(w.fits, FLOOR_FITS, "fits"),
+            floor_count(w.floor_points, FLOOR_POINTS, "checks")
+        ),
         ClassKey::Window => format!("within its bound over {value:.0} DFT comparisons, but entering before the next refit needs {limit:.0}; {n} samples"),
     }
 }
