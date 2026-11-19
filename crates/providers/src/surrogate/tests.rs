@@ -13090,6 +13090,10 @@ fn the_tail_inflation_is_formed_on_rule_6s_own_bound() {
             let ratio = s * lt / pol.force_bound(fm);
             println!("|F_m| {fm:.4}, recorded {}: λ_T {lt:.6}; rule 6 at λ_T: {ratio:.15}× its bound (strictly refused: {})", recorded.is_some(), !(s * lt <= pol.force_bound(fm)));
             assert!(ratio >= 1.0 - 1e-12, "rule 6 at λ_T refuses the measured tail atom (|F_m| {fm}, recorded {}): {ratio}", recorded.is_some());
+            if recorded.is_some() {
+                // on the recorded |F_m| the factor is rule 6's own boundary, no wider (review N2)
+                assert!(ratio <= 1.0 + 1e-12, "the recorded |F_m| is used, not the fallback (|F_m| {fm}): {ratio}");
+            }
         }
     }
     // the teacher's bound, as before the fix: λ_T 7.69, and rule 6 admits the atom at |F_m| = |F_t| + ‖ΔF‖
