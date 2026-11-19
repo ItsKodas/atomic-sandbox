@@ -140,6 +140,19 @@ grows. **One failing check refuses the signature for the session.** The Activity
 numbers. K = 3 is the reviewer's recommendation: each check tests an identity, so a fourth adds no statistical power;
 the geometry coverage is what the region provides.
 
+**Revision 2026-11-19 (controller rulings 12 and 13, after the final review).** A region covers a bonded geometry
+inside its per-feature box **or** within the store's thinning radius of a passed check (ruling 12), the radius and the
+distinctness test measured in the training spreads frozen at that check's pass, so a refit moves no coverage
+(ruling 13, review I2). It covers the scene only with every stray atom **at least as far from the bonded part, and from
+a face, as some pass put one** (the smallest of the passes'; no slack; review I1, I3): the shell fence is pairwise and
+cannot see molecule-level terms such as induction, and a clean check needs ≈ 5 Bohr to a face where the floor allows 4.
+A stray atom nearer than that falls back and queues a check even when the bonded geometry is covered; its pass counts
+nothing towards K but extends the region's reach. A check void for a box-affected solve is not queued again for its
+signature until the stray atoms are farther from the faces. A failing check takes back the samples its region released
+(review minor 1); a basis change drops the regions and keeps the refusals (minor 2); a change of the check's tolerances
+(`energy_std_per_atom`, `force_std_abs`, `force_std_rel`, `max_descriptor_distance`) drops the regions (minor 5); a
+model with a nonzero feature mean answers no stray scene (minor 8). The ledger's ruling 13 has the full list.
+
 **Samples (review C1).** A scene sample containing a stray atom is **held out of the fit** (an in-memory status like
 `Q_LONE`, never written) unless its own check passed or its bonded geometry lies in a cleared region of its signature.
 It is released when that becomes true, and stays held out for good if the signature is refused. Floor-refused
@@ -205,7 +218,8 @@ while the fallbacks run anyway. Persisting them is left for later (a collection 
     on DFT. Report the measured transfer and margin without pre-judging their size.
   - Stretched H₂ (r ≥ 2.5 Bohr) + H: report the measured σu − 1s margin.
 - **Dynamics:** an NVE run in which a stray H returns within r_cut and leaves again. E_conserved drift within the
-  dynamics suite's bound, with the booked jumps reported separately, each within the check's tolerance (review M3).
+  dynamics suite's bound, with the booked jumps reported separately, each within the check's tolerance (review M3;
+  asserted since ruling 13).
 - Gates: `cargo test -p providers --release`, `validate --test surrogate`, `validate --test dynamics`.
 
 ## 7. Physics honesty
