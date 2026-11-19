@@ -371,16 +371,30 @@
 //!   it is evaluated with the variance, which the tick forces; a novel tick's point carries `NOVEL`
 //!   and stays out of P_A. `tick_steps` counts these steps and **nothing resets it**; the step whose
 //!   count is a multiple of `tick_every` is a tick. A draft-mode step is never in-envelope (its
-//!   points are not in P_A) and does not advance the count.
+//!   points are not in P_A) and does not advance the count. The gate is part of the predicate, by
+//!   spec (the Task 7 review's M6): after a failed tick or audit untrusts the model (rule 4), the
+//!   steps until the refit are gate refusals and leave no point, so the old generation's P_A misses
+//!   the interval right after a large error — contained, because the failing comparison itself is
+//!   in the history and the refit replaces the model.
+//! * **Counted from the previous tick's completion** (the Task 7 review's I1, the controller's
+//!   ruling; spec §4's amendment): an in-envelope step taken while a tick's audit job is on the
+//!   auditor (`tick_in_flight`, until its answer is handled or abandoned) does not advance
+//!   `tick_steps`. A refused tick is served at its own step and an answered one by a job busy for
+//!   t_solve/t_step steps; both start the next interval when their measurement ends, so which steps
+//!   are tick-eligible no longer depends on the previous tick's σ outcome, and a tick never finds
+//!   its own predecessor's job in flight. A teacher solve **cancelled** on a counted step rolls its
+//!   count back (the step did not happen; its retry is counted, and is the tick if this one was —
+//!   the review's M2: fallback ticks are the σ-refused ones, so losing them to cancels would be
+//!   σ-coupled).
 //! * **Decided before the variance, on counters and these outcomes alone** — never on σ, a λ, or
 //!   whether rules 6/7 will answer — and the decision **forces the variance read-only**: the
 //!   novelty (5d) is evaluated for the `NOVEL` bit and the stds for the point even where the
 //!   verdict is reused, while the reused verdict, and with it every rule's decision and rule 8's
 //!   `answered` count, stays as it was.
-//! * **Served.** With a background auditor that is **busy** (any job: an audit, a refresh, a
-//!   reference) the tick is **skipped and counted** ([`ticks_skipped`](SurrogateKs::ticks_skipped)),
-//!   whatever answers the step — a fallback tick is skipped too, so the skip does not read σ — and
-//!   never deferred. Otherwise: at a **fallback** (rules 6/7, 5d, the relax verification) it needs
+//! * **Served.** With a background auditor that is **busy** — with other work only, by the count
+//!   above: a rule-8 audit, a refresh, a reference — the tick is **skipped and counted**
+//!   (`TickCounts::skipped_busy`), whatever answers the step — a fallback tick is skipped too, so
+//!   the skip does not read σ — and never deferred. Otherwise: at a **fallback** (rules 6/7, 5d, the relax verification) it needs
 //!   no solve — the teacher's answer and the model's stds are both at hand — and the fallback's
 //!   point carries `TICK`; at an **answered** step it is an audit, judged by rule 8 as well (a
 //!   failed tick untrusts as a failed audit does): asynchronously on the free auditor (an audit job
@@ -388,13 +402,26 @@
 //!   auditor (the CPU teacher, the harness) — **in the step** ([`ticks_in_step`](SurrogateKs::ticks_in_step)).
 //!   A tick alone is not rule 8's audit: rule 8's cadence (`answered`, `audit_due`, the burst)
 //!   and the checklist's box-affected count are untouched by it, and a box-affected tick answer
-//!   does not make rule 8 audit again.
-//! * **Counted.** [`ticks_taken`](SurrogateKs::ticks_taken): the teacher answered a fallback or
-//!   in-step tick, or the auditor's tick answer was judged. Skipped: the auditor busy, an auditor
-//!   job abandoned by a Forget or an installed model (`reset_audits`) or whose thread is gone, an
-//!   answer returned failed or unjudged (discarded, inside a shell band), and a step with no
-//!   prediction to compare (a failed or non-finite prediction, a failed teacher solve). Readouts;
-//!   they decide nothing.
+//!   does not make rule 8 audit again. Its **dispatch** can wait on a tick, as on any job (the
+//!   review's M3): a rule-8 audit falling due while a tick's job is on the auditor is deferred to the
+//!   next answered step once the auditor is free (`audit_due`), exactly as behind a refresh.
+//! * **Counted** ([`tick_counts`](SurrogateKs::tick_counts), booked in one place,
+//!   `tick_outcome`): every tick that fell due is exactly one of **recorded** (taken, its point in
+//!   the history: [`ticks_taken`](SurrogateKs::ticks_taken)), **unrecorded** (taken, no point: a
+//!   box-affected, unfit or variance-less answer — the review's M1: counted apart, so the readout
+//!   cannot show calibration while P_A does not grow), **skipped_busy** (the auditor busy with other
+//!   work) or **lost** (its auditor job abandoned by a Forget or an installed model, `reset_audits`,
+//!   or its thread gone; an answer returned failed or unjudged — discarded, inside a shell band; a
+//!   failed teacher solve; no prediction to compare), or is still in flight.
+//!   [`ticks_skipped`](SurrogateKs::ticks_skipped) = skipped_busy + lost. `answered_due` and
+//!   `answered_skipped_busy` count the due ticks whose step the model answered (for the measurement
+//!   of spec §4's take rate at answered against refused steps). Readouts; they decide nothing.
+//! * **Known limit: the history ring can lift a lock before the window does** (the review's M4).
+//!   λ_T = ∞ "lifts as the window ages": the window needs 300 newer P_A points, about 7500 locked
+//!   steps at one tick per 25. But every locked step records a code-24 point, so a parked scene
+//!   evicts the offending point from the 4096-point ring ([`surrogate::HISTORY_CAP`]) after about
+//!   4096 steps — earlier, and σ-blind, so benign. More generally, when fallbacks flood the ring, a
+//!   key's P_A window is capped at about 4096 × its P_A share.
 //! * **Cost** (spec §4): the effective cadence is max(25, t_solve/t_step) in-envelope steps with
 //!   an auditor; in the step, one teacher solve per 25 answered steps.
 //!
@@ -1435,8 +1462,43 @@ struct Handoff {
 }
 
 /// The calibration ticks' cadence (module doc, "Calibration ticks"; spec 2026-11-18 §4): every
-/// 25th in-envelope strict-mode step, per provider, independent of `audit_every`.
+/// 25th in-envelope strict-mode step, per provider, independent of `audit_every`, counted from the
+/// previous tick's completion.
 pub const TICK_EVERY: usize = 25;
+
+/// What became of a calibration tick that fell due (module doc, "Calibration ticks").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TickOutcome {
+    /// Taken, its point recorded.
+    Recorded,
+    /// Taken, no point: the answer was box-affected, unfit or without a variance factor.
+    Unrecorded,
+    /// The auditor was busy with other work (rule 8, a display, a reference).
+    SkippedBusy,
+    /// Not measured: its auditor job abandoned (a Forget, an installed model, the thread gone) or
+    /// returned failed or unjudged, its solve failed, or no prediction to compare.
+    Lost,
+}
+
+/// The calibration ticks' counts (`SurrogateKs::tick_counts`; module doc, "Calibration ticks"):
+/// every tick that fell due is in exactly one of the first four, or still in flight.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TickCounts {
+    /// Taken, its point recorded.
+    pub recorded: u64,
+    /// Taken, no point (box-affected, unfit, no variance factor).
+    pub unrecorded: u64,
+    /// Skipped: the auditor was busy with other work.
+    pub skipped_busy: u64,
+    /// Lost: abandoned, unjudged, failed, or nothing to compare.
+    pub lost: u64,
+    /// Of the taken ones, served by a teacher solve in the step (no auditor).
+    pub in_step: u64,
+    /// Due at a step the model answered (taken or skipped), of all four above.
+    pub answered_due: u64,
+    /// Of `answered_due`, skipped because the auditor was busy.
+    pub answered_skipped_busy: u64,
+}
 
 /// The surrogate force provider (module doc).
 pub struct SurrogateKs {
@@ -1539,14 +1601,10 @@ pub struct SurrogateKs {
     /// In-envelope strict-mode steps so far, never reset (module doc, "Calibration ticks"): every
     /// `tick_every`-th is a tick.
     tick_steps: u64,
-    /// Ticks taken: served at a fallback, in the step, or by the auditor (its answer judged).
-    ticks_taken: u64,
-    /// Ticks that fell due and were not taken: the auditor was busy, its job was abandoned (a
-    /// Forget, an installed model) or came back unjudged, or the step had no comparison to record.
-    ticks_skipped: u64,
-    /// Ticks served by a teacher solve in the step (no auditor: the CPU path, the harness).
-    ticks_in_step: u64,
-    /// A tick's audit job is on the auditor, its answer not yet handled.
+    /// What became of the ticks that fell due ([`TickCounts`]; `tick_outcome`).
+    ticks: TickCounts,
+    /// A tick's audit job is on the auditor, its answer not yet handled: the in-envelope steps
+    /// meanwhile are not counted toward the next tick (the Task 7 review's I1).
     tick_in_flight: bool,
     last_variance: Option<VarianceVerdict>,
     /// The fit gates' floor, |∪ S_k| over the samples a fit would use in the basis it would build,
@@ -1927,9 +1985,7 @@ impl SurrogateKs {
             cadence_steps: 0,
             tick_every: TICK_EVERY,
             tick_steps: 0,
-            ticks_taken: 0,
-            ticks_skipped: 0,
-            ticks_in_step: 0,
+            ticks: TickCounts::default(),
             tick_in_flight: false,
             last_variance: None,
             fit_floor_cache: std::sync::Mutex::new(BTreeMap::new()),
@@ -2124,22 +2180,52 @@ impl SurrogateKs {
         self.variance_checks
     }
 
-    /// Calibration ticks taken (module doc, "Calibration ticks"): at a fallback, in the step, or
-    /// by the auditor once its answer is judged. A readout.
+    /// Calibration ticks taken that left a history point (module doc, "Calibration ticks"): at a
+    /// fallback, in the step, or by the auditor once its answer is judged. A readout; the ticks
+    /// taken without a point are [`TickCounts::unrecorded`].
     pub fn ticks_taken(&self) -> u64 {
-        self.ticks_taken
+        self.ticks.recorded
     }
 
-    /// Calibration ticks that fell due and were skipped — the auditor busy (whatever answered the
-    /// step), its job abandoned or returned unjudged, or nothing to compare. A readout (the Model
-    /// tab's "calibration checks skipped").
+    /// Calibration ticks that fell due and were skipped: the auditor busy with other work
+    /// ([`TickCounts::skipped_busy`], whatever answered the step) or the tick lost
+    /// ([`TickCounts::lost`]). A readout (the Model tab's "calibration checks skipped").
     pub fn ticks_skipped(&self) -> u64 {
-        self.ticks_skipped
+        self.ticks.skipped_busy + self.ticks.lost
     }
 
     /// Calibration ticks served by a teacher solve in the step (no auditor). A readout.
     pub fn ticks_in_step(&self) -> u64 {
-        self.ticks_in_step
+        self.ticks.in_step
+    }
+
+    /// Every count of the calibration ticks: each tick that fell due is in exactly one of
+    /// `recorded`, `unrecorded`, `skipped_busy` and `lost`, or still in flight. A readout.
+    pub fn tick_counts(&self) -> TickCounts {
+        self.ticks
+    }
+
+    /// Books what became of a tick that fell due (the one place the counts move).
+    pub(super) fn tick_outcome(&mut self, o: TickOutcome) {
+        match o {
+            TickOutcome::Recorded => self.ticks.recorded += 1,
+            TickOutcome::Unrecorded => self.ticks.unrecorded += 1,
+            TickOutcome::SkippedBusy => self.ticks.skipped_busy += 1,
+            TickOutcome::Lost => self.ticks.lost += 1,
+        }
+    }
+
+    /// A teacher solve cancelled: the step did not happen, so whatever it booked toward the ticks
+    /// is undone — its count when it counted toward the next tick, and the counts as they stood at
+    /// its decision (`before`: a busy skip, an answered-step due) — and the retry is counted afresh
+    /// (and is the tick, if this one was): the Task 7 review's M2. Returns whether it was cancelled.
+    fn untick_cancelled(&mut self, r: &Result<ForceResult, ProviderError>, counted: bool, before: TickCounts) -> bool {
+        let cancelled = matches!(r, Err(ProviderError::Cancelled));
+        if cancelled {
+            self.tick_steps -= u64::from(counted);
+            self.ticks = before;
+        }
+        cancelled
     }
 
     /// The next `evaluate` goes to the teacher regardless of the model (M6 spec §6.2: the relax
@@ -2624,15 +2710,23 @@ impl ForceProvider for SurrogateKs {
         // the calibration tick (module doc, "Calibration ticks"; spec 2026-11-18 §4): decided here,
         // before the variance, on counters, the envelope, the class rule and the fences alone —
         // never on σ, a λ or what rules 6/7 will say. Never in draft mode (its points are not in
-        // P_A). Due while the auditor is busy: skipped and counted, whatever answers the step
-        let tick = !draft && envelope.is_none() && class.is_none() && !fenced && {
+        // P_A). The count runs from the previous tick's completion (the Task 7 review's I1): a step
+        // taken while a tick's audit job is in flight is not counted, so an answered tick (its job
+        // busy for t_solve/t_step steps) and a refused one (served at its step) both start the next
+        // interval when their measurement ends. Due while the auditor is busy — with other work
+        // only, then (rule 8, a display, a reference) — skipped and counted, whatever answers the step
+        let tick_counted = !draft && envelope.is_none() && class.is_none() && !fenced && !self.tick_in_flight;
+        // what this step books, undone if its teacher solve is cancelled (`untick_cancelled`)
+        let ticks_before = self.ticks;
+        let tick = tick_counted && {
             self.tick_steps += 1;
             self.tick_every > 0 && self.tick_steps % self.tick_every as u64 == 0
         };
+        let due_tick = tick;
         let tick = tick && {
             let busy = self.auditor.as_ref().is_some_and(|a| a.busy.is_some());
             if busy {
-                self.ticks_skipped += 1;
+                self.tick_outcome(TickOutcome::SkippedBusy);
             }
             !busy
         };
@@ -2649,8 +2743,10 @@ impl ForceProvider for SurrogateKs {
         let pred = match model.predict(&pos, &z, with_variance) {
             Ok(p) => p,
             Err(e) => {
-                // a tick with no prediction to compare is not taken
-                self.ticks_skipped += u64::from(tick);
+                // a tick with no prediction to compare is lost
+                if tick {
+                    self.tick_outcome(TickOutcome::Lost);
+                }
                 return Err(ProviderError::Invalid(format!("surrogate: {e}")));
             }
         };
@@ -2659,8 +2755,6 @@ impl ForceProvider for SurrogateKs {
         // answer is kept, nothing is audited (the gap is not a number), the switch is booked
         // along the forces (`transition_jump`, never through the model's energy)
         if let Some(reason) = non_finite_answer(&pred) {
-            // no point is recorded for a non-finite answer: a tick here has nothing to compare
-            self.ticks_skipped += u64::from(tick);
             self.record_verdict(&pos, &z, Some(strict_gate.unwrap_or_else(|| reason.clone())));
             let h = Handoff {
                 prov,
@@ -2680,7 +2774,13 @@ impl ForceProvider for SurrogateKs {
                 flags: surrogate::history::PointFlags::default(),
                 tick_only: false,
             };
-            return self.teach(scene, h, t0, should_abort);
+            let r = self.teach(scene, h, t0, should_abort);
+            // no point is recorded for a non-finite answer: a tick here has nothing to compare and is
+            // lost — unless the solve was cancelled: the step did not happen (`untick_cancelled`)
+            if !self.untick_cancelled(&r, tick_counted, ticks_before) && tick {
+                self.tick_outcome(TickOutcome::Lost);
+            }
+            return r;
         }
         // rule 5d's novelty at this geometry: `Some((ν, atom))` when ν > 1
         let novelty = |ns: Option<&surrogate::NullSpace>| ns.and_then(|ns| ns.novelty(&pos, &z).ok()).filter(|(nu, _)| *nu > 1.0);
@@ -2803,6 +2903,12 @@ impl ForceProvider for SurrogateKs {
         // at a fallback (a rule refused, or the relax verification) needs no solve: its point is
         // the fallback's, with `TICK`
         let tick_audit = tick && reason.is_none() && !forced;
+        // the take rate at answered steps against refused ones (spec §4's σ-coupling measurement):
+        // a due tick's step outcome, known only now
+        if due_tick && reason.is_none() && !forced {
+            self.ticks.answered_due += 1;
+            self.ticks.answered_skipped_busy += u64::from(!tick);
+        }
         let tick_only = tick_audit && !due;
         self.dispatch_flags = if tick_audit { tick_flags } else { flags };
         self.dispatch_tick_only = tick_only;
@@ -2840,9 +2946,12 @@ impl ForceProvider for SurrogateKs {
             reason = Some(Refusal::new("surrogate: relax verification — the teacher checks the relaxed geometry", TeachRule::RelaxVerification, None));
         }
         if reason.is_some() || audit {
-            let reason = reason.unwrap_or_else(|| match tick_only && audit {
-                true => Refusal::new(format!("surrogate calibration tick (every {} in-envelope steps; no background teacher, so in the step)", self.tick_every), TeachRule::Audit, None),
-                false => Refusal::new(format!("surrogate audit (every {} answered steps)", self.policy.audit_every), TeachRule::Audit, None),
+            let reason = reason.unwrap_or_else(|| {
+                if tick_only && audit {
+                    Refusal::new(format!("surrogate calibration tick (every {} in-envelope steps; no background teacher, so in the step)", self.tick_every), TeachRule::Audit, None)
+                } else {
+                    Refusal::new(format!("surrogate audit (every {} answered steps)", self.policy.audit_every), TeachRule::Audit, None)
+                }
             });
             // the history's point (M8a Task 1, `surrogate::history`) of this in-step audit or
             // consulted-model fallback: the model's stds at this geometry — the cadence may have
@@ -2890,15 +2999,20 @@ impl ForceProvider for SurrogateKs {
                 flags: if tick_here { tick_flags } else { flags },
                 tick_only: audit && tick_only,
             };
+            let before = self.audit_history.recorded();
             let r = self.teach(scene, h, t0, should_abort);
-            if tick_here {
-                // taken when the teacher answered (a failed or cancelled solve leaves no point: the
-                // step is retried, and the retry is not the tick)
-                if r.is_ok() {
-                    self.ticks_taken += 1;
-                    self.ticks_in_step += u64::from(tick_audit);
-                } else {
-                    self.ticks_skipped += 1;
+            // a cancelled solve: the step did not happen, its count is rolled back and its retry is
+            // the tick (the Task 7 review's M2: fallback ticks are the σ-refused ones, so losing them
+            // to the user's cancels would be σ-coupled); a failed one loses the tick
+            if !self.untick_cancelled(&r, tick_counted, ticks_before) && tick_here {
+                let recorded = self.audit_history.recorded() > before;
+                self.tick_outcome(match (r.is_ok(), recorded) {
+                    (false, _) => TickOutcome::Lost,
+                    (true, true) => TickOutcome::Recorded,
+                    (true, false) => TickOutcome::Unrecorded,
+                });
+                if r.is_ok() && tick_audit {
+                    self.ticks.in_step += 1;
                 }
             }
             return r;

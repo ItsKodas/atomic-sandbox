@@ -673,23 +673,25 @@ impl SurrogateKs {
     /// # Panics
     /// If the shapes disagree with the geometry (a programming error at the call site: every
     /// judged comparison leaves a point or a count, so nothing is dropped silently).
+    ///
+    /// Returns whether a point was pushed (a calibration tick's count reads it).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn record_history_point(&mut self, kind: PointKind, pos: &[[f64; 3]], z: &[u8], stds: Option<(f64, &[f64], &[f64])>, model_energy: f64, model_forces: &[[f64; 3]], energy: f64, forces: &[[f64; 3]], box_affected: bool, draft: bool, unfit: bool, flags: surrogate::history::PointFlags, energy_std_epistemic: Option<f64>) {
+    pub(super) fn record_history_point(&mut self, kind: PointKind, pos: &[[f64; 3]], z: &[u8], stds: Option<(f64, &[f64], &[f64])>, model_energy: f64, model_forces: &[[f64; 3]], energy: f64, forces: &[[f64; 3]], box_affected: bool, draft: bool, unfit: bool, flags: surrogate::history::PointFlags, energy_std_epistemic: Option<f64>) -> bool {
         if box_affected {
             self.audit_history.unrecorded.box_affected += 1;
-            return;
+            return false;
         }
         if draft {
             self.audit_history.unrecorded.draft += 1;
-            return;
+            return false;
         }
         if unfit {
             self.audit_history.unrecorded.unfit += 1;
-            return;
+            return false;
         }
         let Some((energy_std, force_std, force_std_epistemic)) = stds else {
             self.audit_history.unrecorded.no_variance += 1;
-            return;
+            return false;
         };
         let n = pos.len();
         assert!(model_forces.len() == n && forces.len() == n, "a comparison's forces agree with its geometry");
@@ -731,6 +733,7 @@ impl SurrogateKs {
         if super::calibrate::in_jurisdiction(kind) {
             self.rejudge_classes();
         }
+        true
     }
 
     /// The last audit judged the current fit: `false` when no audit ran since the last refit
@@ -778,7 +781,9 @@ impl SurrogateKs {
             if !tick_only {
                 self.audit_due = true;
             }
-            self.ticks_skipped += u64::from(tick);
+            if tick {
+                self.tick_outcome(super::TickOutcome::SkippedBusy);
+            }
             return true;
         }
         self.side_jobs += 1;
@@ -800,10 +805,11 @@ impl SurrogateKs {
     }
 
     /// A calibration tick's job on the auditor will not be judged — abandoned by a Forget or an
-    /// installed model, or its thread gone: counted as skipped (module doc, "Calibration ticks").
+    /// installed model, or its thread gone: lost (module doc, "Calibration ticks"), and the next
+    /// tick's count starts here.
     pub(super) fn skip_tick_in_flight(&mut self) {
         if std::mem::take(&mut self.tick_in_flight) {
-            self.ticks_skipped += 1;
+            self.tick_outcome(super::TickOutcome::Lost);
         }
     }
 
@@ -876,8 +882,9 @@ impl SurrogateKs {
             return; // the model it was for was forgotten or replaced
         }
         let positions = || ans.job.scene.nuclei.iter().map(|n| n.pos).collect::<Vec<[f64; 3]>>();
-        // a calibration tick's answer, of this generation (an older one's was counted skipped when
-        // it was abandoned): taken once judged, else skipped (module doc, "Calibration ticks")
+        // a calibration tick's answer, of this generation (an older one's was counted lost when it
+        // was abandoned): taken once judged — recorded or not — else lost (module doc, "Calibration
+        // ticks"); the next tick's count starts here
         let tick = ans.job.kind == JobKind::Audit && ans.job.flags.has(surrogate::history::PointFlags::TICK);
         if tick {
             self.tick_in_flight = false;
@@ -920,7 +927,9 @@ impl SurrogateKs {
                 ev.solve_ms = ans.ms;
                 ev.audit_lag = Some(self.answered.saturating_sub(ans.job.answered));
                 self.push_event(ev);
-                self.ticks_skipped += u64::from(tick);
+                if tick {
+                    self.tick_outcome(super::TickOutcome::Lost);
+                }
                 return self.pending_notes.push(note);
             }
             (JobKind::Audit, Ok(Solved { energy, forces, face, multiplicity, display, orbitals, unfit })) => {
@@ -929,11 +938,11 @@ impl SurrogateKs {
                 }
                 let judged = self.judge_audit(ans.job, energy, forces, face, multiplicity, unfit, ans.ms, ans.scf_steps, ans.ts);
                 if tick {
-                    if judged {
-                        self.ticks_taken += 1;
-                    } else {
-                        self.ticks_skipped += 1;
-                    }
+                    self.tick_outcome(match judged {
+                        None => super::TickOutcome::Lost,
+                        Some(true) => super::TickOutcome::Recorded,
+                        Some(false) => super::TickOutcome::Unrecorded,
+                    });
                 }
             }
         }
@@ -942,11 +951,12 @@ impl SurrogateKs {
     /// A background audit's verdict (`surrogate` module doc, "Audit"): the sample is admitted like any
     /// teacher answer, the gap recorded; a failed audit untrusts the model and books the flip at
     /// the next evaluation. One activity event either way: judged (the verdict, the admission's
-    /// outcome) or discarded (plan review S11). Returns whether the answer was judged (a verdict
-    /// taken, box-affected included): `false` when discarded (the model changed settings or
-    /// species) or inside a fenced shell band — what a calibration tick's count reads.
+    /// outcome) or discarded (plan review S11). Returns `None` when the answer was not judged
+    /// (discarded: the model changed settings or species; inside a fenced shell band), else whether
+    /// its history point was recorded (`record_history_point`: not for a box-affected, unfit or
+    /// variance-less answer) — what a calibration tick's count reads.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, multiplicity: Option<u32>, unfit: Option<&str>, ms: f64, scf_steps: Option<usize>, ts: Option<f64>) -> bool {
+    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, multiplicity: Option<u32>, unfit: Option<&str>, ms: f64, scf_steps: Option<usize>, ts: Option<f64>) -> Option<bool> {
         let unaudited = self.answered.saturating_sub(job.answered);
         let AuditJob { scene, prov, draft_guess, flags: dispatched, tick_only, .. } = job;
         let tag = if draft_guess { SampleTag::DraftAudit } else { SampleTag::Audit };
@@ -975,7 +985,7 @@ impl SurrogateKs {
             ev.audit_lag = Some(unaudited);
             self.push_event(ev);
             self.pending_notes.push(note.into());
-            return false;
+            return None;
         };
         // inside a fenced shell band (the shell fence; final review I1, the coordinator's ruling):
         // strict mode refuses the geometry, so the answer is no judgement of the model — not
@@ -993,7 +1003,7 @@ impl SurrogateKs {
             ev.audit_lag = Some(unaudited);
             self.push_event(ev);
             self.pending_notes.push(note);
-            return false;
+            return None;
         }
         let n = pos.len().max(1) as f64;
         let gap = energy - pred.energy;
@@ -1074,7 +1084,7 @@ impl SurrogateKs {
             (Some(e), Some(f), Some(fe)) => Some((e, &f[..], &fe[..])),
             _ => None,
         };
-        self.record_history_point(PointKind::Audit, &pos, &z, stds, pred.energy, &pred.forces, energy, &forces, box_rho.is_some(), draft_guess, unfit.is_some(), flags, energy_std_epistemic);
+        let recorded = self.record_history_point(PointKind::Audit, &pos, &z, stds, pred.energy, &pred.forces, energy, &forces, box_rho.is_some(), draft_guess, unfit.is_some(), flags, energy_std_epistemic);
         let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, outcome);
         ev.detail = notes.join("\n");
         ev.face_density = face;
@@ -1089,7 +1099,7 @@ impl SurrogateKs {
         ev.audit_lag = Some(unaudited);
         self.push_event(ev);
         self.pending_notes.extend(notes);
-        true
+        Some(recorded)
     }
 }
 

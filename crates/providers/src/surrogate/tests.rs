@@ -13719,15 +13719,19 @@ fn a_calibration_tick_does_not_read_the_std() {
     gate.store(true, SeqCst);
     // a free auditor: the answered steps' ticks go to it
     let (s, h) = tick_fixture(0);
-    let (mut s, _gate, _) = with_tick_auditor(s, &h, true);
+    let (mut s, _gate, auditor_calls) = with_tick_auditor(s, &h, true);
     let (mut dispatched, mut judged) = (Vec::new(), 0);
+    // the stepping teacher's solves: the auditor solves on the same Morse handle, so its own calls
+    // are taken out (read once it is settled: its solve runs on its own thread)
+    let stepping = |h: &Arc<Mutex<MorseDimer>>| calls(h) - auditor_calls.load(SeqCst);
     for i in 0..n + 1 {
         settle(&mut s);
-        let calls0 = calls(&h);
+        let calls0 = stepping(&h);
         let (src, notes, points) = tick_step(&mut s, &tick_scene(i));
+        settle(&mut s);
         if notes.iter().any(|n| n.starts_with("surrogate calibration tick dispatched to the background teacher (every 25 in-envelope steps")) {
             dispatched.push(i);
-            assert_eq!((src, calls(&h)), (Source::Surrogate, calls0), "step {i}: the model answers");
+            assert_eq!((src, stepping(&h)), (Source::Surrogate, calls0), "step {i}: the model answers, no solve in the step");
         }
         if let Some(p) = tick_of(&points) {
             assert!(p.kind == PointKind::Audit && calibrate::in_answer_sample(&p), "{p:?}");
@@ -13755,6 +13759,7 @@ fn skipped_ticks_are_counted_and_shown() {
     }
     println!("taken {} skipped {} in the step {}", s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step());
     assert_eq!((s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step()), (0, 100, 0));
+    assert_eq!(s.tick_counts(), TickCounts { skipped_busy: 100, answered_due: 100, answered_skipped_busy: 100, ..TickCounts::default() }, "skipped because the auditor was busy (with other work), every one at an answered step");
     assert_eq!((calls(&h), s.audit_history().recorded(), auditor_calls.load(SeqCst)), (calls0, 0, 0));
     gate.store(true, SeqCst);
 }
@@ -13907,6 +13912,7 @@ fn an_abandoned_tick_counts_as_skipped() {
         if forget {
             s.forget();
             assert_eq!((s.ticks_taken(), s.ticks_skipped()), (0, 1), "abandoned: skipped");
+            assert_eq!(s.tick_counts(), TickCounts { lost: 1, answered_due: 1, ..TickCounts::default() }, "lost, not busy");
         }
         gate.store(true, SeqCst);
         settle(&mut s);
@@ -13988,4 +13994,123 @@ fn a_key_locked_by_its_tail_inflation_keeps_measuring_on_real_ticks() {
     }
     let (src, code, note) = inflation_step(&mut s, &sc);
     assert_eq!((src, code), (Source::Surrogate, None), "lifted: answered again ({note})");
+}
+
+// ---- Task 7 fix round 1 (review I1, M1, M2) ----
+
+/// The Task 7 review's I1 (the controller's ruling): `TICK_EVERY` counts in-envelope steps from the
+/// previous tick's **completion** — a step taken while a tick's audit job is in flight is not
+/// counted — so the tick-eligible steps do not depend on the previous tick's σ outcome. An auditor
+/// whose every solve takes 40 steps (held at its gate, longer than 25), 300 in-envelope steps, no
+/// rule 8:
+/// - σ ×1: every tick is answered, so it is a job on the auditor, completed when its answer is
+///   handled 40 steps later (the poll at the start of that step's `evaluate`, so that step is the
+///   first counted);
+/// - σ ×10: every tick is refused, so it is served at its own step (no job), completed there.
+///
+/// In both runs every tick is the 25th counted step after the previous completion (the first the
+/// 25th step of the run), and none is skipped. Under the old count (in-flight steps counted) the
+/// ×1 run's next tick falls due 25 steps after its predecessor, while that job is still in flight:
+/// skipped — answered ticks starved their successors, refused ones did not.
+#[test]
+fn a_tick_counts_from_the_previous_ticks_completion() {
+    use std::sync::atomic::Ordering::SeqCst;
+    use surrogate::history::PointFlags;
+    let hold = 40;
+    let mut intervals = Vec::new();
+    for scale in [1.0, 10.0] {
+        let (s, h) = tick_fixture(0);
+        let (mut s, gate, _) = with_tick_auditor(s, &h, false);
+        scale_epistemic(&mut s, scale);
+        s.last_variance = None;
+        let (mut ticks, mut completions, mut gaps) = (Vec::new(), Vec::new(), Vec::new());
+        let mut release_at = None;
+        for i in 0..300 {
+            if release_at == Some(i) {
+                // the job's solve ends: its answer arrives and waits for this step's evaluate
+                gate.store(true, SeqCst);
+                settle(&mut s);
+                gate.store(false, SeqCst);
+                release_at = None;
+            }
+            let in_flight = s.tick_in_flight;
+            let (src, notes, points) = tick_step(&mut s, &h2(1.5 + 0.1 * (i % 3) as f64));
+            if in_flight && !s.tick_in_flight {
+                completions.push(i); // handled before this step's decision: the first counted step
+            }
+            let dispatched = notes.iter().any(|n| n.starts_with("surrogate calibration tick dispatched"));
+            let at_fallback = points.iter().any(|p| p.flags.has(PointFlags::TICK) && matches!(p.kind, surrogate::history::PointKind::Fallback { .. }));
+            if dispatched || at_fallback {
+                assert_eq!(src == Source::Surrogate, scale == 1.0, "step {i}: {notes:?}");
+                // counted steps since the previous completion, this one included
+                let from = match (scale == 1.0, ticks.last(), completions.last()) {
+                    (_, None, _) => 0,
+                    (true, Some(_), Some(&c)) => c,
+                    (false, Some(&t), _) => t + 1,
+                    (true, Some(_), None) => unreachable!("a second tick before the first completed"),
+                };
+                gaps.push(i + 1 - from);
+                ticks.push(i);
+                if dispatched {
+                    release_at = Some(i + hold);
+                }
+            }
+        }
+        println!("×{scale}: ticks at {ticks:?}; completions {completions:?}; counted steps per tick {gaps:?}; {:?}", s.tick_counts());
+        assert!(ticks.len() >= 4, "×{scale}: {ticks:?}");
+        assert!(gaps.iter().all(|&g| g == TICK_EVERY), "×{scale}: every tick is the 25th counted step after the previous completion: {gaps:?}");
+        assert_eq!(s.ticks_skipped(), 0, "×{scale}: no tick waits on its predecessor");
+        intervals.push(gaps);
+        gate.store(true, SeqCst);
+    }
+    let n = intervals[0].len().min(intervals[1].len());
+    assert_eq!(intervals[0][..n], intervals[1][..n], "answered and refused ticks: the same counted steps");
+}
+
+/// The Task 7 review's M2: a cancelled teacher solve on a counted step is a step that did not
+/// happen. Its count is rolled back and the retry is the tick — at a fallback tick (σ ×10) and at
+/// an in-step tick (σ ×1) alike — so cancels do not remove the σ-refused ticks preferentially.
+#[test]
+fn a_cancelled_tick_is_retried_as_the_tick() {
+    use std::sync::atomic::Ordering::SeqCst;
+    use surrogate::history::PointFlags;
+    for scale in [10.0, 1.0] {
+        let (mut s, h) = tick_fixture(0);
+        scale_epistemic(&mut s, scale);
+        s.last_variance = None;
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        s.teacher = Box::new(Gated { inner: h.clone(), open: gate.clone(), rho: 0.0, calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)) });
+        s.tick_steps = TICK_EVERY as u64 - 1;
+        let r = s.evaluate(&h2(1.6), &mut || true);
+        assert!(matches!(r, Err(ProviderError::Cancelled)), "×{scale}: the premise: cancelled ({:?})", r.as_ref().map(|r| &r.stats.notes));
+        assert_eq!((s.tick_steps, s.tick_counts()), (TICK_EVERY as u64 - 1, TickCounts::default()), "×{scale}: rolled back, nothing booked");
+        gate.store(true, SeqCst);
+        let (src, notes, points) = tick_step(&mut s, &h2(1.6));
+        println!("×{scale}: retry {src:?} {notes:?}; {:?}", s.tick_counts());
+        assert!(points.iter().any(|p| p.flags.has(PointFlags::TICK)), "×{scale}: the retry is the tick: {points:?}");
+        assert_eq!((s.tick_steps, s.ticks_taken(), s.ticks_skipped()), (TICK_EVERY as u64, 1, 0));
+        let answered = u64::from(scale == 1.0);
+        assert_eq!(s.tick_counts(), TickCounts { recorded: 1, in_step: answered, answered_due: answered, ..TickCounts::default() }, "×{scale}: booked once");
+    }
+}
+
+/// The Task 7 review's M1: a tick whose answer leaves no point (here box-affected, on the auditor) is
+/// taken but unrecorded — counted apart from the recorded ones, so the readout cannot show
+/// calibration going on while P_A does not grow — and, a tick alone, it does not make rule 8
+/// audit again (`audit_due` stays false).
+#[test]
+fn a_box_affected_tick_is_taken_without_a_point() {
+    let (s, h) = tick_fixture(0);
+    let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let auditor = Gated { inner: h.clone(), open, rho: 1.0, calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)) };
+    let mut s = s.with_auditor(Box::new(auditor));
+    s.tick_steps = TICK_EVERY as u64 - 1;
+    let (_, notes, _) = tick_step(&mut s, &h2(1.6));
+    assert!(notes.iter().any(|n| n.starts_with("surrogate calibration tick dispatched")), "{notes:?}");
+    settle(&mut s);
+    let (_, notes, points) = tick_step(&mut s, &h2(1.6));
+    println!("{notes:?}; {:?}", s.tick_counts());
+    assert!(points.is_empty() && notes.iter().any(|n| n.contains("box-affected") && n.contains("a calibration tick: rule 8's cadence is unchanged")), "{notes:?}");
+    assert_eq!(s.tick_counts(), TickCounts { unrecorded: 1, answered_due: 1, ..TickCounts::default() });
+    assert_eq!((s.ticks_taken(), s.ticks_skipped(), s.audit_due), (0, 0, false));
 }

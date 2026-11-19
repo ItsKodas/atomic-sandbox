@@ -294,6 +294,7 @@ enter P_A. A tick decides before the variance is computed and forces it.
     acceptable because the floor and the class-refused points do most of the catching.
 - **Rejected: ticks only for keys near their bound.** Choosing by nearness reads σ.
 - Rule 8's own cadence is unchanged.
+- **Amendment (Task 7 review I1, controller's ruling, 2026-11-20):** `TICK_EVERY` counts in-envelope steps from the previous tick's *completion*; steps taken while a tick's audit job is in flight do not count, so an answered tick and a refused one both start the next interval when their measurement ends, and only non-tick auditor work (rule 8, displays, references) can make a due tick skip (counted apart as `skipped_busy`).
 
 **Left out of P_A**, because λ selects them:
 
