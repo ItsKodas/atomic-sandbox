@@ -303,6 +303,36 @@
 //! (H₂) ≈ 2 µs of an 8 µs step; four 0.25 fs steps move a hydrogen at 2000 K (v_rms 3.2e-3
 //! Bohr/a.u.) ≈ 0.13 Bohr, inside the 3-spread envelope that is checked every step.
 //!
+//! **The history's flags and epistemic energy std** (trust tightening Task 3, spec 2026-11-18 §4,
+//! "The sample P_A"). Every consulted-model point (`record_history_point`) carries a flags word
+//! and the total-energy epistemic std. Neither reads the step's σ or any λ to decide *which* step
+//! is flagged — the sample they select must be chosen blind to what it measures:
+//!
+//! * `CADENCE_FRESH`: a step is consulted when it passes the gate (rules 1–4) and reaches the
+//!   variance cadence. `cadence_steps` counts consulted steps from 0 and **nothing resets it** (not
+//!   a refit, an install, a policy change, an edit or a forget); a step is cadence-fresh when its
+//!   count c satisfies c mod k = 0, k = `variance_cadence` (≥ 1). `consults` is not used: it
+//!   restarts on every fresh variance, and a variance refused by rule 6/7 is fresh on the next
+//!   step, so its phase follows σ. The bit selects steps; it does not force the variance: on a
+//!   cadence-fresh step that `consults` does not make fresh, the last accepting verdict is reused
+//!   as before (rule 5d's novelty with it), so nothing any rule decides moves.
+//! * `FENCED`: the geometry is near a quarantined or forgotten sample (`near` non-empty), an atom
+//!   is near a misfit (`near_misfit`), or the shell or audit fence would refuse it. All three are
+//!   evaluated on every consulted step — the audit fence read-only (`audit_fence_refusal`) when an
+//!   earlier rule (the class rule, 4b) already refused — so a code 5/6/21 point inside a fence is
+//!   marked (spec review I4: those codes do not imply that the fences passed). A background audit's
+//!   bit is its dispatch step's, OR the fences at its judgement.
+//! * `TICK`: the calibration tick (Task 7); never set yet.
+//! * The epistemic energy std, Ha: σ_E,epi = √max(σ_E² − f², 0), with σ_E the model's total
+//!   predictive energy std and f its aleatoric floor — N·s_E for a model fitted on energies per
+//!   atom, s_E otherwise (`surrogate::model`, "Predictive variance": σ_E² = f² + φ̃ᵀΣφ̃) — the
+//!   same number rule 7 divides by N and inflates (`epistemic_energy_std`). The subtraction
+//!   recovers φ̃ᵀΣφ̃ to an absolute error of about ulp(σ_E²), i.e. σ_E,epi to ≈ 1.5e-8·f when the
+//!   floor dominates (≈ 1e-13 Ha per atom on a 1e-5 Ha/atom floor, 10⁻¹⁰ of the tier). With the
+//!   floor σ_E was built from, the radicand is never negative (σ_E = √fl(f² + φ̃ᵀΣφ̃) ≥ f, and
+//!   correctly rounded squaring is monotone); one below 0 is clamped to 0 all the same. A
+//!   non-finite or negative value is recorded as absent, never pushed (the history refuses it).
+//!
 //! # Draft mode (user request 2026-10-14: `FallbackPolicy::never_fallback`)
 //!
 //! "Guess instead of falling back (unsafe)": with a model present whose provenance, species and
@@ -1285,6 +1315,10 @@ struct ModelAnswer {
     /// epistemic part) — the history's point (M8a Task 1, `surrogate::history`) of an in-step
     /// audit or of a consulted-model fallback. `None` when the model has no variance factor.
     stds: Option<(f64, Vec<f64>, Vec<f64>)>,
+    /// The total-energy epistemic std of `stds`' energy std under the model that predicted it
+    /// (`epistemic_energy_std`; module doc, "The history's flags"), unsanitised — the history
+    /// point sanitises it. `None` with `stds`.
+    energy_std_epistemic: Option<f64>,
 }
 
 /// One teacher step: why (the note's text, the rule's code and the atom it names), with what
@@ -1319,6 +1353,10 @@ struct Handoff {
     /// or `HISTORY_RULE_CLASS_AND_VARIANCE` when the class rule refused and rule 6/7 would have
     /// too; M8a Task 2). Unused for an audit or a gate refusal.
     history_rule: u8,
+    /// The history point's flags (module doc, "The history's flags"): the consulted step's
+    /// cadence-fresh and fenced bits; empty where no point is recorded (a gate refusal, a capped
+    /// segment, a non-finite answer).
+    flags: surrogate::history::PointFlags,
 }
 
 /// The surrogate force provider (module doc).
@@ -1412,6 +1450,10 @@ pub struct SurrogateKs {
     last: Option<LastEval>,
     /// Consultations since the variance was last evaluated (the cadence, module doc).
     consults: usize,
+    /// Consulted steps so far, never reset (module doc, "The history's flags"): a step whose count
+    /// is a multiple of `variance_cadence` is cadence-fresh. Unlike `consults` its phase does not
+    /// follow σ.
+    cadence_steps: u64,
     last_variance: Option<VarianceVerdict>,
     /// The fit gates' floor, |∪ S_k| over the samples a fit would use in the basis it would build,
     /// keyed by a fingerprint of those samples and that basis (`fit_floor`; the status asks for it
@@ -1456,6 +1498,9 @@ pub struct SurrogateKs {
     /// The audit being dispatched is a draft-mode guess the strict policy would have refused
     /// (`AuditJob::draft_guess`); set by `evaluate` right before `dispatch_audit`.
     dispatch_draft_guess: bool,
+    /// The flags of the step dispatching an audit (`AuditJob::flags`); set by `evaluate` right
+    /// before `dispatch_audit`, taken by `send_job`.
+    dispatch_flags: surrogate::history::PointFlags,
     /// A failed asynchronous audit untrusted the model: the next teacher evaluation books the
     /// Model → Teacher flip at its positions (module doc, "Audit").
     audit_flip: bool,
@@ -1782,6 +1827,7 @@ impl SurrogateKs {
             pending_jump: None,
             last: None,
             consults: 0,
+            cadence_steps: 0,
             last_variance: None,
             fit_floor_cache: std::sync::Mutex::new(BTreeMap::new()),
             variance_checks: 0,
@@ -1798,6 +1844,7 @@ impl SurrogateKs {
             audit_due: false,
             box_audits_unjudged: 0,
             dispatch_draft_guess: false,
+            dispatch_flags: surrogate::history::PointFlags::default(),
             audit_flip: false,
             force_teacher: false,
             last_fallback: false,
@@ -2060,7 +2107,7 @@ impl SurrogateKs {
         // there, an audit included) and not for a non-finite prediction (no finite stds exist)
         if let Some(m) = h.model.as_ref().filter(|_| !h.audit && !h.shell_fence && h.reason.rule != TeachRule::NonFiniteAnswer) {
             let kind = surrogate::history::PointKind::Fallback { rule: h.history_rule };
-            self.record_history_point(kind, &h.pos, &h.z, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, boxed.is_some(), false, unfit.is_some());
+            self.record_history_point(kind, &h.pos, &h.z, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, boxed.is_some(), false, unfit.is_some(), h.flags, m.energy_std_epistemic);
         }
         if h.model.is_some() && !h.audit {
             self.streak += 1;
@@ -2135,7 +2182,7 @@ impl SurrogateKs {
                     self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: 0, asynchronous: false, teacher_ms: stats.solve_ms as f64 });
                     self.last_audit_fit = self.fits;
                     // the history's point (M8a Task 1): an in-step audit is never a draft guess
-                    self.record_history_point(surrogate::history::PointKind::Audit, &h.pos, &h.z, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, box_rho.is_some(), false, unfit.is_some());
+                    self.record_history_point(surrogate::history::PointKind::Audit, &h.pos, &h.z, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, box_rho.is_some(), false, unfit.is_some(), h.flags, m.energy_std_epistemic);
                     // a box-affected audit judged nothing: it does not satisfy the cadence — the
                     // next answered step is audited again — and it is counted for the checklist
                     // (M8a Task 2, the Task 1 physics review's I4); the step keeps the model's
@@ -2346,7 +2393,7 @@ impl ForceProvider for SurrogateKs {
             let reason = Refusal::new("surrogate: a capped segment teaches its interior atoms — the model does not answer here (its caps and edge atoms are not the source scene's)", TeachRule::Segment, None);
             let near = if self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
             let near_misfit = self.model.is_some() && self.near_misfit(&pos, &z).contains(&true);
-            let h = Handoff { prov, pos, z, reason, keep_sample: true, shell_fence: false, thin: false, dedup: true, near, near_misfit, model: None, audit: false, teacher_surface: false, history_rule: history_rule_code(TeachRule::Segment) };
+            let h = Handoff { prov, pos, z, reason, keep_sample: true, shell_fence: false, thin: false, dedup: true, near, near_misfit, model: None, audit: false, teacher_surface: false, history_rule: history_rule_code(TeachRule::Segment), flags: surrogate::history::PointFlags::default() };
             return self.teach(scene, h, t0, should_abort);
         }
         // rules 1–4 (draft mode answers past rule 4 only: module doc, "Draft mode")
@@ -2386,7 +2433,7 @@ impl ForceProvider for SurrogateKs {
                 let near = if keep_sample && self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
                 let near_misfit = keep_sample && self.model.is_some() && self.near_misfit(&pos, &z).contains(&true);
                 let history_rule = history_rule_code(reason.rule);
-                let h = Handoff { prov, pos, z, reason, keep_sample, shell_fence: false, thin, dedup, near, near_misfit, model: None, audit: false, teacher_surface: false, history_rule };
+                let h = Handoff { prov, pos, z, reason, keep_sample, shell_fence: false, thin, dedup, near, near_misfit, model: None, audit: false, teacher_surface: false, history_rule, flags: surrogate::history::PointFlags::default() };
                 return self.teach(scene, h, t0, should_abort);
             }
             Ok(()) => {}
@@ -2399,6 +2446,15 @@ impl ForceProvider for SurrogateKs {
         let counts = {
             let rc2 = self.model.as_ref().map_or(0.0, |m| m.basis.r_cut * m.basis.r_cut);
             neighbour_counts(&pos, rc2)
+        };
+        // the history's cadence-fresh bit (module doc, "The history's flags"): this consulted
+        // step's count on the never-reset counter, a multiple of k — not `consults`, whose phase
+        // a rule-6/7 refusal restarts
+        let cadence_fresh = {
+            let k = self.policy.variance_cadence.max(1) as u64;
+            let c = self.cadence_steps;
+            self.cadence_steps += 1;
+            c % k == 0
         };
         let with_variance = {
             let k = self.policy.variance_cadence.max(1);
@@ -2432,10 +2488,11 @@ impl ForceProvider for SurrogateKs {
                 dedup: false,
                 near,
                 near_misfit,
-                model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty: None, stds: None }),
+                model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty: None, stds: None, energy_std_epistemic: None }),
                 audit: false,
                 teacher_surface: true,
                 history_rule: history_rule_code(TeachRule::NonFiniteAnswer),
+                flags: surrogate::history::PointFlags::default(),
             };
             return self.teach(scene, h, t0, should_abort);
         }
@@ -2531,10 +2588,18 @@ impl ForceProvider for SurrogateKs {
             reason = in_shell;
         }
         let mut by_audit_fence = false;
+        let audit_fence_checked = reason.is_none();
         if reason.is_none() {
             reason = self.audit_fence_refusal(&pos, &z);
             by_audit_fence = reason.is_some();
         }
+        // the history's fenced bit (module doc, "The history's flags"; spec review I4): any fence
+        // that applies here, whichever rule named the refusal — the audit fence (which includes the
+        // shell fence) asked read-only when an earlier rule refused before it was consulted
+        let fenced = !near.is_empty() || near_misfit || by_shell_fence || by_audit_fence || (!audit_fence_checked && self.audit_fence_refusal(&pos, &z).is_some());
+        let flags = surrogate::history::PointFlags(
+            if cadence_fresh { surrogate::history::PointFlags::CADENCE_FRESH } else { 0 } | if fenced { surrogate::history::PointFlags::FENCED } else { 0 },
+        );
         self.record_verdict(&pos, &z, strict_gate.clone().or_else(|| reason.clone()));
         // never at lone atoms the references answer (rule 0b — reached here in draft mode only): the
         // gap there is the isolated atoms' grid/box artefacts, not a model error, and the answer is
@@ -2553,8 +2618,10 @@ impl ForceProvider for SurrogateKs {
         // — only when the refusal there is a fact about the geometry (round 1, MUST-1): refused only
         // by rule 4/4b/6/7, strict mode may answer there once trust returns, so the audit is ordinary
         self.dispatch_draft_guess = draft && reason.as_ref().is_some_and(|r| geometry_specific(r.rule));
+        self.dispatch_flags = flags;
         let audit = due && !self.dispatch_audit(scene, &prov) && !draft;
         self.dispatch_draft_guess = false;
+        self.dispatch_flags = surrogate::history::PointFlags::default();
         // draft mode: what the model guesses beyond, and it answers anyway
         let extrapolation = (draft && (untrusted.is_some() || reason.is_some())).then(|| Extrapolation {
             atoms_outside: atom_envelope.iter().filter(|&&d| d > 1.0).count(),
@@ -2592,6 +2659,8 @@ impl ForceProvider for SurrogateKs {
                 (Some(e), Some(f), Some(fe)) => Some((e, f.clone(), fe.clone())),
                 _ => self.model.as_ref().and_then(|m| m.predict(&pos, &z, true).ok()).and_then(|p| Some((p.energy_std?, p.force_std?, p.force_std_epistemic?))),
             };
+            // under the model that predicted them (the same one: nothing refits inside `evaluate`)
+            let energy_std_epistemic = stds.as_ref().zip(self.model.as_ref()).map(|((e, _, _), m)| epistemic_energy_std(m, pos.len(), *e));
             let h = Handoff {
                 prov,
                 pos,
@@ -2614,7 +2683,7 @@ impl ForceProvider for SurrogateKs {
                 dedup: (by_envelope || by_class || by_audit_fence || by_fence || near_misfit) && !forced,
                 near,
                 near_misfit,
-                model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty, stds }),
+                model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty, stds, energy_std_epistemic }),
                 audit,
                 // rules 4b and 5 (the model's energy is an unvalidated guess or an extrapolation)
                 // and the first evaluation after an edit report the teacher's surface; audits
@@ -2622,6 +2691,7 @@ impl ForceProvider for SurrogateKs {
                 // accounting")
                 teacher_surface: !audit && !forced && (by_class || by_envelope || post_edit),
                 history_rule,
+                flags,
             };
             return self.teach(scene, h, t0, should_abort);
         }

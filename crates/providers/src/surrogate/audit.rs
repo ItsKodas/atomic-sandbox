@@ -181,6 +181,14 @@ pub(super) struct FailedAudit {
     pub(super) pair: Option<(u8, u8)>,
 }
 
+/// The epistemic energy std a history point may carry (`record_history_point`): a finite,
+/// non-negative value as itself (−0 as +0), anything else — NaN, ±∞, a negative number — as absent.
+/// `AuditHistory::push` panics on what this refuses; a radicand below 0 is clamped to 0 before the
+/// root (`epistemic_energy_std`), so a cancelled epistemic part arrives as 0, never as NaN.
+pub(super) fn recordable_energy_std(s: Option<f64>) -> Option<f64> {
+    s.filter(|v| v.is_finite() && *v >= 0.0).map(|v| if v == 0.0 { 0.0 } else { v })
+}
+
 /// The isolated neutral atom of species `z` at the centre of `scene`'s cell, solved under the scene's own ionic policy
 /// (the display's atomic superposition and the references both compare it with the scene's solved density: under
 /// `CoresOnly` an oxygen atom of 6 valence electrons, never the 8-electron all-electron one — Task 9 review I1 /
@@ -216,6 +224,10 @@ pub(super) struct AuditJob {
     /// The orbital shares' free-atom tables (`SurrogateKs::share_tables`), handed to the teacher
     /// before it solves; it weights them at this job's positions (module doc, "Orbitals").
     pub(super) shares: Option<Arc<ShareTables>>,
+    /// An audit's history flags from the step that dispatched it (`SurrogateKs::dispatch_flags`;
+    /// module doc, "The history's flags"): its cadence-fresh and fenced bits. Empty for every other
+    /// kind.
+    pub(super) flags: surrogate::history::PointFlags,
     /// The isolated-atom profiles a [`JobKind::HarrisDisplay`] job superposes (`None` for every
     /// other kind).
     pub(super) harris: Option<Arc<sim::HarrisAtoms>>,
@@ -591,7 +603,8 @@ impl SurrogateKs {
         let force = matches!(kind, JobKind::Refresh | JobKind::HarrisDisplay) && self.orbital_view.force_every_step;
         let view = OrbitalViewRequest { force_every_step: force, ..self.orbital_view.clone() };
         let draft_guess = std::mem::take(&mut self.dispatch_draft_guess);
-        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view, interrupt: self.display_interrupt.clone(), core: self.display_core, draft_guess, shares: self.share_tables.clone(), harris };
+        let flags = std::mem::take(&mut self.dispatch_flags);
+        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view, interrupt: self.display_interrupt.clone(), core: self.display_core, draft_guess, shares: self.share_tables.clone(), harris, flags };
         match a.jobs.as_ref().map(|tx| tx.send(job)) {
             Some(Ok(())) => {
                 a.busy = Some(kind);
@@ -634,11 +647,17 @@ impl SurrogateKs {
     /// verdict on the strict model), an unfit teacher answer (cores overlap, an occupation change:
     /// not the surface the model learns), or a model without a variance factor (`stds` None).
     ///
+    /// Since trust tightening Task 3 the point carries `flags` (the step's cadence-fresh, fenced
+    /// and tick bits) and `energy_std_epistemic`, the total-energy epistemic std
+    /// (`epistemic_energy_std`; module doc, "The history's flags") — recorded only when finite and
+    /// non-negative (−0 as +0), else absent: the history refuses anything else with a panic, and
+    /// a panic here would take the provider down with its worker thread.
+    ///
     /// # Panics
     /// If the shapes disagree with the geometry (a programming error at the call site: every
     /// judged comparison leaves a point or a count, so nothing is dropped silently).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn record_history_point(&mut self, kind: PointKind, pos: &[[f64; 3]], z: &[u8], stds: Option<(f64, &[f64], &[f64])>, model_energy: f64, model_forces: &[[f64; 3]], energy: f64, forces: &[[f64; 3]], box_affected: bool, draft: bool, unfit: bool) {
+    pub(super) fn record_history_point(&mut self, kind: PointKind, pos: &[[f64; 3]], z: &[u8], stds: Option<(f64, &[f64], &[f64])>, model_energy: f64, model_forces: &[[f64; 3]], energy: f64, forces: &[[f64; 3]], box_affected: bool, draft: bool, unfit: bool, flags: surrogate::history::PointFlags, energy_std_epistemic: Option<f64>) {
         if box_affected {
             self.audit_history.unrecorded.box_affected += 1;
             return;
@@ -678,10 +697,10 @@ impl SurrogateKs {
             model_gen: self.model_gen,
             species,
             // the fit that judged it (trust tightening Task 2; `fit_id`: a point without one does
-            // not count toward the floor); the flags and the epistemic std from Task 3 on
+            // not count toward the floor); the step's flags and the epistemic energy std (Task 3)
             fit_id: self.model.is_some().then_some(self.fit_id),
-            flags: surrogate::history::PointFlags::default(),
-            energy_std_epistemic: None,
+            flags,
+            energy_std_epistemic: recordable_energy_std(energy_std_epistemic),
         });
         // new verdict evidence re-judges the class verdicts now, not at the next refit (user-test
         // fix 2, the controller's ruling 3: a parked scene whose fallbacks are all "similar" never
@@ -864,7 +883,7 @@ impl SurrogateKs {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, multiplicity: Option<u32>, unfit: Option<&str>, ms: f64, scf_steps: Option<usize>, ts: Option<f64>) {
         let unaudited = self.answered.saturating_sub(job.answered);
-        let AuditJob { scene, prov, draft_guess, .. } = job;
+        let AuditJob { scene, prov, draft_guess, flags: dispatched, .. } = job;
         let tag = if draft_guess { SampleTag::DraftAudit } else { SampleTag::Audit };
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
@@ -916,6 +935,11 @@ impl SurrogateKs {
         let near = self.near_quarantined(&pos, &z);
         // next to a misfit the answer is kept only if it agrees with the model (spec 2026-11-13 §4.3)
         let near_misfit = self.near_misfit(&pos, &z).contains(&true);
+        // the history's flags (module doc, "The history's flags"): the dispatching step's, fenced
+        // as well when a fence applies at the judgement (read-only; the shell fence returned above)
+        let fenced = !near.is_empty() || near_misfit || self.audit_fence_refusal(&pos, &z).is_some();
+        let flags = surrogate::history::PointFlags(dispatched.0 | if fenced { surrogate::history::PointFlags::FENCED } else { 0 });
+        let energy_std_epistemic = pred.energy_std.zip(self.model.as_ref()).map(|(e, m)| epistemic_energy_std(m, pos.len(), e));
         let mut notes = Vec::new();
         let rule = box_affected_face_density(prov.h);
         // (never a capped segment's: a masked scene is teacher-only, nothing is audited there)
@@ -980,7 +1004,7 @@ impl SurrogateKs {
             (Some(e), Some(f), Some(fe)) => Some((e, &f[..], &fe[..])),
             _ => None,
         };
-        self.record_history_point(PointKind::Audit, &pos, &z, stds, pred.energy, &pred.forces, energy, &forces, box_rho.is_some(), draft_guess, unfit.is_some());
+        self.record_history_point(PointKind::Audit, &pos, &z, stds, pred.energy, &pred.forces, energy, &forces, box_rho.is_some(), draft_guess, unfit.is_some(), flags, energy_std_epistemic);
         let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, outcome);
         ev.detail = notes.join("\n");
         ev.face_density = face;

@@ -720,10 +720,8 @@ impl SurrogateKs {
     pub(super) fn energy_variance_refusal(&self, model: &Model, n: usize, e_std: f64, infl: &[f64]) -> Option<Refusal> {
         let p = &self.policy;
         let scaled = |k: f64| if k == 1.0 { String::new() } else { format!(" (the model's std × {k:.2}, its measured calibration for this environment class)") };
-        let floor = if model.energy_per_atom { n as f64 * model.sigma_e } else { model.sigma_e };
-        // `max(0.0)` would turn a NaN variance into 0: keep it (activity Task 3b)
         let e_infl = infl.iter().copied().fold(1.0f64, max_nan);
-        let epistemic_per_atom = max_nan(e_std * e_std - floor * floor, 0.0).sqrt() / n as f64 * e_infl;
+        let epistemic_per_atom = epistemic_energy_std(model, n, e_std) / n as f64 * e_infl;
         (!(epistemic_per_atom <= p.energy_std_per_atom)).then(|| {
             Refusal::new(
                 format!("surrogate: epistemic energy std {epistemic_per_atom:.2e} > {:.2e} Ha/atom{}", p.energy_std_per_atom, scaled(e_infl)),
@@ -732,4 +730,18 @@ impl SurrogateKs {
             )
         })
     }
+}
+
+/// The total-energy epistemic std, Ha, of an `n`-atom prediction whose total predictive energy std
+/// is `e_std` (module doc, "The history's flags"): σ_E,epi = √max(σ_E² − f², 0), with f the
+/// model's aleatoric energy floor — n·s_E for a model fitted on energies per atom, s_E otherwise —
+/// so σ_E² = f² + φ̃ᵀΣφ̃ (`surrogate::model`, "Predictive variance"). Rule 7 divides it by n and
+/// inflates it; the history records it. With the floor `e_std` was built from the radicand is
+/// never negative (σ_E = √fl(f² + φ̃ᵀΣφ̃) ≥ f, and correctly rounded squaring is monotone); one
+/// below 0 all the same (a floor rounded otherwise) gives 0, never the NaN of its root. A NaN stays
+/// NaN (`max_nan`: `max(0.0)` would turn a NaN variance into 0, activity Task 3b) — rule 7 refuses
+/// it, the history records it as absent.
+pub(super) fn epistemic_energy_std(model: &Model, n: usize, e_std: f64) -> f64 {
+    let floor = if model.energy_per_atom { n as f64 * model.sigma_e } else { model.sigma_e };
+    max_nan(e_std * e_std - floor * floor, 0.0).sqrt()
 }

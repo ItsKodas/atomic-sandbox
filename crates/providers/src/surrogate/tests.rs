@@ -4632,7 +4632,7 @@ fn scripted_session_with(views: bool) -> String {
     let (mut s, h, _open, _calls) = with_gated_auditor(0, 0.0);
     let answer = |s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>| {
         let generation = s.auditor.as_ref().expect("an auditor").generation.load(Ordering::Relaxed);
-        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
+        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: Default::default() };
         AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps: None, ts: None }
     };
     let mut teacher = MorseDimer::h2();
@@ -5038,7 +5038,7 @@ fn solved(r: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>)
 /// fields; the tests below hand its answer to `handle_answer` directly).
 fn audit_answer(s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>) -> AuditAnswer {
     let generation = s.auditor.as_ref().expect("an auditor").generation();
-    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
+    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: Default::default() };
     let scf_steps = result.is_ok().then_some(5);
     AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps, ts: None }
 }
@@ -8468,7 +8468,7 @@ fn nothing_inside_a_fenced_band_is_fitted_or_judged() {
     // a background audit landing in the band, its answer 0.5 Ha off the model
     let scene = h2(5.5);
     let prov = s.provenance_for(&scene);
-    let job = AuditJob { scene, prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
+    let job = AuditJob { scene, prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: Default::default() };
     s.judge_audit(job, t.energy - 0.5, t.forces.clone(), None, None, None, 1.0, Some(10), None);
     let note = s.pending_notes.last().cloned().unwrap_or_default();
     println!("{note}");
@@ -8494,7 +8494,7 @@ fn judged_audits_are_recorded_in_the_history() {
     let (pos, z) = pos_z(&scene);
     let pred = s.model().unwrap().predict(&pos, &z, true).unwrap();
     let prov = s.provenance_for(&scene);
-    let job = || AuditJob { scene: scene.clone(), prov: prov.clone(), generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
+    let job = || AuditJob { scene: scene.clone(), prov: prov.clone(), generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: Default::default() };
     s.judge_audit(job(), t.energy, t.forces.clone(), None, None, None, 1.0, Some(10), None);
     assert_eq!(s.audit_history().len(), 1);
     let p = s.audit_history().iter().next().unwrap().clone();
@@ -10804,7 +10804,7 @@ fn new_evidence_rejudges_the_class_verdict_without_a_refit() {
     let (e, f, fe) = (pred.energy_std.unwrap(), pred.force_std.clone().unwrap(), pred.force_std_epistemic.clone().unwrap());
     let teacher: Vec<[f64; 3]> = pred.forces.iter().map(|f| [f[0] + 2e-5, f[1], f[2]]).collect();
     for i in 0..300 {
-        s.record_history_point(PointKind::Fallback { rule: code }, &pos, &[1, 1], Some((e, &f, &fe)), pred.energy, &pred.forces, pred.energy, &teacher, false, false, false);
+        s.record_history_point(PointKind::Fallback { rule: code }, &pos, &[1, 1], Some((e, &f, &fe)), pred.energy, &pred.forces, pred.energy, &teacher, false, false, false, Default::default(), None);
         if i == 0 {
             assert!(s.audit_history.iter().last().unwrap().species == vec![(1, vec![1]), (1, vec![1])], "species recorded");
         }
@@ -11849,7 +11849,7 @@ fn record_audit(s: &mut SurrogateKs, scene: &Scene, teacher: &mut dyn ForceProvi
     let p = s.model().unwrap().predict(&pos, &z, true).unwrap();
     let stds = (p.energy_std.unwrap(), p.force_std.clone().unwrap(), p.force_std_epistemic.clone().unwrap());
     let before = s.audit_history().recorded();
-    s.record_history_point(surrogate::history::PointKind::Audit, &pos, &z, Some((stds.0, &stds.1[..], &stds.2[..])), p.energy, &p.forces, t.energy, &t.forces, false, false, false);
+    s.record_history_point(surrogate::history::PointKind::Audit, &pos, &z, Some((stds.0, &stds.1[..], &stds.2[..])), p.energy, &p.forces, t.energy, &t.forces, false, false, false, Default::default(), None);
     assert_eq!(s.audit_history().recorded(), before + 1, "the point is recorded");
 }
 
@@ -12083,4 +12083,294 @@ fn a_legacy_install_or_attach_stands_at_fit_id_one() {
     assert_eq!(c.fit_id(), 1, "the attach's fit of a collection with no id on record");
     c.refit().unwrap();
     assert_eq!(c.fit_id(), 1, "its refit of what it holds");
+}
+
+// ---- the history's flags and epistemic energy std (trust tightening Task 3; spec 2026-11-18 §4,
+// "The sample P_A"; module doc, "The history's flags") ----
+
+/// Pins the pair class untrusted by hand (no re-judging from the history), as
+/// `a_class_refusal_the_variance_would_also_refuse_is_not_the_verdicts_evidence` does: every
+/// consulted pair step is then a class fallback (rule 4b, code 5 or 21) and leaves a history point.
+fn pin_pair_class_refused(s: &mut SurrogateKs) {
+    s.class_judge = None;
+    s.class_loo[0].trusted = false;
+    s.class_loo[0].refusal = Some((sim::ClassKey::Force, 2.0, 1.0));
+    for k in &mut s.class_loo[0].species {
+        k.trusted = false;
+        k.refusal = Some((sim::ClassKey::Force, 2.0, 1.0));
+    }
+}
+
+/// The newest history point.
+fn last_point(s: &SurrogateKs) -> surrogate::AuditPoint {
+    s.audit_history().iter().last().expect("a history point").clone()
+}
+
+/// Scales the model's epistemic stds by `f` (the Cholesky factor of Σ⁻¹ by 1/f: Σ by f², every
+/// epistemic std by f; the mean, σ_f and s_E untouched) without touching the cadence's state.
+fn scale_epistemic(s: &mut SurrogateKs, f: f64) {
+    for x in s.model.as_mut().expect("a fitted model").sigma_inv_chol.as_mut().expect("a posterior").iter_mut() {
+        *x /= f;
+    }
+}
+
+/// Spec §4 (review I4): the cadence-fresh bit follows a counter of consulted steps that nothing
+/// resets, never `consults`, whose phase a rule-6/7 refusal restarts. Two runs of 14 class-refused
+/// steps (every step leaves a point) at k = 4 from the same model, whose posterior is first scaled
+/// so the variance verdict accepts at ×1 (worst ratio 0.5 of the rule-6/7 limit) and refuses at
+/// ×10: run A at ×1 with a ×2³⁰ spike on step 4 — rule 6/7 refuses there, so the variance is fresh
+/// again on step 5 and then on 9 and 13; run B at ×10 throughout — refused, fresh on every step.
+/// The flagged steps are 0, 4, 8, 12 in both runs.
+#[test]
+fn the_cadence_flag_does_not_follow_refusals() {
+    use surrogate::history::PointFlags;
+    let k = 4;
+    let steps = 14;
+    let scene = |i: usize| h2(1.6 + 0.001 * i as f64);
+    // (`trained` is deterministic: each run builds the same model)
+    let make = || trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, variance_cadence: k, ..FallbackPolicy::default() }).0;
+    let base = make();
+    // the verdict's worst ratio to its limit at each geometry: rule 6 per atom, rule 7
+    let worst_ratio = |s: &SurrogateKs, sc: &Scene| {
+        let (pos, z) = pos_z(sc);
+        let m = s.model().unwrap();
+        let p = m.predict(&pos, &z, true).unwrap();
+        let infl = s.atom_inflation(m, &pos, &z);
+        let f = p.force_std_epistemic.as_ref().unwrap().iter().zip(&p.forces).zip(&infl).map(|((sd, f), l)| sd / 3f64.sqrt() * l / s.policy().force_bound((f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt())).fold(0.0, f64::max);
+        let e = epistemic_energy_std(m, pos.len(), p.energy_std.unwrap()) / pos.len() as f64 * infl.iter().copied().fold(1.0, f64::max) / s.policy().energy_std_per_atom;
+        f.max(e)
+    };
+    let ratios: Vec<f64> = (0..steps).map(|i| worst_ratio(&base, &scene(i))).collect();
+    let (lo, hi) = ratios.iter().fold((f64::INFINITY, 0.0f64), |(a, b), &r| (a.min(r), b.max(r)));
+    let g = 0.5 / hi;
+    println!("worst rule-6/7 ratio at ×1 over the run: {lo:.3e} – {hi:.3e}; posterior scaled ×{g:.3e}");
+    assert!(10.0 * g * lo > 1.0, "the premise: ×10 refuses every step ({lo:.3e} – {hi:.3e})");
+    let prepared = |f: f64| {
+        let mut s = make();
+        scale_epistemic(&mut s, g * f);
+        pin_pair_class_refused(&mut s);
+        s
+    };
+    let run = |s: &mut SurrogateKs, spike: Option<usize>| {
+        let mut fresh = Vec::new();
+        let mut flagged = Vec::new();
+        for i in 0..steps {
+            if spike == Some(i) {
+                scale_epistemic(s, 2f64.powi(30));
+            }
+            let before = (s.variance_checks(), s.audit_history().recorded());
+            let r = s.evaluate(&scene(i), &mut never()).unwrap();
+            assert_eq!((r.stats.source, s.audit_history().recorded()), (Source::Fallback, before.1 + 1), "step {i}: a recorded class fallback: {:?}", r.stats.notes);
+            if spike == Some(i) {
+                scale_epistemic(s, 0.5f64.powi(30)); // exact: a power of two
+            }
+            if s.variance_checks() > before.0 {
+                fresh.push(i);
+            }
+            if last_point(s).flags.has(PointFlags::CADENCE_FRESH) {
+                flagged.push(i);
+            }
+        }
+        (fresh, flagged)
+    };
+    let cadence: Vec<usize> = (0..steps).filter(|i| i % k == 0).collect();
+    // run A: ×1, the spike refused on step 4
+    let (fresh_a, flagged_a) = run(&mut prepared(1.0), Some(4));
+    println!("run A (×1, spike at 4): variance fresh on {fresh_a:?}, cadence-fresh {flagged_a:?}");
+    assert_eq!(fresh_a, vec![0, 4, 5, 9, 13], "the premise: the refusal on step 4 restarts `consults`");
+    // run B: ×10, every verdict refused
+    let (fresh_b, flagged_b) = run(&mut prepared(10.0), None);
+    println!("run B (×10): variance fresh on {fresh_b:?}, cadence-fresh {flagged_b:?}");
+    assert_eq!(fresh_b, (0..steps).collect::<Vec<_>>(), "the premise: ×10 refuses, so every step is fresh");
+    assert_eq!(flagged_a, cadence, "run A: every k-th consulted step, whatever rule 6 refused");
+    assert_eq!(flagged_b, cadence, "run B: identical to run A");
+}
+
+/// Spec §4 (review I4): a class-refused step (code 5) inside a fence is flagged `FENCED` although
+/// the class rule named the refusal and the fences were never consulted for it — the quarantine
+/// fence (a stray label held out of the fit), the misfit fence (a label the fit cannot reproduce)
+/// and an audit fence (a failed audit not re-earned), each asked on every consulted step, the audit
+/// fence read-only. A class-refused step far from every fence is not flagged.
+#[test]
+fn a_class_refused_step_near_a_quarantined_sample_is_flagged_fenced() {
+    use surrogate::history::{PointFlags, PointKind};
+    let code_4b = PointKind::Fallback { rule: history_rule_code(TeachRule::Class(sim::activity::EnvClass::Pair)) };
+    // one class-refused step at `sc`: its point, checked to be the class rule's (code 5)
+    let step = |s: &mut SurrogateKs, sc: &Scene| {
+        let before = s.audit_history().recorded();
+        let r = s.evaluate(sc, &mut never()).unwrap();
+        assert_eq!((r.stats.source, s.audit_history().recorded()), (Source::Fallback, before + 1), "{:?}", r.stats.notes);
+        assert!(r.stats.notes[0].contains("isn't learned well enough yet"), "the class rule names the refusal: {:?}", r.stats.notes);
+        let p = last_point(s);
+        assert_eq!(p.kind, code_4b, "{:?}", r.stats.notes);
+        p.flags
+    };
+    // the quarantine fence: the stray label at 1.63 Bohr is held out of the fit
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let stray = dimer(1.63, [0.0, 1.0, 0.0], [0.1, 0.0, 0.0], 1, 1);
+    let mut bad = morse_sample(&MorseDimer::h2(), &stray);
+    bad.energy += 0.1;
+    s.add_sample(bad, &stray).unwrap();
+    s.refit().unwrap();
+    assert_eq!(s.quarantined(), 1, "the premise: the stray is quarantined");
+    pin_pair_class_refused(&mut s);
+    let far = h2(2.1);
+    let (pf, zf) = pos_z(&far);
+    assert!(s.near_quarantined(&pf, &zf).is_empty(), "the premise: 2.1 Bohr is outside the fence");
+    assert_eq!(step(&mut s, &far), PointFlags(PointFlags::CADENCE_FRESH), "far from every fence; the first consult, cadence-fresh");
+    let (ps, zs) = pos_z(&stray);
+    assert!(!s.near_quarantined(&ps, &zs).is_empty(), "the premise: the stray's geometry is fenced");
+    let f = step(&mut s, &stray);
+    assert!(f.has(PointFlags::FENCED), "near the quarantined sample: {f:?}");
+    // the misfit fence
+    let mut m = near_misfit_store();
+    m.policy.audit_every = 0;
+    pin_pair_class_refused(&mut m);
+    let near = h2(1.63);
+    let (pn, zn) = pos_z(&near);
+    assert!(m.near_misfit(&pn, &zn).contains(&true) && m.near_quarantined(&pn, &zn).is_empty(), "the premise: near a misfit, no quarantine");
+    let f = step(&mut m, &near);
+    assert!(f.has(PointFlags::FENCED), "near a misfit: {f:?}");
+    // an audit fence, asked only for the bit (the class rule refused before it is consulted)
+    let (mut a, _ha) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let fenced_at = h2(1.75);
+    let (pa, za) = pos_z(&fenced_at);
+    let p = a.model().unwrap().predict(&pa, &za, false).unwrap();
+    a.audit_fences.push(FailedAudit { pos: pa.clone(), z: za.clone(), energy: p.energy, forces: p.forces.clone(), index: None, ionic: "none".into(), rejudges: AUDIT_REJUDGE_LIMIT, origin: AuditOrigin::Audit, pair: None });
+    assert!(a.audit_fence_refusal(&pa, &za).is_some() && a.near_quarantined(&pa, &za).is_empty() && !a.near_misfit(&pa, &za).contains(&true), "the premise: the audit fence alone");
+    pin_pair_class_refused(&mut a);
+    let f = step(&mut a, &fenced_at);
+    assert!(f.has(PointFlags::FENCED) && f.has(PointFlags::CADENCE_FRESH), "inside the audit fence, the first consult: {f:?}");
+    assert_eq!(a.audit_fences.len(), 1, "asking for the bit changed no fence");
+}
+
+/// The point's epistemic energy std is the prediction's total std less the fit's aleatoric floor,
+/// √(σ_E² − (N s_E)²) for a model fitted on energies per atom (the number rule 7 divides by N), on
+/// a class fallback, an in-step audit and a background audit — the last two also carrying the
+/// step's flags.
+#[test]
+fn the_recorded_epistemic_energy_std_matches_the_prediction() {
+    use surrogate::history::{PointFlags, PointKind};
+    let expected = |s: &SurrogateKs, sc: &Scene| {
+        let (pos, z) = pos_z(sc);
+        let m = s.model().unwrap();
+        assert!(m.energy_per_atom, "the premise: a per-atom energy fit (floor N·s_E)");
+        let e = m.predict(&pos, &z, true).unwrap().energy_std.unwrap();
+        let floor = pos.len() as f64 * m.sigma_e;
+        (e, floor, (e * e - floor * floor).sqrt())
+    };
+    let check = |what: &str, p: &surrogate::AuditPoint, (e, floor, want): (f64, f64, f64)| {
+        let got = p.energy_std_epistemic.unwrap_or_else(|| panic!("{what}: an epistemic std is recorded"));
+        println!("{what}: σ_E {e:.6e} Ha, floor N·s_E {floor:.6e} Ha, epistemic {got:.6e} Ha (expected {want:.6e})");
+        assert!(want > 0.0 && want.is_finite(), "{what}: the premise, a resolvable epistemic part");
+        assert!((got - want).abs() <= 1e-15 * want, "{what}: {got:e} vs {want:e}");
+        assert_eq!(p.pred_energy_std, e, "{what}: the total std is recorded beside it");
+    };
+    // a class fallback
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    pin_pair_class_refused(&mut s);
+    let sc = h2(1.6);
+    let want = expected(&s, &sc);
+    s.evaluate(&sc, &mut never()).unwrap();
+    check("class fallback", &last_point(&s), want);
+    // an in-step audit (no auditor; every answered step audited): the first consult
+    let (mut t, _ht) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 1, ..FallbackPolicy::default() });
+    let sc = h2(1.57);
+    let want = expected(&t, &sc);
+    let r = t.evaluate(&sc, &mut never()).unwrap();
+    assert!(r.stats.notes.iter().any(|n| n.contains("audit")), "{:?}", r.stats.notes);
+    let p = last_point(&t);
+    assert_eq!((p.kind, p.flags), (PointKind::Audit, PointFlags(PointFlags::CADENCE_FRESH)), "the step's flags: the first consult, no fence");
+    check("in-step audit", &p, want);
+    // a background audit: the dispatching step's flags travel with the job
+    let (mut b, _hb) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let sc = h2(1.53);
+    let want = expected(&b, &sc);
+    let ta = MorseDimer::h2().evaluate(&sc, &mut never()).unwrap();
+    let prov = b.provenance_for(&sc);
+    let job = AuditJob { scene: sc.clone(), prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: PointFlags(PointFlags::CADENCE_FRESH) };
+    b.judge_audit(job, ta.energy, ta.forces.clone(), None, None, None, 1.0, Some(10), None);
+    let p = last_point(&b);
+    assert_eq!((p.kind, p.flags), (PointKind::Audit, PointFlags(PointFlags::CADENCE_FRESH)));
+    check("background audit", &p, want);
+}
+
+/// Task 1 review (a HARD requirement for Task 3): `AuditHistory::push` panics on a non-finite or
+/// negative epistemic std, and a panic on the worker thread takes the provider down — so no value
+/// reaches it unsanitised. (a) Through `evaluate`, with the epistemic part made negligible: the total
+/// std is the floor itself (√fl(f²) = f exactly in binary floating point) and σ_E² − f² cancels to
+/// exactly 0, recorded as +0. On this path the radicand is never negative — σ_E = √fl(f² + φ̃ᵀΣφ̃) ≥ f
+/// and correctly rounded squaring is monotone — but a total std one ulp below its floor (a floor
+/// rounded differently from the one the std was built with) gives a negative radicand, whose root is
+/// NaN: (b) `epistemic_energy_std` clamps it to +0 and the point records +0. (c) The sanitiser: −0
+/// as +0; NaN, ±∞ and a negative value as absent; the point is recorded every time.
+#[test]
+fn a_cancelled_epistemic_energy_std_is_recorded_as_zero_never_a_panic() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    pin_pair_class_refused(&mut s);
+    let sc = h2(1.6);
+    let (pos, z) = pos_z(&sc);
+    let n = pos.len();
+    // (a) the epistemic part made negligible (Σ × 2⁻⁴⁰⁰: the total std is the floor's, to rounding)
+    scale_epistemic(&mut s, 2f64.powi(-200));
+    s.last_variance = None;
+    let f = n as f64 * s.model().unwrap().sigma_e;
+    let e = s.model().unwrap().predict(&pos, &z, true).unwrap().energy_std.unwrap();
+    println!("N·s_E {f:.17e} Ha, σ_E {e:.17e} Ha: σ_E² − (N·s_E)² = {:e}", e * e - f * f);
+    assert_eq!(e.to_bits(), f.to_bits(), "the premise: the total std is the floor, bit for bit");
+    let before = s.audit_history().recorded();
+    let r = s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!((r.stats.source, s.audit_history().recorded()), (Source::Fallback, before + 1), "{:?}", r.stats.notes);
+    let p = last_point(&s);
+    assert_eq!(p.pred_energy_std, e);
+    assert_eq!(p.energy_std_epistemic.map(f64::to_bits), Some(0f64.to_bits()), "cancelled to +0");
+    // (b) one ulp below the floor: a negative radicand, clamped
+    let below = f64::from_bits(f.to_bits() - 1);
+    assert!(below * below - f * f < 0.0 && (below * below - f * f).sqrt().is_nan(), "the premise: the unclamped root is NaN");
+    let clamped = epistemic_energy_std(s.model().unwrap(), n, below);
+    assert_eq!(clamped.to_bits(), 0f64.to_bits(), "clamped to +0");
+    assert!(epistemic_energy_std(s.model().unwrap(), n, f64::NAN).is_nan(), "a NaN stays NaN (rule 7 refuses it)");
+    // the sanitiser on every value it must not pass on
+    for (given, want) in [(Some(clamped), Some(0.0)), (Some(-0.0), Some(0.0)), (Some(f64::NAN), None), (Some(f64::INFINITY), None), (Some(f64::NEG_INFINITY), None), (Some(-1e-300), None), (Some(-1e-3), None), (Some(2.5e-6), Some(2.5e-6)), (None, None)] {
+        let t = MorseDimer::h2().evaluate(&sc, &mut never()).unwrap();
+        let p0 = s.model().unwrap().predict(&pos, &z, true).unwrap();
+        let stds = (p0.energy_std.unwrap(), p0.force_std.clone().unwrap(), p0.force_std_epistemic.clone().unwrap());
+        let before = s.audit_history().recorded();
+        s.record_history_point(surrogate::history::PointKind::Audit, &pos, &z, Some((stds.0, &stds.1[..], &stds.2[..])), p0.energy, &p0.forces, t.energy, &t.forces, false, false, false, Default::default(), given);
+        assert_eq!(s.audit_history().recorded(), before + 1, "{given:?}: recorded");
+        assert_eq!(last_point(&s).energy_std_epistemic.map(f64::to_bits), want.map(f64::to_bits), "{given:?}");
+    }
+}
+
+/// The fit id end to end (Task 2 review, carried to Task 3): a background audit judged by the
+/// standing fit records `Some(fit_id())`; its answer is kept, so the next refit fits new teacher
+/// data and takes `fit_id + 1`. An audit judged inside an audit fence is flagged `FENCED` at its
+/// judgement although the dispatching step's flags had no fence.
+#[test]
+fn a_judged_audit_carries_its_fit_and_its_kept_answer_makes_the_next_fit() {
+    use surrogate::history::{PointFlags, PointKind};
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let id = s.fit_id();
+    assert!(id >= 1);
+    let audit = |s: &mut SurrogateKs, sc: &Scene, flags: PointFlags| {
+        let t = MorseDimer::h2().evaluate(sc, &mut never()).unwrap();
+        let prov = s.provenance_for(sc);
+        let job = AuditJob { scene: sc.clone(), prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags };
+        s.judge_audit(job, t.energy, t.forces.clone(), None, None, None, 1.0, Some(10), None);
+    };
+    let samples = s.samples();
+    audit(&mut s, &h2(1.537), PointFlags(PointFlags::CADENCE_FRESH));
+    let p = last_point(&s);
+    assert_eq!((p.kind, p.fit_id, p.flags), (PointKind::Audit, Some(id), PointFlags(PointFlags::CADENCE_FRESH)), "the fit that judged it");
+    assert_eq!(s.samples(), samples + 1, "the audited answer is kept");
+    s.refit().unwrap();
+    assert_eq!(s.fit_id(), id + 1, "the next refit fits the kept answer: a new fit");
+    // the fence at the judgement
+    let sc = h2(1.81);
+    let (pos, z) = pos_z(&sc);
+    let p = s.model().unwrap().predict(&pos, &z, false).unwrap();
+    s.audit_fences.push(FailedAudit { pos: pos.clone(), z: z.clone(), energy: p.energy, forces: p.forces.clone(), index: None, ionic: "none".into(), rejudges: AUDIT_REJUDGE_LIMIT, origin: AuditOrigin::Audit, pair: None });
+    audit(&mut s, &sc, PointFlags(0));
+    let p = last_point(&s);
+    assert_eq!((p.fit_id, p.flags), (Some(id + 1), PointFlags(PointFlags::FENCED)), "fenced at its judgement");
 }
