@@ -389,7 +389,7 @@ fn tail_words(name: &str, lambda: f64, cause: super::calibrate::TailCause, from_
     let why = match cause {
         C::Max { e, r } => format!(": a measured {what} at {e:.1}× {unit} {}", std(r)),
         C::Rms { value, points, r } => format!(
-            ": the measured error rms {value:.2}× {unit} over {points} checks, limit {:.2}, with the model's std up to {r:.2}× of it",
+            ": the error rms with its small-sample margin {value:.2}× {unit} over {points} checks, limit {:.2}, with the model's std up to {r:.2}× of it",
             super::calibrate::ENTER
         ),
         C::NotANumber => ": a measured comparison is not a number".to_string(),
@@ -773,7 +773,9 @@ impl SurrogateKs {
     /// the product NaN and refuses ("not within"), an infinite one refuses, ∞·0 included (M1). The
     /// verdict says whether it would have accepted at λ_sum alone (`by_tail`: the history's code 24),
     /// and a refusal names the factor that decided — its words byte-identical to before when that
-    /// is λ_sum.
+    /// is λ_sum (the number differs only where ∞·0, formerly NaN, is now ∞: λ_sum = ∞ — a NaN
+    /// comparison in its sample — on a std of exactly 0 prints "inf" where it printed "NaN", per M1;
+    /// the decision, a refusal, is the same).
     pub(super) fn variance_check(&self, model: &Model, pred: &surrogate::Prediction, e_std: f64, f_std: &[f64], pos: &[[f64; 3]], z: &[u8]) -> VarianceVerdict {
         let n = pred.forces.len();
         let p = &self.policy;
@@ -835,8 +837,10 @@ impl SurrogateKs {
         let at_sum = inflate(epi, sum) <= p.energy_std_per_atom;
         let epistemic_per_atom = inflate(epi, factor);
         let refusal = (!(epistemic_per_atom <= p.energy_std_per_atom)).then(|| {
-            // which factor decided: λ_E, λ_T (through λ_F) or λ_sum (the words of before)
-            let words = if energy > sum.max(force) || (energy.is_nan() && !sum.is_nan()) {
+            // which factor decided: λ_E, λ_T (through λ_F) or λ_sum (the words of before); a NaN
+            // λ_F is never out-ranked by a finite λ_E (`max_nan`: the NaN is what the number shows)
+            let others = max_nan(sum, force);
+            let words = if energy > others || (energy.is_nan() && !others.is_nan()) {
                 let k = infl[worst_index(infl.iter().map(|k| k.energy)).expect("λ_E above 1 comes from an atom")];
                 tail_words("λ_E", k.energy, k.energy_cause, k.energy_from_class, false)
             } else if force > sum || (force.is_nan() && !sum.is_nan()) {

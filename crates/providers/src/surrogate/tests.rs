@@ -9439,6 +9439,9 @@ fn the_variance_inflation_is_a_ratio_of_sums_over_the_posteriors_jurisdiction() 
         (history_rule_code(TeachRule::ForceUncertainty), true),
         (history_rule_code(TeachRule::EnergyUncertainty), true),
         (HISTORY_RULE_CLASS_AND_VARIANCE, true),
+        // rule 6/7 refusing only at the tail-aware factors (trust tightening Task 6 ruling 1: in
+        // λ_sum's sample like 14/15, out of P_A — `the_inflations_never_read_what_they_selected`)
+        (HISTORY_RULE_TAIL_INFLATION, true),
         (history_rule_code(TeachRule::Spread), false),
         (history_rule_code(TeachRule::Grade), false),
     ] {
@@ -13277,6 +13280,31 @@ fn a_step_refused_only_by_the_tail_inflation_is_code_24() {
     assert!(note.starts_with("surrogate: epistemic force std"), "rule 6 named it: {note}");
     assert!(note.contains(&format!(" (the model's std × λ_T {lt:.1}: a measured atom at 4.5× the bound with the model's std 0.13× of it)")), "{note}");
     assert_eq!(history_rule_name(HISTORY_RULE_TAIL_INFLATION), "rule 6/7 at the tail-aware inflation (passes at λ_sum)");
+    // review I1: code 24 needs **both** rules to pass at λ_sum — each half alone fails it (code 14,
+    // never 24). At the verdict itself, σ_E,epi/N set through the total std as in `rule_7_…`:
+    {
+        use sim::activity::TeachRule as R;
+        let (pos, z) = pos_z(&sc);
+        let model = s.model().unwrap().clone();
+        let pred = model.predict(&pos, &z, true).unwrap();
+        let f_std = pred.force_std_epistemic.clone().unwrap();
+        let n = pos.len();
+        let tier = s.policy().energy_std_per_atom;
+        let floor = if model.energy_per_atom { n as f64 * model.sigma_e } else { model.sigma_e };
+        let e_std_at = |x: f64| (floor * floor + (x * tier * n as f64).powi(2)).sqrt();
+        // (a) rule 6 passes at λ_sum (0.13) and fails at λ_T; rule 7 at 1.5× the tier at λ_sum
+        let v = s.variance_check(&model, &pred, e_std_at(1.5), &f_std, &pos, &z);
+        let (energy_at_sum, _) = s.energy_variance(&model, n, e_std_at(1.5), &s.atom_inflation(&model, &pos, &z));
+        assert!(!v.accept && !v.by_tail && !energy_at_sum && v.atoms.iter().any(|&a| a > 1.0) && v.reason.as_ref().map(|r| r.rule) == Some(R::ForceUncertainty), "(a) forces pass at λ_sum, the energy does not: code 14 ({:?})", v.reason.map(|r| r.text));
+        // (b) rule 6 at 2× at λ_sum, rule 7 at 0.5× the tier with λ_E 3 (refuses at the factor, passes at λ_sum)
+        set_key_tail(&mut s, &k, (1.0, TailCause::None), (3.0, TailCause::Max { e: 1.2, r: 0.3 }), 81);
+        let wide: Vec<f64> = f_std.iter().map(|sd| sd * 2.0 / r6).collect();
+        let v = s.variance_check(&model, &pred, e_std_at(0.5), &wide, &pos, &z);
+        let (energy_at_sum, energy) = s.energy_variance(&model, n, e_std_at(0.5), &s.atom_inflation(&model, &pos, &z));
+        assert!(energy_at_sum && energy.is_some(), "(b) the premise: rule 7 passes at λ_sum and refuses at λ_E");
+        assert!(!v.accept && !v.by_tail && v.reason.as_ref().map(|r| r.rule) == Some(R::ForceUncertainty), "(b) the energy passes at λ_sum, the forces do not: code 14 ({:?})", v.reason.map(|r| r.text));
+        set_key_tail(&mut s, &k, (lt, cause), (1.0, TailCause::None), 81);
+    }
     // refused at λ_sum already: code 14 whatever λ_T is (λ_sum 1.5 here, so its words are not empty)
     set_key_sum(&mut s, &k, 1.5);
     scale_epistemic(&mut s, 4.0 / r6);
@@ -13447,8 +13475,9 @@ fn rule_7_uses_the_energy_inflation_while_forces_pass() {
 /// Through `calibrate`: the measured tail (80 benign points and one at r 0.13, e/b 4.48) is the max
 /// condition at that atom; 80 points at e/b 0.8 fail the rms from the floor on (60 points, 0.873 ×
 /// ENTER's 0.707); a NaN comparison is not a number; a benign sample decided nothing. The rms words
-/// through `evaluate`: "the measured error rms 0.87× the bound over 60 checks, limit 0.71, with the
-/// model's std up to 0.50× of it".
+/// through `evaluate`: "the error rms with its small-sample margin 0.87× the bound over 60 checks,
+/// limit 0.71, with the model's std up to 0.50× of it" (0.873 = 0.8 × (1 + 1/√120): the margin
+/// is named, the inflated value is not called the measured rms — review M5).
 #[test]
 fn the_inflations_name_their_cause() {
     use calibrate::TailCause;
@@ -13480,5 +13509,40 @@ fn the_inflations_name_their_cause() {
     let (src, code, note) = inflation_step(&mut s, &sc);
     println!("{note}");
     assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "{note}");
-    assert!(note.contains(": the measured error rms 0.87× the bound over 60 checks, limit 0.71, with the model's std up to 0.50× of it)"), "{note}");
+    assert!(note.contains(": the error rms with its small-sample margin 0.87× the bound over 60 checks, limit 0.71, with the model's std up to 0.50× of it)"), "{note}");
+}
+
+/// Review M2: rule 6's factor is per atom — λ_F(j) of atom j's **own** key. A linear H₃ chain, the
+/// middle atom 1.6 Bohr from one end and r_cut − 1.1 from the other (the ends r_cut + 0.5 apart):
+/// the end atoms hold the pair key H{H}, the middle atom a many-body key. λ_T = ∞ on the many-body
+/// key alone makes the middle atom's ratio ∞ and leaves the end atoms' ratios bit for bit as
+/// before (their λ_sum); on the pair key alone, the end atoms ∞ and the middle unchanged.
+#[test]
+fn rule_6_applies_each_atoms_own_tail_inflation() {
+    use calibrate::TailCause;
+    let mut s = inflations_fixture();
+    let model = s.model().unwrap().clone();
+    let rc = model.basis.r_cut;
+    let pos = vec![[0.0, 0.0, 0.0], [1.6, 0.0, 0.0], [rc + 0.5, 0.0, 0.0]];
+    let z = vec![1u8; 3];
+    let keys = env_keys(&pos, &z, rc * rc);
+    let (end, mid) = (keys[0].clone().expect("a key"), keys[1].clone().expect("a key"));
+    assert!(keys[2] == keys[0] && end.class == 1 && mid.class == 2, "the premise: two keys {keys:?}");
+    let pred = model.predict(&pos, &z, true).unwrap();
+    let (f, e) = (pred.force_std_epistemic.clone().unwrap(), pred.energy_std.unwrap());
+    let base = s.variance_check(&model, &pred, e, &f, &pos, &z).atoms;
+    println!("r_cut {rc}: keys {keys:?}; rule-6 ratios at λ_sum {base:?}");
+    assert!(base.iter().all(|r| r.is_finite()), "{base:?}");
+    let lock = (f64::INFINITY, TailCause::Max { e: 4.0, r: 0.0 });
+    let none = (1.0, TailCause::None);
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    set_key_tail(&mut s, &mid, lock, none, 81);
+    let v = s.variance_check(&model, &pred, e, &f, &pos, &z).atoms;
+    assert_eq!(v[1], f64::INFINITY, "the many-body atom: {v:?}");
+    assert_eq!(bits(&[v[0], v[2]]), bits(&[base[0], base[2]]), "the pair atoms keep their own factor: {v:?}");
+    set_key_tail(&mut s, &mid, none, none, 81);
+    set_key_tail(&mut s, &end, lock, none, 81);
+    let v = s.variance_check(&model, &pred, e, &f, &pos, &z).atoms;
+    assert_eq!((v[0], v[2]), (f64::INFINITY, f64::INFINITY), "the pair atoms: {v:?}");
+    assert_eq!(v[1].to_bits(), base[1].to_bits(), "the many-body atom keeps its own factor: {v:?}");
 }

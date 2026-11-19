@@ -990,7 +990,8 @@ pub enum TailCause {
     /// The max condition: an item of the decisive group at `e`× the bound (tier) with the model's std
     /// `r`× of it (the previous prefix was good, so the running max that fails is this group's).
     Max { e: f64, r: f64 },
-    /// The rms condition on a set meeting the floor: its rms × (1 + 1/√(2n)) is `value` (> [`ENTER`])
+    /// The rms condition on a set meeting the floor: its rms × (1 + 1/√(2n)) — the measured rms with
+    /// its small-sample margin, not the measured rms itself — is `value` (> [`ENTER`])
     /// over `points` points, the decisive group's std `r`× the bound (tier).
     Rms { value: f64, points: usize, r: f64 },
     /// A comparison in the sample is not a number: λ = NaN.
