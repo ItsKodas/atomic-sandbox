@@ -418,6 +418,13 @@ fn verdict_line(name: &str, refusal: Option<(sim::ClassKey, f64, f64)>, evidence
         // … and the energy the DFT checks measured
         Some((ClassKey::Window, n, w)) => format!("{name} — not yet (within its bound over {n:.0} DFT checks; it starts answering before the next refit only after {w:.0})"),
         Some((ClassKey::MeasuredEnergy, x, lim)) => format!("{name} — not yet (DFT checks measured its energy error at {x:.2}× the tier over {}, limit {lim:.2}×)", checks(evidence)),
+        // trust tightening §3, the evidence floor: within the bound by the DFT checks, but too few
+        // independent ones (fits, checks) to open it alone, and the fit's own leave-one-out fails
+        Some((ClassKey::Floor, x, _)) => format!(
+            "{name} — not yet (within the bound by too few independent DFT checks — fewer than {} fits / {} checks — and its leave-one-out error is {x:.1}× the bound)",
+            providers::surrogate::FLOOR_FITS,
+            providers::surrogate::FLOOR_POINTS
+        ),
     }
 }
 

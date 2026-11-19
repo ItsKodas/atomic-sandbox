@@ -2208,6 +2208,12 @@ fn migration_classifies_h2_oh_h4() {
 /// keeps trust only if its LOO force rms, force max and energy max are all ≤ 1× (`class_refusal`,
 /// the rule of before). λ_T = λ_E = 1 on legacy points, so only the floor's effect is previewed.
 /// Per key also the collection's scene names whose samples hold it. No assertion on the count.
+///
+/// Since trust tightening Task 4 the evidence floor is built: "trusted today" is the implemented
+/// verdict of the attach + refit, i.e. the new rule at load, and its refusal names `Floor` for a key
+/// the floor shuts. Checked per key (whatever the collection): a key whose attributed verdict points
+/// carry no fit id and that stands trusted on evidence ≥ 3 has its LOO force rms, max and energy max
+/// ≤ 1, and a key refused as `Floor` has one of them > 1 with the ratio that decided as its value.
 #[test]
 #[ignore = "go/no-go measurement: cargo test -p validate --release --test surrogate trust_tightening_go_no_go_report -- --ignored --nocapture"]
 fn trust_tightening_go_no_go_report() {
@@ -2325,6 +2331,7 @@ fn trust_tightening_go_no_go_report() {
     // history and their distinct generations (information only: the verdict reads `evidence`)
     let class_codes = [history_rule_code(TeachRule::Class(EnvClass::Pair)), history_rule_code(TeachRule::Class(EnvClass::ManyBody))];
     let mut points: BTreeMap<EnvKey, (usize, BTreeSet<u64>)> = BTreeMap::new();
+    let mut fit_ids: BTreeMap<EnvKey, BTreeSet<u64>> = BTreeMap::new();
     for p in s.audit_history().iter() {
         let verdict_point = match p.kind {
             PointKind::Audit => true,
@@ -2335,6 +2342,9 @@ fn trust_tightening_go_no_go_report() {
         }
         let keys: BTreeSet<EnvKey> = (0..p.n_atoms).filter_map(|j| p.key(j)).collect();
         for k in keys {
+            if let Some(id) = p.fit_id {
+                fit_ids.entry(k.clone()).or_default().insert(id);
+            }
             let e = points.entry(k).or_default();
             e.0 += 1;
             e.1.insert(p.model_gen);
@@ -2369,8 +2379,20 @@ fn trust_tightening_go_no_go_report() {
             let st = stats.get(&k).copied().expect("every species key has its statistics");
             total += 1;
             let loo_ok = le1(st.force_rms) && le1(st.force_max) && le1(st.energy_max);
-            let (new, why) = if !v.trusted {
-                (false, "untrusted today (unchanged)".to_string())
+            // the implemented floor (Task 4), checked against its rule on this collection
+            let n_fit = fit_ids.get(&k).map_or(0, |f| f.len());
+            if v.trusted && v.evidence >= MIN_EVIDENCE && n_fit == 0 {
+                assert!(loo_ok, "{k:?}: trusted below the floor with a LOO beyond 1×: {st:?}");
+            }
+            if let Some((sim::ClassKey::Floor, value, limit)) = v.refusal {
+                let decided = if le1(st.force_rms) && le1(st.force_max) { st.energy_max } else { st.force_max.max(st.force_rms) };
+                assert!(!loo_ok && limit == 1.0 && value == decided, "{k:?}: Floor {value} / {limit} against {st:?}");
+            }
+            let floor_shut = matches!(v.refusal, Some((sim::ClassKey::Floor, ..)));
+            let (new, why) = if floor_shut {
+                (false, format!("shut by the evidence floor at load (n_fit {n_fit}): the implemented rule (Task 4)"))
+            } else if !v.trusted {
+                (false, "untrusted (unchanged)".to_string())
             } else if v.evidence < MIN_EVIDENCE {
                 (true, format!("evidence {} < {MIN_EVIDENCE}: today's rule", v.evidence))
             } else if loo_ok {
@@ -2392,7 +2414,7 @@ fn trust_tightening_go_no_go_report() {
             let words = v.words();
             let _ = writeln!(
                 table,
-                "| {} | {words} | {} | {refusal} | {} | 0 | {n_pts} ({gens}) | {:.3} | {:.3} | {:.3} | {:.2} | {} | {why} | {scenes} |",
+                "| {} | {words} | {} | {refusal} | {} | {n_fit} | {n_pts} ({gens}) | {:.3} | {:.3} | {:.3} | {:.2} | {} | {why} | {scenes} |",
                 l.class,
                 if v.trusted { "yes" } else { "no" },
                 v.evidence,
@@ -2402,7 +2424,7 @@ fn trust_tightening_go_no_go_report() {
                 v.inflation,
                 if new { "yes" } else { "**no**" }
             );
-            if v.trusted && !new {
+            if (v.trusted && !new) || floor_shut {
                 losing.push(format!("- {} {words}: evidence {}, LOO force rms {:.2}×, max {:.2}×, energy max {:.2}×; scenes: {scenes}", l.class, v.evidence, st.force_rms, st.force_max, st.energy_max));
             }
         }

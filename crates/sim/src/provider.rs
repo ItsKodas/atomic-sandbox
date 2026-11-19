@@ -1773,7 +1773,9 @@ pub enum ClassKey {
     Samples,
     /// One atom's DFT-measured force error in the evidence window beyond `WORST_ATOM` = 3× its
     /// bound: (that ratio, 3). It keeps an untrusted class from entering at every evidence count,
-    /// and makes a trusted one leave while the class has fewer than three comparisons.
+    /// and makes a trusted one leave while the class is below its evidence floor (fewer than 12
+    /// fits or 60 attributed comparisons; trust tightening, spec 2026-11-18 §3 — before it, fewer
+    /// than three comparisons).
     WorstAtom,
     /// The uncalibrated rule (fewer than three comparisons): the leave-one-out force error over
     /// the class's atoms — the larger of max and RMS, as a ratio to each atom's bound (limit 1;
@@ -1798,6 +1800,14 @@ pub enum ClassKey {
     /// The calibrated verdict, decided by the DFT-measured energy error (`ClassLoo::measured_energy`,
     /// in tier units) against its limit.
     MeasuredEnergy,
+    /// The evidence floor (trust tightening, spec 2026-11-18 §3): a key whose calibrated verdict
+    /// passes on fewer than `FLOOR_FITS` = 12 distinct fits or `FLOOR_POINTS` = 60 attributed
+    /// comparisons is trusted only if the rule of before passes as well — the leave-one-out force
+    /// rms and max and the energy max all ≤ 1: (the leave-one-out ratio that decided, 1). Named
+    /// only when the calibrated verdict itself passes (otherwise that refusal is named). Below the
+    /// floor the comparisons' rms is too few independent draws to stand alone; the key opens once
+    /// the floor is met, or once a teach-around brings its leave-one-out within 1.
+    Floor,
     /// Between refits (M8a user-test fix 2: the verdict re-judged as evidence arrives) an untrusted
     /// environment enters only on a full evidence window: (its comparisons, `WINDOW_POINTS` = 300)
     /// — the count at which a window free of 3× atoms makes a 1 % tail unlikely. Until then entry

@@ -1275,6 +1275,12 @@ impl SurrogateKs {
             Some(j) => j.key_stats.get(k).copied().unwrap_or_else(|| unseen_key_stats(&class_st)),
             None => class_st,
         };
+        // the evidence floor's counts, from the calibration the verdict read (the key's own, or the
+        // class's for a class-wide verdict); none without a judgement
+        let floor = self.class_judge.as_ref().map_or((0, 0), |j| {
+            let kc = if class_wide { j.cal.per_class[c] } else { j.cal.key(k) };
+            (kc.fits, kc.floor_points)
+        });
         let words = super::calibrate::WordsInput {
             samples: st.samples,
             force_rms: st.force_rms,
@@ -1284,6 +1290,8 @@ impl SurrogateKs {
             measured_energy: s.measured_energy,
             evidence: s.evidence,
             calibration: s.calibration,
+            fits: floor.0,
+            floor_points: floor.1,
         };
         // the limit is the verdict's own: a key's sample floor is its own column count (M8a
         // user-fix 3), the whole basis's Q′ only for a class-wide verdict or a key no fitted atom holds

@@ -1433,7 +1433,9 @@ fn a_gross_energy_misfit_refuses_its_key() {
 /// Task 7c's promise: with M empty the energy-RMS guard decides nothing. Built on the verdict
 /// function itself (a calibrated store whose key has an energy LOO RMS beyond 1 with M empty and is
 /// answered — 3+ audits of that key and an energy LOO beyond the tier with no misfit — is not
-/// practical to build from samples): in the calibrated path (20 audits at z = 1, W 0.33) a key
+/// practical to build from samples): in the calibrated path at the evidence floor (60 attributed
+/// audits at z = 1 over 12 fits, W 0.32 — trust tightening Task 4: below the floor the rule of
+/// before, energy max 5 > 1, would refuse first) a key
 /// with energy LOO RMS 3 and max 5 is answered exactly as before when no M sample counts
 /// (`energy_misfits` 0), and refused on `EnergyRms` at the bound 1 (no ENTER band) when one does;
 /// the uncalibrated path the same (RMS ≤ 1 with M passes; NaN with M fails). And on real stores
@@ -1443,14 +1445,10 @@ fn a_gross_energy_misfit_refuses_its_key() {
 fn an_energy_rms_without_misfits_decides_nothing() {
     use calibrate::{calibrate, ClassStats, ClassVerdict};
     use sim::ClassKey;
-    use surrogate::history::PointKind;
     let pol = FallbackPolicy::default();
-    let mut ok = surrogate::AuditHistory::default();
-    for _ in 0..20 {
-        ok.push(history_point(PointKind::Audit, 2, 1, 1.0));
-    }
+    let ok = floor_history(12, 60);
     let cal = calibrate(&ok, &pol);
-    assert!(cal.per_class[0].calibrated() && !cal.per_class[1].calibrated(), "the premise: the pair class calibrated, the many-body not");
+    assert!(cal.per_class[0].floor_met() && !cal.per_class[1].calibrated(), "the premise: the pair class at the evidence floor, the many-body not calibrated");
     let st = ClassStats { samples: 100, force_rms: 0.4, force_max: 3.0, energy_rms: 3.0, energy_max: 5.0, energy_misfits: 0 };
     for was in [false, true] {
         assert_eq!(cal.class_verdict(0, &st, 29, was), ClassVerdict::Trusted, "calibrated, M empty: answered (was {was})");
@@ -5532,7 +5530,7 @@ fn the_class_verdict_reproduces_the_pre_task3_rule_on_a_sweep() {
                 }
                 ClassKey::Energy => assert!(limit == 1.0 && !(value <= 1.0) && value.to_bits() == energy_max.to_bits(), "round {i}: {l:?}"),
                 // `EnergyRms` is `calibrate::verdict`'s (open-shell Task 7c), never `class_refusal`'s
-                ClassKey::Calibrated | ClassKey::LooFloor | ClassKey::MeasuredEnergy | ClassKey::WorstAtom | ClassKey::Window | ClassKey::EnergyRms => unreachable!("the uncalibrated rule never names the calibrated verdict"),
+                ClassKey::Calibrated | ClassKey::LooFloor | ClassKey::MeasuredEnergy | ClassKey::WorstAtom | ClassKey::Window | ClassKey::EnergyRms | ClassKey::Floor => unreachable!("the uncalibrated rule never names the calibrated verdict"),
             }
         }
         s.class_loo[0] = l.clone();
@@ -8787,6 +8785,10 @@ fn calibration_widens_when_audits_disagree() {
 /// than three) while the inflation counts the points, fallbacks by other rules are not evidence, a
 /// comparison that is not a number is infinite evidence against, and with fewer than three points
 /// the rule of before stands — except that one atom measured beyond 3× its bound refuses (I4).
+///
+/// Trust tightening Task 4 (spec 2026-11-18 §3): the hysteresis and measured-energy checks run on
+/// attributed audits over 12 fits (`floor_point`), so the evidence floor is met and the LOO max 3.0
+/// / energy max 5.0 do not decide — below the floor the rule of before would refuse first.
 #[test]
 fn the_verdict_has_hysteresis_and_counts_evidence_per_point_and_per_rule() {
     use calibrate::{calibrate, ClassStats, ClassVerdict, ENTER, LEAVE, MIN_EVIDENCE, WORST_ATOM};
@@ -8795,27 +8797,27 @@ fn the_verdict_has_hysteresis_and_counts_evidence_per_point_and_per_rule() {
     let pol = FallbackPolicy::default();
     let code_4b = history_rule_code(TeachRule::Class(sim::activity::EnvClass::Pair));
     let code_5 = history_rule_code(TeachRule::Spread);
-    // 400 audits at z: W = z × 0.2887 × (1 + 1/√800)
+    // 400 audits at z over 12 fits (the evidence floor met): W = z × 0.2887 × (1 + 1/√800)
     let infl = 1.0 + 1.0 / 800f64.sqrt();
     let audits = |z: f64| {
         let mut h = surrogate::AuditHistory::default();
-        for _ in 0..400 {
-            h.push(history_point(PointKind::Audit, 2, 1, z));
+        for i in 0..400 {
+            h.push(floor_point(PointKind::Audit, z, Some(i % 12 + 1)));
         }
         calibrate(&h, &pol)
     };
     let z_for = |w: f64| w / (w_of(1.0) * infl); // z such that W_inflated = w
     let st = ClassStats { samples: 100, force_rms: 0.1, force_max: 3.0, energy_rms: 0.1, energy_max: 5.0, energy_misfits: 0 };
     let inside = audits(z_for(0.85));
-    assert!((inside.per_class[0].measured - 0.85).abs() < 1e-9, "{:?}", inside.per_class[0]);
+    assert!((inside.per_class[0].measured - 0.85).abs() < 1e-9 && inside.per_class[0].floor_met(), "{:?}", inside.per_class[0]);
     assert_eq!(inside.class_verdict(0, &st, 29, true), ClassVerdict::Trusted, "stays");
     assert!(matches!(inside.class_verdict(0, &st, 29, false), ClassVerdict::Untrusted { key: ClassKey::Calibrated, limit, .. } if limit == ENTER), "does not enter");
     assert_eq!(audits(z_for(0.6)).class_verdict(0, &st, 29, false), ClassVerdict::Trusted, "enters below ENTER");
     assert!(matches!(audits(z_for(1.05)).class_verdict(0, &st, 29, true), ClassVerdict::Untrusted { key: ClassKey::Calibrated, limit, .. } if limit == LEAVE), "leaves beyond LEAVE");
-    // the max no longer decides once calibrated (force_max 3.0 above); the measured energy does
+    // the max no longer decides at the evidence floor (force_max 3.0 above); the measured energy does
     let mut he = surrogate::AuditHistory::default();
-    for _ in 0..400 {
-        he.push(history_point_full(PointKind::Audit, 2, 1, 0.5e-3, 0.9 * 2.0 * pol.energy_std_per_atom / infl));
+    for i in 0..400 {
+        he.push(surrogate::AuditPoint { species: vec![(1, vec![1]); 2], fit_id: Some(i % 12 + 1), ..history_point_full(PointKind::Audit, 2, 1, 0.5e-3, 0.9 * 2.0 * pol.energy_std_per_atom / infl) });
     }
     let cal = calibrate(&he, &pol);
     assert!((cal.per_class[0].measured_energy - 0.9).abs() < 1e-9, "{:?}", cal.per_class[0]);
@@ -8887,6 +8889,16 @@ fn the_verdict_has_hysteresis_and_counts_evidence_per_point_and_per_rule() {
     h.push(bad);
     let cal = calibrate(&h, &pol);
     assert_eq!((cal.per_class[0].factor, cal.per_class[0].measured), (f64::INFINITY, f64::INFINITY));
+    // below the evidence floor (trust tightening Task 4) the worst-atom guard refuses both ways: the
+    // non-number is an infinite worst atom
+    assert!(matches!(cal.class_verdict(0, &ClassStats { force_rms: 1e-6, ..st }, 29, true), ClassVerdict::Untrusted { key: ClassKey::WorstAtom, value, .. } if value == f64::INFINITY));
+    // at the floor a trusted class is judged by its measured error: infinite, refused
+    let mut h = floor_history(12, 60);
+    let mut bad = floor_point(PointKind::Audit, 1.0, Some(1));
+    bad.err_force[0] = f64::NAN;
+    h.push(bad);
+    let cal = calibrate(&h, &pol);
+    assert!(cal.per_class[0].floor_met() && cal.per_class[0].measured == f64::INFINITY);
     assert!(matches!(cal.class_verdict(0, &ClassStats { force_rms: 1e-6, ..st }, 29, true), ClassVerdict::Untrusted { key: ClassKey::Calibrated, .. }));
     // isolated atoms (code 0) and the other class's atoms are not this class's evidence
     let mut h = surrogate::AuditHistory::default();
@@ -8913,6 +8925,11 @@ fn the_verdict_has_hysteresis_and_counts_evidence_per_point_and_per_rule() {
 /// class stayed refused for the whole run (0 model answers) — the brief's `class_verdict_does_not_flip`
 /// scenario moved from the cutoff to the outlier: a pair crossing r_cut is the shell check's
 /// structural case (`sampling`, R3-1), not the class verdict's.
+///
+/// Trust tightening Task 4 (spec 2026-11-18 §3, the evidence floor): with LOO max 1.08× > 1 the
+/// calibrated verdict cannot open the class alone until its comparisons span 12 fits and 60
+/// points — the first refit plus 11 more, every 10 steps: it enters after step 119 (was step 9),
+/// and 80 of the 200 steps are answered (was 190; the 120 before are its fallbacks).
 #[test]
 fn a_class_refused_for_one_outlier_earns_the_calibrated_verdict_and_holds() {
     use surrogate::history::PointKind;
@@ -8951,7 +8968,8 @@ fn a_class_refused_for_one_outlier_earns_the_calibrated_verdict_and_holds() {
     assert!(l.trusted, "the class did not earn trust: {l:?}");
     assert!(l.calibration >= 1.0 && l.evidence >= calibrate::MIN_EVIDENCE && l.trusted_since.is_some(), "{l:?}");
     assert!(l.force_max > 1.0, "the outlier is still in the fit: {l:?}");
-    assert!(answered >= 100, "{answered} answered");
+    assert_eq!(first, Some(119), "the floor: the 12th fit's comparisons open it");
+    assert!(answered >= 80, "{answered} answered");
 }
 
 /// The hysteresis memory through the provider (M8a Task 2, `class_memory`): the verdict a refit
@@ -9095,6 +9113,12 @@ fn the_evidence_count_is_exact_at_47_fallbacks() {
 /// model alone and the class enters. The worst-atom guard: one atom at 3.46× its bound among 100 good
 /// comparisons keeps an untrusted class out although the rms would enter, leaves a trusted class
 /// trusted (its rms judges it), and ages with its generation.
+///
+/// Trust tightening Task 4 (spec 2026-11-18 §3): the window keeps generations, and the evidence
+/// floor counts fits inside it. The newer model's comparisons are attributed points over 12 fits
+/// (`floor_point`), so its full window meets the floor and the LOO max 3.0 does not decide; the
+/// worst-atom guard's 101 comparisons span 12 fits as well — below the floor the guard applies both
+/// ways and the trusted class would leave (`the_worst_atom_guard_applies_both_ways_below_the_floor`).
 #[test]
 fn evidence_ages_by_model_generation_both_ways() {
     use calibrate::{calibrate, ClassStats, ClassVerdict, ENTER, LEAVE, WINDOW_POINTS, WORST_ATOM};
@@ -9120,7 +9144,7 @@ fn evidence_ages_by_model_generation_both_ways() {
     assert!(matches!(calibrate(&h, &pol).class_verdict(0, &st, 29, false), ClassVerdict::Untrusted { key: ClassKey::Calibrated, value, .. } if value > LEAVE), "blocked: {c:?}");
     // the refit (generation 2): its comparisons supersede the old ones only once they fill a window
     for k in 1..=WINDOW_POINTS {
-        h.push(at(history_point(PointKind::Fallback { rule: code_4b }, 2, 1, 0.2), 2));
+        h.push(at(floor_point(PointKind::Fallback { rule: code_4b }, 0.2, Some(k as u64 % 12 + 1)), 2));
         let cal = calibrate(&h, &pol);
         let c = cal.per_class[0];
         let v = cal.class_verdict(0, &st, 29, false);
@@ -9130,6 +9154,7 @@ fn evidence_ages_by_model_generation_both_ways() {
         } else {
             println!("generation 2 fills the window: {c:?}");
             assert_eq!((c.window_from, c.aged, c.audits, c.fallbacks, c.evidence), (Some(2), 48, 0, WINDOW_POINTS, 3), "{c:?}");
+            assert_eq!((c.fits, c.floor_points), (12, WINDOW_POINTS), "the floor counts the window's fits: {c:?}");
             assert!(c.measured < ENTER, "{c:?}");
             assert_eq!(v, ClassVerdict::Trusted, "released by the newer model's own evidence");
         }
@@ -9137,13 +9162,13 @@ fn evidence_ages_by_model_generation_both_ways() {
     // the worst-atom guard on entry, at every evidence count, aged by generation
     let fine = ClassStats { force_max: 0.5, ..st };
     let mut g = surrogate::AuditHistory::default();
-    g.push(at(history_point(PointKind::Audit, 2, 1, 12.0), 1)); // 3.46× its bound
-    for _ in 0..100 {
-        g.push(at(history_point(PointKind::Audit, 2, 1, 0.5), 1));
+    g.push(at(floor_point(PointKind::Audit, 12.0, Some(1)), 1)); // 3.46× its bound
+    for i in 0..100u64 {
+        g.push(at(floor_point(PointKind::Audit, 0.5, Some(i % 12 + 1)), 1));
     }
     let cal = calibrate(&g, &pol);
     let c = cal.per_class[0];
-    assert!(c.calibrated() && c.measured < ENTER && c.worst_atom > WORST_ATOM, "the premise: the rms alone would enter: {c:?}");
+    assert!(c.floor_met() && c.measured < ENTER && c.worst_atom > WORST_ATOM, "the premise: the rms alone would enter: {c:?}");
     assert!(
         matches!(cal.class_verdict(0, &fine, 29, false), ClassVerdict::Untrusted { key: ClassKey::WorstAtom, value, limit, .. } if limit == WORST_ATOM && (value - w_of(12.0)).abs() < 1e-12),
         "does not enter"
@@ -9278,6 +9303,10 @@ const TRIMER_COMPRESSED: f64 = 0.8;
 /// triangle breathing inside the taught window, refitting every 10 steps while samples are pending,
 /// the verdict changes at most once (untrusted → trusted), and it is judged by its evidence — the
 /// rule-4b comparisons of those steps — with the compressed sample still in the fit.
+///
+/// Trust tightening Task 4 (spec 2026-11-18 §3, the evidence floor): with LOO max 1.57× > 1 the
+/// class opens only once its comparisons span 12 fits and 60 points — after step 119 (was 9) —
+/// and 80 of the 200 steps are answered (was 190).
 #[test]
 fn a_compressed_trimer_does_not_flip_the_many_body_verdict() {
     use surrogate::history::PointKind;
@@ -9314,7 +9343,8 @@ fn a_compressed_trimer_does_not_flip_the_many_body_verdict() {
     assert!(flips <= 1, "the verdict flipped {flips} times: {verdicts:?}");
     assert!(l.trusted && l.evidence >= calibrate::MIN_EVIDENCE && l.measured.is_some(), "judged by its evidence: {l:?}");
     assert!(l.force_max > 1.0, "the compressed sample is still in the fit: {l:?}");
-    assert!(answered >= 100, "{answered} answered");
+    assert_eq!(verdicts.iter().position(|&t| t), Some(119), "the floor: the 12th fit's comparisons open it");
+    assert!(answered >= 80, "{answered} answered");
 }
 
 
@@ -10732,6 +10762,11 @@ fn three_body_point(gen: u64, ratio: f64, species: Option<Vec<(u8, Vec<u8>)>>) -
 /// (class, Z, neighbour species) key water's O{H} and H{H, O} enter, H₃'s H{H} stays out until
 /// 300 newer H{H} comparisons age its bad point; a point recorded before species were kept counts
 /// for every key of its class.
+///
+/// Trust tightening Task 4 (spec 2026-11-18 §3): the class's LOO max is 1.27× > 1, so a key opens
+/// only at the evidence floor — water's 81 comparisons carry the fit ids 1..=21 (one per 4 points)
+/// and H₃'s 300 newer ones 22..=33; the same 81 water points saved without fit ids (as every point
+/// before Task 2) stay shut on the floor.
 #[test]
 fn class_trust_is_per_environment_species_the_users_water_after_h3() {
     use calibrate::{calibrate_with, ClassVerdict};
@@ -10741,10 +10776,18 @@ fn class_trust_is_per_environment_species_the_users_water_after_h3() {
     let water = || Some(vec![(8u8, vec![1u8]), (1, vec![1, 8]), (1, vec![1, 8])]);
     let key = |z: u8, nb: &[u8]| surrogate::EnvKey { class: 2, z, neighbours: nb.to_vec() };
     let st = ClassStats { samples: 775, force_rms: 0.13, force_max: 1.27, energy_rms: 0.10, energy_max: 0.49, energy_misfits: 0 };
+    let fit = |p: surrogate::AuditPoint, id: u64| surrogate::AuditPoint { fit_id: Some(id), ..p };
     let mut h = surrogate::AuditHistory::default();
     h.push(three_body_point(416, 5.66, h3()));
+    let mut legacy = h.clone();
     for g in 0..81u64 {
-        h.push(three_body_point(436 + g / 4, 0.02, water()));
+        h.push(fit(three_body_point(436 + g / 4, 0.02, water()), 1 + g / 4));
+        legacy.push(three_body_point(436 + g / 4, 0.02, water()));
+    }
+    // without fit ids: within the bound, but below the floor and LOO max 1.27 > 1
+    let cal = calibrate_with(&legacy, &pol, [0.0; 2], &Default::default());
+    for k in [key(8, &[1]), key(1, &[1, 8])] {
+        assert!(matches!(cal.key_verdict(&k, &st, 452, false), ClassVerdict::Untrusted { key: ClassKey::Floor, value, .. } if value == 1.27), "{k:?}: {:?}", cal.key(&k));
     }
     let cal = calibrate_with(&h, &pol, [0.0; 2], &Default::default());
     // the class-wide reading (what decided before): the H₃ atom keeps every many-body environment out
@@ -10759,7 +10802,7 @@ fn class_trust_is_per_environment_species_the_users_water_after_h3() {
     // H₃'s key leaves the guard once 300 newer comparisons of its own fill its window
     let mut aged = h.clone();
     for i in 0..300u64 {
-        aged.push(three_body_point(470 + i / 100, 0.02, h3()));
+        aged.push(fit(three_body_point(470 + i / 100, 0.02, h3()), 22 + i / 25));
     }
     let cal = calibrate_with(&aged, &pol, [0.0; 2], &Default::default());
     assert_eq!(cal.key_verdict(&key(1, &[1]), &st, 452, false), ClassVerdict::Trusted, "{:?}", cal.key(&key(1, &[1])));
@@ -12373,4 +12416,214 @@ fn a_judged_audit_carries_its_fit_and_its_kept_answer_makes_the_next_fit() {
     audit(&mut s, &sc, PointFlags(0));
     let p = last_point(&s);
     assert_eq!((p.fit_id, p.flags), (Some(id + 1), PointFlags(PointFlags::FENCED)), "fenced at its judgement");
+}
+
+// ---- trust tightening Task 4 (spec 2026-11-18 §3): the evidence floor ----
+
+/// An H–H dimer's verdict point at `z` (see [`history_point`]) attributed to the pair key H{H}
+/// (`species`) and judged by fit `fit` (`None`: a point without a fit id).
+fn floor_point(kind: surrogate::history::PointKind, z: f64, fit: Option<u64>) -> surrogate::AuditPoint {
+    surrogate::AuditPoint { species: vec![(1, vec![1]); 2], fit_id: fit, ..history_point(kind, 2, 1, z) }
+}
+
+/// `points` audits at z = 1 (measured 0.29× the bound, far inside ENTER) of the pair key H{H},
+/// their fit ids cycling over 1..=`fits`.
+fn floor_history(fits: usize, points: usize) -> surrogate::AuditHistory {
+    let mut h = surrogate::AuditHistory::default();
+    for i in 0..points {
+        h.push(floor_point(surrogate::history::PointKind::Audit, 1.0, Some((i % fits) as u64 + 1)));
+    }
+    h
+}
+
+/// Spec §3: below the floor (12 distinct fits **and** 60 attributed points) the calibrated verdict
+/// cannot open a key alone — the rule of before (LOO force rms and max ≤ 1, LOO energy max ≤ 1)
+/// must pass as well, refused as `ClassKey::Floor` with the leave-one-out ratio that decided. At
+/// 11 fits / 80 points and at 12 fits / 59 points a key measured well inside ENTER with LOO max
+/// 3.07× (the spec's measured case, 762159b) stays shut, entering or staying; at 12 / 60 it is
+/// today's calibrated verdict (trusted); below the floor with LOO max 0.9 it opens. Below three
+/// points of evidence today's rule is unchanged (`Force`), and where the calibrated verdict itself
+/// refuses, its own refusal is named (the floor is not why it is shut).
+#[test]
+fn a_class_below_the_floor_needs_its_leave_one_out_as_well() {
+    use calibrate::{calibrate, ClassStats, ClassVerdict, ENTER, FLOOR_FITS, FLOOR_POINTS};
+    use sim::ClassKey;
+    let pol = FallbackPolicy::default();
+    let st = ClassStats { samples: 100, force_rms: 0.3, force_max: 3.07, energy_rms: 0.2, energy_max: 0.5, energy_misfits: 0 };
+    for (fits, points) in [(11, 80), (12, 59)] {
+        let cal = calibrate(&floor_history(fits, points), &pol);
+        let kc = cal.key(&hk_pair());
+        assert_eq!((kc.fits, kc.floor_points, kc.points), (fits, points, points), "{kc:?}");
+        assert!(kc.calibrated() && !kc.floor_met() && kc.measured <= ENTER, "{kc:?}");
+        for was in [false, true] {
+            match cal.key_verdict(&hk_pair(), &st, 29, was) {
+                ClassVerdict::Untrusted { key: ClassKey::Floor, value, limit, reason } => {
+                    assert_eq!((value, limit), (3.07, 1.0));
+                    assert_eq!(reason, format!("within the bound over {fits} of 12 fits / {points} of 60 checks, and its leave-one-out is 3.1× the bound; 100 samples"));
+                }
+                v => panic!("{fits} fits / {points} points, was {was}: {v:?}"),
+            }
+        }
+        // the energy decides when it is the leave-one-out ratio that fails
+        let e = ClassStats { force_max: 0.9, energy_max: 1.5, ..st };
+        assert!(matches!(cal.key_verdict(&hk_pair(), &e, 29, false), ClassVerdict::Untrusted { key: ClassKey::Floor, value, limit, .. } if value == 1.5 && limit == 1.0));
+        // LOO max 0.9 below the floor: the rule of before passes, the calibrated verdict opens it
+        assert_eq!(cal.key_verdict(&hk_pair(), &ClassStats { force_max: 0.9, ..st }, 29, false), ClassVerdict::Trusted);
+    }
+    // at the floor: today's calibrated verdict, the max no longer decides
+    let cal = calibrate(&floor_history(FLOOR_FITS, FLOOR_POINTS), &pol);
+    assert!(cal.key(&hk_pair()).floor_met());
+    for was in [false, true] {
+        assert_eq!(cal.key_verdict(&hk_pair(), &st, 29, was), ClassVerdict::Trusted, "was {was}");
+    }
+    // below three points of evidence: today's rule, unchanged
+    let cal = calibrate(&floor_history(2, 2), &pol);
+    assert!(!cal.key(&hk_pair()).calibrated());
+    assert!(matches!(cal.key_verdict(&hk_pair(), &st, 29, true), ClassVerdict::Untrusted { key: ClassKey::Force, value, .. } if value == 3.07));
+    // the calibrated verdict refusing too (the LOO floor R 0.8 > ENTER): its refusal is named
+    let cal = calibrate(&floor_history(11, 80), &pol);
+    assert!(matches!(cal.key_verdict(&hk_pair(), &ClassStats { force_rms: 0.8, ..st }, 29, false), ClassVerdict::Untrusted { key: ClassKey::LooFloor, .. }));
+}
+
+/// Spec §3: a point counts toward the floor only with species **and** a fit id. Points without a
+/// fit id (attributed or not) and species-less legacy points with one still enter W, the evidence
+/// and the worst-atom guard, but leave n_fit and n_pts unchanged — so they never open a key.
+#[test]
+fn points_without_a_fit_id_or_species_do_not_open_a_key() {
+    use calibrate::{calibrate, ClassStats, ClassVerdict};
+    use sim::ClassKey;
+    use surrogate::history::PointKind;
+    let pol = FallbackPolicy::default();
+    let st = ClassStats { samples: 100, force_rms: 0.3, force_max: 3.07, energy_rms: 0.2, energy_max: 0.5, energy_misfits: 0 };
+    // 11 fits / 80 points, then 40 attributed points without a fit id and 40 species-less points
+    // with new fit ids 100..139: still 11 / 80, still shut by the floor
+    let mut h = floor_history(11, 80);
+    for i in 0..40 {
+        h.push(floor_point(PointKind::Audit, 1.0, None));
+        h.push(surrogate::AuditPoint { fit_id: Some(100 + i), ..history_point(PointKind::Audit, 2, 1, 1.0) });
+    }
+    let cal = calibrate(&h, &pol);
+    let kc = cal.key(&hk_pair());
+    assert_eq!((kc.fits, kc.floor_points, kc.points), (11, 80, 160), "{kc:?}");
+    assert!(matches!(cal.key_verdict(&hk_pair(), &st, 29, false), ClassVerdict::Untrusted { key: ClassKey::Floor, .. }));
+    // at the floor (12 / 60): one bad point of each kind raises W and trips the entry guard, and
+    // leaves the floor's counts as they were
+    let base = calibrate(&floor_history(12, 60), &pol).key(&hk_pair());
+    assert!(base.floor_met() && base.worst_atom < 1.0);
+    for bad in [floor_point(PointKind::Audit, 12.0, None), surrogate::AuditPoint { fit_id: Some(99), ..history_point(PointKind::Audit, 2, 1, 12.0) }] {
+        let mut h = floor_history(12, 60);
+        h.push(bad);
+        let cal = calibrate(&h, &pol);
+        let kc = cal.key(&hk_pair());
+        assert_eq!((kc.fits, kc.floor_points, kc.points), (12, 60, 61), "{kc:?}");
+        assert!(kc.measured > base.measured && kc.worst_atom > calibrate::WORST_ATOM, "{kc:?}");
+        assert!(matches!(cal.key_verdict(&hk_pair(), &st, 29, false), ClassVerdict::Untrusted { key: ClassKey::WorstAtom, .. }));
+    }
+}
+
+/// Spec §3: below the floor the worst-atom guard applies both ways (as below three points before):
+/// one atom at 3.46× its bound makes a trusted key leave at 11 fits / 81 points, with the floor's
+/// words; at 12 fits / 81 points the trusted key is judged by its rms and stays (the guard holds on
+/// entry only), as today.
+#[test]
+fn the_worst_atom_guard_applies_both_ways_below_the_floor() {
+    use calibrate::{calibrate, ClassStats, ClassVerdict, WORST_ATOM};
+    use sim::ClassKey;
+    use surrogate::history::PointKind;
+    let pol = FallbackPolicy::default();
+    let fine = ClassStats { samples: 100, force_rms: 0.3, force_max: 0.9, energy_rms: 0.2, energy_max: 0.5, energy_misfits: 0 };
+    for fits in [11usize, 12] {
+        let mut h = floor_history(fits, 80);
+        h.push(floor_point(PointKind::Audit, 12.0, Some(1)));
+        let cal = calibrate(&h, &pol);
+        let kc = cal.key(&hk_pair());
+        assert_eq!((kc.fits, kc.floor_points), (fits, 81), "{kc:?}");
+        assert!(kc.calibrated() && kc.measured < calibrate::ENTER && kc.worst_atom > WORST_ATOM, "the rms alone would enter: {kc:?}");
+        assert!(matches!(cal.key_verdict(&hk_pair(), &fine, 29, false), ClassVerdict::Untrusted { key: ClassKey::WorstAtom, .. }), "{fits}: no entry");
+        let stay = cal.key_verdict(&hk_pair(), &fine, 29, true);
+        if fits < calibrate::FLOOR_FITS {
+            match stay {
+                ClassVerdict::Untrusted { key: ClassKey::WorstAtom, value, limit, reason } => {
+                    assert!((value - w_of(12.0)).abs() < 1e-12 && limit == WORST_ATOM);
+                    assert_eq!(reason, "a DFT check found an atom's force 3.5× its bound, limit 3× while the class is below its evidence floor (11 of 12 fits / 81 of 60 checks); 100 samples");
+                }
+                v => panic!("leaves below the floor: {v:?}"),
+            }
+        } else {
+            assert_eq!(stay, ClassVerdict::Trusted, "at the floor a trusted key is judged by its rms");
+        }
+    }
+}
+
+/// Spec §3, no grandfathering: a saved model is re-judged at load. A file whose `class_memory`
+/// holds the pair key trusted on 3 attributed comparisons (3 fits) inside the band, its fit's LOO
+/// force max 3.91× (the gap fixture's leverage outlier; measured), loads closed (`ClassKey::Floor`,
+/// value 3.91, limit 1); the same file
+/// with 12 fits / 60 comparisons in the band loads trusted (the memory holds it, as before).
+#[test]
+fn a_class_saved_open_on_three_points_loads_closed() {
+    use calibrate::{ENTER, LEAVE};
+    use surrogate::history::PointKind;
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    let l = s.class_loo()[0].clone();
+    println!("the fixture's pair class: {l:?}");
+    assert!(l.force_max > 1.0 && l.force_rms < ENTER, "premise: refused by the max alone: {l:?}");
+    let since = s.model_generation();
+    let path = std::env::temp_dir().join(format!("floor-at-load-{}.model", std::process::id()));
+    for (fits, points, open) in [(3usize, 3usize, false), (12, 60, true)] {
+        // the band: W inflated = 0.85 over `points` comparisons
+        let z = 0.85 / (w_of(1.0) * (1.0 + 1.0 / (2.0 * points as f64).sqrt()));
+        s.audit_history = surrogate::AuditHistory::default();
+        for i in 0..points {
+            s.audit_history.push(surrogate::AuditPoint { model_gen: since, ..floor_point(PointKind::Audit, z, Some((i % fits) as u64 + 1)) });
+        }
+        // a file written open (by the build of before)
+        s.class_memory = [(hk_pair(), (true, Some(since)))].into();
+        s.save_sidecar(&path).unwrap();
+        let (back, _, _) = installed_from(&path);
+        let b = back.class_loo()[0].clone();
+        let k = &b.species[0];
+        println!("{fits} fits / {points} points, loaded: {k:?}");
+        assert!((k.measured.unwrap() - 0.85).abs() < 1e-9 && 0.85 > ENTER && 0.85 <= LEAVE, "premise, in the band: {k:?}");
+        if open {
+            assert!(b.trusted && k.trusted_since == Some(since), "the floor met: the memory holds it: {b:?}");
+        } else {
+            assert!(!b.trusted, "re-judged at load: {b:?}");
+            assert!(matches!(k.refusal, Some((sim::ClassKey::Floor, v, lim)) if v == l.force_max.max(l.force_rms) && lim == 1.0), "{k:?}");
+            assert_eq!(back.class_memory.get(&hk_pair()).copied(), Some((false, None)), "committed closed");
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Review Focus 2 (the dead end, spec §3): a key below the floor refused at a parked scene says
+/// why and offers the way out. The gap fixture's pair key (LOO force max 3.91× at its far outlier) asked
+/// at 1.5 Bohr: its rule-4b comparisons there are good — they would open it today once a window
+/// (300) of them stood — but they come from one fit, so after `TEACH_PROMPT_STREAK` (5) class
+/// fallbacks the note names the floor (n_fit of 12, n_pts of 60, the leave-one-out ratio; measured:
+/// "within the bound over 1 of 12 fits / 4 of 60 checks, and its leave-one-out is 3.9× the bound")
+/// and the offer carries the prompt to teach around the blocker.
+#[test]
+fn a_parked_key_below_the_floor_raises_the_teach_prompt_and_says_why() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    let max = s.class_loo()[0].force_max;
+    assert!(!s.class_loo()[0].trusted && max > 1.0, "premise");
+    let id = s.fit_id();
+    let here = in_big_cell(h2(1.5));
+    let mut note = String::new();
+    for _ in 0..teach::TEACH_PROMPT_STREAK {
+        s.discontinuity();
+        let r = s.evaluate(&here, &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
+        note = r.stats.notes[0].clone();
+    }
+    assert_eq!(s.fit_id(), id, "parked: no refit");
+    let l = s.class_loo()[0].clone();
+    println!("{note}\n{l:?}");
+    assert!(matches!(l.refusal, Some((sim::ClassKey::Floor, v, lim)) if v == max.max(l.force_rms) && lim == 1.0), "{l:?}");
+    let n = teach::TEACH_PROMPT_STREAK;
+    assert!(note.contains(&format!("within the bound over 1 of 12 fits / {} of 60 checks, and its leave-one-out is {max:.1}× the bound", n - 1)), "{note}");
+    let p = s.teach_offer().unwrap().prompt.expect("the prompt");
+    println!("{p}");
+    assert!(p.contains("two-atom environments are untrusted everywhere") && p.ends_with("teach around it"), "{p}");
 }

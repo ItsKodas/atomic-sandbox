@@ -618,18 +618,25 @@
 //!   unlucky) — an rms over a heavy-tailed error's benign early points does not bound its tail.
 //!   **Below three points of evidence** (`MIN_EVIDENCE`) the posterior's claims are unverified and
 //!   the rule of before stands unchanged — RMS ≤ 1 **and** max ≤ 1 on the force, LOO energy max ≤
-//!   1 (`trust::class_refusal`) — and the guard refuses both ways. Nothing is loosened without
-//!   evidence, and a class the max refuses for one outlier earns the calibrated verdict from its
-//!   own three rule-4b fallbacks (the Morse fixture: 201 samples with one at 3.6 Bohr, LOO max
-//!   1.08×, enters after 10 fallback steps and holds —
+//!   1 (`trust::class_refusal`) — and the guard refuses both ways. **The evidence floor** (trust
+//!   tightening, spec 2026-11-18 §3; `calibrate`, "The evidence floor"): the calibrated verdict
+//!   opens a key alone only once its window's attributed verdict points carrying a fit id span
+//!   `FLOOR_FITS` = 12 distinct fits **and** `FLOOR_POINTS` = 60 points; below that, with
+//!   evidence ≥ 3, the rule of before must pass as well (`ClassKey::Floor`, named when the
+//!   calibrated verdict itself passes) and the worst-atom guard applies both ways. Saved models
+//!   and collections are re-judged at load, no grandfathering: legacy points carry no fit id, so
+//!   a key saved open with LOO max > 1 loads closed. Nothing is loosened without evidence, and a
+//!   class the max refuses for one outlier earns the calibrated verdict from its own rule-4b
+//!   fallbacks once they meet the floor (the Morse fixture: 201 samples with one at 3.6 Bohr, LOO
+//!   max 1.08×, enters after 120 fallback steps — the 12th fit; 10 before the floor — and holds:
 //!   `a_class_refused_for_one_outlier_earns_the_calibrated_verdict_and_holds`). The max over the
-//!   class is gone where evidence exists: the verdict is about the expected error over the
+//!   class is gone where the floor is met: the verdict is about the expected error over the
 //!   class's environments (what rule 6's "std ≤ bound" claims per step), measured by the teacher
 //!   at the geometries the class would answer. A sample whose LOO is undefined (I − H_ss singular)
 //!   counts as infinitely off (RMS ∞); a comparison in the evidence that is not a number makes W
 //!   and κ infinite. The refusal names the term that decided (`ClassKey::Calibrated` the measured
-//!   force, `LooFloor` the leave-one-out floor, `MeasuredEnergy`, `WorstAtom`; the uncalibrated
-//!   `Force` / `Energy`). The same verdict holds for the user's #344 shape (a compressed H–H in
+//!   force, `LooFloor` the leave-one-out floor, `MeasuredEnergy`, `WorstAtom`, `Floor` the evidence
+//!   floor; the uncalibrated `Force` / `Energy`). The same verdict holds for the user's #344 shape (a compressed H–H in
 //!   H₃⁺): a many-body class the max rule refuses for one compressed trimer (LOO max 1.57×)
 //!   enters on its own rule-4b comparisons and holds (`a_compressed_trimer_does_not_flip_the_many_body_verdict`).
 //! - **Per environment species** (M8a user-test fix 2, the controller's rulings; `calibrate` "Per
@@ -1264,7 +1271,7 @@ use lone::Lone;
 use policy::*;
 use quarantine::*;
 pub use audit::{history_rule_code, history_rule_name, AuditRecord, AuditVerdict, HISTORY_RULE_CLASS_AND_VARIANCE};
-pub use calibrate::{calibrate, refusal_words, Calibration, ClassCalibration, ClassStats, ClassVerdict, WordsInput, ENTER, LEAVE, MIN_EVIDENCE, WINDOW_POINTS, WORST_ATOM};
+pub use calibrate::{calibrate, refusal_words, Calibration, ClassCalibration, ClassStats, ClassVerdict, WordsInput, ENTER, FLOOR_FITS, FLOOR_POINTS, LEAVE, MIN_EVIDENCE, WINDOW_POINTS, WORST_ATOM};
 pub use ledger::EVENT_QUEUE;
 pub(crate) use policy::PSEUDO_FORCE_NOISE;
 pub use policy::{box_affected_face_density, AtomVerdicts, FallbackPolicy, BOX_AFFECTED_FACE_DENSITY, FORCE_STD_BOUND_MAX, GRADE_MAX};

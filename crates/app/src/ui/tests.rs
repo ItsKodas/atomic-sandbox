@@ -6254,8 +6254,10 @@ mod activity_trust {
         // the worst-atom guard: on entry with evidence, and both ways with fewer than three checks
         assert_eq!(class_line(&l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0)))), "Two-atom arrangements — not yet (a recent DFT check found an atom's force 4.2× its bound; it starts answering only without one beyond 3×)");
         assert_eq!(class_line(&ClassLoo { evidence: 2, ..l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0))) }), "Two-atom arrangements — not yet (a DFT check found an atom's force 4.2× its bound, with fewer than 3 checks to judge the class by)");
+        // trust tightening Task 4: the evidence floor, the leave-one-out ratio that decided
+        assert_eq!(class_line(&l("pair", Some((ClassKey::Floor, 3.07, 1.0)))), "Two-atom arrangements — not yet (within the bound by too few independent DFT checks — fewer than 12 fits / 60 checks — and its leave-one-out error is 3.1× the bound)");
         // no claim of the posterior's calibration is worded (no "1.0× less", no "inf× less")
-        for k in [ClassKey::Calibrated, ClassKey::LooFloor, ClassKey::MeasuredEnergy, ClassKey::WorstAtom, ClassKey::Window] {
+        for k in [ClassKey::Calibrated, ClassKey::LooFloor, ClassKey::MeasuredEnergy, ClassKey::WorstAtom, ClassKey::Window, ClassKey::Floor] {
             for cal in [1.0, f64::INFINITY] {
                 let t = class_line(&ClassLoo { calibration: cal, ..l("pair", Some((k, 1.4, 1.0))) });
                 assert!(!t.contains("less") && !t.contains("inf"), "{t}");

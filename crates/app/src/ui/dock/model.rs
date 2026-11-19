@@ -420,6 +420,8 @@ fn refusal_words(refusal: Option<(sim::ClassKey, f64, f64)>, samples: usize, col
         Some((K::LooFloor, x, _)) => (samples, columns, format!("left-out {x:.2}×")),
         Some((K::MeasuredEnergy, x, _)) => (samples, columns, format!("DFT energy {x:.2}×")),
         Some((K::EnergyRms, x, _)) => (samples, columns, format!("energy {x:.1}× avg")),
+        // trust tightening §3: below the evidence floor, the leave-one-out ratio that decided
+        Some((K::Floor, x, _)) => (samples, columns, format!("floor, left-out {x:.1}×")),
         None => (samples, columns, format!("{samples} / {columns}")),
     }
 }
