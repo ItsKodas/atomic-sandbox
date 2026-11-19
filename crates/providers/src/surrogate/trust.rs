@@ -450,6 +450,19 @@ pub(super) struct ClassJudge {
     pub(super) between_refits: bool,
 }
 
+/// λ_sum as rules 6 and 7 read it for environment key `k` (`key_factors`' `sum`): `own` (the key's
+/// verdict's λ_sum, `SpeciesVerdict::inflation`), and for a key with fewer than `MIN_EVIDENCE`
+/// points of its own posterior evidence its class's where larger or not a number (user-fix-2
+/// physics review). Also the Model tab's `SpeciesVerdict::rule_inflation` (Task 8 review I2): one
+/// rule, never two copies.
+fn floored_sum(cal: &super::calibrate::Calibration, k: &surrogate::EnvKey, own: f64) -> f64 {
+    let c = (k.class as usize).wrapping_sub(1);
+    match cal.per_class.get(c) {
+        Some(cl) if cal.key(k).inflation_points < super::calibrate::MIN_EVIDENCE => max_nan(own, cl.inflation),
+        _ => own,
+    }
+}
+
 /// λ_T and λ_E of environment key `k` from the calibration `cal` (the last refit's: they never move
 /// on a step they decided), with `sum` as λ_sum: the key's own, and for a **sparse key** (fewer than
 /// `MIN_EVIDENCE` points of its own answer sample P_A in the window) its class's where larger or
@@ -872,7 +885,8 @@ impl SurrogateKs {
                         let some = |x: f64| (kc.points > 0).then_some(x);
                         // λ_T and λ_E as rules 6 and 7 read them (a sparse key's class floors
                         // included; `key_factors`), for the Model tab (plan Task 8)
-                        let tail = tail_factors(&j.refit_cal, k, 1.0);
+                        let sum = floored_sum(&j.refit_cal, k, j.refit_cal.key(k).inflation);
+                        let tail = tail_factors(&j.refit_cal, k, sum);
                         sim::SpeciesVerdict {
                             z: k.z,
                             neighbours: k.neighbours.clone(),
@@ -889,6 +903,7 @@ impl SurrogateKs {
                             columns: kq,
                             fits: kc.fits,
                             floor_points: kc.floor_points,
+                            rule_inflation: tail.sum,
                             tail_inflation: tail.tail,
                             energy_inflation: tail.energy,
                         }
@@ -958,14 +973,7 @@ impl SurrogateKs {
         let c = (k.class as usize).wrapping_sub(1);
         let shown = self.class_loo.get(c).and_then(|l| l.species.iter().find(|s| s.z == k.z && s.neighbours == k.neighbours)).map(|s| s.inflation);
         let Some(j) = self.class_judge.as_ref() else { return KeyFactors { sum: shown.unwrap_or(1.0), ..KeyFactors::ONE } };
-        let own = j.refit_cal.key(k);
-        let class = j.refit_cal.per_class.get(c);
-        let mut sum = shown.unwrap_or(own.inflation);
-        if own.inflation_points < super::calibrate::MIN_EVIDENCE {
-            if let Some(cl) = class {
-                sum = max_nan(sum, cl.inflation);
-            }
-        }
+        let sum = floored_sum(&j.refit_cal, k, shown.unwrap_or(j.refit_cal.key(k).inflation));
         tail_factors(&j.refit_cal, k, sum)
     }
 
@@ -1296,7 +1304,7 @@ impl SurrogateKs {
         let class_wide = l.species.is_empty();
         let own = if class_wide {
             let f = self.key_factors(k);
-            Some(sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: l.trusted, refusal: l.refusal, calibration: l.calibration, measured: l.measured, measured_energy: l.measured_energy, worst_atom: l.worst_atom, evidence: l.evidence, trusted_since: l.trusted_since, inflation: l.inflation, samples: l.samples, columns: q, fits: l.fits, floor_points: l.floor_points, tail_inflation: f.tail, energy_inflation: f.energy })
+            Some(sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: l.trusted, refusal: l.refusal, calibration: l.calibration, measured: l.measured, measured_energy: l.measured_energy, worst_atom: l.worst_atom, evidence: l.evidence, trusted_since: l.trusted_since, inflation: l.inflation, samples: l.samples, columns: q, fits: l.fits, floor_points: l.floor_points, rule_inflation: f.sum, tail_inflation: f.tail, energy_inflation: f.energy })
         } else {
             l.species.iter().find(|s| s.z == k.z && s.neighbours == k.neighbours).cloned()
         };
@@ -1313,8 +1321,8 @@ impl SurrogateKs {
                 };
                 let refusal = entry_between_refits(refusal, false, &kc, j.between_refits);
                 let some = |x: f64| (kc.points > 0).then_some(x);
-                let tail = tail_factors(&j.refit_cal, k, 1.0);
-                sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: refusal.is_none(), refusal, calibration: kc.factor, measured: some(kc.measured), measured_energy: some(kc.measured_energy), worst_atom: some(kc.worst_atom), evidence: kc.evidence, trusted_since: None, inflation: j.refit_cal.key(k).inflation, samples: 0, columns: unseen_key_floor(j.q_prime), fits: kc.fits, floor_points: kc.floor_points, tail_inflation: tail.tail, energy_inflation: tail.energy }
+                let tail = tail_factors(&j.refit_cal, k, floored_sum(&j.refit_cal, k, j.refit_cal.key(k).inflation));
+                sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: refusal.is_none(), refusal, calibration: kc.factor, measured: some(kc.measured), measured_energy: some(kc.measured_energy), worst_atom: some(kc.worst_atom), evidence: kc.evidence, trusted_since: None, inflation: j.refit_cal.key(k).inflation, samples: 0, columns: unseen_key_floor(j.q_prime), fits: kc.fits, floor_points: kc.floor_points, rule_inflation: tail.sum, tail_inflation: tail.tail, energy_inflation: tail.energy }
             }
         };
         if s.trusted {

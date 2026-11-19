@@ -1786,11 +1786,16 @@ pub struct SpeciesVerdict {
     /// [`ClassLoo::fits`]): the distinct fits and the attributed comparisons in its evidence window.
     pub fits: usize,
     pub floor_points: usize,
+    /// λ_sum as rules 6 and 7 read it for this key: `inflation`, raised to its class's λ_sum while the
+    /// key has fewer than three points of its own posterior evidence (the sparse-key floor). What the
+    /// tail-aware inflations are compared with: a step they refuse that passes at this factor is
+    /// history code 24.
+    pub rule_inflation: f64,
     /// λ_T and λ_E, the tail-aware inflations rules 6 and 7 apply to this key's atoms (spec
     /// 2026-11-18 §4; `providers::surrogate::calibrate`, "The tail-aware inflations"), with a sparse
     /// key's class floors applied: ≥ 1, ∞ when a DFT check found an error beyond its limit where the
-    /// model's std was 0, NaN when a comparison was not a number. Rule 6 reads max(`inflation`,
-    /// `tail_inflation`); a step they refuse that passes at `inflation` alone is history code 24.
+    /// model's std was 0, NaN when a comparison was not a number. Rule 6 reads max(`rule_inflation`,
+    /// `tail_inflation`); a step they refuse that passes at `rule_inflation` alone is history code 24.
     pub tail_inflation: f64,
     pub energy_inflation: f64,
 }

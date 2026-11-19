@@ -724,6 +724,11 @@ pub struct TeachEvent {
     /// dof): the Verlet velocities v(t + dt) at the solved geometry, before the CSVR thermostat
     /// rescales them (plan review S6).
     pub burst_t: Option<f64>,
+    /// The surrogate's history code for this step's teacher answer (`providers::surrogate`,
+    /// `history_rule_name`), where the provider set one: it tells a rule-6/7 refusal that passes at
+    /// λ_sum alone (code 24, the tail-aware inflations: the model was measured too confident) from
+    /// one where the model's own std refuses (14, 15). `None` from `new`.
+    pub history_code: Option<u8>,
 }
 
 impl TeachEvent {
@@ -747,6 +752,7 @@ impl TeachEvent {
             audit: None,
             audit_lag: None,
             burst_t: None,
+            history_code: None,
         }
     }
 

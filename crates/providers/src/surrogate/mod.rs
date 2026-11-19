@@ -2363,6 +2363,7 @@ impl SurrogateKs {
         // the event's record of the solve (read before `r` and `h` are consumed below)
         let (teacher_ms, scf, ts) = (r.stats.solve_ms as f64, r.stats.scf_steps, r.stats.energy.ts);
         let (h_audit, rule_code, atom, n_atoms) = (h.audit, h.reason.rule, h.reason.atom, h.pos.len());
+        let history_code = h.history_rule;
         let gap = h.model.as_ref().map(|m| r.energy - m.energy);
         let mut notes = Vec::new();
         let face = r.stats.face_density;
@@ -2572,6 +2573,8 @@ impl SurrogateKs {
         ev.scf_steps = Some(scf);
         ev.ts = Some(ts);
         ev.audit = if h_audit { self.last_audit.as_ref().map(|a| a.verdict) } else { None };
+        // the history code (Task 8 review M4: a code-24 row says the model was too confident)
+        ev.history_code = Some(history_code);
         self.push_event(ev);
         let surface_forces = surface_forces.unwrap_or_else(|| r.forces.clone());
         self.last = Some(LastEval { pos: h.pos, z: h.z, energy, on_model, provenance: h.prov, flip_back, surface_forces, reference: None });

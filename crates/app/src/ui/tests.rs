@@ -5749,7 +5749,7 @@ mod activity_words {
     fn the_box_clause_names_the_atom_at_the_edge() {
         use activity::words::{rule_sentence, RowCtx};
         use sim::activity::{TeachRule as R, TrustKey};
-        let cx = |box_affected, near_face, kept| RowCtx { box_affected, near_face, kept };
+        let cx = |box_affected, near_face, kept| RowCtx { box_affected, near_face, kept, tail: false };
         assert_eq!(
             rule_sentence(R::Spread, Some(0), cx(true, true, false)),
             "atom 0 is outside what the model has learned and is touching the box edge — move it inward"
@@ -7912,7 +7912,7 @@ fn the_model_tab_warns_of_atoms_without_a_neighbour() {
 /// only that key (rows per key used to appear only for classes of two or more keys).
 #[test]
 fn a_refused_class_names_its_short_key() {
-    let nn = sim::SpeciesVerdict { z: 7, neighbours: vec![7], trusted: false, refusal: Some((sim::ClassKey::Samples, 5.0, 29.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples: 5, columns: 29, fits: 0, floor_points: 0, tail_inflation: 1.0, energy_inflation: 1.0 };
+    let nn = sim::SpeciesVerdict { z: 7, neighbours: vec![7], trusted: false, refusal: Some((sim::ClassKey::Samples, 5.0, 29.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples: 5, columns: 29, fits: 0, floor_points: 0, rule_inflation: 1.0, tail_inflation: 1.0, energy_inflation: 1.0 };
     let pair = sim::ClassLoo { class: "pair", samples: 5, force_rms: 0.1, force_max: 0.2, energy_rms: 0.1, energy_max: 0.2, trusted: false, refusal: nn.refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, fits: 0, floor_points: 0, species: vec![nn.clone()] };
     let m = ModelStatus { class_loo: vec![pair.clone()], ..model() };
     let scene = Scene::preset("h2").unwrap();
@@ -8095,6 +8095,7 @@ mod knowledge_map {
             columns,
             fits: 0,
             floor_points: 0,
+            rule_inflation: 1.0,
             tail_inflation: 1.0,
             energy_inflation: 1.0,
         };
@@ -8536,6 +8537,7 @@ mod knowledge_map {
             columns: 92,
             fits: 0,
             floor_points: 0,
+            rule_inflation: 1.0,
             tail_inflation: 1.0,
             energy_inflation: 1.0,
         };
@@ -8617,6 +8619,7 @@ mod knowledge_map {
             columns: 92,
             fits: 0,
             floor_points: 0,
+            rule_inflation: 1.0,
             tail_inflation: 1.0,
             energy_inflation: 1.0,
         };
@@ -11479,7 +11482,7 @@ mod model_panel {
     }
 
     fn key(z: u8, nb: Vec<u8>, refusal: Option<(sim::ClassKey, f64, f64)>, samples: usize, columns: usize) -> sim::SpeciesVerdict {
-        sim::SpeciesVerdict { z, neighbours: nb, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples, columns, fits: 0, floor_points: 0, tail_inflation: 1.0, energy_inflation: 1.0 }
+        sim::SpeciesVerdict { z, neighbours: nb, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples, columns, fits: 0, floor_points: 0, rule_inflation: 1.0, tail_inflation: 1.0, energy_inflation: 1.0 }
     }
 
     /// H₂S with an unlearned S–H pair key (12 of 60 samples), an unlearned O–S one (no O in the
@@ -13734,6 +13737,7 @@ mod activity_trust_tightening {
             columns: 29,
             fits: 1,
             floor_points: 4,
+            rule_inflation: inflation,
             tail_inflation: tail,
             energy_inflation: energy,
         }
@@ -13854,5 +13858,76 @@ mod activity_trust_tightening {
         let inp = input(&scene, Some(&snap), &cam);
         let t = texts(&ctx, &mut st, &inp);
         assert!(!t.contains("calibration checks"), "{t}");
+    }
+
+    /// Task 8 review I2: the code-24 note compares with the λ_sum the rules read
+    /// (`SpeciesVerdict::rule_inflation`, a sparse key's class floor included), and prints it — never
+    /// the key's own `inflation` below that floor.
+    #[test]
+    fn the_code_24_note_compares_with_the_floored_lambda_sum() {
+        use activity::words::tail_note;
+        let sparse = |tail: f64| sim::SpeciesVerdict { inflation: 1.0, rule_inflation: 2.0, ..key(true, 1.0, tail, 1.0) };
+        assert_eq!(tail_note(&sparse(1.6)), None, "λ_T 1.6 under the floored λ_sum 2.0 refuses nothing");
+        assert_eq!(tail_note(&sparse(2.0)), None);
+        assert_eq!(
+            tail_note(&sparse(2.5)).as_deref(),
+            Some("steps its std alone would pass can still go to DFT: DFT checks measured larger errors where the model was sure (λ_T 2.5 against λ_sum 2.0)")
+        );
+    }
+
+    /// Task 8 review I1 (Review Focus 3): a lone key, trusted by the class rule but locked by λ_T = ∞
+    /// (H₂'s H{H}), is not a ✓ "learned" on the surfaces seen first — the Activity trust checklist
+    /// draws its row ✗ with the note and the class line ✗, the Learned fold carries the note, and
+    /// the Knowledge panel's sentence says DFT still answers it.
+    #[test]
+    fn a_lone_locked_key_is_never_a_plain_learned() {
+        let scene = Scene::preset("h2").unwrap();
+        let st = UiState::new("h2", &scene);
+        let mut m = model();
+        m.class_loo[0].species = vec![key(true, 1.0, f64::INFINITY, 1.0)];
+        assert!(m.class_loo[0].trusted, "the premise: the class rule trusts it");
+        let lines = activity::trust::lines(&m, &scene, &st);
+        let class = lines.iter().find(|l| l.text == "Two-atom arrangements — learned").expect("the class line");
+        assert!(!class.met, "no ✓ for a class whose key is locked");
+        let row = lines.iter().find(|l| l.text.contains("learned, but every step with it goes to DFT")).expect("the key's row");
+        assert!(!row.met && row.text == "    Two-atom arrangements around H, with H — learned, but every step with it goes to DFT until a check ages out of the window: a DFT check found an error beyond its limit where the model's std was 0 (λ_T ∞)", "{}", row.text);
+        // unlocked: the lone key's row is not drawn and the class line is a ✓, as before
+        let mut ok = m.clone();
+        ok.class_loo[0].species = vec![key(true, 1.0, 1.0, 1.0)];
+        let lines = activity::trust::lines(&ok, &scene, &st);
+        assert!(lines.iter().any(|l| l.met && l.text == "Two-atom arrangements — learned") && !lines.iter().any(|l| l.text.contains("around H, with H")));
+        // the Learned fold
+        let rows = super::super::dock::model::learned(&m);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].3.as_deref().is_some_and(|n| n.starts_with("every step with it goes to DFT")), "{rows:?}");
+        assert_eq!(super::super::dock::model::learned(&ok)[0].3, None);
+        // the Knowledge panel's sentence for a trusted pair
+        let map = knowledge::fixture_map();
+        let locked = key(true, 1.0, f64::INFINITY, 1.0);
+        assert_eq!(
+            knowledge::pair_sentence(&map, map.pair(1, 6).unwrap(), &[("pair", &locked)]),
+            "Taught 2.0–5.3 Bohr (610 samples). Trusted, but DFT still answers two-atom arrangements around H, with H: the model was measured too confident there."
+        );
+        let fine = key(true, 1.0, 1.0, 1.0);
+        assert_eq!(knowledge::pair_sentence(&map, map.pair(1, 6).unwrap(), &[("pair", &fine)]), "Taught 2.0–5.3 Bohr (610 samples). Trusted everywhere this pair was met.");
+    }
+
+    /// Task 8 review M4: a code-24 Log row (a rule-6/7 refusal that passes at λ_sum alone) says the
+    /// model was too confident here, not unsure; codes 14/15 keep their words.
+    #[test]
+    fn a_code_24_row_says_the_model_was_too_confident() {
+        use activity::words::{rule_sentence, RowCtx};
+        use sim::activity::TeachRule as R;
+        let tail = RowCtx { tail: true, ..RowCtx::default() };
+        assert_eq!(
+            rule_sentence(R::ForceUncertainty, Some(1), tail),
+            "the model was sure here (atom 1), but DFT checks found it too confident in places like this (its uncertainty scaled by λ_T/λ_E is over the bound)"
+        );
+        assert_eq!(
+            rule_sentence(R::EnergyUncertainty, None, RowCtx { kept: true, ..tail }),
+            "the model was sure here, but DFT checks found it too confident in places like this (its uncertainty scaled by λ_T/λ_E is over the bound) — this answer teaches it"
+        );
+        assert_eq!(rule_sentence(R::ForceUncertainty, Some(1), RowCtx::default()), "the model is unsure here (atom 1)");
+        assert_eq!(sim::TeachEvent::new(sim::activity::TeachOrigin::Fallback, R::ForceUncertainty, sim::activity::TeachOutcome::Kept).history_code, None, "defaulted in new");
     }
 }

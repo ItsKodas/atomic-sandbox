@@ -162,7 +162,9 @@ loosen or is a different question:
 New wording:
 
 - a `ClassKey::Floor` refusal: "within the bound over n_fit of 12 fits / n_pts of 60 checks, and its
-  leave-one-out is X× the bound";
+  leave-one-out is X× the bound". A count at or over its floor reads "80 checks (60 needed)" or
+  "12 fits (12 needed)", never "80 of 60" (amended at Task 8, the Task 4 review's minor 3;
+  `calibrate::floor_count`, shared by the provider's words and the app's);
 - the worst-atom wording follows the floor (`refusal_words`, `app/src/ui/activity/words.rs`).
 
 **Saved models and collections are re-judged at load, with no grandfathering (my call).**

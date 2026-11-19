@@ -75,6 +75,10 @@ pub struct RowCtx {
     pub near_face: bool,
     /// The answer was kept as a sample (`TeachOutcome::is_kept`).
     pub kept: bool,
+    /// A rule-6/7 refusal that passes at λ_sum alone (history code 24, `TeachEvent::history_code`):
+    /// the tail-aware inflations decided — the model was measured too confident here, not unsure
+    /// (Task 8 review M4).
+    pub tail: bool,
 }
 
 /// `box_advice`'s distance: where a hydrogen-like tail e^(−2r)/π falls to the box rule's face
@@ -200,9 +204,16 @@ pub fn rule_sentence(rule: R, atom: Option<usize>, cx: RowCtx) -> String {
         R::IsolatedAtom => with_box(format!("{} has no neighbour within reach — the model can't describe a lone atom inside a molecule's spin state", a(atom)), true),
         R::Coordination | R::Spread | R::NoGrade | R::UnspannedAtom | R::NewEnvironment | R::Grade => with_box(format!("{} {OUTSIDE}", a(atom)), true),
         R::ForceUncertainty | R::EnergyUncertainty => {
-            let base = match atom {
-                Some(i) => format!("the model is unsure here (atom {i})"),
-                None => "the model is unsure here".into(),
+            let here = match atom {
+                Some(i) => format!("here (atom {i})"),
+                None => "here".into(),
+            };
+            let base = if cx.tail {
+                // code 24: its own std passed; DFT checks measured it too small for this kind of
+                // environment (λ_T / λ_E), and the scaled std refuses
+                format!("the model was sure {here}, but DFT checks found it too confident in places like this (its uncertainty scaled by λ_T/λ_E is over the bound)")
+            } else {
+                format!("the model is unsure {here}")
             };
             // "teaches it" only for a kept answer that no box clause explains (plan review S13)
             if cx.box_affected {
@@ -430,7 +441,8 @@ pub fn factor(x: f64) -> String {
 
 /// What the tail-aware inflations do to a key's steps beyond its λ_sum (trust tightening, spec
 /// 2026-11-18 §4; the steps they refuse that pass at λ_sum alone are history code 24), `None`
-/// while λ_T and λ_E are both at most its λ_sum (`SpeciesVerdict::inflation`):
+/// while λ_T and λ_E are both at most the λ_sum the rules read for it
+/// (`SpeciesVerdict::rule_inflation`: a sparse key's class floor included, Task 8 review I2):
 ///
 /// - a factor that is not a number, or infinite, refuses every step with the key (rule 6 at ∞·0 =
 ///   ∞, rule 7 alike) until the comparison that set it ages out of the evidence window ("No lockout
@@ -452,11 +464,11 @@ pub fn tail_note(s: &sim::SpeciesVerdict) -> Option<String> {
         return Some(format!("{locked}: a DFT check found an error beyond its limit where the model's std was 0 ({which})"));
     }
     let (x, name) = if t >= e { (t, "λ_T") } else { (e, "λ_E") };
-    (x > s.inflation).then(|| {
+    (x > s.rule_inflation).then(|| {
         format!(
             "steps its std alone would pass can still go to DFT: DFT checks measured larger errors where the model was sure ({} against λ_sum {})",
             named(x, name),
-            factor(s.inflation)
+            factor(s.rule_inflation)
         )
     })
 }
@@ -506,6 +518,6 @@ pub fn stuck_sentence(i: &sim::activity::StuckInfo, scene: &sim::Scene) -> Strin
         return format!("trusted, but not answering here (the last {} steps were DFT)", i.steps);
     };
     let near = i.atom.and_then(|a| scene.nuclei.get(a)).is_some_and(|n| face_distance(scene, n.pos) < d_box(scene.cell.h));
-    let s = rule_sentence(rule, i.atom, RowCtx { box_affected: i.box_streak, near_face: near, kept: false });
+    let s = rule_sentence(rule, i.atom, RowCtx { box_affected: i.box_streak, near_face: near, kept: false, tail: false });
     format!("trusted, but not answering here: {s} (the last {} steps were DFT)", i.steps)
 }

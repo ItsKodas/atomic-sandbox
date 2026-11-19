@@ -13259,7 +13259,28 @@ fn a_sparse_key_takes_its_class_inflations_as_floors() {
         s.rejudge_classes();
         let v = key_verdict(&s, &k);
         assert_eq!((v.tail_inflation, v.energy_inflation), (class_t, 3.0), "{own} own points: the readout");
+        assert_eq!(v.rule_inflation, s.key_factors(&k).sum, "{own} own points: the readout's λ_sum is the rules'");
     }
+    // Task 8 review I2: a key with fewer than 3 points of its own posterior evidence reads its
+    // class's λ_sum where larger — the readout carries that floored λ_sum, and its own stays apart
+    {
+        let j = s.class_judge.as_mut().unwrap();
+        let base = j.refit_cal.key(&k);
+        j.refit_cal.per_key.insert(k.clone(), calibrate::ClassCalibration { inflation: 1.0, inflation_points: 2, ..base });
+        j.refit_cal.per_class[0].inflation = 2.0 * lsum.max(1.0);
+    }
+    s.rejudge_classes();
+    let v = key_verdict(&s, &k);
+    let floored = 2.0 * lsum.max(1.0);
+    assert_eq!((v.inflation, v.rule_inflation, s.key_factors(&k).sum), (1.0, floored, floored), "a sparse key's λ_sum: its class's floor");
+    {
+        let j = s.class_judge.as_mut().unwrap();
+        let base = j.refit_cal.key(&k);
+        j.refit_cal.per_key.insert(k.clone(), calibrate::ClassCalibration { inflation: lsum, inflation_points: 10, ..base });
+        j.refit_cal.per_class[0].inflation = 1.0;
+    }
+    s.rejudge_classes();
+    assert_eq!(key_verdict(&s, &k).rule_inflation, lsum, "with its own evidence: its own λ_sum");
     set_key_tail(&mut s, &k, (1.0, TailCause::None), (1.0, TailCause::None), 3);
     assert_eq!(s.key_inflations(&k), (lsum, 1.0), "3 own points: its own");
     set_key_tail(&mut s, &k, (2.0 * class_t, TailCause::Max { e: 9.0, r: 0.1 }), (6.0, TailCause::Max { e: 2.0, r: 0.2 }), 2);
@@ -13307,6 +13328,8 @@ fn a_step_refused_only_by_the_tail_inflation_is_code_24() {
     let (src, code, note) = inflation_step(&mut s, &sc);
     println!("{note}");
     assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "{note}");
+    // Task 8 review M4: the Activity event carries the code, so its row can say why
+    assert_eq!(s.ledger.events.back().map(|e| e.history_code), Some(Some(HISTORY_RULE_TAIL_INFLATION)), "the event's history code");
     let p = last_point(&s);
     assert!(!calibrate::in_answer_sample(&p) && p.flags.has(surrogate::history::PointFlags::CADENCE_FRESH), "cadence-fresh, but λ selected it: {p:?}");
     assert!(note.starts_with("surrogate: epistemic force std"), "rule 6 named it: {note}");
@@ -13344,6 +13367,7 @@ fn a_step_refused_only_by_the_tail_inflation_is_code_24() {
     let (src, code, plain) = inflation_step(&mut s, &sc);
     println!("{plain}");
     assert_eq!((src, code), (Source::Fallback, Some(history_rule_code(TeachRule::ForceUncertainty))), "{plain}");
+    assert_eq!(s.ledger.events.back().map(|e| e.history_code), Some(Some(history_rule_code(TeachRule::ForceUncertainty))), "code 14 on the event");
     assert!(plain.contains(" (the model's std × 1.50, its measured calibration for this environment class)"), "the words of before: {plain}");
     set_key_tail(&mut s, &k, (1.5, cause), (1.0, TailCause::None), 81);
     let (src, code, same) = inflation_step(&mut s, &sc);

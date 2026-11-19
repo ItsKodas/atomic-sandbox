@@ -570,7 +570,7 @@ fn row(ui: &mut Ui, id: egui::Id, rect: Rect, r: &LogRow, widths: &[f32; 7], mon
     let e = &r.event;
     let (step, step_hover) = step_cell(e);
     let (origin, origin_colour) = origin_style(e.origin);
-    let cx = RowCtx { box_affected: e.box_affected, near_face: r.near_face, kept: e.outcome.is_kept() };
+    let cx = RowCtx { box_affected: e.box_affected, near_face: r.near_face, kept: e.outcome.is_kept(), tail: e.history_code == Some(providers::surrogate::HISTORY_RULE_TAIL_INFLATION) };
     let outcome_colour = match e.outcome {
         o if o.is_kept() => theme::INK,
         TeachOutcome::Failed | TeachOutcome::StoreRefused => RED,

@@ -1030,7 +1030,14 @@ pub fn pair_sentence(map: &KnowledgeMap, p: &PairKnowledge, keys: &[(&str, &sim:
     match p.confidence {
         Confidence::Unseen if p.pending_samples > 0 => format!("Never seen — no fitted sample has these two within {:.1} Bohr{new}: they count once the model is refitted.", map.r_cut),
         Confidence::Unseen => format!("Never seen — no fitted sample has these two within {:.1} Bohr. Train a scene that has it.", map.r_cut),
-        Confidence::Trusted => format!("{taught}Trusted everywhere this pair was met."),
+        // a key its tail-aware inflations still send to DFT (code 24; Task 8 review I1)
+        Confidence::Trusted => match keys.iter().find(|(_, s)| s.trusted && super::activity::words::tail_note(s).is_some()) {
+            Some((class, s)) => {
+                let what = if *class == "pair" { "two-atom arrangements" } else { "three-or-more-atom arrangements" };
+                format!("{taught}Trusted, but DFT still answers {what} {}: the model was measured too confident there.", s.words())
+            }
+            None => format!("{taught}Trusted everywhere this pair was met."),
+        },
         Confidence::Thin => {
             let short: Vec<&(&str, &sim::SpeciesVerdict)> = keys.iter().filter(|(_, s)| !s.trusted).collect();
             match short.first() {
@@ -1142,7 +1149,11 @@ fn pair_detail(ui: &mut Ui, st: &mut UiState, map: &KnowledgeMap, p: &PairKnowle
 /// words), the learned ones, the advice, and the taught range with its first peak.
 fn why_lines(ui: &mut Ui, map: &KnowledgeMap, p: &PairKnowledge, total: u32, keys: &[(&str, &sim::SpeciesVerdict)]) {
     let c = p.confidence;
+    // a key the class rule trusts while its tail-aware inflations still send steps to DFT (code 24;
+    // Task 8 review I1) is listed with the refused ones, in its "learned, but …" words
+    let held = |s: &sim::SpeciesVerdict| s.trusted && super::activity::words::tail_note(s).is_some();
     let verdict = match c {
+        Confidence::Trusted if keys.iter().any(|(_, s)| held(s)) => "trusted by the class rule, but DFT still answers some environments of this pair: the model was measured too confident there (below)".to_string(),
         Confidence::Trusted => "trusted: the model answers every environment this pair was met in".to_string(),
         Confidence::Thin => "thin: taught, but not everywhere it was met — the model refuses the environments below".to_string(),
         Confidence::Unseen => format!("never seen: no fitted sample has these two within {:.1} Bohr", map.r_cut),
@@ -1155,7 +1166,7 @@ fn why_lines(ui: &mut Ui, map: &KnowledgeMap, p: &PairKnowledge, total: u32, key
                 theme::note(ui, "the per-environment verdicts are not in this snapshot (Model tab ▸ learned classes)");
             }
         } else {
-            let (short, learned): (Vec<_>, Vec<_>) = keys.iter().partition(|(_, s)| !s.trusted);
+            let (short, learned): (Vec<_>, Vec<_>) = keys.iter().partition(|(_, s)| !s.trusted || held(s));
             for (class, s) in &short {
                 ui.add(egui::Label::new(RichText::new(super::activity::words::species_line(class, s)).size(11.5).color(AMBER)).wrap());
             }
