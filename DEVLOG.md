@@ -1190,6 +1190,19 @@ review: 0 Critical, 0 Important, 8 Minor, all fixed. The app gate passes 795 tes
 - **Gates (merged tree):** providers 457/0, validate surrogate 7/0, app 808/0.
 - **Lesson:** a cheap test trigger ("change the audit cadence to force a generation") hid exactly the coupling the user complained about.
 
+### Isolated atoms are no envelope atoms (2026-11-19, merge envelope-isolated)
+
+- **Found by:** the stray-atoms branch's Task 4 physics review.
+- **Bug:** a kept rule-5a fallback with a stray atom (no neighbour within r_cut, other atoms bonded) put a zero-descriptor atom into the fit's envelope. That set every feature's minimum to 0 for the species. Rule 5b (coordination ratio) then never fired for it, and the 5c box contained 0.
+- **Consequence:** a stretched ordinary dimer just below r_cut, whose descriptors go to 0 continuously, could be answered by the model at ≈ Σ E_ref, while the restricted singlet lies 4.6e-2 Ha above that (the M6 Task 11 failure, back).
+- **Fix (ported from stray-atoms f40f65e3):**
+  - one predicate, `surrogate::envelope::isolated_atom`, shared with rule 5a;
+  - the fit skips isolated atoms at its two envelope call sites;
+  - `spread_distance` is NaN-safe;
+  - a loaded model rebuilds its envelope without them (no refit, no DFT).
+- **Tests:** RED before the fix (coordination minimum 0, 36 envelope atoms instead of 24). A stretched-H₂ scan over 4.5–6 Bohr has the same verdicts with and without the stray sample.
+- **Gates:** providers 460/0, validate surrogate 7/0.
+
 ### Process wins
 
 - An input-replay harness (M6 Task 8) that found a real app bug on its first scripts: a running relax
