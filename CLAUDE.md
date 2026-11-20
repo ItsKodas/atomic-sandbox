@@ -47,7 +47,7 @@ All heavy tests are release-only (`#[cfg_attr(debug_assertions, ignore)]`); run 
 |---|---|---|
 | any | `cargo test -p units -p qm -p sim -p surrogate --release`, `cargo test -p providers --release` | ~9.5 min + ~10–11.5 min |
 | solver (`qm`, `qm-gpu`) | `cargo test -p validate --release --test oracles` and `--test gpu_vs_cpu` | ~51–54 min, ~8 min |
-| dynamics | `cargo test -p validate --release --test dynamics` | ~42–43 min (V5's CO₂⁺ NVE and CPU work integral; the stray-atom NVE re-entry at 101³, ~14 min) |
+| dynamics | `cargo test -p validate --release --test dynamics` | ~42–46 min (V5's CO₂⁺ NVE and CPU work integral; the stray-atom NVE re-entry at 101³, ~14 min) |
 | surrogate / provider / policy | `cargo test -p validate --release --test surrogate` | ~20–40 min (with the stray-atom and trust-tightening tests) |
 | shared-model measurements (not gates) | `--test transfer`, `--test capping` (`#[ignore]`d; commands in `references.md`) | hours |
 | collection migration, V11 (measurement, not a gate) | `FD_DRY_RUN_COPY=<copy of a pre-FD collection> cargo test -p validate --release --test migration dry_run -- --ignored --nocapture` (on a copy only, never `models/collections`) | ~17 h GPU for a 1 657-sample Accurate collection (V11, 37 s/sample) |
