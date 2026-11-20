@@ -1225,6 +1225,8 @@ from the first run's kept fallbacks (samples 273 → 315): one sample spans its 
 lets the posterior judge there, as designed. Box-affected checks are not judged (the box rule);
 the hot run's worst there is 4.6e-2 Ha/atom of confinement and model error together.
 
+**Since then (2026-11-17/20).** Under Fermi–Dirac labels the test passed at 07939ac (1036 s) and failed at 762159b (1378 s: hot run 12 answers beyond, worst 2.38e-3 Ha/atom and 4.48×) — one chaotic trajectory, the many-body class opening on 3 evidence points (bisect: `scf-stall/.superpowers/sdd/2026-11-13-fermi-smearing/stuck-escape-bisect.md`). Trust tightening closes that gap: the many-body key opens only at 12 fits and 60 comparisons. **Run of record 2026-11-20 at 7498cf96: pass, 771 s** — hot run 260 answers, 61 judged, worst 9.72e-4 Ha/atom and 1.82×, 0 beyond; the fallback-energy check now leaves out in-step ticks at box-affected answers (the controller's ruling). Numbers: "Trust tightening (2026-11-19)" below.
+
 ### Runtime (in-suite, five tests concurrent, GPU evaluations serialised; run of record 2026-10-14)
 
 | test | system | grid | tol | teacher solves | GPU s | ms/solve | SCF steps/solve | readbacks/solve | test wall s | result |
