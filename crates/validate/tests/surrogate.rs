@@ -589,6 +589,24 @@ fn h3_neutral(side: f64) -> Scene {
     sc
 }
 
+/// A fallback step's rule for the repro's log, from the step's structured teaching event — its
+/// `origin`, its history code (`TeachEvent::history_code`, else the code of `TeachEvent::rule`) named
+/// by the provider's own table (`history_rule_name`), and the provider's in-step tick count — never
+/// from note text (plan 2026-11-19 Task 9: an in-step calibration tick's note says "in-envelope
+/// steps", which [`which_rule`] read as "rule 5 (envelope)"). Without an event (none drained for
+/// the step) the note-text reading stands, marked "(from notes)".
+fn repro_step_rule(e: Option<&sim::activity::TeachEvent>, in_step_tick: bool, notes: &[String]) -> String {
+    use providers::surrogate::{history_rule_code, history_rule_name};
+    use sim::activity::TeachOrigin;
+    let Some(e) = e else { return format!("{} (from notes)", which_rule(notes)) };
+    let box_tag = if e.audit == Some(sim::AuditVerdict::BoxAffected) { ", box-affected" } else { "" };
+    match e.origin {
+        TeachOrigin::Audit if in_step_tick => format!("calibration tick (in step{box_tag})"),
+        TeachOrigin::Audit => format!("rule 8 audit (in step{box_tag})"),
+        _ => history_rule_name(e.history_code.unwrap_or_else(|| history_rule_code(e.rule))).to_string(),
+    }
+}
+
 fn which_rule(notes: &[String]) -> &'static str {
     let n = notes.join(" | ");
     if n.contains("isolated atom") { "rule 5a (isolated atom)" }
@@ -1053,7 +1071,18 @@ fn repro_steps() -> usize {
 ///   unless the teacher's answer is box-affected (not judged — the box's confinement; counted and
 ///   reported);
 /// - every fallback's reported energy within the tier of the teacher's (the teacher's own on the
-///   teacher's surface, |gap|/N ≤ tier on the model's);
+///   teacher's surface, |gap|/N ≤ tier on the model's). **Not** the steps of an in-step audit or
+///   calibration tick whose teacher answer is box-affected (its activity event's verdict
+///   `AuditVerdict::BoxAffected`, selected from that structured record, never from note text):
+///   by the provider's box rule (`providers::surrogate` `teach`, the audit branch; the
+///   `box_affected_face_density` cut) such a step keeps the model's energy, because its gap is the
+///   box's Dirichlet confinement as much as the model's error — it is not a fallback's energy, and
+///   the answer check excludes box-affected answers the same way. Since trust tightening Task 7
+///   the harness's calibration ticks are such in-step audits (25 in-envelope steps apart; the gated
+///   scenario has `audit_every` 0, so before them none ran here). Ruled by the controller at plan
+///   2026-11-19 Task 9 (the gate failed on 5 such steps, 1.4–8.9e-3 Ha/atom at face densities
+///   2.1e-5–6.2e-4); the tier and every other constant are unchanged. The excluded steps are
+///   counted and printed with their face densities;
 /// - every published scene inside the cell's margin; a pause only with the teacher's "left the
 ///   simulation cell" message (requirement 1);
 /// - a step that changes surface moves E_conserved by exactly Verlet's dt²Σ Δ|F|²/8m (the
@@ -1290,6 +1319,11 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
     let _ = writeln!(out, "    trust (heating): {}; {}", heat_tally.line(), tick_line(ticks_heated, ticks_start, &heat_tally));
     let _ = writeln!(out, "    keys after heating: {}", trust_key_lines(&hs.lock().unwrap_or_else(|e| e.into_inner())));
     let mut edit_tally = PointTally::default();
+    // the steps excluded from the model-surface fallback-energy check: in-step audits and ticks
+    // whose teacher answer was box-affected (the controller's Task 9 ruling; `repro_step_rule`)
+    let mut box_audit_steps: Vec<String> = Vec::new();
+    // the heating phase's teaching events are not this phase's: drained before the edit
+    let _ = d.take_teach_events();
     // judged answers' z per atom, raw ‖ΔF‖/σ_epi and inflated ‖ΔF‖/(λ_F σ_epi) (max over atoms), and
     // the worst force residual / bound per class (pair, many-body)
     let (mut z_raw, mut z_inflated) = (Vec::new(), Vec::new());
@@ -1322,8 +1356,12 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
         d.apply(DynCommand::Step(1));
         let tb = !gate && trusted_now(hs);
         let recorded_before = hs.lock().unwrap_or_else(|e| e.into_inner()).audit_history().recorded();
+        let in_step_before = tick_counts(hs).in_step;
         let snap = d.tick(f64::INFINITY, &mut never());
         tally(hs, &mut edit_tally, recorded_before);
+        // the step's own teaching event (structured: its rule, origin and audit verdict)
+        let step_event = d.take_teach_events().into_iter().rev().find(|e| matches!(e.origin, sim::activity::TeachOrigin::Fallback | sim::activity::TeachOrigin::Audit | sim::activity::TeachOrigin::Verification));
+        let in_step_tick = tick_counts(hs).in_step > in_step_before;
         observe(&mut baseline, tb);
         if snap.source == Source::Fallback && which_rule(&snap.eval.notes) == "rule 4b (class LOO)" {
             // before the refit below: the model that refused is the one judged
@@ -1431,7 +1469,8 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
                 }
             }
             Source::Fallback => {
-                *reasons.entry(which_rule(&snap.eval.notes).to_string()).or_default() += 1;
+                let label = repro_step_rule(step_event.as_ref(), in_step_tick, &snap.eval.notes);
+                *reasons.entry(label.clone()).or_default() += 1;
                 match surface {
                     // the teacher's own total is in the breakdown (EvalStats doc)
                     Surface::Teacher => {
@@ -1441,8 +1480,15 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
                     Surface::Model => {
                         on_model_fb += 1;
                         let g = snap.teacher_gap.expect("a model-surface fallback carries its gap").abs() / n;
+                        // an in-step audit or tick whose teacher answer is box-affected keeps the
+                        // model's energy by the provider's box rule: not a fallback's energy, not
+                        // checked here (the test's doc, the fallback-energy bullet)
+                        if let Some(e) = step_event.as_ref().filter(|e| e.audit == Some(sim::AuditVerdict::BoxAffected)) {
+                            box_audit_steps.push(format!("step {i} ({label}): face density {}, |gap|/N {g:.2e}", e.face_density.map_or("—".to_string(), |f| format!("{f:.2e}"))));
+                            continue;
+                        }
                         worst_fb_gap = worst_fb_gap.max(g);
-                        check!(gate, soft, g <= tier, "{what} step {i}: a model-surface fallback {g:.2e} Ha/atom off the teacher ({})", which_rule(&snap.eval.notes));
+                        check!(gate, soft, g <= tier, "{what} step {i}: a model-surface fallback {g:.2e} Ha/atom off the teacher ({label})");
                     }
                 }
             }
@@ -1475,6 +1521,7 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
     let _ = writeln!(out, "    class-refused steps' would-be answers against the teacher — the verdict's jurisdiction (rule-4b points, codes 5/6, over the refusing class's atoms): {} steps, per-step rms ‖ΔF‖/√3 / bound {} — rms over them {refused_rms:.3} (ENTER {:.3}: the refusal is warranted beyond it)",
                      refused_ratio.len(), quantiles(&refused_ratio), providers::surrogate::ENTER);
     let _ = writeln!(out, "      every step with the class's note (code 21 and box-affected steps included, over every atom): {} steps, {} — rms {noted_rms:.3}", noted_ratio.len(), quantiles(&noted_ratio));
+    let _ = writeln!(out, "    model-surface steps of in-step audits/ticks with a box-affected teacher answer, not checked against the tier (the test's doc): {}{}", box_audit_steps.len(), if box_audit_steps.is_empty() { String::new() } else { format!(" — {}", box_audit_steps.join("; ")) });
     // trust tightening Task 9 Step 1 (printouts, no assertion)
     let _ = writeln!(out, "    trust (after the edit): {}; {}", edit_tally.line(), tick_line(tick_counts(hs), ticks_heated, &edit_tally));
     let _ = writeln!(out, "    keys at the end: {}", trust_key_lines(&hs.lock().unwrap_or_else(|e| e.into_inner())));
