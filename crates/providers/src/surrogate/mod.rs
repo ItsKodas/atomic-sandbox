@@ -1541,7 +1541,8 @@ fn ema(prev: Option<f64>, x: f64) -> f64 {
 pub(super) enum TickOutcome {
     /// Taken, its point recorded.
     Recorded,
-    /// Taken, no point: the answer was box-affected, unfit or without a variance factor.
+    /// Taken, no point: the answer was box-affected, unfit or without a variance factor, or the point was
+    /// deferred to a stray attribution check (its point arrives later with `TICK`).
     Unrecorded,
     /// The auditor was busy with other work (rule 8, a display, a reference).
     SkippedBusy,
@@ -1556,7 +1557,7 @@ pub(super) enum TickOutcome {
 pub struct TickCounts {
     /// Taken, its point recorded.
     pub recorded: u64,
-    /// Taken, no point (box-affected, unfit, no variance factor).
+    /// Taken, no point (box-affected, unfit, no variance factor), or the point deferred to a stray attribution check (its point arrives later with `TICK`).
     pub unrecorded: u64,
     /// Skipped: the auditor was busy with other work.
     pub skipped_busy: u64,
@@ -2457,7 +2458,8 @@ impl SurrogateKs {
 
     /// Calibration ticks taken that left a history point (module doc, "Calibration ticks"): at a
     /// fallback, in the step, or by the auditor once its answer is judged. A readout; the ticks
-    /// taken without a point are [`TickCounts::unrecorded`].
+    /// taken without a point are [`TickCounts::unrecorded`] — among them those whose point was
+    /// deferred to a stray attribution check (its point arrives later with `TICK`).
     pub fn ticks_taken(&self) -> u64 {
         self.ticks.recorded
     }

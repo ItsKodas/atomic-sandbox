@@ -749,8 +749,9 @@ impl SurrogateKs {
     /// none; `AuditOrigin::StrayAttributed`), and the audit history takes the **fragment's** point (ruling 9b). Right
     /// there: the composition's or the box term's, and the model's trust is untouched — no history point (an
     /// `unrecorded.composition` count; a calibration tick's audit, `a.flags` carrying `TICK`, records the fragment's
-    /// point in this outcome too, so the answer sample P_A never reads which way the check went — the final review's
-    /// I1 ruling), and after a refit since the audit the next answered steps are audited
+    /// point in this outcome too, so P_A's membership never reads which way the check went — the final review's I1
+    /// ruling; the recorded values still differ from a passing tick's, trust spec §5), and after a refit since the
+    /// audit the next answered steps are audited
     /// (`AUDIT_BURST`, M5, as a re-earned failed audit). A fragment solve that is not clean or a model that cannot
     /// describe the bonded part cannot attribute: the audit counts as recorded (the conservative side). A model gone
     /// (a Forget) or of another surface: discarded, nothing counted (I1).
@@ -807,8 +808,10 @@ impl SurrogateKs {
         let e_epi = pred.energy_std.zip(self.model.as_ref()).map(|(e, m)| crate::surrogate::policy::epistemic_energy_std(m, surrogate::energy_row_atoms(&m.basis, &fp), e));
         // a calibration tick's point is recorded whichever way the check attributes the failure (the controller's
         // ruling on the final review's I1): the fragment point is the same σ-blind measurement of the model on the
-        // bonded part in both outcomes, so P_A stays outcome-blind (trust spec §4, the self-reference guard) — dropping
-        // the composition outcome's would keep the fragment checks that fail and drop the ones that pass
+        // bonded part in both outcomes, so P_A's membership stays outcome-blind (trust spec §4, the self-reference
+        // guard) — dropping the composition outcome's would keep the fragment checks that fail and drop the ones that
+        // pass. The values are not: a passing tick records the scene gap x + δ, a failing one the fragment gap x — a
+        // bias second order in δ, bounded by the clearing checks' residual, of no fixed sign (trust spec §5)
         let tick = a.flags.has(surrogate::history::PointFlags::TICK);
         let detail = if wrong {
             let mut case = a.case;

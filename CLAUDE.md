@@ -47,7 +47,7 @@ All heavy tests are release-only (`#[cfg_attr(debug_assertions, ignore)]`); run 
 |---|---|---|
 | any | `cargo test -p units -p qm -p sim -p surrogate --release`, `cargo test -p providers --release` | ~9.5 min + ~10–11.5 min |
 | solver (`qm`, `qm-gpu`) | `cargo test -p validate --release --test oracles` and `--test gpu_vs_cpu` | ~51–54 min, ~8 min |
-| dynamics | `cargo test -p validate --release --test dynamics` | ~6–42 min (V5's CO₂⁺ NVE and CPU work integral; the stray-atom NVE re-entry at 101³, ~14 min) |
+| dynamics | `cargo test -p validate --release --test dynamics` | ~42–43 min (V5's CO₂⁺ NVE and CPU work integral; the stray-atom NVE re-entry at 101³, ~14 min) |
 | surrogate / provider / policy | `cargo test -p validate --release --test surrogate` | ~20–40 min (with the stray-atom and trust-tightening tests) |
 | shared-model measurements (not gates) | `--test transfer`, `--test capping` (`#[ignore]`d; commands in `references.md`) | hours |
 | collection migration, V11 (measurement, not a gate) | `FD_DRY_RUN_COPY=<copy of a pre-FD collection> cargo test -p validate --release --test migration dry_run -- --ignored --nocapture` (on a copy only, never `models/collections`) | ~17 h GPU for a 1 657-sample Accurate collection (V11, 37 s/sample) |
@@ -60,7 +60,7 @@ All heavy tests are release-only (`#[cfg_attr(debug_assertions, ignore)]`); run 
 | viewer / UI / worker | `cargo test -p app --release` (incl. the replay scripts) | ~10 min |
 | molecule builder | `cargo test -p app --release --bin app -- builder::` | seconds |
 
-Times as of 2026-11-20 at `-j 4`; the upper ends were measured beside another agent's GPU suite (contention inflates them; the per-suite numbers are in `docs/dev-reference.md` "Test suites"). `cargo test -p validate --release` runs every validate binary. What each suite checks and its measured numbers: `docs/dev-reference.md` "Test suites" and `crates/validate/references.md`.
+Times as of 2026-11-20 at `-j 4`. Measured that day beside another agent's GPU suite: oracles 54 min, gpu_vs_cpu 8 min, dynamics 42 min, charges 5.5 min, orbitals 10 min, harris 18 min, and the lower ends of the pseudo rows (39 min, 4.5 min, 65 min); contention inflates GPU times. Per-suite numbers: `docs/dev-reference.md` "Test suites". `cargo test -p validate --release` runs every validate binary. What each suite checks and its measured numbers: `docs/dev-reference.md` "Test suites" and `crates/validate/references.md`.
 
 ## Hardware
 

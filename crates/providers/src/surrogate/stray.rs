@@ -321,7 +321,11 @@
 //! prediction of it, the fragment's answer) when the model is blamed; none, and an `unrecorded.composition` count,
 //! when it is not — no composition failure is calibration evidence. **A calibration tick** (the final review's I1, the
 //! controller's ruling) is the exception: a ticked audit's point records the fragment's in **both** outcomes, so the
-//! answer sample P_A, chosen without reading errors, never keeps the checks that fail and drops the ones that pass.
+//! **membership** of the answer sample P_A, chosen without reading errors, never keeps the checks that fail and drops
+//! the ones that pass. The recorded values are not outcome-blind: a passing tick records the scene's gap x + δ over the
+//! bonded atoms, a failing one the fragment's gap x; the bias in E[r²], δ²·P(pass) + 2δ·E[x·1{pass}], is second order
+//! in δ, bounded by the clearing checks' residual and of no fixed sign (trust spec §5, "Ticks at a cleared stray-atom
+//! scene"; a parts check on every ticked audit would remove it and was not taken).
 //! At a cleared scene the tick is decided on the bonded part (the envelope with the stray atoms exempt, the fences
 //! judged on the bonded part), the dispatching step's flags travel in the `Attribution`, and the tick counts as
 //! "taken, unrecorded" when the audit is judged (`TickCounts::unrecorded`): its point, if the check records one,

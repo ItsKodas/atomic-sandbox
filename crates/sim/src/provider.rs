@@ -1618,7 +1618,7 @@ pub struct TrainableStatus {
 pub struct CalibrationTicks {
     /// Taken, its point recorded.
     pub recorded: u64,
-    /// Taken, no point (box-affected, unfit, no variance factor).
+    /// Taken, no point (box-affected, unfit, no variance factor), or the point deferred to a stray attribution check (its point arrives later with `TICK`).
     pub unrecorded: u64,
     /// Skipped: the background teacher was busy with other work (an audit, a display, a
     /// reference) when the tick fell due — never deferred, never served in the step.

@@ -372,15 +372,25 @@ factor and its measured cause, e.g. "λ_T 7.7: a measured atom at 4.5× the boun
     - *The point is recorded in both outcomes.* Whether the check finds the model wrong on the bonded
       part or finds the failure to be the composition's, a ticked audit's point is the fragment's: its
       geometry, the model's prediction of it and the fragment's teacher answer. That pair is at hand in
-      both outcomes, so P_A stays outcome-blind. Dropping the composition outcome's point would keep
-      the fragment checks that fail and drop the ones that pass. An ordinary (unticked) audit's
-      composition outcome still records no point (stray ruling 9b), since it is not in P_A.
+      both outcomes, so P_A's **membership** stays outcome-blind: every ticked audit at a cleared scene
+      leaves a point. Dropping the composition outcome's point would keep the fragment checks that
+      fail and drop the ones that pass. An ordinary (unticked) audit's composition outcome still
+      records no point (stray ruling 9b), since it is not in P_A.
+    - *The recorded values are not outcome-blind.* A passing tick records the scene's gap over the
+      bonded atoms, x + δ (x the model's error on the bonded part, δ the composition and box terms); a
+      failing one records the fragment's gap x. Against recording x always, the bias in E[r²] is
+      δ²·P(pass) + 2δ·E[x·1{pass}]: second order in δ, bounded by the clearing checks' residual (a
+      cleared signature's δ is within its measured worst residual), and of no fixed sign — for x
+      normal with std s and a pass at |x + δ| ≤ T, about −7 % at T = s, δ = s/2 and +12 % at T = 2s.
+      The fully consistent alternative, a parts check on every ticked audit at a cleared scene
+      (1 + n_stray extra solves per tick), was not taken.
     - *Where no comparable pair exists the drop stays, as a conservative bias.* A check discarded by a
       Forget, an installed model or a surface change counts nothing. A check that cannot attribute (a
       part's solve not clean, a model that cannot describe the bonded part) counts against the model
-      with the scene's point. Neither reads the error the check would have measured. Any residual
-      selection of this kind can only keep failing measurements, so it can only inflate λ, never
-      shrink it.
+      with the scene's point, so that path substitutes the scene gap x + δ for x. Neither reads the
+      error the check would have measured. One asymmetry is conservative: an `unfit` teacher answer
+      drops a passing tick's point (`unrecorded.unfit`), while a failing one is still recorded through
+      the check, so `unfit` can only drop passes.
     - *How the tick is counted.* At the audit's judgement the tick is "taken, unrecorded"
       (`TickCounts::unrecorded`), because the point is deferred to the check. The point the check
       records later carries `TICK`, so the history can hold more `TICK` points than

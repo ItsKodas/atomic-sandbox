@@ -3045,6 +3045,10 @@ fn a_background_tick_judges_the_fences_on_the_bonded_part() {
     s.quarantine[i] = Q_FORGOTTEN;
     let sc = h2_with(INSIDE, &[STRAY_AT]);
     assert!(s.near_quarantined_cached(&positions(&sc), &zs(&sc)).is_empty(), "the premise: the whole scene escapes the fence");
+    let history = s.audit_history().len();
     s.poll_audit();
-    assert!(s.audit_history().iter().last().unwrap().flags.has(PointFlags::FENCED), "the bonded part is fenced");
+    assert_eq!(s.audit_history().len(), history + 1, "the tick's point, exactly one");
+    let p = s.audit_history().iter().last().unwrap().clone();
+    assert!(p.flags.has(PointFlags::TICK), "the new point is the tick's: {:?}", p.flags);
+    assert!(p.flags.has(PointFlags::FENCED), "the bonded part is fenced: {:?}", p.flags);
 }

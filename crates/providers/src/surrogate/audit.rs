@@ -1022,7 +1022,8 @@ impl SurrogateKs {
     /// outcome) or discarded (plan review S11). Returns `None` when the answer was not judged
     /// (discarded: the model changed settings or species; inside a fenced shell band), else whether
     /// its history point was recorded (`record_history_point`: not for a box-affected, unfit or
-    /// variance-less answer) — what a calibration tick's count reads.
+    /// variance-less answer, nor for a failed audit whose point is deferred to a stray attribution check (its point arrives later with `TICK`)) — what a calibration
+    /// tick's count reads.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, multiplicity: Option<u32>, unfit: Option<&str>, ms: f64, scf_steps: Option<usize>, ts: Option<f64>) -> Option<bool> {
         let unaudited = self.answered.saturating_sub(job.answered);

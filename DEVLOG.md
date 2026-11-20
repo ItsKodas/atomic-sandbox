@@ -774,25 +774,25 @@ The user asked why the orbital views went blank in Estimated mode: the model has
 
 **How it went:**
 - **V0, the entry gate, failed first.** At kT = 1e-3 Ha lone open-shell atoms (O M = 1, N M = 2) polarised depending on where they sat on the grid (note Nov 13 21:52). The user chose kT = 5 mHa and a 1e-5 GPU stop for solves with a partly filled level (Nov 14 06:36). Under those, every species passed the state, spread and winner rules.
-- **Paused once at 95 % of the weekly usage** (Nov 14–15), resumed when the limits lifted.
+- **Two usage stops:** at 95 % of the weekly usage (Nov 14–15, resumed when the limits lifted), and at the usage limit on Nov 17 around 18:10, which stopped Task 14 at its dispatch.
 - **The all-electron witness was expensive (Task 7).** FD needs eigenvectors above the Fermi level, and on all-electron grids the LOBPCG for them hit its cap. gpu_vs_cpu went from 3.5 to 23.7 min and the oracles from 31 to 51 min. A traced run found a transient, not a defect. Raising the cap would have cost the Precise auditor its VRAM, so it was reverted.
 - **The guard's first rule was biased (Task 8).** The review showed its running median locked in low on bond formation: 655 false flags in 2 999 steps of H₂ forming from rest. It now uses the derived bound κ_max: 0 flags.
 - **Tasks 9b–9d, three fix tasks nobody planned:**
-  - An H₃⁺ tier test cycled for 200 steps under FD. The root cause was nalgebra's `SymmetricEigen` losing a level in the Rayleigh–Ritz step.
-  - Cold all-electron water at 97³ took 123 s and VRAM at 177³ hit 21.6 GB, because the blob start put μ in the wrong place. An atomic-density start from `qm::radial` (Z only) brought it to 11 steps and 11 s.
+  - An H₃⁺ tier test cycled for 200 steps under FD. The cause was Task 7's witness columns: their residual entered the step's max_res, so the guess-tolerance accept alternated and reset DIIS every other step (fixed in 9b). nalgebra's `SymmetricEigen` losing a level in the Rayleigh–Ritz step was a separate defect, found by the 9b review (its I1).
+  - Cold all-electron water at 97³ took 123 s, because the blob start put μ in the wrong place. An atomic-density start from `qm::radial` (Z only) brought it to 11 steps and 11 s (9c). The VRAM guard's estimate of 21.6 GB for all-electron water at 177³ was an estimate, not a measured peak; it survived the new start and was fixed in 9d by counting the 3 witness vectors per spin the solver allocates.
   - A DIIS stall at the orbital freeze was fixed by dropping stale pre-freeze entries when a frozen step fails to contract.
 - **V5's pre-registered bounds failed (Task 11),** the work integral by 392×. A physics review re-derived them from a measured, independent source: a box term that falls 26× from a 12 to an 18 Bohr box. The bound was never scaled to fit.
 - **The safety test failed again (Task 14).** The stuck-then-escape repro failed with labels that agreed to 1e-7 Ha. A bisect found the many-body class opening on 3 evidence points; the cause was not the solver. The user chose "Tighten trust", which became its own branch (below).
 - **The migration estimate was about 10× short (Task 17).** The V11 dry run on a copy of the user's 1 657-sample collection took 37 s per sample on average (H₂ 2–4 s, H₃P about 140 s), so a full re-solve is about 17 h of GPU, not the planned 1–2 h. It was stopped at 480 samples: 479 identical, 1 changed state, every hash unchanged. The estimate now scales from the pass's own mean. On Nov 20 the user dropped that collection ("dump that to save time") and trains fresh.
 - **Five merges of `main` along the way** (live orbitals, the knowledge graph, refit speed-up, variance support and more), each gated before work went on.
 
-**Wins:** every reproduced staller converges in one phase; the lone-atom rule works on partial levels; collections move to the new surface without losing the old one; and nothing was loosened. Each re-pin carries its reason in `references.md`.
+**Wins:** every reproduced staller converges in one phase; the lone-atom rule works on partial levels; collections move to the new surface without losing the old one; and no gate was widened to pass: every re-pin carries its derivation in `references.md`.
 
 **Gate (Nov 20, Task 18, on the main-merged tree, beside another agent's GPU jobs):** all 11 solver-side suites passed: qm 249, units 10, qm-gpu 146, gpu_vs_cpu 12 (469 s), oracles 5 (54 min), dynamics 7 (42 min), charges 3, orbitals 13, harris 6, pseudo_gen 6, pseudo 9, pseudo_oracles 11. The final whole-branch review found no Critical; its fixes (the stray-atom × tick tests, the docs, the suite times and the version bump to 0.2.0-beta.6) landed before the merge.
 
 **Size:** the branch with its two merged sub-branches is 136 commits and about 36 000 lines added across 137 files against `main`.
 
-### Stray atoms (Nov 18–19; branch `stray-atoms`, merged into `scf-stall`)
+### Stray atoms (Nov 18–19; branch `stray-atoms`, fast-forwarded into `scf-stall`)
 
 **Why.** A molecule with one atom far away, like H₂ plus a hydrogen 6 Bohr off, was always DFT's. The lone-atom rule (rule 5a) refuses an atom with no neighbour within the cutoff in a scene of two or more, because a model of bonded environments says nothing about how a far atom's energy composes with the rest. That stays the rule until the composition has been measured.
 
