@@ -4503,6 +4503,14 @@ fn sample_tol_is_the_branch_jump_guards() {
     assert_eq!(SAMPLE_TOL, providers::branch_jump::SAMPLE_TOL);
 }
 
+/// The smearing branch's final review, I4: this build's version is not the last pre-Fermi–Dirac release. Released under
+/// the same version, the updater on beta.5 would not offer it, and the legacy-model refusal ("open it in <version>")
+/// would send the user to the version they already run.
+#[test]
+fn version_is_past_the_last_pre_fd_release() {
+    assert_ne!(env!("CARGO_PKG_VERSION"), providers::surrogate::LAST_PRE_FD_RELEASE, "bump the workspace version past the last pre-Fermi–Dirac release");
+}
+
 /// Spec §7.9 (plan 2026-11-13 Task 16; ruling R17): a model file taught before the Fermi–Dirac switch — its ionic tag
 /// the legacy all-electron "none", or a shared-shell one — is refused on load with the reason, naming the last
 /// pre-Fermi–Dirac release (R17 as revised), never the generic "another Kohn-Sham surface"; nothing is loaded. This build's own tags are
