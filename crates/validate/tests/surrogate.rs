@@ -1083,7 +1083,9 @@ fn repro_steps() -> usize {
 ///   by the provider's box rule (`providers::surrogate` `teach`, the audit branch; the
 ///   `box_affected_face_density` cut) such a step keeps the model's energy, because its gap is the
 ///   box's Dirichlet confinement as much as the model's error — it is not a fallback's energy, and
-///   the answer check excludes box-affected answers the same way. Since trust tightening Task 7
+///   the answer check excludes box-affected answers the same way. One-sided (the Task 9 physics
+///   review's M4): confinement only raises the teacher's energy, so an excluded step's signed gap
+///   E_teacher − E_model must stay ≥ −tier·N — asserted, and printed signed. Since trust tightening Task 7
 ///   the harness's calibration ticks are such in-step audits (25 in-envelope steps apart; the gated
 ///   scenario has `audit_every` 0, so before them none ran here). Ruled by the controller at plan
 ///   2026-11-19 Task 9 (the gate failed on 5 such steps, 1.4–8.9e-3 Ha/atom at face densities
@@ -1339,6 +1341,8 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
     let mut checker = Locked::new(ctx.clone(), TOL_H2).0;
     let pol = FallbackPolicy::default();
     let (mut answered, mut on_teacher, mut on_model_fb, mut checked, mut boxed) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    // the model-surface fallbacks the fallback-energy check judged (box-excluded steps apart; review N2)
+    let mut fb_checked = 0usize;
     let (mut worst_e, mut worst_f, mut worst_fb_gap, mut worst_boxed_e) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let mut bad: Vec<String> = Vec::new();
     let (mut worst_z, mut zscores) = (0.0f64, Vec::new());
@@ -1489,10 +1493,16 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
                         // an in-step audit or tick whose teacher answer is box-affected keeps the
                         // model's energy by the provider's box rule: not a fallback's energy, not
                         // checked here (the test's doc, the fallback-energy bullet)
-                        if let Some(e) = step_event.as_ref().filter(|e| e.audit == Some(sim::AuditVerdict::BoxAffected)) {
-                            box_audit_steps.push(format!("step {i} ({label}): face density {}, |gap|/N {g:.2e}", e.face_density.map_or("—".to_string(), |f| format!("{f:.2e}"))));
+                        // (the step's own event: an audit, its teacher answer box-affected — physics review N4)
+                        if let Some(e) = step_event.as_ref().filter(|e| e.origin == sim::activity::TeachOrigin::Audit && e.box_affected && e.audit == Some(sim::AuditVerdict::BoxAffected)) {
+                            // one-sided (physics review M4): the confinement only raises E_teacher, so
+                            // the signed gap E_teacher − E_model of an excluded step stays ≥ −tier·N
+                            let signed = snap.teacher_gap.expect("a model-surface fallback carries its gap");
+                            box_audit_steps.push(format!("step {i} ({label}): face density {}, gap/N {:+.2e}", e.face_density.map_or("—".to_string(), |f| format!("{f:.2e}")), signed / n));
+                            check!(gate, soft, signed >= -tier * n, "{what} step {i}: a box-excluded in-step audit's gap E_teacher − E_model = {:+.2e} Ha/atom is below −tier: confinement only raises the teacher's energy, so this is the model's error ({label})", signed / n);
                             continue;
                         }
+                        fb_checked += 1;
                         worst_fb_gap = worst_fb_gap.max(g);
                         check!(gate, soft, g <= tier, "{what} step {i}: a model-surface fallback {g:.2e} Ha/atom off the teacher ({label})");
                     }
@@ -1505,7 +1515,7 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
         }
     }
     let end = d.snapshot();
-    let _ = writeln!(out, "  {what} run — after the edit: {answered} model answers ({checked} judged against fresh DFT: worst |ΔE|/N {worst_e:.2e} Ha (tier {tier:.0e}), worst force residual / bound {worst_f:.2}; {boxed} box-affected, not judged, worst |ΔE|/N there {worst_boxed_e:.2e}), {on_teacher} teacher-surface fallbacks, {on_model_fb} model-surface fallbacks (worst |gap|/N {worst_fb_gap:.2e}); paused at the cell margin at step {stopped:?}");
+    let _ = writeln!(out, "  {what} run — after the edit: {answered} model answers ({checked} judged against fresh DFT: worst |ΔE|/N {worst_e:.2e} Ha (tier {tier:.0e}), worst force residual / bound {worst_f:.2}; {boxed} box-affected, not judged, worst |ΔE|/N there {worst_boxed_e:.2e}), {on_teacher} teacher-surface fallbacks, {on_model_fb} model-surface fallbacks ({fb_checked} checked against the tier, worst |gap|/N {worst_fb_gap:.2e}; {} box-affected in-step audits/ticks excluded); paused at the cell margin at step {stopped:?}", box_audit_steps.len());
     let _ = writeln!(out, "    E_conserved: {switches} surface changes, largest step there {max_switch:.2e} Ha (NVE: residual vs dt²Σ Δ|F|²/8m ≤ {max_residual:.1e} Ha); largest on one surface {max_same:.2e} Ha; W_jumps {:+.3e}, W_mismatch {:+.3e}", end.work_refit, end.work_mismatch);
     let _ = writeln!(out, "    classes at the end: {}", class_summary(&hs.lock().unwrap_or_else(|e| e.into_inner())));
     let _ = writeln!(out, "    fallback rules: {}", reasons.iter().map(|(k, v)| format!("{v}× {k}")).collect::<Vec<_>>().join("; "));
@@ -1910,7 +1920,7 @@ impl TrustBaseline {
                     continue;
                 }
                 let _ = writeln!(o, "    {what}: {} points touching the class ({} atoms; {} atoms while the class verdict was trusted, {} while the model was untrusted before the step)", b.points, b.atoms, b.atoms_trusted, b.atoms_model_untrusted);
-                let _ = writeln!(o, "      beyond the in-domain LOO p99: {} / {} points = {:.1} % (the independent count — a point's atoms are one draw per N − 1; {} points had no p99); atoms: {} / {} = {:.1} % while the class verdict was trusted (the brief's \"missed large error\"), {} while it was not",
+                let _ = writeln!(o, "      beyond the in-domain LOO p99: {} / {} points = {:.1} % (the independent count — a point's atoms are one draw per N − 1; {} points had no p99); atoms: {} / {} = {:.1} % while the class verdict was trusted (beyond p99 per atom — a generalisation gap, not the bound-scale miss below), {} while it was not",
                                  b.points_beyond, b.points_with_p99, share(b.points_beyond, b.points_with_p99), b.points - b.points_with_p99, b.atoms_beyond_trusted, b.atoms_trusted, share(b.atoms_beyond_trusted, b.atoms_trusted), b.atoms_beyond_untrusted);
                 let _ = writeln!(o, "      per point while the class verdict was trusted: {} beyond the p99 (the generalisation-gap statistic), {} beyond 1× the force bound or the energy tier (the restated C1, fix round 3), of {} points", b.points_beyond_trusted, b.points_beyond_bound_trusted, b.points_trusted);
                 let _ = writeln!(o, "      err/p99 per point (max over its atoms): {}; per atom: {}", quantiles(&b.err_over_p99_point), quantiles(&b.err_over_p99_atom));
@@ -1959,7 +1969,7 @@ fn trust_baseline_report() {
     active_learning_run(Some(&mut al), every);
     let mut out = String::new();
     let _ = writeln!(out, "# M8a trust measurement (`validate::surrogate::trust_baseline_report`, {} UTC; {} ({:?}); teacher GpuKs σ = h = {H}, {N_H2}³, tol {TOL_H2:e}; audit every {every}; wall {:.0} s; the class verdict in force: the calibrated, hysteretic one of M8a Task 2 fix round 3 — the measured error with the LOO floor over an evidence window of model generations, the worst-atom guard on entry, rules 6/7 inflated by the class's λ; ENTER {:.3}, LEAVE {:.1}, MIN_EVIDENCE {}, WORST_ATOM {:.0}, WINDOW_POINTS {})\n", chrono_free_date(), ctx.adapter.get_info().name, ctx.adapter.get_info().backend, t.elapsed().as_secs_f64(), providers::surrogate::ENTER, providers::surrogate::LEAVE, providers::surrogate::MIN_EVIDENCE, providers::surrogate::WORST_ATOM, providers::surrogate::WINDOW_POINTS);
-    let _ = writeln!(out, "Per environment class (rule 4b) and per kind of point (audits — the model answered and the teacher checked; fallbacks — a rule refused the model's answer and the teacher answered, the model's prediction with its variance recorded alongside): points and atoms, how many lie beyond the fit's in-domain 99th-percentile leave-one-out force error (a generalisation-gap statistic; the brief's \"missed large error\" is its per-atom form while the class verdict was trusted), the calibration ratio z = ‖ΔF‖/pred_force_std (E[z²] = 1 when calibrated; only the rms is shape-free), and the class verdict's consecutive-step flips. Per-point counts are the independent ones: the model's ΣF = 0 makes a dimer's two atoms one draw. A measurement, not a gate.\n");
+    let _ = writeln!(out, "Per environment class (rule 4b) and per kind of point (audits — the model answered and the teacher checked; fallbacks — a rule refused the model's answer and the teacher answered, the model's prediction with its variance recorded alongside): points and atoms, how many lie beyond the fit's in-domain 99th-percentile leave-one-out force error (a generalisation-gap statistic, reported per atom while the class verdict was trusted; the missed large errors are the restated C1's, beyond 1× the bound or the tier), the calibration ratio z = ‖ΔF‖/pred_force_std (E[z²] = 1 when calibrated; only the rms is shape-free), and the class verdict's consecutive-step flips. Per-point counts are the independent ones: the model's ΣF = 0 makes a dimer's two atoms one draw. A measurement, not a gate.\n");
     out += &repro.report();
     out += &al.report();
     println!("{out}");

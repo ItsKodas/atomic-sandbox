@@ -281,12 +281,16 @@ enter P_A. A tick decides before the variance is computed and forces it.
   - It is one fit interval of the harness and about 6–9 τ_int of z², so successive ticks are near
     independent.
 - **How ticks are served.**
-  - **In the app,** ticks go asynchronously to the background auditor only, never in-step.
+  - **In the app, while its background auditor lives,** ticks go asynchronously to it, never
+    in-step: they never put a teacher step into the trajectory.
   - A tick that falls due while the auditor is busy is **skipped, not deferred**, whatever answers
     the step, so the skip does not read σ. Skips are counted and reported.
   - A tick at a fallback needs no solve: the teacher's answer and the model's std are both at hand.
   - A tick at an answered step is an extra audit, judged by rule 8 as well.
-  - **In-step ticks exist only on paths with no auditor:** the CPU in-step path and the harness.
+  - **In-step ticks exist only on paths with no auditor:** the CPU in-step path, the harness, and
+    an app whose auditor thread has died (it falls back to in-step, as rule 8 does; Task 9 physics
+    review M2). There a tick is a teacher step inside the model's MD, measured in the harness at
+    drift 3.1e-7 Ha/ps against a model-only −2.6e-11 (references, "Trust tightening").
 - **The effective cadence** (rev. after the Task 7 re-review, R2) is 25 + D in-envelope steps after
   every tick, D ≈ t_solve/t_step with an auditor (the dead time below), 0 without one:
   - 36–48 at 12 ms/step (solves of 130–270 ms: D = 11–23);
