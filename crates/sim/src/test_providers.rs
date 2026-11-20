@@ -395,6 +395,22 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         Trainable::poll_refit_background(&mut *self.lock())
     }
 
+    fn fit_inputs_gen(&self) -> Option<u64> {
+        Trainable::fit_inputs_gen(&*self.lock())
+    }
+
+    fn set_fits_in_background(&mut self, on: bool) {
+        Trainable::set_fits_in_background(&mut *self.lock(), on)
+    }
+
+    fn first_fit_ready(&self) -> bool {
+        Trainable::first_fit_ready(&*self.lock())
+    }
+
+    fn request_first_fit(&mut self) -> bool {
+        Trainable::request_first_fit(&mut *self.lock())
+    }
+
     fn forget(&mut self) {
         Trainable::forget(&mut *self.lock())
     }
@@ -489,6 +505,10 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
 
     fn pending_refit(&self) -> bool {
         Trainable::pending_refit(&*self.lock())
+    }
+
+    fn audits_background(&self) -> bool {
+        Trainable::audits_background(&*self.lock())
     }
 
     fn set_audit_every(&mut self, n: usize) {

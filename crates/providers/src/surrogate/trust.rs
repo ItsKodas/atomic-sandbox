@@ -507,6 +507,7 @@ pub(super) struct FitState {
     pub(super) envelope: Option<Envelope>,
     pub(super) null_space: Option<NullSpace>,
     pub(super) null_space_pending: bool,
+    pub(super) trial_fit: bool,
     pub(super) active_set: Option<ActiveSet>,
     pub(super) training_residuals: Option<TrainingResiduals>,
     pub(super) misfit: Option<Misfit>,
@@ -812,6 +813,10 @@ impl SurrogateKs {
     /// "Class-wise trust", "Readiness"): one pass sets `class_loo` and `class_worst`.
     pub(super) fn refresh_class_loo(&mut self) {
         let _prof = surrogate::prof::span("P2 refresh_class_loo");
+        #[cfg(test)]
+        {
+            self.class_loo_refreshes += 1;
+        }
         self.refit_stage(sim::RefitStage::LeaveOneOut);
         let (loo, worst, blockers, ratios) = self.compute_class_loo_full();
         // the per-sample leave-one-out ratios of this fit (spec ruling R1b), keyed to it
@@ -1927,6 +1932,10 @@ impl SurrogateKs {
     /// A trust failure the recovery (degree cap, quarantine) can act on: the training residuals
     /// or the force noise.
     pub(super) fn recoverable_fail(&self) -> bool {
+        #[cfg(test)]
+        if self.forced_fail_gen == Some(self.model_gen) {
+            return true; // the `confirm_fail` seam's fit (`tests/recovery_warm.rs`)
+        }
         self.residuals_fail() || self.noise_fails()
     }
 
@@ -1940,6 +1949,7 @@ impl SurrogateKs {
             envelope: self.envelope.clone(),
             null_space: self.null_space.clone(),
             null_space_pending: self.null_space_pending,
+            trial_fit: self.trial_fit,
             active_set: self.active_set.clone(),
             training_residuals: self.training_residuals,
             misfit: self.misfit.clone(),
@@ -1968,6 +1978,7 @@ impl SurrogateKs {
         self.envelope = s.envelope;
         self.null_space = s.null_space;
         self.null_space_pending = s.null_space_pending;
+        self.trial_fit = s.trial_fit;
         self.active_set = s.active_set;
         self.training_residuals = s.training_residuals;
         self.misfit = s.misfit;
@@ -1994,7 +2005,7 @@ impl SurrogateKs {
     /// quarantined samples; no surface bookkeeping (`refit` does it once). With the trust passes:
     /// the training residuals, the class-wise leave-one-out and the active set.
     pub(super) fn fit_store(&mut self) -> Result<FitReport, FitError> {
-        self.fit_store_with(true)
+        self.fit_store_with(true, None)
     }
 
     /// [`fit_store`](Self::fit_store) inside a refit: the training residuals and the sample floor's
@@ -2006,15 +2017,84 @@ impl SurrogateKs {
     /// refit's own decisions do not: `refit_fits`; `judge_held_out`, whose `geometry_refusal`
     /// reads rules 5d and 5e, runs `ensure_trust_passes` first).
     pub(super) fn fit_store_deferred(&mut self) -> Result<FitReport, FitError> {
-        // the equivalence tests' reference: every fit with its passes, as before the deferral
-        #[cfg(test)]
-        if self.eager_trust_passes {
-            return self.fit_store_with(true);
-        }
-        self.fit_store_with(false)
+        self.fit_store_with(self.trust_passes_inside_refit(), None)
     }
 
-    fn fit_store_with(&mut self, trust_passes: bool) -> Result<FitReport, FitError> {
+    /// Whether a fit inside a refit computes its trust passes: never (`fit_store_deferred`), but
+    /// every fit in the equivalence tests' reference (`eager_trust_passes`: every fit with its
+    /// passes, as before the deferral).
+    fn trust_passes_inside_refit(&self) -> bool {
+        #[cfg(test)]
+        if self.eager_trust_passes {
+            return true;
+        }
+        false
+    }
+
+    /// A trust recovery's quarantine trial ([`fit_store_deferred`](Self::fit_store_deferred) after
+    /// the trial's codes are set, or step 3's degree cap; spec 2026-11-17, option B — not the cap
+    /// retries of steps 1 and 1b, fix round 1): its hyperparameter search starts
+    /// from the most recent fit's (λ, s_E, s_F) — the fit in place, `report` — instead of the
+    /// data's own levels (`surrogate::Accumulator::refit_from`). The fit in place may be on another
+    /// basis (a cap toggled, the entry fit restored): the noise levels are physical, and the search
+    /// ignores a start that is not finite and positive and converges from any other. On a
+    /// body-4 basis the fit is then a trial (`trial_fit`) until [`confirm_cold`](Self::confirm_cold)
+    /// searches it from the data; a basis without body-4 has no start, and its fit is cold.
+    pub(super) fn fit_trial(&mut self) -> Result<FitReport, FitError> {
+        let start = self.report.as_ref().map(FitReport::search_start);
+        self.fit_store_with(self.trust_passes_inside_refit(), start)
+    }
+
+    /// The trust recovery's acceptance of the fit in place (spec 2026-11-17, option B): `accept` is
+    /// the check that would let it stand. A trial (`trial_fit`) is first refitted on the same
+    /// state with the search from the data — its own accumulator, whose statistics are the store
+    /// state's and which a started search left without a warm state, so this is the cold search
+    /// a rebuild (or a reopened collection) computes, bit for bit — and `accept` is judged on that
+    /// cold fit. `Some(report)` of the fit that may stand when it passes; `None` when it fails or
+    /// the cold fit fails to solve: the trial counts as failed, and the caller goes on exactly as
+    /// after a failed trial (the codes, `degree_cap` and the note are untouched here; the cold fit,
+    /// a fit of the current codes that leaves `species_dirty` as any fit does, or the trial on a
+    /// solve error, is in place). A fit that is not a trial (already cold, the dense path, a
+    /// restored one) is judged as it is, at no cost.
+    pub(super) fn confirm_cold(&mut self, accept: impl Fn(&Self) -> bool) -> Option<FitReport> {
+        #[cfg(test)]
+        let (call, before, refitted) = {
+            self.confirm_calls += 1;
+            (self.confirm_calls - 1, (self.quarantine.clone(), self.degree_cap, self.recovery.clone(), self.species_dirty), self.trial_fit)
+        };
+        if self.trial_fit {
+            // the trial's own null space is never needed: the cold fit replaces the trial
+            // (`fit_store_with` would compute it first on its incremental path, O(Q′³))
+            let pending = std::mem::replace(&mut self.null_space_pending, false);
+            if self.fit_store_with(self.trust_passes_inside_refit(), None).is_err() {
+                // the trial remains in place, its null space still to compute
+                self.null_space_pending = pending;
+                return None;
+            }
+        }
+        #[cfg(test)]
+        if self.confirm_fail == Some(call) {
+            self.forced_fail_gen = Some(self.model_gen);
+            self.confirm_failed = Some(ConfirmFailed {
+                before,
+                after: (self.quarantine.clone(), self.degree_cap, self.recovery.clone(), self.species_dirty),
+                refitted,
+                trial_fit: self.trial_fit,
+                report: self.report.clone(),
+                model: self.model.clone(),
+            });
+            return None;
+        }
+        if accept(self) {
+            self.report.clone()
+        } else {
+            None
+        }
+    }
+
+    /// The fit itself: `fit_store`, `fit_store_deferred` and `fit_trial` with the trust passes or
+    /// not, the search from `start` (a recovery trial's) or from the data (`None`).
+    fn fit_store_with(&mut self, trust_passes: bool, start: Option<surrogate::SearchStart>) -> Result<FitReport, FitError> {
         let _prof = surrogate::prof::span("P2 fit_store_with (one fit)");
         // a background refit's copy whose provider let it go stops here (`background`); its result
         // is never installed, so the error's kind is never shown
@@ -2084,7 +2164,7 @@ impl SurrogateKs {
         accumulated = store.len();
         // `refit` = `solve` for a basis without body-4, bit for bit; the warm or spectral path for a
         // collection's body-4 basis (`surrogate::fit`, "The large-basis path")
-        let solved = acc.refit(&opts, &provenance, &refs);
+        let solved = acc.refit_from(&opts, &provenance, &refs, start);
         let (model, report) = match solved {
             Ok(x) => x,
             Err(e) => {
@@ -2096,6 +2176,10 @@ impl SurrogateKs {
             }
         };
         self.envelope = Some(acc.envelope.clone());
+        // a search from a start is a recovery trial's, which never stands as it is (`confirm_cold`)
+        self.trial_fit = matches!(acc.last_refit(), surrogate::RefitKind::Spectral { from_start: true, .. });
+        #[cfg(test)]
+        self.fit_log.push((acc.last_refit(), acc.basis.degree_cap));
         // the null space with the trust passes: now, or once for the fit that stands
         // (`ensure_null_space`; the accumulator and the model below are what it is built from)
         if trust_passes {

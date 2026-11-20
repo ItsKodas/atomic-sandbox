@@ -294,6 +294,7 @@ impl SurrogateKs {
         }
         let held = self.samples();
         // a clean slate (a previous collection is flushed and released)
+        self.discard_pass_tail("a shared collection was attached");
         self.forget();
         let n = store.len();
         self.face = vec![f64::NAN; n];
@@ -306,7 +307,9 @@ impl SurrogateKs {
         // and samples with stray atoms until a composition check measures them (`Q_STRAY`, never written)
         let stray = self.hold_out_stray(r_cut);
         self.refs_dirty = true;
-        self.pending_refit = n > 0;
+        if n > 0 {
+            self.arm_refit();
+        }
         // the collection's audit history (module doc); its generations are the writers', so this
         // provider's generation moves past them (as `install_sidecar` does)
         let newest = c.history.iter().map(|p| p.model_gen).max().unwrap_or(0);
@@ -377,7 +380,11 @@ impl SurrogateKs {
             return Ok(());
         }
         if self.no_model().is_some_and(|nm| nm.missing.is_empty() && nm.retry) {
-            if let Err(e) = SurrogateKs::refit(self) {
+            if self.fits_in_background {
+                // the caller fits it, in the background (`Trainable::set_fits_in_background`;
+                // quiet refits 2026-11-17: a collection's first fit took 2 min on the worker thread)
+                self.first_fit_due = true;
+            } else if let Err(e) = SurrogateKs::refit(self) {
                 self.last_fit_error = Some(e.to_string());
             }
         }
@@ -968,7 +975,11 @@ impl SurrogateKs {
         }
         if changed {
             self.species_dirty = true;
-            self.pending_refit = n > 0;
+            if n > 0 {
+                self.arm_refit();
+            } else {
+                self.pending_refit = false;
+            }
         }
     }
 
@@ -1039,7 +1050,7 @@ impl SurrogateKs {
             }
         }
         if report.imported > 0 {
-            self.pending_refit = true;
+            self.arm_refit();
             // each against its own box's references; a box without them waits (module doc)
             self.rebase_collection();
         }
@@ -1164,7 +1175,7 @@ impl SurrogateKs {
             st.provenance.record_masses(&set.provenance.masses);
         }
         if taken > 0 {
-            self.pending_refit = true;
+            self.arm_refit();
             self.user_notes.push(format!("shared collection {slug}: {taken} session-only samples of this session are back (kept beside the collection, never added to it)"));
             let r_cut = self.cutoff();
             let lone = self.hold_out_lone(r_cut);
@@ -1593,6 +1604,8 @@ impl SurrogateKs {
         let slot = self.migration.as_ref().ok_or_else(|| format!("the shared collection {} has no collection of the previous solver to re-solve", sh.coll.key.slug()))?;
         let policy = policy_of_tag(&sh.coll.key.ionic).ok_or_else(|| format!("the shared collection's ionic tag {} is not this build's", sh.coll.key.ionic))?;
         let m = Migrator::start(&slot.source, sh.coll.folder(), &sh.coll.key, policy, self.cutoff(), slot.log.clone())?;
+        // a previous pass's tail first, before this pass touches any state (`drop_pass_tail`)
+        self.drop_pass_tail(super::NEW_PASS_FIRST);
         let slot = self.migration.as_mut().expect("checked above");
         slot.log = Some(m.log().clone());
         slot.samples = m.source_samples();

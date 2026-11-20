@@ -136,6 +136,7 @@ fn unit_scale_model(rng: &mut StdRng, basis: Basis, pos: &[[f64; 3]], z: &[u8]) 
         n_samples: 0,
         provenance: provenance(),
         representatives: std::sync::OnceLock::new(),
+        variance_support: surrogate::model::SupportCache::new(),
         basis,
     }
 }

@@ -557,8 +557,10 @@ fn taught(scene: Scene, ctx: GpuContext, autosave: Option<PathBuf>) -> (SimWorke
     let t = Instant::now();
     w.send(Command::EnsureModel { autoload: None, plan: test_plan(), auto_pass: true });
     snapshot_until(&w, "a running pass", |s| sampling_active(&s.dynamics));
+    // (`!working`: a refit the pass's round made due runs in the background — quiet refits fix
+    // round 1 — and lands before the caller reads the model)
     let s = snapshot_until(&w, "the end of the pass", |s| {
-        s.dynamics.sampling.as_ref().is_some_and(|p| p.finished)
+        s.dynamics.sampling.as_ref().is_some_and(|p| p.finished) && !s.working
     });
     let wall = t.elapsed();
     let m = model(&s);
@@ -641,6 +643,8 @@ fn enabling_estimated_without_a_model_starts_a_sampling_pass() {
         }
     };
     assert!(done.len() >= 3, "progress seen at {done:?} only");
+    // the pass's fit runs in the background (quiet refits round 2): the model lands after the end
+    let end = if model(&end).fitted && !end.working { end } else { snapshot_until(&w, "the pass's fit landed", |s| model(s).fitted && !s.working) };
     let pass = t.elapsed();
     let p = end.dynamics.sampling.clone().unwrap();
     assert!(!p.cancelled && p.done == p.total, "{p:?}");
@@ -720,8 +724,10 @@ fn fallbacks_are_visible_in_snapshots() {
     let n0 = model(&trained).samples;
     w.send(Command::MoveNucleus { index: 0, pos: [0.4, 0.0, 0.0] });
     w.send(Command::MoveNucleus { index: 1, pos: [-0.4, 0.0, 0.0] });
-    let s = snapshot_until(&w, "the evaluation at R = 0.8", |s| {
-        !s.dynamics.forces_stale && s.dynamics.scene.nuclei[0].pos[0] == 0.4 && s.dynamics.scene.nuclei[1].pos[0] == -0.4
+    // (`!working`: the paused refit of the kept sample runs in the background — quiet refits fix
+    // round 1 — and the snapshot that shows it landed is the first idle one)
+    let s = snapshot_until(&w, "the evaluation at R = 0.8 and its refit", |s| {
+        !s.dynamics.forces_stale && s.dynamics.scene.nuclei[0].pos[0] == 0.4 && s.dynamics.scene.nuclei[1].pos[0] == -0.4 && !s.working
     });
     let d = &s.dynamics;
     let m = model(&s);
@@ -2540,7 +2546,7 @@ fn views_are_built_only_while_open_and_at_most_every_2_s() {
     let s = snapshots_until(&w, "idle after the teleport", |s| early |= s.activity.views.is_some(), |s| !s.working);
     let idle_at = t_first.elapsed();
     assert!(s.model.as_ref().unwrap().samples > k, "the teleport fell back and was kept");
-    assert!(idle_at < VIEWS_MIN_INTERVAL / 2, "the teleport's round took {idle_at:?}: the test needs it well inside the interval");
+    assert!(idle_at < VIEWS_MIN_INTERVAL / 2, "the teleport's round took {idle_at:?}: the test needs it well inside the interval; {:#?}", s.dynamics.notes);
     assert!(!early, "rebuilt inside the interval");
     // the worker is idle and nothing is sent: the deferred build wakes it at the interval
     let s = snapshot_until(&w, "the deferred views", |s| s.activity.views.is_some());
@@ -2552,11 +2558,15 @@ fn views_are_built_only_while_open_and_at_most_every_2_s() {
     assert_ne!(v.epoch, 0);
     assert_eq!(v.samples, s.model.as_ref().unwrap().samples);
     assert_eq!(v.model_gen, s.model.as_ref().unwrap().model_gen);
-    // a policy change (a new model generation, nothing else moves): rebuilt, again on its own
-    let gen = v.model_gen;
+    // an audit-cadence change moves no fit input and no verdict, so no generation (quiet refits
+    // round 3): nothing to rebuild (a new fit rebuilding on its own is the teleport above)
     w.send(Command::SetAudit(7));
-    let s = snapshot_until(&w, "views after a policy change", |s| s.activity.views.is_some());
-    assert_ne!(s.activity.views.as_ref().unwrap().model_gen, gen);
+    let mut rebuilt = false;
+    snapshots_until(&w, "idle after an audit change", |s| rebuilt |= s.activity.views.is_some(), |s| !s.working);
+    std::thread::sleep(VIEWS_MIN_INTERVAL + Duration::from_millis(100));
+    w.send(Command::Dyn(DynCommand::SetSpeed(4)));
+    snapshots_until(&w, "idle past the interval", |s| rebuilt |= s.activity.views.is_some(), |s| !s.working);
+    assert!(!rebuilt, "an audit change alone rebuilds no view");
     // closed: a change and a wait past the interval build nothing
     w.send(Command::SetActivityViews(false));
     std::thread::sleep(VIEWS_MIN_INTERVAL + Duration::from_millis(100));
@@ -3118,6 +3128,9 @@ impl Trainable for HarrisFake {
     }
     fn pending_refit(&self) -> bool {
         false
+    }
+    fn audits_background(&self) -> bool {
+        true
     }
     fn set_audit_every(&mut self, _n: usize) {}
     fn force_teacher_next(&mut self) {}
@@ -3953,8 +3966,8 @@ fn a_solver_switch_reattaches_the_collection_and_the_autosave_follows_the_mode()
 }
 
 /// M8a Task 9: the knowledge map ships with the fit that made it, the training views closed, and
-/// is not rebuilt while nothing it shows changed; a policy change (a new model generation) ships
-/// it again.
+/// is not rebuilt while nothing it shows changed (an audit-cadence change included); a refit (a new
+/// model generation) ships it again.
 #[test]
 fn the_knowledge_map_ships_when_the_fit_changes() {
     let w = morse_estimated(h2_33());
@@ -3976,8 +3989,511 @@ fn the_knowledge_map_ships_when_the_fit_changes() {
     assert!(map.pairs.len() == 1 && map.pairs[0].samples > 0, "{:?}", map.pairs);
     w.send(Command::Dyn(DynCommand::SetSpeed(3)));
     assert!(idle(&w).activity.knowledge.is_none(), "nothing changed: no rebuild");
+    // an audit-cadence change moves no fit input and no verdict (quiet refits round 3): no rebuild
     w.send(Command::SetAudit(7));
-    snapshot_until(&w, "a map after a policy change", |s| s.activity.knowledge.is_some());
+    assert!(idle(&w).activity.knowledge.is_none(), "an audit change alone: no rebuild");
+    // a new fit (a compressed teleport: a fallback, a sample, a refit — a new model generation)
+    // ships it again
+    w.send(Command::MoveNucleus { index: 1, pos: COMPRESSED });
+    snapshot_until(&w, "a map after a new fit", |s| s.activity.knowledge.is_some());
+}
+
+/// What [`RefitFake`] holds and was asked for (quiet refits, 2026-11-17): the provider's refit
+/// state as `sim::Trainable` shows it, a background refit the test releases, and every refit
+/// started — `"background"` or `"tick"` — with the samples it started on.
+#[derive(Default)]
+struct RefitState {
+    fitted: bool,
+    samples: usize,
+    pending: bool,
+    /// `Trainable::fit_inputs_gen`.
+    gen: u64,
+    /// An attach left its first fit to the worker (`Trainable::first_fit_ready`).
+    first_fit: bool,
+    /// A fit can form from the samples held (every reference in): a Retry leaves it to the worker
+    /// (`Trainable::request_first_fit`).
+    can_form: bool,
+    /// A pass's end left its fit to the worker (`first_fit_ready`, with or without a model; the
+    /// refit that begins carries it).
+    pass_fit: bool,
+    /// Every evaluation keeps a sample (a fallback): appended, a refit due.
+    keep: bool,
+    /// The running background refit: the samples it started on; it lands once `release` is set.
+    running: Option<usize>,
+    release: bool,
+    /// How the next background refit ends: `Ok` installed, `Err(true)` discarded (due again, as
+    /// the provider's conflict leaves it), `Err(false)` failed (the fit's error; still pending).
+    outcome: Option<Result<(), bool>>,
+    /// After an install the provider leaves a refit due by its own outcome: `pending` stays set.
+    sticky: bool,
+    started: Vec<(&'static str, usize)>,
+}
+
+impl RefitState {
+    /// A sample kept (a fallback, a relax check): appended, a refit due.
+    fn keep_one(&mut self) {
+        self.samples += 1;
+        self.pending = true;
+        self.gen += 1;
+    }
+}
+
+/// A stand-in for the estimated solver's refit side, no GPU: Morse H₂ answers every step; its
+/// `sim::Trainable` refit state is [`RefitState`], which the test drives.
+struct RefitFake {
+    inner: sim::MorseDimer,
+    st: Arc<std::sync::Mutex<RefitState>>,
+}
+
+impl RefitFake {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RefitState> {
+        self.st.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl ForceProvider for RefitFake {
+    fn evaluate(&mut self, scene: &sim::Scene, a: &mut dyn FnMut() -> bool) -> Result<sim::ForceResult, sim::ProviderError> {
+        let r = self.inner.evaluate(scene, a);
+        let mut st = self.lock();
+        if st.keep {
+            st.keep_one();
+        }
+        r
+    }
+    fn name(&self) -> &'static str {
+        "refit-fake"
+    }
+    fn reset(&mut self) {}
+    fn as_trainable(&mut self) -> Option<&mut dyn Trainable> {
+        Some(self)
+    }
+}
+
+impl Trainable for RefitFake {
+    fn start_pass(&mut self, _s: &sim::Scene, _p: &SamplingPlan, _r: &mut sim::AtomReferences) -> Result<(), String> {
+        Err("refit-fake: no passes".into())
+    }
+    fn pass_step(&mut self, _a: &mut dyn FnMut() -> bool) -> Result<Option<sim::SamplingProgress>, sim::ProviderError> {
+        Ok(None)
+    }
+    fn cancel_pass(&mut self) {}
+    fn pass_active(&self) -> bool {
+        false
+    }
+    fn progress(&self) -> Option<sim::SamplingProgress> {
+        None
+    }
+    fn refit(&mut self) -> Result<String, String> {
+        let mut st = self.lock();
+        let p = st.samples;
+        st.started.push(("tick", p));
+        (st.fitted, st.pending, st.first_fit) = (true, false, false);
+        Ok(format!("{p} samples"))
+    }
+    fn begin_refit_background(&mut self) -> bool {
+        let mut st = self.lock();
+        if st.running.is_some() || (!st.fitted && !st.first_fit) {
+            return false;
+        }
+        let p = st.samples;
+        st.started.push(("background", p));
+        (st.running, st.release, st.pass_fit) = (Some(p), false, false);
+        true
+    }
+    fn poll_refit_background(&mut self) -> sim::RefitPoll {
+        let mut st = self.lock();
+        let Some(p) = st.running else { return sim::RefitPoll::Idle };
+        if !st.release {
+            return sim::RefitPoll::Running;
+        }
+        st.running = None;
+        match st.outcome.take().unwrap_or(Ok(())) {
+            Ok(()) => {
+                st.fitted = true;
+                st.first_fit = false;
+                st.pending = st.samples > p || st.sticky;
+                sim::RefitPoll::Done(Ok(format!("{p} samples")))
+            }
+            Err(true) => {
+                st.pending = true;
+                sim::RefitPoll::Discarded("background refit discarded: the teach-around rounds changed while it ran — it is due again".into())
+            }
+            Err(false) => sim::RefitPoll::Done(Err("the fit failed".into())),
+        }
+    }
+    fn fit_inputs_gen(&self) -> Option<u64> {
+        Some(self.lock().gen)
+    }
+    fn first_fit_ready(&self) -> bool {
+        let st = self.lock();
+        ((st.first_fit && !st.fitted) || st.pass_fit) && st.running.is_none()
+    }
+    fn request_first_fit(&mut self) -> bool {
+        let mut st = self.lock();
+        if st.fitted || st.running.is_some() || !(st.can_form || st.first_fit) {
+            return false;
+        }
+        (st.first_fit, st.pending) = (true, true);
+        true
+    }
+    fn forget(&mut self) {}
+    fn save(&self, _p: &std::path::Path) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::InvalidInput.into())
+    }
+    fn load(&mut self, _p: &std::path::Path, _s: &sim::Scene) -> Result<(), String> {
+        Err("refit-fake: no files".into())
+    }
+    fn teacher_mut(&mut self) -> &mut dyn ForceProvider {
+        &mut self.inner
+    }
+    fn status(&self, _s: &sim::Scene, _f: &[[f64; 3]]) -> sim::TrainableStatus {
+        let st = self.lock();
+        sim::TrainableStatus {
+            teacher: "morse", fitted: st.fitted, trusted: st.fitted, untrusted_reason: None, samples: st.samples, pending_refit: st.pending, epoch: 0, fit: None,
+            body4_degree: None, residuals: None, force_bound: 0.0, provenance_mismatch: None, provenance: None, audit_every: 0, draft: true,
+            quarantined: 0, superseded: 0, forgotten: 0, forgotten_in_fit: 0, box_excluded: 0, held_out: 0, lone: 0, box_affected: 0,
+            trust_floor: None, unfitted: 0, pending: 0, recovery: None, audits_background: true, audit_in_flight: false, last_audit: None,
+            last_audit_this_fit: false, audits_box_unjudged: 0, stuck: None, class_loo: Vec::new(), solves: Default::default(),
+            trust_checks: Vec::new(), stuck_info: None, model_gen: 0, readiness: None, teach_offer: None, no_model: None, retry_fit: false,
+            model_source: Default::default(), lone_note: None, stray: Vec::new(), stray_held_out: 0, ticks: Default::default(),
+        }
+    }
+    fn fitted(&self) -> bool {
+        self.lock().fitted
+    }
+    fn samples(&self) -> usize {
+        self.lock().samples
+    }
+    fn pending_refit(&self) -> bool {
+        self.lock().pending
+    }
+    fn audits_background(&self) -> bool {
+        true
+    }
+    fn set_audit_every(&mut self, _n: usize) {}
+    fn force_teacher_next(&mut self) {}
+}
+
+/// A worker over a [`RefitFake`] in `st`'s state (paused).
+fn refit_fake(st: RefitState) -> (SimWorker, Arc<std::sync::Mutex<RefitState>>) {
+    let st = Arc::new(std::sync::Mutex::new(st));
+    let s = st.clone();
+    let w = SimWorker::spawn_test(h2_33(), Box::new(move || Box::new(RefitFake { inner: sim::MorseDimer::h2(), st: s.clone() })));
+    (w, st)
+}
+
+/// The refits `st` saw started.
+fn refits_started(st: &Arc<std::sync::Mutex<RefitState>>) -> Vec<(&'static str, usize)> {
+    st.lock().unwrap_or_else(|e| e.into_inner()).started.clone()
+}
+
+/// The snapshots of the next `secs` (the worker ticking, playing or polling); the last one. A
+/// display-only command first makes an idle worker publish one.
+fn snapshots_for(w: &SimWorker, secs: f64) -> Snapshot {
+    let until = Instant::now() + Duration::from_secs_f64(secs);
+    w.send(Command::SetActivityViews(false));
+    let mut last = next_snapshot(w);
+    while Instant::now() < until {
+        match w.recv_timeout(Duration::from_millis(50)) {
+            Some(Event::Snapshot(s)) => last = *s,
+            Some(Event::Error(message)) => panic!("{message}"),
+            _ => {}
+        }
+    }
+    last
+}
+
+/// Quiet refits (2026-11-17, the user: "Can we PLEASE stop refitting all the samples on repeat
+/// whilst in model only mode"): under ⚠ Model only a kept sample makes no refit due — playing, the
+/// samples pile up pending and nothing refits; turning Model only off starts one (playing: in the
+/// background) through the normal throttle.
+#[test]
+fn model_only_keeps_samples_pending_and_leaving_it_starts_one_refit() {
+    let (w, st) = refit_fake(RefitState { fitted: true, samples: 100, ..Default::default() });
+    idle(&w);
+    w.send(Command::SetModelOnly(true));
+    st.lock().unwrap().keep = true;
+    w.send(Command::Dyn(DynCommand::Play));
+    let s = snapshot_until(&w, "samples kept while playing", |s| s.model.as_ref().is_some_and(|m| m.samples >= 110));
+    let s2 = snapshots_for(&w, 1.0);
+    assert!(refits_started(&st).is_empty(), "Model only: no refit: {:?}", refits_started(&st));
+    assert!(model(&s2).pending_refit && model(&s2).samples > model(&s).samples, "the kept samples wait, pending");
+    w.send(Command::SetModelOnly(false));
+    snapshot_until(&w, "the refit after Model only", |s| model(s).refit_running);
+    let started = refits_started(&st);
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(started[0].0, "background", "playing: off the step path");
+}
+
+/// … paused too (a relax check or a teleport keeps a sample while paused): Model only holds it;
+/// **Refit now** runs it anyway — the user asked — in the background.
+#[test]
+fn refit_now_runs_in_model_only() {
+    let (w, st) = refit_fake(RefitState { fitted: true, samples: 100, ..Default::default() });
+    idle(&w);
+    w.send(Command::SetModelOnly(true));
+    st.lock().unwrap().keep_one();
+    // a command wakes the paused worker for a round
+    w.send(Command::Dyn(DynCommand::SetSpeed(2)));
+    let s = snapshots_for(&w, 0.5);
+    assert!(model(&s).pending_refit && refits_started(&st).is_empty(), "Model only holds it: {:?}", refits_started(&st));
+    w.send(Command::RefitNow);
+    snapshot_until(&w, "the refit the user asked for", |s| model(s).refit_running);
+    assert_eq!(refits_started(&st), vec![("background", 101)]);
+    st.lock().unwrap().release = true;
+    let s = snapshot_until(&w, "it landed", |s| !model(s).refit_running && model(s).refits == 1);
+    assert!(!model(&s).pending_refit);
+}
+
+/// The repeated 1629-sample refits (refit_times.csv, 2026-11-17: full trust recoveries on 1628,
+/// 1629, then 1629 again): a refit that ran to completion is not started again and again on the
+/// same data. Failed (still pending) or installed with the provider still reporting a refit due:
+/// none more. Discarded (the provider marks it due again): **one** retry (fix round 1: the conflict
+/// may have moved nothing a refit fits), and after a second discard none more. All in the
+/// background, playing.
+#[test]
+fn a_finished_refit_is_not_repeated_without_new_data() {
+    let (w, st) = refit_fake(RefitState { fitted: true, samples: 1628, ..Default::default() });
+    idle(&w);
+    w.send(Command::Dyn(DynCommand::Play));
+    let land = |outcome: Result<(), bool>, n: usize| {
+        snapshot_until(&w, "a refit started", |_| refits_started(&st).len() == n);
+        {
+            let mut s = st.lock().unwrap();
+            s.outcome = Some(outcome);
+            s.sticky = outcome.is_ok();
+            s.release = true;
+        }
+        // ended — or, a discard's retry, already started again in the same round
+        snapshot_until(&w, "it ended", |s| {
+            let f = st.lock().unwrap();
+            (!model(s).refit_running && f.running.is_none()) || f.started.len() > n
+        });
+    };
+    // discarded, retried once, discarded again: no third
+    st.lock().unwrap().keep_one();
+    land(Err(true), 1);
+    land(Err(true), 2);
+    let s = snapshots_for(&w, 1.5);
+    let started = refits_started(&st);
+    assert_eq!(started, vec![("background", 1629), ("background", 1629)], "one retry, then none: {started:?}");
+    assert!(model(&s).pending_refit, "the provider still says a refit is due");
+    // failed, and installed with a refit still due: none more
+    for (k, outcome) in [Err(false), Ok(())].into_iter().enumerate() {
+        st.lock().unwrap().keep_one();
+        land(outcome, 3 + k);
+        let s = snapshots_for(&w, 1.5);
+        let started = refits_started(&st);
+        assert_eq!(started.len(), 3 + k, "{outcome:?}: no second refit on the same data: {started:?}");
+        assert!(model(&s).pending_refit, "{outcome:?}: the provider still says a refit is due");
+    }
+    assert!(refits_started(&st).iter().all(|x| x.0 == "background"), "never in the tick");
+}
+
+/// Fix round 1, the stranded samples: Model only on, a sample kept, **Refit now**, then Model only
+/// off while it runs, and a discard that moved nothing a refit fits (the fake discards it; since
+/// round 3 the real provider's Model only toggle conflicts with nothing — `set_policy` — but a
+/// threshold change or a teach-around count still can). The worker retries once, in the
+/// background, and that one installs.
+#[test]
+fn a_refit_discarded_by_leaving_model_only_is_retried_once_and_installs() {
+    let (w, st) = refit_fake(RefitState { fitted: true, samples: 100, ..Default::default() });
+    idle(&w);
+    w.send(Command::SetModelOnly(true));
+    st.lock().unwrap().keep_one();
+    w.send(Command::RefitNow);
+    snapshot_until(&w, "Refit now's refit", |s| model(s).refit_running);
+    w.send(Command::SetModelOnly(false));
+    {
+        let mut s = st.lock().unwrap();
+        s.outcome = Some(Err(true));
+        s.release = true;
+    }
+    snapshot_until(&w, "the retry", |_| refits_started(&st).len() == 2);
+    {
+        let mut s = st.lock().unwrap();
+        s.outcome = Some(Ok(()));
+        s.release = true;
+    }
+    let s = snapshot_until(&w, "the retry installed", |s| model(s).refits == 1 && !model(s).refit_running);
+    assert!(!model(&s).pending_refit);
+    assert_eq!(refits_started(&st), vec![("background", 101), ("background", 101)]);
+    let _ = snapshots_for(&w, 1.0);
+    assert_eq!(refits_started(&st).len(), 2, "installed: nothing more");
+}
+
+/// … and the retry is still an automatic refit: under Model only it waits (a discard while Model
+/// only stays on retries only once it is turned off).
+#[test]
+fn the_retry_after_a_discard_waits_for_model_only() {
+    let (w, st) = refit_fake(RefitState { fitted: true, samples: 100, ..Default::default() });
+    idle(&w);
+    w.send(Command::SetModelOnly(true));
+    st.lock().unwrap().keep_one();
+    w.send(Command::RefitNow);
+    snapshot_until(&w, "Refit now's refit", |s| model(s).refit_running);
+    {
+        let mut s = st.lock().unwrap();
+        s.outcome = Some(Err(true));
+        s.release = true;
+    }
+    snapshot_until(&w, "discarded", |s| !model(s).refit_running && st.lock().unwrap().running.is_none());
+    let _ = snapshots_for(&w, 1.0);
+    assert_eq!(refits_started(&st).len(), 1, "Model only holds the retry");
+    w.send(Command::SetModelOnly(false));
+    snapshot_until(&w, "the retry after Model only", |_| refits_started(&st).len() == 2);
+}
+
+/// Quiet refits, the "freeze": the first fit after a collection is attached (no model yet; 113 s
+/// for 1627 samples on the worker thread, 2026-11-17) runs in the background while the worker
+/// stays live: the viewer refuses Play until it lands ([`FIRST_FIT_PLAY`], the `ui` test
+/// `play_waits_for_the_first_fit`), but a Step is answered meanwhile, as with no model. It
+/// installs when done, and nothing new: no second refit.
+#[test]
+fn the_first_fit_after_an_attach_runs_in_the_background() {
+    let (w, st) = refit_fake(RefitState { fitted: false, samples: 1627, pending: true, gen: 1, first_fit: true, ..Default::default() });
+    // the attach arrives as a command (`EnsureModel`, `UseModel`): any command makes the round
+    // that starts the fit
+    w.send(Command::Dyn(DynCommand::SetSpeed(2)));
+    let s = snapshot_until(&w, "the first fit started", |s| s.model.as_ref().is_some_and(|m| m.refit_running));
+    assert!(s.dynamics.paused && s.working && model(&s).first_fit_running(), "paused, busy, the first fit running");
+    let step = s.dynamics.step;
+    w.send(Command::Dyn(DynCommand::Step(1)));
+    let b = snapshot_until(&w, "a Step while the first fit runs", |s| s.dynamics.step == step + 1 && !s.dynamics.forces_stale);
+    assert!(model(&b).first_fit_running(), "still fitting; the worker answered the Step");
+    assert_eq!(refits_started(&st), vec![("background", 1627)], "never in the tick");
+    st.lock().unwrap().release = true;
+    let s = snapshot_until(&w, "the first fit installed", |s| model(s).fitted && !model(s).refit_running);
+    assert_eq!(model(&s).refits, 1);
+    let s = snapshots_for(&w, 1.0);
+    assert_eq!(refits_started(&st).len(), 1, "nothing new: no second refit");
+    assert!(!model(&s).pending_refit && !s.working);
+}
+
+/// Fix round 1, Minor 1: the Model tab's Retry of a fit that can form now (every reference in) is
+/// the background first fit, never the provider's fit in place on the worker thread.
+#[test]
+fn retry_of_a_fit_that_can_form_runs_in_the_background() {
+    let (w, st) = refit_fake(RefitState { fitted: false, samples: 1627, pending: true, gen: 1, can_form: true, ..Default::default() });
+    idle(&w);
+    let _ = snapshots_for(&w, 0.5);
+    assert!(refits_started(&st).is_empty(), "no first fit left to the worker: none starts by itself");
+    w.send(Command::Dyn(DynCommand::RetryFit));
+    snapshot_until(&w, "the Retry's fit", |s| model(s).refit_running);
+    assert_eq!(refits_started(&st), vec![("background", 1627)], "not in the tick");
+    st.lock().unwrap().release = true;
+    snapshot_until(&w, "installed", |s| model(s).fitted && !model(s).refit_running);
+}
+
+/// Quiet refits round 2: a pass's end fit is the worker's, in the background — under ⚠ Model only
+/// too (the user's own pass asked for it), once per pass. While it runs the worker answers a Step
+/// and publishes; it installs, and nothing more starts.
+#[test]
+fn a_pass_end_fit_runs_in_the_background_even_in_model_only() {
+    let (w, st) = refit_fake(RefitState { fitted: true, samples: 100, ..Default::default() });
+    idle(&w);
+    w.send(Command::SetModelOnly(true));
+    {
+        // the pass's end: its samples appended, its fit left to the worker
+        let mut s = st.lock().unwrap();
+        s.keep_one();
+        s.pass_fit = true;
+    }
+    w.send(Command::Dyn(DynCommand::SetSpeed(2)));
+    let s = snapshot_until(&w, "the pass's fit running", |s| model(s).refit_running);
+    assert_eq!(refits_started(&st), vec![("background", 101)], "in the background, in Model only");
+    let step = s.dynamics.step;
+    w.send(Command::Dyn(DynCommand::Step(1)));
+    let b = snapshot_until(&w, "a Step while the pass's fit runs", |s| s.dynamics.step == step + 1 && !s.dynamics.forces_stale);
+    assert!(model(&b).refit_running, "still fitting; the worker answered the Step");
+    st.lock().unwrap().release = true;
+    let s = snapshot_until(&w, "the pass's fit installed", |s| model(s).refits == 1 && !model(s).refit_running && !s.working);
+    assert!(!model(&s).pending_refit);
+    let _ = snapshots_for(&w, 1.0);
+    assert_eq!(refits_started(&st).len(), 1, "once per pass");
+}
+
+/// Quiet refits round 3 (review Minor 5): a refit that lands while playing at a paced speed asks
+/// for one more round (`retick`), and that round keeps the pace — before the fix the loop skipped
+/// the pace wait for it, but the early branch (a deadline not yet reached) published without a
+/// round, so the request stood and the worker spun, publishing a snapshot without a tick per loop
+/// until the deadline.
+#[test]
+fn a_refit_landing_while_playing_floods_no_snapshots() {
+    let (w, st) = refit_fake(RefitState { fitted: true, samples: 100, ..Default::default() });
+    idle(&w);
+    w.send(Command::Dyn(DynCommand::Play));
+    st.lock().unwrap().keep_one();
+    snapshot_until(&w, "the refit running, playing", |s| model(s).refit_running && !s.dynamics.paused);
+    st.lock().unwrap().release = true;
+    let s = snapshot_until(&w, "the refit landed", |s| !model(s).refit_running && model(s).refits == 1);
+    // the snapshots after the landing: each one a tick's (its step moved) — no command is sent
+    let (mut last, mut n, mut repeats) = (s.dynamics.step, 0usize, 0usize);
+    let until = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < until {
+        match w.recv_timeout(Duration::from_millis(50)) {
+            Some(Event::Snapshot(s)) => {
+                n += 1;
+                if s.dynamics.step == last {
+                    repeats += 1;
+                }
+                last = s.dynamics.step;
+            }
+            Some(Event::Error(message)) => panic!("{message}"),
+            _ => {}
+        }
+    }
+    assert!(n > 5, "still playing: {n} snapshots");
+    assert!(repeats <= 1, "{repeats} of {n} snapshots after the landing were published without a tick");
+}
+
+/// … with the real provider: an automatic pass on Morse H₂ ends, its fit is left to the worker and
+/// lands in the background (the refit's note says so), and the pass's outcome note — refit on N
+/// samples, trusted — follows the install, before the worker is idle.
+#[test]
+fn a_real_pass_end_fit_lands_in_the_background() {
+    let w = morse_estimated(h2_33());
+    idle(&w);
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default(), auto_pass: true });
+    let s = snapshot_until(&w, "the pass's fit landed", |s| pass_done(s) && s.model.as_ref().is_some_and(|m| m.fitted));
+    let notes: Vec<String> = s.dynamics.notes.iter().cloned().collect();
+    let deferred = notes.iter().position(|n| n.contains("the refit runs in the background — its outcome follows when it lands"));
+    let outcome = notes.iter().position(|n| n.contains("sampling pass finished") && n.contains("refit on"));
+    let refit = notes.iter().position(|n| n.contains(": refit #") && n.contains("(background)"));
+    assert!(deferred.is_some() && outcome.is_some() && refit.is_some(), "{notes:#?}");
+    assert!(deferred < outcome && outcome < refit, "deferred, then the outcome at the install, then the refit's note: {notes:#?}");
+    assert!(model(&s).trusted, "{:?}", model(&s).untrusted_reason);
+}
+
+/// The three-atom map (spec 2026-11-17 §6.4): `SetTripleView` is a display setting; the map is
+/// built only while shown, once when turned on, not again while nothing changed, again after a new
+/// model generation, and not while hidden.
+#[test]
+fn the_triple_map_ships_only_while_shown() {
+    assert!(![Command::SetTripleView(true).is_edit(), Command::SetTripleView(true).pauses(), Command::SetTripleView(true).reaches_driver(), Command::SetTripleView(true).aborts()].contains(&true));
+    let w = morse_estimated(h2_33());
+    idle(&w);
+    w.send(Command::EnsureModel { autoload: None, plan: SamplingPlan::default(), auto_pass: true });
+    let mut early = false;
+    snapshots_until(&w, "a fitted model", |s| early |= s.activity.triples.is_some(), |s| s.model.as_ref().is_some_and(|m| m.fitted) && !s.working);
+    assert!(!early, "not built while hidden");
+    w.send(Command::SetTripleView(true));
+    let s = snapshot_until(&w, "the triple map", |s| s.activity.triples.is_some());
+    let t = s.activity.triples.as_ref().unwrap();
+    assert!(t.types.is_empty() && t.span(1, 1).is_some(), "H₂ holds no triple, but its H–H span is there");
+    w.send(Command::Dyn(DynCommand::SetSpeed(3)));
+    assert!(idle(&w).activity.triples.is_none(), "nothing changed: no rebuild");
+    // hidden: a new fit (a compressed teleport: a fallback, a sample, a refit — a new model
+    // generation; an audit-cadence change moves none since quiet refits round 3) rebuilds the
+    // knowledge map, not the triple map
+    w.send(Command::SetTripleView(false));
+    w.send(Command::MoveNucleus { index: 1, pos: COMPRESSED });
+    let mut built = false;
+    snapshots_until(&w, "the knowledge map after the new fit", |s| built |= s.activity.triples.is_some(), |s| s.activity.knowledge.is_some());
+    assert!(!built, "hidden: not built");
+    // shown again: built for the new generation
+    w.send(Command::SetTripleView(true));
+    snapshot_until(&w, "a rebuild for the new model generation", |s| s.activity.triples.is_some());
 }
 
 /// Plan 2026-11-13 Task 8 review M7: the sampling teacher's tolerance is the one the `branch_jump` guard's sample tier

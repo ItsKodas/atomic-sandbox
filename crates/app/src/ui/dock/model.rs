@@ -812,14 +812,17 @@ fn teach(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, m: Option<&Model
             if crate::sim::box_blocks_trust(m).is_some() {
                 warnbox(ui, &super::super::box_advice(input.scene, st));
             }
-            no_model_row(ui, m, sampling, acts);
+            // fixed ids: the warnings above come and go between frames (`fixed_row`)
+            if m.no_model.is_some() {
+                fixed_row(ui, "no-model-row", |ui| no_model_row(ui, m, sampling, acts));
+            }
             teach_row(ui, m, sampling, acts);
         }
         if let Some(p) = d.and_then(|d| d.sampling.as_ref()).filter(|_| sampling) {
             progress(ui, p, m);
         }
         if let Some(o) = m.and_then(|m| m.pass_offer.as_ref()).filter(|_| !sampling) {
-            offer(ui, o, acts);
+            fixed_row(ui, "offer-row", |ui| offer(ui, o, acts));
             lone_note(ui, input, "lone-note-offer");
         }
         if m.is_some_and(|m| m.fitted) {
@@ -1838,6 +1841,34 @@ pub fn teach_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Ac
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(40));
         (0.5 + 0.5 * (ui.input(|i| i.time) * 3.5).sin()) as f32
     };
+    // a fixed id (user report 2026-11-18, "needs two clicks"): see `fixed_row`
+    fixed_row(ui, "teach-row", |ui| teach_box(ui, o, label.as_deref(), pulse, sampling, acts));
+    for (i, c, ins, why) in &o.refused {
+        ui.weak(format!("#{i} ({c}, in-sample {ins:.2}×): not taught — {why}"));
+    }
+    if o.refused_total > o.refused.len() {
+        ui.weak(format!("… and {} more not taught", o.refused_total - o.refused.len()));
+    }
+    if !o.blockers.is_empty() {
+        for n in &o.notes {
+            ui.weak(n);
+        }
+    }
+}
+
+/// `add` in a child `Ui` whose id is fixed: `ui.id()` (the parent's stable id, not its running
+/// widget count) with `name`. User report 2026-11-18: "Fix it: Teach around N blockers" needed two
+/// clicks. egui derives a widget's id from the widgets drawn before it in the same `Ui` (a salted
+/// child too, in 0.36: its ids still mix in the parent's count), so a warning that appeared above
+/// the button between the press and the release gave it a new id mid-click — and egui drops a click
+/// whose pressed widget is gone. Rows with buttons below optional content use this.
+fn fixed_row<R>(ui: &mut Ui, name: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let id = ui.id().with(name);
+    ui.scope_builder(egui::UiBuilder::new().id(id), add).inner
+}
+
+/// The amber box of [`teach_row`]: the prompt and the "Fix it: …" button.
+fn teach_box(ui: &mut Ui, o: &::sim::TeachOffer, label: Option<&str>, pulse: f32, sampling: bool, acts: &mut Vec<Action>) {
     egui::Frame::new()
         .fill(AMBER.gamma_multiply(0.08))
         .stroke(egui::Stroke::new(2.0, AMBER.gamma_multiply(0.25 + 0.75 * pulse))) // fixed width: only the brightness pulses (a width change moved the layout)
@@ -1855,8 +1886,7 @@ pub fn teach_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Ac
                     .fill(AMBER)
                     .corner_radius(6)
                     .min_size(egui::Vec2::new(ui.available_width().min(360.0), 32.0));
-                if ui
-                    .add_enabled(!sampling, button)
+                if super::super::probed("teach-around", ui.add_enabled(!sampling, button))
                     .on_disabled_hover_text("a pass is running")
                     .on_hover_text(format!(
                         "a targeted pass around the training samples that keep a class untrusted: {}. About 10 DFT solves each — random nudges each clearly apart from the sample and from each other, and steps toward its nearest learned neighbour — of which 2 are held out to check the result. Accepted only if the unchanged class rule then passes with the sample still in the fit and the checks pass; at most two rounds. Pauses the dynamics.",
@@ -1868,17 +1898,6 @@ pub fn teach_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, acts: &mut Vec<Ac
                 }
             }
         });
-    for (i, c, ins, why) in &o.refused {
-        ui.weak(format!("#{i} ({c}, in-sample {ins:.2}×): not taught — {why}"));
-    }
-    if o.refused_total > o.refused.len() {
-        ui.weak(format!("… and {} more not taught", o.refused_total - o.refused.len()));
-    }
-    if !o.blockers.is_empty() {
-        for n in &o.notes {
-            ui.weak(n);
-        }
-    }
 }
 
 /// The amber note on atoms with no neighbour within the model's cutoff (`ModelStatus::lone_note`):

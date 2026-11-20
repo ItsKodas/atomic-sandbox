@@ -48,8 +48,9 @@ use std::collections::BTreeSet;
 
 /// Every atom pair (a, b), a < b, of sample `s` that the map counts: closer than r_cut (`rc2` its
 /// square) and at least one of the two atoms trained (module doc, "Capped segments"), with its
-/// species pair (min Z, max Z) and its squared distance.
-fn each_pair(s: &Sample, rc2: f64, mut f: impl FnMut(usize, usize, (u8, u8), f64)) {
+/// species pair (min Z, max Z) and its squared distance. The triple map's spans read it too
+/// (`triples.rs`).
+pub(super) fn each_pair(s: &Sample, rc2: f64, mut f: impl FnMut(usize, usize, (u8, u8), f64)) {
     let n = s.pos.len();
     for a in 0..n {
         for b in a + 1..n {
@@ -62,19 +63,24 @@ fn each_pair(s: &Sample, rc2: f64, mut f: impl FnMut(usize, usize, (u8, u8), f64
     }
 }
 
+/// The pair histograms' bin count at cutoff `r_cut` (Bohr): ⌈r_cut/[`BIN`]⌉, at least one.
+pub(super) fn pair_bins(r_cut: f64) -> usize {
+    ((r_cut / BIN).ceil() as usize).max(1)
+}
+
+/// The histogram bin of a pair at squared distance `r2` among `n_bins` ([`pair_bins`]).
+pub(super) fn pair_bin(r2: f64, n_bins: usize) -> usize {
+    ((r2.sqrt() / BIN) as usize).min(n_bins - 1)
+}
+
 impl SurrogateKs {
     /// The knowledge map of the fit that stands (module doc); `None` without a model or a store.
     pub fn knowledge_map(&self) -> Option<KnowledgeMap> {
         let (_, store) = (self.model.as_ref()?, self.store.as_ref()?);
         let r_cut = self.cutoff();
         let rc2 = r_cut * r_cut;
-        let n_bins = ((r_cut / BIN).ceil() as usize).max(1);
-        let fitted: Vec<&Sample> = store.samples[..self.accumulated.min(store.len())]
-            .iter()
-            .enumerate()
-            .filter(|(i, s)| !self.excluded(*i) && !self.in_misfit(*i) && s.z.len() == s.pos.len())
-            .map(|(_, s)| s)
-            .collect();
+        let n_bins = pair_bins(r_cut);
+        let fitted: Vec<&Sample> = self.fitted_indices().into_iter().map(|i| &store.samples[i]).collect();
         let d2 = |a: [f64; 3], b: [f64; 3]| (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>();
 
         // pass 1: atoms, coordination, pair samples and distances, and the keys each pair is met in
@@ -90,7 +96,7 @@ impl SurrogateKs {
                 coord[b] += 1;
                 seen.insert(key);
                 let h = &mut pairs.entry(key).or_insert_with(|| (0, vec![0; n_bins])).1;
-                h[((r2.sqrt() / BIN) as usize).min(n_bins - 1)] += 1;
+                h[pair_bin(r2, n_bins)] += 1;
             });
             for key in seen {
                 pairs.get_mut(&key).expect("a seen pair has a histogram").0 += 1;
@@ -149,7 +155,7 @@ impl SurrogateKs {
             each_pair(s, rc2, |_, _, key, r2| {
                 seen.insert(key);
                 let h = &mut pending_pairs.entry(key).or_insert_with(|| (0, vec![0; n_bins])).1;
-                h[((r2.sqrt() / BIN) as usize).min(n_bins - 1)] += 1;
+                h[pair_bin(r2, n_bins)] += 1;
             });
             for key in seen {
                 pending_pairs.get_mut(&key).expect("a seen pair has a histogram").0 += 1;
@@ -218,6 +224,16 @@ impl SurrogateKs {
             pending_keys,
             pending_classes,
         })
+    }
+
+    /// The stored samples the map counts as fitted (module doc, "The samples counted"), ascending:
+    /// the accumulated prefix, not excluded, not in the misfit set, one Z per position. The triple
+    /// map counts the same ones (`triples.rs`). Empty without a store.
+    pub(super) fn fitted_indices(&self) -> Vec<usize> {
+        let Some(store) = self.store.as_ref() else { return Vec::new() };
+        (0..self.accumulated.min(store.len()))
+            .filter(|&i| !self.excluded(i) && !self.in_misfit(i) && store.samples[i].z.len() == store.samples[i].pos.len())
+            .collect()
     }
 
     /// Whether stored sample `i` is pending (module doc, "The pending samples"): past the fitted

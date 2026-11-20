@@ -138,6 +138,11 @@ pub struct ActivityState {
     /// The knowledge map (M8a Task 9, `ui::knowledge`), kept like `views`: the worker ships it
     /// only when it was rebuilt (`ActivityDelta::knowledge`), and no fitted model means no map.
     pub knowledge: Option<Arc<sim::KnowledgeMap>>,
+    /// The three-atom map (spec 2026-11-17 §6.4), kept exactly as `knowledge`; the worker builds it
+    /// only while the arrangements are shown (`triples_sent` is what it was last told,
+    /// `Command::SetTripleView`).
+    pub triples: Option<Arc<sim::knowledge::TripleMap>>,
+    pub triples_sent: bool,
     pub timeline: Vec<Mark>,
     pub filter: LogFilter,
     /// The Training section is open: the worker builds the views only then (`views_sent` is what
@@ -193,6 +198,8 @@ impl ActivityState {
             views: None,
             views_at: None,
             knowledge: None,
+            triples: None,
+            triples_sent: false,
             timeline: Vec::new(),
             filter: LogFilter { pass: true, fallback: true, audit: true, check: true, kept: true, not_kept: true, orbitals: true },
             training_open: false,
@@ -276,6 +283,7 @@ impl ActivityState {
             self.views = None;
             self.views_at = None;
             self.knowledge = None;
+            self.triples = None;
         } else {
             if let Some(v) = &a.views {
                 self.views = Some(v.clone());
@@ -283,6 +291,9 @@ impl ActivityState {
             }
             if let Some(k) = &a.knowledge {
                 self.knowledge = Some(k.clone());
+            }
+            if let Some(t) = &a.triples {
+                self.triples = Some(t.clone());
             }
         }
         self.provenance_mismatch = s.model.as_ref().is_some_and(|m| m.provenance_mismatch.is_some());

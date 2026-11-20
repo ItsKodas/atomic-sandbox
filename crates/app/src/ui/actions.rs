@@ -367,7 +367,11 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
         Action::Play => {
             // estimated with no model: nothing to play on (the viewer's toggle refuses the same)
             if no_model(st, input) {
-                out.error = Some("the estimated solver has no model to play on: load one (File ▸ Open) or press Start sampling in the Model tab".into());
+                out.error = Some(if input.model().is_some_and(|m| m.first_fit_running()) {
+                    crate::sim::FIRST_FIT_PLAY.into()
+                } else {
+                    "the estimated solver has no model to play on: load one (File ▸ Open) or press Start sampling in the Model tab".into()
+                });
             } else {
                 if starts_play(st, input) {
                     super::rewind::take(st, input);

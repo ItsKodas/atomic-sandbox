@@ -6,7 +6,7 @@ use sim::{atom_coverage, Confidence, KnowledgeMap};
 
 /// A CH₄-like C + 4 H: C–H 1.95–2.15 Bohr along the tetrahedron's directions, each tilted by up
 /// to ~0.1 rad, in the 65³ cell's middle.
-fn random_ch4(rng: &mut StdRng) -> Scene {
+pub(super) fn random_ch4(rng: &mut StdRng) -> Scene {
     let mut sc = in_cell_65(dimer(2.0, [1.0, 0.0, 0.0], [0.0; 3], 6, 1));
     sc.nuclei.clear();
     sc.nuclei.push(Nucleus::new(6, [0.0; 3]));
@@ -42,7 +42,7 @@ fn confidence_from_class_loo(s: &SurrogateKs, m: &KnowledgeMap, a: u8, b: u8) ->
     }
 }
 
-fn h2_and_ch4(n_h2: usize, n_ch4: usize) -> SurrogateKs {
+pub(super) fn h2_and_ch4(n_h2: usize, n_ch4: usize) -> SurrogateKs {
     let mut s = SurrogateKs::new(Box::new(PairMorse(MorseDimer::h2())), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
     for z in [1, 6] {
         s.set_reference_energy(z, MorseDimer::h2().e_atom);
