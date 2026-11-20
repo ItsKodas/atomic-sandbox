@@ -121,10 +121,10 @@
 //!      sample (a released stray atom, or the stray atom of a kept 5a fallback, B = 0) is no
 //!      training atom and never enters the envelope (`surrogate::envelope` module doc, "Isolated
 //!      atoms are not training atoms"): admitted, it would set the minimum to 0 and switch this
-//!      rule off for its species everywhere. A model file whose stored envelope admitted them
-//!      (written before this rule) has its envelope rebuilt from its stored samples at install,
-//!      without a refit (`install_sidecar`, `rebuild_envelope_without_isolated`; a shared
-//!      collection keeps no envelope — its fit is rebuilt from the samples at open).
+//!      rule off for its species everywhere. A model file whose fit admitted them (written before
+//!      this rule) holds those samples out at install (`Q_LONE`, `Q_STRAY`) and its fit is rebuilt
+//!      from its stored samples without them (`install_sidecar`; a shared collection keeps no
+//!      envelope — its fit is rebuilt from the samples at open).
 //!    - **5c, spread**: any feature farther than `max_descriptor_distance` (3.0) training spreads
 //!      outside its per-feature training range (`surrogate::Envelope`, unit in its module doc).
 //!    - **5d, new environment** (M6 Task 11 round 2, controller ruling): a query row (the energy

@@ -11734,7 +11734,7 @@ mod lone;
 mod stray;
 
 /// Isolated atoms are no training atoms: a fitted stray atom leaves the envelope and rule 5b
-/// alone, and an installed file's envelope is rebuilt without them (`envelope_isolated.rs`).
+/// alone (`envelope_isolated.rs`; the install of an older file: `stray.rs`).
 mod envelope_isolated;
 
 /// Spec 2026-11-12 R1: the recovery ranks offenders by their leave-one-out ratio (`recovery_loo.rs`).

@@ -598,20 +598,10 @@ impl SurrogateKs {
                 "surrogate: the file's fit membership ({members} samples, {rows} rows) did not match its report ({want_n}, {want_rows}) or its label sums{} — the fit was rebuilt from its stored samples (no DFT)",
                 if forgot { " (it was saved with a sample forgotten before its refit)" } else { "" }
             ));
-        } else {
-            // the file's fit stands: an envelope that admitted isolated atoms among the fit's
-            // samples (written before they were no training atoms) is rebuilt from the fit's
-            // members (no refit, no DFT). Above, both full rebuilds build it without them. Nothing
-            // before this reads the envelope (it is read per query: the fences, thinning, the
-            // audits re-judged below)
-            let isolated = self.rebuild_envelope_without_isolated();
-            if isolated > 0 {
-                self.user_notes.push(format!(
-                    "model file: its envelope held {isolated} isolated atom{} among the fit's samples (no neighbour within {lone_cut} Bohr) — the envelope was rebuilt from its stored samples without them (no refit, no DFT)",
-                    if isolated == 1 { "" } else { "s" }
-                ));
-            }
         }
+        // (an envelope that admitted isolated atoms needs no rebuild of its own here: every fitted sample with an
+        // isolated atom is a lone sample or one with stray atoms, both held out above, so the fit — and its envelope —
+        // is rebuilt without them; `surrogate::envelope` module doc, "Isolated atoms are not training atoms")
         if lone_in_fit == 0 {
             // held out already (quarantined, box-excluded) or not fitted yet: the fit stands
             self.note_lone_held_out("model file", lone, lone_cut);
@@ -652,48 +642,6 @@ impl SurrogateKs {
             self.user_notes.push(format!("surrogate: {n}"));
         }
         Ok(())
-    }
-
-    /// An installed fit's envelope without the isolated atoms of its members (`surrogate::envelope`
-    /// module doc, "Isolated atoms are not training atoms"): a file written before that rule holds
-    /// an envelope into which its fitted samples' isolated atoms (the stray atom of a kept rule-5a
-    /// fallback) were added — every coordination minimum of their species 0, rule 5b off for it —
-    /// and the samples themselves are not held out, so that envelope would stand until the next
-    /// rebuild of the fit. It is rebuilt here from the members' descriptors (the descriptor cache,
-    /// values only, which the install filled for the active set already; no refit, no DFT), each
-    /// member's trained atoms in store order as `Accumulator::add` adds them, so it is bit for bit the
-    /// envelope a fit of the same members builds today; the accumulator's copy (what a save writes
-    /// and a refit extends) is replaced with it. Returns the isolated atoms found among the members'
-    /// trained atoms when the stored envelope differed from the rebuilt one, else 0 and the stored
-    /// envelope stands. The members are the fit's (`accumulated`, not excluded): called only once
-    /// `install_sidecar` has accepted the file's member set (neither full rebuild fired).
-    pub(super) fn rebuild_envelope_without_isolated(&mut self) -> usize {
-        self.ensure_desc_cache();
-        let (Some(basis), Some(store), Some(stored)) = (self.desc_basis.as_ref(), self.store.as_ref(), self.accumulator.as_ref().map(|a| &a.envelope)) else { return 0 };
-        let n = self.accumulated.min(self.desc_cache.len()).min(store.len());
-        let mut env = Envelope::new(basis);
-        let mut isolated = 0usize;
-        for i in (0..n).filter(|&i| !self.excluded(i)) {
-            let smp = &store.samples[i];
-            for (j, (s, b)) in self.desc_cache[i].iter().enumerate() {
-                if !smp.trains_atom(j) {
-                    continue;
-                }
-                if surrogate::envelope::isolated_atom(basis, b) {
-                    isolated += 1;
-                } else {
-                    env.add_atom(*s, b);
-                }
-            }
-        }
-        if isolated == 0 || env == *stored {
-            return 0;
-        }
-        self.envelope = Some(env.clone());
-        if let Some(acc) = self.accumulator.as_mut() {
-            acc.envelope = env;
-        }
-        isolated
     }
 
     /// Provenance of a sample produced at this scene's settings by this teacher; `masses` is the
