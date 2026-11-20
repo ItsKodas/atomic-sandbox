@@ -6068,3 +6068,31 @@ The second refit with nothing new: 192.6 → 10.6 s. What is left: `NullSpace::o
 
   (σ_F: the force std and its epistemic part, per atom.) The relative 3.4e-3 of the first report was a value of 3.7e-6 moving by 1.3e-8: the absolute differences are at most 0.4 % of a tier.
 - **Across machines.** faer picks its SIMD kernels at run time (AVX-512 here, AVX2 elsewhere), so a refit on a CPU with another instruction set differs from this one by the same ~κε spread — never in a verdict measured here, but a golden compares bit for bit only on the same ISA (the thread count never matters: `dense::SPLIT`).
+
+## Trust tightening (2026-11-19; spec `2026-11-18-trust-tightening-design.md` rev. 2, plan `2026-11-19-trust-tightening.md` Task 9; release, RX 7900 XTX, each GPU binary alone, BelowNormal)
+
+The evidence floor (12 fits and 60 comparisons before the calibrated verdict alone opens a key; below it the key's leave-one-out must pass too), the tail-aware inflations λ_T (forces, bound units) and λ_E (energy, tier units) on rules 6/7, and σ-blind calibration ticks every 25 in-envelope steps. Derivations: `providers::surrogate::calibrate` ("The evidence floor", "The tail-aware inflations") and `providers::surrogate` ("Calibration ticks").
+
+### The gate: `the_stuck_escape_repro_is_answered_honestly`, every constant unchanged
+
+`REPRO_FORCE_RATIO` 3, tier 1e-3, `REPRO_MIN_JUDGED_HOT` 10, `REPRO_BOOKING_RESIDUAL` 1e-9. Run alone 2026-11-20 14:05 at 7498cf96: **pass, 771 s**.
+
+| | 07939ac (pass) | 762159b (fail) | **trust-tighten 7498cf96** |
+|---|---|---|---|
+| test wall | 1036 s | 1378 s | **771 s** (teacher 2396 solves, GPU 646 s) |
+| NVE after the edit | 1 answer, 999 fallbacks | 51 answers (3 judged, worst 8.5e-4 Ha/atom, 2.47×) | 77 answers, 1 judged (4.84e-5, 0.34×), 19 box-affected; 920 teacher-surface + 3 model-surface fallbacks |
+| many-body at the end of NVE | untrusted (κ 5.85, 3 evidence) | **trusted** (κ 3.25, 3 evidence) | untrusted: calibrated 0.951 > 0.707, n_fit 3 / 12, n_pts 8 / 60 |
+| hot heating | 0 fallbacks / 1600 | 1600 / 1600 | 64 / 1600 |
+| hot after the edit | 219 answers, 116 judged, worst 5.23e-4, 1.91×, 0 beyond | 657 answers, 248 judged, worst **2.38e-3, 4.48×, 12 beyond** | **260 answers, 61 judged, worst 9.72e-4 Ha/atom, 1.82×, 0 beyond**; 199 box-affected (worst 2.00e-3) |
+| many-body at the end of the hot run | trusted | trusted | trusted once the floor was met: n_fit 14, n_pts 76 |
+
+- **Per key (the run's own printout).** Pair H{H}: trusted throughout, n_fit 62 → 124, n_pts 302 → 316, λ_sum 10.2 / 5.5 / 3.2 / 4.5 (after NVE heating / NVE end / hot heating / hot end). Many-body H{H}: λ_sum 22.6 while untrusted, 14.7 at the end. **λ_T = λ_E = 1.000 for every key throughout; 0 code-24 refusals**: here the floor, not the tail factors, decides.
+- **Judged z (hot, 61 answers), max_j ‖ΔF_j‖/σ_epi,j:** raw median 17.8, p90 29.6, max 38.4; inflated by the key's λ_F = max(λ_sum, λ_T): median 0.86, p90 1.93, max 2.49, rms 1.21. On √(σ_epi² + 3σ_f²): worst 7.45.
+- **Ticks (the harness has no auditor: all in the step, dead time D = 0, no skips):** NVE heating 54 due, all answered and recorded; NVE after the edit 3 due, all box-affected (unrecorded); hot heating 66 / 66; hot after the edit 15 due (10 at answers), 4 recorded, 11 unrecorded (box-affected).
+- **The fallback-energy check's population (moved, the controller's ruling at Task 9).** In-step ticks at box-affected answers keep the model's energy by the provider's box rule (the gap is the box's Dirichlet confinement). The first run therefore failed on five such steps (NVE 779, 804, 870; hot 314, 389; 1.42–8.86e-3 Ha/atom at face densities 2.1e-5–6.2e-4). The check now excludes in-step audit/tick steps whose structured verdict is `BoxAffected`, as the answer check already excludes box-affected answers. Excluded: NVE 3, hot 9 (face densities 2.02e-5–6.20e-4). The remaining model-surface fallbacks: worst |gap|/N 9.86e-4 (hot).
+- **Step 3b (Task 7 review I1/R1).** Hot run after the edit: population answered share 0.729 (274 / 376), due-tick share 0.667 (10 / 15) — within one binomial σ (0.115): no σ-coupling of which steps become ticks. Take rates 1.0 at answered and refused steps (no auditor, no skips); the skip path needs the app.
+- **M4 (the ring lifts a parked lock first).** A parked key locked by λ_T = ∞ at the real cadence, with the worker's refit flow: the bad tick left the 4096-point ring at step 4096 with 163 newer P_A points (the window needs 300, ≈ 7500 steps); the next refit gave λ_T = 1.04 and the step after was answered (a CPU measurement, not kept as a test).
+
+### Task 0 re-run (the go/no-go report on a fresh copy of the user's collection)
+
+`trust_tightening_go_no_go_report` on a scratchpad copy (no `.lock`) of `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5`, 1657 samples, 434 history points, attach + refit 54.1 s, 0 teacher calls; the original's SHA-256, sizes and mtimes identical before and after. 6 keys, 2 trusted at load; the 2 that lose trust are Task 0's: **pair H{H} (Floor, LOO force max 1.017×, evidence 38, n_fit 0)** and **many-body H{H,O} (Floor, 2.506×, evidence 3)**. Saved points carry no fit id, so n_fit = 0 for every key until new refits.
