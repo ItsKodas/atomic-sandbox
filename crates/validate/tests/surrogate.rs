@@ -435,7 +435,9 @@ fn snapshot(log: &Arc<Mutex<EvalLog>>) -> EvalLog { log.lock().unwrap().clone() 
 fn surrogate_reproduces_the_h2_frequency() {
     let Some(ctx) = gpu() else { return };
     let t_test = Instant::now();
-    let (mut s, log) = student(&ctx, 0);
+    // spec 2026-11-18 §4 "How ticks are served": in-step ticks only where no auditor serves them; this measures the model's own potential, so ticks are off (plan Task 9 ruling)
+    let (s, log) = student(&ctx, 0);
+    let mut s = s.with_tick_every(0);
     let mut out = String::new();
     let _ = writeln!(out, "H₂ surface reproduction and frequency, {N_H2}³, σ = h = {H}, teacher tol {TOL_H2:.0e}");
     // the DFT statics of this surface (the M4 helper): R_e, k, E_mode and the MD start's forces
@@ -517,7 +519,9 @@ fn surrogate_reproduces_the_h2_frequency() {
 fn surrogate_nve_is_tight() {
     let Some(ctx) = gpu() else { return };
     let t_test = Instant::now();
-    let (mut s, log) = student(&ctx, 0);
+    // spec 2026-11-18 §4 "How ticks are served": in-step ticks only where no auditor serves them; this measures the model's own potential, so ticks are off (plan Task 9 ruling)
+    let (s, log) = student(&ctx, 0);
+    let mut s = s.with_tick_every(0);
     let mut out = String::new();
     let _ = writeln!(out, "H₂ NVE on the surrogate, {N_H2}³ teacher, dt = {DT_FS} fs, {NVE_STEPS} steps = {:.0} ps", NVE_STEPS as f64 * DT_FS / 1000.0);
     let (_rep, pass_wall) = sample_and_fit(&mut s, &h2(SCAN_R0), &h2_plan(), &mut out);
@@ -763,7 +767,9 @@ fn displaced(sc: &Scene, f: [f64; 3]) -> Scene {
 fn h3plus_tier() {
     let Some(ctx) = gpu() else { return };
     let t_test = Instant::now();
-    let (mut s, log) = student(&ctx, 0);
+    // spec 2026-11-18 §4 "How ticks are served": in-step ticks only where no auditor serves them; this measures the model's own potential, so ticks are off (plan Task 9 ruling)
+    let (s, log) = student(&ctx, 0);
+    let mut s = s.with_tick_every(0);
     let mut out = String::new();
     let _ = writeln!(out, "H₃⁺ tier, {N_H2}³, σ = h = {H}, teacher tol {TOL_H2:.0e}");
     // relax on the teacher surface

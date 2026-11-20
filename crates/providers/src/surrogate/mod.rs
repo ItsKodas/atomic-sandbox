@@ -2149,6 +2149,17 @@ impl SurrogateKs {
         self
     }
 
+    /// Test hook: the calibration ticks' cadence in in-envelope steps (module doc, "Calibration
+    /// ticks"; [`TICK_EVERY`] by default), **0 = no ticks**. It exists so measurements of the
+    /// model's own dynamics (its frequency, NVE, tier) can switch off the in-step ticks a provider
+    /// without an auditor serves — each one a teacher step on the trajectory (plan 2026-11-19
+    /// Task 9 ruling). Not for the app.
+    #[doc(hidden)]
+    pub fn with_tick_every(mut self, n: usize) -> SurrogateKs {
+        self.tick_every = n;
+        self
+    }
+
     /// A shared collection's fit uses the cutoff `r_cut` (Bohr) instead of
     /// [`surrogate::COLLECTION_R_CUT`]: the reach measurement of the transfer test (M8a Task 6,
     /// `validate/tests/transfer.rs`), which re-fits one collection's samples at another reach. A
