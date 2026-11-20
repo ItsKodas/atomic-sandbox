@@ -172,8 +172,11 @@ New wording:
 - Old points carry no fit id, so a saved key with evidence ≥ 3 and LOO max > 1 loads untrusted.
 - **The knife edge returns there (review I3).** Below the floor the LOO max decides again, the max rule
   that the calibrated verdict replaced. On record: the user's water + H₂ file at LOO max 12.0×/10.6×.
-- **The dead end.** A refused key's fallbacks at a parked scene are thinned: no sample, no refit, no
-  new fit. Its count cannot grow there, by design: refits on near-copies would be the I1 over-count.
+- **The dead end.** A refused key's fallbacks at a parked scene are thinned, so its count grows
+  slowly at best: an exact repeat of a stored answer is not kept, and of the near ones only one in
+  `THIN_EVERY` = 10 is (Task 2 review M3, corrected at Task 9: the earlier "cannot grow there" was
+  wrong). A geometry that jitters therefore still adds a real sample, a refit and a fit now and then;
+  those are new teacher data, so they are honest fits, but too few to reach the floor quickly.
   The way out is the existing one for a LOO-blocked class:
   - the teach prompt, after `TEACH_PROMPT_STREAK` class fallbacks (teach-around brings LOO ≤ 1);
   - or moving the scene.
