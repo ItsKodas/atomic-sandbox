@@ -6098,3 +6098,18 @@ The evidence floor (12 fits and 60 comparisons before the calibrated verdict alo
 ### Task 0 re-run (the go/no-go report on a fresh copy of the user's collection)
 
 `trust_tightening_go_no_go_report` on a scratchpad copy (no `.lock`) of `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5`, 1657 samples, 434 history points, attach + refit 54.1 s, 0 teacher calls; the original's SHA-256, sizes and mtimes identical before and after. 6 keys, 2 trusted at load; the 2 that lose trust are Task 0's: **pair H{H} (Floor, LOO force max 1.017×, evidence 38, n_fit 0)** and **many-body H{H,O} (Floor, 2.506×, evidence 3)**. Saved points carry no fit id, so n_fit = 0 for every key until new refits.
+
+### `trust_baseline_report`, before and after (audit every 50; 2026-11-20 20:08, alone, 800 s)
+
+Before: the open-shell gate's run (2026-11-14, above) for the missed large errors; the M8a fix-round-1 table for the per-class audit z. After: this branch at 75a87c0d + the gate ruling.
+
+| scenario | class | audits beyond 1× the bound or the tier while trusted (missed large errors), before → after | audit z = ‖ΔF‖/pred_force_std per point, rms (max), before → after |
+|---|---|---|---|
+| stuck-escape repro NVE + hot | pair | 0 / 64 → **0 / 122** | 1.4 → **0.65** (4.26) |
+| | many-body | 1 / 12 → **0 / 5** | — (2 audits) → **2.98** (4.69) |
+| active learning | pair | 0 / 5 → **0 / 10** | 3.49 (Task 1) → **2.72** (5.09) |
+
+- The test's own checker on the hot run: before 513 answers, 269 judged, worst 5.15× the force bound, 21 beyond 3× or the tier; **after 132 answers, 53 judged, worst 6.78e-4 Ha/atom and 2.46×, 0 beyond** (3 of 53 beyond 1×). Every gated assertion held under these audits (no notes).
+- Many-body at the end of the hot run: trusted at n_fit 16, n_pts 63, evidence 10, with **λ_T 17.4 and λ_E 40.5** (λ_sum 25.9) — the tail factors bite here, unlike the gated run; 3 steps were labelled code 24 by their activity events (the history recorded none of them: not traced). Its fallback points while trusted: 61 of 93 beyond 1× the bound or the tier — refused, not answered.
+- Class flips: pair 5 (3 entries, 2 losses; the losses by `LooFloor` at LOO rms 1.21 and 1.30), many-body 5 (3 + 2; one loss by `Floor` at LOO max 1.14 below the floor).
+- The fallback-energy exclusion (the gate ruling) covered 15 steps in this run, rule-8 in-step audits as well as ticks (face densities from 3.2e-5).
