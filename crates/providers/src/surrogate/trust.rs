@@ -46,6 +46,8 @@
 use super::*;
 use sim::activity::{StuckInfo, TeachRule, TrustCheck, TrustKey};
 use sim::ClassKey;
+use super::stray::Split;
+use super::policy::KeyFactors;
 
 /// Trust rule: both residual degrees of freedom of the fit must reach this.
 pub const MIN_RESIDUAL_DOF: f64 = 30.0;
@@ -89,6 +91,27 @@ use predicates::*;
 pub(super) fn max_nan(a: f64, b: f64) -> f64 {
     if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) }
 }
+/// A model's coefficients, bit for bit (the species, the feature count, the coefficients, the
+/// standardisation and the reference energies — everything its predictions read but the basis
+/// layout, which the species and the feature count pin): a refit whose standing model has the same
+/// fingerprint as the one before re-solved the same coefficients, and is not a new fit (`refit`,
+/// the fit id; spec 2026-11-18 §3).
+fn coefficient_fingerprint(m: &surrogate::Model) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    m.basis.species.hash(&mut h);
+    m.basis.n_features().hash(&mut h);
+    for row in &m.coeffs {
+        row.len().hash(&mut h);
+        row.iter().for_each(|x| x.to_bits().hash(&mut h));
+    }
+    for v in [&m.mean, &m.scale, &m.ref_energy] {
+        v.len().hash(&mut h);
+        v.iter().for_each(|x| x.to_bits().hash(&mut h));
+    }
+    h.finish()
+}
+
 /// The misfit row's limit: `QUARANTINE_MAX_FRACTION` of the fitted samples M was counted over.
 fn misfit_limit(m: &Misfit) -> f64 {
     QUARANTINE_MAX_FRACTION * m.fitted as f64
@@ -428,6 +451,42 @@ pub(super) struct ClassJudge {
     pub(super) between_refits: bool,
 }
 
+/// λ_sum as rules 6 and 7 read it for environment key `k` (`key_factors`' `sum`): `own` (the key's
+/// verdict's λ_sum, `SpeciesVerdict::inflation`), and for a key with fewer than `MIN_EVIDENCE`
+/// points of its own posterior evidence its class's where larger or not a number (user-fix-2
+/// physics review). Also the Model tab's `SpeciesVerdict::rule_inflation` (Task 8 review I2): one
+/// rule, never two copies.
+fn floored_sum(cal: &super::calibrate::Calibration, k: &surrogate::EnvKey, own: f64) -> f64 {
+    let c = (k.class as usize).wrapping_sub(1);
+    match cal.per_class.get(c) {
+        Some(cl) if cal.key(k).inflation_points < super::calibrate::MIN_EVIDENCE => max_nan(own, cl.inflation),
+        _ => own,
+    }
+}
+
+/// λ_T and λ_E of environment key `k` from the calibration `cal` (the last refit's: they never move
+/// on a step they decided), with `sum` as λ_sum: the key's own, and for a **sparse key** (fewer than
+/// `MIN_EVIDENCE` points of its own answer sample P_A in the window) its class's where larger or
+/// not a number (spec 2026-11-18 §4, M2) — [`SurrogateKs::key_factors`]' tail half, also what the
+/// Model tab shows (`sim::SpeciesVerdict::tail_inflation`, plan Task 8): one rule, never two copies.
+fn tail_factors(cal: &super::calibrate::Calibration, k: &surrogate::EnvKey, sum: f64) -> KeyFactors {
+    let c = (k.class as usize).wrapping_sub(1);
+    let own = cal.key(k);
+    let mut f = KeyFactors { sum, tail: own.tail_inflation, energy: own.energy_inflation, tail_cause: own.tail_cause, energy_cause: own.energy_cause, tail_from_class: false, energy_from_class: false };
+    if own.answer_points < super::calibrate::MIN_EVIDENCE {
+        if let Some(cl) = cal.per_class.get(c) {
+            // the class's factor (and its cause) where it is the larger, or not a number
+            if !(cl.tail_inflation <= f.tail) && !f.tail.is_nan() {
+                (f.tail, f.tail_cause, f.tail_from_class) = (cl.tail_inflation, cl.tail_cause, true);
+            }
+            if !(cl.energy_inflation <= f.energy) && !f.energy.is_nan() {
+                (f.energy, f.energy_cause, f.energy_from_class) = (cl.energy_inflation, cl.energy_cause, true);
+            }
+        }
+    }
+    f
+}
+
 /// The entry rule between refits (`ClassKey::Window`; `calibrate` "Per environment species"): a
 /// key that did not stand trusted and would now be trusted on fewer than `WINDOW_POINTS`
 /// comparisons is refused until the next refit's verdict or a full window.
@@ -465,6 +524,9 @@ pub(super) struct FitState {
     /// only when they were that fit's (`restore_state`).
     pub(super) loo_ratios: Option<LooRatios>,
     pub(super) model_gen: u64,
+    /// The saved fit's id and its watermark: a restore brings them back (spec 2026-11-18 §3).
+    pub(super) fit_id: u64,
+    pub(super) fit_id_samples: usize,
 }
 
 impl SurrogateKs {
@@ -674,7 +736,7 @@ impl SurrogateKs {
     }
 
     /// The misfit row's scenes: M's samples per composition, largest count first ("H2 ×6, …").
-    fn misfit_scenes(&self) -> String {
+    pub(super) fn misfit_scenes(&self) -> String {
         let (Some(m), Some(store)) = (self.misfit.as_ref(), self.store.as_ref()) else { return String::new() };
         let mut count: BTreeMap<String, usize> = BTreeMap::new();
         for s in m.samples.iter().filter_map(|&i| store.samples.get(i)) {
@@ -682,7 +744,17 @@ impl SurrogateKs {
         }
         let mut v: Vec<(String, usize)> = count.into_iter().collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        v.iter().map(|(f, n)| format!("{f} ×{n}")).collect::<Vec<_>>().join(", ")
+        let list = v.iter().map(|(f, n)| format!("{f} ×{n}")).collect::<Vec<_>>().join(", ");
+        // a sample with stray atoms is its bonded part's row plus a term the model cannot represent (ruling 9a): its
+        // energy row, per bonded atom, also carries the composition and the stray atoms' box term — named, so an
+        // energy misfit there is not read as the bonded part's alone (byte-identical without one)
+        let r_cut = self.cutoff();
+        let strays = m.samples.iter().filter_map(|&i| store.samples.get(i)).filter(|s| super::stray::split(&s.pos, r_cut).is_some()).count();
+        if strays == 0 {
+            list
+        } else {
+            format!("{list}; {strays} with stray atoms, whose energy rows per bonded atom also carry the composition and the stray atoms' box term")
+        }
     }
 
     /// One pass over the samples the current model was fitted on (the accumulated prefix of
@@ -705,7 +777,8 @@ impl SurrogateKs {
             }
             let Ok(p) = model.predict(&s.pos, &s.z, false) else { continue };
             m.fitted += 1;
-            let n = s.pos.len().max(1) as f64;
+            // per energy-row atom (N_e, ruling 9a: n without an isolated atom)
+            let n = self.audit_n(&s.pos) as f64;
             // the fitted rows only (a masked sample: no energy, the interior atoms' forces)
             let energy = s.use_energy.then(|| (p.energy - s.energy).abs() / n);
             let forces: Vec<(usize, (f64, f64))> =
@@ -827,6 +900,10 @@ impl SurrogateKs {
                         let refusal = entry_between_refits(refusal_of(verdict(*kc, kst, kq, was)), was, kc, j.between_refits);
                         let trusted = refusal.is_none();
                         let some = |x: f64| (kc.points > 0).then_some(x);
+                        // λ_T and λ_E as rules 6 and 7 read them (a sparse key's class floors
+                        // included; `key_factors`), for the Model tab (plan Task 8)
+                        let sum = floored_sum(&j.refit_cal, k, j.refit_cal.key(k).inflation);
+                        let tail = tail_factors(&j.refit_cal, k, sum);
                         sim::SpeciesVerdict {
                             z: k.z,
                             neighbours: k.neighbours.clone(),
@@ -841,6 +918,11 @@ impl SurrogateKs {
                             inflation: j.refit_cal.key(k).inflation,
                             samples: kst.samples,
                             columns: kq,
+                            fits: kc.fits,
+                            floor_points: kc.floor_points,
+                            rule_inflation: tail.sum,
+                            tail_inflation: tail.tail,
+                            energy_inflation: tail.energy,
                         }
                     })
                     .collect();
@@ -871,28 +953,45 @@ impl SurrogateKs {
                     evidence: cal.evidence,
                     trusted_since: if trusted { species.iter().filter_map(|s| s.trusted_since).max().or(Some(self.model_gen)) } else { None },
                     inflation: species.iter().map(|s| s.inflation).fold(j.refit_cal.per_class[c].inflation, f64::max),
+                    fits: cal.fits,
+                    floor_points: cal.floor_points,
                     species,
                 }
             })
             .collect()
     }
 
-    /// λ of an environment key (`calibrate`, "The variance inflation"; per key since M8a user-test
-    /// fix 2): its verdict's, or — for a key no fitted atom and no attributed point holds — the
-    /// calibration its class's species-less points give; 1 before the first fit.
-    pub(super) fn key_inflation(&self, k: &surrogate::EnvKey) -> f64 {
+    /// The inflations rules 6 and 7 read for an environment key (trust tightening, spec 2026-11-18
+    /// §4): (λ_F, λ_E) with λ_F = max(λ_sum, λ_T) — [`key_factors`](Self::key_factors)' parts. The
+    /// max propagates NaN (`max_nan`, never `f64::max`), and a NaN or ∞ factor refuses (M1). The
+    /// rules read [`key_factors`](Self::key_factors) itself (their words name the cause); this is
+    /// the pair the tests and the Model tab's readout (plan Task 8) read.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn key_inflations(&self, k: &surrogate::EnvKey) -> (f64, f64) {
+        let f = self.key_factors(k);
+        (f.force(), f.energy)
+    }
+
+    /// The three factors of an environment key, from the calibration of the last refit, install
+    /// or policy change (`refit_cal`: they never move on a step they decided), with what decided
+    /// the tail-aware ones (the refusal's words):
+    ///
+    /// - **λ_sum** (`calibrate`, "The variance inflation"; per key since M8a user-test fix 2): its
+    ///   verdict's, or — for a key no fitted atom and no attributed point holds — the calibration
+    ///   its class's species-less points give. A key with fewer than `MIN_EVIDENCE` (3) points of
+    ///   its own posterior evidence takes its class's λ_sum as a floor (user-fix-2 physics review,
+    ///   Important: a sparse key must not drop to λ = 1 where its class measured 17.6).
+    /// - **λ_T, λ_E** (`calibrate`, "The tail-aware inflations"): the key's own; a **sparse key**
+    ///   (fewer than `MIN_EVIDENCE` points of its own answer sample P_A in the window) takes its
+    ///   class's λ_T and λ_E as floors (spec §4, M2), the same rule as λ_sum's.
+    ///
+    /// All 1 before the first fit (no judge: the shown λ_sum, if any, and no tail evidence).
+    pub(super) fn key_factors(&self, k: &surrogate::EnvKey) -> KeyFactors {
         let c = (k.class as usize).wrapping_sub(1);
         let shown = self.class_loo.get(c).and_then(|l| l.species.iter().find(|s| s.z == k.z && s.neighbours == k.neighbours)).map(|s| s.inflation);
-        let Some(j) = self.class_judge.as_ref() else { return shown.unwrap_or(1.0) };
-        let own = j.refit_cal.key(k);
-        let lambda = shown.unwrap_or(own.inflation);
-        // a key with too little evidence of its own (fewer than MIN_EVIDENCE points: its λ is the
-        // floor 1) runs rule 6 at its class's measured λ, never looser (user-fix-2 physics review,
-        // Important: a sparse key must not drop to λ = 1 where its class measured 17.6)
-        if own.inflation_points < super::calibrate::MIN_EVIDENCE {
-            return j.refit_cal.per_class.get(c).map_or(lambda, |cl| lambda.max(cl.inflation));
-        }
-        lambda
+        let Some(j) = self.class_judge.as_ref() else { return KeyFactors { sum: shown.unwrap_or(1.0), ..KeyFactors::ONE } };
+        let sum = floored_sum(&j.refit_cal, k, shown.unwrap_or(j.refit_cal.key(k).inflation));
+        tail_factors(&j.refit_cal, k, sum)
     }
 
     /// The class-wise trust numbers (module doc, "Class-wise trust"): for every fitted sample (the
@@ -963,7 +1062,7 @@ impl SurrogateKs {
         // fitted sample, spec 2026-11-12 R1b; `fresh_loo_ratios` matches them to the fit's members)
         let mut sample_ratios: Vec<(usize, f64, f64, Channel)> = Vec::with_capacity(fitted.len());
         for ((i, s), l) in fitted.into_iter().zip(loos) {
-            let (own, tier, channel) = super::quarantine::loo_ratio(&self.policy, model.energy_per_atom, s, l.as_ref());
+            let (own, tier, channel) = super::quarantine::loo_ratio(&self.policy, model.energy_per_atom, surrogate::energy_row_atoms(&model.basis, &s.pos), s, l.as_ref());
             sample_ratios.push((i, own, tier, channel));
             let in_m = self.in_misfit(i);
             // only the fitted (interior) atoms of a masked sample describe a class or a key
@@ -981,7 +1080,7 @@ impl SurrogateKs {
                     }
                 }
             }
-            let n = s.pos.len().max(1) as f64;
+            let n = self.audit_n(&s.pos) as f64;
             // no energy evidence from a sample whose energy was not fitted (`None`)
             let e_ratio: Option<f64> = s.use_energy.then(|| l.as_ref().and_then(|l| l.energy).map_or(f64::INFINITY, |e| (if model.energy_per_atom { e.abs() } else { e.abs() / n }) / self.policy.energy_std_per_atom));
             // per environment key the same leave-one-out sums over its own atoms (user-test fix 2:
@@ -1101,6 +1200,29 @@ impl SurrogateKs {
         &self.class_loo
     }
 
+    /// Per environment key of the standing judgement — every key of [`class_loo`](Self::class_loo)'s
+    /// species, once, in the calibration's key order — the leave-one-out statistics its verdict
+    /// read: its own sums from the class pass (`compute_class_loo_full`, [`LooSums`]), or for a key
+    /// no fitted atom holds the unseen-key statistics (n_k = 0, final review 5). A readout for the
+    /// trust-tightening go/no-go report (plan 2026-11-19 Task 0); it decides nothing. Empty without
+    /// a fit.
+    pub fn key_class_stats(&self) -> Vec<(surrogate::EnvKey, super::calibrate::ClassStats)> {
+        let Some(j) = self.class_judge.as_ref() else { return Vec::new() };
+        j.cal
+            .per_key
+            .keys()
+            .filter(|k| (1..=2).contains(&k.class))
+            .map(|k| {
+                let c = (k.class - 1) as usize;
+                let st = match (j.key_stats.get(k), j.key_q.get(k)) {
+                    (Some(st), Some(_)) => *st,
+                    _ => unseen_key_stats(&j.stats[c]),
+                };
+                (k.clone(), st)
+            })
+            .collect()
+    }
+
     /// Makes the standing class verdicts the calibrated verdict's hysteresis memory
     /// (`class_memory`; M8a Task 2): called once a refit, an install or a policy change is done,
     /// never by the intermediate fits inside one of them.
@@ -1159,7 +1281,7 @@ impl SurrogateKs {
                 None => undefined += 1,
                 Some(l) => {
                     if let Some(e) = l.energy {
-                        let e = if model.energy_per_atom { e } else { e / s.pos.len().max(1) as f64 };
+                        let e = if model.energy_per_atom { e } else { e / self.audit_n(&s.pos) as f64 };
                         se += e * e;
                         ne += 1;
                     }
@@ -1198,7 +1320,8 @@ impl SurrogateKs {
         // a class without per-species verdicts (no fitted atom of it) answers by its own verdict
         let class_wide = l.species.is_empty();
         let own = if class_wide {
-            Some(sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: l.trusted, refusal: l.refusal, calibration: l.calibration, measured: l.measured, measured_energy: l.measured_energy, worst_atom: l.worst_atom, evidence: l.evidence, trusted_since: l.trusted_since, inflation: l.inflation, samples: l.samples, columns: q })
+            let f = self.key_factors(k);
+            Some(sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: l.trusted, refusal: l.refusal, calibration: l.calibration, measured: l.measured, measured_energy: l.measured_energy, worst_atom: l.worst_atom, evidence: l.evidence, trusted_since: l.trusted_since, inflation: l.inflation, samples: l.samples, columns: q, fits: l.fits, floor_points: l.floor_points, rule_inflation: f.sum, tail_inflation: f.tail, energy_inflation: f.energy })
         } else {
             l.species.iter().find(|s| s.z == k.z && s.neighbours == k.neighbours).cloned()
         };
@@ -1215,7 +1338,8 @@ impl SurrogateKs {
                 };
                 let refusal = entry_between_refits(refusal, false, &kc, j.between_refits);
                 let some = |x: f64| (kc.points > 0).then_some(x);
-                sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: refusal.is_none(), refusal, calibration: kc.factor, measured: some(kc.measured), measured_energy: some(kc.measured_energy), worst_atom: some(kc.worst_atom), evidence: kc.evidence, trusted_since: None, inflation: j.refit_cal.key(k).inflation, samples: 0, columns: unseen_key_floor(j.q_prime) }
+                let tail = tail_factors(&j.refit_cal, k, floored_sum(&j.refit_cal, k, j.refit_cal.key(k).inflation));
+                sim::SpeciesVerdict { z: k.z, neighbours: k.neighbours.clone(), trusted: refusal.is_none(), refusal, calibration: kc.factor, measured: some(kc.measured), measured_energy: some(kc.measured_energy), worst_atom: some(kc.worst_atom), evidence: kc.evidence, trusted_since: None, inflation: j.refit_cal.key(k).inflation, samples: 0, columns: unseen_key_floor(j.q_prime), fits: kc.fits, floor_points: kc.floor_points, rule_inflation: tail.sum, tail_inflation: tail.tail, energy_inflation: tail.energy }
             }
         };
         if s.trusted {
@@ -1233,6 +1357,12 @@ impl SurrogateKs {
             Some(j) => j.key_stats.get(k).copied().unwrap_or_else(|| unseen_key_stats(&class_st)),
             None => class_st,
         };
+        // the evidence floor's counts, from the calibration the verdict read (the key's own, or the
+        // class's for a class-wide verdict); none without a judgement
+        let floor = self.class_judge.as_ref().map_or((0, 0), |j| {
+            let kc = if class_wide { j.cal.per_class[c] } else { j.cal.key(k) };
+            (kc.fits, kc.floor_points)
+        });
         let words = super::calibrate::WordsInput {
             samples: st.samples,
             force_rms: st.force_rms,
@@ -1242,6 +1372,8 @@ impl SurrogateKs {
             measured_energy: s.measured_energy,
             evidence: s.evidence,
             calibration: s.calibration,
+            fits: floor.0,
+            floor_points: floor.1,
         };
         // the limit is the verdict's own: a key's sample floor is its own column count (M8a
         // user-fix 3), the whole basis's Q′ only for a class-wide verdict or a key no fitted atom holds
@@ -1274,7 +1406,23 @@ impl SurrogateKs {
         });
         // the stages (`sim::refit_eta`): a background copy's are read at the install
         self.refit_counts = Some(sim::RefitStages::default());
+        let (id_before, coeffs_before) = (self.fit_id, self.model.as_ref().map(coefficient_fingerprint));
         let r = self.refit_inner();
+        // the fit id (spec 2026-11-18 §3): one new id per refit whose standing model holds new
+        // coefficients solved from new teacher data — a member at or past the watermark
+        // `fit_id_samples` (fix round 1, I1: a forget + restore, a recovery's holds and releases
+        // re-solve old data) — past the history's ids, so ids stay unique across sessions (plan
+        // 2026-11-19, the rulings), whatever its intermediate fits did (the recovery's trial fits
+        // and restores); a refit that re-solved the same coefficients, or left the model that
+        // stood, is not a new fit. A model never stands at 0 (a first model takes ≥ 1)
+        let coeffs_after = self.model.as_ref().map(coefficient_fingerprint);
+        let new_data = self.fit_member_indices().any(|i| i >= self.fit_id_samples);
+        if coeffs_after.is_some() && ((coeffs_after != coeffs_before && new_data) || id_before == 0) {
+            self.fit_id = id_before.max(self.audit_history.max_fit_id().unwrap_or(0)) + 1;
+            self.fit_id_samples = self.samples();
+        } else {
+            self.fit_id = id_before;
+        }
         let counts = if self.refit_fork { self.refit_counts } else { self.refit_counts.take() };
         // the refit history (a copy's is the live provider's to record, at the install)
         if let (false, Ok(_), Some(c)) = (self.refit_fork, r.as_ref(), counts) {
@@ -1285,6 +1433,9 @@ impl SurrogateKs {
         // provider does after the install (`background` module doc)
         if !self.refit_fork {
             self.sync_collection_status();
+            // the review's verdicts after the status records they name (`flush_migration_log`), and before the README,
+            // which carries the migration summary of the log on disk (Task 16 re-review R2)
+            self.flush_migration_log();
             self.flush_collection();
         }
         r
@@ -1315,12 +1466,19 @@ impl SurrogateKs {
         Ok(report)
     }
 
-    /// The fits of a refit ([`refit_inner`](Self::refit_inner)): the fit, the fence votes, the
-    /// release, the trust recovery, the held-out guesses — each fit deferred (`fit_store_deferred`).
+    /// The fits of a refit ([`refit_inner`](Self::refit_inner)): the fit, the review of the re-solved
+    /// samples (`review_resolved`), the fence votes, the release, the trust recovery, the held-out guesses
+    /// — each fit deferred (`fit_store_deferred`).
     fn refit_fits(&mut self) -> Result<FitReport, FitError> {
         let _prof = surrogate::prof::span("P1 refit_fits (fits, votes, release, recovery, held-out)");
         let mut report = self.fit_store_deferred()?;
         self.recovery = None;
+        // the re-solved samples' review (Fermi–Dirac spec §7.6; `review_resolved`): before the trust judgement, so a
+        // released sample is judged by the votes, the release and the recovery as any fitted sample; the refit goes on
+        // from the fit above (the candidate is undone), rebuilt with the released ones
+        if self.review_resolved().is_some_and(|o| !o.released.is_empty()) {
+            report = self.fit_store_deferred()?;
+        }
         // fence votes (`surrogate` module doc, "Fence voting"): a voted sample the new model cannot
         // reproduce is quarantined itself and its region takes no further vote
         let rejected = self.judge_votes();
@@ -1392,16 +1550,19 @@ impl SurrogateKs {
     /// answer — the exact leave-one-out prediction when the answer is in the fit (`surrogate::loo`),
     /// the plain prediction when it is not — judged by the audit's own criteria: (teacher − model
     /// gap, the force failure if any, how it was predicted). An undefined leave-one-out fails (NaN).
+    /// The callers divide the gap by [`audit_n`](Self::audit_n) — per bonded atom at a scene with stray
+    /// atoms (`stray` module doc, "Audits of a cleared answer"); `per` below is the fit's own row, per the
+    /// same N_e (ruling 9a).
     fn judge_case(&self, case: &FailedAudit) -> Option<(f64, Option<(f64, f64)>, &'static str)> {
         let model = self.model.as_ref()?;
-        let n = case.pos.len().max(1) as f64;
         let in_fit = case.index.filter(|&i| i < self.accumulated && !self.excluded(i));
         let (e_pred, f_pred, how) = match in_fit.and_then(|i| self.store.as_ref().map(|st| &st.samples[i])) {
             // (a masked sample — never audited: a masked scene is teacher-only — would take the
             // plain prediction for what its fit left out: its energy, its masked-out atoms)
             Some(smp) => match surrogate::loo::leave_one_out(model, smp).zip(model.predict(&case.pos, &case.z, false).ok()) {
                 Some((l, plain)) => {
-                    let per = if model.energy_per_atom { n } else { 1.0 };
+                    // the row's own atoms (N_e, ruling 9a: `loo` takes the residual per energy-row atom)
+                    let per = if model.energy_per_atom { surrogate::energy_row_atoms(&model.basis, &smp.pos) as f64 } else { 1.0 };
                     let f: Vec<[f64; 3]> = smp.forces.iter().zip(&l.forces).zip(&plain.forces).map(|((f, r), p)| r.map_or(*p, |r| [f[0] - r[0], f[1] - r[1], f[2] - r[2]])).collect();
                     (l.energy.map_or(plain.energy, |e| smp.energy - e * per), f, "the refit's model without the audited sample (leave-one-out)")
                 }
@@ -1434,7 +1595,7 @@ impl SurrogateKs {
                 } else {
                     self.audit_failed = self.audit_failed.or(Some(f64::NAN));
                 }
-                self.audit_atoms = c.pos.len();
+                self.audit_atoms = self.audit_n(&c.pos);
             }
         }
     }
@@ -1469,6 +1630,14 @@ impl SurrogateKs {
         let quarantined = |s: &SurrogateKs, c: &FailedAudit| c.index.is_some_and(|i| matches!(s.quarantine.get(i), Some(&Q_HELD) | Some(&Q_SUPERSEDED)));
         let cases = std::mem::take(&mut self.failed_audits);
         for mut case in cases {
+            // a stray-attributed case's label (the bonded part's answer + Σ E_ref) is what the model claims there only
+            // while those atoms are stray at its cutoff; under a longer reach it is no label of the scene: the case
+            // turns into an audit fence, its neighbourhood falls back (Task 5 fix round 1, M7)
+            if case.origin == AuditOrigin::StrayAttributed && super::stray::split(&case.pos, self.cutoff()).is_none() {
+                self.user_notes.push("surrogate: a failed audit attributed to the model at a scene with stray atoms is no longer such a scene at the model's cutoff — its neighbourhood falls back (an audit fence) instead of the whole model".into());
+                self.audit_fences.push(case);
+                continue;
+            }
             if quarantined(self, &case) {
                 self.user_notes.push("surrogate: the failed audit's sample was quarantined by the refit — its neighbourhood falls back (the fence) instead of the whole model".into());
                 continue;
@@ -1477,7 +1646,8 @@ impl SurrogateKs {
                 self.failed_audits.push(case);
                 continue;
             };
-            let n = case.pos.len().max(1) as f64;
+            // per bonded atom at a scene with stray atoms (`stray` module doc, "Audits of a cleared answer")
+            let n = self.audit_n(&case.pos) as f64;
             let tier = self.policy.energy_std_per_atom;
             if (gap.abs() / n <= tier) && force_fail.is_none() {
                 self.audit_burst = AUDIT_BURST;
@@ -1498,7 +1668,7 @@ impl SurrogateKs {
             }
             self.user_notes.push(match force_fail {
                 Some((d, b)) => format!("surrogate: still untrusted — at the failed audit's geometry {how} is off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.2e} Ha)"),
-                None => format!("surrogate: still untrusted — at the failed audit's geometry {how} is off by {gap:+.2e} Ha ({:.1e} > {tier:.1e} Ha/atom)", gap.abs() / n),
+                None => format!("surrogate: still untrusted — at the failed audit's geometry {how} is off by {gap:+.2e} Ha ({:.1e} > {tier:.1e} {})", gap.abs() / n, self.per_atom_unit(&case.pos)),
             });
             self.failed_audits.push(case);
         }
@@ -1510,7 +1680,7 @@ impl SurrogateKs {
                 continue;
             }
             match self.judge_case(&case) {
-                Some((gap, None, how)) if gap.abs() / case.pos.len().max(1) as f64 <= self.policy.energy_std_per_atom => {
+                Some((gap, None, how)) if gap.abs() / self.audit_n(&case.pos) as f64 <= self.policy.energy_std_per_atom => {
                     self.user_notes.push(format!("surrogate: an audit fence is lifted — {how} now passes there (teacher − model {gap:+.2e} Ha)"));
                 }
                 _ if quarantined(self, &case) => {}
@@ -1623,9 +1793,10 @@ impl SurrogateKs {
     }
 
     /// The refusal of a geometry with an atom near a misfit (`near_misfit_atoms`; spec 2026-11-13
-    /// §4.3), naming the first such atom — `evaluate`'s text. `None` when no atom is near.
-    pub(super) fn near_misfit_refusal(&self, pos: &[[f64; 3]], z: &[u8]) -> Option<Refusal> {
-        let i = self.near_misfit_atoms(pos, z).iter().position(|&b| b)?;
+    /// §4.3), naming the first such atom — `evaluate`'s text. `None` when no atom is near. `part`: the
+    /// split of a cleared stray-atom scene, whose bonded part is judged alone (`near_misfit_atoms_judged`).
+    pub(super) fn near_misfit_refusal(&self, pos: &[[f64; 3]], z: &[u8], part: Option<&Split>) -> Option<Refusal> {
+        let i = self.near_misfit_atoms_judged(pos, z, part).iter().position(|&b| b)?;
         Some(Refusal::new(
             format!(
                 "surrogate: atom {i} is within {:.2} training spreads of a training sample the model cannot reproduce",
@@ -1658,7 +1829,12 @@ impl SurrogateKs {
     /// the novelty (5d), a quarantine fence, an atom near a misfit (`NearMisfit`, spec 2026-11-13
     /// §4.3) or an audit fence. `None`: strict mode refuses there only for
     /// reasons that lift with trust (4, 4b, 6, 7), or answers.
-    pub(super) fn geometry_refusal(&self, pos: &[[f64; 3]], z: &[u8]) -> Option<Refusal> {
+    ///
+    /// `prov` is the settings the geometry was solved at: a cleared stray-atom geometry (`stray_cleared`, keyed by
+    /// its signature on `prov`; spec §4.4) is judged as `evaluate` judges it — its stray atoms exempt from 5a–5e, 5d
+    /// and the fences on the bonded part. Anything else with a stray atom is refused by 5a, so a held draft guess with
+    /// stray atoms is promoted (`judge_held_out`) only inside a cleared region of its signature (Task 3 review M2).
+    pub(super) fn geometry_refusal(&self, pos: &[[f64; 3]], z: &[u8], prov: &Provenance) -> Option<Refusal> {
         let model = self.model.as_ref()?;
         let pred = match model.predict(pos, z, true) {
             Ok(p) => p,
@@ -1667,23 +1843,25 @@ impl SurrogateKs {
         if let Some(r) = non_finite_answer(&pred) {
             return Some(r);
         }
-        if let (_, Some(r)) = self.envelope_outside(model, pos, z) {
+        let cleared = self.stray_cleared(pos, z, prov);
+        let part = cleared.as_ref().map(|c| &c.0);
+        if let (_, Some(r)) = self.envelope_outside_except(model, pos, z, part.map_or(&[][..], |s| &s.stray), None) {
             if r.rule != TeachRule::NoGrade {
                 return Some(r);
             }
         }
         if pred.energy_std.is_some() {
-            if let Some((nu, at)) = self.novelty(pos, z).filter(|(nu, _)| *nu > 1.0) {
+            if let Some((nu, at)) = self.novelty_judged(pos, z, part).filter(|(nu, _)| *nu > 1.0) {
                 return Some(novelty_refusal(nu, at));
             }
         }
-        if !self.near_quarantined_cached(pos, z).is_empty() {
+        if !self.near_quarantined_judged(pos, z, part).is_empty() {
             return Some(Refusal::new("surrogate: near a quarantined geometry", TeachRule::NearQuarantine, None));
         }
-        if let Some(r) = self.near_misfit_refusal(pos, z) {
+        if let Some(r) = self.near_misfit_refusal(pos, z, part) {
             return Some(r);
         }
-        self.audit_fence_refusal(pos, z)
+        self.audit_fence_refusal_judged(pos, z, part)
     }
 
     /// The held-out draft guesses as a test set (round 1, MUST-1): at a refit, every `Q_DRAFT`
@@ -1703,7 +1881,7 @@ impl SurrogateKs {
         if self.misfit_fence_stands() {
             self.ensure_desc_cache();
         }
-        let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
+        let ionic = self.store.as_ref().map_or_else(crate::pseudo::all_electron_tag, |s| s.provenance.ionic.clone());
         let mut promoted = 0;
         for i in held {
             let s = self.store.as_ref().expect("held samples are stored").samples[i].clone();
@@ -1713,7 +1891,7 @@ impl SurrogateKs {
             if self.shared.as_ref().and_then(|sh| sh.box_n.get(i)).is_some_and(|&n| self.box_offset(&s.z, n).is_none()) {
                 continue;
             }
-            if self.geometry_refusal(&s.pos, &s.z).is_some() {
+            if self.geometry_refusal(&s.pos, &s.z, &self.sample_provenance(i)).is_some() {
                 continue;
             }
             let case = FailedAudit { pos: s.pos.clone(), z: s.z.clone(), energy: s.energy, forces: s.forces.clone(), index: Some(i), ionic: ionic.clone(), rejudges: 0, origin: AuditOrigin::HeldOutGuess, pair: None };
@@ -1724,7 +1902,7 @@ impl SurrogateKs {
                 st.samples[i].tag = SampleTag::Audit;
             }
             promoted += 1;
-            let n = s.pos.len().max(1) as f64;
+            let n = self.audit_n(&s.pos) as f64;
             if !(gap.abs() / n <= self.policy.energy_std_per_atom) || force_fail.is_some() {
                 self.user_notes.push(format!(
                     "surrogate: a held-out draft-mode audit (#{i}) is now in strict mode's domain and the model is off there (teacher − model {gap:+.2e} Ha{}) — a failed audit: untrusted until re-earned",
@@ -1786,6 +1964,8 @@ impl SurrogateKs {
             deferred_trust: self.deferred_trust,
             loo_ratios: self.loo_ratios.clone(),
             model_gen: self.model_gen,
+            fit_id: self.fit_id,
+            fit_id_samples: self.fit_id_samples,
         }
     }
 
@@ -1811,6 +1991,9 @@ impl SurrogateKs {
         self.body4_degree = s.body4_degree;
         self.fit_members = s.fit_members;
         self.deferred_trust = s.deferred_trust;
+        // the restored fit's own id, never a new one (spec 2026-11-18 §3)
+        self.fit_id = s.fit_id;
+        self.fit_id_samples = s.fit_id_samples;
         self.model_gen += 1; // a view cache key: the model moved back
         // the restored model is the saved one: its leave-one-out ratios, when the cache held that
         // fit's, are this generation's (`fit_members` is restored with it; re-checked at every read)

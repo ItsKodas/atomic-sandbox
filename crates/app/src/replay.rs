@@ -423,6 +423,7 @@ pub fn unreplayable_kind(a: &Action) -> Option<&'static str> {
         Action::CompareReference { relax: false, .. } => "compare-reference",
         Action::CompareReference { relax: true, .. } => "compare-reference-relax",
         Action::SetupPyscf => "setup-pyscf",
+        Action::StartMigration => "start-migration",
         Action::CancelSetup => "cancel-setup",
         Action::Builder(_) => "builder",
         Action::TrainSegment(_) | Action::OpenSegment | Action::CancelSegment | Action::BackToScene => "segment",
@@ -444,13 +445,15 @@ pub fn is_harmless(kind: &str) -> bool {
 
 fn harmless(kind: &str) -> bool {
     // the reference comparison never feeds the run (its "relax both" does relax ours: not harmless)
-    // nor does setting up PySCF (a replay never installs software: skipped), nor a capture (display only),
+    // nor does setting up PySCF (a replay never installs software: skipped), nor starting the collection migration's
+    // re-solve pass (plan ruling R16: a replay never starts one — it re-solves the user's collection for an hour; headless
+    // runs attach no collection, so nothing would diverge), nor a capture (display only),
     // nor an import of data folders (it copies files into the installed build's root; a replay never does),
     // nor the updater's check, download and restart (a replay never touches the network or installs);
     // a purge of forgotten samples is not harmless (refused, like Forget and Restore and their
     // batches): the purged samples stop fencing, so the replayed run would diverge; nor is Refit now
     // (it moves when the model changes)
-    matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup" | "capture" | "import-data" | "update")
+    matches!(kind, "save-scene" | "save-model" | "compare-reference" | "setup-pyscf" | "cancel-setup" | "start-migration" | "capture" | "import-data" | "update")
 }
 
 /// One line's text (the inverse of the parser; an action without a script form becomes a comment).
@@ -931,7 +934,8 @@ fn counters_check(a: &crate::ui::activity::ActivityState, model: Option<&ModelSt
     let m = model.ok_or("no model: the counters have nothing to compare with")?;
     let new = (a.rows_seen - since.rows_seen) as usize;
     let rows = || a.rows.iter().rev().take(new);
-    let counted = rows().filter(|r| r.event.counts_for_model()).count() as u64;
+    // a composition check's row stands for its parts' solves (`TeachEvent::solves`), as the ledger counts it
+    let counted: u64 = rows().filter(|r| r.event.counts_for_model()).map(|r| u64::from(r.event.solves)).sum();
     let ledger = m.solves.total().saturating_sub(since.model_solves);
     if ledger < counted || (a.dropped == 0 && new <= a.rows.len() && ledger != counted) {
         return Err(format!("the model's solve ledger grew by {ledger}, the log has {counted} rows that count for it since the mark"));

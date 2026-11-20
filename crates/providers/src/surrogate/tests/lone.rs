@@ -299,8 +299,9 @@ fn lone(z: u8) -> Scene {
     sc
 }
 
-/// Records a scanned reference of `z` with multiplicity `m` (and the fractional flag) in the
-/// provider's reference cache at `scene`'s settings, as a sampling pass's scan does.
+/// Records a scanned reference of `z` with multiplicity `m` (and the partial-level flag, `AtomReference::fractional`:
+/// the winning solve had a partly occupied level) in the provider's reference cache at `scene`'s settings, as a
+/// sampling pass's scan does.
 fn record_scan(s: &mut SurrogateKs, scene: &Scene, z: u8, m: u32, fractional: bool) {
     let key = atom_key(&s.provenance_for(scene), z);
     s.ref_cache.insert(key, AtomReference { energy: SpeciesMorse::atom(z), multiplicity: Some(m), fractional: Some(fractional), tol: 1e-6, provider: "pair morse".into(), radial: Default::default(), face_density: Some(0.0) });
@@ -391,30 +392,59 @@ fn a_shell_check_fence_keeps_lone_pairs_of_its_species_with_the_teacher() {
     assert_eq!(s.evaluate(&lone_h(), &mut never()).unwrap().stats.source, Source::Reference);
 }
 
-/// Review I4 (controller ruling): two or more lone atoms are answered only when their reference is
-/// known to end at a gap — Z = 1; on a pseudised surface a scan that shared no shell. Two lone He
-/// at M* on the all-electron surface (integer aufbau: an open shell would not show) decline.
+/// Review I4 (controller ruling), restated for Fermi–Dirac in plan 2026-11-13 Task 10 (spec §6.4): two or more lone
+/// atoms are answered only when their reference is known to end at a gap in each spin channel — Z = 1 (one allowed
+/// multiplicity), or a winning solve with no partial level, on either surface (FD exposes an all-electron open shell as
+/// partial occupations, where aufbau hid it). The rule's cases, then two lone He at M* = 1 on the all-electron surface:
+/// a reference recorded with a partial level declines, one recorded with none composes (the closed 1s² shell ends at a
+/// gap). (An unrecorded reference has no recorded multiplicity either, so the multiplicity rule declines it first.)
 #[test]
 fn copies_of_an_atom_not_known_to_end_at_a_gap_are_the_teachers() {
-    assert!(super::super::lone::closed_spin_channels(1, true, None), "one electron");
-    assert!(super::super::lone::closed_spin_channels(2, false, Some(false)), "pseudised surface, no shared shell");
-    assert!(!super::super::lone::closed_spin_channels(8, false, Some(true)), "a shared shell");
-    assert!(!super::super::lone::closed_spin_channels(2, false, None), "not recorded");
-    assert!(!super::super::lone::closed_spin_channels(2, true, Some(false)), "integer aufbau hides an open shell");
+    use super::super::lone::closed_spin_channels;
+    assert!(closed_spin_channels(1, None), "one electron: one allowed multiplicity");
+    assert!(closed_spin_channels(2, Some(false)), "no partial level");
+    assert!(!closed_spin_channels(8, Some(true)), "a partial level");
+    assert!(!closed_spin_channels(2, None), "not recorded");
     let (mut s, t) = h_student(3);
     s.set_reference_energy(2, SpeciesMorse::atom(2));
     let mut he2 = two_h(6.2, None);
     for n in &mut he2.nuclei {
         n.z = 2;
     }
-    record_scan(&mut s, &he2, 2, 1, false);
-    // one He alone is its own reference
+    // recorded with a partial level: the teacher answers; one He alone is still its own reference
+    record_scan(&mut s, &he2, 2, 1, true);
     assert_reference(&s.evaluate(&lone(2), &mut never()).unwrap(), SpeciesMorse::atom(2), "one He");
     let n0 = species_calls(&t);
     let r = s.evaluate(&he2, &mut never()).unwrap();
     assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
     assert_eq!(species_calls(&t), n0 + 1);
-    assert!(r.stats.notes.iter().any(|n| n.contains("2 lone He atoms") && n.contains("integer occupations")), "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.contains("2 lone He atoms") && n.contains("partly occupied")), "{:?}", r.stats.notes);
+    // recorded with no partial level, on the all-electron surface: the references compose
+    record_scan(&mut s, &he2, 2, 1, false);
+    assert_reference(&s.evaluate(&he2, &mut never()).unwrap(), 2.0 * SpeciesMorse::atom(2), "two lone He, no partial level");
+}
+
+/// V8 (plan 2026-11-13 Task 10, spec §6.4): an O reference whose winning solve has partial levels — the symmetric
+/// ensemble every accepted open-shell species' scan wins at kT = 5 mHa, or a polarised-integer state with its frontier
+/// inside 27.6 kT = 138 mHa of μ — does not compose for two copies: two lone O at their aligned reference spin (M* = 5)
+/// decline to the teacher, on the all-electron surface as on any other; one lone O alone is still its own reference.
+#[test]
+fn polarised_or_partial_o_is_declined() {
+    let (mut s, t) = h_student(3);
+    s.set_reference_energy(8, SpeciesMorse::atom(8));
+    let mut o2 = two_h(6.2, Some(5));
+    for n in &mut o2.nuclei {
+        n.z = 8;
+    }
+    record_scan(&mut s, &o2, 8, 3, true);
+    let mut one = lone(8);
+    one.multiplicity = Some(3);
+    assert_reference(&s.evaluate(&one, &mut never()).unwrap(), SpeciesMorse::atom(8), "one O at its reference spin");
+    let n0 = species_calls(&t);
+    let r = s.evaluate(&o2, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+    assert_eq!(species_calls(&t), n0 + 1, "the teacher answered");
+    assert!(r.stats.notes.iter().any(|n| n.contains("2 lone O atoms") && n.contains("partly occupied")), "{:?}", r.stats.notes);
 }
 
 /// Review M1: with a model the answer sums the model's own references, so a reference changed

@@ -285,7 +285,7 @@
 //! `should_abort` (the job stays queued — the same path as any interrupted solve — and is solved
 //! afresh after the pause). The pass keeps its queue, progress, samples, references and burst; it
 //! is still *active* — Play, Step, Relax, another pass (StartSampling, ResumeSampling,
-//! StartTeaching, RetryFit) and LoadModel are refused, each with "paused" in the reason —, edits are accepted as during a running pass, and nothing that waits for
+//! StartTeaching, StartMigration, RetryFit) and LoadModel are refused, each with "paused" in the reason —, edits are accepted as during a running pass, and nothing that waits for
 //! a pass to end (the bond references, the idle orbital retry) starts. The snapshot's
 //! `sampling.paused` says so. `ContinueSampling` goes on from the queue at the next tick. Both note
 //! the sample the pass stands at; both are no-ops when there is nothing to change. Cancel, Forget,
@@ -743,6 +743,10 @@ pub enum DynCommand {
     /// Start a teach-around pass (`Trainable::start_teach`): like `StartSampling`, a pass that
     /// pauses the dynamics until it ends. Surrogate only.
     StartTeaching,
+    /// Start (or resume from its cursor) the re-solve pass that migrates the attached shared collection's predecessor
+    /// (`Trainable::start_migration`; Fermi–Dirac spec §7.3): like `StartSampling`, a pass that pauses the dynamics until
+    /// it ends, paused, continued and cancelled like one. Surrogate only.
+    StartMigration,
     /// The Retry of a model whose fit did not form (`Trainable::retry_fit`;
     /// `TrainableStatus::no_model`): a pass that re-solves the missing isolated-atom references
     /// (pausing the dynamics like `StartSampling`), or a refit at once. Surrogate only.
@@ -801,11 +805,12 @@ pub struct DynSnapshot {
     /// True after a discontinuous edit until the next tick re-evaluates (then `energy_ks`,
     /// `eval` and `display` are the pre-edit values).
     pub forces_stale: bool,
-    /// The provider's energy at the current positions (Hartree).
+    /// The provider's energy at the current positions (Hartree): for a Kohn-Sham provider the Mermin free energy
+    /// F = E − TS its forces are the derivative of (`EnergyBreakdown::total`, spec 2026-11-13 §4.3), never E.
     pub energy_ks: f64,
     /// Σ ½ m v² (Hartree, lab frame).
     pub kinetic: f64,
-    /// `kinetic + energy_ks` — spec §7's total energy.
+    /// `kinetic + energy_ks` — spec §7's total energy (KE + F under Fermi–Dirac occupations).
     pub total: f64,
     /// The invariant the drift is fitted on (module doc): total + U_spring + U_field + U_wall − W.
     pub energy_conserved: f64,
@@ -1304,7 +1309,7 @@ impl Dynamics {
         self.seq += 1;
         self.last_rejection = None;
         match cmd {
-            DynCommand::Play | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::ResumeSampling(_) | DynCommand::StartTeaching | DynCommand::RetryFit | DynCommand::Rewind if self.fire.is_some() => {
+            DynCommand::Play | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::ResumeSampling(_) | DynCommand::StartTeaching | DynCommand::StartMigration | DynCommand::RetryFit | DynCommand::Rewind if self.fire.is_some() => {
                 return self.reject("relaxing: Stop relax first".into());
             }
             DynCommand::Play | DynCommand::Step(_) | DynCommand::Relax if self.pass_active() && self.pass_paused => {
@@ -1541,6 +1546,7 @@ impl Dynamics {
             DynCommand::StartSampling(plan) => self.start_sampling(plan),
             DynCommand::ResumeSampling(text) => self.resume_sampling(&text),
             DynCommand::StartTeaching => self.start_teaching(),
+            DynCommand::StartMigration => self.start_migration(),
             DynCommand::RetryFit => self.retry_fit(),
             DynCommand::CancelSampling => self.cancel_sampling(),
             DynCommand::PauseSampling => self.pause_sampling(true),
@@ -2100,6 +2106,28 @@ impl Dynamics {
         self.pass_paused = false;
         self.take_provider_notes();
         self.sampling = p;
+    }
+
+    /// The collection migration's re-solve pass (`DynCommand::StartMigration`): `start_sampling`'s bookkeeping around
+    /// `Trainable::start_migration`.
+    fn start_migration(&mut self) {
+        let Some(t) = self.provider.as_trainable() else {
+            return self.no_surrogate("re-solve the collection for the new solver");
+        };
+        if t.pass_active() {
+            return self.reject(format!("re-solve the collection for the new solver: {}", self.pass_busy()));
+        }
+        if let Err(e) = t.start_migration() {
+            self.take_provider_notes();
+            return self.reject(format!("re-solve the collection for the new solver: {e}"));
+        }
+        let p = t.progress();
+        self.paused = true;
+        self.pending_steps = 0;
+        self.pass_paused = false;
+        self.take_provider_notes();
+        self.sampling = p;
+        self.refresh_ghost();
     }
 
     /// The Retry of a model whose fit did not form (`DynCommand::RetryFit`): a references-only pass

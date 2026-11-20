@@ -254,6 +254,7 @@ impl Command {
                     | DynCommand::StartSampling(_)
                     | DynCommand::ResumeSampling(_)
                     | DynCommand::StartTeaching
+                    | DynCommand::StartMigration
                     | DynCommand::RetryFit
                     | DynCommand::Relax
             ),
@@ -295,7 +296,7 @@ impl Command {
                 | Command::SetIonicPolicy(_)
                 | Command::EnsureModel { .. }
                 | Command::ResumeTraining(_)
-                | Command::Dyn(DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::ResumeSampling(_) | DynCommand::StartTeaching | DynCommand::RetryFit | DynCommand::Relax)
+                | Command::Dyn(DynCommand::Pause | DynCommand::Step(_) | DynCommand::StartSampling(_) | DynCommand::ResumeSampling(_) | DynCommand::StartTeaching | DynCommand::StartMigration | DynCommand::RetryFit | DynCommand::Relax)
         )
     }
 
@@ -345,6 +346,7 @@ impl Command {
                     | DynCommand::StartSampling(_)
                     | DynCommand::ResumeSampling(_)
                     | DynCommand::StartTeaching
+                    | DynCommand::StartMigration
                     | DynCommand::RetryFit
                     | DynCommand::CancelSampling
                     | DynCommand::PauseSampling
@@ -490,7 +492,7 @@ impl Worker {
             Command::DisplayPartialCore(on) => self.dy.apply(DynCommand::SetDisplayPartialCore(on)),
             Command::Dyn(c) => {
                 // the user's own model actions make the session's model this worker's
-                let takes_over = matches!(c, DynCommand::ForgetModel | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::RetryFit | DynCommand::LoadModel(_));
+                let takes_over = matches!(c, DynCommand::ForgetModel | DynCommand::StartSampling(_) | DynCommand::StartTeaching | DynCommand::StartMigration | DynCommand::RetryFit | DynCommand::LoadModel(_));
                 let forget = matches!(c, DynCommand::ForgetModel);
                 // a model file the user picked is the one choice against the shared collection: it
                 // is not attached again on a scene change until the Model tab's switch says so; a

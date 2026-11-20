@@ -2,18 +2,34 @@
 //! (installer spec, "The manifest", "Downgrades" and the builder-check ruling on scenes and
 //! profiles).
 //!
-//! Every number is read from the code's own version constant, never typed here:
+//! Every number is read from the code's own version constant, never typed here (the tests pin the
+//! current values, so a bump is seen):
 //!
 //! | key | constant | on disk |
 //! |---|---|---|
-//! | `collection` | `surrogate::collection::RECORD_VERSION` | each record of `models/collections/<key>/samples.bin` |
-//! | `sidecar` | the newest model-file version the reader takes: `surrogate::sidecar::MAGICS.len()` | the magic of `models/*.model`, `training/pass.model` |
-//! | `history` | `surrogate::history::MAGIC` (`ASAUDIT1`) | the magic of `models/collections/<key>/history.bin` |
+//! | `collection` | `surrogate::collection::RECORD_VERSION` (the reader takes every version up to it) | each record of `models/collections/<key>/samples.bin` |
+//! | `sidecar` | the newest model-file version the reader takes: `surrogate::sidecar::MAGICS.len()` (the writers use the newest magic only; its header names the older body it carries) | the magic of `models/*.model`, `training/pass.model` |
+//! | `history` | `surrogate::history::MAGIC` (`ASAUDIT2`) | the magic of `models/collections/<key>/history.bin` |
 //! | `replay` | `crate::replay::HEADER` | a replay script's first line (wherever the user keeps it) |
 //! | `pseudo_cache` | `providers::pseudo::DISK_MAGIC` | `cache/pseudo` (a cache: rebuilt, never lost) |
 //! | `checkpoint` | `providers::sampling::CHECKPOINT_MAGIC` | the first line of `training/pass.ckpt` |
 //! | `scene` | `crate::scene::SCENE_FORMAT` (code-only) | none: scene files carry no version |
 //! | `profile` | `crate::ui::profile::PROFILE_FORMAT` (code-only) | none |
+//!
+//! The Fermi–Dirac switch (plan 2026-11-13 Task 13) moved `collection` and `sidecar` on by one each:
+//! its collections and model files hold free energies on a new solver surface, so a build before it
+//! refuses them as a newer format, and the collections it wrote stay in their own folders, untouched
+//! (`surrogate::collection`, "Record versions"; `surrogate::sidecar`, "Version 9"). A collection the migration made
+//! (its `migration.txt` names the folder it was re-solved from, Fermi–Dirac spec §7.7) gets one more line: the older
+//! version will use that folder, as it was before the migration — said only while it exists.
+//!
+//! Trust tightening (plan 2026-11-19 Task 1) moved `history` (1 to 2) and `sidecar` (9 to 10) on by
+//! one each: an audit history whose points carry a fit id, a flags word or an epistemic energy std is
+//! written as `ASAUDIT2` in `history.bin` and as `ASMOD010` in a `.model` file — older readers
+//! refuse the extra arrays — and every other file keeps its version-1 / version-9 bytes. From
+//! `history` 2 on a build keeps a newer build's `history.bin` untouched
+//! (`surrogate::history::written_by_newer_build`); a build before it overwrites it, and its warning
+//! says so.
 //!
 //! Choosing a downgrade never changes a file: [`downgrade_warnings`] only reads the headers of the
 //! files under the per-user root to say which of them the older version won't open, and where the
@@ -35,6 +51,10 @@ pub const PSEUDO_CACHE: &str = "pseudo_cache";
 pub const CHECKPOINT: &str = "checkpoint";
 pub const SCENE: &str = "scene";
 pub const PROFILE: &str = "profile";
+
+/// The first `history` format whose reader keeps a newer build's `history.bin` untouched instead of
+/// overwriting it (trust tightening Task 1; `surrogate::history::written_by_newer_build`).
+const HISTORY_KEPT_FROM: u32 = 2;
 
 /// The version number a magic or header line ends with (`ASAUDIT1` → 1, `… replay v1` → 1):
 /// `None` without one, or when it overflows a `u32` (a damaged file is unreadable, not a version).
@@ -101,10 +121,15 @@ fn collection_version(samples: &Path) -> Option<u32> {
     }
 }
 
-/// The version digit of an 8-byte magic `<prefix><digit>` (`ASMODEL8`, `ASAUDIT1`).
+/// The version of an 8-byte magic `<prefix><digit>` (`ASAUDIT1`); for a model file (`prefix`
+/// `ASMODEL`) the sidecar's magic layout, `ASMODEL<d>` or from version 10 on `ASMOD<ddd>`
+/// (`surrogate::sidecar::magic_version`).
 fn magic_version(path: &Path, prefix: &[u8; 7]) -> Option<u32> {
     let mut magic = [0u8; 8];
     std::fs::File::open(path).ok()?.read_exact(&mut magic).ok()?;
+    if prefix == b"ASMODEL" {
+        return surrogate::sidecar::magic_version(&magic);
+    }
     (&magic[..7] == prefix && magic[7].is_ascii_digit()).then(|| u32::from(magic[7] - b'0'))
 }
 
@@ -131,6 +156,13 @@ fn name(p: &Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
+/// Whether `name` is one plain folder name (no separator, no `.` or `..`, no root, drive or UNC prefix): a
+/// `migration.txt`'s source slug names a folder beside the collection, never a path.
+fn plain_folder_name(name: &str) -> bool {
+    let mut parts = Path::new(name).components();
+    matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(c)), None) if c == std::ffi::OsStr::new(name)) && !name.contains(['/', '\\', ':'])
+}
+
 /// "1 of your collections (it was …): a. It stays …" / "2 of … (they were …): a, b. They stay …"
 fn files_line(tv: &str, what: &str, names: &[String], verb: &str) -> String {
     let n = names.len();
@@ -151,8 +183,11 @@ fn files_line(tv: &str, what: &str, names: &[String], verb: &str) -> String {
 ///   - collections, saved models, an interrupted training pass — the files under `root` whose
 ///     headers carry a newer version are named, by folder or file. A collection with a newer
 ///     `samples.bin` won't open (untouched); one whose only newer file is `history.bin` opens with
-///     an empty audit history that overwrites it at the next save (its own line says so); a newer
-///     pass can't be resumed, and a new pass there replaces it;
+///     an empty audit history that, in a target before `history` 2, overwrites it at the next save
+///     (its own line says so; a target of `history` 2 or later leaves the file as it is, and its
+///     line says that); a newer pass can't be resumed, and a new pass there replaces it. A collection a migration made names the
+///     folder it was migrated from, which the older version uses instead, while that folder exists (Fermi–Dirac
+///     spec §7.7);
 ///   - scenes, profiles, replays — one line by type (they carry no version, or live anywhere);
 ///   - the pseudopotential cache — one line when `root/cache/pseudo` exists (it is rebuilt).
 ///
@@ -169,11 +204,12 @@ pub fn downgrade_warnings(target_version: &semver::Version, target: Option<&Form
     let mut out = Vec::new();
 
     // collections: a newer `samples.bin` refuses the open (`Collection::open`, untouched); one whose
-    // only newer file is `history.bin` opens, starts an empty audit history and overwrites
-    // `history.bin` at its next save — said on its own line, as the loss it is
+    // only newer file is `history.bin` opens, starts an empty audit history and — in a target before
+    // `history` 2 (`HISTORY_KEPT_FROM`) — overwrites `history.bin` at its next save, said on its own
+    // line as the loss it is; a later target keeps the file, and its line says that
     let models = root.join("models");
     if lower(COLLECTION) || lower(HISTORY) {
-        let (mut refused, mut history_lost) = (Vec::new(), Vec::new());
+        let (mut refused, mut history_lost, mut pre_migration) = (Vec::new(), Vec::new(), Vec::new());
         for d in entries(&models.join("collections")).into_iter().filter(|d| d.is_dir()) {
             let shown = Path::new("models").join("collections").join(name(&d)).display().to_string();
             if newer_than(collection_version(&d.join("samples.bin")), COLLECTION) {
@@ -185,15 +221,32 @@ pub fn downgrade_warnings(target_version: &semver::Version, target: Option<&Form
         if !refused.is_empty() {
             out.push(files_line(&tv, "collections", &refused, "open"));
         }
+        // a collection a migration made (Fermi–Dirac spec §7.7): the older build never computes its key, so it uses
+        // the folder it was migrated from — said while that folder exists. The source is never a path read from the
+        // file (Task 14 security review): one plain folder name beside it, else no line
+        if lower(COLLECTION) {
+            for d in entries(&models.join("collections")).into_iter().filter(|d| d.is_dir()) {
+                let Ok(Some(log)) = surrogate::read_migration(&d) else { continue };
+                if plain_folder_name(&log.source_slug) && models.join("collections").join(&log.source_slug).is_dir() {
+                    let old = Path::new("models").join("collections").join(&log.source_slug).display().to_string();
+                    pre_migration.push(format!(
+                        "{tv} will use {old}, the collection as it was before it was re-solved for the Fermi–Dirac solver, without what was learned since. Both folders stay on disk."
+                    ));
+                }
+            }
+        }
         if !history_lost.is_empty() {
             let n = history_lost.len();
             let (their, its) = if n == 1 { ("its", "it was") } else { ("their", "they were") };
-            out.push(format!(
-                "{tv} would open {n} of your collections but not {their} audit history ({its} written in a newer format): {}. It starts an empty audit history and overwrites history.bin on its next save there, so the audit history in {} would be lost.",
-                history_lost.join(", "),
-                if n == 1 { "that collection" } else { "those collections" }
-            ));
+            let what = if n == 1 { "that collection" } else { "those collections" };
+            let consequence = if theirs(HISTORY) >= HISTORY_KEPT_FROM {
+                format!("It starts an empty audit history there and leaves history.bin as it is: the audit history in {what} is kept, but {tv} won't use it.")
+            } else {
+                format!("It starts an empty audit history and overwrites history.bin on its next save there, so the audit history in {what} would be lost.")
+            };
+            out.push(format!("{tv} would open {n} of your collections but not {their} audit history ({its} written in a newer format): {}. {consequence}", history_lost.join(", ")));
         }
+        out.extend(pre_migration);
     }
     // saved models
     if lower(SIDECAR) {
@@ -297,7 +350,8 @@ mod tests {
         let d = root.join("models").join("collections").join(slug);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("samples.bin"), samples_bin(versions)).unwrap();
-        std::fs::write(d.join("history.bin"), surrogate::history::MAGIC).unwrap();
+        // the oldest history magic, one every release reads (a newer one is written by the test)
+        std::fs::write(d.join("history.bin"), surrogate::history::MAGIC_V1).unwrap();
     }
 
     #[test]
@@ -305,13 +359,16 @@ mod tests {
         let f = current_formats();
         let want: Formats = [
             ("checkpoint", 1),
-            ("collection", 1),
-            ("history", 1),
+            // 2 and 9 since the Fermi–Dirac switch (plan 2026-11-13 Task 13; F1: main's 1 and 8, plus one)
+            ("collection", 2),
+            // 2 and 10 since trust tightening (plan 2026-11-19 Task 1: the history's per-point
+            // fields; 1 and 9 before, plus one)
+            ("history", 2),
             ("profile", 1),
             ("pseudo_cache", 1),
             ("replay", 1),
             ("scene", 1),
-            ("sidecar", 8),
+            ("sidecar", 10),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
@@ -328,25 +385,33 @@ mod tests {
 
     /// The tripwire for the model-file number (review I2): the sidecar reader itself must refuse
     /// the version after the manifest's as "newer than this build", and must not refuse the
-    /// manifest's own so. A V9 reader added to `surrogate::sidecar` without `MAGICS` (and so the
-    /// manifest) moving on fails here.
+    /// manifest's own so. A reader of a newer version added to `surrogate::sidecar` without
+    /// `MAGICS` (and so the manifest) moving on fails here. The magic is `ASMODEL<d>` up to 9 and
+    /// `ASMOD<ddd>` from 10 on (`surrogate::sidecar` "The magic", Task 13 fix round 1); the
+    /// downgrade scan reads both.
     #[test]
     fn the_sidecar_number_is_the_newest_the_reader_takes() {
         let root = Root::new("sidecar-tripwire");
         let n = current_formats()[SIDECAR];
-        assert!(n < 9, "a version {} magic no longer fits `ASMODEL<digit>`: this test needs the new layout", n + 1);
+        assert!(n < 999, "a version {} magic no longer fits `ASMOD<ddd>`: this test needs the new layout", n + 1);
+        let magic = |ver: u32| if ver <= 9 { format!("ASMODEL{ver}") } else { format!("ASMOD{ver:03}") };
         let probe = |ver: u32| {
             let p = root.0.join(format!("probe-v{ver}.model"));
-            let mut bytes = format!("ASMODEL{ver}").into_bytes();
+            let mut bytes = magic(ver).into_bytes();
             bytes.extend_from_slice(&2u64.to_le_bytes());
             bytes.extend_from_slice(b"{}");
             std::fs::write(&p, bytes).unwrap();
+            assert_eq!(magic_version(&p, b"ASMODEL"), Some(ver), "the downgrade scan reads {}", magic(ver));
             surrogate::sidecar::read_provenance(&p).expect_err("a header without provenance never reads").to_string()
         };
         let next = probe(n + 1);
         assert!(next.contains("newer than this build"), "the reader takes version {}: {next}", n + 1);
-        let this = probe(n);
-        assert!(!this.contains("newer than this build"), "the reader refuses its own newest version {n}: {this}");
+        assert!(next.contains(&format!("format version {}", n + 1)), "by its number: {next}");
+        for ver in 1..=n {
+            let this = probe(ver);
+            assert!(!this.contains("newer than this build"), "the reader refuses version {ver} of its own (newest {n}): {this}");
+        }
+        assert_eq!(probe(10).contains("newer than this build"), n < 10);
     }
 
     /// The collection walk holds each record to the reader's tests (review M4): a bad CRC, a length
@@ -392,7 +457,8 @@ mod tests {
         let root = Root::new("newer-coll");
         let mut current = current_formats();
         current.insert(COLLECTION.into(), 2);
-        let target = current_formats(); // collection 1
+        let mut target = current_formats();
+        target.insert(COLLECTION.into(), 1);
         collection(&root.0, "h-new", &[2, 2]);
         collection(&root.0, "h-old", &[1, 1, 1]);
         collection(&root.0, "h-appended", &[1, 1, 2]); // an older collection a newer build appended to
@@ -414,6 +480,67 @@ mod tests {
         assert_eq!(std::fs::read(root1.0.join("models/collections/h-new/samples.bin")).unwrap(), samples_bin(&[2]));
     }
 
+    /// A migrated collection's `migration.txt` (Fermi–Dirac spec §7.5) naming `source`.
+    fn migrated(root: &Path, slug: &str, source: &str) {
+        let log = surrogate::MigrationLog {
+            source_slug: source.into(),
+            source_key: String::new(),
+            build: "0.2.0".into(),
+            date: "2026-11-20".into(),
+            source_len: 0,
+            source_hash: 0,
+            cursor: 3,
+            state: surrogate::MigrationState::Complete,
+            counts: [3, 0, 0, 0],
+            not_migrated: Vec::new(),
+            references: Vec::new(),
+            class_u_max: (0.0, 0.0),
+            review: Vec::new(),
+            waiting: Vec::new(),
+            pending: None,
+            orphaned: Vec::new(),
+        };
+        surrogate::write_migration(&root.join("models").join("collections").join(slug), &log).unwrap();
+    }
+
+    /// Spec §7.7: a downgrade below the Fermi–Dirac switch names, for each collection a migration made, the folder it
+    /// was migrated from — what the older build will use instead — only while that folder exists; never for an
+    /// unmigrated folder, a log whose source is not one plain folder name, or a target that reads the new records.
+    #[test]
+    fn downgrade_line_names_the_pre_migration_folder() {
+        let root = Root::new("migrated");
+        let mut current = current_formats();
+        current.insert(COLLECTION.into(), 2);
+        let mut target = current_formats();
+        target.insert(COLLECTION.into(), 1);
+        collection(&root.0, "h-old", &[1, 1, 1]);
+        collection(&root.0, "h-new", &[2, 2, 2]);
+        migrated(&root.0, "h-new", "h-old");
+        let old = Path::new("models").join("collections").join("h-old").display().to_string();
+        let line = format!("v0.1.0 will use {old}, the collection as it was before it was re-solved for the Fermi–Dirac solver, without what was learned since. Both folders stay on disk.");
+        let w = downgrade_warnings(&v("0.1.0"), Some(&target), &current, &root.0);
+        assert!(w.contains(&line), "{w:#?}");
+        assert_eq!(w.iter().filter(|l| l.contains("will use")).count(), 1, "{w:#?}");
+        // a target that reads version-2 records opens the new folder itself: no line
+        let w = downgrade_warnings(&v("0.3.0"), Some(&current), &current, &root.0);
+        assert!(!w.iter().any(|l| l.contains("will use")), "{w:#?}");
+        // a log naming anything but one plain folder name (security: never a path from a file), or a folder gone
+        for bad in ["..", "../h-old", "h-old/../h-old", r"C:\h-old", "h-gone"] {
+            let r = Root::new("migrated-bad");
+            collection(&r.0, "h-old", &[1]);
+            collection(&r.0, "h-new", &[2]);
+            migrated(&r.0, "h-new", bad);
+            let w = downgrade_warnings(&v("0.1.0"), Some(&target), &current, &r.0);
+            assert!(!w.iter().any(|l| l.contains("will use")), "{bad}: {w:#?}");
+        }
+        // the source folder removed: the line goes
+        std::fs::remove_dir_all(root.0.join("models").join("collections").join("h-old")).unwrap();
+        let w = downgrade_warnings(&v("0.1.0"), Some(&target), &current, &root.0);
+        assert!(!w.iter().any(|l| l.contains("will use")), "{w:#?}");
+        // nothing was changed
+        assert_eq!(std::fs::read(root.0.join("models/collections/h-new/samples.bin")).unwrap(), samples_bin(&[2, 2, 2]));
+    }
+
     #[test]
     fn downgrade_names_newer_models_history_and_training() {
         let root = Root::new("newer-files");
@@ -422,6 +549,7 @@ mod tests {
         current.insert(CHECKPOINT.into(), 2);
         let mut target = current_formats();
         target.insert(SIDECAR.into(), 7);
+        target.insert(HISTORY.into(), 1);
         let models = root.0.join("models");
         std::fs::create_dir_all(&models).unwrap();
         std::fs::write(models.join("b.model"), b"ASMODEL8rest").unwrap();
@@ -455,7 +583,9 @@ mod tests {
         let mut current = current_formats();
         current.insert(COLLECTION.into(), 2);
         current.insert(HISTORY.into(), 2);
-        let target = current_formats(); // collection 1, history 1
+        let mut target = current_formats();
+        target.insert(COLLECTION.into(), 1);
+        target.insert(HISTORY.into(), 1);
         let hist = |slug: &str| std::fs::write(root.0.join("models").join("collections").join(slug).join("history.bin"), b"ASAUDIT2").unwrap();
         collection(&root.0, "h-both", &[2]); // won't open: named as refused only
         hist("h-both");
@@ -483,6 +613,34 @@ mod tests {
         let w1 = downgrade_warnings(&v("0.1.0"), Some(&target), &current, &root1.0);
         assert_eq!(w1.len(), 1);
         assert!(w1[0].contains("would open 1 of your collections but not its audit history (it was") && w1[0].contains("overwrites history.bin") && w1[0].contains("in that collection would be lost"), "{}", w1[0]);
+    }
+
+    /// Trust tightening Task 1 (Review Focus 1): a target whose `history` format is 2 or more keeps a
+    /// newer build's `history.bin` untouched (`surrogate::history::written_by_newer_build`), so its
+    /// line says the history is kept, not lost; a target before 2 still says it is lost. This
+    /// build's own number is the first that keeps it.
+    #[test]
+    fn a_newer_audit_history_is_warned_as_kept_by_a_target_that_keeps_it() {
+        assert_eq!(current_formats()[HISTORY], HISTORY_KEPT_FROM, "this build is the first to keep a newer history.bin");
+        let root = Root::new("history-kept");
+        let mut current = current_formats();
+        current.insert(HISTORY.into(), 3);
+        collection(&root.0, "h-hist", &[1]);
+        std::fs::write(root.0.join("models/collections/h-hist/history.bin"), b"ASAUDIT3").unwrap();
+        let p = Path::new("models").join("collections").join("h-hist").display().to_string();
+        let w = downgrade_warnings(&v("0.3.0"), Some(&current_formats()), &current, &root.0);
+        assert_eq!(
+            w,
+            [format!(
+                "v0.3.0 would open 1 of your collections but not its audit history (it was written in a newer format): {p}. It starts an empty audit history there and leaves history.bin as it is: the audit history in that collection is kept, but v0.3.0 won't use it."
+            )]
+        );
+        let mut before = current_formats();
+        before.insert(HISTORY.into(), 1);
+        let w = downgrade_warnings(&v("0.1.0"), Some(&before), &current, &root.0);
+        assert_eq!(w.len(), 1, "{w:#?}");
+        assert!(w[0].contains("overwrites history.bin") && w[0].contains("would be lost"), "{}", w[0]);
+        assert_eq!(std::fs::read(root.0.join("models/collections/h-hist/history.bin")).unwrap(), b"ASAUDIT3", "untouched");
     }
 
     #[test]

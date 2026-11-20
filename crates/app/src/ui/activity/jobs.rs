@@ -88,14 +88,15 @@ pub fn pause_control(paused: bool) -> (String, Action) {
     }
 }
 
-/// The running solve's line ("Δρ 3.2e-5 → 1e-6 · ΔE −2.1e-4 Ha · 85 ms/iteration") and, once
+/// The running solve's line ("Δρ 3.2e-5 → 1e-6 · ΔF_HF −2.1e-4 Ha · 85 ms/iteration": the change of the iteration's
+/// Harris–Foulkes free energy F_HF, [`ITERATION_ENERGY_TIP`]) and, once
 /// [`STALL_TAG_FROM`] iterations passed without a 2× gain of the best Δρ, the stall tag
 /// ("no 2× gain for 31 / 50": the stall stop ends the solve at 50/50, `qm::scf` "The stall stop").
 pub fn scf_lines(l: &sim::ScfLive) -> (String, Option<String>) {
     let mut parts = vec![format!("Δρ {:.1e} → {:.0e}", l.delta_rho, l.tol)];
     if l.d_energy.is_finite() {
         let sign = if l.d_energy < 0.0 { '−' } else { '+' };
-        parts.push(format!("ΔE {sign}{:.1e} Ha", l.d_energy.abs()));
+        parts.push(format!("ΔF_HF {sign}{:.1e} Ha", l.d_energy.abs()));
     }
     if l.ms_per_iteration.is_finite() {
         parts.push(if l.ms_per_iteration >= 1000.0 { format!("{:.1} s/iteration", l.ms_per_iteration / 1e3) } else { format!("{:.0} ms/iteration", l.ms_per_iteration) });
@@ -104,6 +105,9 @@ pub fn scf_lines(l: &sim::ScfLive) -> (String, Option<String>) {
     let tag = (l.stall_left().is_some() && l.since_gain >= STALL_TAG_FROM).then(|| format!("no 2× gain for {} / {}", l.since_gain, l.window));
     (parts.join(" · "), tag)
 }
+
+/// What the iteration energy is (the hover of the iteration line; Fermi–Dirac spec 2026-11-13 §6.6: E_HF became F_HF).
+pub const ITERATION_ENERGY_TIP: &str = "ΔF_HF is the change between iterations of the Harris–Foulkes free energy F_HF of the iteration's input density: E_HF − T_el·S of that iteration's Fermi–Dirac occupations, which lands on the solve's F as it converges";
 
 /// An orbital display solve's job title (live-orbitals spec §4.3; never "DFT fallback").
 pub const HARRIS_JOB_TITLE: &str = "Orbital display solve";
@@ -122,25 +126,46 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
         let step = running.map(|s| format!(" · {}", iteration_text(s.live.as_ref(), s.scf_step))).unwrap_or_default();
         // paused (user request 2026-11-16): "paused · sample 40 of 144", no time left (none passes)
         let count = if p.paused { format!("paused · {}", sample_text(p.done, p.total).to_lowercase()) } else { sample_text(p.done, p.total).to_lowercase() };
-        v.push(JobRow {
-            key: JobKey::Pass,
-            title: "Sampling pass".into(),
-            detail: format!("{} · {count}{step}", super::words::pass_stage_of(p, d.and_then(|d| d.ghost.as_ref()))),
-            progress: JobProgress::Fraction { done: p.done, total: p.total },
-            elapsed_s: None,
-            eta_s: m.and_then(|m| m.pass_eta_s).filter(|_| !p.paused),
-            control: Some(("Cancel".into(), Action::CancelSampling)),
-            no_control_why: None,
-            // kept between samples: the probe keeps the last solve's record until the next one
-            // starts (user request 2026-10-17: the block hid between samples), so it stays on
-            // screen and is replaced, not blanked, as each sample begins; paused, the dropped
-            // solve's record is not shown
-            scf: probe.and_then(|p| p.main.live).filter(|_| !p.paused),
-            keeps_block: true,
-            stage: Some(super::words::pass_stage_of(p, d.and_then(|d| d.ghost.as_ref()))),
-            count: Some(count),
-            control2: Some(pause_control(p.paused)),
-        });
+        // the collection migration's re-solve pass (Fermi–Dirac spec §7.8): its own title and the progress line's
+        // counts by class, its time left the migration's own estimate (the median of its solves after 20)
+        if let Some(mg) = m.and_then(|m| m.migration.as_ref()).filter(|mg| mg.state == sim::MigrationPhase::Running) {
+            let counts = crate::ui::migration::progress_counts(mg);
+            v.push(JobRow {
+                key: JobKey::Pass,
+                title: crate::ui::migration::RESOLVING.into(),
+                detail: crate::ui::migration::progress_line(mg),
+                progress: JobProgress::Fraction { done: mg.done, total: mg.samples },
+                elapsed_s: None,
+                eta_s: mg.eta_s.filter(|_| !p.paused),
+                control: Some(("Cancel".into(), Action::CancelSampling)),
+                no_control_why: None,
+                scf: probe.and_then(|p| p.main.live).filter(|_| !p.paused),
+                keeps_block: true,
+                stage: (p.stage == "references").then(|| "references".to_string()),
+                count: Some(if p.paused { format!("paused · {counts}") } else { counts }),
+                control2: Some(pause_control(p.paused)),
+            });
+        } else {
+            v.push(JobRow {
+                key: JobKey::Pass,
+                title: "Sampling pass".into(),
+                detail: format!("{} · {count}{step}", super::words::pass_stage_of(p, d.and_then(|d| d.ghost.as_ref()))),
+                progress: JobProgress::Fraction { done: p.done, total: p.total },
+                elapsed_s: None,
+                eta_s: m.and_then(|m| m.pass_eta_s).filter(|_| !p.paused),
+                control: Some(("Cancel".into(), Action::CancelSampling)),
+                no_control_why: None,
+                // kept between samples: the probe keeps the last solve's record until the next one
+                // starts (user request 2026-10-17: the block hid between samples), so it stays on
+                // screen and is replaced, not blanked, as each sample begins; paused, the dropped
+                // solve's record is not shown
+                scf: probe.and_then(|p| p.main.live).filter(|_| !p.paused),
+                keeps_block: true,
+                stage: Some(super::words::pass_stage_of(p, d.and_then(|d| d.ghost.as_ref()))),
+                count: Some(count),
+                control2: Some(pause_control(p.paused)),
+            });
+        }
     } else if let Some(pv) = probe.filter(|p| p.main.running) {
         let last = d.map(|d| d.eval.scf_steps as u32).filter(|&n| n > 0);
         let estimated = snap.is_some_and(|s| s.backend == crate::sim::Backend::Estimated);
@@ -578,7 +603,7 @@ pub fn card(ui: &mut Ui, r: &JobRow, tr: &Traces, bars: &[StripBar], acts: &mut 
             let retry = if l.attempt > 1 { " · cold retry" } else { "" };
             let (full, tag) = scf_lines(l);
             two_sides(ui, &format!("iteration {}{each}{retry}", l.iteration), &format!("Δρ {:.1e} → {:.0e}", l.delta_rho, l.tol), egui::FontId::monospace(10.5), theme::INK_DIM)
-                .on_hover_text(format!("{full}\n\nΔρ = ∫|ρ_out − ρ_in| against the target; the time is the mean per iteration. On the GPU a ΔE below ~1e-5 Ha is at the f32 reduction noise of the energy terms"));
+                .on_hover_text(format!("{full}\n\nΔρ = ∫|ρ_out − ρ_in| against the target; the time is the mean per iteration. {ITERATION_ENERGY_TIP}. On the GPU a ΔF_HF below ~1e-5 Ha is at the f32 reduction noise of the energy terms"));
             if let Some(t) = tag {
                 ui.label(RichText::new(t).size(11.0).strong().color(AMBER)).on_hover_text(format!(
                     "the best Δρ ({:.1e}) has not halved for {} iterations and is still above the stall level {:.1e}; at {} the solve stops as stalled (the iteration cap {} is the backstop; below the level a plateau is never stopped)",

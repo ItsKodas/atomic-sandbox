@@ -7,6 +7,9 @@
 //! [`orbitals`] holds what the Kohn-Sham adapters share for the orbital display (plan Task 3 of
 //! the orbital viewer); [`harris`] the input density and GPU memory of a Harris display solve
 //! (live orbitals, Phase A), which `GpuKs::harris_display` runs.
+pub mod branch_jump;
+#[cfg(test)]
+mod fd_regression;
 pub mod harris;
 pub mod ks;
 pub mod orbitals;

@@ -7,6 +7,7 @@ pub mod grid;
 pub mod ionic;
 pub mod nonlocal;
 pub mod nuclear;
+pub mod occupations;
 pub mod orbitals;
 pub mod poisson;
 pub mod radial;
@@ -19,4 +20,8 @@ pub use forces::forces;
 pub use grid::Grid;
 pub use ionic::{IonicPolicy, IonicSetup};
 pub use nuclear::Nucleus;
-pub use scf::{extrapolate_sigma, one_shot_occupations, scf, scf_observed, valence_electrons, Energy, KsState, OneShot, Occupations, ScfProgress, ScfSettings, ScfStats, StallWatch, System, DEGENERACY_TAU, SCF_STALL_WINDOW};
+pub use occupations::{
+    fd_entropy, fermi_dirac, grown_extras, partial_levels, step_tail_kt, tight_columns, tight_start, witness_bound_reached, witness_bound_reached_tail, witness_keep, witness_keep_tail, witness_reached, FdOccupations, PartialLevel, ELECTRON_KT,
+    GPU_PARTIAL_TOL, LOOSE_F_FACTOR, STEP_TAIL_C, STEP_TAIL_MIN_KT, MAX_MU_HALVINGS, MU_BRACKET_KT, PARTIAL_OCCUPATION_MIN, WITNESS_GAP, WITNESS_GUARD_TOL, WITNESS_TAIL_KT,
+};
+pub use scf::{extrapolate_sigma, one_shot_occupations, scf, scf_observed, valence_electrons, Energy, KsState, OneShot, Occupations, ScfProgress, ScfSettings, ScfStats, StallWatch, System, SCF_STALL_WINDOW};

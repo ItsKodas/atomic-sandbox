@@ -25,6 +25,11 @@
 //! - a **charge or multiplicity** the scene's electrons cannot realise.
 //! The grid, σ, charge, multiplicity and policy are applied; the nuclei stay where they are.
 //!
+//! A model taught **before the Fermi–Dirac switch** (its tag a policy's shared-shell tag, `pseudo::legacy_tag_of`)
+//! differs in its occupation rule, which no setting reaches (Fermi–Dirac spec §7.9): the card never offers it — the
+//! policy is compared as this build tags it — and the load refuses the file with its reason
+//! (`providers::surrogate::legacy_model_refusal`: re-teach it, or open it in the older version).
+//!
 //! Pure functions over data (no egui, no worker) so the diff and the plan are unit tested.
 use crate::scene::{validate_grid, Scene};
 use std::path::{Path, PathBuf};
@@ -66,6 +71,11 @@ pub struct ModelOffer {
     pub rows: Vec<Row>,
     /// What Apply sends, in order; unused while a row is blocked.
     pub edits: Vec<Edit>,
+    /// The model will be refused on load whatever the settings — taught before the Fermi–Dirac switch
+    /// (`providers::surrogate::legacy_model_refusal`; spec §7.9, Task 16 review I2): "Apply and load" refuses with it
+    /// before applying anything (no scene re-solve, no dimer gate for a load that cannot happen); applying the settings
+    /// only (to re-teach the model at them) stays.
+    pub refusal: Option<String>,
 }
 
 impl ModelOffer {
@@ -132,7 +142,7 @@ fn mult_label(m: Option<u32>) -> String {
     m.map_or("lowest".to_string(), |m| m.to_string())
 }
 
-/// The ionic tag in words: "none" → all-electron; "cores/…" and "all/…" with their policy.
+/// The ionic tag in words: "none" and "none/fd…" → all-electron; "cores/…" and "all/…" with their policy.
 pub fn ionic_label(tag: &str) -> String {
     match tag.split('/').next().and_then(sim::IonicPolicy::parse) {
         Some(sim::IonicPolicy::None) => "all-electron (none)".to_string(),
@@ -242,17 +252,26 @@ pub fn offer(path: &Path, prov: &Provenance, scene: &Scene, ctx: &Context<'_>) -
     }
 
     // the ionic surface
-    let scene_tag = if ctx.pseudised { providers::pseudo::tag_of(scene.ionic) } else { "none".to_string() };
+    // the scene's surface tag: the all-electron one is `none/fd5e-3/pin1e-5` since plan 2026-11-13 Task 9
+    let scene_tag = if ctx.pseudised { providers::pseudo::tag_of(scene.ionic) } else { providers::pseudo::all_electron_tag() };
+    // a model of the previous solver (Fermi–Dirac spec §7.9): its tag is the shared-shell tag of a policy, and only its
+    // occupation rule differs from that policy's tag here — which no setting reaches, so it is never offered; the
+    // policy is compared as this build tags it (the load refuses the file with its reason:
+    // `providers::surrogate::legacy_model_refusal`)
+    let model_tag = match prov.ionic.split('/').next().and_then(sim::IonicPolicy::parse) {
+        Some(p) if prov.ionic == providers::pseudo::legacy_tag_of(p) => providers::pseudo::tag_of(p),
+        _ => prov.ionic.clone(),
+    };
     let mut ionic_row = None;
-    if prov.ionic != scene_tag {
-        let mut r = row("ionic potential", ionic_label(&prov.ionic), ionic_label(&scene_tag), true);
-        match prov.ionic.split('/').next().and_then(sim::IonicPolicy::parse) {
-            None => r.blocked = Some(format!("the ionic tag '{}' is not one this build knows", prov.ionic)),
+    if model_tag != scene_tag {
+        let mut r = row("ionic potential", ionic_label(&model_tag), ionic_label(&scene_tag), true);
+        match model_tag.split('/').next().and_then(sim::IonicPolicy::parse) {
+            None => r.blocked = Some(format!("the ionic tag '{}' is not one this build knows", model_tag)),
             Some(sim::IonicPolicy::None) => {
                 t.ionic = sim::IonicPolicy::None;
                 edits.push(Edit::Ionic(sim::IonicPolicy::None));
             }
-            Some(p) if prov.ionic != providers::pseudo::tag_of(p) => {
+            Some(p) if model_tag != providers::pseudo::tag_of(p) => {
                 r.blocked = Some("trained with a different pseudopotential recipe than this build's (another recipe version or occupation scheme): its surface cannot be reproduced here — sample this scene instead".to_string());
             }
             Some(p) if p == scene.ionic => {
@@ -318,7 +337,7 @@ pub fn offer(path: &Path, prov: &Provenance, scene: &Scene, ctx: &Context<'_>) -
         rows.push(r);
     }
 
-    Some(ModelOffer { path: path.to_path_buf(), rows, edits })
+    Some(ModelOffer { path: path.to_path_buf(), rows, edits, refusal: providers::surrogate::legacy_model_refusal(&prov.ionic) })
 }
 
 #[cfg(test)]
@@ -353,7 +372,7 @@ mod tests {
             multiplicity: s.multiplicity,
             teacher: "Kohn-Sham (GPU)".into(),
             masses: vec![(1, 1)],
-            ionic: "none".into(),
+            ionic: providers::pseudo::all_electron_tag(), // this build's all-electron surface (plan 2026-11-13 Task 9)
         }
     }
 
@@ -488,6 +507,56 @@ mod tests {
         let c = Context { pseudised: false, ..ctx(&ok) };
         let o = offer(Path::new("x.model"), &p, &s2, &c).unwrap();
         assert!(o.blocked().unwrap().contains("nothing here has a core"), "{:?}", o.blocked());
+    }
+
+    /// Spec §7.9 (plan 2026-11-13 Task 16): a model taught before the Fermi–Dirac switch differs in its occupation
+    /// rule, which no setting reaches, so the card never offers it — no row when that is the only difference (the
+    /// load then goes out and is refused with its reason, `providers::surrogate::legacy_model_refusal`), the other
+    /// differences offered as for any model; a policy difference is still offered. Another recipe stays blocked.
+    #[test]
+    fn apply_settings_offer_omits_occupations() {
+        use providers::pseudo::legacy_tag_of;
+        let s = scene();
+        // the legacy all-electron tag "none" on this build's all-electron scene: occupations only, no card
+        let mut p = prov_of(&s);
+        p.ionic = legacy_tag_of(sim::IonicPolicy::None);
+        assert_eq!(p.ionic, "none");
+        assert_eq!(make(&p, &s), None, "the occupation difference is not offered");
+        // with a grid difference besides (σ = h, automatic): the grid row alone
+        p.grid_n = 49;
+        p.h = 0.25;
+        p.sigma = 0.25;
+        let o = make(&p, &s).expect("the grid differs");
+        assert_eq!(o.rows.iter().map(|r| r.name).collect::<Vec<_>>(), ["grid"], "{:?}", o.rows);
+        assert_eq!(o.edits, vec![Edit::Grid { n: 49, h: 0.25 }]);
+        assert_eq!(o.blocked(), None);
+        // the card carries the load's refusal, so Apply-and-load refuses before applying (review I2)
+        assert_eq!(o.refusal, providers::surrogate::legacy_model_refusal("none"));
+        assert!(o.refusal.is_some());
+        let mut current = prov_of(&s);
+        current.grid_n = 49;
+        current.h = 0.25;
+        current.sigma = 0.25;
+        assert_eq!(make(&current, &s).unwrap().refusal, None, "this build's tag: no refusal");
+        // a shared-shell pseudopotential tag of the scene's own policy: occupations only
+        let mut s = scene();
+        s.ionic = sim::IonicPolicy::All;
+        let c = Context { pseudised: true, ..ctx(&ok) };
+        let mut p = prov_of(&s);
+        p.ionic = legacy_tag_of(sim::IonicPolicy::All);
+        assert!(p.ionic.contains("/shared"), "{}", p.ionic);
+        assert_eq!(offer(Path::new("x.model"), &p, &s, &c), None);
+        // another policy's legacy tag: the policy is offered (its occupation part is not)
+        p.ionic = legacy_tag_of(sim::IonicPolicy::CoresOnly);
+        let o = offer(Path::new("x.model"), &p, &s, &c).unwrap();
+        assert_eq!(o.edits, vec![Edit::Ionic(sim::IonicPolicy::CoresOnly)]);
+        assert_eq!(o.blocked(), None);
+        assert!(o.rows.iter().all(|r| !r.model.contains("shared") && !r.scene.contains("shared")), "{:?}", o.rows);
+        // the legacy all-electron model on a pseudised scene: all-electron offered
+        p.ionic = "none".into();
+        let o = offer(Path::new("x.model"), &p, &s, &c).unwrap();
+        assert_eq!(o.edits, vec![Edit::Ionic(sim::IonicPolicy::None)]);
+        assert_eq!(o.rows[0].model, "all-electron (none)");
     }
 
     /// Final review M6 (the M7 leftovers): an `all/…` model offered in a run whose H would go through the dimer gate on

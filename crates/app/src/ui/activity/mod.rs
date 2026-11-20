@@ -235,7 +235,8 @@ impl ActivityState {
         }
         for e in &a.events {
             if e.is_solve() {
-                self.session_solves += 1;
+                // a composition check's row stands for its parts' solves (`TeachEvent::solves`)
+                self.session_solves += u64::from(e.solves);
             }
             if let Some(t) = e.burst_t.filter(|t| t.is_finite() && *t >= 0.0) {
                 let bin = ((t / BURST_BIN_K) as usize).min(BURST_BINS_MAX);

@@ -20,7 +20,11 @@
 //! once, with no SCF loop. The SCF's converged state (ψ^S, ε^S, f^S, ρ_SCF) is a fixed point of the
 //! same map: ρ_SCF = ρ_out[V[ρ_SCF]] to its tolerance.
 //!
-//! **The subspace overlap** (`overlap`), per spin channel σ, over the levels with f > 0:
+//! **The subspace overlap** (`overlap`), per spin channel σ, over the occupied levels — f > 0 under `Aufbau`,
+//! f ≥ `qm::PARTIAL_OCCUPATION_MIN` (1e-6) under `FermiDirac` (the scf-stall ← main merge: every scene's occupations;
+//! plan 2026-11-13 Task 9's display rule — the SCF state's witness columns carry f ≤ e^−36 > 0 and are never occupied;
+//! the threshold is the same set as f > 0 under the integer rule and under the deleted shared-shell rule, whose f were 0
+//! or a share ≥ 1/k of the k computed levels):
 //!
 //! ```text
 //!   C_ij = h³ Σ_r ψ^H_i(r) ψ^S_j(r)                 (i ∈ occ_H, j ∈ occ_S; f64, Neumaier)
@@ -32,7 +36,8 @@
 //! the rotation between them. The brief writes the normaliser as n_σ (the electrons of the
 //! channel): that is the same number whenever the f > 0 levels are n_σ whole orbitals (every case
 //! here but pseudo-O). Pseudo-O's auto multiplicity is the singlet (Z_v = 6, n↑ = n↓ = 3) and
-//! `DegenerateShells` shares the 2p shell, f = 1, ⅔, ⅔, ⅔: four f > 0 levels for n_σ = 3. Dividing
+//! Fermi–Dirac fills the 2p shell ⅔ each (as the deleted shared-shell rule did), f = 1, ⅔, ⅔, ⅔: four occupied levels
+//! for n_σ = 3. Dividing
 //! by n_σ = 3 would make the identity read 4/3 and let a 25 % mismatch pass; max(n_occ^H, n_occ^S)
 //! is the strict normaliser (a count mismatch alone keeps O < 1).
 //!
@@ -41,7 +46,7 @@
 //! from the SCF's by δV = f_Hxc δρ with ‖δρ‖₁ ≤ tol (1e-6, or the floor-aware GPU tol under a
 //! setup, ≤ 8e-7 here): |Δε_i| ≈ |⟨ψ_i|δV|ψ_i⟩| ~ 1e-6 Ha, and 1 − O ≈ (1/n)Σ_{i,a}
 //! |⟨ψ_a|δV|ψ_i⟩|²/(ε_a − ε_i)² ~ 1e-11. Gates (spec §7): every occupied |Δε| ≤ 1e-5 Ha, O ≥ 1 −
-//! 1e-6 per channel, and every f^H = f^S to 1e-12. This proves the potential assembly (v_ion with
+//! 1e-6 per channel, and every f^H = f^S to 1e-12 (under `FermiDirac`, a partly filled level to the ε gate propagated through ∂f/∂ε, f(1 − f)/kT · 1e-5: `fd_occ_gate`). This proves the potential assembly (v_ion with
 //! V_loc and the KB projectors, V_H of ρ without ρ_pc, v_xc with ½ρ_pc per spin) is the SCF's, and —
 //! through the H₂ + H doublet, whose ↑ and ↓ potentials differ by the exchange splitting — the spin
 //! assignment (v_xc,↑ on ↑). Cases: H₂, H₂ + H (doublet), H₂O and a pseudo-O atom.
@@ -133,8 +138,28 @@ const H: f64 = 0.15;
 /// V-A1 gates (spec §7).
 const IDENTITY_EPS: f64 = 1e-5;
 const IDENTITY_OVERLAP: f64 = 1.0 - 1e-6;
-/// V-A1: the one-shot occupations equal the SCF's (the same rule on ε equal to ~1e-7 Ha; exact fractions).
+/// V-A1: the one-shot occupations equal the SCF's (the same rule on ε equal to ~1e-7 Ha; exact fractions) — for
+/// every level under `Aufbau`, and under `FermiDirac` for a level within `PARTIAL_OCCUPATION_MIN`
+/// of 0 or 1. A partly filled FD level is gated by `fd_occ_gate` instead.
 const OCC_EPS: f64 = 1e-12;
+
+/// V-A1's f gate for a partly filled `FermiDirac` level (1e-6 < f < 1 − 1e-6; controller ruling (1) on the scf-stall
+/// ← main merge, 2026-11-16). The 1e-12 gate presumed the shared-shell rule's exact fractions (f = (N − n_below)/|C|, a
+/// constant of the level count). Under FD, f = 1/(1 + e^{(ε − μ)/kT}) is a smooth function of ε with
+///   ∂f/∂ε = −f(1 − f)/kT,
+/// so an ε that passes the ε gate (|Δε| ≤ `IDENTITY_EPS`) moves f by at most f(1 − f)/kT · `IDENTITY_EPS` to first
+/// order. The f gate is that propagated ε gate, |Δf| ≤ f(1 − f)/kT · `IDENTITY_EPS` (4.4e-4 at f = ⅔, kT = 5 mHa) —
+/// derived from an existing gate, not loosened to pass; `references.md` "Harris under Fermi–Dirac".
+fn fd_occ_gate(f: f64, kt: f64) -> f64 { f * (1.0 - f) / kt * IDENTITY_EPS }
+
+/// The f gate of one occupied level of SCF occupation `fs` under `occupations` (`OCC_EPS`, or `fd_occ_gate` for a
+/// partly filled FD level).
+fn occ_gate(fs: f64, occupations: qm::Occupations) -> f64 {
+    match occupations {
+        qm::Occupations::FermiDirac { kt } if fs.min(1.0 - fs) > qm::PARTIAL_OCCUPATION_MIN => fd_occ_gate(fs, kt),
+        _ => OCC_EPS,
+    }
+}
 /// V-A2 gate (spec §7): every neutral case.
 const SUPERPOSED_OVERLAP: f64 = 0.95;
 /// V-A3 target (spec §7), recorded only.
@@ -249,10 +274,11 @@ fn profiles_for(ctx: &GpuContext, scene: &Scene, cache: &mut Vec<AtomProfile>) -
 /// h³⟨a|b⟩ in f64 (Neumaier).
 fn dot(a: &[f64], b: &[f64], dv: f64) -> f64 { neumaier(a.iter().zip(b).map(|(x, y)| x * y)) * dv }
 
-/// The f > 0 levels of one channel: (ε, f, ψ), ascending in ε.
+/// The occupied levels of one channel (module doc: f ≥ `PARTIAL_OCCUPATION_MIN`, which is f > 0 under the integer
+/// and shared rules and excludes the FD witness columns): (ε, f, ψ), ascending in ε.
 fn occupied<'a>(psi: &'a [Vec<f64>], eps: &[f64], f: &[f64]) -> Vec<(f64, f64, &'a [f64])> {
     assert!(psi.len() == eps.len() && eps.len() == f.len(), "one ε and f per stored orbital ({} / {} / {})", psi.len(), eps.len(), f.len());
-    let mut v: Vec<(f64, f64, &[f64])> = psi.iter().zip(eps).zip(f).filter(|(_, fi)| **fi > 0.0).map(|((p, e), fi)| (*e, *fi, p.as_slice())).collect();
+    let mut v: Vec<(f64, f64, &[f64])> = psi.iter().zip(eps).zip(f).filter(|(_, fi)| **fi >= qm::PARTIAL_OCCUPATION_MIN).map(|((p, e), fi)| (*e, *fi, p.as_slice())).collect();
     v.sort_by(|a, b| a.0.total_cmp(&b.0));
     v
 }
@@ -319,7 +345,7 @@ const SPIN: [&str; 2] = ["↑", "↓"];
 // ---- V-A1 ----
 
 /// V-A1 (gate; module doc): Harris on ρ_in = the converged SCF density reproduces the SCF —
-/// every occupied |ε^H − ε^S| ≤ 1e-5 Ha, |f^H − f^S| ≤ 1e-12 and O_σ ≥ 1 − 1e-6 — for H₂ and the
+/// every occupied |ε^H − ε^S| ≤ 1e-5 Ha, |f^H − f^S| ≤ 1e-12 (a partly filled FD level: `fd_occ_gate`) and O_σ ≥ 1 − 1e-6 — for H₂ and the
 /// H₂ + H doublet (81³: the spin assignment), H₂O and pseudo-O (97³), all under `Accepted`. Measured (2026-11-15): max |Δε| 9.1e-8 / 4.9e-8 / 1.3e-7 / 2.2e-7 Ha, 1 − O ≤ 1.2e-7,
 /// every f equal (pseudo-O 1, ⅔, ⅔, ⅔); `references.md` "Live orbitals".
 #[test]
@@ -346,7 +372,8 @@ fn va1_identity_on_the_converged_density() {
                 let d = (eh - es).abs();
                 worst = worst.max(d);
                 println!("    {} #{i}: ε_H {eh:+.8} (f {fh:.4}) ε_SCF {es:+.8} (f {fs:.4}) |Δ| {d:.2e}", SPIN[ch]);
-                if (fh - fs).abs() > OCC_EPS { failures.push(format!("{name} {} #{i}: f_H {fh} vs f_SCF {fs}", SPIN[ch])); }
+                let gate = occ_gate(*fs, settings.occupations);
+                if (fh - fs).abs() > gate { failures.push(format!("{name} {} #{i}: f_H {fh} vs f_SCF {fs} (|Δf| {:.2e} > gate {gate:.2e})", SPIN[ch], (fh - fs).abs())); }
             }
             println!("  {name} {}: max occupied |Δε| = {worst:.2e} Ha (gate {IDENTITY_EPS:.0e}); O = 1 − {:.2e} (gate 1 − 1e-6)", SPIN[ch], 1.0 - o[ch]);
             if worst > IDENTITY_EPS { failures.push(format!("{name} {}: max |Δε| = {worst:.3e} > {IDENTITY_EPS:.0e} Ha", SPIN[ch])); }

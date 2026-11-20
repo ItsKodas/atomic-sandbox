@@ -204,6 +204,15 @@ pub struct ModelStatus {
     /// Atoms with no neighbour within the model's cutoff (`sim::TrainableStatus::lone_note`): the
     /// Model tab's amber note by Start sampling and the pass offer.
     pub lone_note: Option<String>,
+    /// The stray-atom signatures of this session, (label, state words) (`sim::TrainableStatus::stray`): the verdict
+    /// card's "Stray atoms: H₂ + H cleared (3 checks)" lines (`ui::dock::model::stray_lines`).
+    pub stray: Vec<(String, String)>,
+    /// Samples with stray atoms held out of the fit until a composition check measures them
+    /// (`sim::TrainableStatus::stray_held_out`): the card's count line and the "fit vs held" line's part.
+    pub stray_held_out: usize,
+    /// The calibration ticks' counts (`sim::TrainableStatus::ticks`; trust tightening): the Model
+    /// tab's "calibration checks skipped", with their causes.
+    pub ticks: sim::CalibrationTicks,
     /// A collections folder is set ([`Command::Collections`]): the Model tab offers the switch.
     pub collections: bool,
     /// The last [`Command::ImportModel`]: what was taken and refused, or why nothing was.
@@ -229,6 +238,9 @@ pub struct ModelStatus {
     /// The species the model in use knows (`Trainable::model_species`): the specialised-model
     /// picker offers them beside the scene's.
     pub model_species: Vec<u8>,
+    /// The attached collection's migration from its predecessor folder (`Trainable::migration`; Fermi–Dirac spec
+    /// §7.8): the Model tab's offer, progress line and summary, and the Activity tab's progress line.
+    pub migration: Option<sim::MigrationStatus>,
 }
 
 /// The Model tab's source line (M8a Task 4b): "model: shared — <slug> · N samples" (with
@@ -300,7 +312,7 @@ pub fn box_blocks_trust(m: &ModelStatus) -> Option<(usize, usize)> {
 }
 
 /// The hover text of the "fit vs held" line.
-pub const FIT_VS_HELD_HELP: &str = "why the fit uses fewer samples than the model holds: box-affected samples (the teacher's density on the outermost grid plane above the box rule) are excluded once enough others exist — they carry the box's confinement, which no invariant model can learn; quarantined ones were held out by the trust recovery (the rest of the data could not predict them, or the fit could not reproduce them); superseded ones were contradicted by a fresh answer; forgotten ones you forgot in \"Worst-fitting samples\" (Restore puts them back); lone atoms (no neighbour within the cutoff, kept before such answers were refused) teach nothing; new ones arrived after the last refit";
+pub const FIT_VS_HELD_HELP: &str = "why the fit uses fewer samples than the model holds: box-affected samples (the teacher's density on the outermost grid plane above the box rule) are excluded once enough others exist — they carry the box's confinement, which no invariant model can learn; quarantined ones were held out by the trust recovery (the rest of the data could not predict them, or the fit could not reproduce them); superseded ones were contradicted by a fresh answer; forgotten ones you forgot in \"Worst-fitting samples\" (Restore puts them back); lone atoms (no neighbour within the cutoff, kept before such answers were refused) teach nothing; stray-atom samples (a molecule plus atoms with no neighbour within the cutoff) wait until a composition check measures that the molecule and the free atoms add up there; new ones arrived after the last refit";
 
 /// "fit N of S held: B box-excluded, Q quarantined, X superseded, F forgotten, P newer than the
 /// fit" — every sample the store holds beyond the fit, by reason (exact right after a refit, M6
@@ -310,9 +322,9 @@ pub const FIT_VS_HELD_HELP: &str = "why the fit uses fewer samples than the mode
 /// are named apart — "N forgotten since this fit (out at the next refit)" — never counted twice
 /// (Task 2 fix round 1, M5).
 #[allow(clippy::too_many_arguments)]
-pub fn fit_vs_held(fit: usize, held: usize, box_excluded: usize, quarantined: usize, superseded: usize, forgotten: usize, forgotten_in_fit: usize, held_out: usize, lone: usize, unfitted: usize) -> String {
+pub fn fit_vs_held(fit: usize, held: usize, box_excluded: usize, quarantined: usize, superseded: usize, forgotten: usize, forgotten_in_fit: usize, held_out: usize, lone: usize, stray: usize, unfitted: usize) -> String {
     let in_fit = forgotten_in_fit.min(forgotten);
-    let line = fit_vs_held_parts(fit, held, box_excluded, quarantined, superseded, forgotten - in_fit, held_out, lone, unfitted);
+    let line = fit_vs_held_parts(fit, held, box_excluded, quarantined, superseded, forgotten - in_fit, held_out, lone, stray, unfitted);
     if in_fit > 0 {
         format!("{line}; {in_fit} forgotten since this fit (out at the next refit)")
     } else {
@@ -328,7 +340,7 @@ pub fn last_fit_line((n, q, e, f): (usize, usize, f64, f64), body4_degree: Optio
 }
 
 #[allow(clippy::too_many_arguments)]
-fn fit_vs_held_parts(fit: usize, held: usize, box_excluded: usize, quarantined: usize, superseded: usize, forgotten: usize, held_out: usize, lone: usize, unfitted: usize) -> String {
+fn fit_vs_held_parts(fit: usize, held: usize, box_excluded: usize, quarantined: usize, superseded: usize, forgotten: usize, held_out: usize, lone: usize, stray: usize, unfitted: usize) -> String {
     let parts: Vec<String> = [
         (box_excluded, "box-excluded"),
         (quarantined, "quarantined"),
@@ -336,6 +348,7 @@ fn fit_vs_held_parts(fit: usize, held: usize, box_excluded: usize, quarantined: 
         (forgotten, "forgotten"),
         (held_out, "draft guesses held out"),
         (lone, "lone atoms held out"),
+        (stray, "stray-atom samples held out until measured"),
         (unfitted, "newer than the fit"),
     ]
         .into_iter()
@@ -704,7 +717,25 @@ impl Worker {
             // its first fit is the worker's, in the background (`refit_if_pending`; module doc,
             // "Refits"): a large collection's took minutes on this thread
             t.set_fits_in_background(true);
-            t.attach_collection(&root, &scene).err().map(|e| format!("shared collection not attached: {e}"))
+            match t.attach_collection(&root, &scene) {
+                Err(e) => Some(format!("shared collection not attached: {e}")),
+                Ok(()) => {
+                    // a re-solve pass started and not finished goes on at the next attach (Fermi–Dirac spec §7.3,
+                    // "Resume"): a collection newly attached — at app start, a worker re-spawn, another surface —
+                    // never the one already attached (a Cancel keeps it stopped until then)
+                    let now = match t.model_source() {
+                        sim::ModelSource::Collection { slug, .. } => Some(slug),
+                        _ => None,
+                    };
+                    let paused = t.migration().is_some_and(|m| m.state == sim::MigrationPhase::Paused) && !t.pass_active();
+                    if now.is_some() && now != attached && paused {
+                        // through the command path, so its bookkeeping (the first-pass offer, the pass sizing,
+                        // the autosave's owner) is the button's (review M6)
+                        self.apply(Command::Dyn(DynCommand::StartMigration));
+                    }
+                    None
+                }
+            }
         };
         if let Some(n) = note {
             self.dy.add_note(n);
@@ -1131,7 +1162,7 @@ impl Worker {
             pending: st.pending,
             box_affected: st.box_affected,
             trust_floor: st.trust_floor,
-            fit_vs_held: st.fit.map(|f| fit_vs_held(f.0, st.samples, st.box_excluded, st.quarantined, st.superseded, st.forgotten, st.forgotten_in_fit, st.held_out, st.lone, st.unfitted)),
+            fit_vs_held: st.fit.map(|f| fit_vs_held(f.0, st.samples, st.box_excluded, st.quarantined, st.superseded, st.forgotten, st.forgotten_in_fit, st.held_out, st.lone, st.stray_held_out, st.unfitted)),
             audits_background: st.audits_background,
             audit_in_flight: st.audit_in_flight,
             last_audit: st.last_audit,
@@ -1151,6 +1182,9 @@ impl Worker {
             retry_fit: st.retry_fit,
             source: st.model_source,
             lone_note: st.lone_note,
+            stray: st.stray,
+            stray_held_out: st.stray_held_out,
+            ticks: st.ticks,
             collections,
             last_import,
             purge_refusal: s.purge_refusal(),
@@ -1160,6 +1194,7 @@ impl Worker {
             source_is_autosave,
             specialised: s.specialised(),
             model_species: s.model_species(),
+            migration: s.migration(),
         })
     }
 
@@ -1222,18 +1257,20 @@ mod fit_vs_held_tests {
     /// M6 Task 11: the user's "230 vs 250" — the panel names every sample held beyond the fit.
     #[test]
     fn the_fit_vs_held_line_names_what_the_fit_left_out() {
-        assert_eq!(fit_vs_held(250, 250, 0, 0, 0, 0, 0, 0, 0, 0), "250 of 250 held");
-        assert_eq!(fit_vs_held(230, 250, 20, 0, 0, 0, 0, 0, 0, 0), "230 of 250 held: 20 box-excluded");
-        assert_eq!(fit_vs_held(70, 76, 3, 1, 1, 0, 0, 0, 0, 1), "70 of 76 held: 3 box-excluded, 1 quarantined, 1 superseded, 1 newer than the fit");
-        assert_eq!(fit_vs_held(70, 73, 0, 0, 0, 0, 0, 3, 0, 0), "70 of 73 held: 3 draft guesses held out");
-        assert_eq!(fit_vs_held(40, 45, 0, 0, 0, 0, 0, 0, 5, 0), "40 of 45 held: 5 lone atoms held out");
-        assert_eq!(fit_vs_held(1697, 1805, 0, 105, 1, 2, 0, 0, 0, 0), "1697 of 1805 held: 105 quarantined, 1 superseded, 2 forgotten");
+        assert_eq!(fit_vs_held(250, 250, 0, 0, 0, 0, 0, 0, 0, 0, 0), "250 of 250 held");
+        assert_eq!(fit_vs_held(230, 250, 20, 0, 0, 0, 0, 0, 0, 0, 0), "230 of 250 held: 20 box-excluded");
+        assert_eq!(fit_vs_held(70, 76, 3, 1, 1, 0, 0, 0, 0, 0, 1), "70 of 76 held: 3 box-excluded, 1 quarantined, 1 superseded, 1 newer than the fit");
+        assert_eq!(fit_vs_held(70, 73, 0, 0, 0, 0, 0, 3, 0, 0, 0), "70 of 73 held: 3 draft guesses held out");
+        assert_eq!(fit_vs_held(40, 45, 0, 0, 0, 0, 0, 0, 5, 0, 0), "40 of 45 held: 5 lone atoms held out");
+        assert_eq!(fit_vs_held(1697, 1805, 0, 105, 1, 2, 0, 0, 0, 0, 0), "1697 of 1805 held: 105 quarantined, 1 superseded, 2 forgotten");
         // fix round 1, M5: a sample forgotten during the background refit that installed this fit
         // is still in it — named apart, never counted twice (1698 + 105 + 1 + 1 = 1805)
         assert_eq!(
-            fit_vs_held(1698, 1805, 0, 105, 1, 2, 1, 0, 0, 0),
+            fit_vs_held(1698, 1805, 0, 105, 1, 2, 1, 0, 0, 0, 0),
             "1698 of 1805 held: 105 quarantined, 1 superseded, 1 forgotten; 1 forgotten since this fit (out at the next refit)"
         );
+        // stray atoms (spec 2026-11-18 §5): held out until a composition check measures them
+        assert_eq!(fit_vs_held(40, 44, 0, 0, 0, 0, 0, 0, 0, 3, 1), "40 of 44 held: 3 stray-atom samples held out until measured, 1 newer than the fit");
     }
 }
 

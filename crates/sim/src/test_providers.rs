@@ -487,6 +487,14 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         self.lock().forgotten_in_collection()
     }
 
+    fn migration(&self) -> Option<crate::provider::MigrationStatus> {
+        self.lock().migration()
+    }
+
+    fn start_migration(&mut self) -> Result<(), String> {
+        self.lock().start_migration()
+    }
+
     fn fitted(&self) -> bool {
         Trainable::fitted(&*self.lock())
     }

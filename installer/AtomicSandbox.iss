@@ -142,7 +142,8 @@ Source: "{#StageDir}\installed.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\LICENSE.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#StageDir}\docs\images\*"; DestDir: "{app}\docs\images"; Flags: ignoreversion recursesubdirs createallsubdirs
-; bundled\models (committed *.model), bundled\scenes (presets + the committed scenes\ library),
+; bundled\models (committed *.model: none since the Fermi-Dirac switch, so the folder is absent and
+; the app's first-launch seed skips it), bundled\scenes (presets + the committed scenes\ library),
 ; bundled\timings (the committed timings\, possibly empty)
 Source: "{#StageDir}\bundled\*"; DestDir: "{app}\bundled"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 

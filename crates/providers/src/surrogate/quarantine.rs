@@ -68,6 +68,30 @@ pub(super) const Q_REF_WAIT: u8 = 5;
 /// model that may one day learn from them (long-range terms).
 pub(super) const Q_LONE: u8 = 6;
 
+/// A stored sample with **stray atoms** — a bonded part plus atoms with no neighbour within the
+/// model's cutoff ([`stray::split`](super::stray::split); spec 2026-11-18 §4.3, review C1) — that
+/// no composition check has measured: a stray atom has no features, so a composition error in its
+/// label (a spin state or a charge transfer the model cannot see) would land in the bonded part's
+/// coefficients and spoil bonded-only scenes too. **Held out of the fit** like [`Q_LONE`] — not
+/// fitted, not in the envelope, the grade or the leave-one-out, never fencing, never released by
+/// the trust recovery or superseded — until its own check passes or a cleared region of its
+/// signature covers its bonded geometry ([`SurrogateKs::release_stray_samples`]: back to
+/// `released_code`, [`Q_NONE`] or [`Q_REF_WAIT`]); for good when the signature is refused. Unlike
+/// `Q_LONE` it is **counted in the thinning distance** (`nearest_stored`): a parked molecule with a
+/// stray atom must not add a sample per step while its check waits. Set only on a sample in the fit
+/// or waiting for its box's reference (`Q_NONE`, `Q_REF_WAIT`: the keep path, `keep_sample_masked`;
+/// at load, `hold_out_stray` and `mirror_collection_sample`), so its code on disk is always `Q_NONE`
+/// and a release restores exactly that — a draft guess's audit is held here too (its tag says it is
+/// one) and is released to `Q_DRAFT`, so strict mode's promotion (`judge_held_out`, which reads only
+/// `Q_DRAFT`) never takes an unmeasured one into the fit (review M2). A provider-only code like [`Q_REF_WAIT`]
+/// and [`Q_LONE`]: **never written** — a saved file writes `Q_NONE`, a collection gets no status
+/// record for it (`sync_collection_status`) and a new stray sample waits outside the collection
+/// (`offer`, like a draft guess) until it is released, so the user's files are untouched. Its value
+/// is the next one that no in-memory code uses and no collection status record can hold (codes
+/// 0–9: [`surrogate::quarantine::is_collection_code`]; 9 is the Fermi–Dirac migration's
+/// `Q_RESOLVED`).
+pub(super) const Q_STRAY: u8 = 10;
+
 /// A box-affected sample ([`surrogate::quarantine::Q_BOX`]).
 pub(super) const Q_BOX: u8 = surrogate::quarantine::Q_BOX;
 
@@ -83,6 +107,12 @@ pub(super) const Q_FORGOTTEN: u8 = surrogate::quarantine::Q_FORGOTTEN;
 /// `surrogate` module doc, "Lifting a forgotten sample's fence"): still forgotten — excluded, never
 /// released or superseded, restorable, purgeable — but no longer fencing.
 pub(super) const Q_FORGOTTEN_UNFENCED: u8 = surrogate::quarantine::Q_FORGOTTEN_UNFENCED;
+
+/// A sample the collection migration re-solved whose state changed ([`surrogate::quarantine::Q_RESOLVED`];
+/// Fermi–Dirac spec §7.5–7.6; `surrogate` module doc, "Re-solved samples"): excluded like a held sample, never counted
+/// by [`SurrogateKs::fencing`] or the held cap, not the user's (Forget and Restore refuse it); it fences only once a
+/// review kept it ([`SurrogateKs::review_resolved`]).
+pub(super) const Q_RESOLVED: u8 = surrogate::quarantine::Q_RESOLVED;
 
 /// Quarantine rounds per refit (`surrogate` module doc).
 pub const QUARANTINE_ROUNDS: usize = 5;
@@ -165,6 +195,12 @@ pub(super) struct FenceVote {
 /// projected on the interatomic unit vectors, or Kabsch-aligned frames — would not); the vote only
 /// keeps one sample for the next refit, whose `judge_votes` decides on the full vectors.
 pub(super) fn votes_agree(p: &FallbackPolicy, va: &FenceVote, vb: &FenceVote) -> bool {
+    // the same atoms: `n` is per energy-row atom (n_bonded at a stray-atom scene), so H₂ and H₂ + a stray H both give
+    // 2 — the scenes' own atom counts (their force lists) must agree too, or the per-atom pairing below mispairs
+    // (Task 5 fix round 1, M2)
+    if va.forces.len() != vb.forces.len() || va.n != vb.n {
+        return false;
+    }
     match (&va.residual, &vb.residual) {
         (Some((ea, fa)), Some((eb, fb))) => {
             let norm = |v: &[f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
@@ -202,9 +238,10 @@ pub(super) fn votes_agree(p: &FallbackPolicy, va: &FenceVote, vb: &FenceVote) ->
 /// the tier it measured against (Task 1 re-review N1: a high-leverage energy outlier's ρ_σ is its
 /// energy ratio, against 1e-3 Ha/atom, not the force tier). The force channel wins a tie; an
 /// undefined residual reports the force channel (no channel was measured).
-pub(super) fn loo_ratio(p: &FallbackPolicy, per_atom: bool, s: &Sample, l: Option<&surrogate::loo::SampleLoo>) -> (f64, f64, Channel) {
+pub(super) fn loo_ratio(p: &FallbackPolicy, per_atom: bool, n_e: usize, s: &Sample, l: Option<&surrogate::loo::SampleLoo>) -> (f64, f64, Channel) {
     let Some(l) = l else { return (f64::INFINITY, f64::INFINITY, Channel::Force) };
-    let n = s.pos.len().max(1) as f64;
+    // `n_e`: the sample's energy-row atoms (`surrogate::energy_row_atoms`, ruling 9a)
+    let n = n_e.max(1) as f64;
     let e = if s.use_energy { l.energy.map_or(f64::INFINITY, |e| (if per_atom { e.abs() } else { e.abs() / n }) / p.energy_std_per_atom) } else { 0.0 };
     let (mut own, mut force_tier) = (e, 0.0f64);
     for (r, f) in l.forces.iter().zip(&s.forces) {
@@ -217,6 +254,16 @@ pub(super) fn loo_ratio(p: &FallbackPolicy, per_atom: bool, s: &Sample, l: Optio
     let channel = if e > force_tier { Channel::Energy } else { Channel::Force };
     let undefined_is_worst = |x: f64| if x.is_nan() { f64::INFINITY } else { x };
     (undefined_is_worst(own), undefined_is_worst(tier), channel)
+}
+
+/// What one review of the re-solved samples decided ([`SurrogateKs::review_resolved`]; Fermi–Dirac spec §7.6): store
+/// indices.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ReviewOutcome {
+    /// Released into the fit (9 → 0): each one's leave-one-out ratio in the candidate was ≤ 1.
+    pub(super) released: Vec<usize>,
+    /// Kept at code 9, fencing from now on: (store index, its ratio > 1).
+    pub(super) kept: Vec<(usize, f64)>,
 }
 
 /// Which of a leave-one-out ratio's two channels attains it ([`loo_ratio`]'s third number).
@@ -393,16 +440,19 @@ pub(super) fn quarantine_words(held: usize, added: usize, h: Held, ranking: Rank
 /// L∞ distance between two descriptors of species `s` in the envelope's training-spread units
 /// (a feature the training never varied counts as infinitely far once the two differ).
 ///
-/// Never NaN: a NaN unit (a species with no training atom — since isolated atoms are no
-/// training atoms, also one seen only as an isolated atom) or a NaN gap returns ∞, so the
-/// callers' `f64::max` folds cannot drop it (`max` with a NaN keeps the other operand). A NaN
-/// unit was ∞ already (it fails `u > 0`); a NaN gap is unreachable on finite in-cell inputs
-/// (`Scene::check_inside_cell` rejects non-finite positions; `describe` handles r = 0) and is
-/// guarded only. What ∞ means depends on the caller: for thinning, the label-copy check and the
-/// teach planner's distinctness it keeps the sample / counts it distinct (conservative); for the
-/// quarantine, misfit and audit fences (`d <= limit` fences) it is **not fenced** — permissive,
-/// and harmless only because rules 5b and 5c refuse every query atom of a count-0 species before
-/// any fence is read (`Envelope::coordination_ratio`, `Envelope::distance`: ∞ at count 0).
+/// Never NaN (stray-atoms Task 4 fix round 1, C1(c)): a NaN unit (a species with no training
+/// atom — since isolated atoms are no training atoms, also one seen only as an isolated or stray
+/// atom) or a NaN gap returns ∞, so the callers' `f64::max` folds cannot drop it (`max` with a NaN
+/// keeps the other operand). A NaN unit was ∞ already (it fails `u > 0`); a NaN gap is unreachable
+/// on finite in-cell inputs (`Scene::check_inside_cell` rejects non-finite positions; `describe`
+/// handles r = 0) and is guarded only, so no scene without a stray atom moves (the scripted-session
+/// digest is unchanged; `stray` module doc, final review minor 7). What ∞ means depends on the
+/// caller: for thinning, the label-copy check and the teach planner's distinctness it keeps the
+/// sample / counts it distinct (conservative); for the quarantine, misfit and audit fences
+/// (`d <= limit` fences) it is **not fenced** — permissive, and harmless only because rules 5b and
+/// 5c refuse every query atom of a count-0 species before any fence is read
+/// (`Envelope::coordination_ratio`, `Envelope::distance`: ∞ at count 0); the stray atoms' cleared
+/// region's distinctness refuses such a species before measuring (`Region::distinct`).
 pub(super) fn spread_distance(env: &Envelope, s: usize, a: &[f64], b: &[f64]) -> f64 {
     let mut worst = 0.0f64;
     for (k, (x, y)) in a.iter().zip(b).enumerate() {
@@ -481,9 +531,22 @@ impl SurrogateKs {
     }
 
     /// Whether stored sample `i` fences its neighbourhood (geometries within the quarantine radius
-    /// fall back): a quarantined ([`Q_HELD`]) or a forgotten ([`Q_FORGOTTEN`]) sample.
+    /// fall back): a quarantined ([`Q_HELD`]) or a forgotten ([`Q_FORGOTTEN`]) sample, or a re-solved one
+    /// ([`Q_RESOLVED`]) its last review kept (Fermi–Dirac spec §7.6 step 4, preflight F4: "a stored label the model
+    /// cannot reproduce"). Before its review a re-solved sample does not fence.
     pub(super) fn fences(&self, i: usize) -> bool {
-        matches!(self.quarantine.get(i), Some(&Q_HELD) | Some(&Q_FORGOTTEN))
+        match self.quarantine.get(i) {
+            Some(&Q_HELD) | Some(&Q_FORGOTTEN) => true,
+            Some(&Q_RESOLVED) => self.review_kept.contains(&i),
+            _ => false,
+        }
+    }
+
+    /// Whether any stored sample fences ([`fences`](Self::fences)): the quarantine fence's on-switch (the distance
+    /// scan, the views' re-judge). [`fencing`](Self::fencing) does not count a kept re-solved sample (F4), so this
+    /// reads those too (controller ruling A).
+    pub(super) fn any_fences(&self) -> bool {
+        self.fencing() > 0 || self.review_kept.iter().any(|&i| self.quarantine.get(i) == Some(&Q_RESOLVED))
     }
 
     /// Whether stored sample `i` is one of the standing fit's members (`fit_members`: below its
@@ -505,12 +568,16 @@ impl SurrogateKs {
         let d = QUARANTINE_FRACTION * self.policy.max_descriptor_distance;
         if self.fence_is_forgotten(near) {
             format!("surrogate: within {d:.2} training spreads of samples you forgot (Model tab, Worst-fitting samples): the model answers here again once {FENCE_VOTES} fresh teacher answers in a row agree with it, or Restore the samples")
+        } else if near.iter().any(|&i| self.quarantine.get(i) == Some(&Q_RESOLVED)) {
+            format!("surrogate: within {d:.2} training spreads of a sample held out of the fit (quarantined: the rest of the data could not predict it, or the fit could not reproduce it; or forgotten by the user; or re-solved for the new solver and not predicted by the samples around it)")
         } else {
             format!("surrogate: within {d:.2} training spreads of a sample held out of the fit (quarantined: the rest of the data could not predict it, or the fit could not reproduce it; or forgotten by the user)")
         }
     }
 
-    /// How many stored samples fence ([`fences`](Self::fences)).
+    /// How many quarantined ([`Q_HELD`]) and forgotten ([`Q_FORGOTTEN`]) samples fence. A re-solved sample its
+    /// review kept fences too but is **not** counted here (preflight F4: it is no misfit hold); "does anything
+    /// fence" is [`any_fences`](Self::any_fences) (controller ruling A).
     pub(super) fn fencing(&self) -> usize {
         self.quarantine.iter().filter(|&&q| q == Q_HELD || q == Q_FORGOTTEN).count()
     }
@@ -552,15 +619,73 @@ impl SurrogateKs {
         lone.len()
     }
 
+    /// Stored samples with stray atoms held out of the fit until a composition check measures them
+    /// ([`Q_STRAY`]).
+    pub fn stray_held_out(&self) -> usize {
+        self.quarantine.iter().filter(|&&q| q == Q_STRAY).count()
+    }
+
+    /// Holds every stored sample in the fit ([`Q_NONE`], waiting for its box's reference:
+    /// [`Q_REF_WAIT`], or a draft guess's audit: [`Q_DRAFT`], whose tag carries it back on release)
+    /// that has stray atoms at `r_cut` (Bohr; [`stray::split`](super::stray::split)) out of it
+    /// ([`Q_STRAY`]) — unless a cleared region of its signature covers it already; how many were
+    /// newly held. Called where stored samples are installed, beside
+    /// [`hold_out_lone`](Self::hold_out_lone): at an install the session's clearances start empty
+    /// (spec §4.6), so a loaded stray sample waits for a check like a new one. Samples otherwise out
+    /// of the fit keep their own code (they are not fitted either way, and their code is what a file
+    /// holds).
+    pub(super) fn hold_out_stray(&mut self, r_cut: f64) -> usize {
+        let Some(store) = self.store.as_mut() else { return 0 };
+        // every loaded sample with stray atoms has them out of its force rows (in memory; fix round 1, I2)
+        for s in store.samples.iter_mut() {
+            super::stray::mask_stray_atoms(s, r_cut);
+        }
+        let store = self.store.as_ref().expect("checked");
+        let candidates: Vec<usize> = (0..store.len())
+            .filter(|&i| self.quarantine.get(i).is_none_or(|&q| q == Q_NONE || q == Q_REF_WAIT || q == Q_DRAFT) && super::stray::split(&store.samples[i].pos, r_cut).is_some())
+            .collect();
+        // one a cleared region of its signature covers already stays in (review M3: a session-only restore or a mirrored
+        // sample after a clearance; at a fresh install the book is empty)
+        let mut held = Vec::with_capacity(candidates.len());
+        for i in candidates {
+            let (pos, z) = self.store.as_ref().map(|st| (st.samples[i].pos.clone(), st.samples[i].z.clone())).expect("stored");
+            let prov = self.sample_provenance(i);
+            if self.stray_held(&pos, &z, &prov) {
+                held.push(i);
+            }
+        }
+        if held.is_empty() {
+            return 0;
+        }
+        let n = self.store.as_ref().map_or(0, |st| st.len());
+        self.quarantine.resize(n, Q_NONE);
+        for &i in &held {
+            self.quarantine[i] = Q_STRAY;
+        }
+        held.len()
+    }
+
+    /// The user's note on [`hold_out_stray`](Self::hold_out_stray)'s count `k` of the samples
+    /// from `source`.
+    pub(super) fn note_stray_held_out(&mut self, source: &str, k: usize, r_cut: f64) {
+        if k > 0 {
+            let r = format!("{r_cut}");
+            self.user_notes.push(format!(
+                "{source}: {k} sample{} with stray atoms (no neighbour within {r} Bohr) held out of the fit until a composition check measures them (kept on disk, unchanged)",
+                if k == 1 { "" } else { "s" }
+            ));
+        }
+    }
+
     /// The code sample `i` is written to a file with: a lone sample's ([`Q_LONE`]) is the code it
-    /// was loaded with; the provider-only codes `Q_DRAFT` (its tag carries it) and `Q_REF_WAIT` (it
-    /// waits again at the reload) write as `Q_NONE`.
+    /// was loaded with; the provider-only codes `Q_DRAFT` (its tag carries it), `Q_REF_WAIT` (it
+    /// waits again at the reload) and `Q_STRAY` (set only on a `Q_NONE` sample) write as `Q_NONE`.
     pub(super) fn persisted_code(&self, i: usize) -> u8 {
         let q = match self.quarantine.get(i).copied().unwrap_or(Q_NONE) {
             Q_LONE => self.lone_codes.get(&i).copied().unwrap_or(Q_NONE),
             q => q,
         };
-        if q == Q_DRAFT || q == Q_REF_WAIT || q == Q_LONE {
+        if q == Q_DRAFT || q == Q_REF_WAIT || q == Q_LONE || q == Q_STRAY {
             Q_NONE
         } else {
             q
@@ -634,7 +759,8 @@ impl SurrogateKs {
     }
 
     /// Whether stored sample `i` is left out of the fit (quarantined, superseded, box-excluded, a
-    /// held-out draft guess, waiting for its box's reference, lone atoms, or forgotten by the user).
+    /// held-out draft guess, waiting for its box's reference, lone atoms, forgotten by the user, or re-solved
+    /// for the new solver and not released by its review — `Q_RESOLVED`, Fermi–Dirac spec §8 touch point 1).
     pub(super) fn excluded(&self, i: usize) -> bool {
         self.quarantine.get(i).is_some_and(|&q| q != Q_NONE)
     }
@@ -974,7 +1100,7 @@ impl SurrogateKs {
     pub(super) fn reproduces(&self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]]) -> bool {
         let Some(model) = self.model.as_ref() else { return false };
         let Ok(pr) = model.predict(pos, z, false) else { return false };
-        Self::agree(&self.policy, pos.len(), pr.energy, &pr.forces, energy, forces)
+        Self::agree(&self.policy, self.audit_n(pos), pr.energy, &pr.forces, energy, forces)
     }
 
     /// [`reproduces`](Self::reproduces) for a stored sample, on the rows it was fitted with (M8a Task
@@ -987,15 +1113,16 @@ impl SurrogateKs {
         let Some(model) = self.model.as_ref() else { return false };
         let Ok(pr) = model.predict(&s.pos, &s.z, false) else { return false };
         let p = &self.policy;
-        (!s.use_energy || (pr.energy - s.energy).abs() / s.pos.len().max(1) as f64 <= p.energy_std_per_atom)
+        (!s.use_energy || (pr.energy - s.energy).abs() / self.audit_n(&s.pos) as f64 <= p.energy_std_per_atom)
             && pr.forces.iter().zip(&s.forces).enumerate().filter(|(j, _)| s.trains_atom(*j)).all(|(_, (a, b))| {
                 let (d, bound) = p.force_residual(a, b);
                 d <= bound
             })
     }
 
-    /// Two answers agree within the policy's thresholds (per-atom energy; every atom's force
-    /// against its bound for the reference force).
+    /// Two answers agree within the policy's thresholds (per-atom energy over `n`; every atom's force
+    /// against its bound for the reference force). The callers pass [`audit_n`](Self::audit_n): per
+    /// bonded atom at a scene with stray atoms (`stray` module doc, "Audits of a cleared answer").
     pub(super) fn agree(p: &FallbackPolicy, n: usize, e_a: f64, f_a: &[[f64; 3]], e_b: f64, f_b: &[[f64; 3]]) -> bool {
         (e_a - e_b).abs() / n.max(1) as f64 <= p.energy_std_per_atom
             && f_a.iter().zip(f_b).all(|(a, b)| {
@@ -1042,6 +1169,189 @@ impl SurrogateKs {
         back.len()
     }
 
+    /// Whether the attached collection's migration lets its re-solved samples be reviewed: its pass is complete
+    /// (`migration.txt` at "complete" or "reviewed"), so every sibling of a sample is present before any is judged
+    /// (Fermi–Dirac spec §7.6; Review Focus 3: never while the pass runs, paused or not).
+    pub(super) fn review_open(&self) -> bool {
+        self.migration.as_ref().and_then(|m| m.log.as_ref()).is_some_and(|l| matches!(l.state, surrogate::MigrationState::Complete | surrogate::MigrationState::Reviewed))
+    }
+
+    /// What the review judges against (`review_stamp`): FNV-1a 64 over the sample count and each sample's code and
+    /// energy bits — a sample added or purged, a code moved (a hold, a release, a Forget, a reference wait) or a label
+    /// rebased changes it — and over the bounds a ratio is read against (`energy_std_per_atom`, `force_std_abs`,
+    /// `force_std_rel`) and the basis the candidate is fitted in (`degree_cap`, `body4_degree`): a policy or basis
+    /// change re-judges the verdicts too (Task 15 review M3).
+    pub(super) fn review_stamp_now(&self) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut eat = |bytes: &[u8]| {
+            for &b in bytes {
+                h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        let n = self.samples();
+        eat(&(n as u64).to_le_bytes());
+        if let Some(st) = self.store.as_ref() {
+            for (i, s) in st.samples.iter().enumerate() {
+                eat(&[self.quarantine.get(i).copied().unwrap_or(Q_NONE)]);
+                eat(&s.energy.to_bits().to_le_bytes());
+            }
+        }
+        let p = &self.policy;
+        for x in [p.energy_std_per_atom, p.force_std_abs, p.force_std_rel] {
+            eat(&x.to_bits().to_le_bytes());
+        }
+        eat(&(self.degree_cap.map_or(u64::MAX, |d| d as u64)).to_le_bytes());
+        eat(&(self.body4_degree as u64).to_le_bytes());
+        h
+    }
+
+    /// The code-9 samples a review cannot judge because they have stray atoms (a stray composition is never fitted
+    /// unmeasured, `stray` module doc): they wait at 9, unreviewed, not fencing (spec §7.6, "Not judged").
+    pub(super) fn resolved_stray(&self, i: usize) -> bool {
+        self.quarantine.get(i) == Some(&Q_RESOLVED) && self.store.as_ref().and_then(|st| st.samples.get(i)).is_some_and(|s| super::stray::split(&s.pos, self.cutoff()).is_some())
+    }
+
+    /// **The review of the re-solved samples** (Fermi–Dirac spec §7.6; `surrogate` module doc, "Re-solved samples"),
+    /// run by a refit after its first fit and before the trust judgement (touch point 4). Only when the migration pass
+    /// is complete ([`review_open`](Self::review_open)), a code-9 sample remains, and the store (or the bounds and the
+    /// basis, `review_stamp_now`) changed since the last review (`review_stamp`); else `None`, nothing changed.
+    ///
+    /// 1. A **candidate** is fitted on the current fit's members plus every code-9 sample judged now.
+    /// 2. Each one's leave-one-out ratio ρ in it ([`loo_ratio`]'s first number: how far the candidate without the sample
+    ///    misses it, against its own energy and force bounds — the reading the recovery ranks offenders by).
+    /// 3. ρ ≤ 1: **released** (9 → 0, or the reference wait); the refit goes on with it as an ordinary fitted sample.
+    /// 4. ρ > 1 (an undefined residual is ∞): **kept** at 9 — from now on a stored label the model cannot reproduce:
+    ///    it fences ([`fences`](Self::fences); F4), is not counted by [`fencing`](Self::fencing) or the held cap, never
+    ///    lifted by purge's votes (they take code 7 only), never in M (an excluded sample is not fitted), never code 1.
+    ///    A later review can still release it.
+    ///
+    /// The fit the refit stands on is restored after the candidate (its accumulator, model, verdicts and codes), so
+    /// the candidate decides the codes only. Judged now: every code-9 sample whose box has its references (one waiting
+    /// for them holds the teacher's raw energy; the reference's arrival rebases it, which moves the stamp) and that has
+    /// no stray atoms ([`resolved_stray`](Self::resolved_stray): it waits at 9, unreviewed — a known limit, spec §7.6).
+    /// The verdicts go to `migration.txt`'s review log (collection indices, the latest per sample) with the stray
+    /// samples listed as waiting; the state is "reviewed" once none waits, else it stays "complete" (task 15 review
+    /// M1). Written at the refit's end (`flush_migration_log`); the codes as status records (`sync_collection_status`).
+    /// The note is pushed only when the verdicts changed (M4). A candidate that does not fit decides nothing (the
+    /// stamp is taken, so the next try waits for a change).
+    pub(super) fn review_resolved(&mut self) -> Option<ReviewOutcome> {
+        if !self.review_open() {
+            return None;
+        }
+        let (judged, stray): (Vec<usize>, Vec<usize>) = {
+            let n = self.samples();
+            let nine: Vec<usize> = (0..n).filter(|&i| self.quarantine.get(i) == Some(&Q_RESOLVED)).collect();
+            let stray: Vec<usize> = nine.iter().copied().filter(|&i| self.resolved_stray(i)).collect();
+            (nine.into_iter().filter(|&i| !stray.contains(&i) && self.released_code(i) == Q_NONE).collect(), stray)
+        };
+        if judged.is_empty() && stray.is_empty() {
+            return None;
+        }
+        let stamp = self.review_stamp_now();
+        if self.review_stamp == Some(stamp) {
+            return None;
+        }
+        if judged.is_empty() {
+            // only stray samples remain: nothing to fit, but the log says they wait
+            self.review_stamp = Some(stamp);
+            if self.log_review(&[], &[], &stray) {
+                self.note_review(0, 0, stray.len());
+            }
+            return None;
+        }
+        let _prof = surrogate::prof::span("P2 review_resolved (candidate fit + leave-one-out)");
+        #[cfg(test)]
+        {
+            self.reviews_run += 1;
+        }
+        // 1. the candidate: the fit's members and every code-9 sample judged
+        let (entry, flags, dirty) = (self.save_state(), self.quarantine.clone(), self.species_dirty);
+        for &i in &judged {
+            self.quarantine[i] = Q_NONE;
+        }
+        self.species_dirty = true;
+        let ratios: Option<Vec<f64>> = match self.fit_store_deferred() {
+            Ok(_) => {
+                let (model, store) = (self.model.as_ref().expect("just fitted"), self.store.as_ref().expect("stored"));
+                let samples: Vec<&Sample> = judged.iter().map(|&i| &store.samples[i]).collect();
+                // 2. each one's leave-one-out ratio in the candidate
+                let loos = surrogate::loo::leave_one_out_many(model, &samples);
+                Some(samples.iter().zip(&loos).map(|(s, l)| loo_ratio(&self.policy, model.energy_per_atom, surrogate::energy_row_atoms(&model.basis, &s.pos), s, l.as_ref()).0).collect())
+            }
+            Err(_) => None,
+        };
+        // the fit the refit stands on, and its codes
+        self.restore_state(entry);
+        self.quarantine = flags;
+        self.species_dirty = dirty;
+        let Some(ratios) = ratios else {
+            self.review_stamp = Some(stamp);
+            self.user_notes.push(format!("surrogate: the review of {} re-solved samples could not fit its candidate — they stay held out until the samples change", judged.len()));
+            return None;
+        };
+        // 3. and 4.
+        let kept_before = self.review_kept.clone();
+        let mut out = ReviewOutcome { released: Vec::new(), kept: Vec::new() };
+        for (&i, &rho) in judged.iter().zip(&ratios) {
+            if rho <= 1.0 {
+                self.quarantine[i] = self.released_code(i);
+                self.review_kept.remove(&i);
+                out.released.push(i);
+            } else {
+                self.review_kept.insert(i);
+                out.kept.push((i, rho));
+            }
+        }
+        if !out.released.is_empty() {
+            self.species_dirty = true; // rebuild with them
+        }
+        let waiting_changed = self.log_review(&judged, &ratios, &stray);
+        self.review_stamp = Some(self.review_stamp_now());
+        // the note only when the verdicts changed (M4): a session with kept samples is reviewed at most refits
+        if !out.released.is_empty() || self.review_kept != kept_before || waiting_changed {
+            self.note_review(out.released.len(), out.kept.len(), stray.len());
+        }
+        Some(out)
+    }
+
+    /// The user's note on a review: `released` rejoined, `kept` kept out, `waiting` not judged (stray atoms).
+    fn note_review(&mut self, released: usize, kept: usize, waiting: usize) {
+        let judged = released + kept;
+        let mut text = format!(
+            "surrogate: {} re-solved for the new solver reviewed: {released} rejoined the fit (the model without each predicts it within its bound), {kept} kept out{}",
+            if judged == 1 { "1 sample".to_string() } else { format!("{judged} samples") },
+            if kept > 0 { " — the model falls back to DFT near them" } else { "" }
+        );
+        if waiting > 0 {
+            text.push_str(&format!("; {waiting} waiting (stray atoms: not judged until a composition rule can measure them)"));
+        }
+        self.user_notes.push(text);
+    }
+
+    /// The review's verdicts on `judged` (store indices, their `ratios`) and the samples it could not judge (`stray`)
+    /// into the attached migration's review log: by collection index, the latest verdict per sample, in index order;
+    /// the waiting list replaced; the state "reviewed" when none waits, else "complete" (M1). Written at the refit's
+    /// end (`flush_migration_log`). A sample the collection does not hold has no entry. Whether the waiting list
+    /// changed.
+    fn log_review(&mut self, judged: &[usize], ratios: &[f64], stray: &[usize]) -> bool {
+        let Some(sh) = self.shared.as_ref() else { return false };
+        let coll = |i: usize| match sh.link.get(i) {
+            Some(&super::shared::Link::In(k)) => Some(k),
+            _ => None,
+        };
+        let entries: Vec<(usize, f64, bool)> = judged.iter().zip(ratios).filter_map(|(&i, &rho)| coll(i).map(|k| (k, rho, rho <= 1.0))).collect();
+        let waiting: Vec<usize> = stray.iter().filter_map(|&i| coll(i)).collect();
+        let Some(log) = self.migration.as_mut().and_then(|m| m.log.as_mut()) else { return false };
+        log.review.retain(|e| !entries.iter().any(|x| x.0 == e.0));
+        log.review.extend(entries);
+        log.review.sort_by_key(|e| e.0);
+        let changed = log.waiting != waiting;
+        log.waiting = waiting;
+        log.state = if log.waiting.is_empty() { surrogate::MigrationState::Reviewed } else { surrogate::MigrationState::Complete };
+        self.review_log_dirty = true;
+        changed
+    }
+
     /// The quarantined (fencing) samples within the quarantine radius of the geometry: for each
     /// held sample, the worst query atom's distance to that sample's nearest atom of its species
     /// (training-spread units, L∞ over features). One description of the query for all of them
@@ -1055,7 +1365,7 @@ impl SurrogateKs {
     /// ([`fences`](Self::fences)) — from the geometry (`near_quarantined`). Fills the descriptor
     /// cache, then reads it ([`quarantine_distances_cached`](Self::quarantine_distances_cached)).
     pub(super) fn quarantine_distances(&mut self, pos: &[[f64; 3]], z: &[u8]) -> Vec<(usize, f64)> {
-        if self.fencing() == 0 {
+        if !self.any_fences() {
             return Vec::new();
         }
         self.ensure_desc_cache();
@@ -1070,7 +1380,7 @@ impl SurrogateKs {
     /// numbers either way, only slower. Without a model there is nothing to fence with (the
     /// filling path's cache basis is the model's, `None` without one).
     pub(super) fn quarantine_distances_cached(&self, pos: &[[f64; 3]], z: &[u8]) -> Vec<(usize, f64)> {
-        if self.fencing() == 0 {
+        if !self.any_fences() {
             return Vec::new();
         }
         let (Some(model), Some(env), Some(store)) = (self.model.as_ref(), self.envelope.as_ref(), self.store.as_ref()) else { return Vec::new() };
@@ -1230,7 +1540,7 @@ impl SurrogateKs {
     /// quarantine codes when it was installed, the samples with no code). Right after a fit they are
     /// the class pass's and the training residuals' members; between fits a code may move without
     /// the fit (a hold, a release, a forget), and these stay the fit's.
-    fn fit_member_indices(&self) -> impl Iterator<Item = usize> + '_ {
+    pub(super) fn fit_member_indices(&self) -> impl Iterator<Item = usize> + '_ {
         let (n, codes) = (&self.fit_members.0, &self.fit_members.1);
         let n = self.store.as_ref().map_or(0, |st| (*n).min(st.len()));
         (0..n).filter(move |&i| codes.get(i).is_none_or(|&q| q == Q_NONE))
@@ -1261,7 +1571,7 @@ impl SurrogateKs {
             let loos = surrogate::loo::leave_one_out_many(model, &samples);
             let (mut rows, mut tier, mut tier_channel) = (Vec::with_capacity(members.len()), Vec::with_capacity(members.len()), Vec::with_capacity(members.len()));
             for ((&i, s), l) in members.iter().zip(&samples).zip(&loos) {
-                let (own, t, ch) = loo_ratio(&self.policy, model.energy_per_atom, s, l.as_ref());
+                let (own, t, ch) = loo_ratio(&self.policy, model.energy_per_atom, surrogate::energy_row_atoms(&model.basis, &s.pos), s, l.as_ref());
                 rows.push((i, own));
                 tier.push(t);
                 tier_channel.push(ch);
@@ -1304,7 +1614,7 @@ impl SurrogateKs {
             .filter(|(i, _)| !self.excluded(*i) && !self.is_box(*i))
             .filter_map(|(i, s)| {
                 let pr = model.predict(&s.pos, &s.z, false).ok()?;
-                let n = s.pos.len().max(1) as f64;
+                let n = self.audit_n(&s.pos) as f64;
                 // the fitted rows only (a capped segment's: no energy, its interior atoms)
                 let mut r = if s.use_energy { (pr.energy - s.energy).abs() / n / p.energy_std_per_atom } else { 0.0 };
                 for (_, (fm, fs)) in pr.forces.iter().zip(&s.forces).enumerate().filter(|(j, _)| s.trains_atom(*j)) {
@@ -1367,7 +1677,9 @@ impl SurrogateKs {
     /// held-out draft guesses (`Q_DRAFT`) left out — they are not the strict store's data, and
     /// counting them would thin (and, through `is_label_copy`, refuse) the fallbacks that teach
     /// strict mode the region (round 1 re-review, R1-1) — and so are lone atoms (`Q_LONE`: never
-    /// data). ∞ without a model, an envelope or a candidate.
+    /// data). Stray-atom samples held out (`Q_STRAY`) count: they are the teacher's answers, and a
+    /// parked molecule with a stray atom must not add one per step while its check waits. ∞ without
+    /// a model, an envelope or a candidate.
     pub(super) fn nearest_stored(&mut self, pos: &[[f64; 3]], z: &[u8]) -> f64 {
         self.ensure_desc_cache();
         let (Some(basis), Some(env)) = (self.desc_basis.as_ref(), self.envelope.as_ref()) else { return f64::INFINITY };
@@ -1454,13 +1766,13 @@ impl SurrogateKs {
                 (_, 0) => ("a forgotten sample", "forgotten samples"),
                 _ => ("quarantined and forgotten samples", "quarantined and forgotten samples"),
             };
-            let agrees = model.is_some_and(|(e, f)| Self::agree(&self.policy, pos.len(), e, f, energy, forces));
+            let agrees = model.is_some_and(|(e, f)| Self::agree(&self.policy, self.audit_n(pos), e, f, energy, forces));
             if !agrees {
                 // a disagreeing answer ends a run of agreeing ones toward lifting a forgotten fence
                 self.lift_votes.clear();
                 // fence voting (`surrogate` module doc, "Fence voting"): fresh answers that agree with each
                 // other but not with the model are evidence the model is wrong here
-                let n = pos.len();
+                let n = self.audit_n(pos);
                 let residual = model.map(|(e, f)| (energy - e, forces.iter().zip(f).map(|(t, m)| [t[0] - m[0], t[1] - m[1], t[2] - m[2]]).collect()));
                 self.fence_votes.push(FenceVote { near: near.to_vec(), n, energy, forces: forces.to_vec(), residual, gen: self.model_gen });
                 if self.fence_votes.len() > FENCE_VOTES {
@@ -1536,7 +1848,7 @@ impl SurrogateKs {
                 // an agreeing vote; FENCE_VOTES consecutive, mutually consistent ones next to the
                 // same forgotten samples under one model lift the fence of the samples every one
                 // of them was next to, and keep the last answer
-                let n = pos.len();
+                let n = self.audit_n(pos);
                 let residual = model.map(|(e, f)| (energy - e, forces.iter().zip(f).map(|(t, m)| [t[0] - m[0], t[1] - m[1], t[2] - m[2]]).collect()));
                 self.lift_votes.push(FenceVote { near: near.to_vec(), n, energy, forces: forces.to_vec(), residual, gen: self.model_gen });
                 if self.lift_votes.len() > FENCE_VOTES {
@@ -1582,6 +1894,8 @@ impl SurrogateKs {
             if !movable.is_empty() {
                 for i in movable {
                     let s = self.store.as_ref().expect("a quarantined sample is stored").samples[i].clone();
+                    // a re-solved sample its review kept moves as a held one does (controller ruling B, spec §7.6)
+                    self.review_kept.remove(&i);
                     if self.reproduces_sample(&s) {
                         self.quarantine[i] = self.released_code(i);
                         released += 1;
@@ -1605,7 +1919,7 @@ impl SurrogateKs {
         // it agrees with the model, so a region the model cannot fit stays refused without a parked
         // scene growing M; it is learned when a later refit fits M's samples
         if near_misfit {
-            let agrees = model.is_some_and(|(e, f)| Self::agree(&self.policy, pos.len(), e, f, energy, forces));
+            let agrees = model.is_some_and(|(e, f)| Self::agree(&self.policy, self.audit_n(pos), e, f, energy, forces));
             if !agrees {
                 notes.push(match model {
                     Some(_) => "surrogate: sample not kept — next to a training sample the model cannot reproduce, and the teacher disagrees with the model there (a later refit at more samples or a higher body-4 degree may fit it)".into(),
@@ -1698,7 +2012,8 @@ impl SurrogateKs {
             return None;
         }
         let s = &store.samples[i];
-        let n = z.len().max(1) as f64;
+        // N_e · s_E: the fit's noise on this total energy (ruling 9a)
+        let n = surrogate::energy_row_atoms(basis, pos) as f64;
         let s_e = if model.energy_per_atom { n * report.sigma_e } else { report.sigma_e };
         let mag = |f: &[f64; 3]| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
         let same = (!use_energy || (energy - s.energy).abs() <= s_e)
@@ -1766,6 +2081,7 @@ impl SurrogateKs {
         match self.quarantine.get(i).copied().unwrap_or(Q_NONE) {
             Q_NONE => Ok(()),
             Q_FORGOTTEN | Q_FORGOTTEN_UNFENCED => Err(format!("sample #{i} is forgotten already")),
+            Q_RESOLVED => Err(Self::resolved_refusal(i, "Forget")),
             q => Err(format!(
                 "sample #{i} is not in the fit ({}): only a sample in the fit can be forgotten",
                 match q {
@@ -1775,10 +2091,28 @@ impl SurrogateKs {
                     Q_DRAFT => "a draft guess held out of the strict fit",
                     Q_REF_WAIT => "waiting for its box's isolated-atom reference",
                     Q_LONE => "lone atoms, held out for good",
+                    Q_STRAY => "stray atoms, held out until a composition check measures them",
                     _ => "held out of the fit",
                 }
             )),
         }
+    }
+
+    /// Whether stored sample `i` may be restored: only a forgotten one; else the refusal — a re-solved sample
+    /// ([`Q_RESOLVED`]) in the words of [`resolved_refusal`](Self::resolved_refusal).
+    fn restorable(&self, i: usize) -> Result<(), String> {
+        if self.is_forgotten(i) {
+            return Ok(());
+        }
+        match self.quarantine.get(i).copied() {
+            Some(Q_RESOLVED) => Err(Self::resolved_refusal(i, "Restore")),
+            _ => Err(format!("sample #{i} is not forgotten")),
+        }
+    }
+
+    /// Why Forget or Restore (`verb`) refuses re-solved sample `i` (Fermi–Dirac spec §7.6: it is not the user's).
+    fn resolved_refusal(i: usize, verb: &str) -> String {
+        format!("sample #{i} was re-solved for the new solver and waits for its review (it rejoins the fit when the samples around it predict it) — {verb} does not apply to it")
     }
 
     /// The batch's store indices (2026-11-14, the batched forget): every id checked
@@ -1877,7 +2211,7 @@ impl SurrogateKs {
         if let [id] = ids {
             return self.restore_sample(*id);
         }
-        let idx = self.batch_indices(ids, |s, i| if s.is_forgotten(i) { Ok(()) } else { Err(format!("sample #{i} is not forgotten")) })?;
+        let idx = self.batch_indices(ids, |s, i| s.restorable(i))?;
         let written: Vec<String> = idx
             .iter()
             .map(|&i| {
@@ -1902,9 +2236,7 @@ impl SurrogateKs {
     /// `Err`, nothing changed: the id no longer names the sample (M8), or it is not forgotten.
     pub fn restore_sample(&mut self, id: sim::SampleId) -> Result<(), String> {
         let i = self.check_id(id)?;
-        if !self.is_forgotten(i) {
-            return Err(format!("sample #{i} is not forgotten"));
-        }
+        self.restorable(i)?;
         let code = self.released_code(i);
         let written = self.set_user_code(i, code);
         self.user_notes.push(format!("surrogate: sample #{i} restored — back in the fit at the refit{written}"));

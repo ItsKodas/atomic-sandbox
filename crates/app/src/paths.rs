@@ -1196,6 +1196,34 @@ mod tests {
         assert_eq!(seed_from(Some(&m), Some(&s), &root), None, "and quiet again");
     }
 
+    /// No trained model ships since the Fermi–Dirac switch (plan 2026-11-13 Task 17, the user's ruling of 2026-11-16):
+    /// `scripts/package.ps1` stages no `bundled\models`. The first launch seeds the scenes alone and writes the marker,
+    /// the next launch is quiet, and the models and collections folders are made on first use, empty — the shared
+    /// collection then learns into them.
+    #[test]
+    fn seed_without_bundled_models() {
+        let t = Tmp::new("seed-no-models");
+        t.file("exe/installed.txt", "installed by AtomicSandbox-Setup-0.2.0");
+        t.file("exe/bundled/scenes/h2o.scene", "w");
+        let (exe, root) = (t.0.join("exe"), t.0.join("root"));
+        let c = ctx(DataMode::Installed, &exe, &exe, Some(&root));
+        let (m, s) = (c.bundled(DataDir::Models), c.bundled(DataDir::Scenes));
+        assert!(m.as_deref().is_some_and(|m| !m.exists()), "the install folder has no bundled\\models");
+        let r = seed_from(m.as_deref(), s.as_deref(), &root).expect("the first launch seeds");
+        assert_eq!(r, CopyReport { copied: 1, ..Default::default() });
+        assert_eq!(t.read("root/scenes/h2o.scene"), "w");
+        assert!(!root.join("models").exists(), "nothing to copy, no models folder made by the seed");
+        assert_eq!(seeded_version(&root.join(SEEDED_MARKER)).as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(seed_from(m.as_deref(), s.as_deref(), &root), None, "the next launch is quiet");
+        // the models and collections folders: made on first use, empty
+        let models = c.dir(DataDir::Models).expect("installed: under the root");
+        let collections = c.dir(DataDir::Collections).expect("installed: under the root");
+        assert_eq!((models.clone(), collections.clone()), (root.join("models"), root.join("models").join("collections")));
+        assert!(collections.is_dir());
+        assert_eq!(std::fs::read_dir(&models).unwrap().count(), 1, "only collections\\");
+        assert_eq!(seed_from(m.as_deref(), s.as_deref(), &root), None, "and still quiet");
+    }
+
     #[test]
     fn import_copies_the_three_folders_and_records_the_source() {
         let t = Tmp::new("import");

@@ -537,9 +537,11 @@ pub enum Surface {
 }
 
 /// The Kohn-Sham energy breakdown of an evaluation (Hartree): kinetic, external (electron–nucleus),
-/// Hartree, exchange-correlation, nuclear repulsion and their total — `EvalStats::energy`. The
-/// same fields as `qm::Energy`, which it carried until M6 (`providers::ks` converts at the
-/// boundary, so `sim` does not depend on `qm`).
+/// Hartree, exchange-correlation, nuclear repulsion, their sum `internal` = E, the electronic entropy term
+/// `ts` = T_el·S (kT·S under Fermi–Dirac occupations; 0 for a gapped state) and `total` = F = E − TS, the Mermin free
+/// energy the forces are the derivative of — `EvalStats::energy` (spec 2026-11-13 §4.3, §6.3). The same fields as
+/// `qm::Energy`, which it carried until M6 (`providers::ks` converts at the boundary, so `sim` does not depend on
+/// `qm`). A consumer that rebuilds the total from the parts must subtract `ts`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct EnergyBreakdown {
     pub kinetic: f64,
@@ -547,6 +549,8 @@ pub struct EnergyBreakdown {
     pub hartree: f64,
     pub xc: f64,
     pub nuclear: f64,
+    pub internal: f64,
+    pub ts: f64,
     pub total: f64,
 }
 
@@ -594,10 +598,12 @@ pub struct EnergyBreakdown {
 ///   `SolveProfile::eig_tol_used`; CPU: the fixed `ScfSettings::eig_tol`).
 /// - `scf_tol_used`: the Δρ tolerance this solve actually stopped at (M7): the provider's `scf_tol`, except
 ///   where a GPU solver cannot reach it — under a pseudo setup its stop is max(tol, 2·floor(N)), the f32
-///   density floor growing with the valence electron count (spec §7 risk 6). **A record, never compared**: the
-///   surrogate's provenance carries the stop *rule* (in the ionic tag), the nominal tolerance as before, and
-///   this number is what each answer ran at (`None` from an analytic provider or a model answer).
-/// - `energy`: the breakdown (kinetic, external, Hartree, xc, nuclear, total — Hartree);
+///   density floor growing with the valence electron count (spec §7 risk 6), and on a final step whose
+///   occupations have a partly occupied level max(that, `qm::GPU_PARTIAL_TOL`) (spec 2026-11-13 §5.1;
+///   `qm::ScfStats::tol_used`, plan 2026-11-13 Task 9 F9). **A record, never compared** for provenance: the
+///   surrogate's provenance carries the stop *rule* (in the ionic tag), the nominal tolerance as before, and this
+///   number is what each answer ran at (`None` from an analytic provider or a model answer).
+/// - `energy`: the breakdown (kinetic, external, Hartree, xc, nuclear, internal E, TS, total F — Hartree);
 ///   `max_eigen_residual`, `poisson_residual`: as `ScfStats` defines them (the worst LOBPCG
 ///   exit residual of the tight-tol steps; the worst relative Poisson residual). On a surrogate
 ///   `Fallback` step the breakdown is the TEACHER's (its `total` = `ForceResult::energy` +
@@ -635,33 +641,74 @@ pub struct EvalStats {
     /// (every field is finite) and never kept as training data. Each is also a warning, prefixed
     /// [`CORE_OVERLAP_WARNING`].
     pub core_overlaps: Vec<(usize, usize, f64)>,
-    /// M7 (spec §5.7; Task 6 review A.6): the shared (fractionally occupied) degenerate shells of
-    /// the final SCF step under `Occupations::DegenerateShells`; empty for integer occupations.
-    pub fractional: Vec<SharedShell>,
-    /// The shared-shell pattern (spin, first level, size) differs from the previous step's
-    /// evaluation by the same provider: E(R) can jump by the orbital-polarisation energy there
-    /// (a few mHa), so the answer is used and never kept as training data (Task 6 review A.6).
-    /// Also a warning, [`OCCUPATION_CHANGE_WARNING`].
-    pub occupation_changed: bool,
+    /// Spec 2026-11-13 §6.3: the partly occupied levels of the final SCF step under Fermi–Dirac occupations
+    /// (`qm::ScfStats::partial`: min(f, 1 − f) ≥ `qm::PARTIAL_OCCUPATION_MIN`), ascending ε per spin, ↑ first;
+    /// empty for a gapped state.
+    pub partial: Vec<PartialLevel>,
+    /// Stray-atoms spec 2026-11-18: the final SCF step's frontier levels per spin channel, ↑ then ↓ (Ha) — the highest
+    /// eigenvalue with f ≥ ½ and the lowest with f < ½ among the computed block (witnesses included). `None` where a
+    /// channel has no such level, and both `None` from a provider without electrons (analytic, surrogate-answered steps).
+    /// Under Fermi–Dirac a `lumo` from a witness column is converged to the guard tolerance only, not the SCF's.
+    pub frontier: [Frontier; 2],
+    /// Plan 2026-11-13 Task 8 (spec §6.3, the `providers::branch_jump` guard): `Some(m)` when this step's change of F
+    /// disagrees with the forces' trapezoid work since the same provider's previous evaluation by m (Ha) beyond the
+    /// noise and third-order bound — the SCF moved to another stationary state. The answer is used for its step and
+    /// never trained on; also a warning, [`branch_jump_warning`]. `None`: not flagged, or not judged (the first
+    /// evaluation after a reset or a grid/box/atom-set change, a single-atom displacement over 0.1 Bohr, a provider
+    /// without the guard).
+    pub branch_jump: Option<f64>,
+    /// With a judged step at N↑ = N↓: |Δ∫|ρ↑ − ρ↓|| (electrons) since the previous evaluation, where a
+    /// restricted ↔ broken-symmetry switch shows (spec §6.3, "Spin measure"); reported, never decided on.
+    pub spin_change: Option<f64>,
 }
 
 /// The prefix of the per-step core-overlap warning (spec §5.6): "cores overlap: I–J at R = … Bohr".
 /// Pinned equal to `qm::ionic::CORE_OVERLAP_WARNING` in `providers`.
 pub const CORE_OVERLAP_WARNING: &str = "cores overlap";
 
-/// The prefix of the warning for a shared-shell pattern that changed between consecutive steps.
-pub const OCCUPATION_CHANGE_WARNING: &str = "occupation pattern changed";
+/// The short reason [`EvalStats::untrainable`] gives for a step the `branch_jump` guard flagged (spec §6.3).
+pub const BRANCH_JUMP_WARNING: &str = "F changed by more than the forces' work";
 
-/// One shared (fractionally occupied) cluster of one spin channel (`qm::scf::FractionalShell`): spin
-/// (0 ↑, 1 ↓), the index of its first level in ascending order, its size, the occupation f of each
-/// level and the spread of its eigenvalues (Ha).
+/// The spec section behind an [`EvalStats::untrainable`] reason, for the "not kept (… — <section>)" notes (plan
+/// 2026-11-13 Task 8 review M5): the core overlap is the pseudopotential spec's §5.6, the branch jump the Fermi–Dirac
+/// spec's §6.3.
+pub fn untrainable_citation(reason: &str) -> &'static str {
+    match reason {
+        CORE_OVERLAP_WARNING => "spec §5.6",
+        BRANCH_JUMP_WARNING => "Fermi–Dirac spec §6.3",
+        // a reason added to `untrainable` without its section here: caught by the tests, never a panic in the app
+        _ => {
+            debug_assert!(false, "untrainable_citation: no spec section for {reason:?}");
+            "no spec section recorded"
+        }
+    }
+}
+
+/// The warning of a flagged step (spec §6.6): the mismatch `m` (Ha) shown in mHa with one decimal.
+pub fn branch_jump_warning(m: f64) -> String {
+    format!("F changed by {:.1} mHa more than the forces' work: the SCF moved to another stationary state (not trained on)", m * 1e3)
+}
+
+/// One partly occupied level of one spin channel (`qm::PartialLevel`; spec 2026-11-13 §6.3): spin (0 ↑, 1 ↓), its
+/// rank in ascending ε within the channel, ε (Ha) and its Fermi–Dirac occupation f.
 #[derive(Clone, Debug, PartialEq)]
-pub struct SharedShell {
+pub struct PartialLevel {
     pub spin: u8,
-    pub first: usize,
-    pub count: usize,
+    pub index: usize,
+    pub eps: f64,
     pub f: f64,
-    pub spread: f64,
+}
+
+/// One spin channel's frontier levels (Ha; [`EvalStats::frontier`]): `homo` the highest eigenvalue with occupation
+/// f ≥ ½, `lumo` the lowest with f < ½ among the computed block; `None` when the channel has no such level. `mu`: the
+/// channel's chemical potential μ_σ (Ha) of the final SCF step under Fermi–Dirac occupations (`qm::ScfStats::mu`; the
+/// stray-atom check's frontier window is centred on the scene's, controller ruling 10a); `None` under integer aufbau, for
+/// a channel without electrons, and from a provider without electrons.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Frontier {
+    pub homo: Option<f64>,
+    pub lumo: Option<f64>,
+    pub mu: Option<f64>,
 }
 
 /// What the generator recorded for one pseudised species, for the badge, the Selection tab and the
@@ -720,8 +767,10 @@ impl Default for EvalStats {
             extrapolation: None,
             pseudised: Vec::new(),
             core_overlaps: Vec::new(),
-            fractional: Vec::new(),
-            occupation_changed: false,
+            partial: Vec::new(),
+            frontier: [Frontier::default(); 2],
+            branch_jump: None,
+            spin_change: None,
         }
     }
 }
@@ -729,13 +778,14 @@ impl Default for EvalStats {
 impl EvalStats {
     /// Why this answer must never be a training sample, if it must not (M7): the cores of two ions overlap
     /// ([`CORE_OVERLAP_WARNING`], spec §5.6 — the frozen-core approximation is outside its domain) or the
-    /// shared-shell occupation pattern changed since the previous evaluation ([`OCCUPATION_CHANGE_WARNING`] —
-    /// E(R) jumps by the orbital-polarisation energy there). The answer is still used for its step.
+    /// `branch_jump` guard flagged the step ([`BRANCH_JUMP_WARNING`], spec 2026-11-13 §6.3 — F changed by more than
+    /// the forces' work: another stationary state; it replaced the shared-shell occupation watch in plan 2026-11-13
+    /// Task 9). The answer is still used for its step. [`untrainable_citation`] names each reason's spec section.
     pub fn untrainable(&self) -> Option<&'static str> {
         if !self.core_overlaps.is_empty() {
             Some(CORE_OVERLAP_WARNING)
-        } else if self.occupation_changed {
-            Some(OCCUPATION_CHANGE_WARNING)
+        } else if self.branch_jump.is_some() {
+            Some(BRANCH_JUMP_WARNING)
         } else {
             None
         }
@@ -927,8 +977,9 @@ pub trait ForceProvider: Send {
     /// (spec §6.5). Applies from the next evaluation; the Kohn-Sham adapters honour it, a
     /// surrogate forwards it to its teacher. No-op by default.
     fn set_display_partial_core(&mut self, _on: bool) {}
-    /// M7: the identity of the ionic surface this provider solves `scene` on — `"none"` when
-    /// nothing in it is pseudised (the all-electron surface), else `"<policy word>/<recipe hash>"`
+    /// M7: the identity of the ionic surface this provider solves `scene` on — the all-electron tag
+    /// (`none/fd5e-3/pin1e-5` since plan 2026-11-13 Task 9; `providers::pseudo::is_all_electron_tag` also answers for the
+    /// legacy `"none"`) when nothing in it is pseudised, else `"<policy word>/<recipe hash>/…"`
     /// (`providers::pseudo::provenance_tag`). Keys the isolated-atom references
     /// ([`crate::references::ReferenceKey::ionic`]): a reference solved on one surface is never
     /// reused on another (the valence energies differ by tens of Ha). The default — for the
@@ -1329,6 +1380,19 @@ pub trait Trainable {
     fn forgotten_in_collection(&self) -> usize {
         0
     }
+    /// The attached shared collection's migration from its predecessor folder (Fermi–Dirac spec §7.3): offered, running,
+    /// paused, complete or reviewed, with the counts and the time estimate. `None` without an attached collection, when
+    /// it has no predecessor with samples and no `migration.txt`, and by default.
+    fn migration(&self) -> Option<MigrationStatus> {
+        None
+    }
+    /// Starts — or resumes from its cursor — the re-solve pass that migrates the predecessor's samples into the attached
+    /// collection (`providers::sampling::migrate`): a pass like any other, driven by `pass_step`, paused and cancelled
+    /// like one. `Err` with the reason, nothing started: no collection or no predecessor, a pass running, the migration
+    /// complete, the predecessor held by a live writer. The default refuses.
+    fn start_migration(&mut self) -> Result<(), String> {
+        Err("this provider does not learn".into())
+    }
     /// Draft mode: the model answers every step it can be asked at all, extrapolating (the
     /// surrogate's `FallbackPolicy::never_fallback`). A provider without one ignores it.
     fn set_draft(&mut self, _on: bool) {}
@@ -1472,7 +1536,8 @@ pub struct TrainableStatus {
     /// of the stored species' basis, the trust floor); `None` with an empty store.
     pub trust_floor: Option<usize>,
     /// Samples kept since the last refit (not in the fit yet). Right after a refit
-    /// `samples` = fit samples + `quarantined` + `superseded` + `forgotten` + `box_excluded` + `held_out` + `lone` + `unfitted`
+    /// `samples` = fit samples + `quarantined` + `superseded` + `forgotten` + `box_excluded` + `held_out` + `lone` +
+    /// `stray_held_out` + `unfitted`
     /// exactly (M6 Task 11: the panel's "fit vs held" reconciliation).
     pub unfitted: usize,
     /// Of `unfitted`, the samples in the next fit's codes (no quarantine code: not forgotten, held,
@@ -1532,6 +1597,51 @@ pub struct TrainableStatus {
     /// (`providers::surrogate::lone_atoms_note`): all of them — a pass is refused; some — they are
     /// not learned. `None` when every atom has a neighbour. Informational.
     pub lone_note: Option<String>,
+    /// The stray-atom signatures of this session (`providers::surrogate::stray`, spec 2026-11-18 §5): per signature its
+    /// label ("H2 + H": the bonded part's formula + the stray atoms') and its state in words — "checking (1 of 3)",
+    /// "cleared (3 checks)" or "refused (why)". Session-only; empty without a model or a check.
+    pub stray: Vec<(String, String)>,
+    /// Stored samples with stray atoms held out of the fit until a composition check measures them
+    /// (`providers::surrogate`, `Q_STRAY`): with the counts above, what the store holds beyond the fit.
+    pub stray_held_out: usize,
+    /// The calibration ticks' counts (trust tightening, spec 2026-11-18 §4; the Model tab's
+    /// "calibration checks skipped"): plain data of the provider's own counters, so the app never
+    /// downcasts the provider (CLAUDE.md rule 5).
+    pub ticks: CalibrationTicks,
+}
+
+/// What became of the calibration ticks ([`TrainableStatus::ticks`]; `providers::surrogate`,
+/// "Calibration ticks": every 25th in-envelope step is checked against DFT whatever the model's
+/// std says). Every tick that fell due is in exactly one of `recorded`, `unrecorded`,
+/// `skipped_busy` and `lost`, or still in flight.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CalibrationTicks {
+    /// Taken, its point recorded.
+    pub recorded: u64,
+    /// Taken, no point (box-affected, unfit, no variance factor), or the point deferred to a stray attribution check (its point arrives later with `TICK`).
+    pub unrecorded: u64,
+    /// Skipped: the background teacher was busy with other work (an audit, a display, a
+    /// reference) when the tick fell due — never deferred, never served in the step.
+    pub skipped_busy: u64,
+    /// Lost: its job abandoned (Forget, an installed model, the teacher gone), returned failed or
+    /// unjudged, or nothing to compare.
+    pub lost: u64,
+    /// Of the taken ones, served by a teacher solve in the step (no background teacher).
+    pub in_step: u64,
+    /// Every tick that fell due.
+    pub due: u64,
+}
+
+impl CalibrationTicks {
+    /// Taken: recorded or not.
+    pub fn taken(&self) -> u64 {
+        self.recorded + self.unrecorded
+    }
+
+    /// Skipped, for either cause (`providers::surrogate::SurrogateKs::ticks_skipped`).
+    pub fn skipped(&self) -> u64 {
+        self.skipped_busy + self.lost
+    }
 }
 
 /// Where a [`Trainable`]'s model comes from (M8a Task 4a; [`TrainableStatus::model_source`]): the
@@ -1554,6 +1664,48 @@ pub struct ImportSummary {
     pub imported: usize,
     pub refused: Vec<(Option<usize>, String)>,
     pub notes: Vec<String>,
+}
+
+/// Where a shared collection's migration from its predecessor stands ([`MigrationStatus::state`];
+/// Fermi–Dirac spec `docs/superpowers/specs/2026-11-13-fermi-smearing-design.md` §7.3, §7.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MigrationPhase {
+    /// The attached collection has a predecessor (the same surface under the previous solver's tag)
+    /// with samples, and no pass has started: [`Trainable::start_migration`] starts one.
+    Offered,
+    /// The re-solve pass is running (driven by `Trainable::pass_step` like any pass).
+    Running,
+    /// A pass was started and is not complete, and none runs now (cancelled, or the app was closed):
+    /// [`Trainable::start_migration`] resumes it from its cursor.
+    Paused,
+    /// Every source sample was re-solved or listed as not migrated; the code-9 review is pending.
+    Complete,
+    /// Complete, and the code-9 samples were reviewed by a refit.
+    Reviewed,
+}
+
+/// A shared collection's migration (plain data of the provider's `migration.txt` and its offer;
+/// [`Trainable::migration`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MigrationStatus {
+    /// The predecessor folder's name (under `models/collections`).
+    pub source: String,
+    /// The predecessor's samples (whole records read).
+    pub samples: usize,
+    /// Source samples re-solved or listed as not migrated so far (the pass's cursor).
+    pub done: usize,
+    /// Unchanged (U), entropy only (T), state changed (S), not migrated.
+    pub counts: [usize; 4],
+    /// The GPU time left, s: before the start a count-based estimate, from the median of the pass's own solves
+    /// once it has made 20 (`None` when complete).
+    pub eta_s: Option<f64>,
+    pub state: MigrationPhase,
+    /// The predecessor's species (Z ascending; the offer's words), as read of it before the pass ends; empty once the
+    /// migration is complete (the source is no longer read).
+    pub species: Vec<u8>,
+    /// The summary once the pass is complete (spec §7.8; `surrogate::migration::summary_text` of `migration.txt`, the
+    /// text the collection's `README.txt` carries too); `None` before.
+    pub summary: Option<String>,
 }
 
 /// What [`Trainable::purge_forgotten`] did (plain data of the provider's purge).
@@ -1674,6 +1826,12 @@ pub struct ClassLoo {
     /// it before they are compared with their bounds. ≥ 1; 1 until the class has three
     /// comparisons where the posterior decides.
     pub inflation: f64,
+    /// The evidence floor's counts of the verdict's evidence window (trust tightening, spec
+    /// 2026-11-18 §3; `providers::surrogate::calibrate`, "The evidence floor"): n_fit, the distinct
+    /// fits, and n_pts, the attributed comparisons (audits and rule-4b fallbacks carrying species and
+    /// a fit id). Below 12 fits or 60 comparisons the calibrated verdict cannot open a key alone.
+    pub fits: usize,
+    pub floor_points: usize,
     /// The verdict per environment species of the class (M8a user-test fix 2,
     /// `providers::surrogate::calibrate` "Per environment species"): an atom answers by its own
     /// (central Z, neighbour species) key's verdict. The class's own `trusted` is all of them
@@ -1704,6 +1862,22 @@ pub struct SpeciesVerdict {
     /// its class's sample count and the whole basis's Q′.
     pub samples: usize,
     pub columns: usize,
+    /// The evidence floor's n_fit and n_pts for this key (trust tightening, spec 2026-11-18 §3;
+    /// [`ClassLoo::fits`]): the distinct fits and the attributed comparisons in its evidence window.
+    pub fits: usize,
+    pub floor_points: usize,
+    /// λ_sum as rules 6 and 7 read it for this key: `inflation`, raised to its class's λ_sum while the
+    /// key has fewer than three points of its own posterior evidence (the sparse-key floor). What the
+    /// tail-aware inflations are compared with: a step they refuse that passes at this factor is
+    /// history code 24.
+    pub rule_inflation: f64,
+    /// λ_T and λ_E, the tail-aware inflations rules 6 and 7 apply to this key's atoms (spec
+    /// 2026-11-18 §4; `providers::surrogate::calibrate`, "The tail-aware inflations"), with a sparse
+    /// key's class floors applied: ≥ 1, ∞ when a DFT check found an error beyond its limit where the
+    /// model's std was 0, NaN when a comparison was not a number. Rule 6 reads max(`rule_inflation`,
+    /// `tail_inflation`); a step they refuse that passes at `rule_inflation` alone is history code 24.
+    pub tail_inflation: f64,
+    pub energy_inflation: f64,
 }
 
 impl SpeciesVerdict {
@@ -1739,7 +1913,9 @@ pub enum ClassKey {
     Samples,
     /// One atom's DFT-measured force error in the evidence window beyond `WORST_ATOM` = 3× its
     /// bound: (that ratio, 3). It keeps an untrusted class from entering at every evidence count,
-    /// and makes a trusted one leave while the class has fewer than three comparisons.
+    /// and makes a trusted one leave while the class is below its evidence floor (fewer than 12
+    /// fits or 60 attributed comparisons; trust tightening, spec 2026-11-18 §3 — before it, fewer
+    /// than three comparisons).
     WorstAtom,
     /// The uncalibrated rule (fewer than three comparisons): the leave-one-out force error over
     /// the class's atoms — the larger of max and RMS, as a ratio to each atom's bound (limit 1;
@@ -1764,6 +1940,14 @@ pub enum ClassKey {
     /// The calibrated verdict, decided by the DFT-measured energy error (`ClassLoo::measured_energy`,
     /// in tier units) against its limit.
     MeasuredEnergy,
+    /// The evidence floor (trust tightening, spec 2026-11-18 §3): a key whose calibrated verdict
+    /// passes on fewer than `FLOOR_FITS` = 12 distinct fits or `FLOOR_POINTS` = 60 attributed
+    /// comparisons is trusted only if the rule of before passes as well — the leave-one-out force
+    /// rms and max and the energy max all ≤ 1: (the leave-one-out ratio that decided, 1). Named
+    /// only when the calibrated verdict itself passes (otherwise that refusal is named). Below the
+    /// floor the comparisons' rms is too few independent draws to stand alone; the key opens once
+    /// the floor is met, or once a teach-around brings its leave-one-out within 1.
+    Floor,
     /// Between refits (M8a user-test fix 2: the verdict re-judged as evidence arrives) an untrusted
     /// environment enters only on a full evidence window: (its comparisons, `WINDOW_POINTS` = 300)
     /// — the count at which a window free of 3× atoms makes a 1 % tail unlikely. Until then entry
@@ -1807,16 +1991,46 @@ pub struct AuditRecord {
 mod ionic_tests {
     use super::*;
 
-    /// M7 Task 9 (spec §5.6; Task 6 review A.6): an answer with overlapping cores or a changed shared-shell pattern
-    /// is untrainable and says why; an ordinary one is not.
+    /// M7 Task 9 (spec §5.6): an answer with overlapping cores or a flagged branch jump is untrainable and says why;
+    /// an ordinary one is not. (Re-pinned in plan 2026-11-13 Task 9: the shared-shell occupation watch this test
+    /// exercised is gone; the `branch_jump` guard took its role, spec 2026-11-13 §6.3.)
     #[test]
     fn untrainable_answers_say_why() {
         let mut s = EvalStats::default();
         assert_eq!(s.untrainable(), None);
-        s.occupation_changed = true;
-        assert_eq!(s.untrainable(), Some(OCCUPATION_CHANGE_WARNING));
+        s.branch_jump = Some(0.012);
+        assert_eq!(s.untrainable(), Some(BRANCH_JUMP_WARNING));
         s.core_overlaps = vec![(0, 1, 0.8)];
         assert_eq!(s.untrainable(), Some(CORE_OVERLAP_WARNING), "overlapping cores are named first");
         assert_eq!(CORE_OVERLAP_WARNING, "cores overlap");
+    }
+
+    /// Plan 2026-11-13 Task 8 (spec §6.3): a step the `branch_jump` guard flagged is untrainable, named after the
+    /// core overlaps; each reason cites its own spec section (Task 8 review M5; the occupation watch went in Task 9).
+    #[test]
+    fn untrainable_reports_branch_jump() {
+        let mut s = EvalStats::default();
+        assert_eq!((s.branch_jump, s.spin_change), (None, None), "not judged by default");
+        assert!(s.partial.is_empty(), "no partly occupied level by default");
+        s.branch_jump = Some(0.012);
+        assert_eq!(s.untrainable(), Some(BRANCH_JUMP_WARNING));
+        assert_eq!(untrainable_citation(BRANCH_JUMP_WARNING), "Fermi–Dirac spec §6.3");
+        s.core_overlaps = vec![(0, 1, 0.8)];
+        assert_eq!(s.untrainable(), Some(CORE_OVERLAP_WARNING), "overlapping cores are still named first");
+        assert_eq!(untrainable_citation(CORE_OVERLAP_WARNING), "spec §5.6");
+        s.core_overlaps.clear();
+        s.branch_jump = None;
+        assert_eq!(s.untrainable(), None);
+    }
+
+    /// Spec §6.6's warning text, m in mHa with one decimal (F14; plan Task 12 asserts the same text in the UI).
+    #[test]
+    fn untrainable_branch_jump_warning_text() {
+        assert_eq!(
+            branch_jump_warning(0.012),
+            "F changed by 12.0 mHa more than the forces' work: the SCF moved to another stationary state (not trained on)"
+        );
+        assert_eq!(BRANCH_JUMP_WARNING, "F changed by more than the forces' work");
+        assert!(branch_jump_warning(0.012).starts_with("F changed by "));
     }
 }

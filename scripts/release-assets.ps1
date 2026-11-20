@@ -3,7 +3,7 @@
   -RequireInstaller, writes dist\SHA256SUMS.txt (the installer and the zip, sha256sum text form, LF)
   and dist\manifest.json (the exe's --write-manifest plus each asset's name, size and sha256), the
   same steps as .github/workflows/release.yml's build job. Signing is the user's, by hand.
-  Usage: powershell -NoProfile -ExecutionPolicy Bypass -File scriptselease-assets.ps1 -Version 0.2.0-beta.5
+  Usage: powershell -NoProfile -ExecutionPolicy Bypass -File scripts\release-assets.ps1 -Version 0.2.0-beta.5
 #>
 param([Parameter(Mandatory = $true)][string]$Version)
 $ErrorActionPreference = 'Stop'

@@ -42,6 +42,9 @@ pub use sim::{AuditRecord, AuditVerdict};
 /// | 21 | `Class(_)` refused **and** the variance verdict (rule 6/7) refused too — the class's note
 ///       is shown, but the step is not the class verdict's evidence ([`HISTORY_RULE_CLASS_AND_VARIANCE`];
 ///       M8a Task 2: `calibrate` reads codes 5 and 6 only) |
+/// | 24 | `ForceUncertainty` / `EnergyUncertainty` refused **only** by the tail-aware factor — rule 6/7
+///       at λ_F = max(λ_sum, λ_T) or λ_E refused, at λ_sum alone it passes ([`HISTORY_RULE_TAIL_INFLATION`];
+///       trust tightening, spec 2026-11-18 §4: never in the answer sample P_A, since λ selected it) |
 pub fn history_rule_code(rule: TeachRule) -> u8 {
     use sim::activity::EnvClass;
     match rule {
@@ -77,6 +80,13 @@ pub fn history_rule_code(rule: TeachRule) -> u8 {
 /// comparison is not evidence for the class verdict — `calibrate::in_jurisdiction` leaves it out.
 pub const HISTORY_RULE_CLASS_AND_VARIANCE: u8 = 21;
 
+/// The history code of a step rule 6 or 7 refused only at the tail-aware inflations (trust
+/// tightening, spec 2026-11-18 §4; `calibrate`, "The tail-aware inflations"): rule 6 at
+/// λ_F(j) = max(λ_sum(k), λ_T(k)) or rule 7 at max(max_j λ_F(j), max_k λ_E(k)) refused, and at
+/// λ_sum alone both pass. Recorded for the Log and the measurement; `calibrate::in_answer_sample`
+/// leaves it out (λ selected it), while λ_sum's posterior jurisdiction reads it as it reads 14/15.
+pub const HISTORY_RULE_TAIL_INFLATION: u8 = 24;
+
 /// The rule a [`history_rule_code`] names, in the decision list's words ("?" for an unknown code).
 pub fn history_rule_name(code: u8) -> &'static str {
     match code {
@@ -104,6 +114,7 @@ pub fn history_rule_name(code: u8) -> &'static str {
         21 => "rule 4b with rule 6/7 failing too",
         22 => "capped segment (teacher only)",
         23 => "near a misfit",
+        24 => "rule 6/7 at the tail-aware inflation (passes at λ_sum)",
         _ => "?",
     }
 }
@@ -123,6 +134,13 @@ pub(super) enum JobKind {
     /// spec §4.2): orbitals only, display only — never a fallback, an audit, a teacher solve, a
     /// sample or a teach event. At most one is queued (`SurrogateKs::harris_queued`).
     HarrisDisplay,
+    /// A composition check's bonded part alone (`stray`, spec 2026-11-18 §4.3): the scene's
+    /// bonded nuclei in its cell, charge 0, automatic multiplicity, the scene's ionic policy; its
+    /// answer goes to the check in flight (`SurrogateKs::take_stray_answer`), never a sample.
+    Fragment,
+    /// A composition check's stray atom of this Z alone at its scene position, at its reference
+    /// multiplicity, in the scene's cell — like [`Fragment`](JobKind::Fragment) never a sample.
+    AtomAt(u8),
 }
 
 /// Where a failed audit came from (the teach-around review, SHOULD-T5: the chip says which).
@@ -138,6 +156,11 @@ pub(super) enum AuditOrigin {
     /// A pass's shell check (`sampling` module doc, 3.): the interaction left beyond the scan limit
     /// that the cutoff truncates.
     ShellCheck,
+    /// A failed audit at a scene with stray atoms that its attribution check blamed on the model
+    /// (`stray` module doc, "Audits of a cleared answer"): its label is the bonded part's teacher answer
+    /// plus each stray atom's E_ref — valid only while those atoms are stray at the model's cutoff
+    /// (`rejudge_failed_audits` fences it otherwise; Task 5 fix round 1, M7).
+    StrayAttributed,
 }
 
 impl AuditOrigin {
@@ -148,6 +171,7 @@ impl AuditOrigin {
             AuditOrigin::TeachCheck => "teach-check",
             AuditOrigin::HeldOutGuess => "held-out-guess",
             AuditOrigin::ShellCheck => "shell-check",
+            AuditOrigin::StrayAttributed => "stray-attributed",
         }
     }
 
@@ -156,6 +180,7 @@ impl AuditOrigin {
             "teach-check" => AuditOrigin::TeachCheck,
             "held-out-guess" => AuditOrigin::HeldOutGuess,
             "shell-check" => AuditOrigin::ShellCheck,
+            "stray-attributed" => AuditOrigin::StrayAttributed,
             _ => AuditOrigin::Audit,
         }
     }
@@ -179,6 +204,14 @@ pub(super) struct FailedAudit {
     /// cutoff shell (`trust::shell_fence_refusal`; final review I2 — carried, never re-derived
     /// from the case's geometry). `Some` exactly for `AuditOrigin::ShellCheck`.
     pub(super) pair: Option<(u8, u8)>,
+}
+
+/// The epistemic energy std a history point may carry (`record_history_point`): a finite,
+/// non-negative value as itself (−0 as +0), anything else — NaN, ±∞, a negative number — as absent.
+/// `AuditHistory::push` panics on what this refuses; a radicand below 0 is clamped to 0 before the
+/// root (`epistemic_energy_std`), so a cancelled epistemic part arrives as 0, never as NaN.
+pub(super) fn recordable_energy_std(s: Option<f64>) -> Option<f64> {
+    s.filter(|v| v.is_finite() && *v >= 0.0).map(|v| if v == 0.0 { 0.0 } else { v })
 }
 
 /// The isolated neutral atom of species `z` at the centre of `scene`'s cell, solved under the scene's own ionic policy
@@ -216,6 +249,14 @@ pub(super) struct AuditJob {
     /// The orbital shares' free-atom tables (`SurrogateKs::share_tables`), handed to the teacher
     /// before it solves; it weights them at this job's positions (module doc, "Orbitals").
     pub(super) shares: Option<Arc<ShareTables>>,
+    /// An audit's history flags from the step that dispatched it (`SurrogateKs::dispatch_flags`;
+    /// module doc, "The history's flags"): its cadence-fresh and fenced bits. Empty for every other
+    /// kind. `TICK` on a calibration tick's audit (`SurrogateKs` module doc, "Calibration ticks").
+    pub(super) flags: surrogate::history::PointFlags,
+    /// A calibration tick alone, not rule 8's audit (`SurrogateKs::dispatch_tick_only`): judged as
+    /// an audit, but a box-affected answer does not make rule 8 audit again. False for every other
+    /// kind and for a rule-8 audit that is a tick as well.
+    pub(super) tick_only: bool,
     /// The isolated-atom profiles a [`JobKind::HarrisDisplay`] job superposes (`None` for every
     /// other kind).
     pub(super) harris: Option<Arc<sim::HarrisAtoms>>,
@@ -237,17 +278,25 @@ pub(super) struct Solved {
     pub(super) orbitals: Option<OrbitalDisplay>,
     /// Why this answer must not be trained on (`EvalStats::untrainable`), if it must not.
     pub(super) unfit: Option<&'static str>,
+    /// The solve's per-spin frontier levels and partial levels (`EvalStats::frontier`,
+    /// `EvalStats::partial`) and whether it warned (`EvalStats::warnings`): a composition check's
+    /// (`stray::PartAnswer`).
+    pub(super) frontier: [sim::Frontier; 2],
+    pub(super) partial: Vec<sim::PartialLevel>,
+    pub(super) warned: bool,
 }
 
 /// The auditor's answer: what the teacher solved, or its error; for a `Reference` job the scan's
 /// outcome is in `reference` (and `result` is unused). `scf_steps`: the solve's SCF steps as its
-/// teacher reported them (`None` for an error or a reference scan).
+/// teacher reported them (`None` for an error or a reference scan); `ts` its electronic entropy term T_el·S
+/// (`EvalStats::energy.ts`, Ha; `None` likewise — the Activity row's "−TS", Fermi–Dirac spec 2026-11-13 §6.6).
 pub(super) struct AuditAnswer {
     pub(super) job: AuditJob,
     pub(super) result: Result<Solved, String>,
     pub(super) reference: Option<Result<AtomReference, ProviderError>>,
     pub(super) ms: f64,
     pub(super) scf_steps: Option<usize>,
+    pub(super) ts: Option<f64>,
 }
 
 /// The background auditor (ruling S14, module doc "Audit"): a second teacher instance on its own
@@ -280,23 +329,37 @@ impl Auditor {
                 let mut view = OrbitalViewRequest::default();
                 let mut core = false;
                 while let Ok(job) = jrx.recv() {
-                    let atom = matches!(job.kind, JobKind::Atom(_) | JobKind::Reference(_));
+                    let atom = matches!(job.kind, JobKind::Atom(_) | JobKind::Reference(_) | JobKind::AtomAt(_));
                     // a Harris display solve touches neither the SCF warm state nor its
                     // extrapolation (it writes its own `HarrisState`; spec §4.2): no reset, no
                     // discontinuity, and `last_atom` stays the last SCF job's
                     if job.kind != JobKind::HarrisDisplay {
                         // the audits are thousands of steps apart: no extrapolation through the
                         // previous one's geometry (the density is kept as a warm start) — but an
-                        // isolated atom's density is no warm start for a molecule, nor the reverse
-                        if atom || last_atom {
+                        // isolated atom's density is no warm start for a molecule, nor the reverse. A
+                        // composition check's parts start cold too (review M1): one failing check refuses
+                        // its signature for the session, so its solves must not depend on the job before
+                        // (a reproducible cold solve, as the migration's)
+                        let cold = atom || job.kind == JobKind::Fragment;
+                        if cold || last_atom {
                             teacher.reset();
                         } else {
                             teacher.discontinuity();
                         }
                         last_atom = atom;
                     }
-                    // the one orbital producer: on for audits, refreshes and Harris, off for an atom
-                    let want = if atom { OrbitalViewRequest::default() } else { job.view.clone() };
+                    // the one orbital producer: on for audits, refreshes and Harris, off for an atom — except a composition
+                    // check's parts, which ask for one unoccupied level per spin channel (`stray` module doc, "The
+                    // levels"; controller ruling 10b): an empty channel stores no orbital, so without it a stray H's empty
+                    // 1s↓ — a real acceptor — would have no level and the check would be void for good
+                    let part = matches!(job.kind, JobKind::Fragment | JobKind::AtomAt(_));
+                    let want = if part {
+                        super::stray::part_view()
+                    } else if atom {
+                        OrbitalViewRequest::default()
+                    } else {
+                        job.view.clone()
+                    };
                     if want != view {
                         teacher.set_orbital_view(want.clone());
                         view = want;
@@ -317,7 +380,7 @@ impl Auditor {
                     teacher.set_share_tables(job.shares.clone());
                     let t = Instant::now();
                     let g = job.generation;
-                    let mut scf_steps = None;
+                    let (mut scf_steps, mut ts) = (None, None);
                     let (result, reference) = match job.kind {
                         // the multiplicity scan (each solve cold, the teacher reset after it)
                         JobKind::Reference(z) => {
@@ -333,7 +396,7 @@ impl Auditor {
                             let interrupt = job.interrupt.clone();
                             let mut abort = || current.load(Ordering::Relaxed) != g || interrupt.as_ref().is_some_and(|i| i());
                             let result = match teacher.harris_display(&job.scene, &atoms, &mut abort) {
-                                Some(sim::HarrisAnswer::Solved(Ok(o))) => Ok(Solved { energy: f64::NAN, forces: Vec::new(), face: None, multiplicity: None, display: None, orbitals: Some(o), unfit: None }),
+                                Some(sim::HarrisAnswer::Solved(Ok(o))) => Ok(Solved { energy: f64::NAN, forces: Vec::new(), face: None, multiplicity: None, display: None, orbitals: Some(o), unfit: None, frontier: Default::default(), partial: Vec::new(), warned: false }),
                                 // superseded or yielded to the user: silent (review minor 3)
                                 Some(sim::HarrisAnswer::Solved(Err(ProviderError::Cancelled))) => Err(HARRIS_CANCELLED.into()),
                                 Some(sim::HarrisAnswer::Solved(Err(e))) => Err(e.to_string()),
@@ -346,15 +409,27 @@ impl Auditor {
                             teacher
                                 .evaluate(&job.scene, &mut || current.load(Ordering::Relaxed) != g)
                                 .map(|r| {
-                                    scf_steps = Some(r.stats.scf_steps);
-                                    Solved { energy: r.energy, forces: r.forces, face: r.stats.face_density, multiplicity: r.stats.multiplicity, unfit: r.stats.untrainable(), display: r.display, orbitals: r.orbitals }
+                                    (scf_steps, ts) = (Some(r.stats.scf_steps), Some(r.stats.energy.ts));
+                                    let frontier = if part { super::stray::with_unoccupied(r.stats.frontier, r.orbitals.as_ref()) } else { r.stats.frontier };
+                                    Solved {
+                                        energy: r.energy,
+                                        forces: r.forces,
+                                        face: r.stats.face_density,
+                                        multiplicity: r.stats.multiplicity,
+                                        unfit: r.stats.untrainable(),
+                                        display: r.display,
+                                        orbitals: r.orbitals,
+                                        frontier,
+                                        warned: !r.stats.warnings.is_empty(),
+                                        partial: r.stats.partial,
+                                    }
                                 })
                                 .map_err(|e| e.to_string()),
                             None,
                         ),
                     };
                     let ms = t.elapsed().as_secs_f64() * 1e3;
-                    if atx.send(AuditAnswer { job, result, reference, ms, scf_steps }).is_err() {
+                    if atx.send(AuditAnswer { job, result, reference, ms, scf_steps, ts }).is_err() {
                         break;
                     }
                 }
@@ -589,7 +664,9 @@ impl SurrogateKs {
         let force = matches!(kind, JobKind::Refresh | JobKind::HarrisDisplay) && self.orbital_view.force_every_step;
         let view = OrbitalViewRequest { force_every_step: force, ..self.orbital_view.clone() };
         let draft_guess = std::mem::take(&mut self.dispatch_draft_guess);
-        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view, interrupt: self.display_interrupt.clone(), core: self.display_core, draft_guess, shares: self.share_tables.clone(), harris };
+        let flags = std::mem::take(&mut self.dispatch_flags);
+        let tick_only = std::mem::take(&mut self.dispatch_tick_only);
+        let job = AuditJob { scene, prov, generation: a.generation(), answered, kind, id, view, interrupt: self.display_interrupt.clone(), core: self.display_core, draft_guess, shares: self.share_tables.clone(), harris, flags, tick_only };
         match a.jobs.as_ref().map(|tx| tx.send(job)) {
             Some(Ok(())) => {
                 a.busy = Some(kind);
@@ -600,6 +677,7 @@ impl SurrogateKs {
                 // `side_job_in_flight` would hold forever); the references asked for are answered
                 self.auditor = None;
                 self.audit_due = false;
+                self.skip_tick_in_flight();
                 self.fail_references(None, "the background teacher is gone");
                 self.side_queue.clear();
                 self.harris_queued = None;
@@ -632,27 +710,46 @@ impl SurrogateKs {
     /// verdict on the strict model), an unfit teacher answer (cores overlap, an occupation change:
     /// not the surface the model learns), or a model without a variance factor (`stds` None).
     ///
+    /// Since trust tightening Task 3 the point carries `flags` (the step's cadence-fresh, fenced
+    /// and tick bits) and `energy_std_epistemic`, the total-energy epistemic std
+    /// (`epistemic_energy_std`; module doc, "The history's flags") — recorded only when finite and
+    /// non-negative (−0 as +0), else absent: the history refuses anything else with a panic, and
+    /// a panic here would take the provider down with its worker thread.
+    ///
     /// # Panics
     /// If the shapes disagree with the geometry (a programming error at the call site: every
     /// judged comparison leaves a point or a count, so nothing is dropped silently).
+    ///
+    /// Returns whether a point was pushed (a calibration tick's count reads it).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn record_history_point(&mut self, kind: PointKind, pos: &[[f64; 3]], z: &[u8], stds: Option<(f64, &[f64], &[f64])>, model_energy: f64, model_forces: &[[f64; 3]], energy: f64, forces: &[[f64; 3]], box_affected: bool, draft: bool, unfit: bool) {
+    pub(super) fn record_history_point(&mut self, kind: PointKind, pos: &[[f64; 3]], z: &[u8], stds: Option<(f64, &[f64], &[f64])>, model_energy: f64, model_forces: &[[f64; 3]], energy: f64, forces: &[[f64; 3]], box_affected: bool, draft: bool, unfit: bool, flags: surrogate::history::PointFlags, energy_std_epistemic: Option<f64>) -> bool {
         if box_affected {
             self.audit_history.unrecorded.box_affected += 1;
-            return;
+            return false;
         }
         if draft {
             self.audit_history.unrecorded.draft += 1;
-            return;
+            return false;
         }
         if unfit {
             self.audit_history.unrecorded.unfit += 1;
-            return;
+            return false;
         }
         let Some((energy_std, force_std, force_std_epistemic)) = stds else {
             self.audit_history.unrecorded.no_variance += 1;
-            return;
+            return false;
         };
+        // a scene with stray atoms is recorded over its bonded part (Task 5 fix round 1, I3): calibration's energy
+        // evidence is per atom over the point's atoms (`calibrate`, e2 = (err_E / n_atoms / tier)²), and the stray
+        // atoms are no evidence (no feature, exactly 0 force std); the energy std is the bonded part's bit for bit
+        // (`Model::predict`'s floor per energy-row atom, ruling 9a) and the energy error the scene's
+        if let Some(sp) = self.model.as_ref().and_then(|m| super::stray::split(pos, m.basis.r_cut)).filter(|_| z.len() == pos.len()) {
+            let keep = |v: &[f64]| sp.bonded.iter().map(|&i| v[i]).collect::<Vec<f64>>();
+            let keep3 = |v: &[[f64; 3]]| sp.bonded.iter().map(|&i| v[i]).collect::<Vec<[f64; 3]>>();
+            let (bp, bz) = sp.bonded_part(pos, z);
+            let (fs, fe) = (keep(force_std), keep(force_std_epistemic));
+            return self.record_history_point(kind, &bp, &bz, Some((energy_std, &fs, &fe)), model_energy, &keep3(model_forces), energy, &keep3(forces), false, false, false, flags, energy_std_epistemic);
+        }
         let n = pos.len();
         assert!(model_forces.len() == n && forces.len() == n, "a comparison's forces agree with its geometry");
         let rc2 = self.model.as_ref().map_or(0.0, |m| m.basis.r_cut * m.basis.r_cut);
@@ -662,6 +759,11 @@ impl SurrogateKs {
         let err_force = forces.iter().zip(model_forces).map(|(t, m)| ((t[0] - m[0]).powi(2) + (t[1] - m[1]).powi(2) + (t[2] - m[2]).powi(2)).sqrt()).collect();
         // |F_teacher| per atom: the per-atom bound's input (M8a Task 2 fix round 1, review A.1)
         let teacher_force = forces.iter().map(|t| (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt()).collect();
+        // |F_model| per atom: the input of rule 6's bound, the same expression as `variance_check`'s,
+        // so λ_T admits exactly the atoms rule 6 would (Task 5 fix round 1, review I1); recorded only
+        // when every magnitude is a finite number (`push` refuses another), else absent
+        let model_force: Vec<f64> = model_forces.iter().map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt()).collect();
+        let model_force = if model_force.iter().all(|f| f.is_finite()) { model_force } else { Vec::new() };
         // (`push` checks the per-atom lengths and the class codes and panics on a mismatch)
         self.audit_history.push(surrogate::AuditPoint {
             kind,
@@ -675,6 +777,12 @@ impl SurrogateKs {
             n_atoms: n,
             model_gen: self.model_gen,
             species,
+            // the fit that judged it (trust tightening Task 2; `fit_id`: a point without one does
+            // not count toward the floor); the step's flags and the epistemic energy std (Task 3)
+            fit_id: self.model.is_some().then_some(self.fit_id),
+            flags,
+            energy_std_epistemic: recordable_energy_std(energy_std_epistemic),
+            model_force,
         });
         // new verdict evidence re-judges the class verdicts now, not at the next refit (user-test
         // fix 2, the controller's ruling 3: a parked scene whose fallbacks are all "similar" never
@@ -682,6 +790,7 @@ impl SurrogateKs {
         if super::calibrate::in_jurisdiction(kind) {
             self.rejudge_classes();
         }
+        true
     }
 
     /// The last audit judged the current fit: `false` when no audit ran since the last refit
@@ -697,6 +806,10 @@ impl SurrogateKs {
         if let Some(a) = self.auditor.as_mut() {
             a.new_generation();
         }
+        // a composition check in flight is the old model's: its answers come back of an older
+        // generation (discarded), and its queued parts are dropped (`stray`) — an attribution
+        // check's failed audit too, without counting it (nothing is booked; Task 5 fix round 1, I1)
+        self.discard_stray_check();
         self.audit_due = false;
         self.box_audits_unjudged = 0;
         self.audit_flip = false;
@@ -704,6 +817,8 @@ impl SurrogateKs {
         self.failed_audits.clear();
         self.audit_fences.clear();
         self.audit_burst = 0;
+        // an abandoned tick counts as skipped (module doc, "Calibration ticks")
+        self.skip_tick_in_flight();
         self.streak = 0;
         self.streak_reason = None;
         self.streak_gap = None;
@@ -713,23 +828,49 @@ impl SurrogateKs {
 
     /// Hands an audit that fell due to the background auditor (`surrogate` module doc, "Audit"); `false`
     /// when there is none (the audit then runs in the step). A busy auditor defers it to the
-    /// next answered step.
+    /// next answered step. A calibration tick at the step (`dispatch_flags` carries `TICK`; module
+    /// doc, "Calibration ticks") rides on the same job, or is the job alone (`dispatch_tick_only`):
+    /// it never sets or clears rule 8's `audit_due`, and is never deferred — a busy auditor skips it
+    /// (which `evaluate` has already decided before the variance: it dispatches a tick only to a
+    /// free auditor).
     pub(super) fn dispatch_audit(&mut self, scene: &Scene, prov: &Provenance) -> bool {
         let every = self.policy.audit_every;
+        let tick = self.dispatch_flags.has(surrogate::history::PointFlags::TICK);
+        let tick_only = self.dispatch_tick_only;
         let Some(a) = self.auditor.as_ref() else { return false };
         if a.busy.is_some() {
-            self.audit_due = true;
+            if !tick_only {
+                self.audit_due = true;
+            }
+            if tick {
+                self.tick_outcome(super::TickOutcome::SkippedBusy);
+            }
             return true;
         }
         self.side_jobs += 1;
         if self.send_job(scene.clone(), prov.clone(), JobKind::Audit, self.side_jobs, None) {
-            self.audit_due = false;
-            self.pending_notes.push(format!("surrogate audit dispatched to the background teacher (every {every} answered steps; the model answers meanwhile)"));
+            if !tick_only {
+                self.audit_due = false;
+                self.pending_notes.push(format!("surrogate audit dispatched to the background teacher (every {every} answered steps; the model answers meanwhile)"));
+            }
+            if tick {
+                self.tick_in_flight = true;
+                self.pending_notes.push(format!("surrogate calibration tick dispatched to the background teacher (every {} in-envelope steps; the model answers meanwhile)", self.tick_every));
+            }
             true
         } else {
             // the thread is gone (`send_job` dropped it): audit in the step from now on
             self.side_jobs -= 1;
             false
+        }
+    }
+
+    /// A calibration tick's job on the auditor will not be judged — abandoned by a Forget or an
+    /// installed model, or its thread gone: lost (module doc, "Calibration ticks"), and the next
+    /// tick's count starts here.
+    pub(super) fn skip_tick_in_flight(&mut self) {
+        if std::mem::take(&mut self.tick_in_flight) {
+            self.tick_outcome(super::TickOutcome::Lost);
         }
     }
 
@@ -749,6 +890,8 @@ impl SurrogateKs {
         match a.answers.try_recv() {
             Ok(ans) => {
                 a.busy = None;
+                // every job's wall time, whatever its kind and outcome: the ticks' dead time
+                self.time_auditor_job(ans.ms);
                 Some(ans)
             }
             Err(mpsc::TryRecvError::Empty) => None,
@@ -756,6 +899,7 @@ impl SurrogateKs {
                 let busy = a.busy;
                 self.auditor = None;
                 self.audit_due = false;
+                self.skip_tick_in_flight();
                 self.fail_references(busy, "the background teacher stopped");
                 // nothing queued can run any more (review minor 4)
                 self.side_queue.clear();
@@ -800,7 +944,18 @@ impl SurrogateKs {
         if ans.job.generation != a.generation() {
             return; // the model it was for was forgotten or replaced
         }
+        // a composition check's part (`stray`): to the check in flight, never a sample
+        if matches!(ans.job.kind, JobKind::Fragment | JobKind::AtomAt(_)) {
+            return self.take_stray_answer(ans);
+        }
         let positions = || ans.job.scene.nuclei.iter().map(|n| n.pos).collect::<Vec<[f64; 3]>>();
+        // a calibration tick's answer, of this generation (an older one's was counted lost when it
+        // was abandoned): taken once judged — recorded or not — else lost (module doc, "Calibration
+        // ticks"); the next tick's count starts here
+        let tick = ans.job.kind == JobKind::Audit && ans.job.flags.has(surrogate::history::PointFlags::TICK);
+        if tick {
+            self.tick_in_flight = false;
+        }
         match (ans.job.kind, ans.result) {
             (JobKind::Atom(z), Ok(Solved { display: Some(d), .. })) => return self.atom_densities.push((z, d)),
             (JobKind::Refresh, Ok(Solved { display: Some(d), orbitals, .. })) => {
@@ -810,6 +965,7 @@ impl SurrogateKs {
             (JobKind::Reference(z), _) => {
                 return self.atom_references.push((z, Err(ProviderError::Invalid("the background teacher returned no reference".into()))));
             }
+            (JobKind::Fragment | JobKind::AtomAt(_), _) => unreachable!("routed to take_stray_answer above"),
             // display only (G4): a payload, else a note — never a teach event or a counter
             (JobKind::HarrisDisplay, Ok(Solved { orbitals: Some(o), .. })) => {
                 self.side_harris = Some(SideDisplay { display: None, orbitals: Some(o), kind: SideKind::Harris, job: ans.job.id, positions: positions() });
@@ -839,13 +995,23 @@ impl SurrogateKs {
                 ev.solve_ms = ans.ms;
                 ev.audit_lag = Some(self.answered.saturating_sub(ans.job.answered));
                 self.push_event(ev);
+                if tick {
+                    self.tick_outcome(super::TickOutcome::Lost);
+                }
                 return self.pending_notes.push(note);
             }
-            (JobKind::Audit, Ok(Solved { energy, forces, face, multiplicity, display, orbitals, unfit })) => {
+            (JobKind::Audit, Ok(Solved { energy, forces, face, multiplicity, display, orbitals, unfit, .. })) => {
                 if let Some(d) = display {
                     self.side_display = Some(SideDisplay { display: Some(d), orbitals, kind: SideKind::Audit, job: ans.job.id, positions: positions() });
                 }
-                self.judge_audit(ans.job, energy, forces, face, multiplicity, unfit, ans.ms, ans.scf_steps);
+                let judged = self.judge_audit(ans.job, energy, forces, face, multiplicity, unfit, ans.ms, ans.scf_steps, ans.ts);
+                if tick {
+                    self.tick_outcome(match judged {
+                        None => super::TickOutcome::Lost,
+                        Some(true) => super::TickOutcome::Recorded,
+                        Some(false) => super::TickOutcome::Unrecorded,
+                    });
+                }
             }
         }
     }
@@ -853,11 +1019,15 @@ impl SurrogateKs {
     /// A background audit's verdict (`surrogate` module doc, "Audit"): the sample is admitted like any
     /// teacher answer, the gap recorded; a failed audit untrusts the model and books the flip at
     /// the next evaluation. One activity event either way: judged (the verdict, the admission's
-    /// outcome) or discarded (plan review S11).
+    /// outcome) or discarded (plan review S11). Returns `None` when the answer was not judged
+    /// (discarded: the model changed settings or species; inside a fenced shell band), else whether
+    /// its history point was recorded (`record_history_point`: not for a box-affected, unfit or
+    /// variance-less answer, nor for a failed audit whose point is deferred to a stray attribution check (its point arrives later with `TICK`)) — what a calibration
+    /// tick's count reads.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, multiplicity: Option<u32>, unfit: Option<&str>, ms: f64, scf_steps: Option<usize>) {
+    pub(super) fn judge_audit(&mut self, job: AuditJob, energy: f64, forces: Vec<[f64; 3]>, face: Option<f64>, multiplicity: Option<u32>, unfit: Option<&str>, ms: f64, scf_steps: Option<usize>, ts: Option<f64>) -> Option<bool> {
         let unaudited = self.answered.saturating_sub(job.answered);
-        let AuditJob { scene, prov, draft_guess, .. } = job;
+        let AuditJob { scene, prov, draft_guess, flags: dispatched, tick_only, .. } = job;
         let tag = if draft_guess { SampleTag::DraftAudit } else { SampleTag::Audit };
         let pos: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
         let z: Vec<u8> = scene.nuclei.iter().map(|n| n.z).collect();
@@ -876,37 +1046,51 @@ impl SurrogateKs {
             let note = "surrogate audit: discarded — the model changed settings or species since its dispatch";
             let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, TeachOutcome::Discarded);
             ev.detail = note.to_string();
-            ev.n_atoms = pos.len();
+            ev.n_atoms = self.audit_n(&pos);
             ev.solve_ms = ms;
             ev.scf_steps = scf_steps;
+            ev.ts = ts;
             ev.scf_end = scf_steps.filter(|&n| n > 0).map(|_| sim::ScfEnd::Converged);
             ev.audit_lag = Some(unaudited);
             self.push_event(ev);
             self.pending_notes.push(note.into());
-            return;
+            return None;
         };
+        // at a cleared stray-atom scene the fences judge the bonded part alone, as `evaluate`'s do
+        // (`policy::judged_part`; the smearing branch's final review, M1): the FENCED bit and the
+        // keep decision of a background tick are the in-step ones
+        let cleared = self.stray_cleared(&pos, &z, &prov);
+        let part = cleared.as_ref().map(|c| &c.0);
         // inside a fenced shell band (the shell fence; final review I1, the coordinator's ruling):
         // strict mode refuses the geometry, so the answer is no judgement of the model — not
         // judged, not kept (a draft guess's included: a band row is never fitted, now or after a
         // later shell check lifts the fence)
-        if let Some(why) = self.shell_fence_refusal(&pos, &z) {
+        if let Some(why) = self.shell_fence_refusal_judged(&pos, &z, part) {
             let note = format!("surrogate audit not judged: {} — not a judgement of the model; the answer is not fitted", why.text.trim_start_matches("surrogate: "));
             let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, TeachOutcome::ShellNotKept);
             ev.detail = note.clone();
-            ev.n_atoms = pos.len();
+            ev.n_atoms = self.audit_n(&pos);
             ev.solve_ms = ms;
             ev.scf_steps = scf_steps;
+            ev.ts = ts;
             ev.scf_end = scf_steps.filter(|&n| n > 0).map(|_| sim::ScfEnd::Converged);
             ev.audit_lag = Some(unaudited);
             self.push_event(ev);
             self.pending_notes.push(note);
-            return;
+            return None;
         }
-        let n = pos.len().max(1) as f64;
+        // per bonded atom at a scene with stray atoms (`stray` module doc, "Audits of a cleared answer"), else per atom
+        let n = self.audit_n(&pos) as f64;
+        let unit = self.per_atom_unit(&pos);
         let gap = energy - pred.energy;
-        let near = self.near_quarantined(&pos, &z);
+        let near = super::policy::judged_part(&pos, &z, part, |p, q| self.near_quarantined(p, q));
         // next to a misfit the answer is kept only if it agrees with the model (spec 2026-11-13 §4.3)
-        let near_misfit = self.near_misfit(&pos, &z).contains(&true);
+        let near_misfit = super::policy::judged_part(&pos, &z, part, |p, q| self.near_misfit(p, q)).contains(&true);
+        // the history's flags (module doc, "The history's flags"): the dispatching step's, fenced
+        // as well when a fence applies at the judgement (read-only; the shell fence returned above)
+        let fenced = !near.is_empty() || near_misfit || self.audit_fence_refusal_judged(&pos, &z, part).is_some();
+        let flags = surrogate::history::PointFlags(dispatched.0 | if fenced { surrogate::history::PointFlags::FENCED } else { 0 });
+        let energy_std_epistemic = pred.energy_std.zip(self.model.as_ref()).map(|(e, m)| epistemic_energy_std(m, surrogate::energy_row_atoms(&m.basis, &pos), e));
         let mut notes = Vec::new();
         let rule = box_affected_face_density(prov.h);
         // (never a capped segment's: a masked scene is teacher-only, nothing is audited there)
@@ -923,68 +1107,103 @@ impl SurrogateKs {
         } else {
             AuditVerdict::Passed
         };
+        let mut stray_note = None;
+        // an audit a check attributes leaves its history point to the check (ruling 9b)
+        let mut deferred = false;
         notes.insert(0, match verdict {
             AuditVerdict::Passed => format!("surrogate audit passed (background teacher, judged {unaudited} answered steps after its dispatch): teacher − model {gap:+.2e} Ha"),
             AuditVerdict::BoxAffected => format!(
-                "surrogate audit not judged: the teacher's answer is box-affected (face density {:.1e} > {rule:.1e}) — its teacher − model {gap:+.2e} Ha is the box's confinement as much as the model's error; the next answered step is audited again",
-                box_rho.unwrap_or(0.0)
+                "surrogate audit not judged: the teacher's answer is box-affected (face density {:.1e} > {rule:.1e}) — its teacher − model {gap:+.2e} Ha is the box's confinement as much as the model's error{}",
+                box_rho.unwrap_or(0.0),
+                if tick_only { " (a calibration tick: rule 8's cadence is unchanged)" } else { "; the next answered step is audited again" }
             ),
             // a draft guess's audit (a geometry strict mode refuses): recorded, held out of the
             // strict fit, and not a verdict on the strict model (module doc, "Draft mode")
             AuditVerdict::Failed if draft_guess => format!(
-                "surrogate draft-mode audit failed (background teacher): teacher − model {gap:+.2e} Ha ({:.1e} Ha/atom{}) at a geometry strict mode refuses — the guess was off; the strict model's trust is unchanged and the answer is held out of its fit",
+                "surrogate draft-mode audit failed (background teacher): teacher − model {gap:+.2e} Ha ({:.1e} {unit}{}) at a geometry strict mode refuses — the guess was off; the strict model's trust is unchanged and the answer is held out of its fit",
                 gap.abs() / n,
                 force_fail.map_or(String::new(), |(d, b)| format!(", worst atom's force off by {d:.1e} > {b:.1e} Ha/Bohr"))
             ),
             AuditVerdict::Failed => {
-                self.audit_failed = Some(gap);
-                self.audit_force = force_fail;
-                self.audit_atoms = n as usize;
                 let index = outcome.is_kept().then(|| self.samples().saturating_sub(1));
-                self.failed_audits.push(FailedAudit { pos: pos.clone(), z: z.clone(), energy, forces: forces.clone(), index, ionic: prov.ionic.clone(), rejudges: 0, origin: AuditOrigin::Audit, pair: None });
-                self.audit_flip = self.last.as_ref().is_some_and(|l| l.on_model);
+                let case = FailedAudit { pos: pos.clone(), z: z.clone(), energy, forces: forces.clone(), index, ionic: prov.ionic.clone(), rejudges: 0, origin: AuditOrigin::Audit, pair: None };
+                // at a scene with stray atoms: the signature refused, its samples held, and a check attributes the
+                // failure (`stray` module doc, "Audits of a cleared answer")
+                let why = match force_fail {
+                    Some((d, b)) if gap.abs() / n <= thr => format!("worst atom's force off by {d:.1e} > {b:.1e} Ha/Bohr"),
+                    _ => format!("teacher − model {gap:+.2e} Ha, {:.1e} > {thr:.1e} Ha per bonded atom", gap.abs() / n),
+                };
+                let stray = self.stray_audit_failed(&scene, raw_energy, &forces, &case, gap, why, flags);
+                let attributing = matches!(stray, stray::StrayAudit::Attributing(_));
+                deferred = attributing;
+                if let stray::StrayAudit::Attributing(note) | stray::StrayAudit::CountsNow(note) = stray {
+                    stray_note = Some(note);
+                }
+                if !attributing {
+                    self.audit_failed = Some(gap);
+                    self.audit_force = force_fail;
+                    self.audit_atoms = n as usize;
+                    self.failed_audits.push(case);
+                    self.audit_flip = self.last.as_ref().is_some_and(|l| l.on_model);
+                }
                 match force_fail {
+                    _ if attributing => format!(
+                        "surrogate audit failed (background teacher) at a scene with stray atoms: teacher − model {gap:+.2e} Ha ({:.1e} Ha per bonded atom{}) — a check of the bonded part alone says whether the model or the composition failed",
+                        gap.abs() / n,
+                        force_fail.map_or(String::new(), |(d, b)| format!(", worst atom's force off by {d:.1e} > {b:.1e} Ha/Bohr"))
+                    ),
                     Some((d, b)) if gap.abs() / n <= thr => format!(
                         "surrogate audit failed on forces (background teacher): worst atom off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.2e} Ha) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until a refit predicts that geometry without the audited sample"
                     ),
                     _ => format!(
-                        "surrogate audit failed (background teacher): teacher − model {gap:+.2e} Ha ({:.1e} > {thr:.1e} Ha/atom) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until a refit predicts that geometry without the audited sample",
+                        "surrogate audit failed (background teacher): teacher − model {gap:+.2e} Ha ({:.1e} > {thr:.1e} {unit}) — the {unaudited} answered steps since its dispatch were answered by an unaudited model; untrusted until a refit predicts that geometry without the audited sample",
                         gap.abs() / n
                     ),
                 }
             }
         });
+        notes.extend(stray_note);
         self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: unaudited, asynchronous: true, teacher_ms: ms });
         // the prediction judged above is the current model's, so the stamp is this fit's
         self.last_audit_fit = self.fits;
         // a box-affected audit judged nothing (M8a Task 2, the Task 1 physics review's I4): it
         // does not satisfy the cadence — the next answered step dispatches another — and the
-        // checklist counts it; the model's surface and trust are untouched (the gap is the box's)
-        if verdict == AuditVerdict::BoxAffected {
-            self.audit_due = true;
-            self.box_audits_unjudged += 1;
-        } else {
-            self.box_audits_unjudged = 0;
+        // checklist counts it; the model's surface and trust are untouched (the gap is the box's).
+        // A calibration tick alone is not rule 8's audit: neither satisfied nor missed, its cadence
+        // and the checklist's count stay as they were (module doc, "Calibration ticks")
+        match (tick_only, verdict == AuditVerdict::BoxAffected) {
+            (true, _) => {}
+            (false, true) => {
+                self.audit_due = true;
+                self.box_audits_unjudged += 1;
+            }
+            (false, false) => self.box_audits_unjudged = 0,
         }
         // the history's point (M8a Task 1)
         let stds = match (pred.energy_std, pred.force_std.as_ref(), pred.force_std_epistemic.as_ref()) {
             (Some(e), Some(f), Some(fe)) => Some((e, &f[..], &fe[..])),
             _ => None,
         };
-        self.record_history_point(PointKind::Audit, &pos, &z, stds, pred.energy, &pred.forces, energy, &forces, box_rho.is_some(), draft_guess, unfit.is_some());
+        // a failed audit at a stray-atom scene that a check attributes (`deferred`) records its point when the check
+        // answers (ruling 9b; `stray::wiring`, with this audit's flags carried in its `Attribution`): no point now, so
+        // a calibration tick on it reads "taken, unrecorded"
+        let recorded = !deferred && self.record_history_point(PointKind::Audit, &pos, &z, stds, pred.energy, &pred.forces, energy, &forces, box_rho.is_some(), draft_guess, unfit.is_some(), flags, energy_std_epistemic);
         let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, outcome);
         ev.detail = notes.join("\n");
         ev.face_density = face;
         ev.box_affected = box_rho.is_some();
         ev.gap = Some(gap);
-        ev.n_atoms = pos.len();
+        // the atoms the verdict's per-atom gap divides by (N_e: `audit_n`), the Activity hover's count
+        ev.n_atoms = n as usize;
         ev.solve_ms = ms;
         ev.scf_steps = scf_steps;
+        ev.ts = ts;
         ev.scf_end = scf_steps.filter(|&n| n > 0).map(|_| sim::ScfEnd::Converged);
         ev.audit = Some(verdict);
         ev.audit_lag = Some(unaudited);
         self.push_event(ev);
         self.pending_notes.extend(notes);
+        Some(recorded)
     }
 }
 

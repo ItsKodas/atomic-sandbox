@@ -250,7 +250,8 @@
 //! dominates the denominator exactly where the epistemic std is too small).
 //!
 //! over the class's points in the **posterior's jurisdiction** — the verdict's (audits, rule-4b
-//! fallbacks) plus the fallbacks rules 6/7 refused alone (codes 14, 15) or with the class (21): the
+//! fallbacks) plus the fallbacks rules 6/7 refused alone (codes 14, 15, and 24 where only λ_T or
+//! λ_E refused: rule 6/7 at the inflated factor, still the std deciding) or with the class (21): the
 //! geometries where the std decides. Points of rules 5/5a–5e and the fences are not: those refuse
 //! whatever the std says. The same window of generations as the verdict (≥ [`WINDOW_POINTS`]),
 //! one draw per point, no weight cap (every comparison is equally a draw of the posterior; the cap
@@ -285,15 +286,17 @@
 //! - **The worst-atom guard** ([`WORST_ATOM`] = 3; `ClassKey::WorstAtom`): an untrusted class does
 //!   not **enter** while any point in its window has an atom measured beyond 3× its bound — at
 //!   every evidence count (fix round 2, the controller's ruling on the entry question); while the
-//!   class has fewer than [`MIN_EVIDENCE`] points such an atom also makes a trusted class leave.
+//!   class is below its evidence floor ("The evidence floor" below; before it, fewer than
+//!   [`MIN_EVIDENCE`] points) such an atom also makes a trusted class leave.
 //!   For a calibrated posterior at std = bound, P(χ²₃/3 > 9) = 5.9e-6 per atom: such an error is a
 //!   posterior that is wrong somewhere the class would answer, not an unlucky draw (the repro
 //!   test's own derivation). Why at entry and at every n: the many-body error is heavy-tailed
 //!   (refused-step max/rms 4–6 against ≈ 1.9 for a calibrated Gaussian), so an rms over the
 //!   benign early points of a refused class — at any n — admitted it before the compact
 //!   collisions that followed reached 3–5× (the fix-round-1 measurement). A trusted class with
-//!   evidence keeps being judged by its rms (rule 8's audits fail a trusted model's 3× answer per
-//!   step and the window then holds the failing audit). The window ages the guard's points too.
+//!   evidence at the floor keeps being judged by its rms (rule 8's audits fail a trusted model's 3×
+//!   answer per step and the window then holds the failing audit). The window ages the guard's
+//!   points too.
 //! - **calibrated** (n_c ≥ [`MIN_EVIDENCE`] = 3 points): untrusted → trusted when V_c ≤ [`ENTER`]
 //!   = 1/√2 and V_E,c ≤ ENTER; trusted → stays while V_c ≤ [`LEAVE`] = 1 and V_E,c ≤ LEAVE. The
 //!   class is never trusted with its measured rms error beyond the bound — the tolerance rules 6
@@ -302,7 +305,8 @@
 //!   (review M3), so refit-to-refit jitter of W and R does not flip the verdict. The refusal names
 //!   which term decided: the measured error (`ClassKey::Calibrated`), the leave-one-out floor
 //!   (`ClassKey::LooFloor`), the energy LOO RMS with M (`ClassKey::EnergyRms`, below) or the
-//!   measured energy (`ClassKey::MeasuredEnergy`).
+//!   measured energy (`ClassKey::MeasuredEnergy`). **Below the evidence floor** the rule of before
+//!   must pass as well (`ClassKey::Floor`; "The evidence floor" below).
 //! - **uncalibrated** (fewer than 3 points): the rule of before, unchanged — LOO force max ≤ 1 and
 //!   rms ≤ 1, LOO energy max ≤ 1 (`super::trust::class_refusal`) — plus the worst-atom guard both
 //!   ways.
@@ -313,7 +317,8 @@
 //!   at most the max (≤ 1 already), calibrated the verdict never read the energy LOO. The limit is
 //!   1 in both paths — no ½ entry band, the calibrated energy check is the measured one. Without evidence nothing is loosened; the fallbacks a refused class produces are
 //!   themselves evidence (rule-4b points), so a class the max rule refuses for one outlier earns
-//!   the calibrated verdict after three teacher steps of its own and a refit. A class whose only
+//!   the calibrated verdict from teacher steps of its own — since the evidence floor, once they
+//!   span 12 fits and 60 points (before it, three steps and a refit). A class whose only
 //!   recent comparisons were box-affected has no evidence from them (they leave no point):
 //!   unverified, never passing by calibration.
 //!
@@ -327,11 +332,175 @@
 //! words are [`refusal_words`], one function for the verdict and the provider's Log note (fix
 //! round 2, the task review's M2). Numbers of record: `validate/references.md`, "M8a calibrated
 //! verdict".
+//!
+//! # The evidence floor (trust tightening, spec 2026-11-18 §3; the user: "Keep it, gated")
+//!
+//! Three points tell an rms from a single draw; they do not make it a number to open a class on.
+//! The measured case (bisect 762159b): a many-body key opened on 3 rule-4b points — LOO force rms
+//! 0.32×, max 3.07× — and answered a hot run beyond the gate. So the calibrated verdict opens a key
+//! **alone** only at the floor:
+//!
+//! ```text
+//! n_fit = |{ fit_id(p) }|,  n_pts = |{ p }|,   p over the key's verdict points in its window (audits and rule-4b
+//!                                              fallbacks, uncapped) that carry species and a fit id
+//! floor met  ⇔  n_fit ≥ FLOOR_FITS = 12  and  n_pts ≥ FLOOR_POINTS = 60
+//!
+//! floor met:                 today's calibrated verdict (ENTER / LEAVE, the worst-atom guard on entry)
+//! evidence ≥ 3, floor unmet: today's calibrated verdict AND the rule of before (LOO force rms, max ≤ 1, energy max ≤ 1),
+//!                            the worst-atom guard both ways
+//! evidence < 3:              the rule of before, the guard both ways (unchanged)
+//! ```
+//!
+//! At every count this is today's verdict ANDed with a further condition, or today's verdict — it
+//! can only refuse more. **The criterion**: two sigma of the verdict value's relative scatter,
+//! ≈ ½√(CV²/n) for an rms over n draws whose squares have coefficient of variation CV², inside the
+//! √2 band: n ≥ CV²/(√2 − 1)² = 5.83·CV² (the spec's review I2). **12 fits**: one fit pools one
+//! decorrelated block (in the harness a 25-step refit interval, 6–9 τ_int); the measured block CV²
+//! 0.84 needs n ≥ 4.9. **60 points**: where a fit holds 1–3 points (the app refits for every kept
+//! sample) the per-answer CV² proxy 10 needs n ≥ 59; the points are correlated (τ_int 2.8–4.4: 14–21
+//! effective draws), which is why both conditions are needed. W keeps its per-point rms: re-weighting
+//! per fit could dilute one fit of many bad points by benign one-point fits.
+//!
+//! **A fit, not a generation**: `model_gen` is also bumped by policy changes, restores, forgets
+//! and installs, so a parked scene could reach 12 by settings changes; the fit id is bumped only by
+//! a refit that solved new coefficients from new teacher data (`SurrogateKs::fit_id`). **Which points
+//! count**: a point needs species (legacy species-less points still enter W, the evidence and the
+//! guard for every key of their class, never the floor) **and** a fit id (every point saved before
+//! the fit id existed has none) — the stricter of the spec's two readings, so n_pts never counts a
+//! point n_fit cannot see. Over-count, documented (spec §3): one key's refit advances every key's
+//! fit id.
+//!
+//! **The refusal's name**: `ClassKey::Floor` — (the LOO ratio that decided, 1), "within the bound
+//! over n_fit of 12 fits / n_pts of 60 checks, and its leave-one-out is X× the bound" (a count that
+//! has reached its floor reads "80 checks (60 needed)", [`floor_count`]) — only when the
+//! calibrated verdict itself passes; when it fails, its own failing term is named (the floor is not
+//! why the key is shut, and the words would claim "within the bound"). The decision is the AND
+//! either way.
+//!
+//! **No grandfathering**: the verdict is re-judged at every install and attach (`refresh_class_loo`
+//! with the file's `class_memory` as the hysteresis), so a key a file saved open on legacy points
+//! with LOO max > 1 loads closed (`a_class_saved_open_on_three_points_loads_closed`). The way back
+//! from a parked scene (its thinned fallbacks add no fit) is the existing one for a LOO-blocked
+//! class: the teach prompt after `TEACH_PROMPT_STREAK` class fallbacks, or moving the scene.
+//! Measured on the Morse fixtures: a pair class refused for one outlier (LOO max 1.08×) now enters
+//! after 120 fallback steps — the 12th fit — instead of 10.
+//!
+//! # The tail-aware inflations (trust tightening, spec 2026-11-18 §4; plan Task 5)
+//!
+//! λ_sum (above) is a ratio of sums: it is dominated by the high-std points and cannot see a
+//! confident point's large error — the hot run's 4.48× answer needs λ ≈ 7.7 to be refused (spec
+//! §4; its std is not in the log), and with such an atom at s = 0.13 b among 80 benign points
+//! λ_sum is 1.21 (`the_tail_inflation_refuses_the_measured_tail`, where λ_T is 7.69). λ_T (forces)
+//! and λ_E (energy) ask the question rule 6/7 answer, of exactly the
+//! measured atoms (points) those rules would admit. Pure functions of the history's **answer
+//! sample** P_A ([`in_answer_sample`]) and the policy's bounds; they decide nothing here — rules 6
+//! and 7 read them (`SurrogateKs::key_factors`, `variance_check`) as λ_F(j) = max(λ_sum(k),
+//! λ_T(k)) on s_j and max(max_j λ_F(j), max_k λ_E(k)) on σ_E,epi/N, N the one normalisation rule 7
+//! and λ_E share (`policy::energy_atoms`), a sparse key (fewer than [`MIN_EVIDENCE`] P_A points of
+//! its own) at its class's λ_T and λ_E as floors. Each comes with its [`TailCause`], which the
+//! refusal names. All quantities are ratios, no unit enters:
+//!
+//! ```text
+//! forces, per P_A atom j of the key (bound units; force_bound(|F|) = min(max(2e-3, 10 %|F|), 1e-2) Ha/Bohr):
+//!   r_j = s_j / b⁶_j,  s_j = σ_epi,j/√3,  b⁶_j = force_bound(|F_m,j|)   rule 6's own ratio (uninflated): its bound is the model's
+//!   e_j = ‖F_t,j − F_m,j‖/√3 / b_j,      b_j = force_bound(|F_t,j|)     the measured error on the teacher's bound (rule 8's)
+//!   (a point recorded without |F_m,j|: b⁶_j = force_bound(|F_t,j| + ‖ΔF_j‖) ≥ force_bound(|F_m,j|))
+//! energy, per P_A point p holding the key (tier units, tier = energy_std_per_atom = 1e-3 Ha/atom; N_p its atoms):
+//!   r_p = σ_E,epi,p / N_p / tier,   e_p = |E_t − E_m| / N_p / tier      (the aleatoric floor not subtracted)
+//!
+//! A(λ) = { items with λ·r ≤ 1 }                 the measured items rule 6 (7) would admit at factor λ
+//! A good  ⇔  max_A e ≤ M                        M = WORST_ATOM = 3 for λ_T, ENERGY_MAX = 1 (1× the tier) for λ_E
+//!         ∧  (A meets the floor ⇒ √( Σ_{p∈A} ē_p² / n_A ) · (1 + 1/√(2 n_A)) ≤ ENTER)
+//!            ē_p² = the mean of e_j² over p's atoms in A (one draw per point; λ_E: e_p² itself),
+//!            n_A = the points with an item in A; the floor: ≥ FLOOR_FITS distinct fits and ≥ FLOOR_POINTS points
+//! λ = min{ λ ≥ 1 : A(λ′) good for every λ′ ≥ λ }
+//! ```
+//!
+//! **The one pass.** Sorted by r ascending, the items with r ≤ 1 form groups of equal r, and every
+//! A(λ), λ ≥ 1, is a prefix P_m of whole groups (P_m grows as λ falls; A(1) = every item with
+//! r ≤ 1). Let m* be the largest m with P_1 … P_m all good. If m* is every group, λ = 1. Else the
+//! first bad prefix P_{m*+1} must be excluded: λ·r_{m*+1} > 1, so λ = the next float above
+//! 1/r_{m*+1} (fl(1/r) is within half an ulp of 1/r, its successor strictly above), and ∞ when
+//! r_{m*+1} = 0 — no finite factor excludes an atom whose std is 0. Goodness is not monotone in
+//! the prefix (a later benign group can bring the rms back), which is why the *first* bad prefix
+//! decides: "for every λ′ ≥ λ". The max is a running max; the rms a compensated running sum of the
+//! per-point means, each point's old mean taken out and its new one put in as its atoms join; the
+//! floor is monotone in the set, so its first prefix is found by bisection. One sort, one pass and
+//! O(log n) floor counts.
+//!
+//! **Which bound r is on** (fix round 1, review I1). The bound is piecewise in |F| (2e-3, 10 %|F|,
+//! 1e-2), and the model's force differs from the teacher's by the very error measured: at
+//! |F_t| = 0.05 Ha/Bohr and e/b = 4.48 the two bounds differ by up to 1.78×. On the teacher's
+//! bound, A(λ_T) was not rule 6's set: at λ_T rule 6 still admitted the measured bad atom. So r is
+//! formed on rule 6's own bound, force_bound(|F_m,j|) with |F_m,j| recorded per atom
+//! (`AuditPoint::model_force`), the same expression as `variance_check`'s — A(λ) is the set rule 6
+//! admits at factor λ (to the rounding of a different evaluation order: λ = next_up(1/r) is not a
+//! bit-exact boundary). A point recorded without |F_m| (an older file) uses |F_t,j| + ‖ΔF_j‖ ≥
+//! |F_m,j| (the triangle inequality; the bound is non-decreasing in |F|): its r is never above rule
+//! 6's, so the atom the max condition names is refused by rule 6 at λ_T, never let through; the
+//! cost is a λ_T up to 1.78× larger than rule 6's own bound would need. Never the teacher's bound
+//! alone. e stays on the teacher's bound: the error is judged against the policy's claim at the
+//! true force, as rule 8 does.
+//!
+//! **Why the rms only at the floor** (the spec's addition to the review's definition): below it a
+//! single admitted atom at 0.8× the bound would fail the rms and make λ_T = ∞ — the knife edge of
+//! one draw. The max condition holds at every size. **Why bound (tier) units**: only errors that
+//! matter to the policy inflate — a harmless confident point (e = 0.3 b at r = 0.02, a mean of
+//! ratios 15) leaves λ_T = 1 (`a_harmless_confident_point_does_not_inflate`). **Why 1× the tier for
+//! λ_E** (rev. 2): the gate checks every answer's energy at 1× the tier, so an admitted energy
+//! beyond it is an answer already called wrong; rev. 1's 4.53 never fired on the hot run's
+//! energy-only failures (e_p 1.03–1.39), and their rms (≈ 0.26, below the floor anyway) gives 1.
+//!
+//! **NaN and zero (M1).** An item with e = r = 0 adds nothing: not to the max, an rms, a point
+//! count or the floor (it is no draw — counted, it would dilute a failing rms). Any NaN r or e in
+//! the sample, admitted or not, gives NaN (the inflation is undefined; rule 6/7 refuse a NaN
+//! factor). An infinite error is the worst item (∞ at r = 0, else the next float above 1/r). An
+//! item with r > 1 (r = ∞ included) is never admitted at λ ≥ 1 and decides nothing.
+//!
+//! **What it does not do** (C1, change 3): it bounds the tail *of what was measured*. An answer at
+//! a geometry like none in P_A is still unmeasured; rule 5's envelope and novelty are for that.
+//!
+//! # The answer sample P_A: chosen without reading σ or λ (spec §4, the self-reference guard)
+//!
+//! ```text
+//! p ∈ P_A  ⇔  ¬FENCED ∧ ¬NOVEL ∧ ( TICK ∨ (CADENCE_FRESH ∧ class-refused(p)) )
+//! class-refused(p)  ⇔  p is a fallback the class rule (4b) named: codes 5, 6 (the class codes) or 21 (the class with rule 6/7 failing too)
+//! ```
+//!
+//! The selection reads the point's flags word and kind only — never its stds, its errors or any λ.
+//! (i) **Class-refused in-envelope steps**: the class verdict is decided by measured errors and the
+//! LOO, never by this step's σ, and every such step is recorded. The rule that names a refusal is
+//! the first of envelope (rule 5: 5a/5b/5e, every step) → novelty (5d) → class (4b) → variance
+//! (6/7) → the fences; so a class code means "the class refused and neither the envelope nor the
+//! novelty did". The envelope is evaluated every step (σ-blind). The novelty is evaluated only
+//! with the variance, whose phase follows σ — so on a reused verdict a novel geometry the class
+//! refuses carries a class code, on a fresh one 5d's code 11. The provider therefore evaluates the
+//! novelty on **every cadence-fresh step**, read-only where the verdict was reused, and records
+//! `NOVEL` (Task 3 review MUST, carried; `surrogate` module doc, "The history's flags"): with the
+//! bit, a cadence-fresh point is in P_A exactly when the class refused it, the envelope and the
+//! novelty did not and no fence holds it — the predicate, whichever code the precedence chain
+//! wrote. Below the class rule only 6/7 remain, and 5/6 versus 21 (whether a stale or fresh
+//! variance verdict also refused) is inside P_A either way. (ii) **Calibration ticks** (Task 7):
+//! σ-blind by their own counter; a fenced or novel tick is still left out.
+//!
+//! **Left out**: ordinary audits, codes 14/15 and 24 (λ selects them), fenced points (`FENCED`:
+//! codes 5/6/21 can hold geometries the key will never answer), novel ones, and class-refused
+//! points fresh only by a refusal (not `CADENCE_FRESH`). **Draft mode**: a draft-mode step is never
+//! cadence-fresh for the history (its only consulted-model points are relax verifications, coded
+//! by the rule that fired first, and background audits), and a draft guess's audit is never
+//! recorded (`Unrecorded::draft`; its sample is a `DraftAudit`). **Legacy points** (flags 0) are
+//! never in P_A.
+//!
+//! **The window**: the same rule as the verdict's and λ_sum's — the newest whole generations of
+//! the key's (class's) own P_A points holding at least [`WINDOW_POINTS`] — over P_A itself.
+//! `ClassCalibration::answer_points` is the window's P_A count (the sparse-key rule, Task 6). Each
+//! point counts for every key it holds an atom of, like the LOO energy; the floor counts a point
+//! only with species and a fit id, like the evidence floor's.
 
 use sim::activity::{EnvClass, TeachRule};
 use sim::ClassKey;
-use std::collections::{BTreeMap, BTreeSet};
-use surrogate::history::{AuditHistory, AuditPoint, PointKind};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use surrogate::history::{AuditHistory, AuditPoint, PointFlags, PointKind};
 use surrogate::EnvKey;
 
 use super::FallbackPolicy;
@@ -346,7 +515,7 @@ pub const LEAVE: f64 = 1.0;
 pub const MIN_EVIDENCE: usize = 3;
 /// One jurisdiction point in the window with an atom's measured force error beyond this many
 /// times its bound keeps an untrusted class from entering (at every evidence count) and, with
-/// fewer than [`MIN_EVIDENCE`] points, makes a trusted one leave: P(χ²₃/3 > 9) = 5.9e-6 per atom
+/// its key below the evidence floor ([`FLOOR_FITS`] fits and [`FLOOR_POINTS`] points), makes a trusted one leave: P(χ²₃/3 > 9) = 5.9e-6 per atom
 /// for a calibrated posterior at std = bound.
 pub const WORST_ATOM: f64 = 3.0;
 /// The evidence window (module doc, "The evidence window"): the newest whole generations of a
@@ -354,6 +523,16 @@ pub const WORST_ATOM: f64 = 3.0;
 /// atom beyond [`WORST_ATOM`] makes a 3× tail at 1 % unlikely (0.99ⁿ ≤ 5 %: n ≥ 298), which also
 /// keeps two sigma of the rms's own scatter, 2/√(2n), far inside the hysteresis band √2 − 1.
 pub const WINDOW_POINTS: usize = 300;
+/// The evidence floor's fits (trust tightening, spec 2026-11-18 §3; module doc, "The evidence
+/// floor"): a key's calibrated verdict opens it alone only over at least this many distinct fits
+/// among its attributed verdict points in the window — one decorrelated block per fit, and two
+/// sigma of the rms's scatter inside the √2 band needs n ≥ 5.83·CV² = 4.9 blocks at the measured
+/// block CV² 0.84.
+pub const FLOOR_FITS: usize = 12;
+/// The evidence floor's points: at least this many attributed verdict points carrying a fit id in
+/// the window — the per-answer CV² proxy of 10 needs n ≥ 5.83 × 10 = 59 (fits of 1–3 points, as in
+/// the app, where the worker refits for every kept sample).
+pub const FLOOR_POINTS: usize = 60;
 
 const SQRT_3: f64 = 1.732_050_807_568_877_2;
 
@@ -399,12 +578,37 @@ pub struct ClassCalibration {
     /// √(Σ w̄² / Σ s̄²) before the floor at 1 and the scatter factor (NaN with fewer than
     /// [`MIN_EVIDENCE`] points): the measured error over the epistemic std, both in bound units.
     pub inflation_raw: f64,
+    /// The evidence floor's n_fit: the distinct fit ids among the window's verdict points that
+    /// carry species and a fit id (module doc, "The evidence floor").
+    pub fits: usize,
+    /// The evidence floor's n_pts: the window's verdict points (audits and rule-4b fallbacks,
+    /// uncapped) that carry species and a fit id.
+    pub floor_points: usize,
+    /// λ_T, the tail-aware force inflation over the answer sample P_A (module doc, "The tail-aware
+    /// inflations"): ≥ 1, ∞ when a bad atom has s = 0, NaN when a comparison in P_A is NaN.
+    pub tail_inflation: f64,
+    /// λ_E, the tail-aware energy inflation over P_A's points with an epistemic energy std (module
+    /// doc): ≥ 1, ∞ / NaN as λ_T.
+    pub energy_inflation: f64,
+    /// The P_A points in λ_T's window (the sparse-key rule reads it: fewer than [`MIN_EVIDENCE`]).
+    pub answer_points: usize,
+    /// What decided `tail_inflation` (the refusal's words name it; Task 6).
+    pub tail_cause: TailCause,
+    /// What decided `energy_inflation`.
+    pub energy_cause: TailCause,
 }
 
 impl ClassCalibration {
     /// Enough evidence for the calibrated verdict ([`MIN_EVIDENCE`]).
     pub fn calibrated(&self) -> bool {
         self.evidence >= MIN_EVIDENCE
+    }
+
+    /// The evidence floor is met ([`FLOOR_FITS`] distinct fits **and** [`FLOOR_POINTS`] points):
+    /// the calibrated verdict may open the key alone (module doc, "The evidence floor"). Met
+    /// implies [`calibrated`](Self::calibrated): 60 points weigh at least min(60, 3) evidence.
+    pub fn floor_met(&self) -> bool {
+        self.fits >= FLOOR_FITS && self.floor_points >= FLOOR_POINTS
     }
 }
 
@@ -487,12 +691,16 @@ struct PointEvidence {
     s2: f64,
     /// ā̄² = mean over the point's class atoms of (ā_c/b_j)²: the aleatoric part of w̄² (fix round 1)
     a2: f64,
+    /// The point's fit id when it counts toward the evidence floor: it carries species and a fit
+    /// id (module doc, "The evidence floor"); `None` otherwise.
+    floor_fit: Option<u64>,
 }
 
 /// A history point in the **posterior's** jurisdiction (fix round 3, the variance inflation): the
 /// geometries where the model's predictive std decided or would have decided — the class
 /// verdict's jurisdiction (audits, rule-4b fallbacks) plus the fallbacks rules 6/7 refused alone
-/// (codes 14, 15) and those the class and rules 6/7 refused together (code 21). Not rules
+/// (codes 14, 15; code 24 where only the tail-aware factor refused, trust tightening Task 6) and
+/// those the class and rules 6/7 refused together (code 21). Not rules
 /// 5/5a–5e or the fences: those refuse whatever the std says (the extrapolating posterior's z rms
 /// 12–54 there argues for those rules, not for the std inside their reach).
 fn in_posterior_jurisdiction(kind: PointKind) -> bool {
@@ -502,6 +710,7 @@ fn in_posterior_jurisdiction(kind: PointKind) -> bool {
             in_jurisdiction(kind)
                 || rule == super::history_rule_code(TeachRule::ForceUncertainty)
                 || rule == super::history_rule_code(TeachRule::EnergyUncertainty)
+                || rule == super::HISTORY_RULE_TAIL_INFLATION
                 || rule == super::HISTORY_RULE_CLASS_AND_VARIANCE
         }
     }
@@ -510,9 +719,14 @@ fn in_posterior_jurisdiction(kind: PointKind) -> bool {
 /// The oldest generation of the window (module doc, "The evidence window"): from the newest
 /// generation back, whole generations until they hold [`WINDOW_POINTS`]; `None` = every point.
 fn window_from(points: &[&PointEvidence]) -> Option<u64> {
+    window_from_gens(points.iter().map(|p| p.gen))
+}
+
+/// [`window_from`] over the points' generations.
+fn window_from_gens(gens: impl Iterator<Item = u64>) -> Option<u64> {
     let mut per_gen: BTreeMap<u64, usize> = BTreeMap::new();
-    for p in points {
-        *per_gen.entry(p.gen).or_default() += 1;
+    for g in gens {
+        *per_gen.entry(g).or_default() += 1;
     }
     let mut held = 0usize;
     for (&gen, &n) in per_gen.iter().rev() {
@@ -552,18 +766,23 @@ fn point_evidence(p: &AuditPoint, atoms: &[usize], aleatoric: f64, policy: &Fall
         audit: p.kind.is_audit(),
         w2: w2 / n,
         z2: z2 / n,
-        e2: sq(p.err_energy.abs() / p.n_atoms.max(1) as f64 / policy.energy_std_per_atom),
+        // per N_e through the one normalisation (`policy::energy_atoms`; a point's `n_atoms` is its N_e)
+        e2: sq(p.err_energy.abs() / super::policy::energy_atoms(p.n_atoms.max(1)) / policy.energy_std_per_atom),
         worst,
         s2: s2 / n,
         a2: a2 / n,
+        // a species-less (legacy) point or one without a fit id never counts toward the floor
+        floor_fit: p.fit_id.filter(|_| !p.species.is_empty()),
     })
 }
 
-/// The verdict's and the posterior's evidence lists of one class or key.
+/// The verdict's and the posterior's evidence lists of one class or key, and its answer sample
+/// (module doc, "The answer sample P_A").
 #[derive(Default)]
 struct Lists {
     verdict: Vec<PointEvidence>,
     posterior: Vec<PointEvidence>,
+    answer: Vec<AnswerEvidence>,
 }
 
 impl Lists {
@@ -584,17 +803,32 @@ pub fn calibrate_with(history: &AuditHistory, policy: &FallbackPolicy, aleatoric
     let mut legacy: [Lists; 2] = Default::default();
     let mut by_key: BTreeMap<EnvKey, Lists> = BTreeMap::new();
     for p in history.iter() {
-        if !in_posterior_jurisdiction(p.kind) {
+        // the posterior's jurisdiction (λ_sum, the verdict) and the answer sample (λ_T, λ_E) are
+        // selected apart: a tick may be a point of either kind
+        let posterior = in_posterior_jurisdiction(p.kind);
+        let answer = in_answer_sample(p);
+        if !posterior && !answer {
             continue;
         }
         let verdict = in_jurisdiction(p.kind);
         for c in 0..2 {
             let code = c as u8 + 1;
             let atoms: Vec<usize> = (0..p.n_atoms).filter(|&j| p.classes[j] == code).collect();
-            let Some(e) = point_evidence(p, &atoms, aleatoric[c], policy) else { continue };
-            class[c].push(e, verdict);
-            if p.species.is_empty() {
-                legacy[c].push(e, verdict);
+            if posterior {
+                if let Some(e) = point_evidence(p, &atoms, aleatoric[c], policy) {
+                    class[c].push(e, verdict);
+                    if p.species.is_empty() {
+                        legacy[c].push(e, verdict);
+                    }
+                }
+            }
+            if answer {
+                if let Some(a) = answer_evidence(p, &atoms, policy) {
+                    if p.species.is_empty() {
+                        legacy[c].answer.push(a.clone());
+                    }
+                    class[c].answer.push(a);
+                }
             }
         }
         let mut atoms_of: BTreeMap<EnvKey, Vec<usize>> = BTreeMap::new();
@@ -605,16 +839,23 @@ pub fn calibrate_with(history: &AuditHistory, policy: &FallbackPolicy, aleatoric
         }
         for (k, atoms) in atoms_of {
             let c = (k.class - 1) as usize;
-            if let Some(e) = point_evidence(p, &atoms, aleatoric[c], policy) {
-                by_key.entry(k).or_default().push(e, verdict);
+            if posterior {
+                if let Some(e) = point_evidence(p, &atoms, aleatoric[c], policy) {
+                    by_key.entry(k.clone()).or_default().push(e, verdict);
+                }
+            }
+            if answer {
+                if let Some(a) = answer_evidence(p, &atoms, policy) {
+                    by_key.entry(k).or_default().answer.push(a);
+                }
             }
         }
     }
-    fn refs(l: &[PointEvidence]) -> Vec<&PointEvidence> {
+    fn refs<T>(l: &[T]) -> Vec<&T> {
         l.iter().collect()
     }
-    let per_class = std::array::from_fn(|c| summarise(&refs(&class[c].verdict), &refs(&class[c].posterior)));
-    let legacy_cal: [ClassCalibration; 2] = std::array::from_fn(|c| summarise(&refs(&legacy[c].verdict), &refs(&legacy[c].posterior)));
+    let per_class = std::array::from_fn(|c| summarise(&refs(&class[c].verdict), &refs(&class[c].posterior), &refs(&class[c].answer)));
+    let legacy_cal: [ClassCalibration; 2] = std::array::from_fn(|c| summarise(&refs(&legacy[c].verdict), &refs(&legacy[c].posterior), &refs(&legacy[c].answer)));
     let all: BTreeSet<EnvKey> = keys.iter().filter(|k| (1..=2).contains(&k.class)).cloned().chain(by_key.keys().cloned()).collect();
     let empty = Lists::default();
     let per_key = all
@@ -624,15 +865,18 @@ pub fn calibrate_with(history: &AuditHistory, policy: &FallbackPolicy, aleatoric
             let old = &legacy[(k.class - 1) as usize];
             let v: Vec<&PointEvidence> = own.verdict.iter().chain(&old.verdict).collect();
             let q: Vec<&PointEvidence> = own.posterior.iter().chain(&old.posterior).collect();
-            (k, summarise(&v, &q))
+            let a: Vec<&AnswerEvidence> = own.answer.iter().chain(&old.answer).collect();
+            (k, summarise(&v, &q, &a))
         })
         .collect();
     Calibration { per_class, per_key, legacy: legacy_cal }
 }
 
-/// One class's or key's calibration from its verdict and posterior evidence (module doc).
-fn summarise(all: &[&PointEvidence], posterior: &[&PointEvidence]) -> ClassCalibration {
+/// One class's or key's calibration from its verdict and posterior evidence and its answer sample
+/// (module doc).
+fn summarise(all: &[&PointEvidence], posterior: &[&PointEvidence], answer: &[&AnswerEvidence]) -> ClassCalibration {
     let (inflation_var, inflation_points, inflation_raw) = variance_inflation(posterior);
+    let ((tail_inflation, tail_cause), (energy_inflation, energy_cause), answer_points) = tail_inflations(answer);
     let from = window_from(all);
     let inside = |e: &&&PointEvidence| from.is_none_or(|g| e.gen >= g);
     let audits: Vec<&PointEvidence> = all.iter().filter(inside).filter(|e| e.audit).copied().collect();
@@ -640,8 +884,13 @@ fn summarise(all: &[&PointEvidence], posterior: &[&PointEvidence]) -> ClassCalib
     let (n_a, n_f) = (audits.len(), fallbacks.len());
     let points = n_a + n_f;
     let aged = all.len() - points;
+    // the evidence floor: the window's verdict points carrying species and a fit id, uncapped, and
+    // their distinct fits
+    let floor_ids: Vec<u64> = audits.iter().chain(&fallbacks).filter_map(|e| e.floor_fit).collect();
+    let floor_points = floor_ids.len();
+    let fits = floor_ids.iter().collect::<BTreeSet<_>>().len();
     if points == 0 {
-        return ClassCalibration { factor: 1.0, audits: 0, fallbacks: 0, evidence: 0, points: 0, aged, window_from: None, z_rms: f64::NAN, measured: f64::NAN, measured_energy: f64::NAN, worst_atom: 0.0, inflation: inflation_var, inflation_points, inflation_raw };
+        return ClassCalibration { factor: 1.0, audits: 0, fallbacks: 0, evidence: 0, points: 0, aged, window_from: None, z_rms: f64::NAN, measured: f64::NAN, measured_energy: f64::NAN, worst_atom: 0.0, inflation: inflation_var, inflation_points, inflation_raw, fits, floor_points, tail_inflation, energy_inflation, answer_points, tail_cause, energy_cause };
     }
     // the fallbacks of the class together weigh at most the audits (never fewer than three);
     // the count in integers (review I1), the per-point weight only for the sums
@@ -655,7 +904,7 @@ fn summarise(all: &[&PointEvidence], posterior: &[&PointEvidence]) -> ClassCalib
     let measured = (sum(&|e| e.w2) / den).sqrt() * inflation;
     let measured_energy = (sum(&|e| e.e2) / den).sqrt() * inflation;
     let worst_atom = audits.iter().chain(&fallbacks).map(|e| e.worst).fold(0.0f64, |m, w| if w.is_nan() || m.is_nan() { f64::NAN } else { m.max(w) });
-    ClassCalibration { factor: z_rms.max(1.0) * inflation, audits: n_a, fallbacks: n_f, evidence, points, aged, window_from: from, z_rms, measured, measured_energy, worst_atom, inflation: inflation_var, inflation_points, inflation_raw }
+    ClassCalibration { factor: z_rms.max(1.0) * inflation, audits: n_a, fallbacks: n_f, evidence, points, aged, window_from: from, z_rms, measured, measured_energy, worst_atom, inflation: inflation_var, inflation_points, inflation_raw, fits, floor_points, tail_inflation, energy_inflation, answer_points, tail_cause, energy_cause }
 }
 
 /// λ_c (module doc, "The variance inflation"): over the class's points in the posterior's
@@ -687,6 +936,291 @@ fn variance_inflation(points: &[&PointEvidence]) -> (f64, usize, f64) {
     (raw.max(1.0) * (1.0 + 1.0 / (2.0 * n as f64).sqrt()), n, raw)
 }
 
+// ---- the tail-aware inflations (module doc, "The tail-aware inflations"; spec 2026-11-18 §4) ----
+
+/// Whether `p` is in the answer sample P_A (module doc, "The answer sample P_A"): not fenced, not
+/// novel, and a calibration tick or a cadence-fresh class-refused point (codes 5, 6, 21). Reads the
+/// point's flags word and kind only — never a std, an error or a λ (the self-reference guard).
+pub(super) fn in_answer_sample(p: &AuditPoint) -> bool {
+    let f = p.flags;
+    let tick = f.has(PointFlags::TICK);
+    !f.has(PointFlags::FENCED) && !f.has(PointFlags::NOVEL) && (tick || (f.has(PointFlags::CADENCE_FRESH) && class_refused(p.kind)))
+}
+
+/// The class rule (4b) named the refusal: a class code (5, 6) or the class with rule 6/7 failing
+/// too (21) — from the provider's own code table, never literal numbers.
+fn class_refused(kind: PointKind) -> bool {
+    match kind {
+        PointKind::Audit => false,
+        PointKind::Fallback { rule } => in_jurisdiction(kind) || rule == super::HISTORY_RULE_CLASS_AND_VARIANCE,
+    }
+}
+
+/// One measured atom of the answer sample, in the policy's bound units (module doc): r = s_j/b_j,
+/// e = e_j/b_j (s_j = σ_epi,j/√3, e_j = ‖ΔF_j‖/√3), of point `point` judged by fit `fit` (`None`:
+/// it does not count toward the floor).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TailAtom {
+    pub point: usize,
+    pub fit: Option<u64>,
+    pub r: f64,
+    pub e: f64,
+}
+
+/// One measured point of the answer sample, in tier units (module doc): r = σ_E,epi/N/tier,
+/// e = |ΔE|/N/tier.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TailPoint {
+    pub point: usize,
+    pub fit: Option<u64>,
+    pub r: f64,
+    pub e: f64,
+}
+
+/// λ_E's max condition: an admitted point's measured energy error is at most 1× the tier (spec §4
+/// rev. 2 — the gate's own per-answer criterion).
+pub const ENERGY_MAX: f64 = 1.0;
+
+/// What decided a tail-aware inflation (module doc, "The one pass"): the first bad prefix's failing
+/// condition and the r of the group that made it bad — what a refusal at the factor names (Task 6).
+/// All values are ratios: bound units for λ_T, tier units for λ_E.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum TailCause {
+    /// Every admitted set is good: λ = 1.
+    #[default]
+    None,
+    /// The max condition: an item of the decisive group at `e`× the bound (tier) with the model's std
+    /// `r`× of it (the previous prefix was good, so the running max that fails is this group's).
+    Max { e: f64, r: f64 },
+    /// The rms condition on a set meeting the floor: its rms × (1 + 1/√(2n)) — the measured rms with
+    /// its small-sample margin, not the measured rms itself — is `value` (> [`ENTER`])
+    /// over `points` points, the decisive group's std `r`× the bound (tier).
+    Rms { value: f64, points: usize, r: f64 },
+    /// A comparison in the sample is not a number: λ = NaN.
+    NotANumber,
+}
+
+/// What [`tail_factor`] reads of an item.
+trait Tail: Copy {
+    fn point(&self) -> usize;
+    fn fit(&self) -> Option<u64>;
+    fn r(&self) -> f64;
+    fn e(&self) -> f64;
+}
+
+impl Tail for TailAtom {
+    fn point(&self) -> usize {
+        self.point
+    }
+    fn fit(&self) -> Option<u64> {
+        self.fit
+    }
+    fn r(&self) -> f64 {
+        self.r
+    }
+    fn e(&self) -> f64 {
+        self.e
+    }
+}
+
+impl Tail for TailPoint {
+    fn point(&self) -> usize {
+        self.point
+    }
+    fn fit(&self) -> Option<u64> {
+        self.fit
+    }
+    fn r(&self) -> f64 {
+        self.r
+    }
+    fn e(&self) -> f64 {
+        self.e
+    }
+}
+
+/// The evidence floor over a set of items: ≥ [`FLOOR_FITS`] distinct fits and ≥ [`FLOOR_POINTS`]
+/// distinct points among the items that carry a fit id. Monotone in the set.
+fn meets_floor<T: Tail>(items: &[T]) -> bool {
+    let mut points = BTreeSet::new();
+    let mut fits = BTreeSet::new();
+    for t in items {
+        if let Some(f) = t.fit() {
+            points.insert(t.point());
+            fits.insert(f);
+        }
+    }
+    fits.len() >= FLOOR_FITS && points.len() >= FLOOR_POINTS
+}
+
+/// The floor over a set of answer-sample atoms ([`tail_inflation`]'s `floor_met` in `calibrate`).
+pub fn atoms_meet_floor(atoms: &[TailAtom]) -> bool {
+    meets_floor(atoms)
+}
+
+/// The floor over a set of answer-sample points ([`energy_inflation`]'s `floor_met`).
+pub fn points_meet_floor(points: &[TailPoint]) -> bool {
+    meets_floor(points)
+}
+
+/// λ_T over a key's answer-sample atoms (module doc, "The tail-aware inflations"): the max
+/// condition at [`WORST_ATOM`] = 3, the rms condition at [`ENTER`] on the sets `floor_met` (monotone
+/// in the set) accepts. ≥ 1; ∞ when a bad atom has r = 0; NaN when any r or e is NaN.
+pub fn tail_inflation(atoms: &[TailAtom], floor_met: impl Fn(&[TailAtom]) -> bool) -> f64 {
+    tail_factor(atoms, WORST_ATOM, floor_met).0
+}
+
+/// λ_E over a key's answer-sample points with an epistemic energy std: as [`tail_inflation`], the
+/// max condition at [`ENERGY_MAX`] = 1× the tier.
+pub fn energy_inflation(points: &[TailPoint], floor_met: impl Fn(&[TailPoint]) -> bool) -> f64 {
+    tail_factor(points, ENERGY_MAX, floor_met).0
+}
+
+/// [`energy_inflation`] with another max condition: a test's counterfactual (rev. 1's 4.53).
+#[cfg(test)]
+pub(super) fn energy_inflation_with_max(points: &[TailPoint], max: f64, floor_met: impl Fn(&[TailPoint]) -> bool) -> f64 {
+    tail_factor(points, max, floor_met).0
+}
+
+/// Neumaier's compensated running sum (CLAUDE.md rule 4): the rms condition's Σ of per-point means,
+/// whose terms are taken out and put back as a point's atoms join.
+#[derive(Clone, Copy, Default)]
+struct Compensated {
+    sum: f64,
+    c: f64,
+}
+
+impl Compensated {
+    fn add(&mut self, x: f64) {
+        let t = self.sum + x;
+        if self.sum.abs() >= x.abs() {
+            self.c += (self.sum - t) + x;
+        } else {
+            self.c += (x - t) + self.sum;
+        }
+        self.sum = t;
+    }
+
+    fn value(&self) -> f64 {
+        self.sum + self.c
+    }
+}
+
+/// The smallest λ ≥ 1 with A(λ′) good for every λ′ ≥ λ (module doc, "The tail-aware inflations",
+/// "The one pass"): `max` the max condition's limit, the rms condition at [`ENTER`] on the prefixes
+/// `floor_met` accepts. With it, what decided ([`TailCause`]).
+fn tail_factor<T: Tail>(items: &[T], max: f64, floor_met: impl Fn(&[T]) -> bool) -> (f64, TailCause) {
+    // any NaN, admitted or not: the inflation is undefined (M1)
+    if items.iter().any(|t| t.r().is_nan() || t.e().is_nan()) {
+        return (f64::NAN, TailCause::NotANumber);
+    }
+    // admitted at some λ ≥ 1 (λ·r ≤ 1 needs r ≤ 1), and not e = r = 0 (no draw: adds nothing)
+    let mut a: Vec<T> = items.iter().copied().filter(|t| t.r() <= 1.0 && !(t.r() == 0.0 && t.e() == 0.0)).collect();
+    a.sort_by(|x, y| x.r().total_cmp(&y.r()));
+    // the first prefix length that meets the floor (the floor is monotone in the set): bisection
+    let first_floor = {
+        let (mut lo, mut hi) = (0usize, a.len() + 1);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if floor_met(&a[..mid]) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        lo
+    };
+    let mut worst = 0.0f64;
+    // per point: Σ e² over its admitted atoms and their count; Σ over points of their means
+    let mut per_point: HashMap<usize, (Compensated, usize)> = HashMap::new();
+    let mut total = Compensated::default();
+    let mut i = 0;
+    while i < a.len() {
+        // the next group of equal r enters together
+        let r = a[i].r();
+        let mut j = i;
+        while j < a.len() && a[j].r() == r {
+            let e = a[j].e();
+            worst = worst.max(e); // no NaN here
+            let (sum, n) = per_point.entry(a[j].point()).or_default();
+            if *n > 0 {
+                total.add(-(sum.value() / *n as f64));
+            }
+            sum.add(sq(e));
+            *n += 1;
+            total.add(sum.value() / *n as f64);
+            j += 1;
+        }
+        // (an infinite e fails the max first, so a NaN the sum may then hold is never read)
+        let cause = if !(worst <= max) {
+            Some(TailCause::Max { e: worst, r })
+        } else if j < first_floor {
+            None
+        } else {
+            let n_a = per_point.len() as f64;
+            let v = total.value() / n_a;
+            let v = if v < 0.0 { 0.0 } else { v }; // rounding below 0; a NaN stays NaN and fails
+            let value = v.sqrt() * (1.0 + 1.0 / (2.0 * n_a).sqrt());
+            (!(value <= ENTER)).then_some(TailCause::Rms { value, points: per_point.len(), r })
+        };
+        if let Some(cause) = cause {
+            // λ·r > 1 excludes this group; no finite λ excludes r = 0
+            return (if r <= 0.0 { f64::INFINITY } else { (1.0 / r).next_up() }, cause);
+        }
+        i = j;
+    }
+    (1.0, TailCause::None)
+}
+
+/// One answer-sample point's measurements over the atoms of one class or key (module doc): per
+/// atom (r_j, e_j) in bound units, and (r_p, e_p) in tier units when it carries an epistemic
+/// energy std; its generation (the window) and its fit id when it counts toward the floor.
+#[derive(Clone)]
+struct AnswerEvidence {
+    gen: u64,
+    fit: Option<u64>,
+    atoms: Vec<(f64, f64)>,
+    energy: Option<(f64, f64)>,
+}
+
+fn answer_evidence(p: &AuditPoint, atoms: &[usize], policy: &FallbackPolicy) -> Option<AnswerEvidence> {
+    if atoms.is_empty() {
+        return None;
+    }
+    let per_atom = atoms
+        .iter()
+        .map(|&j| {
+            // e on the teacher's bound (rule 8's); r on rule 6's own, force_bound(|F_m|) — or, for a
+            // point recorded without |F_m|, the bound at |F_t| + ‖ΔF‖ ≥ |F_m| (the triangle
+            // inequality; the bound is non-decreasing), never larger r than rule 6's (module doc)
+            let bound = policy.force_bound(p.teacher_force[j]);
+            let rule6 = policy.force_bound(p.model_force.get(j).copied().unwrap_or(p.teacher_force[j] + p.err_force[j]));
+            (p.pred_force_std_epistemic[j] / SQRT_3 / rule6, p.err_force[j] / SQRT_3 / bound)
+        })
+        .collect();
+    // N: rule 7's own normalisation, through the one shared function (spec §5; `atoms` is not empty,
+    // so n_atoms ≥ 1). A point is recorded over its bonded part (`record_history_point`), so its n_atoms
+    // is its N_e, the energy-row atoms rule 7 divides by (stray-atoms ruling 9a)
+    let (n, tier) = (super::policy::energy_atoms(p.n_atoms), policy.energy_std_per_atom);
+    Some(AnswerEvidence {
+        gen: p.model_gen,
+        // as the evidence floor: a point counts only with species and a fit id
+        fit: p.fit_id.filter(|_| !p.species.is_empty()),
+        atoms: per_atom,
+        energy: p.energy_std_epistemic.map(|s| (s / n / tier, p.err_energy.abs() / n / tier)),
+    })
+}
+
+/// (λ_T, λ_E — each with its cause — and the P_A points in the window) of one class or key: over its
+/// own window of the newest generations holding [`WINDOW_POINTS`] of its P_A points (module doc,
+/// "The window").
+fn tail_inflations(points: &[&AnswerEvidence]) -> ((f64, TailCause), (f64, TailCause), usize) {
+    let from = window_from_gens(points.iter().map(|p| p.gen));
+    let inside: Vec<&AnswerEvidence> = points.iter().filter(|p| from.is_none_or(|g| p.gen >= g)).copied().collect();
+    let atoms: Vec<TailAtom> = inside.iter().enumerate().flat_map(|(i, p)| p.atoms.iter().map(move |&(r, e)| TailAtom { point: i, fit: p.fit, r, e })).collect();
+    let energies: Vec<TailPoint> = inside.iter().enumerate().filter_map(|(i, p)| p.energy.map(|(r, e)| TailPoint { point: i, fit: p.fit, r, e })).collect();
+    (tail_factor(&atoms, WORST_ATOM, atoms_meet_floor), tail_factor(&energies, ENERGY_MAX, points_meet_floor), inside.len())
+}
+
 /// What the refusal's words read (a `ClassLoo` holds all of it; `class_verdict` passes its own).
 pub struct WordsInput {
     pub samples: usize,
@@ -699,10 +1233,22 @@ pub struct WordsInput {
     /// The evidence count and the calibration factor κ.
     pub evidence: usize,
     pub calibration: f64,
+    /// The evidence floor's counts ([`ClassCalibration::fits`], [`ClassCalibration::floor_points`]).
+    pub fits: usize,
+    pub floor_points: usize,
 }
 
 /// The words of a class refusal (key, value, limit): the part after "isn't learned well enough yet
 /// (<class>: " — the verdict's `reason` and the provider's Log note alike (one wording, review M2).
+/// One count of the evidence floor in words (trust tightening Task 8; the Task 4 review's minor 3:
+/// never "80 of 60 checks"): "11 of 12 fits" while it is short of its floor, "80 checks (60
+/// needed)" once it reaches it. `unit` may be empty ("4 of 60", "80 (60 needed)") where the
+/// sentence names it. The provider's refusal words and the app's panel read this one function.
+pub fn floor_count(n: usize, floor: usize, unit: &str) -> String {
+    let unit = if unit.is_empty() { String::new() } else { format!(" {unit}") };
+    if n < floor { format!("{n} of {floor}{unit}") } else { format!("{n}{unit} ({floor} needed)") }
+}
+
 /// The uncalibrated keys keep their words of before (pinned byte for byte by the refusal-string
 /// tests).
 pub fn refusal_words(key: ClassKey, value: f64, limit: f64, w: &WordsInput) -> String {
@@ -720,9 +1266,12 @@ pub fn refusal_words(key: ClassKey, value: f64, limit: f64, w: &WordsInput) -> S
         }
         ClassKey::Energy => format!("LOO energy error {:.1}× the tier, {n} samples", w.energy_max),
         ClassKey::EnergyRms => format!("LOO energy error RMS {value:.1}× the tier (training samples the model cannot reproduce included), {n} samples"),
-        ClassKey::WorstAtom if w.evidence < MIN_EVIDENCE => {
-            format!("a DFT check found an atom's force {value:.1}× its bound, limit {limit:.0}× while fewer than {MIN_EVIDENCE} comparisons judge the class; {n} samples")
-        }
+        // the guard applies both ways below the evidence floor (trust tightening §3)
+        ClassKey::WorstAtom if w.fits < FLOOR_FITS || w.floor_points < FLOOR_POINTS => format!(
+            "a DFT check found an atom's force {value:.1}× its bound, limit {limit:.0}× while the class is below its evidence floor: {} / {}; {n} samples",
+            floor_count(w.fits, FLOOR_FITS, "fits"),
+            floor_count(w.floor_points, FLOOR_POINTS, "checks")
+        ),
         ClassKey::WorstAtom => format!("a DFT check found an atom's force {value:.1}× its bound — the class does not enter while its recent evidence holds an atom beyond {limit:.0}×; {n} samples"),
         ClassKey::Calibrated => format!("DFT-measured force error {value:.2}× the bound over {over}, limit {limit:.2} (leave-one-out RMS {:.2}×){posterior}; {n} samples", w.force_rms),
         ClassKey::LooFloor => format!(
@@ -730,6 +1279,11 @@ pub fn refusal_words(key: ClassKey, value: f64, limit: f64, w: &WordsInput) -> S
             w.measured.map_or("—".to_string(), |m| format!("{m:.2}×"))
         ),
         ClassKey::MeasuredEnergy => format!("DFT-measured energy error {value:.2}× the tier over {over}, limit {limit:.2}; {n} samples"),
+        ClassKey::Floor => format!(
+            "within the bound over {} / {}, and its leave-one-out is {value:.1}× the bound; {n} samples",
+            floor_count(w.fits, FLOOR_FITS, "fits"),
+            floor_count(w.floor_points, FLOOR_POINTS, "checks")
+        ),
         ClassKey::Window => format!("within its bound over {value:.0} DFT comparisons, but entering before the next refit needs {limit:.0}; {n} samples"),
     }
 }
@@ -763,41 +1317,63 @@ pub fn verdict(cal: ClassCalibration, st: &ClassStats, q_prime: usize, was_trust
             measured_energy: if cal.points > 0 { finite(cal.measured_energy) } else { None },
             evidence: cal.evidence,
             calibration: cal.factor,
+            fits: cal.fits,
+            floor_points: cal.floor_points,
         };
         let untrusted = |key: ClassKey, value: f64, limit: f64| ClassVerdict::Untrusted { key, value, limit, reason: refusal_words(key, value, limit, &words) };
         if st.samples < q_prime {
             return untrusted(ClassKey::Samples, st.samples as f64, q_prime as f64);
         }
-        // the worst-atom guard: on entry at every evidence count, both ways while unverified
-        if (!was_trusted || !cal.calibrated()) && !(cal.worst_atom <= WORST_ATOM) {
+        // the worst-atom guard: on entry at every evidence count, both ways below the evidence
+        // floor (trust tightening §3; before it, below three points)
+        if (!was_trusted || !cal.floor_met()) && !(cal.worst_atom <= WORST_ATOM) {
             return untrusted(ClassKey::WorstAtom, cal.worst_atom, WORST_ATOM);
         }
+        // the rule of before: LOO force rms and max ≤ 1, LOO energy max ≤ 1
+        let before = super::trust::class_refusal(st.samples, q_prime, st.force_rms, st.force_max, st.energy_max);
         if !cal.calibrated() {
-            // the rule of before, unchanged — no evidence loosens nothing
-            return match super::trust::class_refusal(st.samples, q_prime, st.force_rms, st.force_max, st.energy_max) {
+            // unchanged — no evidence loosens nothing
+            return match before {
                 None if energy_rms_fails(st) => untrusted(ClassKey::EnergyRms, st.energy_rms, 1.0),
                 None => ClassVerdict::Trusted,
                 Some((key, value, limit)) => untrusted(key, value, limit),
             };
         }
-        let limit = if was_trusted { LEAVE } else { ENTER };
-        // the force: the measured error with the leave-one-out as the floor (NaN fails either way);
-        // the key names the term that decided
-        let (w, r) = (cal.measured, st.force_rms);
-        if !(w <= limit) && !(w < r) {
-            return untrusted(ClassKey::Calibrated, w, limit);
+        // today's calibrated verdict; below the floor it must pass **and** the rule of before. The
+        // refusal names what shuts the key: the calibrated verdict's own failing term when it
+        // fails (the floor is not why), else the floor with the leave-one-out ratio that decided
+        // (`ClassKey::Floor`, limit 1)
+        match calibrated_refusal(&cal, st, was_trusted) {
+            Some((key, value, limit)) => untrusted(key, value, limit),
+            None => match before {
+                Some((_, value, limit)) if !cal.floor_met() => untrusted(ClassKey::Floor, value, limit),
+                _ => ClassVerdict::Trusted,
+            },
         }
-        if !(r <= limit) {
-            return untrusted(ClassKey::LooFloor, r, limit);
-        }
-        // the energy half of C1: at the bound itself (no ENTER band — the calibrated energy check
-        // is the measured audit energy below), and only when M contributes
-        if energy_rms_fails(st) {
-            return untrusted(ClassKey::EnergyRms, st.energy_rms, 1.0);
-        }
-        if !(cal.measured_energy <= limit) {
-            return untrusted(ClassKey::MeasuredEnergy, cal.measured_energy, limit);
-        }
-        ClassVerdict::Trusted
     }
+}
+
+/// Today's calibrated verdict (module doc, "The verdict, with hysteresis"): the first failing term
+/// as (key, value, limit), `None` when it passes.
+#[allow(clippy::neg_cmp_op_on_partial_ord)] // the negation is the point: NaN fails
+fn calibrated_refusal(cal: &ClassCalibration, st: &ClassStats, was_trusted: bool) -> Option<(ClassKey, f64, f64)> {
+    let limit = if was_trusted { LEAVE } else { ENTER };
+    // the force: the measured error with the leave-one-out as the floor (NaN fails either way);
+    // the key names the term that decided
+    let (w, r) = (cal.measured, st.force_rms);
+    if !(w <= limit) && !(w < r) {
+        return Some((ClassKey::Calibrated, w, limit));
+    }
+    if !(r <= limit) {
+        return Some((ClassKey::LooFloor, r, limit));
+    }
+    // the energy half of C1: at the bound itself (no ENTER band — the calibrated energy check
+    // is the measured audit energy below), and only when M contributes
+    if energy_rms_fails(st) {
+        return Some((ClassKey::EnergyRms, st.energy_rms, 1.0));
+    }
+    if !(cal.measured_energy <= limit) {
+        return Some((ClassKey::MeasuredEnergy, cal.measured_energy, limit));
+    }
+    None
 }

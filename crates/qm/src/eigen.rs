@@ -138,6 +138,78 @@ pub struct EigenStats {
     pub aborted: bool,
 }
 
+/// The eigen-decomposition of a small symmetric matrix, **checked** (plan 2026-11-13 Task 9b fix round 1, review I1):
+/// `nalgebra::SymmetricEigen`, then every pair's residual ‖A v − λ v‖ against `SYM_EIGEN_CHECK`·(1 + max|λ|); when any
+/// pair fails, the decomposition is refined by cyclic Jacobi on VᵀAV (V nalgebra's eigenvectors, when orthonormal to
+/// 1e-10; from A itself otherwise), which converges in a sweep or two from a nearly diagonal start and is accurate to
+/// rounding. Measured: on LOBPCG's reduced problems nalgebra 0.33.3 often returns pair residuals of 1e-7 … 1e-4 and
+/// sometimes wrong pairings (residual 0.17 … 4.1 Ha; on the 24 × 24 matrix of the GPU pseudo-H₂O display solve the
+/// eigenvalues −0.8687 and +0.7195 carried each other's eigenvectors, so LOBPCG formed the converged 2s column from
+/// the wrong coefficients and lost the level). A decomposition that passes is returned unchanged, bit for bit.
+/// Eigenvalues are in no particular order (as `SymmetricEigen`'s).
+pub fn sym_eigen(a: DMatrix<f64>) -> SymmetricEigen<f64, nalgebra::Dyn> {
+    let e = SymmetricEigen::new(a.clone());
+    let n = e.eigenvalues.len();
+    let scale = 1.0 + e.eigenvalues.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    let bad = (0..n).any(|k| {
+        let v = e.eigenvectors.column(k);
+        !((&a * v - v * e.eigenvalues[k]).norm() <= SYM_EIGEN_CHECK * scale)
+    });
+    if !bad { return e; }
+    let v = e.eigenvectors;
+    let orthonormal = (v.transpose() * &v - DMatrix::<f64>::identity(n, n)).norm() <= 1e-10;
+    if !orthonormal { return jacobi_sym_eigen(a); }
+    let m = v.transpose() * &a * &v;
+    let m = DMatrix::from_fn(n, n, |i, j| 0.5 * (m[(i, j)] + m[(j, i)]));
+    let r = jacobi_sym_eigen(m);
+    SymmetricEigen { eigenvectors: v * r.eigenvectors, eigenvalues: r.eigenvalues }
+}
+
+/// The pair-residual bound of `sym_eigen`, relative to 1 + max|λ|: 10³ × the f64 rounding of an accurate symmetric
+/// eigen-decomposition (≈ 1e-14·‖A‖ per pair).
+pub const SYM_EIGEN_CHECK: f64 = 1e-11;
+
+/// The cyclic Jacobi eigenvalue method (Golub & Van Loan, *Matrix Computations*, §8.5), the fallback of `sym_eigen`:
+/// plane rotations zero each off-diagonal entry in turn until the off-diagonal norm is below 1e-15 × the matrix norm
+/// (or 100 sweeps). Slower than QR but unconditionally robust; eigenvectors are orthonormal to rounding.
+pub fn jacobi_sym_eigen(mut a: DMatrix<f64>) -> SymmetricEigen<f64, nalgebra::Dyn> {
+    let n = a.nrows();
+    let mut v = DMatrix::<f64>::identity(n, n);
+    let norm = a.norm();
+    for _ in 0..100 {
+        let off: f64 = (0..n).flat_map(|i| (0..n).filter(move |&j| j != i).map(move |j| (i, j))).map(|(i, j)| a[(i, j)] * a[(i, j)]).sum::<f64>().sqrt();
+        if !(off > 1e-15 * norm) { break; }
+        for p in 0..n {
+            for q in p + 1..n {
+                let apq = a[(p, q)];
+                if apq == 0.0 { continue; }
+                let theta = (a[(q, q)] - a[(p, p)]) / (2.0 * apq);
+                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                let t = if theta == 0.0 { 1.0 } else { t };
+                let c = 1.0 / (t * t + 1.0).sqrt();
+                let s = t * c;
+                for k in 0..n {
+                    let (akp, akq) = (a[(k, p)], a[(k, q)]);
+                    a[(k, p)] = c * akp - s * akq;
+                    a[(k, q)] = s * akp + c * akq;
+                }
+                for k in 0..n {
+                    let (apk, aqk) = (a[(p, k)], a[(q, k)]);
+                    a[(p, k)] = c * apk - s * aqk;
+                    a[(q, k)] = s * apk + c * aqk;
+                }
+                for k in 0..n {
+                    let (vkp, vkq) = (v[(k, p)], v[(k, q)]);
+                    v[(k, p)] = c * vkp - s * vkq;
+                    v[(k, q)] = s * vkp + c * vkq;
+                }
+            }
+        }
+    }
+    let eigenvalues = nalgebra::DVector::from_fn(n, |i, _| a[(i, i)]);
+    SymmetricEigen { eigenvectors: v, eigenvalues }
+}
+
 /// Number of damped-Jacobi sweeps in `jacobi_precond` (1 = plain diagonal scaling).
 pub const JACOBI_SWEEPS: usize = 4;
 
@@ -193,7 +265,31 @@ fn orthonormalise(grid: &Grid, s: &mut Vec<Vec<f64>>) {
 #[allow(clippy::too_many_arguments)]
 pub fn lobpcg(grid: &Grid, op: &dyn Operator, x: &mut [Vec<f64>], evals: &mut [f64],
               precond: Option<&dyn Fn(&[f64], &mut [f64])>, tol: f64, max_iter: usize,
-              mut should_abort: Option<&mut dyn FnMut() -> bool>) -> EigenStats {
+              should_abort: Option<&mut dyn FnMut() -> bool>) -> EigenStats {
+    let k = x.len();
+    lobpcg_impl(grid, op, x, evals, precond, tol, k, tol, max_iter, should_abort, None)
+}
+
+/// `lobpcg` with a split stop test (plan 2026-11-13 Task 9b; `occupations` module doc, "Witness columns at a guard
+/// tolerance"): it stops when the lowest `head` columns (by position: after a Rayleigh–Ritz step the columns are
+/// ascending, at the guess they are as given) have max residual < `tol` and the others < `tail_tol` ≥ `tol`, or after
+/// `max_iter` steps. `residuals[i]` receives ‖H xᵢ − λᵢ xᵢ‖ of every returned column; `EigenStats::max_residual`
+/// stays the max over all of them. With `head` = `x.len()` the iteration is `lobpcg`'s instruction for instruction
+/// (the tail test is then empty).
+#[allow(clippy::too_many_arguments)]
+pub fn lobpcg_tiers(grid: &Grid, op: &dyn Operator, x: &mut [Vec<f64>], evals: &mut [f64],
+                    precond: Option<&dyn Fn(&[f64], &mut [f64])>, tol: f64, head: usize, tail_tol: f64, max_iter: usize,
+                    residuals: &mut [f64]) -> EigenStats {
+    assert!(tail_tol >= tol, "lobpcg_tiers: tail_tol {tail_tol} must not be below tol {tol}");
+    assert!(head <= x.len(), "lobpcg_tiers: head {head} > {} columns", x.len());
+    assert_eq!(residuals.len(), x.len(), "lobpcg_tiers: one residual slot per column");
+    lobpcg_impl(grid, op, x, evals, precond, tol, head, tail_tol, max_iter, None, Some(residuals))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lobpcg_impl(grid: &Grid, op: &dyn Operator, x: &mut [Vec<f64>], evals: &mut [f64],
+               precond: Option<&dyn Fn(&[f64], &mut [f64])>, tol: f64, head: usize, tail_tol: f64, max_iter: usize,
+               mut should_abort: Option<&mut dyn FnMut() -> bool>, mut residuals: Option<&mut [f64]>) -> EigenStats {
     let k = x.len();
     let n = grid.len();
     assert_eq!(evals.len(), k, "evals must have one slot per eigenvector");
@@ -209,15 +305,20 @@ pub fn lobpcg(grid: &Grid, op: &dyn Operator, x: &mut [Vec<f64>], evals: &mut [f
         for i in 0..k { op.apply(&xs[i], &mut hx[i]); evals[i] = grid.dot(&xs[i], &hx[i]); }
         let mut w: Vec<Vec<f64>> = Vec::with_capacity(k);
         let mut max_res = 0.0f64;
+        // the two tiers' maxima (`lobpcg_tiers`; head = k leaves the tail empty, so the test is `max_res < tol`)
+        let (mut head_res, mut tail_res) = (0.0f64, 0.0f64);
         for i in 0..k {
             let r: Vec<f64> = (0..n).map(|j| hx[i][j] - evals[i] * xs[i][j]).collect();
-            max_res = max_res.max(grid.dot(&r, &r).sqrt());
+            let ri = grid.dot(&r, &r).sqrt();
+            max_res = max_res.max(ri);
+            if i < head { head_res = head_res.max(ri); } else { tail_res = tail_res.max(ri); }
+            if let Some(out) = residuals.as_deref_mut() { out[i] = ri; }
             let mut wi = vec![0.0; n];
             match precond { Some(t) => t(&r, &mut wi), None => wi.copy_from_slice(&r) }
             w.push(wi);
         }
         stats.max_residual = max_res;
-        if max_res < tol || stats.iterations >= max_iter { break; }
+        if (head_res < tol && tail_res < tail_tol) || stats.iterations >= max_iter { break; }
         if let Some(abort) = should_abort.as_mut() {
             if abort() { stats.aborted = true; break; }
         }
@@ -240,7 +341,7 @@ pub fn lobpcg(grid: &Grid, op: &dyn Operator, x: &mut [Vec<f64>], evals: &mut [f
             let v = grid.dot(&s[i], &hs[j]);
             a[(i, j)] = v; a[(j, i)] = v;
         }}
-        let eig = SymmetricEigen::new(a);
+        let eig = sym_eigen(a);
         // SymmetricEigen does not sort; take the k lowest Ritz values explicitly.
         let mut order: Vec<usize> = (0..m).collect();
         order.sort_by(|&i, &j| eig.eigenvalues[i].total_cmp(&eig.eigenvalues[j]));
@@ -325,6 +426,52 @@ mod tests {
         let pc = jacobi_precond(&g, &v, 1.5);
         let pre = lobpcg(&g, &op, &mut x2, &mut e2, Some(&pc), 1e-6, 500, None);
         assert!(pre.iterations < plain.iterations, "plain {} pre {}", plain.iterations, pre.iterations);
+    }
+
+    /// Plan Task 9b: `lobpcg_tiers` holds the lowest `head` columns to `tol` and the rest to `tail_tol`; with head = k it
+    /// is `lobpcg` bit for bit. Oscillator 33³, k = 4 (1.5 and the 2.5 triplet), head 1.
+    #[test]
+    fn tiers_hold_the_tail_to_its_own_tolerance() {
+        let (g, v) = oscillator(33, 0.25);
+        let op = LocalHamiltonian { grid: &g, v: &v };
+        let pc = jacobi_precond(&g, &v, 1.5);
+        let (mut xa, mut ea) = (random_guess(&g, 4), vec![0.0; 4]);
+        let plain = lobpcg(&g, &op, &mut xa, &mut ea, Some(&pc), 1e-8, 500, None);
+        let (mut xb, mut eb, mut rb) = (random_guess(&g, 4), vec![0.0; 4], vec![0.0; 4]);
+        let full = lobpcg_tiers(&g, &op, &mut xb, &mut eb, Some(&pc), 1e-8, 4, 1e-8, 500, &mut rb);
+        assert_eq!(plain.iterations, full.iterations);
+        assert_eq!(plain.max_residual.to_bits(), full.max_residual.to_bits());
+        assert!(ea.iter().zip(&eb).all(|(a, b)| a.to_bits() == b.to_bits()) && xa == xb, "head = k is lobpcg");
+        let (mut xc, mut ec, mut rc) = (random_guess(&g, 4), vec![0.0; 4], vec![0.0; 4]);
+        let tiered = lobpcg_tiers(&g, &op, &mut xc, &mut ec, Some(&pc), 1e-8, 1, 1e-3, 500, &mut rc);
+        eprintln!("tiers: all at 1e-8 {} iterations; head 1 at 1e-8, tail at 1e-3: {} iterations, residuals {rc:?}", full.iterations, tiered.iterations);
+        assert!(rc[0] < 1e-8 && rc[1..].iter().all(|&r| r < 1e-3), "{rc:?}");
+        assert_eq!(tiered.max_residual, rc.iter().copied().fold(0.0, f64::max));
+        assert!(tiered.iterations <= full.iterations);
+        assert!((ec[0] - 1.5).abs() < 1e-4, "{ec:?}");
+    }
+
+    /// Plan Task 9b fix round 1 (I1): `sym_eigen` returns correct pairs where they are checked, and the Jacobi fallback
+    /// decomposes a matrix with a near-degenerate cluster and a wide spread to rounding.
+    #[test]
+    fn sym_eigen_pairs_are_checked() {
+        let n = 30;
+        let mut seed = 7u64;
+        let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5 };
+        let q = DMatrix::from_fn(n, n, |_, _| rnd()).qr().q();
+        let lam: Vec<f64> = (0..n).map(|i| if i < 3 { -0.8686 + 1e-12 * i as f64 } else { 70.0 * i as f64 / n as f64 }).collect();
+        let a = &q * DMatrix::from_diagonal(&nalgebra::DVector::from_vec(lam.clone())) * q.transpose();
+        let a = DMatrix::from_fn(n, n, |i, j| 0.5 * (a[(i, j)] + a[(j, i)]));
+        for e in [sym_eigen(a.clone()), jacobi_sym_eigen(a.clone())] {
+            let worst = (0..n).map(|k| { let v = e.eigenvectors.column(k); (&a * v - v * e.eigenvalues[k]).norm() }).fold(0.0, f64::max);
+            let ortho = (e.eigenvectors.transpose() * &e.eigenvectors - DMatrix::<f64>::identity(n, n)).norm();
+            let mut got: Vec<f64> = e.eigenvalues.iter().copied().collect();
+            got.sort_by(f64::total_cmp);
+            let mut want = lam.clone();
+            want.sort_by(f64::total_cmp);
+            let dev = got.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+            assert!(worst < 1e-10 && ortho < 1e-10 && dev < 1e-10, "residual {worst:e}, orthonormality {ortho:e}, eigenvalues {dev:e}");
+        }
     }
 
     #[test]

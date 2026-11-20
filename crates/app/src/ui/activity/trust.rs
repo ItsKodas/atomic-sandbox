@@ -104,8 +104,11 @@ pub fn lines(m: &crate::sim::ModelStatus, scene: &crate::scene::Scene, st: &UiSt
         }
     }
     for l in &m.class_loo {
+        // a key the class rule trusts while its tail-aware inflations send steps to DFT (code 24)
+        // is never a ✓ (trust tightening, Review Focus 3; Task 8 review I1): its row is drawn, ✗
+        let held = |s: &sim::SpeciesVerdict| s.trusted && words::tail_note(s).is_some();
         v.push(Line {
-            met: l.trusted,
+            met: l.trusted && !l.species.iter().any(held),
             why: false,
             text: words::class_line(l),
             hover: format!(
@@ -124,9 +127,9 @@ pub fn lines(m: &crate::sim::ModelStatus, scene: &crate::scene::Scene, st: &UiSt
         // per environment species when the class holds more than one (an atom answers by its own),
         // and always for a refused class: its key's row says which key is short and of what (M8a
         // user-fix 3, the controller's ruling on concern 1 — the user learns what to train)
-        for s in l.species.iter().filter(|_| l.species.len() > 1 || !l.trusted) {
+        for s in l.species.iter().filter(|s| l.species.len() > 1 || !l.trusted || held(s)) {
             v.push(Line {
-                met: s.trusted,
+                met: s.trusted && !held(s),
                 why: false,
                 text: format!("    {}", words::species_line(l.class, s)),
                 hover: format!(

@@ -64,8 +64,10 @@
 //!    *ionic surface*) differ from the model's `Provenance` → teacher, unconditionally; the sample
 //!    is NOT kept (it belongs to a different Kohn-Sham surface than the store's). The ionic tag
 //!    (`Provenance::ionic`, `crate::pseudo::provenance_tag`) follows the physics, not the menu:
-//!    `"none"` whenever nothing is pseudised (H₂ under `CoresOnly` *is* the all-electron surface),
-//!    else `"<policy>/<recipe hash>/shared<τ>/<τ_c>/stop2x<floor>"`; the surfaces differ by tens of Ha per pseudised
+//!    the all-electron tag `none/fd5e-3/pin1e-5` whenever nothing is pseudised (H₂ under `CoresOnly` *is* the
+//!    all-electron surface; `crate::pseudo::is_all_electron_tag` also answers for the legacy `"none"`), else
+//!    `"<policy>/<surface hash>/fd5e-3/stop2x<floor>/pin1e-5"` (Fermi–Dirac at kT = 5 mHa and the GPU stop rules, plan
+//!    2026-11-13 Task 9; the shared-shell-era `…/shared1e-3/1e-1/stop2x5e-8` is the legacy tag); the surfaces differ by tens of Ha per pseudised
 //!    atom and in bond angles, so a model taught on one is never consulted on another. **With a
 //!    shared collection attached** (M8a Task 4a, `shared` module doc) the comparison is the
 //!    collection's surface-key check instead: any box, neutral, automatic multiplicity, the same
@@ -104,7 +106,11 @@
 //!      force, which is not the teacher's: the scene is solved at one spin state, and a pulled-
 //!      apart pair keeps it (the restricted H₂ singlet lies 4.6e-2 Ha above 2 E_ref at r = 6.4,
 //!      measured; the diagnosis §1). A one-atom scene is exempt: its answer is E_ref, the
-//!      teacher's own isolated atom (rulings S5, S9).
+//!      teacher's own isolated atom (rulings S5, S9). So is a **stray atom** of a bonded part
+//!      plus stray atoms whose composition checks cleared it for bonded geometries like this one
+//!      (`stray` module doc, "Answering inside a region"; spec 2026-11-18 §4.4): exempt from 5a–5e,
+//!      the bonded part judged on its own (rule 7 per bonded atom, 5d and the fences on the bonded
+//!      part alone).
 //!    - **5b, coordination ratio** (M6 Task 11): an atom whose coordination C_t = Σ_{j∈t} f_c(r_ij)
 //!      (the n = 0 body-2 feature of neighbour species t) is more than
 //!      [`surrogate::envelope::COORDINATION_RATIO`] = 3 below the smallest the fit has seen
@@ -112,12 +118,12 @@
 //!      relatively, because one kept stretched-pair sample (the user's r = 5.125, f_c 0.05) put an
 //!      empty neighbourhood half a training spread inside the old spread box (derivation and the
 //!      old/new decision on the repro: the envelope module doc). An isolated atom of a fitted
-//!      sample (the stray atom of a kept 5a fallback, B = 0) is no training atom and never enters
-//!      the envelope (`surrogate::envelope` module doc, "Isolated atoms are not training atoms"):
-//!      admitted, it would set the minimum to 0 and switch this rule off for its species
-//!      everywhere. A model file whose stored envelope admitted them (written before this rule)
-//!      has its envelope rebuilt from its stored samples at install, without a refit
-//!      (`install_sidecar`, `rebuild_envelope_without_isolated`; a shared collection keeps no
+//!      sample (a released stray atom, or the stray atom of a kept 5a fallback, B = 0) is no
+//!      training atom and never enters the envelope (`surrogate::envelope` module doc, "Isolated
+//!      atoms are not training atoms"): admitted, it would set the minimum to 0 and switch this
+//!      rule off for its species everywhere. A model file whose fit admitted them (written before
+//!      this rule) holds those samples out at install (`Q_LONE`, `Q_STRAY`) and its fit is rebuilt
+//!      from its stored samples without them (`install_sidecar`; a shared collection keeps no
 //!      envelope — its fit is rebuilt from the samples at open).
 //!    - **5c, spread**: any feature farther than `max_descriptor_distance` (3.0) training spreads
 //!      outside its per-feature training range (`surrogate::Envelope`, unit in its module doc).
@@ -191,7 +197,9 @@
 //!    condition, below).
 //! 7. **Energy uncertainty, per atom and epistemic only**: `energy_std` is the TOTAL energy's
 //!    std with the aleatoric floor (N·s_E)² (Task 3), so the criterion is
-//!    `√(energy_std² − (N s_E)²) / N ≤ energy_std_per_atom` (1e-3 Ha). The floor is excluded
+//!    `√(energy_std² − (N s_E)²) / N ≤ energy_std_per_atom` (1e-3 Ha), N the energy-row atoms
+//!    (`surrogate::energy_row_atoms`: the atom count without an isolated atom, the bonded part's at a
+//!    stray-atom scene; stray-atoms ruling 9a). The floor is excluded
 //!    because it is the teacher's own scatter (egg-box, SCF lag) — the part of the residual no
 //!    number of samples removes, so a fallback triggered by it would teach the model nothing;
 //!    the epistemic part is what new samples shrink, so it is the part a fallback can act on.
@@ -206,6 +214,22 @@
 //!    geometries where the std decides (audits, rule-4b and rule-6/7 fallbacks), ≥ 1, used from
 //!    three comparisons on. A refusal it decides says "(the model's std × λ, its measured
 //!    calibration for this environment class)".
+//!
+//!    **And by the tail-aware inflations** (trust tightening, spec 2026-11-18 §4; [`calibrate`],
+//!    "The tail-aware inflations"): per environment key, λ_F(j) = max(λ_sum, λ_T) on atom j's
+//!    force std (rule 6) and max(max_j λ_F(j), max_k λ_E(k)) on σ_E,epi/N (rule 7), N the
+//!    normalisation rule 7 and λ_E share (`policy::energy_atoms`). λ_T and λ_E ask rule 6/7's own
+//!    question of the measured answer sample P_A: the smallest factor at which every measured
+//!    atom (point) the rule would admit is within `WORST_ATOM` (3× the bound; λ_E: 1× the tier)
+//!    and, from the evidence floor on, its rms within `ENTER`. A key with fewer than 3 P_A points
+//!    of its own takes its class's λ_T and λ_E as floors. The bounds and the tier never move; every
+//!    factor is ≥ 1; a NaN or ∞ factor refuses (∞·0 counts as ∞). The factors move at refits,
+//!    installs and policy changes only (`refit_cal`), never on a step they decided. A step refused
+//!    only by λ_T or λ_E — it passes at λ_sum — is history code 24
+//!    ([`HISTORY_RULE_TAIL_INFLATION`]), never in P_A; its words name the factor and its measured
+//!    cause ("(the model's std × λ_T 7.7: a measured atom at 4.5× the bound with the model's std
+//!    0.13× of it)"; at ∞ "… it lifts as the window ages"), and are byte-identical to the λ_sum
+//!    words when λ_sum is the larger.
 //! 8. **Audit** (ruling S7): every `audit_every`-th step the model answers (2000 by default;
 //!    0 disables) the teacher checks it at that geometry, the sample is kept and the gap is
 //!    recorded ([`SurrogateKs::last_audit`]). If |gap|/N > `energy_std_per_atom` — or, since
@@ -307,6 +331,124 @@
 //! (44 → 162 steps/s at N = 20 for k = 1 → 4), at S = 2 N = 20 80 % (889 → 1819), at S = 1
 //! (H₂) ≈ 2 µs of an 8 µs step; four 0.25 fs steps move a hydrogen at 2000 K (v_rms 3.2e-3
 //! Bohr/a.u.) ≈ 0.13 Bohr, inside the 3-spread envelope that is checked every step.
+//!
+//! **The history's flags and epistemic energy std** (trust tightening Task 3, spec 2026-11-18 §4,
+//! "The sample P_A"). Every consulted-model point (`record_history_point`) carries a flags word
+//! and the total-energy epistemic std. Neither reads the step's σ or any λ to decide *which* step
+//! is flagged — the sample they select must be chosen blind to what it measures:
+//!
+//! * `CADENCE_FRESH`: `cadence_steps` counts every step that reaches the gate (rules 1–4; the ones
+//!   it refuses included — the Task 3 review's minor, so the phase does not follow rule 4's
+//!   untrust, which follows audit failures on an answered-step cadence σ-refusals shift) from 0,
+//!   and **nothing resets it** (not a refit, an install, a policy change, an edit or a forget); a
+//!   step is cadence-fresh when its count c satisfies c mod k = 0, k = `variance_cadence` (≥ 1).
+//!   `consults` is not used: it restarts on every fresh variance, and a variance refused by rule
+//!   6/7 is fresh on the next step, so its phase follows σ. The bit selects steps; it does not
+//!   force the variance: on a cadence-fresh step that `consults` does not make fresh, the last
+//!   accepting verdict is reused as before, so nothing any rule decides moves. A draft-mode step
+//!   is never cadence-fresh for the history (Task 5: draft-mode points are not in P_A).
+//! * `NOVEL` (Task 5; the Task 3 review's MUST): rule 5d's novelty ν > 1 at the geometry. It is
+//!   evaluated with every fresh variance (where 5d decides) and, **read-only**, on every
+//!   cadence-fresh step that reuses a verdict — where 5d decides nothing and the step may carry a
+//!   class code that a fresh verdict would have written as 5d's 11. So on every cadence-fresh
+//!   step the bit is a function of the geometry and the fit alone, and `calibrate`'s answer sample
+//!   leaves novel points out whichever code they carry. Off the cadence it is set only where the
+//!   variance was fresh (and P_A does not read those points). The cost: one null-space projection
+//!   per k-th consult at most, beside the variance it would otherwise share.
+//! * `FENCED`: the geometry is near a quarantined or forgotten sample (`near` non-empty), an atom
+//!   is near a misfit (`near_misfit`), or the shell or audit fence would refuse it. All three are
+//!   evaluated on every consulted step — the audit fence read-only (`audit_fence_refusal`) when an
+//!   earlier rule (the class rule, 4b) already refused — so a code 5/6/21 point inside a fence is
+//!   marked (spec review I4: those codes do not imply that the fences passed). A background audit's
+//!   bit is its dispatch step's, OR the fences at its judgement.
+//! * `TICK`: the point a calibration tick left (below, "Calibration ticks"): in P_A whichever
+//!   code it carries and whether or not it is cadence-fresh, unless fenced or novel.
+//! * The epistemic energy std, Ha: σ_E,epi = √max(σ_E² − f², 0), with σ_E the model's total
+//!   predictive energy std and f its aleatoric floor — N·s_E for a model fitted on energies per
+//!   atom, s_E otherwise (`surrogate::model`, "Predictive variance": σ_E² = f² + φ̃ᵀΣφ̃) — the
+//!   same number rule 7 divides by N and inflates (`epistemic_energy_std`). The subtraction
+//!   recovers φ̃ᵀΣφ̃ to an absolute error of about ulp(σ_E²), i.e. σ_E,epi to ≈ 1.5e-8·f when the
+//!   floor dominates (≈ 1e-13 Ha per atom on a 1e-5 Ha/atom floor, 10⁻¹⁰ of the tier). With the
+//!   floor σ_E was built from, the radicand is never negative (σ_E = √fl(f² + φ̃ᵀΣφ̃) ≥ f, and
+//!   correctly rounded squaring is monotone); one below 0 is clamped to 0 all the same. A
+//!   non-finite or negative value is recorded as absent, never pushed (the history refuses it).
+//!
+//! **Calibration ticks** (trust tightening Task 7; spec 2026-11-18 §4, "Ticks on their own
+//! cadence"). A trusted key's answers are measured on steps nothing selected by σ: every
+//! [`TICK_EVERY`] = 25th **in-envelope** step, per provider, independent of `audit_every` (whose
+//! default 2000 would let a trusted key's 300-point window never age, and whose 0 would give no
+//! ticks at all).
+//! * **In-envelope**: a strict-mode step past the gate (rules 1–4), the class rule (4b), the
+//!   envelope (5a–5c, 5e and 0b's lone-atom refusal) and every fence (the quarantine and misfit
+//!   fences, the shell and audit fences — the `FENCED` bit's set). Rule 5d is not in the decision:
+//!   it is evaluated with the variance, which the tick forces; a novel tick's point carries `NOVEL`
+//!   and stays out of P_A. `tick_steps` counts these steps and **nothing resets it**; the step whose
+//!   count is a multiple of `tick_every` is a tick. A draft-mode step is never in-envelope (its
+//!   points are not in P_A) and does not advance the count. The gate is part of the predicate, by
+//!   spec (the Task 7 review's M6): after a failed tick or audit untrusts the model (rule 4), the
+//!   steps until the refit are gate refusals and leave no point, so the old generation's P_A misses
+//!   the interval right after a large error — contained, because the failing comparison itself is
+//!   in the history and the refit replaces the model.
+//! * **A dead time after every tick** (the Task 7 review's I1 and re-review's R1, the controller's
+//!   re-ruling; spec §4's amendment): after **every** due tick — answered or refused, taken or
+//!   skipped — the count pauses for D in-envelope steps (`tick_dead`), then 25 counted steps make
+//!   the next tick due. D is σ-blind: ⌈EMA(auditor job wall ms) / EMA(in-envelope step wall ms)⌉
+//!   (`tick_dead_time`), both EMAs over every job of every kind and every in-envelope step (one
+//!   sample capped at 1 s, so a pause is not a step), never selected by an outcome; 0 without an
+//!   auditor or before its first job; fixed in tests (`tick_dead_fixed`). So the tick-eligible
+//!   steps are the same whatever the ticks' σ outcomes, and with D ≥ the job's duration an answered
+//!   tick's job is done before the next one falls due. (The round-1 rule, counting from the previous
+//!   tick's completion, paused only after answered ticks — T = t_solve/t_step uncounted steps after
+//!   an answered tick, none after a refused one — so refused stretches were over-weighted by
+//!   (25 + T)/25; `a_tick_samples_answered_steps_at_their_population_share` fails under it and
+//!   under the original count-every-step rule.) A teacher solve **cancelled** on an in-envelope
+//!   step undoes what the step booked — its count or dead-time step, and the counts (the step did
+//!   not happen; its retry is the tick if this one was — the review's M2: fallback ticks are the
+//!   σ-refused ones, so losing them to cancels would be σ-coupled).
+//! * **Decided before the variance, on counters and these outcomes alone** — never on σ, a λ, or
+//!   whether rules 6/7 will answer — and the decision **forces the variance read-only**: the
+//!   novelty (5d) is evaluated for the `NOVEL` bit and the stds for the point even where the
+//!   verdict is reused, while the reused verdict, and with it every rule's decision and rule 8's
+//!   `answered` count, stays as it was.
+//! * **Served.** With a background auditor that is **busy** — an answered tick's job outliving the
+//!   dead time, or other work (a rule-8 audit, a refresh, a reference) — the tick is **skipped and
+//!   counted**
+//!   (`TickCounts::skipped_busy`), whatever answers the step — a fallback tick is skipped too, so
+//!   the skip does not read σ — and never deferred. Otherwise: at a **fallback** (rules 6/7, 5d, the relax verification) it needs
+//!   no solve — the teacher's answer and the model's stds are both at hand — and the fallback's
+//!   point carries `TICK`; at an **answered** step it is an audit, judged by rule 8 as well (a
+//!   failed tick untrusts as a failed audit does): asynchronously on the free auditor (an audit job
+//!   carrying `TICK`; when rule 8 falls due on the same step the one job serves both), or — with no
+//!   auditor (the CPU teacher, the harness) — **in the step** ([`ticks_in_step`](SurrogateKs::ticks_in_step)).
+//!   A tick alone is not rule 8's audit: rule 8's cadence (`answered`, `audit_due`, the burst)
+//!   and the checklist's box-affected count are untouched by it, and a box-affected tick answer
+//!   does not make rule 8 audit again. Its **dispatch** can wait on a tick, as on any job (the
+//!   review's M3): a rule-8 audit falling due while a tick's job is on the auditor is deferred to the
+//!   next answered step once the auditor is free (`audit_due`), exactly as behind a refresh.
+//! * **Counted** ([`tick_counts`](SurrogateKs::tick_counts), booked in one place,
+//!   `tick_outcome`): every tick that fell due is exactly one of **recorded** (taken, its point in
+//!   the history: [`ticks_taken`](SurrogateKs::ticks_taken)), **unrecorded** (taken, no point: a
+//!   box-affected, unfit or variance-less answer — the review's M1: counted apart, so the readout
+//!   cannot show calibration while P_A does not grow), **skipped_busy** (the auditor busy with other
+//!   work) or **lost** (its auditor job abandoned by a Forget or an installed model, `reset_audits`,
+//!   or its thread gone; an answer returned failed or unjudged — discarded, inside a shell band; a
+//!   failed teacher solve; no prediction to compare), or is still in flight.
+//!   [`ticks_skipped`](SurrogateKs::ticks_skipped) = skipped_busy + lost. `due` counts every due
+//!   tick; `answered_due` and `answered_skipped_busy` those whose step the model answered; and the
+//!   σ-blind population counters `population` (every in-envelope step, in the dead time and with a
+//!   job in flight included) and `population_answered` (of those, the model's answers). The
+//!   answered share among due ticks against the population's measures any σ-coupling of which
+//!   steps become ticks; the take rates at answered against refused steps, any through skips
+//!   (plan Task 9 Step 3b). Readouts; they decide nothing.
+//! * **Known limit: the history ring can lift a lock before the window does** (the review's M4).
+//!   λ_T = ∞ "lifts as the window ages": the window needs 300 newer P_A points, about 300 × (25 + D)
+//!   locked steps (7500 at D = 0). But every locked step records a code-24 point, so a parked scene
+//!   evicts the offending point from the 4096-point ring ([`surrogate::HISTORY_CAP`]) after about
+//!   4096 steps — earlier, and σ-blind, so benign. More generally, when fallbacks flood the ring, a
+//!   key's P_A window is capped at about 4096 × its P_A share.
+//! * **Cost** (spec §4, revised by the re-review's R2): the cadence is 25 + D in-envelope steps after
+//!   every tick — with an auditor D ≈ t_solve/t_step, so 36–48 at 12 ms/step and 51–79 at 5 ms/step
+//!   for 130–270 ms solves; without one D = 0, one teacher solve in the step per 25 answered steps.
 //!
 //! # Draft mode (user request 2026-10-14: `FallbackPolicy::never_fallback`)
 //!
@@ -593,18 +735,25 @@
 //!   unlucky) — an rms over a heavy-tailed error's benign early points does not bound its tail.
 //!   **Below three points of evidence** (`MIN_EVIDENCE`) the posterior's claims are unverified and
 //!   the rule of before stands unchanged — RMS ≤ 1 **and** max ≤ 1 on the force, LOO energy max ≤
-//!   1 (`trust::class_refusal`) — and the guard refuses both ways. Nothing is loosened without
-//!   evidence, and a class the max refuses for one outlier earns the calibrated verdict from its
-//!   own three rule-4b fallbacks (the Morse fixture: 201 samples with one at 3.6 Bohr, LOO max
-//!   1.08×, enters after 10 fallback steps and holds —
+//!   1 (`trust::class_refusal`) — and the guard refuses both ways. **The evidence floor** (trust
+//!   tightening, spec 2026-11-18 §3; `calibrate`, "The evidence floor"): the calibrated verdict
+//!   opens a key alone only once its window's attributed verdict points carrying a fit id span
+//!   `FLOOR_FITS` = 12 distinct fits **and** `FLOOR_POINTS` = 60 points; below that, with
+//!   evidence ≥ 3, the rule of before must pass as well (`ClassKey::Floor`, named when the
+//!   calibrated verdict itself passes) and the worst-atom guard applies both ways. Saved models
+//!   and collections are re-judged at load, no grandfathering: legacy points carry no fit id, so
+//!   a key saved open with LOO max > 1 loads closed. Nothing is loosened without evidence, and a
+//!   class the max refuses for one outlier earns the calibrated verdict from its own rule-4b
+//!   fallbacks once they meet the floor (the Morse fixture: 201 samples with one at 3.6 Bohr, LOO
+//!   max 1.08×, enters after 120 fallback steps — the 12th fit; 10 before the floor — and holds:
 //!   `a_class_refused_for_one_outlier_earns_the_calibrated_verdict_and_holds`). The max over the
-//!   class is gone where evidence exists: the verdict is about the expected error over the
+//!   class is gone where the floor is met: the verdict is about the expected error over the
 //!   class's environments (what rule 6's "std ≤ bound" claims per step), measured by the teacher
 //!   at the geometries the class would answer. A sample whose LOO is undefined (I − H_ss singular)
 //!   counts as infinitely off (RMS ∞); a comparison in the evidence that is not a number makes W
 //!   and κ infinite. The refusal names the term that decided (`ClassKey::Calibrated` the measured
-//!   force, `LooFloor` the leave-one-out floor, `MeasuredEnergy`, `WorstAtom`; the uncalibrated
-//!   `Force` / `Energy`). The same verdict holds for the user's #344 shape (a compressed H–H in
+//!   force, `LooFloor` the leave-one-out floor, `MeasuredEnergy`, `WorstAtom`, `Floor` the evidence
+//!   floor; the uncalibrated `Force` / `Energy`). The same verdict holds for the user's #344 shape (a compressed H–H in
 //!   H₃⁺): a many-body class the max rule refuses for one compressed trimer (LOO max 1.57×)
 //!   enters on its own rule-4b comparisons and holds (`a_compressed_trimer_does_not_flip_the_many_body_verdict`).
 //! - **Per environment species** (M8a user-test fix 2, the controller's rulings; `calibrate` "Per
@@ -895,6 +1044,29 @@
 //! for good — from the store and the shared collection's file — once the refit after the last
 //! Forget has run; no refit, the fit bitwise unchanged, every index the provider holds remapped.
 //!
+//! **Re-solved samples** (code 9, `Q_RESOLVED`; Fermi–Dirac spec §7.5–7.6 and §8, plan 2026-11-13 Task 15): a sample
+//! the collection migration re-solved for the new solver whose state changed (class S). Out of the fit, the envelope,
+//! the grade, the leave-one-out and the class statistics like a held sample (`excluded` is "code ≠ 0"); **not**
+//! counted by the recovery's 10 % held cap (`quarantined() + forgotten()`) nor by `fencing()` — it is no misfit hold —
+//! and **not the user's**: Forget and Restore refuse it. Before its review it does not fence: the fit simply has no
+//! data there. **The review** (`review_resolved`) runs inside a refit, after its first fit and before the trust
+//! judgement (votes, release, recovery), only once the migration pass is complete (`migration.txt` at "complete" or
+//! "reviewed": every sibling present), while a code-9 sample remains and the store changed since the last review: a
+//! candidate is fitted on the fit's members plus every code-9 sample, each one's leave-one-out ratio in it
+//! (`loo_ratio`, against its own bounds) is read, ≤ 1 releases it (9 → 0; the refit is rebuilt with it and the trust
+//! machinery judges it as any new data), > 1 keeps it at 9. A **kept** one is a stored label the model cannot
+//! reproduce: it fences like a held sample (`fences()`, F4; the fence's on-switch is `any_fences()`, controller ruling
+//! A, since `fencing()` does not count it) — but never joins M (it is not fitted), is never code 1 (no ratchet), and
+//! purge's lift votes never lift it (they take code 7 only). Like a held sample, one fresh teacher answer next to it
+//! that agrees with the model settles it in `admit` — released when the model reproduces it, else superseded
+//! (controller ruling B) — and a later review can still release it. Its verdict is in `migration.txt`'s review log
+//! (collection indices, the latest per sample), read back at attach (ruling R13), renumbered by a purge (F3), and
+//! written at the refit's end after the status records it names. Judged by the review: code-9 samples whose box has
+//! its references and that have no stray atoms. One with stray atoms waits at 9, unreviewed and not fencing (a known
+//! limit, spec §7.6 "Not judged"): the log lists it as `waiting` and stays "complete" while it remains, and the note
+//! counts it. The review repeats when the store, the policy's bounds or the basis (degree cap, body-4 degree) changed;
+//! its note only when the verdicts changed.
+//!
 //! **Box-affected answers** (fix round 4; threshold Task 9, h-scaled by ruling S17): a teacher
 //! answer whose reported face density (`EvalStats::face_density`: max ρ on the outermost grid
 //! plane, one spacing h inside the Dirichlet wall) exceeds [`box_affected_face_density`]`(h)` =
@@ -1088,15 +1260,16 @@
 //! # Pseudopotential scenes (M7 Task 9)
 //! - **Never trained on** (before `admit` can quarantine, fence or release anything on it): a teacher
 //!   answer with `EvalStats::core_overlaps` (two ions' frozen cores overlap — the approximation fails,
-//!   spec §5.6) and one with `EvalStats::occupation_changed` (the shared-shell pattern differs from the
-//!   previous step's: E(R) jumps by the orbital-polarisation energy, Task 6 review A.6). The answer is
-//!   still the step's; the note reads "surrogate: sample not kept (cores overlap — spec §5.6)", the
-//!   activity row is `TeachOutcome::UnfitNotKept`. The same holds for a background audit's answer and a
-//!   sampling pass's geometry (`EvalStats::untrainable`).
+//!   spec §5.6) and one the `branch_jump` guard flagged (`EvalStats::branch_jump`: F changed by more than the
+//!   forces' work since the teacher's previous answer — another stationary state, spec 2026-11-13 §6.3; it
+//!   replaced the shared-shell occupation watch in plan 2026-11-13 Task 9). The answer is still the step's;
+//!   the note reads "surrogate: sample not kept (cores overlap — spec §5.6)" or "(… the forces' work —
+//!   Fermi–Dirac spec §6.3)" (`sim::untrainable_citation`), the activity row is `TeachOutcome::UnfitNotKept`.
+//!   The same holds for a background audit's answer and a sampling pass's geometry (`EvalStats::untrainable`).
 //! - **Force-label noise prior** ([`PSEUDO_FORCE_NOISE`] = 5e-5 Ha/Bohr per component, task-8b review
 //!   ruling (b) and task-8a): the GPU pseudo path's own scatter at the sampling tolerance is measured
 //!   4.7–4.8e-5 on lone pseudo-O and OH, up to ≈ 7e-5 on warm teacher chains, and no model can represent
-//!   it. On a pseudo surface (`Provenance::ionic != "none"`) the fit's force noise s_F is floored at it
+//!   it. On a pseudo surface (`!pseudo::is_all_electron_tag(&Provenance::ionic)`) the fit's force noise s_F is floored at it
 //!   (`FitOptions::sigma_f_min`: the fit is redone with s_F pinned there when the evidence estimate falls
 //!   below it), so the posterior is never more confident about forces than the labels can support; and a
 //!   force **audit** is never judged against a tier below 3 × it (`policy::audit_force_floor`). The
@@ -1126,7 +1299,10 @@
 //!   (`add_sample`, `add_sample_answer` via `store::masked_by`) — is kept with `force_mask` = the
 //!   scene's mask and `use_energy` false. A mask whose length is not the nucleus count is never
 //!   used (`Scene::train_mask`); an answer with no interior atom is refused by the store (it teaches
-//!   nothing). A `.model` file or a collection reads a sample as it was stored.
+//!   nothing). A `.model` file or a collection reads a sample as it was stored. A sample with
+//!   **stray atoms** (`stray` module doc) carries a mask too, its energy fitted: its stray atoms'
+//!   force rows are zero and are left out (`stray::mask_stray_atoms`, at every entry to the store;
+//!   in memory only for a loaded sample).
 //! - **The model never answers in a masked scene** (`TeachRule::Segment`, checked in `evaluate`
 //!   before rule 1): every step is the teacher's and is kept; nothing is audited, judged as a fallback
 //!   point, thinned or held out there — the caps and edge atoms are not the source's, so a model
@@ -1224,8 +1400,14 @@ mod policy;
 mod purge;
 mod quarantine;
 mod shared;
-pub use shared::COLLECTION_CHECKPOINT_PREFIX;
+pub use shared::{legacy_model_refusal, predecessor_of, LAST_PRE_FD_RELEASE, COLLECTION_CHECKPOINT_PREFIX, PASS_STARTED_WITH_PREVIOUS_SOLVER};
+pub use purge::PURGE_WAIT_MIGRATION;
 mod store;
+pub(crate) use store::PassKeep;
+// the stray-atom logic (spec 2026-11-18): the composition checks and the hold-out (plan Task 3); answering inside a
+// cleared region is Task 4's, so a few of its items are not used yet
+#[allow(dead_code)]
+mod stray;
 mod teach;
 mod triples;
 mod trust;
@@ -1238,9 +1420,10 @@ use ledger::*;
 use lone::Lone;
 use policy::*;
 use quarantine::*;
-pub use audit::{history_rule_code, history_rule_name, AuditRecord, AuditVerdict, HISTORY_RULE_CLASS_AND_VARIANCE};
-pub use calibrate::{calibrate, refusal_words, Calibration, ClassCalibration, ClassStats, ClassVerdict, WordsInput, ENTER, LEAVE, MIN_EVIDENCE, WINDOW_POINTS, WORST_ATOM};
+pub use audit::{history_rule_code, history_rule_name, AuditRecord, AuditVerdict, HISTORY_RULE_CLASS_AND_VARIANCE, HISTORY_RULE_TAIL_INFLATION};
+pub use calibrate::{calibrate, floor_count, refusal_words, Calibration, ClassCalibration, ClassStats, ClassVerdict, WordsInput, ENTER, FLOOR_FITS, FLOOR_POINTS, LEAVE, MIN_EVIDENCE, WINDOW_POINTS, WORST_ATOM};
 pub use ledger::EVENT_QUEUE;
+pub(crate) use policy::PSEUDO_FORCE_NOISE;
 pub use policy::{box_affected_face_density, AtomVerdicts, FallbackPolicy, BOX_AFFECTED_FACE_DENSITY, FORCE_STD_BOUND_MAX, GRADE_MAX};
 pub use quarantine::{
     FENCE_VOTES, FENCE_VOTE_LIMIT, NO_MODEL_SAMPLE_FACTOR, QUARANTINE_FRACTION, QUARANTINE_MAX_FRACTION, QUARANTINE_ROUNDS,
@@ -1289,6 +1472,10 @@ struct ModelAnswer {
     /// epistemic part) — the history's point (M8a Task 1, `surrogate::history`) of an in-step
     /// audit or of a consulted-model fallback. `None` when the model has no variance factor.
     stds: Option<(f64, Vec<f64>, Vec<f64>)>,
+    /// The total-energy epistemic std of `stds`' energy std under the model that predicted it
+    /// (`epistemic_energy_std`; module doc, "The history's flags"), unsanitised — the history
+    /// point sanitises it. `None` with `stds`.
+    energy_std_epistemic: Option<f64>,
 }
 
 /// One teacher step: why (the note's text, the rule's code and the atom it names), with what
@@ -1323,6 +1510,74 @@ struct Handoff {
     /// or `HISTORY_RULE_CLASS_AND_VARIANCE` when the class rule refused and rule 6/7 would have
     /// too; M8a Task 2). Unused for an audit or a gate refusal.
     history_rule: u8,
+    /// The history point's flags (module doc, "The history's flags"): the consulted step's
+    /// cadence-fresh and fenced bits; empty where no point is recorded (a gate refusal, a capped
+    /// segment, a non-finite answer); `TICK` on a calibration tick's point.
+    flags: surrogate::history::PointFlags,
+    /// An in-step audit that is a calibration tick alone, not rule 8's (module doc, "Calibration
+    /// ticks"): judged as an audit, but a box-affected answer does not make rule 8 audit again.
+    tick_only: bool,
+}
+
+/// The calibration ticks' cadence (module doc, "Calibration ticks"; spec 2026-11-18 §4): every
+/// 25th counted in-envelope strict-mode step, per provider, independent of `audit_every`; after
+/// every due tick the count pauses for the dead time D (`SurrogateKs::tick_dead_time`).
+pub const TICK_EVERY: usize = 25;
+
+/// The weight of the newest sample in the dead time's EMAs (`SurrogateKs::tick_dead_time`).
+const TICK_EMA_WEIGHT: f64 = 1.0 / 16.0;
+
+/// The largest in-envelope step wall time one sample may stand for, ms: a pause, an edit or a
+/// stalled frame between two steps is not a step's time.
+const TICK_STEP_SAMPLE_MAX_MS: f64 = 1000.0;
+
+/// An exponential moving average with [`TICK_EMA_WEIGHT`]; the first sample seeds it.
+fn ema(prev: Option<f64>, x: f64) -> f64 {
+    prev.map_or(x, |p| p + TICK_EMA_WEIGHT * (x - p))
+}
+
+/// What became of a calibration tick that fell due (module doc, "Calibration ticks").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TickOutcome {
+    /// Taken, its point recorded.
+    Recorded,
+    /// Taken, no point: the answer was box-affected, unfit or without a variance factor, or the point was
+    /// deferred to a stray attribution check (its point arrives later with `TICK`).
+    Unrecorded,
+    /// The auditor was busy with other work (rule 8, a display, a reference).
+    SkippedBusy,
+    /// Not measured: its auditor job abandoned (a Forget, an installed model, the thread gone) or
+    /// returned failed or unjudged, its solve failed, or no prediction to compare.
+    Lost,
+}
+
+/// The calibration ticks' counts (`SurrogateKs::tick_counts`; module doc, "Calibration ticks"):
+/// every tick that fell due is in exactly one of the first four, or still in flight.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TickCounts {
+    /// Taken, its point recorded.
+    pub recorded: u64,
+    /// Taken, no point (box-affected, unfit, no variance factor), or the point deferred to a stray attribution check (its point arrives later with `TICK`).
+    pub unrecorded: u64,
+    /// Skipped: the auditor was busy with other work.
+    pub skipped_busy: u64,
+    /// Lost: abandoned, unjudged, failed, or nothing to compare.
+    pub lost: u64,
+    /// Of the taken ones, served by a teacher solve in the step (no auditor).
+    pub in_step: u64,
+    /// Every tick that fell due (the four above plus the one in flight, if any).
+    pub due: u64,
+    /// Of `due`, those at a step the model answered (taken or skipped).
+    pub answered_due: u64,
+    /// Of `answered_due`, skipped because the auditor was busy.
+    pub answered_skipped_busy: u64,
+    /// Every in-envelope step (the tick predicate's population: in the dead time and with a job in
+    /// flight included). σ-blind: the diagnostic's denominator.
+    pub population: u64,
+    /// Of `population`, the steps the model answered: `population_answered / population` against
+    /// `answered_due / due` measures any σ-coupling of which steps become ticks (the Task 7
+    /// re-review's R1 diagnostic; plan Task 9 Step 3b).
+    pub population_answered: u64,
 }
 
 /// The surrogate force provider (module doc).
@@ -1456,6 +1711,31 @@ pub struct SurrogateKs {
     last: Option<LastEval>,
     /// Consultations since the variance was last evaluated (the cadence, module doc).
     consults: usize,
+    /// Steps that reached the gate so far, never reset (module doc, "The history's flags"): a step
+    /// whose count is a multiple of `variance_cadence` is cadence-fresh. Unlike `consults` its phase
+    /// does not follow σ.
+    cadence_steps: u64,
+    /// The calibration ticks' cadence, in in-envelope steps ([`TICK_EVERY`]; module doc,
+    /// "Calibration ticks"). 0 takes no tick: the tests' "ticks off" only.
+    tick_every: usize,
+    /// In-envelope strict-mode steps so far, never reset (module doc, "Calibration ticks"): every
+    /// `tick_every`-th is a tick.
+    tick_steps: u64,
+    /// What became of the ticks that fell due ([`TickCounts`]; `tick_outcome`).
+    ticks: TickCounts,
+    /// A tick's audit job is on the auditor, its answer not yet handled (an abandoned one is lost).
+    tick_in_flight: bool,
+    /// In-envelope steps of the dead time still to pass before the count resumes (module doc,
+    /// "Calibration ticks").
+    tick_dead: u64,
+    /// A fixed dead time (tests: a deterministic schedule), instead of the timed one.
+    tick_dead_fixed: Option<u64>,
+    /// EMA of the auditor's job wall times, ms, over every job of every kind.
+    job_ms_ema: Option<f64>,
+    /// EMA of the in-envelope steps' wall times, ms, over every in-envelope step.
+    step_ms_ema: Option<f64>,
+    /// When the previous in-envelope step was decided (its wall time's start).
+    last_in_envelope_at: Option<Instant>,
     last_variance: Option<VarianceVerdict>,
     /// The fit gates' floor, |∪ S_k| over the samples a fit would use in the basis it would build,
     /// keyed by a fingerprint of those samples and that basis (`fit_floor`; the status asks for it
@@ -1519,6 +1799,12 @@ pub struct SurrogateKs {
     /// The audit being dispatched is a draft-mode guess the strict policy would have refused
     /// (`AuditJob::draft_guess`); set by `evaluate` right before `dispatch_audit`.
     dispatch_draft_guess: bool,
+    /// The flags of the step dispatching an audit (`AuditJob::flags`); set by `evaluate` right
+    /// before `dispatch_audit`, taken by `send_job`.
+    dispatch_flags: surrogate::history::PointFlags,
+    /// The audit being dispatched is a calibration tick alone, not rule 8's (`AuditJob::tick_only`);
+    /// set by `evaluate` right before `dispatch_audit`, taken by `send_job`.
+    dispatch_tick_only: bool,
     /// A failed asynchronous audit untrusted the model: the next teacher evaluation books the
     /// Model → Teacher flip at its positions (module doc, "Audit").
     audit_flip: bool,
@@ -1537,6 +1823,22 @@ pub struct SurrogateKs {
     /// leaves the model untrusted, which the surface `epoch` does not see. The views' cache key
     /// and their age line; it decides nothing.
     model_gen: u64,
+    /// The fit id (trust tightening, spec 2026-11-18 §3): the id a history point records for the
+    /// fit that judged it (`record_history_point`). Bumped only by a refit that solved new
+    /// coefficients from new teacher data — to max(this, the history's largest id) + 1, so ids
+    /// stay unique across sessions (`refit`; `fit_id_samples`) — never by a policy change, a
+    /// forget, a restore (it brings back the restored fit's own id), an install (the file's id,
+    /// else its history's largest), an attach (the collection history's largest) or a fork (the
+    /// copy's refit brings its id back at the install). 0 only while no model has ever stood: a
+    /// standing model's id is always ≥ 1 (a legacy install or attach with no id on record takes
+    /// 1), so a point's `Some(0)` never occurs and an absent id is `None`, never 0.
+    fit_id: u64,
+    /// The fit id's watermark (fix round 1, I1): the store length when the fit id was last taken
+    /// (the fitted prefix an install brought, the collection's length at an attach; 0 after a
+    /// forget). A refit takes a new id only when its standing fit holds a sample at or past it —
+    /// new teacher data — so forgetting and restoring a sample, a recovery's holds and releases or
+    /// a degree-cap retry re-solve old data and add no fit. It can only under-count.
+    fit_id_samples: usize,
     /// (`accumulated`, quarantine codes) when the standing fit was installed: what the training
     /// views call `Fitted` (Task 4 review, the released-sample ruling). A readout only.
     fit_members: (usize, Vec<u8>),
@@ -1577,6 +1879,25 @@ pub struct SurrogateKs {
     side_queue: std::collections::VecDeque<(Scene, Provenance, JobKind, u64)>,
     /// An audit answer taken outside `evaluate`, judged at the next one (review M7).
     held_audit: Option<AuditAnswer>,
+    /// The stray-atom signatures of this session and their states (`stray`; spec 2026-11-18
+    /// §4.3, session-only): cleared with the model's basis or provenance (`stray_key`).
+    stray_book: stray::StrayBook,
+    /// The model's basis and surface (`lone::reference_settings_key`) the book's regions were built under
+    /// (`stray_book_current`).
+    stray_key: Option<(Basis, String)>,
+    /// The composition check in flight on the auditor (at most one; `queue_stray_check`).
+    stray_pending: Option<stray::StrayCheck>,
+    /// Composition checks queued so far: the id their parts' jobs carry (`AuditJob::id`).
+    stray_checks: u64,
+    /// Failed stray-atom audits waiting for their attribution check while another is in flight (`stray`,
+    /// "Audits of a cleared answer"; Task 5 fix round 1, M4), oldest first.
+    stray_attributions: std::collections::VecDeque<stray::AttributionRequest>,
+    /// The signatures whose fallbacks were told "no background teacher, so no composition check runs" this session:
+    /// the note is written once per signature, not at every step (Task 6, the Task 3 review's minor).
+    stray_no_auditor: std::collections::HashSet<stray::Signature>,
+    /// The scene-edit generation: bumped by `reset` and `discontinuity` (the driver's edit
+    /// signals, `Dynamics::after_edit`); a composition check queued before an edit is dropped.
+    scene_gen: u64,
     /// Per stored sample: the teacher's face density (NaN = not known: `add_sample`, a teacher
     /// that reports none, or a file saved without densities — which `save_sidecar` writes only
     /// when no stored sample is box-affected).
@@ -1669,10 +1990,36 @@ pub struct SurrogateKs {
     /// The shared collection this provider learns into (M8a Task 4a; `shared` module doc), if
     /// attached: the process's one writable handle of it.
     shared: Option<shared::SharedCollection>,
+    /// The attached collection's migration from its predecessor (`shared` module doc, "The migration"; plan 2026-11-13
+    /// Task 14): the offer, or the `migration.txt` it keeps. `None` without a collection or anything to migrate.
+    migration: Option<shared::MigrationSlot>,
+    /// The re-solved samples (code 9, `Q_RESOLVED`) whose last review **kept** them (`quarantine` module,
+    /// `review_resolved`; Fermi–Dirac spec §7.6 step 4): store indices. Such a sample fences (`fences`) while its code
+    /// is 9. Read back from `migration.txt`'s review log at attach (`shared::find_migration`, ruling R13), remapped by a
+    /// purge, cleared with the collection.
+    review_kept: std::collections::BTreeSet<usize>,
+    /// The store's stamp (`review_stamp_now`) when the re-solved samples were last reviewed: the review repeats only
+    /// when it moved. `None`: not reviewed in this session (an attach starts here).
+    review_stamp: Option<u64>,
+    /// The migration log's review entries (or its state) changed since `migration.txt` was written
+    /// (`flush_migration_log`).
+    review_log_dirty: bool,
+    /// Tests only: how many reviews of the re-solved samples ran (`review_resolved`).
+    #[cfg(test)]
+    pub(super) reviews_run: usize,
+    /// Tests only: an attach runs no refit (`shared::attach_inner`), so what the attach itself installed is seen.
+    #[cfg(test)]
+    pub(super) attach_refit_off: bool,
     /// Tests only: a collection fitted without the body-4 block (the basis collections had before
     /// M8a Task 5 — the user's stuck collection's repro is pinned to it).
     #[cfg(test)]
     body4_off: bool,
+    /// Tests only: the next migrated append stops after its sample record (`shared`, the status window).
+    #[cfg(test)]
+    status_window_crash: bool,
+    /// Tests only: the next migrated append fails before it writes anything.
+    #[cfg(test)]
+    migrated_append_fails: bool,
     /// Tests only: the body-4 degree every fit takes instead of the growth rule's
     /// ([`grown_body4_degree`](Self::grown_body4_degree)), in collection mode.
     #[cfg(test)]
@@ -1837,6 +2184,16 @@ impl SurrogateKs {
             pending_jump: None,
             last: None,
             consults: 0,
+            cadence_steps: 0,
+            tick_every: TICK_EVERY,
+            tick_steps: 0,
+            ticks: TickCounts::default(),
+            tick_in_flight: false,
+            tick_dead: 0,
+            tick_dead_fixed: None,
+            job_ms_ema: None,
+            step_ms_ema: None,
+            last_in_envelope_at: None,
             last_variance: None,
             fit_floor_cache: std::sync::Mutex::new(BTreeMap::new()),
             triple_cache: std::sync::Mutex::new(None),
@@ -1859,6 +2216,8 @@ impl SurrogateKs {
             audit_due: false,
             box_audits_unjudged: 0,
             dispatch_draft_guess: false,
+            dispatch_flags: surrogate::history::PointFlags::default(),
+            dispatch_tick_only: false,
             audit_flip: false,
             force_teacher: false,
             last_fallback: false,
@@ -1868,6 +2227,8 @@ impl SurrogateKs {
             fits: 0,
             last_audit_fit: 0,
             model_gen: 0,
+            fit_id: 0,
+            fit_id_samples: 0,
             fit_members: (0, Vec::new()),
             curve_cache: None,
             pending_notes: Vec::new(),
@@ -1880,6 +2241,13 @@ impl SurrogateKs {
             atom_references: Vec::new(),
             side_queue: std::collections::VecDeque::new(),
             held_audit: None,
+            stray_book: stray::StrayBook::default(),
+            stray_key: None,
+            stray_pending: None,
+            stray_checks: 0,
+            stray_attributions: std::collections::VecDeque::new(),
+            stray_no_auditor: std::collections::HashSet::new(),
+            scene_gen: 0,
             face: Vec::new(),
             fence_votes: Vec::new(),
             lift_votes: Vec::new(),
@@ -1922,8 +2290,20 @@ impl SurrogateKs {
             pass_start: None,
             pass_coverage: None,
             shared: None,
+            migration: None,
+            review_kept: std::collections::BTreeSet::new(),
+            review_stamp: None,
+            review_log_dirty: false,
+            #[cfg(test)]
+            reviews_run: 0,
+            #[cfg(test)]
+            attach_refit_off: false,
             #[cfg(test)]
             body4_off: false,
+            #[cfg(test)]
+            status_window_crash: false,
+            #[cfg(test)]
+            migrated_append_fails: false,
             #[cfg(test)]
             body4_force: None,
             #[cfg(test)]
@@ -1945,6 +2325,17 @@ impl SurrogateKs {
     /// Records the teacher's SCF tolerance in the samples' provenance (module doc).
     pub fn with_teacher_tol(mut self, tol: f64) -> SurrogateKs {
         self.teacher_tol = tol;
+        self
+    }
+
+    /// Test hook: the calibration ticks' cadence in in-envelope steps (module doc, "Calibration
+    /// ticks"; [`TICK_EVERY`] by default), **0 = no ticks**. It exists so measurements of the
+    /// model's own dynamics (its frequency, NVE, tier) can switch off the in-step ticks a provider
+    /// without an auditor serves — each one a teacher step on the trajectory (plan 2026-11-19
+    /// Task 9 ruling). Not for the app.
+    #[doc(hidden)]
+    pub fn with_tick_every(mut self, n: usize) -> SurrogateKs {
+        self.tick_every = n;
         self
     }
 
@@ -2065,6 +2456,96 @@ impl SurrogateKs {
         self.variance_checks
     }
 
+    /// Calibration ticks taken that left a history point (module doc, "Calibration ticks"): at a
+    /// fallback, in the step, or by the auditor once its answer is judged. A readout; the ticks
+    /// taken without a point are [`TickCounts::unrecorded`] — among them those whose point was
+    /// deferred to a stray attribution check (its point arrives later with `TICK`).
+    pub fn ticks_taken(&self) -> u64 {
+        self.ticks.recorded
+    }
+
+    /// Calibration ticks that fell due and were skipped: the auditor busy with other work
+    /// ([`TickCounts::skipped_busy`], whatever answered the step) or the tick lost
+    /// ([`TickCounts::lost`]). A readout (the Model tab's "calibration checks skipped").
+    pub fn ticks_skipped(&self) -> u64 {
+        self.ticks.skipped_busy + self.ticks.lost
+    }
+
+    /// Calibration ticks served by a teacher solve in the step (no auditor). A readout.
+    pub fn ticks_in_step(&self) -> u64 {
+        self.ticks.in_step
+    }
+
+    /// Every count of the calibration ticks: each tick that fell due is in exactly one of
+    /// `recorded`, `unrecorded`, `skipped_busy` and `lost`, or still in flight. A readout.
+    pub fn tick_counts(&self) -> TickCounts {
+        self.ticks
+    }
+
+    /// The tick counts the readouts show ([`sim::TrainableStatus::ticks`], plan Task 8; Task 7
+    /// review M5: through the status, never a downcast): the outcomes with their causes, the
+    /// in-step ones and the due count.
+    pub fn calibration_ticks(&self) -> sim::CalibrationTicks {
+        let t = self.ticks;
+        sim::CalibrationTicks { recorded: t.recorded, unrecorded: t.unrecorded, skipped_busy: t.skipped_busy, lost: t.lost, in_step: t.in_step, due: t.due }
+    }
+
+    /// Books what became of a tick that fell due (the one place the counts move).
+    pub(super) fn tick_outcome(&mut self, o: TickOutcome) {
+        match o {
+            TickOutcome::Recorded => self.ticks.recorded += 1,
+            TickOutcome::Unrecorded => self.ticks.unrecorded += 1,
+            TickOutcome::SkippedBusy => self.ticks.skipped_busy += 1,
+            TickOutcome::Lost => self.ticks.lost += 1,
+        }
+    }
+
+    /// A teacher solve cancelled: the step did not happen, so whatever it booked toward the ticks
+    /// is undone — `before` = (`tick_steps`, `tick_dead`, the counts) as they stood at its decision —
+    /// and the retry is counted afresh (and is the tick, if this one was): the Task 7 review's M2.
+    /// The timing EMAs are not rolled back (wall clock, not a count). Returns whether it was
+    /// cancelled.
+    fn untick_cancelled(&mut self, r: &Result<ForceResult, ProviderError>, before: (u64, u64, TickCounts)) -> bool {
+        let cancelled = matches!(r, Err(ProviderError::Cancelled));
+        if cancelled {
+            (self.tick_steps, self.tick_dead, self.ticks) = before;
+        }
+        cancelled
+    }
+
+    /// The dead time after a due tick, in in-envelope steps (module doc, "Calibration ticks"; the
+    /// controller's re-ruling on the Task 7 re-review's R1): the fixed one a test set, else
+    /// D = ⌈EMA(auditor job wall ms) / EMA(in-envelope step wall ms)⌉ — both EMAs over every job of
+    /// every kind and every in-envelope step, never selected by an outcome — and 0 without both (no
+    /// auditor, or no job measured yet: no job to outlive).
+    fn tick_dead_time(&self) -> u64 {
+        if let Some(d) = self.tick_dead_fixed {
+            return d;
+        }
+        match (self.job_ms_ema, self.step_ms_ema) {
+            (Some(job), Some(step)) if step > 0.0 && (job / step).is_finite() => (job / step).ceil().max(0.0) as u64,
+            _ => 0,
+        }
+    }
+
+    /// One in-envelope step's wall time, from the previous in-envelope step's decision (capped at
+    /// `TICK_STEP_SAMPLE_MAX_MS`, so a pause or an edit does not stand for a step), into its EMA.
+    fn time_in_envelope_step(&mut self) {
+        let now = Instant::now();
+        if let Some(prev) = self.last_in_envelope_at {
+            let ms = (now - prev).as_secs_f64() * 1e3;
+            self.step_ms_ema = Some(ema(self.step_ms_ema, ms.min(TICK_STEP_SAMPLE_MAX_MS)));
+        }
+        self.last_in_envelope_at = Some(now);
+    }
+
+    /// One auditor job's wall time (any kind: an audit, a tick, a display, a reference) into its EMA.
+    pub(super) fn time_auditor_job(&mut self, ms: f64) {
+        if ms.is_finite() && ms >= 0.0 {
+            self.job_ms_ema = Some(ema(self.job_ms_ema, ms));
+        }
+    }
+
     /// The next `evaluate` goes to the teacher regardless of the model (M6 spec §6.2: the relax
     /// verification). The answer takes the normal fallback path — kept as a sample (never
     /// thinned), reported as a model-surface fallback with the teacher gap when the model could
@@ -2103,14 +2584,23 @@ impl SurrogateKs {
                 return Err(e);
             }
         };
+        // a rule-5a fallback of a bonded part plus stray atoms the floor lets through: its answer is a composition
+        // check's scene answer (`stray` module doc, "The checks on the auditor"), raw — before the canonical surface
+        let stray_check = (h.reason.rule == TeachRule::IsolatedAtom && !h.audit && h.model.is_some() && scene.train_mask().is_none())
+            .then(|| self.stray_split(&h.pos, &h.z, &h.prov))
+            .flatten()
+            .filter(|(_, _, floor)| floor.is_none())
+            .map(|(split, sig, _)| (split, sig, stray::part_answer(&r, r.energy, h.prov.h)));
         // in collection mode every comparison and report is on the collection's canonical surface
         // (`shared` module doc, "References per box"; the identity per scene)
         let mut r = r;
         let raw_energy = r.energy;
         r.energy = self.to_canonical(&h.z, h.prov.grid_n, r.energy);
         // the event's record of the solve (read before `r` and `h` are consumed below)
-        let (teacher_ms, scf) = (r.stats.solve_ms as f64, r.stats.scf_steps);
-        let (h_audit, rule_code, atom, n_atoms) = (h.audit, h.reason.rule, h.reason.atom, h.pos.len());
+        let (teacher_ms, scf, ts) = (r.stats.solve_ms as f64, r.stats.scf_steps, r.stats.energy.ts);
+        // the event's atom count is N_e (`audit_n`), what the step's per-atom gap divides by (the Activity hover's)
+        let (h_audit, rule_code, atom, n_atoms) = (h.audit, h.reason.rule, h.reason.atom, self.audit_n(&h.pos));
+        let history_code = h.history_rule;
         let gap = h.model.as_ref().map(|m| r.energy - m.energy);
         let mut notes = Vec::new();
         let face = r.stats.face_density;
@@ -2132,12 +2622,26 @@ impl SurrogateKs {
             // a capped segment's answer is kept with the scene's mask (module doc, "Masked scenes")
             self.admit_and_keep(&h.pos, &h.z, r.energy, raw_energy, &r.forces, face, multiplicity, model_answer, &h.near, h.near_misfit, h.keep_sample, h.thin && !h.audit, h.dedup && !h.audit, essential, &h.prov, unfit, tag, scene.train_mask(), &mut notes)
         };
+        if let Some((split, sig, part)) = stray_check {
+            let kept = outcome.is_kept().then(|| self.samples().saturating_sub(1));
+            let label = stray::signature_label(&sig);
+            if self.auditor.is_none() {
+                // controller ruling C: a synchronous fragment solve would stall the step; said once per signature
+                if self.stray_no_auditor.insert(sig) {
+                    notes.push(format!("surrogate: stray atoms ({label}) — no background teacher, so no composition check runs; DFT answers (said once this session)"));
+                }
+            } else if self.queue_stray_check(scene, part, split, sig, kept) {
+                notes.push(format!("surrogate: stray atoms ({label}) — a composition check (the bonded part alone, each stray atom alone) is queued on the background teacher"));
+            }
+        }
         // an audit at a fenced-band geometry is not a judgement of the model (strict mode refuses
         // it there): the teacher answered, nothing is judged
         let judged_audit = h.audit && !h.shell_fence;
-        let n = h.pos.len().max(1) as f64;
+        // the per-atom tiers below (the over-tier report, the audit) per bonded atom at a scene with stray atoms
+        // (`stray` module doc, "Audits of a cleared answer"), else per atom
+        let n = self.audit_n(&h.pos) as f64;
         let mut stats = r.stats;
-        if stats.pseudised.is_empty() && h.prov.ionic == "none" {
+        if stats.pseudised.is_empty() && crate::pseudo::is_all_electron_tag(&h.prov.ionic) {
             self.last_pseudised = None;
         } else if !stats.pseudised.is_empty() {
             self.last_pseudised = Some((h.prov.ionic.clone(), stats.pseudised.clone()));
@@ -2152,7 +2656,7 @@ impl SurrogateKs {
         // there, an audit included) and not for a non-finite prediction (no finite stds exist)
         if let Some(m) = h.model.as_ref().filter(|_| !h.audit && !h.shell_fence && h.reason.rule != TeachRule::NonFiniteAnswer) {
             let kind = surrogate::history::PointKind::Fallback { rule: h.history_rule };
-            self.record_history_point(kind, &h.pos, &h.z, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, boxed.is_some(), false, unfit.is_some());
+            self.record_history_point(kind, &h.pos, &h.z, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, boxed.is_some(), false, unfit.is_some(), h.flags, m.energy_std_epistemic);
         }
         if h.model.is_some() && !h.audit {
             self.streak += 1;
@@ -2226,39 +2730,66 @@ impl SurrogateKs {
                     };
                     self.last_audit = Some(AuditRecord { gap, verdict, face_density: face, unaudited_steps: 0, asynchronous: false, teacher_ms: stats.solve_ms as f64 });
                     self.last_audit_fit = self.fits;
-                    // the history's point (M8a Task 1): an in-step audit is never a draft guess
-                    self.record_history_point(surrogate::history::PointKind::Audit, &h.pos, &h.z, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, box_rho.is_some(), false, unfit.is_some());
+                    // the history's point (M8a Task 1): an in-step audit is never a draft guess; a failed one
+                    // records it below, unless a check attributes it (ruling 9b)
+                    if !audit_fails {
+                        self.record_history_point(surrogate::history::PointKind::Audit, &h.pos, &h.z, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, box_rho.is_some(), false, unfit.is_some(), h.flags, m.energy_std_epistemic);
+                    }
                     // a box-affected audit judged nothing: it does not satisfy the cadence — the
                     // next answered step is audited again — and it is counted for the checklist
                     // (M8a Task 2, the Task 1 physics review's I4); the step keeps the model's
                     // energy: the gap is the Dirichlet confinement, not the model's error
-                    self.audit_due = box_rho.is_some();
-                    self.box_audits_unjudged = if box_rho.is_some() { self.box_audits_unjudged + 1 } else { 0 };
+                    // — a calibration tick alone is not rule 8's audit: its cadence and the count
+                    // stay as they were (module doc, "Calibration ticks")
+                    if !h.tick_only {
+                        self.audit_due = box_rho.is_some();
+                        self.box_audits_unjudged = if box_rho.is_some() { self.box_audits_unjudged + 1 } else { 0 };
+                    }
                     if let Some(rho) = box_rho {
                         notes.push(format!(
-                            "surrogate audit not judged: the teacher's answer is box-affected (face density {rho:.1e} > {rule:.1e}) — its gap is the box's confinement as much as the model's error; the next answered step is audited again"
+                            "surrogate audit not judged: the teacher's answer is box-affected (face density {rho:.1e} > {rule:.1e}) — its gap is the box's confinement as much as the model's error{}",
+                            if h.tick_only { " (a calibration tick: rule 8's cadence is unchanged)" } else { "; the next answered step is audited again" }
                         ));
                     }
                 }
                 if judged_audit && audit_fails {
                     // failed audit: this step is already on the teacher surface, and the jump
                     // of the reported energy at these positions is the gap itself
-                    self.audit_failed = Some(gap);
-                    self.audit_force = force_fail;
-                    self.audit_atoms = n as usize;
                     let index = outcome.is_kept().then(|| self.samples().saturating_sub(1));
-                    self.failed_audits.push(FailedAudit { pos: h.pos.clone(), z: h.z.clone(), energy: r.energy, forces: r.forces.clone(), index, ionic: h.prov.ionic.clone(), rejudges: 0, origin: AuditOrigin::Audit, pair: None });
+                    let case = FailedAudit { pos: h.pos.clone(), z: h.z.clone(), energy: r.energy, forces: r.forces.clone(), index, ionic: h.prov.ionic.clone(), rejudges: 0, origin: AuditOrigin::Audit, pair: None };
+                    // at a scene with stray atoms the signature is refused and its samples held, and a check
+                    // attributes the failure when one can run (`stray` module doc, "Audits of a cleared answer")
+                    let why = match force_fail {
+                        Some((d, b)) if gap.abs() / n <= self.policy.energy_std_per_atom => format!("worst atom's force off by {d:.1e} > {b:.1e} Ha/Bohr"),
+                        _ => format!("teacher − model {gap:+.2e} Ha, {:.1e} > {:.1e} Ha per bonded atom", gap.abs() / n, self.policy.energy_std_per_atom),
+                    };
+                    let stray = self.stray_audit_failed(scene, raw_energy, &r.forces, &case, gap, why, h.flags);
+                    let attributing = matches!(stray, stray::StrayAudit::Attributing(_));
+                    if let stray::StrayAudit::Attributing(note) | stray::StrayAudit::CountsNow(note) = stray {
+                        notes.push(note);
+                    }
+                    if !attributing {
+                        self.record_history_point(surrogate::history::PointKind::Audit, &h.pos, &h.z, m.stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), m.energy, &m.forces, r.energy, &r.forces, false, false, unfit.is_some(), h.flags, m.energy_std_epistemic);
+                        self.audit_failed = Some(gap);
+                        self.audit_force = force_fail;
+                        self.audit_atoms = n as usize;
+                        self.failed_audits.push(case);
+                    }
                     // on the refresh right after a refit the refit's own jump (E_new − E_reported
                     // at these positions) is still pending: the reported energy moves by both.
                     // (From a teacher-surface step there is nothing to book: `jump_to_teacher`.)
                     stats.refit_jump = self.jump_to_teacher(gap);
                     notes.insert(0, match force_fail {
+                        _ if attributing => format!(
+                            "surrogate audit failed at a scene with stray atoms: teacher − model {gap:+.2e} Ha ({:.1e} Ha per bonded atom) — a check of the bonded part alone says whether the model or the composition failed",
+                            gap.abs() / n
+                        ),
                         Some((d, b)) if gap.abs() / n <= self.policy.energy_std_per_atom => format!(
                             "surrogate audit failed on forces: worst atom off by {d:.1e} > {b:.1e} Ha/Bohr (teacher − model {gap:+.2e} Ha) — untrusted until a refit predicts that geometry without the audited sample"
                         ),
                         _ => format!(
-                            "surrogate audit failed: teacher − model {gap:+.2e} Ha ({:.1e} > {:.1e} Ha/atom) — untrusted until a refit predicts that geometry without the audited sample",
-                            gap.abs() / n, self.policy.energy_std_per_atom
+                            "surrogate audit failed: teacher − model {gap:+.2e} Ha ({:.1e} > {:.1e} {}) — untrusted until a refit predicts that geometry without the audited sample",
+                            gap.abs() / n, self.policy.energy_std_per_atom, self.per_atom_unit(&h.pos)
                         ),
                     });
                     (r.energy, false)
@@ -2313,7 +2844,10 @@ impl SurrogateKs {
         ev.n_atoms = n_atoms;
         ev.solve_ms = teacher_ms;
         ev.scf_steps = Some(scf);
+        ev.ts = Some(ts);
         ev.audit = if h_audit { self.last_audit.as_ref().map(|a| a.verdict) } else { None };
+        // the history code (Task 8 review M4: a code-24 row says the model was too confident)
+        ev.history_code = Some(history_code);
         self.push_event(ev);
         let surface_forces = surface_forces.unwrap_or_else(|| r.forces.clone());
         self.last = Some(LastEval { pos: h.pos, z: h.z, energy, on_model, provenance: h.prov, flip_back, surface_forces, reference: None });
@@ -2437,7 +2971,7 @@ impl ForceProvider for SurrogateKs {
             let reason = Refusal::new("surrogate: a capped segment teaches its interior atoms — the model does not answer here (its caps and edge atoms are not the source scene's)", TeachRule::Segment, None);
             let near = if self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
             let near_misfit = self.model.is_some() && self.near_misfit(&pos, &z).contains(&true);
-            let h = Handoff { prov, pos, z, reason, keep_sample: true, shell_fence: false, thin: false, dedup: true, near, near_misfit, model: None, audit: false, teacher_surface: false, history_rule: history_rule_code(TeachRule::Segment) };
+            let h = Handoff { prov, pos, z, reason, keep_sample: true, shell_fence: false, thin: false, dedup: true, near, near_misfit, model: None, audit: false, teacher_surface: false, history_rule: history_rule_code(TeachRule::Segment), flags: surrogate::history::PointFlags::default(), tick_only: false };
             return self.teach(scene, h, t0, should_abort);
         }
         // rules 1–4 (draft mode answers past rule 4 only: module doc, "Draft mode")
@@ -2464,6 +2998,18 @@ impl ForceProvider for SurrogateKs {
         // the strict policy's refusal here, before draft mode or the relax verification override
         // it: the readiness readout's (module doc, "Readiness")
         let mut strict_gate: Option<Refusal> = None;
+        // the history's cadence-fresh bit (module doc, "The history's flags"): this step's count on
+        // the never-reset counter, a multiple of k — not `consults`, whose phase a rule-6/7 refusal
+        // restarts. Every step reaching the gate counts (the Task 3 review's minor), so the phase
+        // does not follow rule 4's untrust either (audit failures, on an answered-step cadence that
+        // σ-refusals shift). A draft-mode step is never cadence-fresh for the history: its points
+        // are not in P_A (`calibrate`, "The answer sample P_A")
+        let cadence_fresh = {
+            let k = self.policy.variance_cadence.max(1) as u64;
+            let c = self.cadence_steps;
+            self.cadence_steps += 1;
+            c % k == 0 && !draft
+        };
         match self.gate(&z, &prov) {
             Err(Gate { reason, untrusted: true, .. }) if draft => {
                 strict_gate = Some(reason.clone());
@@ -2477,7 +3023,7 @@ impl ForceProvider for SurrogateKs {
                 let near = if keep_sample && self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
                 let near_misfit = keep_sample && self.model.is_some() && self.near_misfit(&pos, &z).contains(&true);
                 let history_rule = history_rule_code(reason.rule);
-                let h = Handoff { prov, pos, z, reason, keep_sample, shell_fence: false, thin, dedup, near, near_misfit, model: None, audit: false, teacher_surface: false, history_rule };
+                let h = Handoff { prov, pos, z, reason, keep_sample, shell_fence: false, thin, dedup, near, near_misfit, model: None, audit: false, teacher_surface: false, history_rule, flags: surrogate::history::PointFlags::default(), tick_only: false };
                 return self.teach(scene, h, t0, should_abort);
             }
             Ok(()) => {}
@@ -2487,68 +3033,33 @@ impl ForceProvider for SurrogateKs {
         // or a rejection, else at least every k-th consultation — an accepting verdict is reused
         // at most k − 1 times, a rejecting one never
         // a neighbour entering or leaving r_cut is a new environment for the verdict (M6 Task 11)
-        let counts = {
+        let mut counts = {
             let rc2 = self.model.as_ref().map_or(0.0, |m| m.basis.r_cut * m.basis.r_cut);
             neighbour_counts(&pos, rc2)
         };
-        let with_variance = {
-            let k = self.policy.variance_cadence.max(1);
-            let fresh = self.last_variance.as_ref().is_none_or(|v| !v.accept) || self.consults + 1 >= k || counts != self.verdict_counts;
-            self.consults = if fresh { 0 } else { self.consults + 1 };
-            if fresh {
-                self.variance_checks += 1;
-            }
-            fresh
-        };
-        let model = self.model.as_ref().expect("gate passed (or draft past rule 4: a model exists)");
-        let pred = model
-            .predict(&pos, &z, with_variance)
-            .map_err(|e| ProviderError::Invalid(format!("surrogate: {e}")))?;
-        // a prediction that is not finite is never an answer, draft mode and the relax
-        // verification included (activity Task 3b): the teacher answers on its own surface, the
-        // answer is kept, nothing is audited (the gap is not a number), the switch is booked
-        // along the forces (`transition_jump`, never through the model's energy)
-        if let Some(reason) = non_finite_answer(&pred) {
-            self.record_verdict(&pos, &z, Some(strict_gate.unwrap_or_else(|| reason.clone())));
-            let near = if self.model.is_some() { self.near_quarantined(&pos, &z) } else { Vec::new() };
-            let near_misfit = self.model.is_some() && self.near_misfit(&pos, &z).contains(&true);
-            let h = Handoff {
-                prov,
-                pos,
-                z,
-                reason,
-                keep_sample: true,
-                shell_fence: false,
-                thin: false,
-                dedup: false,
-                near,
-                near_misfit,
-                model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty: None, stds: None }),
-                audit: false,
-                teacher_surface: true,
-                history_rule: history_rule_code(TeachRule::NonFiniteAnswer),
-            };
-            return self.teach(scene, h, t0, should_abort);
+        // a bonded part plus stray atoms whose composition was measured for bonded geometries like this one (`stray`
+        // module doc, "Answering inside a region"; spec §4.4): the stray atoms are exempt from 5a–5e (and 6: their
+        // force rows are zero), rule 7 is per bonded atom, 5d and the fences judge the bonded part alone; every other
+        // rule as before. The answer is the model's own `predict(scene)`, the bonded part's plus Σ E_ref. Only a scene
+        // with an atom without neighbours can have stray atoms (the split's test is the counts')
+        // (the scene's descriptors, shared with the envelope below: no extra description on this path)
+        let scene_desc = if counts.contains(&0) { self.model.as_ref().and_then(|m| describe_values(&m.basis, &pos, &z).ok()) } else { None };
+        let cleared = scene_desc.as_deref().and_then(|d| self.stray_cleared_with(&pos, &z, &prov, Some(d)));
+        let part = cleared.as_ref().map(|c| &c.0);
+        // an exempt stray atom marks another environment for the variance cadence than a refused one: a verdict reached
+        // before the clearance is never reused for a cleared step, nor the reverse. Since ruling 9a rules 7 and 5d are
+        // per energy-row atom, so the verdict no longer depends on the exemption; the marker only forces a fresh
+        // evaluation at the switch (kept: it costs one variance evaluation there)
+        for &i in part.map_or(&[][..], |s| &s.stray) {
+            counts[i] = usize::MAX;
         }
-        // rule 6 on the epistemic force std (σ_f excluded, as rule 7 excludes the energy floor)
-        let variance = match (pred.energy_std, pred.force_std_epistemic.as_ref()) {
-            (Some(e), Some(f)) => {
-                let mut v = self.variance_check(model, &pred, e, f, &pos, &z);
-                // rule 5d with the variance (the same cadence; a rejection is never reused)
-                if let Some((nu, at)) = self.null_space.as_ref().and_then(|ns| ns.novelty(&pos, &z).ok()).filter(|(nu, _)| *nu > 1.0) {
-                    v.accept = false;
-                    v.novel = true;
-                    v.reason = Some(novelty_refusal(nu, at));
-                }
-                self.verdict_counts = counts.clone();
-                self.last_variance = Some(v.clone());
-                v
-            }
-            _ => self.last_variance.clone().expect("a variance verdict exists when none is evaluated"),
+        // rule 5's envelope (5a–5c, 5e), the class rule (4b) and the fences, before the variance:
+        // none reads σ, and the calibration tick is decided on them (module doc, "Calibration
+        // ticks"); the reason chain below assembles them in its own order, as before
+        let (mut atom_envelope, mut envelope) = {
+            let model = self.model.as_ref().expect("gate passed (or draft past rule 4: a model exists)");
+            self.envelope_outside_except(model, &pos, &z, part.map_or(&[][..], |s| &s.stray), scene_desc.as_deref())
         };
-        let uncertainty = Some(variance.uncertainty);
-        let atom_uncertainty = Some(variance.atoms.clone());
-        let (mut atom_envelope, mut envelope) = self.envelope_outside(model, &pos, &z);
         // a lone scene rule 0b declined is never the model's in strict mode (review I1): rule 5a's
         // refusal, which covers a scene of two or more lone atoms already, also for one atom (5a's
         // one-atom exemption assumed the reference composes — 0b checks it) and without an envelope
@@ -2560,16 +3071,158 @@ impl ForceProvider for SurrogateKs {
                 }
             }
         }
-        // rule 5 includes 5d (an unspanned direction): outside what the model has seen
-        let by_envelope = envelope.is_some() || (variance.novel && !variance.accept);
         // rule 4b, the class rule (module doc, "Class-wise trust"): the query's environment class
-        // must be trusted by the fit's leave-one-out errors. When rule 5 fires as well its note
-        // (which atom, which feature) is the more specific one and is shown; the variance's
-        // (6–7) yields to the class's
+        // must be trusted by the fit's leave-one-out errors
         let class = {
             let rc2 = self.model.as_ref().map_or(0.0, |m| m.basis.r_cut * m.basis.r_cut);
             self.class_untrusted(&env_keys(&pos, &z, rc2))
         };
+        // the fences (each consulted by the chain below only while no reason is set): the
+        // quarantine fence, the misfit set, the shell fence and the audit fence (which returns the
+        // shell fence's refusal first) — at a cleared stray-atom scene each judges the bonded part
+        // alone (`policy::judged_part`; `stray` module doc, "Answering inside a region"), the atoms
+        // named in the scene's numbering
+        let near = policy::judged_part(&pos, &z, part, |p, q| self.near_quarantined(p, q));
+        let near_misfit_atoms = match part {
+            Some(sp) => {
+                let (p, q) = sp.bonded_part(&pos, &z);
+                let near = self.near_misfit(&p, &q);
+                sp.scene_values(&near, pos.len(), false)
+            }
+            None => self.near_misfit(&pos, &z),
+        };
+        let near_misfit = near_misfit_atoms.contains(&true);
+        let in_shell = self.shell_fence_refusal_judged(&pos, &z, part);
+        let audit_fence = self.audit_fence_refusal_judged(&pos, &z, part);
+        // the history's fenced bit (module doc, "The history's flags"; spec review I4): any fence
+        // that applies here, whichever rule names the refusal
+        let fenced = !near.is_empty() || near_misfit || in_shell.is_some() || audit_fence.is_some();
+        // the calibration tick (module doc, "Calibration ticks"; spec 2026-11-18 §4): decided here,
+        // before the variance, on counters, the envelope, the class rule and the fences alone —
+        // never on σ, a λ or what rules 6/7 will say. Never in draft mode (its points are not in
+        // P_A). After **every** due tick, answered or refused, taken or skipped, the count pauses for
+        // a dead time of D in-envelope steps (the controller's re-ruling on the Task 7 re-review's
+        // R1): D is σ-blind (`tick_dead_time`), so the tick-eligible steps are the same whatever the
+        // ticks' outcomes. Due while the auditor is busy — an answered tick's job outliving D, or
+        // other work — skipped and counted, whatever answers the step
+        let in_envelope = !draft && envelope.is_none() && class.is_none() && !fenced;
+        // what this step books, undone if its teacher solve is cancelled (`untick_cancelled`)
+        let tick_before = (self.tick_steps, self.tick_dead, self.ticks);
+        if in_envelope {
+            self.ticks.population += 1;
+            self.time_in_envelope_step();
+        }
+        let tick = in_envelope && {
+            if self.tick_dead > 0 {
+                self.tick_dead -= 1;
+                false
+            } else {
+                self.tick_steps += 1;
+                self.tick_every > 0 && self.tick_steps % self.tick_every as u64 == 0
+            }
+        };
+        if tick {
+            self.ticks.due += 1;
+            self.tick_dead = self.tick_dead_time();
+        }
+        let due_tick = tick;
+        let tick = tick && {
+            let busy = self.auditor.as_ref().is_some_and(|a| a.busy.is_some());
+            if busy {
+                self.tick_outcome(TickOutcome::SkippedBusy);
+            }
+            !busy
+        };
+        let with_variance = {
+            let k = self.policy.variance_cadence.max(1);
+            let fresh = self.last_variance.as_ref().is_none_or(|v| !v.accept) || self.consults + 1 >= k || counts != self.verdict_counts;
+            self.consults = if fresh { 0 } else { self.consults + 1 };
+            if fresh {
+                self.variance_checks += 1;
+            }
+            fresh
+        };
+        let model = self.model.as_ref().expect("gate passed (or draft past rule 4: a model exists)");
+        let pred = match model.predict(&pos, &z, with_variance) {
+            Ok(p) => p,
+            Err(e) => {
+                // a tick with no prediction to compare is lost
+                if tick {
+                    self.tick_outcome(TickOutcome::Lost);
+                }
+                return Err(ProviderError::Invalid(format!("surrogate: {e}")));
+            }
+        };
+        // a prediction that is not finite is never an answer, draft mode and the relax
+        // verification included (activity Task 3b): the teacher answers on its own surface, the
+        // answer is kept, nothing is audited (the gap is not a number), the switch is booked
+        // along the forces (`transition_jump`, never through the model's energy)
+        if let Some(reason) = non_finite_answer(&pred) {
+            self.record_verdict(&pos, &z, Some(strict_gate.unwrap_or_else(|| reason.clone())));
+            let h = Handoff {
+                prov,
+                pos,
+                z,
+                reason,
+                keep_sample: true,
+                shell_fence: false,
+                thin: false,
+                dedup: false,
+                near,
+                near_misfit,
+                model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty: None, stds: None, energy_std_epistemic: None }),
+                audit: false,
+                teacher_surface: true,
+                history_rule: history_rule_code(TeachRule::NonFiniteAnswer),
+                flags: surrogate::history::PointFlags::default(),
+                tick_only: false,
+            };
+            let r = self.teach(scene, h, t0, should_abort);
+            // no point is recorded for a non-finite answer: a tick here has nothing to compare and is
+            // lost — unless the solve was cancelled: the step did not happen (`untick_cancelled`)
+            if !self.untick_cancelled(&r, tick_before) && tick {
+                self.tick_outcome(TickOutcome::Lost);
+            }
+            return r;
+        }
+        // rule 5d's novelty at this geometry: `Some((ν, atom))` when ν > 1
+        // (the bonded part's alone at a cleared stray-atom scene: `novelty_judged`, the atom in the scene's numbering)
+        let novelty = |s: &Self| s.novelty_judged(&pos, &z, part).filter(|(nu, _)| *nu > 1.0);
+        // the history's novel bit (module doc, "The history's flags"): rule 5d's novelty wherever it
+        // is evaluated — with a fresh variance, and read-only on every cadence-fresh step that
+        // reuses a verdict (Task 3 review MUST), so a cadence-fresh point's bit does not follow the
+        // σ-coupled variance phase
+        let mut novel_bit = false;
+        // rule 6 on the epistemic force std (σ_f excluded, as rule 7 excludes the energy floor)
+        let variance = match (pred.energy_std, pred.force_std_epistemic.as_ref()) {
+            (Some(e), Some(f)) => {
+                let mut v = self.variance_check(model, &pred, e, f, &pos, &z);
+                // rule 5d with the variance (the same cadence; a rejection is never reused)
+                if let Some((nu, at)) = novelty(self) {
+                    v.accept = false;
+                    v.novel = true;
+                    v.by_tail = false;
+                    v.reason = Some(novelty_refusal(nu, at));
+                    novel_bit = true;
+                }
+                self.verdict_counts = counts.clone();
+                self.last_variance = Some(v.clone());
+                v
+            }
+            _ => {
+                // read-only: the reused verdict and every rule's decision stay as they were — on a
+                // tick too (the tick forces the novelty and the stds for its point, never a fresh
+                // verdict: no rule-6/7 decision moves on a tick step)
+                novel_bit = (cadence_fresh || tick) && novelty(self).is_some();
+                self.last_variance.clone().expect("a variance verdict exists when none is evaluated")
+            }
+        };
+        let uncertainty = Some(variance.uncertainty);
+        let atom_uncertainty = Some(variance.atoms.clone());
+        // rule 5 includes 5d (an unspanned direction): outside what the model has seen
+        let by_envelope = envelope.is_some() || (variance.novel && !variance.accept);
+        // the class rule (4b, above): when rule 5 fires as well its note (which atom, which
+        // feature) is the more specific one and is shown; the variance's (6–7) yields to the class's
         let class_short = class.as_ref().is_some_and(|c| c.1);
         let by_class = class.is_some();
         let novel = (variance.novel && !variance.accept).then(|| variance.reason.clone()).flatten();
@@ -2578,9 +3231,8 @@ impl ForceProvider for SurrogateKs {
             .or(class.map(|c| c.0))
             .or_else(|| if variance.accept { None } else { variance.reason.clone() });
         // a quarantined geometry is outside what the model may answer (ruling S15), whichever
-        // rule fired first; its answer is kept only if it agrees with the model (teach)
-        let near = self.near_quarantined(&pos, &z);
-        // refused by the fence alone (final review I1): its answer is thinned and copy-checked as an
+        // rule fired first; its answer is kept only if it agrees with the model (teach) — `near`,
+        // above. Refused by the fence alone (final review I1): its answer is thinned and copy-checked as an
         // envelope (rule 5) fallback's is — which reaches `admit`'s checks only where forgotten samples
         // alone fence (a held one is released or superseded by an agreeing answer, and a
         // disagreeing one is never kept but by a fence vote)
@@ -2595,9 +3247,7 @@ impl ForceProvider for SurrogateKs {
         // next to a training sample the model cannot reproduce (spec 2026-11-13 §4.3; `trust`
         // module doc, "M, the misfit set"): refused when **any** atom is near — broader than the
         // all-atom quarantine test above, deliberately — and the teacher's answer is kept only if
-        // it agrees with the model (`admit`), whichever rule fired first
-        let near_misfit_atoms = self.near_misfit(&pos, &z);
-        let near_misfit = near_misfit_atoms.contains(&true);
+        // it agrees with the model (`admit`), whichever rule fired first (`near_misfit_atoms`, above)
         if reason.is_none() {
             if let Some(i) = near_misfit_atoms.iter().position(|&b| b) {
                 reason = Some(Refusal::new(
@@ -2615,17 +3265,24 @@ impl ForceProvider for SurrogateKs {
         // is **held out of the fit** — a band row is the leverage/structural outlier R3-1 stopped
         // fitting (f_c → 0 there), and a flood of them would untrust a class everywhere or let the
         // fit absorb them; then an audit fence (round 1, SHOULD-3), whose fallbacks are never
-        // copies (R1-2)
-        let in_shell = self.shell_fence_refusal(&pos, &z);
+        // copies (R1-2) — both evaluated above, on every consulted step
         let by_shell_fence = in_shell.is_some();
         if reason.is_none() {
             reason = in_shell;
         }
         let mut by_audit_fence = false;
         if reason.is_none() {
-            reason = self.audit_fence_refusal(&pos, &z);
+            reason = audit_fence;
             by_audit_fence = reason.is_some();
         }
+        // the history's flags: `fenced` (above) whichever rule named the refusal; `TICK` on the
+        // point a tick leaves (`tick_flags`, below)
+        let flags = surrogate::history::PointFlags(
+            if cadence_fresh { surrogate::history::PointFlags::CADENCE_FRESH } else { 0 }
+                | if fenced { surrogate::history::PointFlags::FENCED } else { 0 }
+                | if novel_bit { surrogate::history::PointFlags::NOVEL } else { 0 },
+        );
+        let tick_flags = if tick { surrogate::history::PointFlags(flags.0 | surrogate::history::PointFlags::TICK) } else { flags };
         self.record_verdict(&pos, &z, strict_gate.clone().or_else(|| reason.clone()));
         // never at lone atoms the references answer (rule 0b — reached here in draft mode only): the
         // gap there is the isolated atoms' grid/box artefacts, not a model error, and the answer is
@@ -2644,8 +3301,31 @@ impl ForceProvider for SurrogateKs {
         // — only when the refusal there is a fact about the geometry (round 1, MUST-1): refused only
         // by rule 4/4b/6/7, strict mode may answer there once trust returns, so the audit is ordinary
         self.dispatch_draft_guess = draft && reason.as_ref().is_some_and(|r| geometry_specific(r.rule));
-        let audit = due && !self.dispatch_audit(scene, &prov) && !draft;
+        // a tick at a step the model answers is an audit (module doc, "Calibration ticks"): on the
+        // auditor (free: a busy one skipped the tick above), else in the step; judged by rule 8 as
+        // well, and rule 8's own cadence (`due`, `answered`, `audit_due`) is untouched by it. A tick
+        // at a fallback (a rule refused, or the relax verification) needs no solve: its point is
+        // the fallback's, with `TICK`
+        let tick_audit = tick && reason.is_none() && !forced;
+        // the answered share among due ticks against the population's (spec §4's σ-coupling
+        // measurement, the re-review's R1 diagnostic): a step's outcome, known only now — every
+        // in-envelope step's, in the dead time and with a job in flight included
+        if in_envelope && reason.is_none() && !forced {
+            self.ticks.population_answered += 1;
+            if due_tick {
+                self.ticks.answered_due += 1;
+                self.ticks.answered_skipped_busy += u64::from(!tick);
+            }
+        }
+        let tick_only = tick_audit && !due;
+        self.dispatch_flags = if tick_audit { tick_flags } else { flags };
+        self.dispatch_tick_only = tick_only;
+        let audit = (due || tick_audit) && !self.dispatch_audit(scene, &prov) && !draft;
         self.dispatch_draft_guess = false;
+        self.dispatch_flags = surrogate::history::PointFlags::default();
+        self.dispatch_tick_only = false;
+        // a tick served by this step's teacher solve: at a fallback, or in the step's audit
+        let tick_here = tick && (!tick_audit || audit);
         // draft mode: what the model guesses beyond, and it answers anyway
         let extrapolation = (draft && (untrusted.is_some() || reason.is_some())).then(|| Extrapolation {
             atoms_outside: atom_envelope.iter().filter(|&&d| d > 1.0).count(),
@@ -2656,9 +3336,12 @@ impl ForceProvider for SurrogateKs {
         // the history's rule code of this step's fallback point, from the rule that fired (before
         // the relax verification overrides the reason — the Task 1 re-review's Minor 1): a class
         // refusal the variance verdict would have refused as well is coded apart, since the model
-        // would not have answered it had the class been trusted (M8a Task 2, `calibrate`)
+        // would not have answered it had the class been trusted (M8a Task 2, `calibrate`); a rule-6/7
+        // refusal that passes at λ_sum — only λ_T or λ_E refused — is coded apart as well (trust
+        // tightening, spec 2026-11-18 §4: λ selected it, so it is never in the answer sample P_A)
         let history_rule = match reason.as_ref() {
             Some(r) if matches!(r.rule, TeachRule::Class(_)) && !variance.accept => HISTORY_RULE_CLASS_AND_VARIANCE,
+            Some(r) if matches!(r.rule, TeachRule::ForceUncertainty | TeachRule::EnergyUncertainty) && variance.by_tail => HISTORY_RULE_TAIL_INFLATION,
             Some(r) => history_rule_code(r.rule),
             None => history_rule_code(TeachRule::RelaxVerification),
         };
@@ -2671,7 +3354,13 @@ impl ForceProvider for SurrogateKs {
             reason = Some(Refusal::new("surrogate: relax verification — the teacher checks the relaxed geometry", TeachRule::RelaxVerification, None));
         }
         if reason.is_some() || audit {
-            let reason = reason.unwrap_or_else(|| Refusal::new(format!("surrogate audit (every {} answered steps)", self.policy.audit_every), TeachRule::Audit, None));
+            let reason = reason.unwrap_or_else(|| {
+                if tick_only && audit {
+                    Refusal::new(format!("surrogate calibration tick (every {} in-envelope steps; no background teacher, so in the step)", self.tick_every), TeachRule::Audit, None)
+                } else {
+                    Refusal::new(format!("surrogate audit (every {} answered steps)", self.policy.audit_every), TeachRule::Audit, None)
+                }
+            });
             // the history's point (M8a Task 1, `surrogate::history`) of this in-step audit or
             // consulted-model fallback: the model's stds at this geometry — the cadence may have
             // reused an earlier verdict, so when the prediction carries none they are evaluated
@@ -2683,6 +3372,8 @@ impl ForceProvider for SurrogateKs {
                 (Some(e), Some(f), Some(fe)) => Some((e, f.clone(), fe.clone())),
                 _ => self.model.as_ref().and_then(|m| m.predict(&pos, &z, true).ok()).and_then(|p| Some((p.energy_std?, p.force_std?, p.force_std_epistemic?))),
             };
+            // under the model that predicted them (the same one: nothing refits inside `evaluate`)
+            let energy_std_epistemic = stds.as_ref().zip(self.model.as_ref()).map(|((e, _, _), m)| epistemic_energy_std(m, surrogate::energy_row_atoms(&m.basis, &pos), *e));
             let h = Handoff {
                 prov,
                 pos,
@@ -2705,7 +3396,7 @@ impl ForceProvider for SurrogateKs {
                 dedup: (by_envelope || by_class || by_audit_fence || by_fence || near_misfit) && !forced,
                 near,
                 near_misfit,
-                model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty, stds }),
+                model: Some(ModelAnswer { energy: pred.energy, forces: pred.forces, uncertainty, stds, energy_std_epistemic }),
                 audit,
                 // rules 4b and 5 (the model's energy is an unvalidated guess or an extrapolation)
                 // and the first evaluation after an edit report the teacher's surface; audits
@@ -2713,13 +3404,31 @@ impl ForceProvider for SurrogateKs {
                 // accounting")
                 teacher_surface: !audit && !forced && (by_class || by_envelope || post_edit),
                 history_rule,
+                flags: if tick_here { tick_flags } else { flags },
+                tick_only: audit && tick_only,
             };
-            return self.teach(scene, h, t0, should_abort);
+            let before = self.audit_history.recorded();
+            let r = self.teach(scene, h, t0, should_abort);
+            // a cancelled solve: the step did not happen, its count is rolled back and its retry is
+            // the tick (the Task 7 review's M2: fallback ticks are the σ-refused ones, so losing them
+            // to the user's cancels would be σ-coupled); a failed one loses the tick
+            if !self.untick_cancelled(&r, tick_before) && tick_here {
+                let recorded = self.audit_history.recorded() > before;
+                self.tick_outcome(match (r.is_ok(), recorded) {
+                    (false, _) => TickOutcome::Lost,
+                    (true, true) => TickOutcome::Recorded,
+                    (true, false) => TickOutcome::Unrecorded,
+                });
+                if r.is_ok() && tick_audit {
+                    self.ticks.in_step += 1;
+                }
+            }
+            return r;
         }
         let mut stats = EvalStats::default();
         stats.source = Source::Surrogate;
         if let Some((tag, summaries)) = &self.last_pseudised {
-            if *tag == prov.ionic && prov.ionic != "none" {
+            if *tag == prov.ionic && !crate::pseudo::is_all_electron_tag(&prov.ionic) {
                 stats.pseudised = summaries.clone();
             }
         }
@@ -2730,6 +3439,16 @@ impl ForceProvider for SurrogateKs {
         self.take_offset_jump(&mut stats);
         stats.energy.total = pred.energy;
         stats.solve_ms = t0.elapsed().as_millis() as u64;
+        if let Some((_, residual, margin, passes)) = cleared {
+            // the answer identity E = E_model(bonded) + Σ E_ref needs offset_s = 0 (mean 0, no intercept): `stray_cleared`
+            // answers no stray scene with a nonzero mean, in every build (final review minor 8)
+            // rule 7 of the doc's honesty (review M6): what answered, and on what measurement — the passing checks booked
+            stats.notes.push(format!(
+                "stray atoms: model for the bonded part + free atoms (composition measured, {passes} checks; worst residual {:.2} mHa, frontier margin {:.0} mHa)",
+                residual * 1e3,
+                margin * 1e3
+            ));
+        }
         stats.notes.append(&mut self.step_notes);
         stats.notes.append(&mut self.pending_notes);
         self.streak = 0;
@@ -2750,9 +3469,12 @@ impl ForceProvider for SurrogateKs {
         self.last = None;
         self.offset_jump = 0.0;
         self.last_variance = None; // the next consultation checks the variance afresh
+        // an edit: a composition check in flight is of the old scene (`stray`)
+        self.scene_gen += 1;
     }
 
     fn discontinuity(&mut self) {
+        self.scene_gen += 1;
         self.teacher.discontinuity();
         self.last_fallback = false;
         self.last = None;
@@ -2938,6 +3660,9 @@ impl SurrogateKs {
     /// the worker thread inside a Cancel: the samples are kept and the refit waits; M6 Task 3
     /// fix round 2) — and the outcome noted (what `Dynamics` did before M6).
     fn finish_pass(&mut self, mut sampler: Sampler) {
+        if sampler.is_migration() {
+            return self.finish_migration(sampler);
+        }
         let progress = sampler.progress();
         // a teach-around pass is judged after its refit (`teach`)
         let teach = sampler.is_targeted().then(|| (sampler.targets().to_vec(), sampler.take_holdouts()));
@@ -3399,6 +4124,10 @@ impl Trainable for SurrogateKs {
             return Err("a pass is already running (cancel it first)".into());
         }
         let info = crate::sampling::checkpoint_info(checkpoint)?;
+        // a pass the previous solver started never goes on here (Fermi–Dirac spec §7.7)
+        if let Some(why) = self.legacy_checkpoint_refusal(scene, &info.provenance) {
+            return Err(why);
+        }
         let (want, _, _) = self.checkpoint_counts(scene);
         if info.provenance != want {
             return Err(format!("it was taught at {}, the scene is solved at {want}", info.provenance));
@@ -3456,6 +4185,14 @@ impl Trainable for SurrogateKs {
         if let Some(sampler) = &mut self.pass {
             sampler.rescale(plan);
         }
+    }
+
+    fn migration(&self) -> Option<sim::MigrationStatus> {
+        self.migration_status()
+    }
+
+    fn start_migration(&mut self) -> Result<(), String> {
+        self.start_migration_pass()
     }
 
     fn pass_active(&self) -> bool {
@@ -3542,6 +4279,12 @@ impl Trainable for SurrogateKs {
             surrogate::sidecar::Contents::Samples(set) if !set.specialised.is_empty() => return self.load_specialised(path, set, scene),
             surrogate::sidecar::Contents::Samples(set) => return self.load_samples(path, set, scene),
         };
+        // a model of the previous solver (spec §7.9): its reason, never the generic "another surface"
+        if let Some(why) = legacy_model_refusal(&sc.model.provenance.ionic) {
+            let msg = format!("model {} refused: {why}", path.display());
+            self.user_notes.push(msg.clone());
+            return Err(msg);
+        }
         let want = self.provenance_for(scene);
         if sc.model.provenance != want {
             let msg = format!(
@@ -3686,6 +4429,9 @@ impl Trainable for SurrogateKs {
             retry_fit: self.pass.is_none() && self.background.is_none() && self.no_model().is_some_and(|n| n.retry),
             model_source: self.model_source(),
             lone_note: lone_atoms_note(&scene.nuclei.iter().map(|n| n.pos).collect::<Vec<_>>(), self.cutoff()),
+            stray: self.stray_status(),
+            stray_held_out: self.stray_held_out(),
+            ticks: self.calibration_ticks(),
         }
     }
 
@@ -3832,6 +4578,11 @@ impl SurrogateKs {
     /// checked against `scene` as for a model, then `install_samples` — which fits when it can —
     /// and its S9 references seeded into the cache (a later pass skips their scans).
     fn load_samples(&mut self, path: &std::path::Path, set: surrogate::SampleSet, scene: &Scene) -> Result<(), String> {
+        if let Some(why) = legacy_model_refusal(&set.provenance.ionic) {
+            let msg = format!("samples {} refused: {why}", path.display());
+            self.user_notes.push(msg.clone());
+            return Err(msg);
+        }
         let want = self.provenance_for(scene);
         if set.provenance != want {
             let msg = format!(

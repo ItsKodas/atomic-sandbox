@@ -68,15 +68,19 @@
 //!   = 0): the state's own vectors, a block grows behind its Ritz vectors (a shared shell or a short
 //!   window) up to that bound — and an `Aufbau` block whose window's last row and first guard are
 //!   one τ-set runs n_σ + m + G + 1 (final review M1) — and the fields it trims stay on the state's
-//!   free list. W = `MAX_WITNESS_GROWTH` under an ionic setup, 0 without: the occupations are
-//!   `DegenerateShells` exactly when there is a setup (`crate::ks::problem`), and `Aufbau` has no
-//!   window and n_occ = n_σ, so an all-electron block never grows (as `crate::ks::pseudo_extra_bytes`
-//!   counts the SCF's witness growth only for a pseudo solve);
+//!   free list. W = the solver's witness cap for every scene (`crate::ks::witness_cap_for` under a budget: the counted
+//!   start, `crate::ks::WITNESS_GROWTH_COUNTED` = 3, up to `qm::scf::MAX_WITNESS_GROWTH` = 32, plan 2026-11-13 Task 9b and
+//!   Task 9c fix round 2): `crate::ks::problem` poses every scene under
+//!   `FermiDirac` (smearing plan Task 9), whose Harris block grows to the SCF's witness
+//!   (`qm_gpu::harris` "Fermi–Dirac"; the scf-stall ← main merge) — all-electron too, where main's
+//!   `Aufbau` block never grew (W was 0 without a setup until that merge). The SCF's own growth is
+//!   counted alike: `crate::ks::pseudo_extra_bytes` under a setup, `crate::ks::witness_extra_bytes`
+//!   without;
 //! - 13 fields: ρ_in↑↓, ρ, V_H, v_nuc, v↑↓, exc, v_xc↑↓, ρ_out↑↓ and one scratch; + 3 under an ionic
 //!   setup (ρ_pc and the two xc inputs ρ_σ + ½ρ_pc);
 //! - the solver's one `LobpcgWork` (8 fields per vector) grown to the largest block, max n_σ + m +
-//!   G + W + 1: the solve's term counts 8·max n_σ, and under a setup its pseudo extras the SCF's own
-//!   witness growth 8W, so what is left is 8(m + G + 1), less the view's own growth of the same work
+//!   G + W + 1: the solve's term counts 8·max n_σ, and its witness extras (pseudo or all-electron) the
+//!   SCF's own witness growth 8W, so what is left is 8(m + G + 1), less the view's own growth of the same work
 //!   space (`OrbitalView::work_growth_fields(m)` = 8(m + G) for m > 0), which the view's term counts;
 //! - × 1.2, the slack of the other terms (uniforms, readback buffers, allocator slack). The Harris
 //!   state's own `GpuIonic` (local tables, nonlocal point lists: ≈ (4 + 4·rows) bytes per point in
@@ -86,7 +90,6 @@
 //! Each field is `crate::ks::field_bytes(n)`.
 use crate::ks::field_bytes;
 use qm::orbitals::UNOCC_GUARD;
-use qm::scf::MAX_WITNESS_GROWTH;
 use qm_gpu::orbitals::OrbitalView;
 use sim::AtomProfile;
 
@@ -214,17 +217,18 @@ fn splat(grid: &qm::Grid, pos: [f64; 3], p: &AtomProfile, at: &mut Vec<usize>, v
 
 /// The GPU memory (bytes) a Harris display solve holds on top of the solve and the orbital view
 /// of an n³ grid with n↑, n↓ occupied orbitals and m unoccupied ones per channel (module doc, "GPU
-/// memory"); `pseudised`: the scene has an ionic setup (the partial-core fields and the witness
-/// growth counted).
-pub fn harris_footprint_bytes(n: usize, n_up: usize, n_dn: usize, m: usize, pseudised: bool) -> u64 {
-    // the witness growth only under a setup: `DegenerateShells` exactly then (`crate::ks::problem`)
-    let (g, w) = (UNOCC_GUARD, if pseudised { MAX_WITNESS_GROWTH } else { 0 });
+/// memory"); `pseudised`: the scene has an ionic setup (the partial-core fields counted); `w`: the witness cap the
+/// block grows to (the solver's, `GpuSolver::witness_cap`: `crate::ks::witness_cap_for` under a budget). The witness
+/// growth is counted for every scene (FermiDirac everywhere: module doc, "GPU memory").
+pub fn harris_footprint_bytes(n: usize, n_up: usize, n_dn: usize, m: usize, pseudised: bool, w: usize) -> u64 {
+    // the witness growth for every scene: `crate::ks::problem` poses all of them under FermiDirac
+    let g = UNOCC_GUARD;
     // + 1: the untested buffer column above the tested levels (`qm_gpu::harris`'s `split_bound`)
     let block = |n_s: usize| if n_s + m > 0 { n_s + m + g + w + 1 } else { 0 };
     let vectors = block(n_up) + block(n_dn);
     let fields = if pseudised { 13 + 3 } else { 13 };
     // the one `LobpcgWork` grown to the largest block, less what the solve's term (its 8W witness
-    // growth under a setup: `crate::ks::pseudo_extra_bytes`) and the view's term count of it
+    // growth: `crate::ks::pseudo_extra_bytes` / `witness_extra_bytes`) and the view's term count of it
     let work = (8 * (m + g + 1)).saturating_sub(OrbitalView::work_growth_fields(m));
     ((vectors + fields + work) as u64 as f64 * field_bytes(n) as f64 * 1.2) as u64
 }
@@ -385,17 +389,21 @@ mod tests {
     /// The memory term's field count (module doc, "GPU memory"), at the counts it is built from;
     /// every block and the work include the untested buffer column (+ 1 vector per channel, + 8
     /// work fields: final review M1 — the solve's `split_bound` is n + m + G + W + 1, was 35 / 27 /
-    /// 62 / 74 / 32 without it). H₂ all-electron, m = 0: blocks 2 × (1 + 2 + 1) + 13 + the work's
-    /// 8·3 = 45 fields; m = 4: blocks 2 × 8 + 13 + (8·7 − the view's 8·6) = 37; pseudo-O triplet
+    /// 62 / 74 / 32 without it). H₂ all-electron, m = 0: blocks 2 × (1 + 2 + 16 + 1) + 13 + the work's
+    /// 8·3 = 77 fields; m = 4: blocks 2 × 24 + 13 + (8·7 − the view's 8·6) = 69 (the witness growth W = 16 in
+    /// all-electron blocks since the scf-stall ← main merge: FermiDirac everywhere; were 45 and 37 under
+    /// main's `Aufbau`); pseudo-O triplet
     /// (n = 4, 2) at m = 2: blocks (4 + 2 + 2 + 16 + 1) + (2 + 2 + 2 + 16 + 1) + 16 + (8·5 − the
     /// view's 8·4) = 48 + 16 + 8 = 72 (the work's 8W witness growth is the solve's term's,
     /// `pseudo_extra_bytes`: Task 4 review M1); at m = 0: (4 + 2 + 16 + 1) + (2 + 2 + 16 + 1) + 16 +
-    /// 8·3 = 44 + 16 + 24 = 84; an empty channel (H atom ↓, m = 0) holds no block.
+    /// 8·3 = 44 + 16 + 24 = 84; an empty channel (H atom ↓, m = 0) holds no block (↑: 1 + 2 + 16 + 1 = 20).
     #[test]
     fn harris_footprint_counts_its_fields() {
         let fields = |b: u64| b as f64 / (field_bytes(33) as f64 * 1.2);
-        let at = |n_up, n_dn, m, ps| fields(harris_footprint_bytes(33, n_up, n_dn, m, ps));
-        for (got, want) in [(at(1, 1, 0, false), 45.0), (at(1, 1, 4, false), 37.0), (at(4, 2, 2, true), 72.0), (at(4, 2, 0, true), 84.0), (at(1, 0, 0, false), 4.0 + 13.0 + 24.0)] {
+        // the formula at W = 16 (the count before plan 2026-11-13 Task 9c fix round 2; the term is linear in W, so the
+        // pinned counts stay the formula's check whatever `crate::ks::WITNESS_GROWTH_COUNTED` is)
+        let at = |n_up, n_dn, m, ps| fields(harris_footprint_bytes(33, n_up, n_dn, m, ps, 16));
+        for (got, want) in [(at(1, 1, 0, false), 77.0), (at(1, 1, 4, false), 69.0), (at(4, 2, 2, true), 72.0), (at(4, 2, 0, true), 84.0), (at(1, 0, 0, false), 20.0 + 13.0 + 24.0)] {
             assert!((got - want).abs() < 1e-3, "{got} fields, expected {want} (the bytes are truncated to an integer)");
         }
     }

@@ -95,25 +95,32 @@
 //!   occupied and empty parts are separated by a shell gap far above any box splitting, so the
 //!   filling gives each copy its own occupation. Two lone H at M = 3: N↑ = 2, both 1s↑ — σg + σu
 //!   filled is a unitary rotation of a + b, the same density — E = 2 E_ref.
-//! - **Open shells do not compose for k ≥ 2 copies.** Under `DegenerateShells` (the occupations of
-//!   every solve with a pseudised species, `providers::ks`) a shared cluster survives only while its
-//!   converged spread is below τ = `DEGENERACY_TAU` = 1e-3 Ha — not τ_c = 0.1 Ha, the candidate
-//!   window, as the first version of this derivation said. The box splits two copies' levels by
-//!   more than that wherever their confinement differs (H: 1.8 mHa 4 Bohr from a face), the cluster
-//!   is released (`released_occupations`: aufbau over the groups, the pattern then frozen) and the
-//!   lower copy's shell fills first — two O at M = 5 put both minority-p electrons on one atom, an
-//!   O⁻ + O⁺ state hundreds of mHa from 2 E_ref (the review's derivation from the occupation rule;
-//!   not measured). Under integer aufbau (`Aufbau`, every all-electron solve) an open shell is
-//!   integer-occupied and does not show as fractional at all, and the same cross-copy filling can
-//!   happen once the box splitting exceeds the self-polarisation gap (O: 11.6–11.8 mHa). So two or
-//!   more lone atoms are answered only when their reference is known to end at a gap
-//!   ([`closed_spin_channels`]): Z = 1 (one electron: the only multiplicity the scan can solve), or,
-//!   on a pseudised surface (`DegenerateShells`), a reference whose winning solve shared no shell
-//!   (`AtomReference::fractional == Some(false)`, recorded by the scan next to its multiplicity);
-//!   unknown, or any Z ≥ 2 on the all-electron surface, declines. One open-shell atom alone is still
-//!   answered: it is its own reference, but near a face its shell can be released into the integer,
-//!   symmetry-broken state, a few mHa up to ≈ 12 mHa (O) below the shared one (`qm::scf`) — another
-//!   finite-box occupation artefact, and the free atom is again the physical answer.
+//! - **Open shells do not compose for k ≥ 2 copies** (spec 2026-11-13 §6.4). Every solve's occupations are
+//!   Fermi–Dirac at kT = `qm::ELECTRON_KT` = 5 mHa (`providers::ks`), with one μ_σ per spin over the whole cell. The
+//!   box splits two copies' levels wherever their confinement differs (≤ 1.8 mHa measured: H 4 Bohr from a face),
+//!   and one μ_σ then fills the lower copy's open shell first — two O at M = 5 can put the minority-p weight unequally
+//!   on the two atoms, a charge-transfer state far from 2 E_ref (the review's derivation from the occupation rule; not
+//!   measured) — and the copies' partly filled shells see each other at μ. That cannot happen when the reference
+//!   **ends at a gap** in each spin channel: its winning solve has no partial level (`ScfStats.partial` empty:
+//!   min(f, 1 − f) < `PARTIAL_OCCUPATION_MIN` = 1e-6 for every level, i.e. every level at least ln(1/1e-6) ≈ 13.8 kT
+//!   from μ on each side, a gap of at least 27.6 kT = 138 mHa around μ), which exceeds the O self-polarisation gap
+//!   (11.6–11.8 mHa) plus the largest box splitting of two copies' levels (1.8 mHa), so the copies' fillings are each
+//!   their own. So two or more lone atoms are answered only when their reference is known to end at a gap
+//!   ([`closed_spin_channels`]): the species has one allowed multiplicity (Z = 1, one electron), or the reference's
+//!   winning solve had no partial level (`AtomReference::fractional == Some(false)`, recorded by the scan next to its
+//!   multiplicity), on either surface — FD exposes an all-electron open shell as partial occupations, where integer
+//!   aufbau hid it. At 5 mHa every accepted open-shell species' winning reference (B, C, O, F, Si, S, Cl) is the
+//!   symmetric partial ensemble, so all of them decline in pairs, and so does all-electron O on Accurate (its gapped
+//!   M = 1 winner has a 113 mHa gap, inside 138 mHa); Z = 1 and the gapped winners (N and P at M = 4) compose. A
+//!   polarised-integer open shell shows partial levels at that gap and declines — the safe side. Unknown (unrecorded)
+//!   declines. One open-shell atom alone is still answered: it is its own reference (the free atom is the physical
+//!   answer; a face can still distort its ensemble, a finite-box artefact).
+//!   (Before plan 2026-11-13 Task 10 the rule read the shared-shell rule's clusters on pseudised surfaces and declined
+//!   every Z ≥ 2 on the all-electron one, whose integer aufbau hid open shells.)
+//! - **Z = 1 is not "DFT-equivalent"** [NOTE-9]: the Z = 1 branch composes k far-apart H as k·E_ref(M = 2) at their
+//!   aligned spin. A DFT solve of an even number of far-apart H at auto is the restricted ½/½ ensemble, tens of mHa
+//!   above that sum (below: 4.6e-2 Ha at 6.4 Bohr), and FD lowers that DFT side by a further 2 kT ln 2 per pair.
+//!   "Compose to k·E_ref" is the rule's answer, not a claim that DFT gives it.
 //! - **Any other M** puts at least one atom into another spin state, or — the measured case — the
 //!   teacher's SCF converges to the **spin-restricted** delocalised state (the cold start splits
 //!   one blob n↑/N : n↓/N, so ρ↑ ≡ ρ↓ is kept): two H at M = 1 (also what "automatic" picks for an
@@ -128,7 +135,7 @@
 //! - **One atom**: M* = m. Under "automatic" that holds only when the reference is the lowest
 //!   multiplicity of its parity (H, and every atom the scan solves lowest at 1 or 2).
 //!
-//! The reference multiplicity m (and the fractional flag) of species Z on this surface is the
+//! The reference multiplicity m (and the partial-level flag, `AtomReference::fractional`) of species Z on this surface is the
 //! scan's record when the provider holds it (`ref_cache`, keyed by the atom's solve settings: a
 //! sampling pass's scan), else, for the multiplicity, the only one the scan can solve when
 //! `allowed_multiplicities(Z)` has a single entry (Z = 1: 2), else unknown → decline. Model files and
@@ -151,7 +158,7 @@ pub(super) enum Lone {
 /// Neumaier's compensated sum in the order given — the same additions as the model's energy
 /// (`surrogate::energy_and_forces`), so a reference answer equals the model's at a lone geometry
 /// bit for bit when the references are the model's.
-fn compensated_sum(values: &[f64]) -> f64 {
+pub(super) fn compensated_sum(values: &[f64]) -> f64 {
     let (mut sum, mut comp) = (0.0f64, 0.0f64);
     for &x in values {
         let t = sum + x;
@@ -172,17 +179,20 @@ fn same_reference_settings(a: &Provenance, b: &Provenance) -> bool {
     a.grid_n == b.grid_n && a.h == b.h && a.sigma == b.sigma && a.tol == b.tol && a.teacher == b.teacher && a.ionic == b.ionic
 }
 
-/// Whether the reference of species `z` is known to **end at a gap** in each spin channel (module
-/// doc, "The multiplicity rule and the occupations"), so k ≥ 2 copies compose: one electron (the
-/// only multiplicity the scan can solve, Z = 1), or, on a pseudised surface (`all_electron` false:
-/// the `DegenerateShells` occupations, where an open shell shows as a shared cluster), a scan that
-/// recorded no shared shell. Under the all-electron surface's integer aufbau an open shell does not
-/// show, so a Z ≥ 2 reference there is not known to compose; nor is an unrecorded one.
-pub(super) fn closed_spin_channels(z: u8, all_electron: bool, fractional: Option<bool>) -> bool {
-    if sim::allowed_multiplicities(z as u32).len() == 1 {
-        return true;
-    }
-    !all_electron && fractional == Some(false)
+/// The settings [`same_reference_settings`] compares, as one key (the `stray` module's signature surface): two
+/// provenances that compare equal there give the same key, and (`{:?}` of an f64 round-trips its value) the key tells
+/// apart any two that differ in those settings.
+pub(super) fn reference_settings_key(p: &Provenance) -> String {
+    format!("{}³ · h {:?} · σ {:?} · tol {:?} · {} · {}", p.grid_n, p.h, p.sigma, p.tol, p.teacher, p.ionic)
+}
+
+/// Whether the reference of species `z` is known to **end at a gap** in each spin channel (module doc, "The
+/// multiplicity rule and the occupations"; spec 2026-11-13 §6.4), so k ≥ 2 copies compose: the species has one allowed
+/// multiplicity (Z = 1: one electron, the only multiplicity the scan can solve), or the reference's winning solve had no
+/// partial level (`partial == Some(false)`: `AtomReference::fractional`, a gap of ≥ 27.6 kT = 138 mHa around μ), on
+/// either surface. A reference with a partial level, or one not recorded (`None`), is not known to compose.
+pub(super) fn closed_spin_channels(z: u8, partial: Option<bool>) -> bool {
+    sim::allowed_multiplicities(z as u32).len() == 1 || partial == Some(false)
 }
 
 /// The note of a step the rule answered (`Source::Reference`): the solve log's and the chip's words.
@@ -284,16 +294,14 @@ impl SurrogateKs {
         }
         // two or more copies compose only when the reference ends at a gap (review I4)
         if z.len() >= 2 {
-            let all_electron = prov.ionic == "none";
-            let fractional = self.ref_cache.get(&atom_key(prov, z[0])).and_then(|r| r.fractional);
-            if !closed_spin_channels(z[0], all_electron, fractional) {
-                let why = match (all_electron, fractional) {
-                    (true, _) => "the all-electron surface's integer occupations do not show whether its shell is open".to_string(),
-                    (false, Some(true)) => "its reference shares a partly filled shell".to_string(),
-                    (false, _) => "whether its reference's shell is open is not recorded here (a sampling pass records it)".to_string(),
+            let partial = self.ref_cache.get(&atom_key(prov, z[0])).and_then(|r| r.fractional);
+            if !closed_spin_channels(z[0], partial) {
+                let why = match partial {
+                    Some(_) => "its reference has a partly occupied level (an open shell, or a frontier within 138 mHa of μ)".to_string(),
+                    None => "whether its reference's shell is open is not recorded here (a sampling pass records it)".to_string(),
                 };
                 return Lone::StandAside(format!(
-                    "{} lone {} atoms: {why} — copies whose levels the box splits by more than 1e-3 Ha can fill one copy's shell first (charge moves between them), so DFT's answer need not be Σ E_ref",
+                    "{} lone {} atoms: {why} — one Fermi level spans the box, so copies whose levels the box splits can fill one copy's shell first (charge moves between them), and DFT's answer need not be Σ E_ref",
                     z.len(),
                     symbol(z[0])
                 ));
@@ -312,7 +320,7 @@ impl SurrogateKs {
     /// The multiplicity of species `z`'s isolated-atom reference on `prov`'s surface (module doc,
     /// "The multiplicity rule and the occupations"): the scan's choice when it is cached, else the
     /// only one the scan can solve, else `None`.
-    fn reference_multiplicity(&self, z: u8, prov: &Provenance) -> Option<u32> {
+    pub(super) fn reference_multiplicity(&self, z: u8, prov: &Provenance) -> Option<u32> {
         if let Some(m) = self.ref_cache.get(&atom_key(prov, z)).and_then(|r| r.multiplicity) {
             return Some(m);
         }
@@ -336,7 +344,7 @@ impl SurrogateKs {
         let mut stats = EvalStats::default();
         stats.source = Source::Reference;
         if let Some((tag, summaries)) = &self.last_pseudised {
-            if *tag == prov.ionic && prov.ionic != "none" {
+            if *tag == prov.ionic && !crate::pseudo::is_all_electron_tag(&prov.ionic) {
                 stats.pseudised = summaries.clone();
             }
         }

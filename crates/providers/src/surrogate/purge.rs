@@ -42,7 +42,8 @@
 //!
 //! # When it is refused
 //!
-//! Nothing forgotten; a sampling pass running; a background refit running (its copy holds the old
+//! Nothing forgotten; a collection migration's re-solve pass not complete ([`PURGE_WAIT_MIGRATION`]: its
+//! `migration.txt` at "running", paused or not — Fermi–Dirac spec §7, F3); a sampling pass running; a background refit running (its copy holds the old
 //! indices); the refit after a Forget not run yet (the standing fit still holds a forgotten
 //! sample: purging it would change what the fit was built from); and, with forgotten samples in
 //! the collection, a collection handle without the lock — another copy of the app has it open — or
@@ -53,6 +54,10 @@
 use super::shared::Link;
 use super::*;
 
+/// The refusal while the attached collection's migration is running (its `migration.txt` at "running", whether a pass
+/// steps it now or it waits to be resumed; plan 2026-11-13 Task 14, F3): its review log and the duplicate rule name
+/// samples of this folder by index, and a purge renumbers them.
+pub const PURGE_WAIT_MIGRATION: &str = "a re-solve pass is running — purge once the collection's migration from the previous solver is complete";
 /// The refusal while the fit still holds a forgotten sample.
 pub const PURGE_WAIT_REFIT: &str = "Forget / Restore changes are pending — the refit after them has not run yet (the fit still holds a forgotten sample); purge once it has (Refit now starts it)";
 /// Why a purge waits while Forget / Restore changes no fit holds yet are pending (2026-11-14, the
@@ -79,6 +84,9 @@ impl SurrogateKs {
     pub fn purge_refusal(&self) -> Option<String> {
         if self.forgotten() == 0 {
             return Some("no forgotten samples".into());
+        }
+        if self.migration.as_ref().is_some_and(|m| m.log.as_ref().is_some_and(|l| l.state == surrogate::MigrationState::Running)) {
+            return Some(PURGE_WAIT_MIGRATION.into());
         }
         if self.pass.is_some() {
             return Some("a sampling pass is running — purge once it is done".into());
@@ -136,6 +144,8 @@ impl SurrogateKs {
             keep[i] = false;
         }
         self.remap_after_purge(&keep, cmap.as_deref());
+        // the review log renumbered with the collection (F3): `migration.txt` rewritten now
+        self.flush_migration_log();
         let purged = gone.len();
         let collection_mode = self.shared.is_some();
         let where_ = match (&backup, collection_mode) {
@@ -185,6 +195,8 @@ impl SurrogateKs {
         retain_by(&mut self.desc_cache, keep);
         retain_by(&mut self.face, keep);
         self.lone_codes = std::mem::take(&mut self.lone_codes).into_iter().filter_map(|(i, c)| m(i).map(|j| (j, c))).collect();
+        // the re-solved samples a review kept (a code-9 sample is never purged: it is not forgotten)
+        self.review_kept = std::mem::take(&mut self.review_kept).into_iter().filter_map(m).collect();
         // fences and votes: a purged sample fences nothing
         for v in &mut self.fence_votes {
             v.near = v.near.iter().filter_map(|&i| m(i)).collect();
@@ -203,6 +215,11 @@ impl SurrogateKs {
             })
             .collect();
         for f in self.failed_audits.iter_mut().chain(self.audit_fences.iter_mut()) {
+            f.index = f.index.and_then(m);
+        }
+        // and the failed audits waiting for their attribution check (`stray`; Task 5 fix round 1, M3)
+        let pending = self.stray_pending.as_mut().and_then(|p| p.attribution.as_mut()).map(|a| &mut a.case);
+        for f in pending.into_iter().chain(self.stray_attributions.iter_mut().map(|r| &mut r.attribution.case)) {
             f.index = f.index.and_then(m);
         }
         // the fit's members and its readouts
@@ -256,6 +273,14 @@ impl SurrogateKs {
                     }
                 }
                 sh.pass_start = sh.pass_start.map(|p| cm[..p.min(cm.len())].iter().filter(|x| x.is_some()).count());
+                // `migration.txt`'s review log names samples of the new folder by index (F3, spec §8): each entry
+                // follows its sample through the collection's map — one whose sample was purged (released, then
+                // forgotten) goes with it; the caller writes the file (`flush_migration_log`)
+                if let Some(log) = self.migration.as_mut().and_then(|m| m.log.as_mut()).filter(|l| !l.review.is_empty() || !l.waiting.is_empty()) {
+                    log.review = log.review.iter().filter_map(|&(k, r, rel)| cm.get(k).copied().flatten().map(|j| (j, r, rel))).collect();
+                    log.waiting = log.waiting.iter().filter_map(|&k| cm.get(k).copied().flatten()).collect();
+                    self.review_log_dirty = true;
+                }
             }
         }
         // the views' cached curves name no sample, but their per-sample states are rebuilt

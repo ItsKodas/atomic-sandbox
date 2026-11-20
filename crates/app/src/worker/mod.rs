@@ -322,7 +322,8 @@ const INTERACTIVE_TOL: f64 = 1e-5;
 /// audit *gap* alone would tolerate 1e-5: the energy lag there is ≤ 3e-6 Ha against a
 /// threshold of N × 1e-3 Ha). Cost: none measurable per solve on the GPU (the wall time is flat
 /// in tol, above); the H₂ 49³ pass, `references.md` "Surrogate (M5)". The provenance records it,
-/// so a model taught at 1e-5 is refused with both tolerances named.
+/// so a model taught at 1e-5 is refused with both tolerances named. The `branch_jump` guard's sample tier keys on the
+/// same number (`providers::branch_jump::SAMPLE_TOL`, pinned equal in `tests::sample_tol_is_the_branch_jump_guards`).
 pub(crate) const SAMPLE_TOL: f64 = 1e-6;
 
 /// After the first command of a paused burst, keep collecting commands for this long before

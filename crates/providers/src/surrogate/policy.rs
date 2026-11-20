@@ -9,6 +9,7 @@
 
 use super::*;
 use sim::activity::{EnvClass, TeachRule};
+use super::stray::Split;
 use super::trust::max_nan;
 use surrogate::envelope::COORDINATION_RATIO;
 
@@ -126,9 +127,10 @@ pub(super) fn env_keys(pos: &[[f64; 3]], z: &[u8], rc2: f64) -> Vec<Option<surro
 pub const PSEUDO_FORCE_NOISE: f64 = 5e-5;
 
 /// The label-noise prior of the surface `ionic` (`Provenance::ionic`): [`PSEUDO_FORCE_NOISE`] for a pseudised
-/// surface, 0 for the all-electron one (whose labels keep the evidence-estimated noise, bitwise as before).
+/// surface, 0 for the all-electron one (whose labels keep the evidence-estimated noise, bitwise as before) — the legacy
+/// `"none"` and the Fermi–Dirac `none/fd5e-3/pin1e-5` alike (`crate::pseudo::is_all_electron_tag`, spec 2026-11-13 §6.2).
 pub(super) fn force_noise_prior(ionic: &str) -> f64 {
-    if ionic == "none" { 0.0 } else { PSEUDO_FORCE_NOISE }
+    if crate::pseudo::is_all_electron_tag(ionic) { 0.0 } else { PSEUDO_FORCE_NOISE }
 }
 
 /// The least tier an audit's force check may use on the surface `ionic`: 3σ of ONE label's noise, 0 on the
@@ -317,6 +319,104 @@ pub(super) struct VarianceVerdict {
     pub(super) atoms: Vec<f64>,
     /// The rejection is rule 5d (an unspanned direction), not the variance.
     pub(super) novel: bool,
+    /// The rejection is rule 6/7 at the tail-aware factors alone: at λ_sum both rules pass (the
+    /// history's code 24, [`super::HISTORY_RULE_TAIL_INFLATION`]).
+    pub(super) by_tail: bool,
+}
+
+/// The inflations of one atom's environment key ([`SurrogateKs::key_factors`]; trust tightening,
+/// spec 2026-11-18 §4): λ_sum, λ_T and λ_E, each ≥ 1 (∞ / NaN as measured), with what decided
+/// the tail-aware two and whether the key, being sparse, took its class's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct KeyFactors {
+    pub(super) sum: f64,
+    pub(super) tail: f64,
+    pub(super) energy: f64,
+    pub(super) tail_cause: super::calibrate::TailCause,
+    pub(super) energy_cause: super::calibrate::TailCause,
+    pub(super) tail_from_class: bool,
+    pub(super) energy_from_class: bool,
+}
+
+impl KeyFactors {
+    /// No inflation (an isolated atom, or before the class has numbers).
+    pub(super) const ONE: Self = Self {
+        sum: 1.0,
+        tail: 1.0,
+        energy: 1.0,
+        tail_cause: super::calibrate::TailCause::None,
+        energy_cause: super::calibrate::TailCause::None,
+        tail_from_class: false,
+        energy_from_class: false,
+    };
+
+    /// λ_F = max(λ_sum, λ_T): rule 6's factor (NaN propagates).
+    pub(super) fn force(&self) -> f64 {
+        max_nan(self.sum, self.tail)
+    }
+}
+
+/// N, the per-atom energy normalisation of rule 7 **and** of λ_E's e_p and r_p (spec 2026-11-18
+/// §5: the inflations multiply σ_E,epi before the division, so both must divide by the same N —
+/// one function, never a second copy). Since the merge with the stray-atom work (controller ruling
+/// 9a) N is N_e, the **energy-row atoms** (`surrogate::energy_row_atoms`: the atoms with a neighbour
+/// within the model's cutoff, N when none is isolated), the count the fit's energy row and
+/// `Model::predict`'s aleatoric floor are per. Callers pass it: rule 7 ([`SurrogateKs::energy_variance`])
+/// computes `energy_row_atoms` at the scene; λ_E and the verdict's energy evidence e2 (`calibrate`) pass a history point's `n_atoms`,
+/// which is its N_e because a point is recorded over its bonded part (`record_history_point`: a
+/// stray-atom scene's split, every recorded atom with a neighbour). For a scene with no isolated
+/// atom N_e = N, so nothing changes there.
+pub(super) fn energy_atoms(n_e: usize) -> f64 {
+    n_e as f64
+}
+
+/// σ·λ with ∞·0 = ∞ (plan M1: an infinite factor refuses the key's atoms, a std of 0 included); a
+/// NaN stays NaN.
+fn inflate(s: f64, lambda: f64) -> f64 {
+    if lambda == f64::INFINITY && s == 0.0 { f64::INFINITY } else { s * lambda }
+}
+
+/// The words of a refusal at λ_sum (rule 6/7 as before the tail-aware factors: byte-identical).
+fn sum_words(k: f64) -> String {
+    if k == 1.0 { String::new() } else { format!(" (the model's std × {k:.2}, its measured calibration for this environment class)") }
+}
+
+/// The words of a refusal a tail-aware factor decided (spec §4: "λ_T 7.7: a measured atom at 4.5×
+/// the bound with the model's std 0.13× of it"): the factor, and its measured cause.
+fn tail_words(name: &str, lambda: f64, cause: super::calibrate::TailCause, from_class: bool, force: bool) -> String {
+    use super::calibrate::TailCause as C;
+    let (what, unit) = if force { ("atom", "the bound") } else { ("energy", "the tier") };
+    let factor = if lambda.is_nan() {
+        format!("{name} NaN")
+    } else if lambda.is_infinite() {
+        format!("{name} = ∞")
+    } else {
+        format!("{name} {lambda:.1}")
+    };
+    let whose = if from_class { format!(", its class's (this environment has fewer than {} checks of its own)", super::calibrate::MIN_EVIDENCE) } else { String::new() };
+    let std = |r: f64| if r == 0.0 { "where the model's std was 0".to_string() } else { format!("with the model's std {r:.2}× of it") };
+    let why = match cause {
+        C::Max { e, r } => format!(": a measured {what} at {e:.1}× {unit} {}", std(r)),
+        C::Rms { value, points, r } => format!(
+            ": the error rms with its small-sample margin {value:.2}× {unit} over {points} checks, limit {:.2}, with the model's std up to {r:.2}× of it",
+            super::calibrate::ENTER
+        ),
+        C::NotANumber => ": a measured comparison is not a number".to_string(),
+        C::None => String::new(),
+    };
+    let lifts = if lambda.is_finite() { "" } else { "; it lifts as the window ages" };
+    format!(" (the model's std × {factor}{whose}{why}{lifts})")
+}
+
+/// The index of the largest of `xs`, a NaN first (it is the worst).
+fn worst_index(xs: impl Iterator<Item = f64>) -> Option<usize> {
+    let mut best: Option<(usize, f64)> = None;
+    for (i, x) in xs.enumerate() {
+        if best.is_none_or(|(_, b)| !b.is_nan() && (x.is_nan() || x > b)) {
+            best = Some((i, x));
+        }
+    }
+    best.map(|(i, _)| i)
 }
 
 /// Why the model is not consulted (rules 1–4), whether the teacher's answer is kept, and
@@ -349,6 +449,13 @@ impl SurrogateKs {
     /// as a conflict (`background_conflict`), though the copy's fit and verdicts are exactly the
     /// ones it would give under the new fields and its install books the jump under the live policy.
     pub fn set_policy(&mut self, p: FallbackPolicy) {
+        // a stray-atom region was cleared under the check's tolerances (its energy and force tests) and the thinning
+        // radius: when one of them changes, every region is checked again; a refusal stays (final review minor 5,
+        // controller ruling 13; `stray` module doc, "The cleared region")
+        let stray_judged = |q: &FallbackPolicy| (q.energy_std_per_atom, q.force_std_abs, q.force_std_rel, q.max_descriptor_distance);
+        if stray_judged(&p) != stray_judged(&self.policy) {
+            self.stray_book.clear_regions();
+        }
         let judged = FallbackPolicy { never_fallback: self.policy.never_fallback, audit_every: self.policy.audit_every, ..p } != self.policy;
         self.policy = p;
         self.consults = 0;
@@ -446,8 +553,29 @@ impl SurrogateKs {
     /// isolated atom) and the reason naming the rule that fired (and the atom), if any atom is
     /// outside.
     pub(super) fn envelope_outside(&self, model: &Model, pos: &[[f64; 3]], z: &[u8]) -> (Vec<f64>, Option<Refusal>) {
+        self.envelope_outside_except(model, pos, z, &[], None)
+    }
+
+    /// [`envelope_outside`](Self::envelope_outside) with the atoms `stray` exempt from 5a–5e: the stray atoms of a
+    /// cleared, in-region scene (`stray` module doc, "Answering inside a region"; spec §4.4) — the model's answer there
+    /// is the free atom's E_ref with zero force, measured to be the teacher's. Their distance is 0; the bonded part is
+    /// judged as before (its descriptors are the bonded part's own: a stray atom is no atom's neighbour). `desc`: the
+    /// scene's descriptors under the model's basis when the caller has them (`evaluate`'s, shared with the cleared
+    /// decision), else they are computed here.
+    pub(super) fn envelope_outside_except(&self, model: &Model, pos: &[[f64; 3]], z: &[u8], stray: &[usize], desc: Option<&[Vec<f64>]>) -> (Vec<f64>, Option<Refusal>) {
         let Some(env) = self.envelope.as_ref() else { return (Vec::new(), None) };
-        let (Ok(desc), Ok(s)) = (describe_values(&model.basis, pos, z), model.basis.species_indices(z)) else { return (Vec::new(), None) };
+        let described;
+        let desc = match desc.filter(|d| d.len() == pos.len()) {
+            Some(d) => d,
+            None => match describe_values(&model.basis, pos, z) {
+                Ok(d) => {
+                    described = d;
+                    &described[..]
+                }
+                Err(_) => return (Vec::new(), None),
+            },
+        };
+        let Ok(s) = model.basis.species_indices(z) else { return (Vec::new(), None) };
         let n = pos.len();
         let limit = self.policy.max_descriptor_distance;
         let r_cut = model.basis.r_cut;
@@ -457,6 +585,10 @@ impl SurrogateKs {
         let mut worst_grade = (0.0f64, 0usize);
         let mut atoms = Vec::with_capacity(desc.len());
         for (i, d) in desc.iter().enumerate() {
+            if stray.contains(&i) {
+                atoms.push(0.0);
+                continue;
+            }
             let (dist, k) = env.distance(s[i], d);
             // 5a and 5b only in a scene of more than one atom: a lone atom in a one-atom scene is
             // the reference itself (the model answers E_ref exactly, ruling S5, and the reference
@@ -564,9 +696,13 @@ impl SurrogateKs {
             return None;
         }
         let whole = |rule: TeachRule| Some(AtomVerdicts { geometry: Some(rule), atoms: vec![None; n] });
-        if let Err(g) = self.gate(&z, &self.scene_provenance(scene)) {
+        let prov = self.scene_provenance(scene);
+        if let Err(g) = self.gate(&z, &prov) {
             return whole(g.reason.rule);
         }
+        // a cleared stray-atom scene (spec §4.4, `evaluate`'s): its stray atoms are exempt, the bonded part judged alone
+        let cleared = self.stray_cleared(&pos, &z, &prov);
+        let part = cleared.as_ref().map(|c| &c.0);
         let model = self.model.as_ref().expect("the gate passed: a model exists");
         // past the gate an unknown species is unreachable (rule 2), named as `would_answer` names it
         let pred = match model.predict(&pos, &z, true) {
@@ -583,12 +719,16 @@ impl SurrogateKs {
                 atoms[i] = Some(rule);
             }
         };
-        // 5a–5c and 5e per atom (`envelope_outside`'s tests, atom by atom, in its order)
+        // 5a–5c and 5e per atom (`envelope_outside`'s tests, atom by atom, in its order; a cleared scene's stray atoms
+        // exempt, `envelope_outside_except`)
         if let (Some(env), Ok(desc), Ok(sp)) = (self.envelope.as_ref(), describe_values(&model.basis, &pos, &z), model.basis.species_indices(&z)) {
             if self.active_set.as_ref().is_some_and(|a| !a.converged()) {
                 geometry = geometry.or(Some(TeachRule::NoGrade));
             }
             for (i, d) in desc.iter().enumerate() {
+                if part.is_some_and(|c| c.stray.contains(&i)) {
+                    continue;
+                }
                 let (dist, _) = env.distance(sp[i], d);
                 let lone = n >= 2 && lone_atom(&model.basis, d);
                 let (ratio, _) = if n >= 2 { env.coordination_ratio(&model.basis, sp[i], d) } else { (0.0, 0) };
@@ -612,7 +752,7 @@ impl SurrogateKs {
         };
         // 5d: the energy row refuses the geometry, an atom's force rows the atom
         if posterior.is_some() {
-            if let Some((nu_e, nu_atoms)) = self.null_space.as_ref().and_then(|ns| ns.novelty_per_atom(&pos, &z).ok()) {
+            if let Some((nu_e, nu_atoms)) = self.novelty_per_atom_judged(&pos, &z, part) {
                 if nu_e > 1.0 {
                     geometry = geometry.or(Some(TeachRule::NewEnvironment));
                 }
@@ -638,22 +778,22 @@ impl SurrogateKs {
                     refuse(&mut atoms, i, TeachRule::ForceUncertainty);
                 }
             }
-            if let Some(r) = self.energy_variance_refusal(model, n, e, &self.atom_inflation(model, &pos, &z)) {
+            if let Some(r) = self.energy_variance(model, &pos, e, &self.atom_inflation(model, &pos, &z)).1 {
                 geometry = geometry.or(Some(r.rule));
             }
         }
         // near a misfit (spec 2026-11-13 §4.3): per atom, not the geometry — exactly the atoms
         // whose environment is near a misfit atom (`would_answer` refuses when any is)
-        for (i, near) in self.near_misfit_atoms(&pos, &z).into_iter().enumerate() {
+        for (i, near) in self.near_misfit_atoms_judged(&pos, &z, part).into_iter().enumerate() {
             if near {
                 refuse(&mut atoms, i, TeachRule::NearMisfit);
             }
         }
         // the quarantine and audit fences refuse the geometry
         if geometry.is_none() {
-            if !self.near_quarantined_cached(&pos, &z).is_empty() {
+            if !self.near_quarantined_judged(&pos, &z, part).is_empty() {
                 geometry = Some(TeachRule::NearQuarantine);
-            } else if let Some(r) = self.audit_fence_refusal(&pos, &z) {
+            } else if let Some(r) = self.audit_fence_refusal_judged(&pos, &z, part) {
                 geometry = Some(r.rule);
             }
         }
@@ -669,82 +809,206 @@ impl SurrogateKs {
         Some(desc.iter().zip(&s).map(|(d, &si)| act.grade(si, d)).fold(0.0f64, f64::max))
     }
 
-    /// The variance inflation per atom of a geometry (M8a Task 2 fix round 3; `calibrate`, "The
-    /// variance inflation"): λ of the atom's environment key (class, Z, neighbour species — M8a
-    /// user-test fix 2; `SpeciesVerdict::inflation`), 1 for an isolated atom or before the class
+    /// The inflations per atom of a geometry ([`KeyFactors`] of the atom's environment key: class,
+    /// Z, neighbour species — M8a user-test fix 2; λ_sum since M8a Task 2 fix round 3, λ_T and λ_E
+    /// since trust tightening Task 6), [`KeyFactors::ONE`] for an isolated atom or before the class
     /// has numbers.
-    pub(super) fn atom_inflation(&self, model: &Model, pos: &[[f64; 3]], z: &[u8]) -> Vec<f64> {
+    pub(super) fn atom_inflation(&self, model: &Model, pos: &[[f64; 3]], z: &[u8]) -> Vec<KeyFactors> {
         let rc2 = model.basis.r_cut * model.basis.r_cut;
         if z.len() != pos.len() {
-            return vec![1.0; pos.len()];
+            return vec![KeyFactors::ONE; pos.len()];
         }
-        env_keys(pos, z, rc2).into_iter().map(|k| k.map_or(1.0, |k| self.key_inflation(&k))).collect()
+        env_keys(pos, z, rc2).into_iter().map(|k| k.map_or(KeyFactors::ONE, |k| self.key_factors(&k))).collect()
     }
 
     /// Rules 6–7 on a prediction that carries stds; `f_std` is the **epistemic** per-atom force
     /// std (`Prediction::force_std_epistemic`: force_std² = 3σ_f² + epistemic², exact) — rule 6
-    /// leaves the label noise out as rule 7 does for the energy (module doc). Since M8a Task 2 fix
-    /// round 3 each atom's epistemic force std is multiplied by its class's variance inflation λ
-    /// (`atom_inflation`; 1 for a calibrated or unmeasured class) and the epistemic energy std by
-    /// the largest λ among the geometry's atoms — one scale of the posterior covariance per class,
-    /// measured where the posterior decides (`calibrate`, "The variance inflation").
+    /// leaves the label noise out as rule 7 does for the energy (module doc). The stds are inflated
+    /// per environment key (trust tightening, spec 2026-11-18 §4; `atom_inflation`):
+    ///
+    /// ```text
+    /// λ_F(j) = max(λ_sum(k_j), λ_T(k_j))
+    /// rule 6:  λ_F(j) · σ_epi,j/√3 ≤ b_j = force_bound(|F_m,j|)               per atom j
+    /// rule 7:  max(max_j λ_F(j), max_j λ_E(k_j)) · σ_E,epi/N ≤ tier         N = energy_atoms(N_e)
+    /// ```
+    ///
+    /// b_j and the tier never move; every λ ≥ 1, so no inflation shrinks a std. A NaN factor makes
+    /// the product NaN and refuses ("not within"), an infinite one refuses, ∞·0 included (M1). The
+    /// verdict says whether it would have accepted at λ_sum alone (`by_tail`: the history's code 24),
+    /// and a refusal names the factor that decided — its words byte-identical to before when that
+    /// is λ_sum (the number differs only where ∞·0, formerly NaN, is now ∞: λ_sum = ∞ — a NaN
+    /// comparison in its sample — on a std of exactly 0 prints "inf" where it printed "NaN", per M1;
+    /// the decision, a refusal, is the same).
+    ///
+    /// At a stray-atom scene both rules are the bonded part's own without an exemption: rule 7 is per energy-row atom
+    /// (N_e = `surrogate::energy_row_atoms`, [`energy_variance`](Self::energy_variance)), and a stray atom's force rows
+    /// are zero, so its epistemic force std is exactly 0 (rule 6) and its key factors are [`KeyFactors::ONE`].
     pub(super) fn variance_check(&self, model: &Model, pred: &surrogate::Prediction, e_std: f64, f_std: &[f64], pos: &[[f64; 3]], z: &[u8]) -> VarianceVerdict {
         let n = pred.forces.len();
         let p = &self.policy;
         let infl = self.atom_inflation(model, pos, z);
-        // 6. forces, epistemic only, inflated by the class's calibration
+        let factors = |j: usize| infl.get(j).copied().unwrap_or(KeyFactors::ONE);
+        // 6. forces, epistemic only, inflated by the key's factors
         let mut uncertainty = 0.0f64;
         let mut worst: Option<(usize, f64, f64)> = None;
         let mut atoms = Vec::with_capacity(n);
+        let mut at_sum = true;
         for (j, (&sd, f)) in f_std.iter().zip(&pred.forces).enumerate() {
-            let fs = sd / SQRT_3 * infl.get(j).copied().unwrap_or(1.0);
+            let k = factors(j);
+            let s = sd / SQRT_3;
+            let fs = inflate(s, k.force());
             uncertainty = max_nan(uncertainty, fs);
             let bound = p.force_bound((f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt());
             atoms.push(fs / bound);
+            at_sum &= inflate(s, k.sum) <= bound;
             // "not within the bound": a NaN std refuses (activity Task 3b), and is the worst
             let over = !(fs <= bound);
             if over && worst.is_none_or(|(_, s, b)| !(s / b).is_nan() && (fs.is_nan() || fs / bound > s / b)) {
                 worst = Some((j, fs, bound));
             }
         }
-        // the refusal says when the class's calibration decided (byte-identical without it)
-        let scaled = |k: f64| if k == 1.0 { String::new() } else { format!(" (the model's std × {k:.2}, its measured calibration for this environment class)") };
+        // 7. energy, per atom, epistemic only
+        let (energy_at_sum, energy) = self.energy_variance(model, pos, e_std, &infl);
+        let by_tail = at_sum && energy_at_sum;
         if let Some((j, fs, bound)) = worst {
+            let k = factors(j);
+            // the refusal says which factor decided (byte-identical when it is λ_sum)
+            let words = if k.tail > k.sum || k.tail.is_nan() { tail_words("λ_T", k.tail, k.tail_cause, k.tail_from_class, true) } else { sum_words(k.sum) };
             return VarianceVerdict {
                 accept: false,
                 uncertainty,
-                reason: Some(Refusal::new(
-                    format!("surrogate: epistemic force std {fs:.2e} > bound {bound:.2e} Ha/Bohr on atom {j}{}", scaled(infl.get(j).copied().unwrap_or(1.0))),
-                    TeachRule::ForceUncertainty,
-                    Some(j),
-                )),
+                reason: Some(Refusal::new(format!("surrogate: epistemic force std {fs:.2e} > bound {bound:.2e} Ha/Bohr on atom {j}{words}"), TeachRule::ForceUncertainty, Some(j))),
                 atoms,
                 novel: false,
+                by_tail,
             };
         }
-        // 7. energy, per atom, epistemic only
-        if let Some(r) = self.energy_variance_refusal(model, n, e_std, &infl) {
-            return VarianceVerdict { accept: false, uncertainty, reason: Some(r), atoms, novel: false };
+        if let Some(r) = energy {
+            return VarianceVerdict { accept: false, uncertainty, reason: Some(r), atoms, novel: false, by_tail };
         }
-        VarianceVerdict { accept: true, uncertainty, reason: None, atoms, novel: false }
+        VarianceVerdict { accept: true, uncertainty, reason: None, atoms, novel: false, by_tail: false }
     }
 
     /// Rule 7 alone ([`variance_check`](Self::variance_check)'s energy half): the epistemic energy
-    /// std per atom of an `n`-atom prediction whose total std is `e_std`, inflated by the largest
-    /// of the atoms' class factors `infl`, against `energy_std_per_atom`.
-    pub(super) fn energy_variance_refusal(&self, model: &Model, n: usize, e_std: f64, infl: &[f64]) -> Option<Refusal> {
+    /// std per atom of a prediction at `pos` whose total std is `e_std`, inflated by
+    /// max(max_j λ_F(j), max_j λ_E(k_j)) over the atoms' factors `infl`, against
+    /// `energy_std_per_atom`. Returns (it passes at λ_sum alone — the largest λ_sum, the factor of
+    /// before — and the refusal at the full factor).
+    ///
+    /// Per atom over the geometry's N_e energy-row atoms (`surrogate::energy_row_atoms`: N without an isolated atom,
+    /// controller ruling 9a; spec §4.4, review I4): `e_std` is `Model::predict`'s, whose aleatoric floor (N_e s_E)² is
+    /// removed exactly ([`epistemic_energy_std`] at N_e), and the epistemic rest is divided by
+    /// [`energy_atoms`]`(N_e)` — the one normalisation λ_E's e_p and r_p share (`calibrate`). At a stray-atom scene
+    /// both are the bonded part's own — a stray atom adds nothing to the energy row (B_s = 0), so the prediction's std
+    /// is its bonded part's bit for bit — so the number is rule 7 on the bonded part alone, cleared or not (Task 4's
+    /// per-bonded-atom special case, now exactly what the general rule computes).
+    pub(super) fn energy_variance(&self, model: &Model, pos: &[[f64; 3]], e_std: f64, infl: &[KeyFactors]) -> (bool, Option<Refusal>) {
         let p = &self.policy;
-        let scaled = |k: f64| if k == 1.0 { String::new() } else { format!(" (the model's std × {k:.2}, its measured calibration for this environment class)") };
-        let floor = if model.energy_per_atom { n as f64 * model.sigma_e } else { model.sigma_e };
-        // `max(0.0)` would turn a NaN variance into 0: keep it (activity Task 3b)
-        let e_infl = infl.iter().copied().fold(1.0f64, max_nan);
-        let epistemic_per_atom = max_nan(e_std * e_std - floor * floor, 0.0).sqrt() / n as f64 * e_infl;
-        (!(epistemic_per_atom <= p.energy_std_per_atom)).then(|| {
-            Refusal::new(
-                format!("surrogate: epistemic energy std {epistemic_per_atom:.2e} > {:.2e} Ha/atom{}", p.energy_std_per_atom, scaled(e_infl)),
-                TeachRule::EnergyUncertainty,
-                None,
-            )
-        })
+        let sum = infl.iter().map(|k| k.sum).fold(1.0f64, max_nan);
+        let force = infl.iter().map(|k| k.force()).fold(1.0f64, max_nan);
+        let energy = infl.iter().map(|k| k.energy).fold(1.0f64, max_nan);
+        let factor = max_nan(force, energy);
+        // N_e, the energy-row atoms (ruling 9a): the floor `Model::predict` built `e_std` from and rule 7's N
+        let n_e = surrogate::energy_row_atoms(&model.basis, pos).max(1);
+        let epi = epistemic_energy_std(model, n_e, e_std) / energy_atoms(n_e);
+        let at_sum = inflate(epi, sum) <= p.energy_std_per_atom;
+        let epistemic_per_atom = inflate(epi, factor);
+        let refusal = (!(epistemic_per_atom <= p.energy_std_per_atom)).then(|| {
+            // which factor decided: λ_E, λ_T (through λ_F) or λ_sum (the words of before); a NaN
+            // λ_F is never out-ranked by a finite λ_E (`max_nan`: the NaN is what the number shows)
+            let others = max_nan(sum, force);
+            let words = if energy > others || (energy.is_nan() && !others.is_nan()) {
+                let k = infl[worst_index(infl.iter().map(|k| k.energy)).expect("λ_E above 1 comes from an atom")];
+                tail_words("λ_E", k.energy, k.energy_cause, k.energy_from_class, false)
+            } else if force > sum || (force.is_nan() && !sum.is_nan()) {
+                let k = infl[worst_index(infl.iter().map(|k| k.tail)).expect("λ_T above λ_sum comes from an atom")];
+                tail_words("λ_T", k.tail, k.tail_cause, k.tail_from_class, true)
+            } else {
+                sum_words(sum)
+            };
+            Refusal::new(format!("surrogate: epistemic energy std {epistemic_per_atom:.2e} > {:.2e} Ha/atom{words}", p.energy_std_per_atom), TeachRule::EnergyUncertainty, None)
+        });
+        (at_sum, refusal)
     }
+}
+
+/// `f` at the atoms rule 5d and the fences judge (`stray` module doc, "Answering inside a region"; spec §4.4): the
+/// bonded part alone of a cleared stray-atom scene (`cleared`, `stray_cleared`'s split), else the scene. The bonded part
+/// must pass them **on its own**: 5d's energy row is per atom over the atoms it is given (n_bonded, review I4), and a
+/// fence that takes the worst atom's distance to a fenced geometry (the quarantine and audit fences) would let a stray
+/// atom, which no fenced H₂ has a counterpart for, carry an otherwise fenced bonded geometry outside. The caller maps
+/// the atoms named back to the scene's ([`Split::scene_atom`], [`Split::scene_values`]).
+pub(super) fn judged_part<T>(pos: &[[f64; 3]], z: &[u8], cleared: Option<&Split>, f: impl FnOnce(&[[f64; 3]], &[u8]) -> T) -> T {
+    match cleared {
+        Some(sp) => {
+            let (p, q) = sp.bonded_part(pos, z);
+            f(&p, &q)
+        }
+        None => f(pos, z),
+    }
+}
+
+/// A refusal [`judged_part`] gave, its atom in the scene's numbering (its text names no atom index: the quarantine,
+/// shell and audit fences').
+pub(super) fn scene_refusal(mut r: Refusal, cleared: Option<&Split>) -> Refusal {
+    if let Some(sp) = cleared {
+        r.atom = sp.scene_atom(r.atom);
+    }
+    r
+}
+
+impl SurrogateKs {
+    /// Rule 5d's (ν, the atom whose force rows reach furthest) at a scene, the bonded part alone when `cleared`
+    /// ([`judged_part`]); the atom in the scene's numbering. `None` without a null space or for a species it lacks.
+    pub(super) fn novelty_judged(&self, pos: &[[f64; 3]], z: &[u8], cleared: Option<&Split>) -> Option<(f64, Option<usize>)> {
+        let ns = self.null_space.as_ref()?;
+        let (nu, at) = judged_part(pos, z, cleared, |p, q| ns.novelty(p, q).ok())?;
+        Some((nu, cleared.map_or(at, |sp| sp.scene_atom(at))))
+    }
+
+    /// Rule 5d per atom (`NullSpace::novelty_per_atom`) as [`novelty_judged`](Self::novelty_judged): a stray atom's ν
+    /// is 0 (its force rows are zero).
+    pub(super) fn novelty_per_atom_judged(&self, pos: &[[f64; 3]], z: &[u8], cleared: Option<&Split>) -> Option<(f64, Vec<f64>)> {
+        let ns = self.null_space.as_ref()?;
+        let (nu_e, atoms) = judged_part(pos, z, cleared, |p, q| ns.novelty_per_atom(p, q).ok())?;
+        Some((nu_e, cleared.map_or_else(|| atoms.clone(), |sp| sp.scene_values(&atoms, pos.len(), 0.0))))
+    }
+
+    /// Which atoms are near a misfit (`near_misfit_atoms`), the bonded part's alone when `cleared` (a stray atom is
+    /// exempt: false); read-only.
+    pub(super) fn near_misfit_atoms_judged(&self, pos: &[[f64; 3]], z: &[u8], cleared: Option<&Split>) -> Vec<bool> {
+        let flags = judged_part(pos, z, cleared, |p, q| self.near_misfit_atoms(p, q));
+        cleared.map_or_else(|| flags.clone(), |sp| sp.scene_values(&flags, pos.len(), false))
+    }
+
+    /// The shell and audit fences (`audit_fence_refusal`) at the judged atoms, the atom in the scene's numbering.
+    pub(super) fn audit_fence_refusal_judged(&self, pos: &[[f64; 3]], z: &[u8], cleared: Option<&Split>) -> Option<Refusal> {
+        judged_part(pos, z, cleared, |p, q| self.audit_fence_refusal(p, q)).map(|r| scene_refusal(r, cleared))
+    }
+
+    /// The shell fence alone (`shell_fence_refusal`) at the judged atoms, the atom in the scene's numbering.
+    pub(super) fn shell_fence_refusal_judged(&self, pos: &[[f64; 3]], z: &[u8], cleared: Option<&Split>) -> Option<Refusal> {
+        judged_part(pos, z, cleared, |p, q| self.shell_fence_refusal(p, q)).map(|r| scene_refusal(r, cleared))
+    }
+
+    /// The fencing samples near the judged atoms (`near_quarantined_cached`; read-only).
+    pub(super) fn near_quarantined_judged(&self, pos: &[[f64; 3]], z: &[u8], cleared: Option<&Split>) -> Vec<usize> {
+        judged_part(pos, z, cleared, |p, q| self.near_quarantined_cached(p, q))
+    }
+}
+
+/// The total-energy epistemic std, Ha, of a prediction over `n_e` energy-row atoms
+/// (`surrogate::energy_row_atoms`, ruling 9a: N without an isolated atom) whose total predictive
+/// energy std is `e_std` (module doc, "The history's flags"): σ_E,epi = √max(σ_E² − f², 0), with f
+/// the model's aleatoric energy floor — N_e·s_E for a model fitted on energies per atom, s_E
+/// otherwise, exactly the floor `Model::predict` adds — so σ_E² = f² + φ̃ᵀΣφ̃ (`surrogate::model`,
+/// "Predictive variance"). Rule 7 divides it by [`energy_atoms`]`(N_e)` and inflates it; the history
+/// records it. Every caller passes N_e, never the scene's atom count. With the floor `e_std` was built from the radicand is
+/// never negative (σ_E = √fl(f² + φ̃ᵀΣφ̃) ≥ f, and correctly rounded squaring is monotone); one
+/// below 0 all the same (a floor rounded otherwise) gives 0, never the NaN of its root. A NaN stays
+/// NaN (`max_nan`: `max(0.0)` would turn a NaN variance into 0, activity Task 3b) — rule 7 refuses
+/// it, the history records it as absent.
+pub(super) fn epistemic_energy_std(model: &Model, n_e: usize, e_std: f64) -> f64 {
+    let floor = if model.energy_per_atom { n_e as f64 * model.sigma_e } else { model.sigma_e };
+    max_nan(e_std * e_std - floor * floor, 0.0).sqrt()
 }

@@ -6,6 +6,16 @@ use crate::scf::GpuSolver;
 use qm::orbitals as cpu;
 use qm::{Grid, Nucleus, ScfSettings, System};
 
+/// The SCF settings of the display tests: `ScfSettings::for_grid`, i.e. `FermiDirac { kt: ELECTRON_KT }` — the
+/// providers' states on every scene since plan 2026-11-13 Task 9, which removed the Task 7 Aufbau hold here. The display
+/// treats only the f-bearing columns as occupied eigenpairs; the stored witness columns are never compared or projected
+/// (`OrbitalView::unoccupied`; measured 2026-11-16 before that fix: four of these tests failed on FD states).
+fn display_settings(grid: &Grid) -> ScfSettings {
+    let s = ScfSettings::for_grid(grid);
+    assert_eq!(s.occupations, qm::Occupations::FermiDirac { kt: qm::ELECTRON_KT });
+    s
+}
+
 
 fn ctx() -> Option<GpuContext> {
     let c = GpuContext::new_headless();
@@ -353,7 +363,7 @@ fn display_copy_matches_cpu_reference() {
 fn h_atom_display_texture_is_normalised() {
     let Some(ctx) = ctx() else { return };
     let grid = Grid::cube(49, 0.25);
-    let settings = ScfSettings::for_grid(&grid);
+    let settings = display_settings(&grid);
     let mut s = GpuSolver::new(ctx, &grid);
     let nuclei = vec![nucleus([0.0; 3], 1)];
     s.solve(&System::new(nuclei.clone(), 0, None), &settings, false).expect("H converges");
@@ -384,7 +394,7 @@ fn h_atom_display_texture_is_normalised() {
 fn spin_texture_integrates_to_the_unpaired_count() {
     let Some(ctx) = ctx() else { return };
     let grid = Grid::cube(49, 0.25);
-    let settings = ScfSettings::for_grid(&grid);
+    let settings = display_settings(&grid);
     let mut s = GpuSolver::new(ctx, &grid);
     let nuclei = vec![nucleus([0.0; 3], 1)];
     s.solve(&System::new(nuclei.clone(), 0, None), &settings, false).expect("H converges");
@@ -452,7 +462,7 @@ fn colour_volume_matches_the_cpu_reference() {
 fn one_readback_per_update() {
     let Some(ctx) = ctx() else { return };
     let grid = Grid::cube(33, 0.25);
-    let settings = ScfSettings::for_grid(&grid);
+    let settings = display_settings(&grid);
     let mut s = GpuSolver::new(ctx, &grid);
     let vol = Volume3D::new(&s.ctx, [33; 3]);
     let cvol = ColourVolume3D::new(&s.ctx, [33; 3]);
@@ -481,7 +491,7 @@ fn one_readback_per_update() {
 fn update_does_not_write_solver_fields() {
     let Some(ctx) = ctx() else { return };
     let grid = Grid::cube(33, 0.25);
-    let settings = ScfSettings::for_grid(&grid);
+    let settings = display_settings(&grid);
     let mut s = GpuSolver::new(ctx, &grid);
     let vol = Volume3D::new(&s.ctx, [33; 3]);
     let cvol = ColourVolume3D::new(&s.ctx, [33; 3]);
@@ -525,7 +535,7 @@ fn update_does_not_write_solver_fields() {
 fn display_updates_between_solves_leave_the_scf_bitwise_unchanged() {
     let Some(ctx) = ctx() else { return };
     let grid = Grid::cube(33, 0.25);
-    let settings = ScfSettings::for_grid(&grid);
+    let settings = display_settings(&grid);
     let geometry = |t: usize| -> Vec<Nucleus> { let d = 0.7 + 0.03 * t as f64; vec![nucleus([d, 0.01 * t as f64, 0.0], 1), nucleus([-d, 0.0, 0.0], 1)] };
     let run = |with_view: bool| -> Vec<(u64, u64, usize, Vec<[u64; 3]>)> {
         let mut s = GpuSolver::new(ctx.clone(), &grid);
@@ -604,15 +614,18 @@ fn cpu_step_on_gpu_scalars_matches_the_cpu_pipeline() {
                               ("Li", 33, vec![nucleus([0.1, 0.0, 0.0], 3)]),
                               ("Ne", 41, vec![nucleus([0.37 * 0.25, -0.21 * 0.25, 0.12 * 0.25], 10)])] {
         let grid = Grid::cube(n, 0.25);
-        let settings = ScfSettings::for_grid(&grid);
+        let settings = display_settings(&grid);
         let mut s = GpuSolver::new(ctx.clone(), &grid);
         if let Err(e) = s.solve(&System::new(nuclei.clone(), 0, None), &settings, false) { panic!("{what}: {e:?}"); }
         let state = s.state().expect("converged");
         let mut view = OrbitalView::new(&s);
         let gpu = view.update(&s, state, &nuclei, settings.tol, Product::None);
-        // the CPU pipeline on the read-back orbitals
-        let raw = [state.orbitals_up.iter().map(|f| f.read_interior(&s.ctx, &s.g)).collect::<Vec<_>>(),
-                   state.orbitals_dn.iter().map(|f| f.read_interior(&s.ctx, &s.g)).collect::<Vec<_>>()];
+        // the CPU pipeline on the read-back orbitals: the shown (f-bearing) columns and their display occupations, as the
+        // view takes them (plan 2026-11-13 Task 9)
+        let cols = shown(state);
+        let raw = [cols[0].iter().map(|&i| state.orbitals_up[i].read_interior(&s.ctx, &s.g)).collect::<Vec<_>>(),
+                   cols[1].iter().map(|&i| state.orbitals_dn[i].read_interior(&s.ctx, &s.g)).collect::<Vec<_>>()];
+        let evals = [cols[0].iter().map(|&i| state.evals_up[i]).collect::<Vec<_>>(), cols[1].iter().map(|&i| state.evals_dn[i]).collect::<Vec<_>>()];
         let pos: Vec<[f64; 3]> = nuclei.iter().map(|n| n.pos).collect();
         let lone = nuclei.len() == 1;
         let refs = |ch: usize| raw[ch].iter().map(|v| v.as_slice()).collect::<Vec<_>>();
@@ -623,9 +636,10 @@ fn cpu_step_on_gpu_scalars_matches_the_cpu_pipeline() {
         let ow = [0, 1].map(|ch| raw[ch].iter().map(|p| cpu::outer_weight(&grid, p)).collect::<Vec<_>>());
         let cross = (!raw[1].is_empty()).then(|| nalgebra::DMatrix::from_fn(raw[0].len(), raw[1].len(), |i, j| grid.dot(&raw[0][i], &raw[1][j])));
         let n_occ = [raw[0].len(), raw[1].len()];
-        let occ = [vec![1.0; n_occ[0]], vec![1.0; n_occ[1]]];
+        let occ = [cols[0].iter().map(|&i| cpu::display_occupation(state.occ_up.get(i).copied().unwrap_or(1.0))).collect::<Vec<_>>(),
+                   cols[1].iter().map(|&i| cpu::display_occupation(state.occ_dn.get(i).copied().unwrap_or(1.0))).collect::<Vec<_>>()];
         let input = cpu::UpdateInput {
-            evals: [&state.evals_up, &state.evals_dn], occupations: [&occ[0], &occ[1]], overlaps_prev: [None, None], cross: cross.as_ref(),
+            evals: [&evals[0], &evals[1]], occupations: [&occ[0], &occ[1]], overlaps_prev: [None, None], cross: cross.as_ref(),
             moments: lone.then(|| [&ms[0][..], &ms[1][..]]), character: lone.then(|| [&ms[0][..], &ms[1][..]]), radial: lone.then(|| [&rp[0][..], &rp[1][..]]),
             first_sign: [&fs[0], &fs[1]], max_abs: [&mx[0], &mx[1]], outer_weight: [&ow[0], &ow[1]],
             n_occ, n_computed: n_occ, n_core: [0; 4], z_sigma: lone.then(|| nuclei[0].z as f64 * state.sigma), tol_scf: settings.tol, unoccupied: None, face_limit: f64::INFINITY,
@@ -802,7 +816,7 @@ const FACE_LIMIT_H025: f64 = 2e-5;
 /// A converged GPU solve of `nuclei` on n³ at h = 0.25 (σ = h, tol 1e-6).
 fn solved(ctx: &GpuContext, n: usize, nuclei: &[Nucleus]) -> (GpuSolver, ScfSettings) {
     let grid = Grid::cube(n, 0.25);
-    let settings = ScfSettings::for_grid(&grid);
+    let settings = display_settings(&grid);
     let mut s = GpuSolver::new(ctx.clone(), &grid);
     s.solve(&System::new(nuclei.to_vec(), 0, None), &settings, false).expect("the SCF converges");
     (s, settings)
@@ -911,7 +925,10 @@ fn display_solve_converges_at_the_effective_tolerance() {
         }
         println!("  shown unoccupied rows {shown}, tagged not converged {tagged}");
     }
-    assert!(bound_total >= 3, "Li's bound 2p rows were checked ({bound_total})");
+    // re-pinned in plan 2026-11-13 Task 9 (was ≥ 3, Li's three ↑ 2p): under FermiDirac Li's ↑ 2p, 0.018 Ha above its 2s at
+    // σ = h = 0.25, are partly occupied (f ≈ 0.083, plan Task 7) — shown as the state's rows, not unoccupied ones; the
+    // bound unoccupied row left is checked
+    assert!(bound_total >= 1, "a bound unoccupied row was checked ({bound_total})");
 }
 
 /// §8's bound: the display solve's occupied eigenvalues (of V[ρ_out]) agree with the SCF's (of
@@ -974,7 +991,9 @@ fn unoccupied_gpu_matches_cpu() {
 /// The shown set is orthonormal (§8: the unoccupied vectors are projected onto the complement of
 /// the SCF's occupied orbitals): |⟨ψ_occ|φ⟩| ≤ 1e-5 on the GPU's f32 vectors (read back, dotted in
 /// f64). The CPU's 1e-10 is `qm`'s `unoccupied_cpu_is_a_display_solve_on_the_output_potential`.
-/// H₂ and Li at 49³, m = 4.
+/// H₂ and Li at 49³, m = 4. Under FermiDirac (plan 2026-11-13 Task 9) "occupied" is the f-bearing columns
+/// (f ≥ `PARTIAL_OCCUPATION_MIN`); the stored witness columns are never projected out (they may be unconverged), and
+/// the vectors' overlap with them is printed, not asserted.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn unoccupied_are_orthogonal_to_occupied() {
@@ -986,19 +1005,23 @@ fn unoccupied_are_orthogonal_to_occupied() {
         assert!(u.rejected.is_none());
         let grid = s.grid().clone();
         let st = s.state().unwrap();
-        let (mut worst_occ, mut worst_self) = (0.0f64, 0.0f64);
+        let (mut worst_occ, mut worst_self, mut worst_witness) = (0.0f64, 0.0f64, 0.0f64);
         for ch in 0..2 {
-            let occ: Vec<Vec<f64>> = if ch == 0 { &st.orbitals_up } else { &st.orbitals_dn }.iter().map(|f| f.read_interior(&s.ctx, &s.g)).collect();
+            let (orbs, f) = if ch == 0 { (&st.orbitals_up, &st.occ_up) } else { (&st.orbitals_dn, &st.occ_dn) };
+            let bearing = |i: usize| f.get(i).copied().unwrap_or(1.0) >= qm::PARTIAL_OCCUPATION_MIN;
+            let occ: Vec<Vec<f64>> = orbs.iter().enumerate().filter(|&(i, _)| bearing(i)).map(|(_, f)| f.read_interior(&s.ctx, &s.g)).collect();
+            let witnesses: Vec<Vec<f64>> = orbs.iter().enumerate().filter(|&(i, _)| !bearing(i)).map(|(_, f)| f.read_interior(&s.ctx, &s.g)).collect();
             let phis: Vec<Vec<f64>> = view.unocc[ch].iter().map(|f| f.read_interior(&s.ctx, &s.g)).collect();
             for phi in &phis {
                 for psi in &occ { worst_occ = worst_occ.max(grid.dot(psi, phi).abs()); }
+                for w in &witnesses { worst_witness = worst_witness.max(grid.dot(w, phi).abs()); }
                 for other in &phis {
                     let d = grid.dot(phi, other);
                     worst_self = worst_self.max(if std::ptr::eq(phi, other) { (d - 1.0).abs() } else { d.abs() });
                 }
             }
         }
-        println!("{what}: max |⟨ψ_occ|φ⟩| {worst_occ:.2e}, max |⟨φ|φ′⟩ − δ| {worst_self:.2e}");
+        println!("{what}: max |⟨ψ_occ|φ⟩| {worst_occ:.2e}, max |⟨φ|φ′⟩ − δ| {worst_self:.2e}, max |⟨ψ_witness|φ⟩| {worst_witness:.2e} (not asserted)");
         assert!(worst_occ <= 1e-5, "{what}: {worst_occ:.2e}");
     }
 }
@@ -1068,7 +1091,8 @@ fn box_states_of(ctx: &GpuContext, what: &str, z: u8) {
     let grid = s.grid().clone();
     let st = s.state().unwrap();
     let out = view.update(&s, st, &nuclei, settings.tol, Product::None).out;
-    let n_occ = [st.orbitals_up.len(), st.orbitals_dn.len()];
+    // the state's shown rows: its f-bearing columns (plan 2026-11-13 Task 9: a FermiDirac state's witness columns are not rows)
+    let n_occ = shown(st).map(|c| c.len());
     for (ch, spin) in [(0usize, Spin::Up), (1, Spin::Down)] {
         let phis: Vec<Vec<f64>> = view.unocc[ch].iter().map(|f| f.read_interior(&s.ctx, &s.g)).collect();
         let ow: Vec<f64> = phis.iter().map(|p| cpu::outer_weight(&grid, p)).collect();
@@ -1144,7 +1168,7 @@ fn unoccupied_uses_the_pseudo_hamiltonian() {
     let setup = std::sync::Arc::new(IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([
         (8, Ionic::Pseudo(filtered_at(8, h))), (1, Ionic::AllElectron { sigma: h })])));
     let sys = System::with_ionic(nuclei.clone(), 0, None, setup);
-    let settings = ScfSettings::for_grid(&grid);
+    let settings = display_settings(&grid);
     let mut s = GpuSolver::new(ctx.clone(), &grid);
     s.solve(&sys, &settings, false).expect("the SCF converges");
     let mut view = OrbitalView::new(&s);

@@ -16,13 +16,17 @@
       AtomicSandbox.exe, portable.txt          its data stays beside the exe)
       README.md, LICENSE.md, docs\images\
       scenes\     the presets (crates\app\presets) and the committed scenes\ library
-      models\     the committed models\ (never models\collections\)
+      models\     the committed models\ (never models\collections\): its README only since the
+                  Fermi-Dirac switch (no trained model ships; the folder must exist, so a portable
+                  copy finds models\ and models\collections beside the exe)
       profiles\   the committed profiles\ (the README only: personal profiles never ship)
       timings\    the committed timings\, when there is one
   dist\AtomicSandbox-<ver>-windows-x64.zip     that folder zipped (forward-slash entry names)
   dist\installer-stage\                        what installer\AtomicSandbox.iss packs:
       AtomicSandbox.exe, installed.txt, README.md, LICENSE.md, docs\images\
       bundled\models\*.model, bundled\scenes\*.scene, bundled\timings\
+                  (bundled\models only when a .model is committed: none since the Fermi-Dirac
+                  switch, so it is absent and the first launch seeds the scenes alone)
       AtomicSandbox.ico                        the setup's icon (AtomicSandbox.exe --write-icon)
   dist\AtomicSandbox-Setup-<ver>.exe           the installer (ISCC.exe found, -NoInstaller not given)
 

@@ -79,8 +79,10 @@
 //! outputs:
 //!
 //! * `energy_std`: the TOTAL energy, φ̃ = Σ_i φ̃_i with φ̃_i the standardised descriptor of atom i
-//!   in its species block, plus the aleatoric floor of the energy rows: (N·σ_e)² when the fit
-//!   used energies per atom (the row was E/N with noise σ_e), σ_e² otherwise.
+//!   in its species block, plus the aleatoric floor of the energy rows: (N_e·σ_e)² when the fit
+//!   used energies per atom (the row was E/N_e with noise σ_e), σ_e² otherwise. N_e is
+//!   [`crate::energy_row_atoms`]: N for every geometry without an isolated atom (bit for bit as
+//!   before), the non-isolated atoms' count at a stray-atom scene (controller ruling 9a).
 //! * `force_std[j]`: √(Σ_a var_{j,a}) with var_{j,a} = σ_f² + g̃_{j,a}ᵀΣg̃_{j,a}, where g̃_{j,a}
 //!   is the force-row feature vector −Σ_i ∂B̃_i/∂r_{j,a} — the expected squared norm of the
 //!   force error on atom j, the quantity that compares to |F_j| in the fallback threshold; a
@@ -151,10 +153,11 @@ pub struct Provenance {
     pub teacher: String,
     pub masses: Vec<(u8, u16)>,
     /// The ionic surface the samples were solved on (M7, spec §5.5; `providers::pseudo::provenance_tag`):
-    /// `"none"` for the all-electron surface (every model before M7), else `"<policy>/<recipe hash>"`.
+    /// the all-electron tag (`"none"` for every model before the Fermi–Dirac switch, `none/fd5e-3/pin1e-5` after it,
+    /// plan 2026-11-13 Task 9), else `"<policy>/<recipe hash>/…"`.
     /// **Compared**: the surfaces differ by tens of Ha per pseudised atom and in bond angles, so a model
     /// taught on one is never consulted on another. The tag follows the physics, not the menu — H₂ under
-    /// `CoresOnly` is the all-electron surface and carries `"none"`.
+    /// `CoresOnly` is the all-electron surface and carries the all-electron tag.
     pub ionic: String,
 }
 
@@ -510,7 +513,9 @@ impl Model {
             _ => full_quad_forms(l, qr, &self.full_query_vectors(&q)),
         };
         let floor_e = if self.energy_per_atom {
-            (n as f64 * self.sigma_e).powi(2)
+            // N_e: the atoms the energy row is per (`crate::energy_row_atoms`; = n without an isolated atom), counted
+            // over the descriptors already in hand — the same test, no second pair pass
+            (crate::descriptor::energy_row_atoms_described(&self.basis, &desc) as f64 * self.sigma_e).powi(2)
         } else {
             self.sigma_e.powi(2)
         };

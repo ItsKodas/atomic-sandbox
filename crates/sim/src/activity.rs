@@ -612,6 +612,11 @@ pub enum TeachOutcome {
     KeptBoxAffected,
     KeptByVote,
     KeptReleased { released: u32, superseded: u32 },
+    /// Kept in the store but held out of the fit: the answer has stray atoms (no neighbour within the
+    /// model's cutoff) whose composition no check has measured at this geometry yet
+    /// (`providers::surrogate::stray`, "The hold-out"; spec 2026-11-18 §4.3). A check's pass, or a
+    /// cleared region that covers it, releases it into the fit.
+    KeptStrayHeld,
     /// Kept: the last of `FENCE_VOTES` consecutive, mutually consistent fresh answers near forgotten
     /// samples that agree with the model — the fence of `lifted` forgotten samples is lifted
     /// (`providers::surrogate`, "Lifting a forgotten sample's fence"; 2026-11-14).
@@ -619,8 +624,8 @@ pub enum TeachOutcome {
     Thinned,
     BoxNotKept,
     /// A teacher answer that is used for its step and never trained on: its cores overlap (the frozen-core
-    /// approximation fails, spec §5.6) or its shared-shell occupation pattern changed since the previous step
-    /// (E(R) jumps there, Task 6 review A.6). M7.
+    /// approximation fails, spec §5.6) or the `branch_jump` guard flagged it (F changed by more than the forces'
+    /// work since the previous step: another stationary state, spec 2026-11-13 §6.3). M7.
     UnfitNotKept,
     /// A teacher answer at a geometry inside a fenced cutoff shell (the surrogate's shell fence,
     /// 2026-10-19 final review I1): used for its step — a relax verification included — and never
@@ -631,6 +636,24 @@ pub enum TeachOutcome {
     /// step, never trained on — every descriptor is empty, so it teaches nothing and carries only the
     /// grid/box artefacts of an isolated atom (the per-box reference energies cover isolated atoms).
     LoneNotKept,
+    /// A teacher answer of a bonded part plus stray atoms (no neighbour within the model's cutoff)
+    /// whose combination the static floor refuses (a charge, a forced multiplicity, the spin rule,
+    /// mixed stray species, a shell-check fence, a stray atom near a face): used for its step,
+    /// never kept (`providers::surrogate::stray`, spec 2026-11-18 §4.2–4.3).
+    StrayNotKept,
+    /// A composition check of a stray-atom signature passed on the background teacher: `n` of the
+    /// `of` passes at distinct bonded geometries its cleared region needs (spec 2026-11-18 §4.3).
+    StrayChecking { n: usize, of: usize },
+    /// A composition check passed at a bonded geometry outside the signature's cleared region: the
+    /// region grows.
+    StrayCheckingNew,
+    /// A composition check failed: the signature is refused for the session, its samples held out.
+    StrayRefused,
+    /// A failed audit of a model answer at a scene with stray atoms was attributed by a check of the bonded part alone
+    /// and each stray atom alone (spec 2026-11-18 §4.5): `model` when the model is wrong on the bonded part alone — the
+    /// failure then counts against it (a failed audit) — else the composition's, and the model's trust is unchanged.
+    /// Either way the combination stays with DFT for the session.
+    StrayAuditAttributed { model: bool },
     FenceDisagrees,
     /// A teacher answer next to a training sample the model cannot reproduce (`NearMisfit`) that
     /// disagrees with the model: used for its step, not kept, no fence vote (spec 2026-11-13 §4.3).
@@ -653,7 +676,10 @@ pub enum TeachOutcome {
 
 impl TeachOutcome {
     pub fn is_kept(self) -> bool {
-        matches!(self, TeachOutcome::Kept | TeachOutcome::KeptBoxAffected | TeachOutcome::KeptByVote | TeachOutcome::KeptReleased { .. } | TeachOutcome::FenceLifted { .. })
+        matches!(
+            self,
+            TeachOutcome::Kept | TeachOutcome::KeptBoxAffected | TeachOutcome::KeptByVote | TeachOutcome::KeptReleased { .. } | TeachOutcome::FenceLifted { .. } | TeachOutcome::KeptStrayHeld
+        )
     }
 }
 
@@ -703,6 +729,10 @@ pub struct TeachEvent {
     pub box_affected: bool,
     /// E_teacher − E_model where the model was consulted.
     pub gap: Option<f64>,
+    /// The atom count the row's per-atom gap divides by (the Activity hover's "per atom over N
+    /// atoms"). For a surrogate row it is the provider's N_e, the energy-row atoms its verdicts
+    /// divide by: the scene's atom count unless an atom has no neighbour within the model's cutoff,
+    /// so a stray-atom scene's row counts its bonded atoms. Elsewhere, the scene's atom count.
     pub n_atoms: usize,
     /// Wall time of the teacher's solve (ms); 0 for a row with no solve (`NotSolved`).
     pub solve_ms: f64,
@@ -713,6 +743,10 @@ pub struct TeachEvent {
     pub scf_steps: Option<usize>,
     /// How the SCF ended, where known (`None`: no SCF, or a provider that does not say).
     pub scf_end: Option<ScfEnd>,
+    /// The teacher solve's electronic entropy term T_el·S (Ha; `EvalStats::energy.ts`, Fermi–Dirac spec 2026-11-13
+    /// §6.6): the Activity row prints "−TS = −… mHa" when it is ≥ 1e-6. `None` where no solve ran or it did not
+    /// report one (a failure, a reference scan, a row with no solve).
+    pub ts: Option<f64>,
     pub audit: Option<AuditVerdict>,
     /// A background audit: answered steps between its dispatch and its verdict.
     pub audit_lag: Option<usize>,
@@ -720,6 +754,15 @@ pub struct TeachEvent {
     /// dof): the Verlet velocities v(t + dt) at the solved geometry, before the CSVR thermostat
     /// rescales them (plan review S6).
     pub burst_t: Option<f64>,
+    /// The teacher solves this row stands for: 1, except a stray-atom composition check — the bonded part alone
+    /// and each stray atom alone, 1 + n_stray solves in one row (`providers::surrogate::stray`). Every counter of
+    /// solves ([`SolveCounts`], the Activity tab's) adds this, never 1 per row.
+    pub solves: u32,
+    /// The surrogate's history code for this step's teacher answer (`providers::surrogate`,
+    /// `history_rule_name`), where the provider set one: it tells a rule-6/7 refusal that passes at
+    /// λ_sum alone (code 24, the tail-aware inflations: the model was measured too confident) from
+    /// one where the model's own std refuses (14, 15). `None` from `new`.
+    pub history_code: Option<u8>,
 }
 
 impl TeachEvent {
@@ -739,9 +782,12 @@ impl TeachEvent {
             solve_ms: 0.0,
             scf_steps: None,
             scf_end: None,
+            ts: None,
             audit: None,
             audit_lag: None,
             burst_t: None,
+            solves: 1,
+            history_code: None,
         }
     }
 
@@ -785,11 +831,12 @@ impl SolveCounts {
         if !e.counts_for_model() {
             return;
         }
+        let k = u64::from(e.solves);
         match e.origin {
-            TeachOrigin::Pass => self.pass += 1,
-            TeachOrigin::Fallback => self.fallback += 1,
-            TeachOrigin::Audit => self.audit += 1,
-            TeachOrigin::Verification => self.verification += 1,
+            TeachOrigin::Pass => self.pass += k,
+            TeachOrigin::Fallback => self.fallback += k,
+            TeachOrigin::Audit => self.audit += k,
+            TeachOrigin::Verification => self.verification += k,
         }
         if e.outcome.is_kept() {
             self.kept += 1;
@@ -1193,5 +1240,19 @@ mod tests {
         let mut c = SolveCounts::default();
         c.count(&e);
         assert_eq!((c.audit, c.kept, c.not_kept()), (1, 0, 1));
+    }
+
+    /// Stray atoms (spec 2026-11-18 §5, the Task 3 review's minor): a composition check is the bonded part's solve
+    /// and each stray atom's in one row, counted as that many solves, none kept; a held stray-atom sample is kept
+    /// (in the store), only held out of the fit.
+    #[test]
+    fn a_composition_check_counts_its_solves_and_a_held_stray_sample_is_kept() {
+        let mut e = TeachEvent::new(TeachOrigin::Audit, TeachRule::IsolatedAtom, TeachOutcome::StrayChecking { n: 1, of: 3 });
+        assert_eq!(e.solves, 1, "one solve per row by default");
+        e.solves = 2;
+        let mut c = SolveCounts::default();
+        c.count(&e);
+        assert_eq!((c.audit, c.total(), c.kept, c.not_kept()), (2, 2, 0, 2));
+        assert!(TeachOutcome::KeptStrayHeld.is_kept());
     }
 }

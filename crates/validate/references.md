@@ -38,6 +38,26 @@ test pass (CLAUDE.md rule 6) — a miss is investigated and reported.
   h = 0.10 (+12.3 mHa; +45.9 at h = 0.15); Li is a known limitation (below).
   At finite σ the smearing is also repulsive in the bond coordinate (2πσ² Σ_I ρ(R_I) grows as the
   bond shortens), so H₂'s R_e and the force at R_e are extrapolated in σ as well.
+- **Fermi–Dirac occupations** (spec `2026-11-13-fermi-smearing-design.md` §4.3, §4.7; every solve since plan Task 9,
+  the dimer gate since Task 10): the reported energy is the Mermin free energy **F = E − TS at T_el = 1 579 K
+  (kT = 5 mHa)**, not the T = 0 Kohn–Sham energy. TS = 0 (≤ 1e-14 Ha) on systems gapped by ≥ 74 kT; below that a gap Δ
+  with μ at mid-gap carries TS ≈ 2kT(1 + y)e^{−y} per channel, y = Δ/(2kT) (4e-10 Ha at Δ = 0.2 Ha, 5e-6 Ha at 0.1 Ha).
+  Exactly degenerate open shells carry the closed forms (spec §4.3): H₄ square 4 kT ln 2 = 1.38629e-2 Ha; linear OH
+  and the H₅ ring 2 kT ln 2 = 6.9315e-3 Ha; one open p channel (O, S, C, Si at M = 3; B at M = 2 and 4; F, Cl at
+  M = 2 and 4) 3 kT s(⅓) = 9.5477e-3 Ha; two open p channels (O, S, C, Si at M = 1; N, P at M = 2) 1.90954e-2 Ha.
+  Smearing converges to the nearest stationary state, not the lowest: the restricted (spin-symmetric) H₄ lies
+  12–24 mHa (pseudo) and 12.4 mHa (all-electron) above its broken-symmetry state (spec §4.7(e)). **F, not E, is what
+  MD conserves** (the forces are −dF/dR).
+- S is the entropy of the Kohn–Sham occupations with ground-state LSDA xc, not the molecule's physical electronic
+  entropy (spec §4.7, SHOULD-4).
+- Separated fragments share one μ_σ per spin over the whole box, so fragments whose frontier levels align share charge
+  or spin across any distance (LSDA delocalisation, spec §4.7(h), SHOULD-10).
+- Atomisation and binding energies against free-atom references shift by +TS_atom per open-shell atom (a lone O at
+  M = 3 carries −TS = −9.55 mHa; spec §4.7(i), NOTE-4).
+- The lone-atom rule's Z = 1 branch composes k far-apart H as k·E_ref(M = 2) at aligned spin; a DFT solve of an even
+  number of far-apart H at auto is the restricted ½/½ ensemble, tens of mHa above that sum (4.6e-2 Ha at 6.4 Bohr), and
+  FD lowers that DFT side by a further 2 kT ln 2 per pair. "Compose to k·E_ref" is the rule's answer, not a claim that
+  DFT gives it (spec §6.4, NOTE-9).
 
 ## Oracle designs (σ → 0 extrapolation) and measured values (Task 11, 2026-10-13, release)
 
@@ -302,9 +322,103 @@ not usable either. The energy does not catch it either: with the old target H₂
 is therefore the **asserted** H₂O step-count guard in `energies_match_at_fixed_sigma`: GPU
 steps ≤ CPU steps + 5 (achieved 17 vs 17; the old target's 27 fails it by 5).
 
+### Fermi–Dirac on the GPU; FD is `for_grid`'s default (plan 2026-11-13 Task 7, 2026-11-16, release, RX 7900 XTX)
+
+`qm-gpu` runs `Occupations::FermiDirac { kt }` on the shared host rule (`qm::fermi_dirac`, `witness_reached`,
+`partial_levels` on the GPU's f64 Rayleigh–Ritz eigenvalues; `qm_gpu::scf` "Fermi–Dirac occupations"), with spec §5.1's
+partial-level stop: a GPU step whose occupations have a partial level is tested against max(tol, `GPU_PARTIAL_TOL` =
+1e-5), every other step against tol (`ScfStats::tol_used` reports which; the CPU always reports tol).
+`ScfSettings::for_grid` now returns FermiDirac at kT = `ELECTRON_KT` = 5 mHa, so every all-electron case of this suite
+solves witness vectors. Held at `Aufbau` until plan Task 9 (the providers' all-electron surface and its tag move
+together): `providers::ks::problem`'s all-electron branch, `cpu_provider_matches_qm_directly`, `timing_table` (below),
+the qm-gpu orbital-display tests and its orbital-lag witness; `BondForce::settings` until Task 10. The pseudo cases keep
+`DegenerateShells` explicitly until Task 10. (Task 9 removed every hold here except `timing_table`, now until Task 9b,
+and `BondForce::settings`, until Task 10: "The providers' Fermi–Dirac surface" below.)
+
+**V4** (`gpu_fd_h4_square_matches_cpu`, `gpu_fd_pseudo_o_m3_matches_cpu`, `gpu_fd_pseudo_o_m1_matches_cpu`; 49³ × 0.25,
+σ = h; CPU at tol 1e-6, GPU at its partial-level stop 1e-5; the H₄ square a = 1.8 centred on the middle grid point, the
+lone pseudo-O (`CoresOnly`, `from_tables` at h = 0.25) on it, so the frontier pairs/p sets are degenerate on the grid).
+Bounds: F and TS within the suite's class bound (`E_BOUND_H2` = 2e-6 for H₄, `E_BOUND_PSEUDO` = 6e-6 for O), μ within
+`EPS_BOUND_PSEUDO` = 1e-5, each f within `EPS_BOUND_PSEUDO`/(2kT) = 1e-3, Σf per CPU-degenerate cluster within 1e-9, the
+same state class (TS within 5 % of the closed form = symmetric), forces within `F_BOUND_H2` = 5e-6 / `F_BOUND_PSEUDO` =
+6e-5.
+
+| system | F_cpu | F_gpu | ΔF | TS_cpu = TS_gpu (closed form) | ΔTS | max \|Δμ\| | max \|Δf\| | class | max \|ΔF_I\| (max \|F_I\|) | steps cpu / gpu | tol_used cpu / gpu |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| H₄ square | −1.721953786 | −1.721953640 | +1.46e-7 | 1.386294e-2 (4 kT ln 2) | −9.9e-14 | 1.6e-6 | 1.9e-6 | symmetric / symmetric | 2.6e-6 (8.8e-2) | 10 / 9 | 1e-6 / 1e-5 |
+| pseudo-O M = 3 | −16.114269705 | −16.114269362 | +3.44e-7 | 9.547713e-3 (3 kT s(⅓)) | −3.9e-15 | 3.6e-6 | 4.3e-7 | symmetric / symmetric | 1.8e-7 (0, symmetric site) | 14 / 31 | 1e-6 / 1e-5 |
+| pseudo-O M = 1 | −16.067788821 | −16.067789120 | −2.99e-7 | 1.909543e-2 (6 kT s(⅔)) | −2.9e-13 | 2.1e-6 | 3.6e-6 | symmetric / symmetric | 1.5e-7 (0) | 11 / 21 | 1e-6 / 1e-5 |
+
+Every degenerate cluster's Σf agrees to the 12 printed digits (H₄: 1 per spin; O M = 3: 3 ↑ and 1 ↓; M = 1: 2 and 2).
+Both solvers stored the same blocks (5 / 5 per spin: H₄ and O grow 2–3 witnesses). ΔTS is second order in Δε, as spec
+§9 V4 says (the GPU's p levels split by ≤ 1.5e-7 Ha around a CPU degeneracy of ≤ 3e-11). **The pre-registered M = 1 stop
+(plan F15) did not fire:** the GPU converged at the 1e-5 stop in 21 steps, no stall and no cap. The H₄ GPU solve ended 2
+of 22 eigensolves at the LOBPCG cap (worst 1.46e-3, the witnesses in the box-state cluster on early steps; a note, the
+final step converged at 7.4e-6).
+
+**The existing cases under FD** (same run; all pass at their unchanged bounds):
+
+| system | E_cpu (F) | E_gpu (F) | ΔE | steps cpu / gpu | bound |
+|---|---|---|---|---|---|
+| H | −0.424224232 | −0.424224223 | +8.3e-9 | 7 / 8 | 1e-6 |
+| He | −2.138685118 | −2.138685076 | +4.2e-8 | 11 / 12 | 2e-6 |
+| H₂ R = 1.4 | −0.962715541 | −0.962715500 | +4.1e-8 | 9 / 10 | 2e-6 |
+| LiH R = 3.0 | −5.320421060 | −5.320421010 | +5.0e-8 | 13 / 11 | 3e-6 |
+| H₂O | −37.528379899 | −37.528383152 | −3.25e-6 | 16 / 17 (step guard ≤ +5 holds) | 2e-5 |
+
+Forces max |ΔF|: H₂ R = 1.0 / 1.4 / 2.5 2.68e-6 / 2.97e-6 / 1.64e-6 (bound 5e-6), H₂O 2.97e-6 (6e-5). H₂ curve shape
+max |ΔE − mean| 1.18e-7 cold / 1.08e-7 warm (5e-6). The CPU H, He and H₂ numbers equal the Aufbau run's to the printed
+digits (FD ≡ Aufbau on a gapped closed shell: F − E_A = −4.5e-12 for H₂ at 33³); LiH moves by −1.2e-7 (its small frontier
+gap: TS 1.6e-7 at 33³) and H₂O by −2.7e-8. The pseudo cases
+(`DegenerateShells`) are unchanged: pseudo-O ΔE −4.21e-7, CH₄ −2.70e-7, H₂O (All) −1.67e-6, OH −2.85e-7.
+
+**Cost: the suite took 1420 s (23.7 min) instead of ~3.5 min.** Every all-electron CPU reference now solves witness
+vectors, and the witness of a light atom in a 12 Bohr box sits in a cluster of box states that LOBPCG converges slowly
+(it often stops at its 200-iteration cap: CPU `max_eigen_residual` 2.2e-2 for H₂O, 1.4e-4 for He; the witness's f is
+≤ e^{−36}, so no energy or force moves). CPU walls with the suite's twelve tests concurrent: H 59 s (5.1 s under Aufbau),
+H₂O 454 s (88 s), LiH 179 s (32 s), H₄ 114 s, pseudo-O 102–107 s. The GPU walls moved less (H₂O 19.8 s contended).
+
+**`timing_table` is held at Aufbau** (until plan Task 9). Under FD the 97³ × 0.25 H₂O (a 24.5 Bohr box) failed cold
+with "no gap witness within 16 extra levels of spin 0". The self-consistent state should need only ~5–8 extras: the
+window top μ + 36 kT ≈ +0.05–0.06 Ha holds about 4 empty-box states (Task 7 review I1). **Cause (Task 7 fix round 1
+diagnostic, a traced cold solve):** a transient, pre-convergence step, not the converged spectrum and not the
+eigensolver.
+- Steps 1–2 needed 1 extra per spin.
+- Step 3 (Δρ_prev 4.78) had ε_N = −0.152 and μ = −0.067 Ha, so the top was +0.113 Ha; it needed 15–16 extras.
+- Step 4 (Δρ_prev 2.33) had ε_N = −0.132 and μ = −0.053, so the top was +0.127; it hit the cap of 16. The converged
+  ε_N is ≈ −0.26.
+- The levels between were box states from +0.020 to +0.116 Ha.
+- The block stayed orthonormal (max |⟨ψ_i|ψ_j⟩| ≤ 2.9e-8) with Ritz gaps ≥ 2.4e-4 Ha: no collapsed or duplicate
+  columns.
+
+A trial cap of 32 (fix round 1) passed step 4 (19 extras on ↑). The solve still did not converge within the 15-minute
+GPU batch: cut off at 15 min in step 4, ↓ at 17 extras. Each growth re-solves a ~20-vector block at 97³ with LOBPCG at
+its cap (step residuals 1e-2 against a step tol of 1e-3). It also cost the memory guard 192 more fields. So
+`qm::scf::MAX_WITNESS_GROWTH` stays 16 for now (fix round 2), and the GPU memory guard counts it for all-electron
+scenes too (192 fields). The cap, its budget and the all-electron FD cost at large boxes belong to plan Task 9b; the
+table stays held until then. The held table (Aufbau, solo, 2026-11-16): 49³ H₂ cold / warm 129 / 79 ms, 97³ H₂O cold
+1.79 s.
+
+**Re-pins** (each with its reason in the test): `qm` `none_policy_is_bitwise_today` and `qm-gpu`
+`gpu_none_policy_is_bitwise_today` keep the pre-M7 Aufbau bits under an explicit `Aufbau` and pin the `for_grid` (FD)
+bits beside them — "all-electron now solves witness vectors (FD, spec 2026-11-13)": CPU H₂ F = −0.952449176832
+(Aufbau −4.5e-12; TS 4.3e-20), LiH F = −5.219911361078 (Aufbau −1.0e-8 = −TS 1.59e-7 + ΔE +1.49e-7); GPU H₂
+−0.952449244390 (−8.0e-8, the witness path), LiH −5.219911456346 (+5.0e-7, inside the f32 path scatter; TS 1.59e-7).
+`lithium_runs_with_unequal_spin_channels` (CPU) and `empty_channel_and_lithium_run` (GPU) assert the witnesses (more than
+2 / 1 stored, Σf = 2 / 1) instead of exactly 2 / 1; Li at σ = h = 0.25 has its 2s and 2p 0.018 Ha apart, so FD shares
+them (2s f = 0.75, each 2p 0.083; TS 7.1e-3 on both solvers) and the GPU stops at 1e-5 (asserted).
+
+**The σ → 0 oracles under FD** (`--test oracles`, CPU f64; `validate::converged` takes `for_grid`'s FermiDirac): every
+oracle passes at its unchanged bound and every printed number equals the Aufbau table above — H a = −0.477710, He
+−2.822561 (+12.3 mHa), H₂ R_e = 1.4511 (R_e(σ) 1.6008 / 1.6530 / 1.7092 / 1.7685), F(R_e) → +0.0010, and V3 (ratio
+3.9395, b/e −0.0212). The new assertion TS ≤ 1e-12 at every σ of H and He and at every H₂ point holds with the largest TS
+5.6e-15 (spec §4.3: a closed shell gapped far beyond 74 kT). **Wall 3080 s (51 min) instead of ~31 min** — the witness
+vectors. The tests run concurrently and the bond scan (16 solves at 81³) is the long pole at the full 3080 s; H 852 s,
+He 1398 s, the H₂ force 658 s, V3 395 s (V3 was FD already).
+
 ## Dynamics (M4 Task 7, `tests/dynamics.rs`, 2026-10-13, release, RX 7900 XTX)
 
-Run with `cargo test -p validate --release --test dynamics` (~6 min, four tests
+Run with `cargo test -p validate --release --test dynamics` (~6 min before V5, ~33 min with V5's two tests (plan 2026-11-13 Task 11; "V5" under "Fermi–Dirac migration"); four tests
 concurrent with their GPU evaluations serialised; skips without a GPU adapter; `--nocapture`
 prints every number; each test appends its row to the gitignored `last-run-dynamics.md`). Wall
 times are reported, never asserted (ruling R3).
@@ -974,9 +1088,9 @@ units. "Why" is the one-line justification; the module docs carry the derivation
 | `energy_std_per_atom` | 1e-3 Ha | the spec's energy tier per atom; the trust rule's training-residual bound and the audit's verdict use the same number |
 | `max_descriptor_distance` | 3.0 training spreads | the envelope (rule 5c): what the variance cannot see (all body-2 features vanish as a pair separates) |
 | rule 0: the cell check under the surrogate (M6 Task 11) | `Scene::check_inside_cell`, 3h from every face | the teacher's own R12 check, same error and message, before any rule (draft mode too): a model answer is a function of the positions alone and carried a dissociated pair to \|x\| = 287 Bohr (diagnosis 2026-10-15 §3); the store, envelope and audits are of in-cell geometries |
-| rule 0b: lone atoms answered from the references (user request 2026-11-12, fix round 1; `providers::surrogate::lone`) | strict mode, no atom with a neighbour within the model's r_cut (6 Bohr; one source for the rule and the audit skip) → E = Σ_i E_ref(Z_i), every F = 0, `Source::Reference` (on the model's surface), no teacher call, no audit, no sample; the references are the model's own `ref_energy` when a model on this surface covers the species (bitwise `Model::predict`; it moves only with a refit, booked), else the provider's (per scene the store's surface: grid, h, σ, tol, teacher, ionic tag equal; in collection mode the canonical ones, the box's own reference solved). Declines — the **teacher** answers (rules 1–4, else rule 5a's refusal `IsolatedAtom` before any model answer, readiness the same; never the model's one-atom answer) — for charge ≠ 0, a missing or unsolved reference, ≥ 2 lone atoms of mixed species, a pair under a shell-check fence, ≥ 2 atoms not known to end at a gap (Z = 1, or on a pseudised surface a scan with `AtomReference::fractional == Some(false)`; any Z ≥ 2 on the all-electron surface or unrecorded → declined), and a multiplicity ≠ 1 + Σ_i (m_i − 1) (m_i the scan's recorded choice, else the only one the scan can solve — H's 2 — else unknown → declined); draft mode answers with the model, the same number; the relax verification is skipped after a reference step | exact for the model by construction (empty descriptors, mean 0, no intercept: `surrogate::fit` "Isolated-atom limit"; bitwise test). For the scenes it answers, DFT differs only by finite-box artefacts, **measured for a lone H** against the same atom at the cell centre (`diag_lone_h_wobble`, GPU, tol 1e-6, all-electron; the app's `Accepted` pseudo-H not measured): default box 81³ × 0.15 — a sub-grid shift **+8.7e-7 Ha**, (2, 1, 0.5) Bohr (4 Bohr from the nearest face, face density 7.3e-6 at the box rule's 7.2e-6) **+1.82e-3 Ha** with F_x −2.6e-3 Ha/Bohr toward the centre, 2 Bohr from a face **+3.47e-2 Ha** (F −5.2e-2); 49³ × 0.25 the same box: +2.7e-6, +1.95e-3 (face 2.0e-5 at the rule's 2e-5), +3.29e-2. The grid's ripple is µHa; the rest is the grid box's confinement (its Dirichlet boundary, ψ = 0 at the faces — not the app's container walls, which `sim` applies on top and books), which the free-atom reference leaves out (the more physical answer; it also made the user's 202 lone-H samples spread by 1.3 mHa). Open shells: under `DegenerateShells` a shared cluster is released once its spread reaches τ = `DEGENERACY_TAU` = 1e-3 Ha (not τ_c = 0.1), which box confinement exceeds between copies, and `released_occupations` fills one copy first (two O at M = 5 → O⁻ + O⁺, hundreds of mHa: derived from the occupation rule, not measured); integer aufbau hides open shells — hence the ≥ 2 rule; one open-shell atom alone is answered, its in-box release into the integer symmetry-broken state (≤ ≈ 12 mHa for O) being one more box artefact. Multiplicity: two H at M = 1 (also "automatic") are the restricted singlet, +4.6e-2 Ha above 2 E_ref at 6.4 Bohr (rule 5a's measurement; R → ∞: 2 E_LDA(H) ≈ +66 mHa above 2 E_LSD). Mixed species: aligned spins can move charge to another species' partly empty shell at any separation. Why: the user's untrusted collection (1805 samples) sent a single H to DFT on every step. Tests: `surrogate::tests::lone` (13) |
+| rule 0b: lone atoms answered from the references (user request 2026-11-12, fix round 1; `providers::surrogate::lone`) | strict mode, no atom with a neighbour within the model's r_cut (6 Bohr; one source for the rule and the audit skip) → E = Σ_i E_ref(Z_i), every F = 0, `Source::Reference` (on the model's surface), no teacher call, no audit, no sample; the references are the model's own `ref_energy` when a model on this surface covers the species (bitwise `Model::predict`; it moves only with a refit, booked), else the provider's (per scene the store's surface: grid, h, σ, tol, teacher, ionic tag equal; in collection mode the canonical ones, the box's own reference solved). Declines — the **teacher** answers (rules 1–4, else rule 5a's refusal `IsolatedAtom` before any model answer, readiness the same; never the model's one-atom answer) — for charge ≠ 0, a missing or unsolved reference, ≥ 2 lone atoms of mixed species, a pair under a shell-check fence, ≥ 2 atoms not known to end at a gap (since plan 2026-11-13 Task 10, spec §6.4: Z = 1, or a scan whose winning solve had no partial level, `AtomReference::fractional == Some(false)` — a ≥ 27.6 kT = 138 mHa gap around μ — on either surface; a partial level or unrecorded → declined; before it, any Z ≥ 2 on the all-electron surface declined), and a multiplicity ≠ 1 + Σ_i (m_i − 1) (m_i the scan's recorded choice, else the only one the scan can solve — H's 2 — else unknown → declined); draft mode answers with the model, the same number; the relax verification is skipped after a reference step | exact for the model by construction (empty descriptors, mean 0, no intercept: `surrogate::fit` "Isolated-atom limit"; bitwise test). For the scenes it answers, DFT differs only by finite-box artefacts, **measured for a lone H** against the same atom at the cell centre (`diag_lone_h_wobble`, GPU, tol 1e-6, all-electron; the app's `Accepted` pseudo-H not measured): default box 81³ × 0.15 — a sub-grid shift **+8.7e-7 Ha**, (2, 1, 0.5) Bohr (4 Bohr from the nearest face, face density 7.3e-6 at the box rule's 7.2e-6) **+1.82e-3 Ha** with F_x −2.6e-3 Ha/Bohr toward the centre, 2 Bohr from a face **+3.47e-2 Ha** (F −5.2e-2); 49³ × 0.25 the same box: +2.7e-6, +1.95e-3 (face 2.0e-5 at the rule's 2e-5), +3.29e-2. The grid's ripple is µHa; the rest is the grid box's confinement (its Dirichlet boundary, ψ = 0 at the faces — not the app's container walls, which `sim` applies on top and books), which the free-atom reference leaves out (the more physical answer; it also made the user's 202 lone-H samples spread by 1.3 mHa). Open shells: one μ_σ spans the box, so copies whose levels the box splits (≤ 1.8 mHa measured) can fill one copy's partly filled shell first (two O at M = 5 → charge moved between them, far from 2 E_ref: derived from the occupation rule, not measured); a reference with no partial level has a ≥ 138 mHa gap at μ, above the O self-polarisation gap (11.6–11.8 mHa) plus that splitting — hence the ≥ 2 rule (before Task 10 the shared-shell rule's release did the same with τ = 1e-3 Ha, and integer aufbau hid all-electron open shells); one open-shell atom alone is answered. Multiplicity: two H at M = 1 (also "automatic") are the restricted singlet, +4.6e-2 Ha above 2 E_ref at 6.4 Bohr (rule 5a's measurement; R → ∞: 2 E_LDA(H) ≈ +66 mHa above 2 E_LSD). Mixed species: aligned spins can move charge to another species' partly empty shell at any separation. Why: the user's untrusted collection (1805 samples) sent a single H to DFT on every step. Tests: `surrogate::tests::lone` (13) |
 | rule 5a: an isolated atom in a scene of ≥ 2 atoms (M6 Task 11) | no neighbour within r_cut = 6 Bohr → fallback | the model's free-atom limit is Σ E_ref with F = 0 (ruling S5), not the teacher's dissociated state at the scene's spin (restricted H₂ singlet +4.6e-2 Ha above 2 E_ref at r = 6.4, measured); a one-atom scene is exempt (its answer is E_ref, the teacher's own atom, S9). Not an envelope limit: on even with `max_descriptor_distance` = ∞ |
-| `COORDINATION_RATIO` (rule 5b, M6 Task 11) | 3 | the vanishing direction judged relatively: an atom whose coordination C_t = Σ_{j∈t} f_c(r_ij) is > 3× below the training minimum of its species is outside (the minimum over its non-isolated training atoms: an atom of a fitted sample with no neighbour within r_cut — a kept fallback's stray atom — never enters the envelope; admitted, it set the minimum to 0 and switched the rule off for that species. Envelope-isolated fix, 2026-11-19: `an_isolated_atom_is_no_envelope_atom`, `a_fitted_stray_atom_leaves_the_envelope_and_the_stretched_pair_alone`; an older `.model` file's envelope is rebuilt at install). One kept stretched-pair sample (r = 5.125, f_c 0.05) put C = 0 at 0.51 spreads (old rule never fired; now: fires at C < 0.0172, r > 5.50 Bohr for one H neighbour, and at C = 0). Factor = the spread limit's "3× beyond what was seen", multiplicatively — no new tuning; where the old premise held nothing changes (the spread rule fires first iff u < 2m/9: H₂ pass m 0.531, u 0.078 = 0.15 m → spread fires at r > 3.8, ratio would at r > 4.34). Only the n = 0 channels (the n ≥ 1 and l ≥ 1 features vanish inside full neighbourhoods by symmetry). Derivation: `surrogate::envelope` module doc |
+| `COORDINATION_RATIO` (rule 5b, M6 Task 11) | 3 | the vanishing direction judged relatively: an atom whose coordination C_t = Σ_{j∈t} f_c(r_ij) is > 3× below the training minimum of its species is outside (the minimum over its non-isolated training atoms: an atom of a fitted sample with no neighbour within r_cut — a kept fallback's stray atom — never enters the envelope; admitted, it set the minimum to 0 and switched the rule off for that species. Envelope-isolated fix, 2026-11-19: `an_isolated_atom_is_no_envelope_atom`, `a_fitted_stray_atom_leaves_the_envelope_and_the_stretched_pair_alone`; an older `.model` file's envelope is rebuilt at install — since the stray-atoms merge by holding its lone and stray samples out and rebuilding the fit without them, `stray.rs` `an_installed_file_with_isolated_atoms_in_its_envelope_is_rebuilt`). One kept stretched-pair sample (r = 5.125, f_c 0.05) put C = 0 at 0.51 spreads (old rule never fired; now: fires at C < 0.0172, r > 5.50 Bohr for one H neighbour, and at C = 0). Factor = the spread limit's "3× beyond what was seen", multiplicatively — no new tuning; where the old premise held nothing changes (the spread rule fires first iff u < 2m/9: H₂ pass m 0.531, u 0.078 = 0.15 m → spread fires at r > 3.8, ratio would at r > 4.34). Only the n = 0 channels (the n ≥ 1 and l ≥ 1 features vanish inside full neighbourhoods by symmetry). Derivation: `surrogate::envelope` module doc |
 | rule 6: the force std compared (M6 Task 11) | epistemic only: force_std_epistemic/√3 | the posterior's force variance splits exactly, force_std² = 3σ_f² + Σ_a g̃ᵀΣg̃ (accumulated separately in `Model::predictive_std`; test 1e-14); σ_f is label noise a fallback cannot reduce — as rule 7 already excludes the energy floor. With σ_f in it, a fit with σ_f ≳ 2e-3 fell back on every pass through equilibrium (absolute bound) and answered near the turning points: the user's cycle |
 | trust: force noise (M6 Task 11) | σ_f ≤ `force_std_abs` (2e-3 Ha/Bohr) | σ_f is the fit's homoscedastic force residual — label noise *and* basis misfit together, one number for every geometry. A constant carries no geometry-dependent information, so it cannot inform a per-step decision (rule 6 leaves it out) and is gated once, globally, by trust: a model whose force residual scatter exceeds the absolute tier is untrusted ("force noise σ_f …") and goes through the recovery (offenders ranked against the absolute tier, quarantine within the 10 % cap). With both gates the per-component expected error of an answer is √(s² + σ_f²) ≤ √(b² + σ_f²) ≤ √2·b at the 2e-3 floor (s the epistemic std ≤ b by rule 6). User's model 9.6e-3 (trusted before: the relative residual bound passes up to 10 % of \|F\|, capped at 1e-2); validated fits: H₂ pass 4.49e-5, H₃⁺ 2e-5 |
 | teacher-surface fallbacks (M6 Task 11) | rule 5, the first evaluation after an edit, \|gap\|/N > `energy_std_per_atom` | the model's energy there is an extrapolation (+578 Ha in the user's run), a guess the history must not be anchored on (a 15 Ha offset carried for good), or off by more than its tier (rule-7 fallbacks 3.9e-2 Ha/atom in the repro): E_total is the teacher's on every such step. The switch is booked as J = E₁ − E₀ + ½(m̃₀ + m̃₁)·Δr, so E_conserved moves by Verlet's dt²Σ Δ\|F\|²/8m only (GPU repro: residual 1.6e-16 Ha); no model energy at an extrapolated point enters |
@@ -1110,6 +1224,8 @@ P(χ²₃/3 > 9) = 6e-6 per atom. The residual 1–2× cases are H₃ geometries
 from the first run's kept fallbacks (samples 273 → 315): one sample spans its direction, so rule 5d
 lets the posterior judge there, as designed. Box-affected checks are not judged (the box rule);
 the hot run's worst there is 4.6e-2 Ha/atom of confinement and model error together.
+
+**Since then (2026-11-17/20).** Under Fermi–Dirac labels the test passed at 07939ac (1036 s) and failed at 762159b (1378 s: hot run 12 answers beyond, worst 2.38e-3 Ha/atom and 4.48×) — one chaotic trajectory, the many-body class opening on 3 evidence points (bisect: `scf-stall/.superpowers/sdd/2026-11-13-fermi-smearing/stuck-escape-bisect.md`). Trust tightening closes that gap: the many-body key opens only at 12 fits and 60 comparisons. **Run of record 2026-11-20 at 7498cf96: pass, 771 s** — hot run 260 answers, 61 judged, worst 9.72e-4 Ha/atom and 1.82×, 0 beyond; the fallback-energy check now leaves out in-step ticks at box-affected answers (the controller's ruling). Numbers: "Trust tightening (2026-11-19)" below.
 
 ### Runtime (in-suite, five tests concurrent, GPU evaluations serialised; run of record 2026-10-14)
 
@@ -2024,10 +2140,12 @@ generated without the gate (CPU, `generate`), so H and He read "provisional (dim
 (`IonicError::Provisional`); the gated H (f = 1.2, s-local, h_req 0.35) and He (not applicable, f = 1.6) the providers use
 are recorded in "M7 `All` (Task 11)". The hash line is `recipe_hash` = ledger + `DIMER_PROCEDURE` (the "two identities" of
 `qm::radial::ledger`; `LEDGER.version` did not move): regenerated at Task 11 with every row's values unchanged (only the
-hash line and the new column differ).
+hash line and the new column differ). **Plan 2026-11-13 Task 10:** the dimer procedure gained the occupation rule (Fermi–Dirac
+at kT = 5e-3) and the GPU partial-level stop (1e-5) among its hashed fields, so the hash line moved from 0x30a74d9bda495668
+(now `legacy_recipe_hash`, the shared-shell era's) to 0xeaf63fe213a84a26 with every row unchanged.
 
 <!-- m7-generation-records:begin -->
-recipe_hash = 0x30a74d9bda495668 (m7-tm-kb-nlcc-4 + dimer-gate-1)
+recipe_hash = 0xeaf63fe213a84a26 (m7-tm-kb-nlcc-4 + dimer-gate-1)
 
 | Z | el | f | local | r_c (Bohr) | Z_v | E_KB (Ha) | GSS (Ha) | r_nlc | r_core | h_req | h_eb | dimer |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -4735,6 +4853,1058 @@ So the study's cost estimate (under 1 s per failing refit at Q′ 1 590) holds: 
 - **N₂ moves by exactly 0**: its columns share no sample with H or O (Rule 2's component argument, exact).
 - **Nothing here argues for a larger ε or a looser gate (i).** The H₃ tails (2.5–5.3× the bound) are where a looser rule would answer wrongly.
 
+## Fermi–Dirac migration (spec `2026-11-13-fermi-smearing-design.md`; A1 measurements, plan Task 3, 2026-11-14, release, RX 7900 XTX, GPU prototype)
+
+Measured on the uncommitted prototype before production code (branch `smearing-prototype`, never merged), kT =
+5 mHa. Full tables and method: `docs/superpowers/notes/2026-11-13-a1-measurements.md`. The V2 pins are in the
+spec's §9 V2 table (amended).
+
+**Witness cost** (spec §4.2; median of 5, `solve_observed` wall time; cold = same geometry, warm = nucleus 0 moved
+±0.005 Bohr alternately). All-electron rows: aufbau (today) against the witness configuration
+(`DegenerateShells` + FD). Pseudised H₂O: DS against FD.
+
+| case | grid, tol | cold (ms) | warm (ms) | extra vectors per channel |
+|---|---|---|---|---|
+| H₂ all-electron (R = 1.4) | 49³ × 0.25, 1e-6 | 230 → 708 (3.1×) | 222 → 308 (1.39×) | 0 → 1 |
+| H₃⁺ all-electron (side 1.9) | 49³ × 0.25, 1e-6 | 248 → 550 (2.2×) | 188 → 329 (1.75×) | 0 → 1 |
+| H₂O pseudised (`h2o` preset) | 57³ × 0.20, 1e-5 | 3082 → 5437 (1.76×) | 1713 → 2252 (1.31×) | 1 → 2 |
+| H₂O pseudised | 81³ × 0.15, 1e-5 | 5383 → 6924 (1.29×) | 2594 → 2817 (1.09×) | 1 → 2 |
+
+E unchanged within 5e-8 Ha (all-electron) and 1.5e-6 Ha (pseudised, the 1e-5 stop's scatter). Pseudo-O cannot run
+at 57³ × 0.25 (h > h_req = 0.20), so 57³ × 0.20 stands in. The 3p atoms in V0's 14 Bohr box cost 5–80× DS cold (V0
+note, 2026-11-14 section C).
+
+**E‴ of the stiffest bonds** (spec §6.3, κ_max = 1 Ha/Bohr³; default pseudo surface, 81³ × 0.15, tol 1e-6; one bond
+stretched at 7 points 0.8 R_e … R_e; F(R) fitted to degree 5 and the HF bond force to degree 4):
+
+| bond | R_e (Bohr) | E‴ at 0.8 R_e … R_e (Ha/Bohr³) | max (1/12)\|E‴\| (energy / force fit) |
+|---|---|---|---|
+| O–H in H₂O | 1.8488 | −4.77 … −1.80 | **0.398 / 0.402** |
+| N–H in NH₃ | 1.9367 | −4.15 … −1.40 | **0.346 / 0.350** |
+
+Both under κ_max = 1 (2.5× and 2.9×). At R_e (1/12)|E‴| = 0.15 and 0.12, consistent with "M7 forces" OH's ≈ 0.18.
+
+**V3 (FD-consistency oracle) aspect, chosen on the GPU prototype** (all-electron, 41³ × 0.30, σ = h, tol 1e-6;
+Task 6 confirms on the CPU at tol 1e-9): **H₄ rectangle 1.8 (x) × 1.95 (y) Bohr, centred, atom 0 at (−0.9, −0.975, 0)
+displaced along x.** Frontier splitting Δ = 12.93 mHa (u = Δ/4kT = 0.65); c = dΔ/dx = 0.0498–0.0540 Ha/Bohr and
+d(TS)/dx = −2.14e-2 … −2.39e-2 Ha/Bohr over the 4δ span (= −u sech²u · c to 3 digits); plain |FD(0.01) − FD(0.02)| =
+2.9e-5 Ha/Bohr; HF − R_E(δ/2, δ) = −2.27e-2 Ha/Bohr. The GPU Richardson pair (|R(δ/2, δ) − R(δ, 2δ)| = 2.3e-5) is at the
+f32 floor; the CPU test certifies it. Pre-registered (spec §9 V3): the measured F‴ ≈ 0.58 Ha/Bohr³ puts the plain
+truncation e ≈ 1e-5 at the δ-scaling check's own gate; Task 6 records e and b = HF − R_F separately; if the ratio check
+is asserted and b lies outside [−e/2, e/4], that is a spec decision, never a re-pin. (Superseded: the stop rule reads
+b/e ∈ [−½, ¼], since the literal interval is empty for e < 0; see "V3 on the CPU" below and spec §9 V3.)
+
+**V3 on the CPU** (plan Task 6, 2026-11-15; `oracles.rs` `fd_forces_are_minus_df_dx_near_a_pinned_pair`, geometry
+`common::v3_h4()`; CPU f64, 41³ × 0.30, σ = h, tol 1e-9 (Poisson 1e-12 by `qm`'s `poisson_tol`, Task 6 fix round 1), eig_tol
+1e-10, FD at kT = 5 mHa; release, Ryzen 7 9800X3D, 4 solver threads, 394 s; **passes**). The aspect is confirmed: Δ = 12.93 mHa
+(u = 0.646) at the centre, c = dΔ/dx = 0.0498 … 0.0540 Ha/Bohr and d(TS)/dx = −2.14e-2 … −2.39e-2 Ha/Bohr over every
+sub-interval of the 4δ span ((d(TS)/dx)/c = −0.429 … −0.443, against −u sech²u), plain |FD(δ) − FD(2δ)| = 2.96e-5.
+Every solve carries the box warning alone (face density 1.68–1.74e-5, the partly occupied level's tail; the same box
+at every x, part of the discrete problem).
+
+| quantity | value (Ha/Bohr) | bound |
+|---|---|---|
+| HF (atom 0, x) | −0.0464015592 | |
+| FD_F(δ/2), FD_F(δ), FD_F(2δ) | −0.0464042293, −0.0464116142, −0.0464411711 | |
+| R_F(δ/2, δ), R_F(δ, 2δ) | **−0.0464017677, −0.0464017620** | |
+| \|R_F(δ/2, δ) − R_F(δ, 2δ)\| | **5.7e-9** | ≤ 2.5e-5 |
+| e = FD_F(δ) − R_F(δ/2, δ) | −9.85e-6 (F‴ = +0.591 Ha/Bohr³; A1 GPU 0.58) | recorded |
+| b = HF − R_F(δ/2, δ) | **+2.09e-7**; b/e = −0.021 | \|b\| ≤ 1e-4; b/e ∈ [−½, ¼] (pre-registered stop) |
+| FD_F(δ) − HF | −1.006e-5: **0.6 % above the 1e-5 gate**, so the ratio is asserted | asserted iff ≥ 1e-5 |
+| (FD_F(2δ) − HF)/(FD_F(δ) − HF) | **3.940** | ∈ [3, 5] |
+| R_E(δ/2, δ), R_E(δ, 2δ) | −0.0237560843, −0.0237560654 | |
+| HF − R_E(δ/2, δ) | **−2.2645e-2** (45× the bound) | \|…\| ≥ 5e-4 |
+| centre warm (from +δ/2) − cold | F −6.2e-12 Ha, E −7.3e-12 Ha | (path scatter) |
+
+The ratio gate's margin is thin by construction (the pre-registration put e ≈ 1e-5 at the gate); the rule is kept as
+written (Task 6 ruling). Whether the ratio is asserted can flip on a 0.6 % change of FD_F(δ) − HF; when asserted it holds
+with b/e = −0.021, far inside [−½, ¼]. **A run in which the ratio is not asserted (|FD_F(δ) − HF| just under 1e-5,
+printed "not asserted") is expected near this gate and is not a regression**; the check stays conditional as
+pre-registered (the Richardson certification already establishes the expansion regime). SCF steps per point (the centre cold, the rest warm from it): 121, 20, 27, 18, 52,
+29, 19 at x = −2δ … +2δ; the centre re-solve 19 (Poisson 1e-12). At the first ruling's 1e-2·tol (Poisson 1e-11) they
+were 23, 184, 28, 17, 92, 30, 27 and 18, with R_F 1.0e-8 apart and a path scatter of 1.6e-10 Ha; every asserted number
+agreed to its printed digits.
+
+**Why V3 needs tighter inner solvers** (Task 6 diagnosis; the ruling, option A, is in spec §9 V3). Near the pinned pair
+∂f/∂ε = f(1 − f)/kT ≈ 34/Ha amplifies inner-solver error into a Δρ floor. The V3 centre, cold, tol 1e-9: at the old
+fixed Poisson tolerance 1e-10 Δρ wandered between 2e-9 and 2e-7 for 200 steps at eig_tol 1e-9, 1e-10 and 1e-11 alike
+(F_HF ± 1e-9); at Poisson 1e-11 / 1e-12 / 1e-13 it converged in 20 / 18 / 20 steps. Warm re-solves at eig_tol 1e-9
+then sat at Δρ 1e-8 … 2e-7 (the pair's rotation θ ≈ r/Δ ≈ 8e-8 unresolved, ≈ (f₁ − f₂)θ in ρ): 200 steps without
+convergence at Poisson 1e-12, 196 at 1e-13; at eig_tol 1e-10 the same re-solve took 19. `qm` now asks its Poisson solves
+for min(1e-10, 1e-3·tol) (bit-identical for tol ≥ 1e-7; Task 6 fix round 1, from 1e-2·tol, whose floor ≈ 1e-9 sat at
+tol), and V3 sets eig_tol 1e-10.
+
+**V5 NVE case: CO₂⁺, not N₃.** Pseudised N₃ (71³ × 0.20) is linear ²Π_g (R_e 2.224 Bohr, TS = 2 kT ln 2 within 1e-9,
+k_β = 0.128 Ha/rad², ω_b 543 cm⁻¹), but its ↓ π split grows only to 39 mHa at a 60° bend, after which the ↑ channel
+turns partial and the state changes (75°: split 30.5 mHa, the bend force collapses); it never reaches the spec's
+10 kT. **CO₂⁺** (pseudised C and O, charge +1, doublet; 71³ × 0.20, 14 Bohr): linear ²Π_g, R_e = 2.225 Bohr, TS =
+2 kT ln 2 within 1e-9, restoring and smooth to 70°, k_β = 0.107 Ha/rad², ω_b = 2.335e-3 a.u. (512 cm⁻¹). **Start:
+β = 70° (bond angle 110°) at R = 2.226, at rest, C on a grid node**: ↓ π split 47.3 mHa (9.5 kT), ↑ gap 95 mHa,
+TS 0.514 mHa (6.931 at linear: a 6.4 mHa swing), E_mode = F(70°) − F(0) = 98.75 mHa, h_b = ω_b·dt = 0.0241 at
+**dt = 0.25 fs**, **h_b²/4·E_mode = 1.4e-5 Ha** (the symmetric stretch, the only other mode a C₂ᵥ start feeds, holds
+5.8 mHa at the start: h_s²/4·E = 5.6e-6; the whole E_mode there would give 9.5e-5). Face density ≤ 1.1e-6 over
+0°–80° (rule 1.28e-5). **Steps: ≥ 2 bend periods, ≈ 600** (harmonic period 260 steps; the large amplitude stiffens
+the bend, F(70°) = 98.75 mHa against ½k_ββ² = 80 mHa; 300 steps = 0.075 ps cannot resolve drift at `DRIFT_BOUND`).
+Task 11 times the per-step cost (not measured here) and measures σ_path under the 1e-5 stop, then pre-registers
+the drift and fluctuation (3 × (h²/4·E_mode + 2σ_path)) bounds for this trajectory.
+
+### The branch_jump guard (plan 2026-11-13 Task 8, 2026-11-16, release, RX 7900 XTX; `providers::branch_jump`)
+
+**The check** (spec §6.3 as amended by Task 8 fix round 1; derivation in the `providers::branch_jump` module doc). Two
+consecutive evaluations of the same provider: ΔF = E₁ − E₀, W = −½Σ_I(F_I,0 + F_I,1)·ΔR_I (the trapezoid estimate of
+ΔF; on a smooth surface m = |ΔF − W| = (1/12)|∂³E/∂u³|‖ΔR‖³ at some point of the step, u the unit 3N direction),
+flagged when m > b = 3(√(σ_E,0² + σ_E,1²) + ½‖ΔR‖√(σ_F,0² + σ_F,1²)) + 3κ_max‖ΔR‖³ (each evaluation's own tier,
+review M4). Pre-registered, never loosened: **factor 3, reach 0.1 Bohr (largest single-atom displacement judged),
+κ_max = 1 Ha/Bohr³** ((1/12)·6Da³ = 0.34 for D = 0.2 Ha, a = 1.5 Bohr⁻¹, rounded up; the measured (1/12)|V‴| of O–H in
+H₂O and N–H in NH₃ reach 0.40 and 0.35 at 0.8 R_e, "Fermi–Dirac migration" above; with the 2√2 of two equal masses
+moving oppositely along one bond, 1.13 and 0.99, under 3κ_max = 3; ≈ 1.19× for O–H in MD, review M2).
+
+**Fix round 1 (review C1): κ_max always, no running median.** The first build used κ̂ = min(median of m/‖ΔR‖³ over the
+last 8 judged, unflagged, third-order-dominated steps, κ_max). The running median is biased low on large-amplitude bond
+motion and locks in, because flagged steps never enter it: Morse V‴ ∝ x − 4x² vanishes at R_e + ln 4/a (2.8 Bohr for
+H₂, 3.0 for O–H), steps there fill the window with m/‖ΔR‖³ ≈ 0.001–0.005, and the third derivative rises 100–300×
+within a few steps into the well. The review's replica flagged 655 of 2999 steps of H₂ forming from rest at 4 Bohr, and
+2–17 per collision. With κ_max always (`h2_forming_from_rest_is_never_flagged`: LSDA-like H₂ Morse D 0.17, a 1.03, R_e
+1.45, velocity Verlet 0.25 fs, 3000 steps, r ∈ [0.81, 4.00]: **0 flags of 2999 judged, worst m/b 0.33**;
+`o_h_collision_is_never_flagged`: O–H Morse D 0.17, a 1.21, R_e 1.85 — fitted to the measured E‴ −1.80 at R_e, giving
+−4.9 at 0.8 R_e against −4.77 measured — H onto O from 5 Bohr at E_rel 0, 0.005, 0.01, 0.02 Ha: **0 flags of 2651–2977
+judged, worst m/b 0.24–0.25**). `BRANCH_JUMP_WINDOW` is gone.
+
+**What it can see (rule 7; review I2).** The reach is per atom, the bound uses the 3N norm: N atoms each moving δ give
+‖ΔR‖ = √N·δ and b ≈ 3κ_max·N^{3/2}·δ³ + n. At the reach (δ = 0.1 Bohr) the third-order term is **3.0, 8.5, 15.6, 33.5
+and 94.9 mHa for N = 1, 2, 3, 5 and 10**, so **a 12 mHa jump is not detectable on a step that moves three or more atoms
+near the reach**. MD steps are far shorter: an H moves about 0.013, 0.024 and 0.041 Bohr per 0.25 fs step at 300, 1000
+and 3000 K (all ten atoms at 0.041 Bohr: 6.5 mHa + n).
+
+**The tiers** (`noise_tier(all_electron, ScfStats::tol_used, E)`, ruling R8; σ_E in Ha, σ_F in Ha/Bohr per component;
+**σ_E = max(the tier's, c·|E|)** with c = 9e-8 pseudo, 1.0e-7 all-electron, fix round 1 below):
+
+| tier | used when | σ_E | σ_F | source |
+|---|---|---|---|---|
+| pseudo, sample | tol_used ≤ 1e-6 | 1.87e-6 | 5e-5 (`PSEUDO_FORCE_NOISE`) | H₂O (`All`) warm vs cold, "GPU vs CPU at fixed σ" (pseudo path scatter); the GPU pseudo force scatter at 1e-6 |
+| all-electron, sample | tol_used ≤ 1e-6 | 5.4e-6 | **2.4e-5** | H₂O GPU path scatter (M3 Task 8); σ_F measured below (no all-electron force scatter was on record) |
+| pseudo, app | otherwise (1e-5; every partial-level GPU stop) | **1.6e-6** | **9.0e-5** | measured below: the larger of H₂O and linear OH |
+| all-electron, app | otherwise | **4.7e-6** | **1.4e-5** | measured below: all-electron H₂O |
+
+**Measurement** (`branch_jump::tests::tier_scatter_measurement`, `#[ignore]`d; `BRANCH_JUMP_TIER_CASE=<case> cargo test -p
+providers --release tier_scatter_measurement -- --ignored --nocapture`). `GpuSolver` driven directly with explicit
+`FermiDirac { kt: ELECTRON_KT }` (the providers still run the old occupation rule until plan Task 9) on the scene
+`providers::ks::problem` builds at the app's Accurate grid for the H₂O preset's 14 Bohr box, **95³ × 0.15**, σ = h,
+density extrapolation off. One cold solve at R₀, then 5 repeats of {warm solve at R₀ + δ (every atom 0.02 Bohr in a
+seeded random direction), warm solve back at R₀}; per repeat |E_warm − E_cold| and the largest per-component
+|F_warm − F_cold|. **σ is the largest of the 5** (each a difference of two solves, so conservative by up to √2 against a
+per-solve σ, as the sample tier's 1.87e-6 is), rounded up to two digits.
+
+| case | ionic, tol (stop) | steps cold / warm, wall | \|E_warm − E_cold\| (5 repeats) | max \|ΔF\| per repeat | σ_E (rms) | σ_F (rms of maxima) |
+|---|---|---|---|---|---|---|
+| H₂O | `Accepted`, `effective_gpu_tol(1e-5)` = 1e-5 (gapped) | 13 / 9–10, 6.8 s / 2.5–3.3 s | 6.0e-7, 1.2e-6, 1.6e-6, 7.9e-7, 9.8e-7 | 2.6e-5, 3.9e-5, 3.6e-5, 1.3e-5, 1.7e-5 | **1.56e-6** (1.07e-6) | **3.93e-5** (2.81e-5) |
+| linear OH (R = 1.85, along x) | `Accepted`, asked 1e-6, **stopped at 1e-5** (partial π↓ pair, f = ½, ½; TS 6.93 mHa) | 14 / 12–17, 5.1 s / 4.5–9.4 s | 5.4e-7, 1.6e-8, 3.5e-7, 3.9e-7, 8.3e-8 | 9.9e-6, 3.5e-5, 2.9e-5, **8.9e-5**, 3.9e-5 | 5.35e-7 (3.37e-7) | **8.95e-5** (4.83e-5) |
+| H₂O all-electron | `None`, 1e-5 (gapped, TS 1.6e-15) | 16 / 10–14, 94 s / 38–60 s | 1.2e-6, 3.3e-6, 1.9e-6, 2.2e-7, 4.7e-6 | 1.4e-5, 9.0e-6, 7.0e-6, 4.9e-6, 1.3e-5 | **4.66e-6** (2.74e-6) | **1.35e-5** (1.01e-5) |
+| H₂O all-electron | `None`, 1e-6 (gapped) | 20 / 12–13, 92 s / 32–50 s | 1.1e-6, 3.6e-6, 1.6e-6, 4.4e-7, 3.5e-6 | 2.0e-5, 1.1e-5, 6.2e-6, 2.3e-5, 5.3e-6 | 3.60e-6 (2.40e-6) | **2.35e-5** (1.51e-5) |
+
+- **Pseudo app tier = the larger of H₂O and OH per quantity**: σ_E 1.56e-6 → **1.6e-6** (H₂O), σ_F 8.95e-5 → **9.0e-5**
+  (OH, whose partial-level stop is the pinned teacher case [kT-5]).
+- **All-electron app tier** (H₂O): **4.7e-6**, **1.4e-5**. The all-electron FD solve at this grid converged (no witness
+  cap, NOTE-6), so the provisional pseudo ×5 fallback was not needed. Its LOBPCG hit the 200-iteration cap in 1–10 of
+  20–44 calls per solve (the witness columns among box states, plan Task 9b's cost item); each solve still converged.
+- **Rule 7 notes on the numbers.** The app-tier σ_E come out *below* the older sample-tier σ_E (pseudo 1.6e-6 against
+  1.87e-6, all-electron 4.7e-6 against 5.4e-6): those were measured on other grids (51³ × 0.20 and 49³ × 0.25) and with
+  other warm paths, and a looser stop need not show a larger warm/cold difference on a gapped molecule (the 1e-5 stop's
+  own error is second order in Δρ, spec §5.1). They are recorded as measured, not raised to the sample tier. The OH
+  force scatter at its 1e-5 stop (8.95e-5) is 1.8× `PSEUDO_FORCE_NOISE`, within the "up to ≈ 7e-5 on warm teacher chains"
+  range noted for that constant's measurement, and one repeat in five sets it (the rms of the maxima is 4.8e-5).
+- **The all-electron tiers are not ordered in σ_F**: the 1e-6 run's largest force difference (2.35e-5) exceeds the 1e-5
+  run's (1.35e-5) on the same geometry and neighbours — with five draws each, the maximum is itself a noisy estimate (the
+  rms of the maxima, 1.5e-5 and 1.0e-5, are within each other's scatter). So a sample-tolerance all-electron solve is
+  judged slightly more loosely than an interactive one. Recorded as measured; a sixth draw or a pooled estimate is a
+  review decision, not a tuning here.
+
+**I1 (fix round 1): does the scatter grow with system size?** The same harness, density extrapolation **on** (the MD
+case: per repeat the history dropped, then warm solves at R₀ − 2δ, R₀ − δ and R₀, the last two from 2ρ_t − ρ_{t−1}),
+`Accepted`, 1e-5, on the largest preset, **SiH₄** (5 atoms, 8 valence electrons; the `sih4` preset geometry), at
+Accurate and Balanced, and H₂O beside it (one GPU batch, 647 s):
+
+| case | grid | \|E\| (Ha) | cold / warm R₀ steps, wall | σ_E max (rms) | σ_E/\|E\| | σ_F max (rms of maxima) |
+|---|---|---|---|---|---|---|
+| SiH₄, extrapolation on | Balanced 57³ × 0.25 | 6.4542 | 11 / 6–10, 14 s / 3.8–16 s | 5.16e-7 (3.31e-7) | 8.0e-8 | 2.76e-6 (2.02e-6) |
+| SiH₄, extrapolation on | Accurate 95³ × 0.15 | 6.4540 | 10 / 7–12, 27 s / 5–7 s | 4.44e-7 (2.29e-7) | 6.9e-8 | 2.78e-6 (2.19e-6) |
+| H₂O, extrapolation on | Accurate 95³ × 0.15 | 17.4766 | 13 / 8, 5.8 s / 1.6–2.0 s | 4.85e-7 (3.68e-7) | 2.8e-8 | 1.68e-5 (1.31e-5) |
+| H₂O, extrapolation off (Step 1) | Accurate 95³ × 0.15 | 17.4766 | | 1.56e-6 | 8.9e-8 | 3.93e-5 |
+| H₂O all-electron, off (Step 1) | Accurate 95³ × 0.15 | 46.558 | | 4.66e-6 | 1.0e-7 | 1.35e-5 |
+
+- Extrapolation on gives *smaller* warm/cold differences than the Step 1 protocol (H₂O 4.9e-7 against 1.56e-6; forces
+  1.7e-5 against 3.9e-5), so the Step 1 tiers (extrapolation off) are the conservative ones for MD. Every preset carries
+  ≤ 8 valence electrons on the default `Accepted` surface (H₂O, H₂S, HCl, PH₃, SiH₄: 8), so on the presets the scatter
+  cannot grow by electron count; SiH₄ (the most atoms) sits under H₂O's tiers at both qualities (σ_E 5.2e-7 against
+  1.6e-6, σ_F 2.8e-6 against 9.0e-5).
+- Across surfaces, on one protocol, σ_E tracks |E|: 8.9e-8·|E| pseudo and 1.0e-7·|E| all-electron on H₂O (the f32
+  path's relative precision; SiH₄'s 8.0e-8·|E| with extrapolation on is the same size). **Pre-registered rule
+  (one global rule per surface): σ_E = max(tier, c·|E|), c = 9e-8 pseudo (`PSEUDO_RELATIVE_SIGMA_E`, 1.56e-6/17.477
+  rounded up), 1.0e-7 all-electron (`ALL_ELECTRON_RELATIVE_SIGMA_E`, 4.66e-6/46.558).** It does not bind on any measured
+  case (the tiers were measured on H₂O; SiH₄'s c·|E| = 5.8e-7 is under the tier and over its measured 5.2e-7) and grows
+  σ_E for scenes larger than H₂O (a 10× |E| scene gets 10× H₂O's σ_E). Test: `the_energy_scatter_scales_with_the_energy`.
+- σ_F shows no growth (SiH₄ 2.8e-6 against H₂O's 1.7e-5 on the same protocol): no |E| term for it.
+- **Range covered** (rule 7): measured scenes up to 5 atoms and 8 valence electrons pseudo (|E| ≤ 17.5 Ha) and 10
+  electrons all-electron (|E| 46.6 Ha). Larger scenes rely on the c·|E| rule, an extrapolation of the f32 relative
+  precision, not a measurement; Task 11's GPU NVE records its flag count (plan amendment 60034eb).
+
+**What the guard's tests found** (`cargo test -p providers --release branch_jump`, CPU, instant; analytic Morse dimer
+D = 0.2 Ha, a = 1.5 Bohr⁻¹, R_e = 1.8 Bohr on the pseudo sample tier; numbers after fix round 1):
+- a +12 mHa jump at a 0.02 Bohr step: m = 12.00 mHa against b = 3.41e-5 → flagged at that step only; the same after 50
+  steps of 1e-3 Bohr and at every jump of a ±12 mHa every-other-step stream;
+- smooth paths over R ∈ [0.8, 2.0]·R_e, out and back, never flagged. Tightest m/b with one atom moving: 0.016, 0.26,
+  0.34 at ‖ΔR‖ = 0.005, 0.02, 0.05 Bohr; with both atoms moving symmetrically (the bond changes by √2‖ΔR‖, so
+  m/‖ΔR‖³ = 2√2·(1/12)|V‴|): 0.045, 0.72, **0.92** (‖ΔR‖ = 0.05 at R ≈ 1.51). On this stiff Morse the symmetric
+  0.05 Bohr path uses most of the factor 3: (1/12)|V‴| reaches 1.1 at 0.8 R_e, ×2√2 = 3.2 per ‖ΔR‖³ against 3κ_max = 3,
+  held by |V‴| falling over the step. (The first build's 0.97 was the running median's lag, R 2.006 → 1.935 with κ̂ 0.143
+  against a local 0.518, review M3.) For the app's bonds ((1/12)|V‴| ≤ 0.40 at 0.8 R_e) the symmetric factor gives
+  ≤ 1.13 against 3.
+- the trapezoid error is third order (halving the step divides m by 8.0 ± 0.5) and equals (1/12)|E‴|h³ at the midpoint
+  within 5 %.
+- V7 (`validate --test surrogate branch_jump_step_is_not_trained_on`): a 12 mHa switch in a 12-step fallback streak is
+  warned and absent from the store; the 11 other steps are kept.
+- `a_scripted_session_decides_exactly_as_before` re-pinned (0xfeaa_fe54_5608_3db3 → 0x09f6_9183_02c2_fda9): the two new
+  `EvalStats` fields' `{:?}` text, 341 occurrences; removing exactly those reproduces the old digest.
+
+**Coverage** (rule 7, R-NOTE-b): sampling-pass solves and sparse audits, usually more than 0.1 Bohr apart, are not
+judged (dense scans and teach path points closer than that are, review M8); under the surrogate otherwise only fallback
+streaks are. The CPU f64 path is judged on these GPU tiers (conservative: its scatter is far smaller).
+
+**`PSEUDO_FORCE_NOISE` and the sample tier under FD (review M9).** `PSEUDO_FORCE_NOISE` (5e-5) was measured under
+`DegenerateShells` at 1e-6; under FD the cases it came from (lone pseudo-O, OH) carry a partial level and stop at 1e-5,
+so they are judged on the app tier (9.0e-5), and the pseudo sample tier now covers gapped pseudo solves at ≤ 1e-6, whose
+FD force scatter (H₂O 3.93e-5 even at 1e-5) is under 5e-5.
+
+### The providers' Fermi–Dirac surface (plan 2026-11-13 Task 9, 2026-11-16, release, RX 7900 XTX)
+
+**The switch.** `providers::ks::problem` poses every scene with `FermiDirac { kt: ELECTRON_KT }` (5 mHa), pseudised or
+not; `EvalStats` carries `partial` (the partly occupied levels), `energy.internal` (E), `energy.ts` and `energy.total`
+(F), and `scf_tol_used` = `ScfStats::tol_used` (a GPU solve with a partial level reports 1e-5). The shared-shell
+occupation watch is gone; the `branch_jump` guard above is its successor. Holds left: `BondForce::settings` (Task 10)
+and `gpu_vs_cpu::timing_table` (Task 9b).
+
+**Tags** (spec §6.2): pseudised `<word>/<surface_hash:016x>/fd5e-3/stop2x5e-8/pin1e-5`, all-electron
+`none/fd5e-3/pin1e-5`; `is_all_electron_tag` answers for `"none"` and `"none/…"`. **The legacy strings**, printed from
+`provenance_tag`/`tag_of` on the unmodified tree (62ae478) for every policy under `set_dimer_backend(Cpu)` and `Gpu`, are
+`legacy_tag_of`'s pins (`legacy_tag_of_matches_recorded_ds_strings`):
+
+| policy | CPU dimer backend | GPU dimer backend |
+|---|---|---|
+| None | `none` | `none` |
+| CoresOnly | `cores/eef0a918057a9fbe/shared1e-3/1e-1/stop2x5e-8` | the same |
+| Accepted | `cores/eef0a918057a9fbe/shared1e-3/1e-1/stop2x5e-8` | `all/30a74d9bda495668/shared1e-3/1e-1/stop2x5e-8` |
+| All | `all/30a74d9bda495668/shared1e-3/1e-1/stop2x5e-8` | the same |
+
+The new tags keep the table hashes: `cores/eef0a918057a9fbe/fd5e-3/stop2x5e-8/pin1e-5` and
+`all/30a74d9bda495668/fd5e-3/stop2x5e-8/pin1e-5`.
+
+**V2** (`providers::fd_regression`; spec §9 "V2 cases" as amended; through `problem`, cold, 81³ × 0.15, the app's 1e-5,
+stall stop on; "vectors" = electrons + extra witness vectors per channel). Every case converged without the stall stop,
+the step cap or the witness cap, in exactly A1's prototype count, and on A1's F and TS to ≤ 9.6e-7 Ha:
+
+| policy | case | steps (budget) | F (pin) | ΔF | TS (pin) | ΔTS | vectors ↑ / ↓ | wall (s) |
+|---|---|---|---|---|---|---|---|---|
+| default | H₄ rhombus | 12 (20) | −2.079322 | +3.2e-7 | 0.000027 | −3.0e-7 | 2+3 / 2+3 | 2.8 |
+| default | H₄ lopsided tetra | 16 (25) | −1.943830 | +9.5e-8 | 0.013889 | +3.4e-7 | 2+4 / 2+4 | 8.5 |
+| default | H₄ seed 1 | 13 (20) | −2.078602 | +4.7e-7 | 0.002076 | −9.6e-7 | 2+3 / 2+3 | 4.2 |
+| default | H₅ seed 3 | 15 (25) | −2.564249 | −2.8e-7 | 0.003006 | −1.5e-7 | 3+3 / 2+3 | 5.3 |
+| default | H₈ seed 8 | 14 (25) | −4.220394 | −5.6e-8 | 0.000163 | −3.6e-7 | 4+5 / 4+5 | 24.5 |
+| `ionic none` | H₅ ring | 11 (20) | −2.470682 | +4.6e-7 | 0.006932 | −5.3e-7 | 3+3 / 2+2 | 3.0 |
+| `ionic none` | H₆ seed 5 | 15 (25) | −2.973255 | +4.2e-7 | 0.009715 | −1.7e-7 | 3+3 / 3+3 | 5.5 |
+| `ionic none` | lopsided tetra | 15 (25) | −1.824952 | +2.6e-7 | 0.013978 | +1.2e-7 | 2+4 / 2+4 | 8.5 |
+| `ionic none` | H₂O + 2 H | 33 (50) | −47.350019 | +5.0e-7 | 0.013163 | −2.1e-8 | 6+9 / 6+9 | 336.5 |
+
+Controls: H₂ 9 steps, F −1.1361194 (Δ −4.0e-7 against −1.136119, bound 2e-6), TS 8e-19; H₂O 13 steps, F −17.4760229
+(Δ +7.2e-8, bound 6e-6), TS 1.4e-12.
+
+**The witness cap on an anion** (V8, NOTE-6; `all_electron_h_minus_witness_cap`): all-electron H⁻ in the presets'
+largest box at Accurate (the 14 Bohr box, 95³ × 0.15), cold, 1e-5: **converges** in 18 steps (74–76 s), F = −0.474954
+Ha, TS 1.9e-7; LSDA's HOMO is unbound (ε = +0.089 Ha, held by the box) and the witness took 10 extra vectors ↑ and 11 ↓
+of the cap 16. Larger user-chosen boxes (Scene ▸ Grid, up to 201³) can exceed the cap (N(E) ∝ L³); Task 9b.
+
+All-electron H₂O + 2 H grew 9 witness vectors per channel (6 occupied each): its 336.5 s (10 s per step, against A1's
+434 s) is the witness block's cost, plan Task 9b's item.
+
+**The orbital display under FD** (both producers: `qm_gpu::orbitals::OrbitalView`, `providers::orbitals::CpuView` and
+its reference `qm::orbitals::unoccupied_cpu`). A FermiDirac state's shown rows are its f-bearing columns
+(`qm::orbitals::shown_columns`: f ≥ `PARTIAL_OCCUPATION_MIN`); only they are compared with the display eigensolve's
+occupied pairs and projected out of its unoccupied vectors. The stored witness columns (which LOBPCG may leave at its
+cap; Task 7 measured "occupied eigenvalues disagree … 7.39e-4 Ha" when they were compared, and the first attempt that
+kept them as rows showed a display vector overlapping a stored Li witness by 0.49) are never rows: they seed the
+display eigensolve, whose unoccupied rows stand for those levels converged (overlap with the stored witnesses 1.00, i.e.
+the same states). A shown level within 1e-6 of 1 shows as full (`qm::orbitals::display_occupation`, spec §6.6). Li at
+σ = h = 0.25 now shows its ↑ 2p as the state's partly occupied rows (f ≈ 0.083), so `display_solve_converges_at_the_
+effective_tolerance` checks one bound unoccupied row, not three (re-pinned). The orbital-lag test reads the f-bearing
+columns' residual through a test probe (`SolveProfile::eigen_occupied_residual`, cfg(test)): 3.97e-6 warm, 5.38e-6
+cold against 3·lo, where `max_eigen_residual` (witness included) reads 7.45e-6 / 1.85e-4.
+
+**Re-pins of this switch** (each with its reason in the test; none deleted, no tolerance moved):
+- the stall stop on its measured cases (`the_level_gated_stall_stop_on_the_measured_cases`): stretched H₂ at 65³ × 0.25,
+  R = 6.0 and 107³ × 0.15, R = 5.75 converge in **14** and **13** iterations (were 191 and 144 under aufbau; the stop off
+  gives the same counts and F bits; σ_g/σ_u partly occupied, TS 5.2 / 4.8 mHa); the water O–H 1.8 r₀ point (95³ × 0.15,
+  `CoresOnly`) **converges in 16** (it stalled early under `DegenerateShells`). The stop's early end of a hopeless solve
+  stays pinned in `qm` and `qm-gpu`.
+- `the_stall_stop_leaves_a_released_pseudo_solve_bitwise`: OH 3.5 Bohr, FD: 24 steps, nothing released (no release under
+  FD), partly occupied π↓ (TS 6.93 mHa = 2 kT ln 2); the stop on/off bits and F_HF(last) − F = 2.8e-7 hold.
+- pseudo-O records the partial-level stop: `scf_tol_used` = 1e-5 at a requested 1e-6 (`the_gpu_stop_is_floor_aware…`,
+  `scf_tol_used_reports_the_partial_stop`, 30 steps, TS 9.547713e-3 = 3 kT s(⅓)); gapped H₂ records 1e-6.
+- the lone pseudo-O's rows (CPU): three ↓ 2p at f = ⅓, TS = 3 kT s(⅓) within 1e-7, F = E − TS bitwise.
+- `gpu_oxygen_reference_multiplicity` (A.7): E (= `energy.internal`) against the radial atom, −0.73 / −0.74 mHa at M = 1 /
+  3 (on- and off-grid); splitting E(1) − E(3) 56.069 mHa (radial 56.062); F: −16.069151 / −16.115673 / −15.756812 Ha at
+  M = 1 / 3 / 5 (TS 19.095, 9.548, 0.063 mHa); the scan keeps M = 3.
+- `unoccupied_budget_in_play`'s H₂O leg runs on the preset's 95³ × 0.15 cell (cold 106.8 s): at 97³ × 0.25 the cold
+  all-electron solve hits the witness cap on a transient step after 630 s (Task 9b).
+- display tests: see "The orbital display under FD"; LiH's "occupied" helper is f > ½ (its LUMO set at 11.7–13.4 kT
+  above μ carries f ≈ 8e-6 / 1.5e-6); Li's core-spin check runs with `Occupations::Aufbau` explicit and keeps
+  ∫|m| − ∫m > 1e-4 (fix round 1, review I2; the first round's "no negative m" re-pin was vacuous) — the FD gap below.
+- the tag tests, `the_provenance_carries_the_stop_rule_not_its_value` (`…/fd5e-3/…/stop2x5e-8/pin1e-5`), and the
+  scripted-session digest (0x09f6_9183_02c2_fda9 → 0xe356_bcdb_45e7_b03c, field and tag text only).
+
+**Documented gap: Li's core spin polarisation under FD** (rule 7; plan Task 9 review I2). Under aufbau LSDA the ↑ 2s
+exchange pulls the ↑ 1s inward, so m = ρ↑ − ρ↓ turns negative near the nucleus and ∫|m| − ∫m > 0. Under FD at kT = 5 mHa
+the all-electron Li of the grid (σ = h = 0.25) shares its ↑ valence electron between 2s (f ≈ 0.75) and 2p (≈ 0.083 each,
+plan Task 7), and the partial 2p fills the 2s node: ∫|m| − ∫m = 0 to f32 (2026-11-16, `spin_density_integrals`). The
+2p occupation is mostly a smeared-nucleus artefact that FD amplifies: the smeared nucleus pulls 2p down toward 2s. Radial
+LSDA (the reviewer's f64 atom, `scratchpad/li_rev/li_radial.py`):
+
+| nucleus | ε2p − ε2s (↑, Ha) | aufbau ∫\|m\| − ∫m | FD f per 2p at that gap |
+|---|---|---|---|
+| point | 0.0669 | 2.4e-4 | ≈ 7e-4 |
+| σ = 0.15 | 0.0426 | 3.1e-4 | ≈ 0.008 |
+| σ = 0.25 | 0.0224 | 4.0e-4 | — (grid: gap 0.018 Ha, f2s 0.75, f2p 0.083; ∫\|m\| − ∫m = 0) |
+
+The display test therefore checks the integer-occupied Li (Aufbau explicit); what FD shows at coarse σ is this gap.
+
+**Closed in plan Task 9b: `validate --test surrogate h3plus_tier`** (re-run 2026-11-17: the sampling pass solved 296 of
+297 jobs, 0 skipped, 0 failed; the held-out tier and both modes pass; "Witness columns at a guard tolerance" below).
+The failure as recorded at Task 9 (owned by plan Task 9b, review C1): The H₃⁺
+pass's scan 0–2 point at 1.6 r₀ (atom 2 moved along the 0–2 axis of the relaxed triangle; all-electron, 49³ × 0.25, the
+sample tolerance 1e-6) ends at the 200-step cap with Δρ 9.2e-5, and the stretched-tail rule skips its 2 further-out points;
+the test requires (failed, skipped) = (0, 0). Reproduced cold through `problem` + `GpuSolver`: from step 9 the steps
+alternate between 0 and ≈ 25 LOBPCG iterations and Δρ cycles between 4e-5 and 3e-4. Mechanism (review C1):
+`qm_gpu::eigen::lobpcg` takes one max residual over every block column, the FD witness column included, and it feeds both
+the tol stop and the guess acceptance at 1.5·tol; an accepted guess is a "frozen" orbital set, and the next iterating step
+restarts DIIS, so the history stays at 1–2 entries (effectively linear mixing) and every re-solve kicks Δρ by ≈ 1e-4. The
+state is gapped (↑ level 2 f ≈ 5e-11, TS 2.8e-8). Under aufbau the same geometry converges in 13 steps (two consecutive
+frozen steps let DIIS solve the constant map; its occupied column sits at 7–8e-6 against the 8.13e-6 band, already
+marginal — the diffuse witness tips it). Plan Task 9b fixes it: both classify decisions read the tight columns only,
+"frozen" means the tight columns did not move, and `h3plus_tier` plus a direct cold H₃⁺ test (1.6 r₀, bounded steps and
+DIIS resets) become its acceptance tests. Task 9 is not done until it passes.
+
+**Run in plan Task 9b, failing: `validate --test surrogate the_stuck_escape_repro_is_answered_honestly`** (2026-11-17,
+with `h3plus_tier` in one invocation: 1280 s for the two, i.e. ≈ 20 min for this test alone — no longer cut off, the
+witness cost fix brought it in). It **fails its gate**: on the hot run 7 model answers lie beyond the energy tier or 3×
+the force bound (steps 163 and 804–810; |ΔE|/N 6.4e-4 … 3.9e-3 Ha, force residual / bound 3.2 … 9.1; face densities
+1.5–1.9e-5, just under the box-affected cut), and the edited NVE run judged 2 of 3 answers beyond 1× the bound (worst
+2.03×, inside its 3× gate). This is the surrogate's trust policy on the all-electron FD teacher surface (plan Task 9's
+switch), not a solver number: open for the controller. Before 9b the record was: Run alone twice (2026-11-16, 11:35 and 12:53), it did not finish within the 15-minute GPU batch and was
+stopped; at Task 8 the whole surrogate suite took 532–545 s. It becomes a plan Task 9b acceptance test (the witness cost
+fix must bring it inside one batch, then it must pass). Pre-preview check on the user's surface (Accepted, pseudo-H):
+a cold H₃⁺ with the pair at 1.6 r₀, tol 1e-6, through `problem` + `effective_gpu_tol` converges in 15 steps at
+49³ × 0.25 (no DIIS reset) and in 16 at 81³ × 0.15 (one reset after a single frozen step at Δρ 6.6e-4), without the
+all-electron case's 0/25-iteration alternation.
+
+### Witness columns at a guard tolerance (plan 2026-11-13 Task 9b, 2026-11-16/17, release, RX 7900 XTX)
+
+The rule and its derivation are `qm::occupations`' module doc ("Witness columns at a guard tolerance"); the GPU's
+split stop, locking, frozen definition, convergence-phase guess band and formation check are `qm_gpu::eigen` /
+`qm_gpu::scf` module docs. In short:
+- a column is **loose** iff the tail sum of upper-bound occupations f̂ = f(θ − r; μ) over it and every column above it
+  is below 1e-2·tol (tol = the SCF's Δρ stop); loose columns are held to `WITNESS_GUARD_TOL` = 1e-3 Ha, the rest
+  (tight) to the step's eigen tol; ∫|δρ| from the loose set ≤ (2 + 2g/kT)·Σ_L f = 2.4e-2·tol (≲ 2.9e-2·tol with
+  the loose levels' shift of μ; review M1 corrected a first 2.2 that omitted the loose columns' own weight change);
+- the witness reads the lower bound θ_top − r_top (Krylov–Weinstein), never the Ritz value alone;
+- growth doubles the extra block (1, 2, 4, …, the cap) and the overshoot is trimmed above the lowest witness;
+- the cap is min(`MAX_WITNESS_GROWTH` = 32, what the VRAM budget fits) (`providers::ks::witness_cap_for`); the
+  scene guard still counts 16 (`WITNESS_GROWTH_COUNTED`), so acceptance is unchanged.
+
+**CPU f64 loose vs all-tight** (`qm` `fd_guard_tier_matches_all_tight`; FD at kT = 5 mHa, tol = eig_tol = 1e-10,
+cold; gate |ΔF| ≤ 1e-10 Ha, |ΔF_I| ≤ 1e-9 Ha/Bohr per component):
+
+| system (grid) | F loose | ΔF (loose − tight) | max \|ΔF_I\| | TS | steps loose / tight | wall loose / tight (s) | stored ↑ / ↓ |
+|---|---|---|---|---|---|---|---|
+| H₂O (33³ × 0.30) | −34.291555816453 | +8.5e-13 | 5.4e-10 | 3.2e-15 | 24 / 29 | 73 / 109 | 7 / 7 |
+| LiH (33³ × 0.30) | −4.918157471927 | −3.1e-13 | 1.4e-11 | 7.8e-7 | 23 / 22 | 75 / 105 | 6 / 6 |
+| Li (33³ × 0.25) | −4.697501425788 | +9.1e-13 | 2.5e-12 | 9.57e-3 | 17 / 18 | 37 / 38 | 6 / 2 |
+| H₄ square (33³ × 0.30) | −1.615047599844 | −4.2e-13 | 2.4e-12 | 1.386e-2 | 19 / 17 | 37 / 50 | 6 / 6 |
+| pseudo-O M = 1, on site (33³ × 0.25) | −16.058593195275 | +3.8e-12 | 2.6e-14 | 1.910e-2 | 24 / 19 | 33 / 36 | 5 / 5 |
+| pseudo-O M = 3, on site | −16.105378836728 | −2.8e-12 | 1.7e-13 | 9.548e-3 | 18 / 17 | 39 / 46 | 5 / 6 |
+| *record:* pseudo-O M = 1 off site, tol 1e-8 | −16.058530205496 | +4.9e-10 | 1.1e-9 | 1.910e-2 | 27 / 18 | 41 / 57 | 5 / 5 |
+
+The guard columns ended ≤ 9.9e-4 in every loose run. Off site at tol 1e-10 neither tier converges reliably (the
+lattice splits the partly filled p set by δ ~ 1e-5 Ha, so ρ depends on the rotation inside it, fixed only to r/δ:
+a Δρ floor ≈ 4e-9 at eig_tol 1e-10 — measured loose 200 steps at ≈ 3e-9, all-tight 86 steps), so that case is a
+record at tol 1e-8, where both tiers stop anywhere inside Δρ < 1e-8 and the difference is the stop's own resolution.
+`fd_witness_holds_on_the_lower_bound` (H₂O 33³ × 0.30, residuals re-measured in H[ρ_out]): 5 tight / 2 loose per
+spin, θ_top − r − μ = 0.2332 Ha ≥ 36 kT; `fd_a_column_changes_class_mid_solve` (H₂ 1.4 → 4.0 warm): σ_u starts loose,
+2 class raises, ends tight (f 3.7e-5, residual 9.5e-10), F − F_all-tight = −8.8e-13.
+
+**GPU, the H₃⁺ cycle** (task 9 review C1): `qm-gpu` `gpu_fd_stretched_h3plus_converges_cold` (49³ × 0.25, pair at
+1.6 r₀, tol 1e-6, cold) converges in **13 steps, 0 DIIS resets** (Aufbau 13; before 9b the 200-step cap with a reset
+every other step), and a second cold solve gives the same bits. Measured on the way (with the guess band on every
+step, before the convergence-phase rule): 19 steps / 2 resets; off-site Li 33³ 146 steps / 23 resets (92 before 9b);
+the extrapolated H₂ MD path 7.11 steps against 8.00 plain (5.78 before 9b). With the rule: Li 93 / 5, MD path
+6.67 / 8.00, H₃⁺ 13 / 0.
+
+**GPU, the lost level — root cause** (task 9b review I1, fix round 1). The pseudo-H₂O orbital-display solve (33³,
+m = 2) lost its converged 2s column at iteration 196 (λ = +0.719 against θ = −0.8687 Ha; rejected, |Δε_occ| 0.458 Ha).
+A formation diagnostic at every step localised it: fused Gram vs f64 dots ≤ 3e-8 relative, GPU lincomb vs f64 S·c
+≤ 8e-8, fresh H·s vs the stored H-products ≤ 5e-12, ghost cells all zero — and the coefficient vector's own Rayleigh
+quotient on the measured A, B was +0.719: `nalgebra::SymmetricEigen` 0.33.3 had paired two eigenvalues of the reduced
+24 × 24 Â with each other's eigenvectors (residual 1.59; every other pair ≤ 2e-13). The dense eigensolves of both
+LOBPCGs now go through `qm::eigen::sym_eigen` (every pair's residual checked, cyclic Jacobi on a failure; bit-neutral
+when the check passes); the dumped matrices are a regression test. The trace-based formation check with the restart
+without P stays as a safety net, counted in `EigenStats::restores` (exhaustion: an error on the SCF path).
+
+**GPU, cost at large blocks.** The fused Gram's greedy planner (`qm_gpu::reduce::plan_gram`) ran on the CPU every
+LOBPCG iteration: 2.65 s per iteration at a 37-column witness block (S of 101 columns) against ≈ 15 ms at 13 columns;
+plans are now memoised per pair pattern (a pure function: no number moves). Under a lock the α guard reads the
+active columns' own residual (the scaled one sent every locked step to the MGS fallback).
+
+**The RED tests** (`providers`):
+- cold all-electron H₂O at 97³ × 0.25 (24.5 Bohr), 1e-5, no budget (cap 32): **converges in 22 steps, 123 s**
+  (Task 7: the cap error after 525–630 s; held Aufbau 1.8 s); the witness block peaks at 20 extra vectors per spin on
+  the transient step 4 (μ ≈ −0.05 Ha) and ends at 6 (trimmed), 12 growths, 2 class raises, 6 frozen steps.
+- H⁻ at 95³ × 0.15 (V8, the 14 Bohr preset box): 18 steps, **62.6 s** (74.5 s before 9b; 184.7 s with doubling and
+  no trim), 8 extra vectors per spin, F −0.47495361.
+- H⁻ at the app's largest box (201³ × 0.15, 30 Bohr) under the app's budget (half the adapter's memory, 12.88 GB):
+  **refused by the scene guard** before any allocation, naming the budget — 13.45 GB with the counted 16 extra vectors
+  (5.04 GB without; one extra vector per spin costs 0.53 GB at 201³). Weyl's ≈ 79 box states under the window are out
+  of reach of any cap the card holds; a solve without the guard would end on the cap error (not run: ≈ 22 GB at 32).
+
+**Suite times after 9b** (2026-11-17, release, the gentle-GPU rules lifted by the user): `gpu_vs_cpu` 12 passed in
+10.1 min (Task 7: 23.7; pre-FD 3.5), V4 re-passes (H₄ ΔF −4.4e-8), `timing_table` on FD again (H₂ 49³ cold 482 ms /
+warm 146 ms, targets met; **H₂O 97³ cold 114.5 s**, 17 steps, LOBPCG 98 % — reported, target 5 s missed); `oracles` 5
+passed in 45.3 min (Task 7: 51; pre-FD 31; partly overlapping GPU runs), V3 ratio 3.9394; `qm` 249 passed in 571 s
+(the loose-vs-tight test adds ≈ 200 s); `qm-gpu` 144 passed in 303 s; `providers` 458 passed in 11.1 min.
+
+**The memory guard and the app's estimated mode** (open; not re-pinned). `app` `ui::tests::a_change_over_the_vram_budget_is_refused`
+pins the all-electron H₂O preset at Custom 0.08 (177³) in estimated mode (teacher + auditor) at 9.5–10.3 GB; it now
+reads **21.6 GB** (= 2 × (4.94 GB solve + 5.85 GB witness term)), over the 12 GB default, so the change is refused. The
+witness term was added to the all-electron estimate in Task 7 fix round 1 (the pseudised estimate has counted it
+since M7). It is **real allocation, not over-counting**: the solver's pool and `LobpcgWork` keep their peak, and cold
+all-electron FD solves reach ≥ 16 extra vectors per spin on transient steps (97³ H₂O 20, 95³ H⁻ 16 before the trim).
+Each extra vector costs 12 fields (8 `LobpcgWork` slots, the orbital, its kinetic scratch, per spin).
+
+### The cold-start window (plan 2026-11-13 Task 9c, 2026-11-17, release, RX 7900 XTX)
+
+What changed (derivations in `qm::occupations` "The step-accuracy tail" / "No loose stop", `qm::nuclear::free_atom_density`,
+`qm_gpu::scf` "The cold-start window"): (a) the FermiDirac cold density is the superposition of the free atoms'
+LSDA densities (`qm::radial`, Z only) convolved with the nuclear Gaussian σ and rescaled per atom to Z on the grid
+(pseudised centres keep the σ = 1 blobs); (b) a loosened GPU step's witness tail is X = ln(n_w/(1e-3·Δρ_prev)) kT,
+clamped to [6, 36] (tight steps keep 36 kT), with a DIIS reset when a widened window grew the block; (c) the GPU block's
+top column is an untested buffer (f = 0; none at the cap) that decides the witness itself when its own θ − r passes
+(then one vector is added as the next buffer instead of doubling); `GpuSolver::solve_polled`'s inner poll reaches the
+FD channels' LOBPCG (pause/cancel within an iteration; `providers::GpuKs` passes the same abort to both polls, the
+Activity probe counting only the per-step one). (d), a loose stop at Σ_L (2 + 2r/kT)·f̂ < 1e-2·tol, was measured and
+not adopted: it cut the 97³ solve's LOBPCG iterations by a quarter, but the stretched H₂ of
+`the_level_gated_stall_stop_on_the_measured_cases` took 43 / 102 / 41 steps (stop on every step / on loosened and first
+steps / first step only; gate ≤ 30) against 11 and 25 without it. (e), a chunked witness tail, was not needed.
+
+**Why the free atoms are smeared.** Unsmeared, the O 1s (⟨r⟩ ≈ 0.19 Bohr) sits inside the σ = h = 0.25 nucleus and
+over-screens it: on all-electron H₂O 97³ × 0.25 every first-step level lay above −0.04 Ha (μ −0.003 Ha; no witness in
+32 extra vectors, the solve failed). Unrescaled, the point samples of that core carried several times Z (every level
+above +0.39 Ha). Smeared and rescaled, the first step's μ is −0.127 Ha (converged −0.138).
+
+**All-electron H₂O 97³ × 0.25 cold** (`providers` `cold_all_electron_h2o_at_97_converges`, 1e-5; 9b: 22 steps, 123 s,
+peak 20 extra vectors per spin): **11 steps, 11 s**, peak block 14 (9 extra vectors per spin, the buffer included, on
+step 1's 36 kT window), 1 DIIS reset; F −37.5301554 (9b −37.5301542: the f32 path scatter at Δρ < 1e-5). On the way:
+(a)+(b) alone 11 steps, peak 12–13 (38 s with the user's app on 43 % of the GPU); the buffer without the buffer witness
+doubled 13 → 21.
+
+**The app's 177³ VRAM case** (`providers` `cold_all_electron_h2o_at_177_peak`, `#[ignore]`d measurement): the
+all-electron H₂O at the app's 14.08 Bohr box, run at 167³ × 0.0848 — 177³ does not run on the solver's device: the
+Poisson boundary table (`ghost_fill`'s binding 3) is 147 MB at 177³, over wgpu's default 128 MiB
+`max_storage_buffer_binding_size`, which `gpu::GpuContext` keeps — **14 steps, 36 s, peak block 8: 3 extra vectors per
+spin** (the buffer included), no growth (17 steps / peak 9 with the buffer but no buffer witness). The scene guard's
+estimate still counts `WITNESS_GROWTH_COUNTED` = 16, so the app test still reads 21.58 GB (estimated mode, 2 solvers).
+At a counted w the estimate is 9.91 + 0.729·w GB: w = 3 (the measured peak) 12.10 GB, under this card's 12.88 GB budget
+(half its 25.76 GB) but over the 12.0 GB default the test pins; w ≤ 2 fits 12.0 GB. Not re-pinned: the count is the 9b
+ruling's acceptance number (open).
+
+**The gates after 9c.** CPU loose vs all-tight (`fd_guard_tier_matches_all_tight`, the six gated cases; the CPU path
+has (a) only): H₂O ΔF +7.8e-12 (|ΔF_I| 1.1e-10), LiH −7.0e-13, Li +1.0e-12, H₄ −1.4e-12, pseudo-O M = 1 −4.3e-12,
+M = 3 −1.1e-11 Ha (all |ΔF_I| ≤ 1.1e-10); the off-site record −5.4e-10 / 2.0e-9 inside its derived bounds (1.47e-9,
+2e-8). GPU H₃⁺ 1.6 r₀: **14 steps, 1 DIIS reset** (gates ≤ 20, ≤ 1; 9b 13 / 0). Stretched H₂ 65³ R 6 / 107³ R 5.75:
+18 / 12 steps (9b 17 / printed); the water O–H 1.8 r₀ point 17 steps (16). Re-pinned with reasons: the CPU and GPU FD
+pins of `none_policy` (Aufbau bits unchanged), the frozen-density stall test's anchor (the frozen first Δρ, 0.077 from
+the free-atom H), the water point's count.
+
+**Fix round 2 and Task 9d (2026-11-17; rulings in the ledger; review `task-9c-review.md`).**
+- *VRAM (Decision 1).* The guard counts the solver's start allocation: `WITNESS_GROWTH_COUNTED` = 3 per spin (the
+  measured peak of 2 tested witness vectors at the app's 14 Bohr box plus the buffer). Measured at the real
+  177³ × 0.08 once the binding limit was raised: 13 steps, 37 s, peak block n_σ + 3, no growth. Growth past the
+  start is clamped by the remaining budget (`witness_cap_for`) and ends with the named cap error:
+  `a_growth_over_the_budget_is_the_named_cap_error` (H⁻ 95³ × 0.15 under a budget leaving cap 4: "no gap witness
+  within 4 extra levels … 4 is the most the 2.0 GB budget fits", 1.6 s, the block never past n + 4). The app's
+  estimated-mode H₂O at 177³ now reads 12.10 GB (9.91 + 2.19): refused under the 12 GB default, accepted on this card's
+  12.88 GB at the estimated box 179³; the 8-Ne 201³ refusal is unchanged. H⁻ at 201³ × 0.15 is accepted (6.62 GB)
+  with cap 3 — below Weyl's ≈ 79 box states, so its solve would end on the cap error (guard-level test). Fewer fields
+  per vector (12; 0.73 GB per vector at 177³ in estimated mode) is a later optimisation.
+- *Binding limits.* `gpu::GpuContext` requests the adapter's `max_storage_buffer_binding_size` and `max_buffer_size`
+  (wgpu's defaults as the floor; the RX 7900 XTX offers 2 GiB − 4 B and 2 GiB). `qm-gpu`
+  `a_177_cube_solve_allocates_and_runs`: the 147 MB boundary table binds, one H₂ step at 177³ × 0.08 in 5.4 s.
+- *Review I1 (ruling (a)).* The buffer decides the witness only at r ≤ g = `WITNESS_GUARD_TOL` (its spectral weight
+  below θ − r is ≤ r²/D²; at larger r an unconverged buffer can hide an occupied-weight level); at r > g the block
+  grows by one. `buffer_last`'s swap edge re-solves until the moved column meets g. H₃⁺ 1.6 r₀: 12 steps, 0 resets.
+- *Review I2 / Task 9d.* On the failing test's warm solves the counters were witness growths 0, trims 0, buffer
+  witnesses 0, DIIS resets 0 — the trim is not involved there; trimming at 36 kT and removing the widen + grow reset
+  changed neither gate case (identical numbers), so both are kept. The plateau is the freeze (DIIS trace in the
+  `qm_gpu::scf` module doc, "The DIIS history at a freeze"). Adopted: a frozen step that follows a frozen step and
+  fails the Pulay contraction 1 − α drops the entries older than the freeze. Measured (provider test extrapolated /
+  cold steps; stretched H₂ 65³ R 6 / 107³ R 5.75, gate ≤ 30): no rule 10 > 9 (11 / 18); full restart at a freeze 6
+  (55 before I1); keep only the newest entry at every freeze 6, but 11 / 39; **the stall rule 7 ≤ 9, 11 / 18**.
+  Water O–H 1.8 r₀ (CoresOnly) 18 steps (the AE H's free-atom start, review M4).
+- *The stuck-escape repro now passes* (`validate --test surrogate the_stuck_escape_repro_is_answered_honestly`, with
+  `h3plus_tier`, 805 s for both; it failed in 9b): hot run 219 model answers, 116 judged, worst |ΔE|/N 5.23e-4 Ha
+  (tier 1e-3), worst force residual / bound 1.91 (gate 3×), 0 beyond; 103 box-affected and not judged (worst 2.01e-3
+  there). No trust rule changed — the teacher's path did. `h3plus_tier` passes (975 teacher solves, 6.8 steps each).
+- *Gates.* qm 253, qm-gpu 146, providers 461 (with the water re-pin), app `worker:: ui::` 471, gpu_vs_cpu 12
+  (timing_table H₂O 97³ cold 10.1 s / 12 steps, warm 13 steps).
+- *Fix round 3 (task-9d-review.md, 8 minors).* The stall trigger reads the Gram (L2) norm the Pulay bound holds in
+  (‖r_k‖² > (1 − α)²·‖r_{k−1}‖²): provider test 9 / 7 / 7 (warm ≤ cold), stretched H₂ 11 / 12; the L1 trigger gave
+  9 / 7 / 7 and 11 / 11 on the same code — both pass, the Gram one is kept (a heuristic either way on the GPU: FD
+  levels, the clamp and the renormalisation bend the constant-map premise; a misfire costs steps, never the answer).
+  A tight step's tested witness decides only at r ≤ 1.5 g, else the block grows by one (LiH's GPU FD pin moves, 8 / 8
+  stored); the Poisson boundary table (4704·n² B) joins the device-limit check (`binding_refusal`: 177³ refused at the
+  default 128 MiB, 161³ passes); the old LOBPCG work is released before the grown one is allocated.
+- *Minors.* M4: the cold guess is per centre (`qm::nuclear::cold_guess`: free atoms at all-electron centres, Z_v blobs
+  for pseudised). M6: `SolveProfile::eigen_restores` — 0 in every solve printed (97³ H₂O, the provider test).
+
+### Task 10: the shared-shell rule deleted, the dimer gate on Fermi–Dirac (plan 2026-11-13 Task 10, 2026-11-17, release, RX 7900 XTX)
+
+`Occupations::DegenerateShells` and everything that served it (`degenerate_shell_occupations`, `released_occupations`,
+`decide`, `shared_runs`, `FractionalShell`, `DEGENERACY_TAU`, `ScfStats.{fractional, released}`, the phase-2 release
+with its pattern frozen by rank and its DIIS/stall-watch restart, `StallWatch::restart`, in both solvers) are gone.
+The Rust sources hold none of those identifiers (`rg` over `crates`); docs cite them as history.
+
+**The dimer gate's identity** (spec §6.2). `DIMER_PROCEDURE` gained `occupations: FermiDirac { kt: ELECTRON_KT }` and
+`gpu_partial_tol: GPU_PARTIAL_TOL`, read from the constants (F11); both dimers' 3-D solves run it (the `Aufbau` hold
+and the shared-shell rule are gone, F8). `recipe_hash` moved 0x30a74d9bda495668 → **0xeaf63fe213a84a26** (FNV-1a 64
+of the ledger and the new `Debug` text, computed independently and pinned in `dimer_procedure_hashes_fd`);
+`core_recipe_hash` = 0xeef0a918057a9fbe and the `CoresOnly` surface hash are unchanged (`core_recipe_hash_unchanged`).
+`legacy_recipe_hash()` hashes the frozen `ledger::ds_era::DIMER_PROCEDURE_DS` — a struct of its own named
+`DimerProcedure`, so its derived `Debug` text is byte for byte the old one — and reproduces 0x30a74d9bda495668, so
+`legacy_tag_of` still returns the recorded `all/30a74d9bda495668/shared1e-3/1e-1/stop2x5e-8` and
+`cores/eef0a918057a9fbe/…` (`legacy_tag_of_matches_recorded_ds_strings`, unchanged). The generation records block
+moved its hash line only (`generation_record_table_matches_references_md` passes with every row bitwise the same; `pseudo_gen` 6/6, 273 s).
+
+**The DS-era V7 labels** (`tests/fixtures/ds_era_labels.txt`, Step 1, F13; captured on 1d816c4 before the deletion):
+`Accepted` (H and O pseudised with the GPU gate), 61³ × 0.20 (12 Bohr), σ = h, tol 1e-6 raised to the GPU floor,
+cold, multiplicity auto. H₂ R = 1.4: E_DS −1.1359545439214114 (10 steps, gapped). Linear OH, O–H 1.83 Bohr along x
+(O on a grid point): E_DS −16.777455516610495, the ↓ π pair shared ½–½ (spread 1.4e-8; 17 steps) — FD's ensemble is the
+same, so V7 expects class T with ΔF = −2 kT ln 2 = −6.9315e-3 Ha. H₄ 1.8 × 1.809 Bohr (aspect 1.005): E_DS
+−2.0289850167853247 (50 steps: the shared-shell rule **released** the e pair, spread 2.36 mHa ≥ τ, into the integer
+state), FD at ELECTRON_KT E −2.0006504639744724, F −2.0144863903, TS 1.3836e-2 (31 steps, f 0.526 / 0.474 per spin):
+**E_FD − E_DS = +2.83e-2 Ha** (≥ 3ε_E = 3e-5 by a factor of 940; class S). The other aspects scanned, all released
+under DS: 1.01 +2.82e-2, 1.02 +2.76e-2, 1.04 +2.52e-2, 1.083 +4.27e-3 (E_FD − E_DS). The DS label is the lower-F state
+(F_FD − E_DS = +1.45e-2 at 1.005): the shared-shell release found the broken-symmetry integer state FD does not reach
+from its cold start (spec §4.7(e), the restricted-vs-broken-symmetry H₄ gap): **the migration replaces a lower-F label at
+this geometry** (rule 7). Fix round 1 (review M4), the same teacher under FD after the deletion: OH E_FD −16.777454783579,
+E_FD − E_DS = +7.3e-7 Ha (14× inside ε_E = 1e-5), F_FD − E_DS = −6.93074e-3 against −2 kT ln 2 = −6.931472e-3, max
+|ΔF_I| 1.23e-5 Ha/Bohr (12× inside ε_F); H₂ F_FD − E_DS = +7.6e-8, max |ΔF_I| 5.9e-6.
+
+**Moved references** (each converted test compares F with F on both sides, so no bound moved by −TS):
+
+| test | case | DS era | FD (this task) | TS (closed form) |
+|---|---|---|---|---|
+| `qm` `fd_h4_square_closed_form` | H₄ square 41³ × 0.30, tol 1e-9 | E_DS run in the test | E_DS the literal −1.621874087546 (1d816c4; Task 5 printed −1.621874088905 before Task 6's Poisson-tolerance change, 1.36e-9 apart); E − E_DS −5.3e-12 | 1.386294e-2 = 4 kT ln 2 (+7.3e-14) |
+| `qm` `ion_on_a_grid_point_is_finite` | pseudo-O M = 3 on a grid point, tol 1e-9 | one shared cluster, f = ⅓, spread < τ/10 | three ↓ partial levels f = ⅓ within 1e-6, TS within 1e-6 relative of the closed form | 9.5477e-3 = 3 kT s(⅓) |
+| `qm` / `qm-gpu` `the_stall_stop_and_the_observer_leave_a_pseudo_solve_bitwise` | pseudo-O M = 3 33³ | shared ⅓ cluster | bitwise stop on/off/observed; F_HF(last) − F −1.2e-7 (GPU) | 9.547611e-3 (GPU) |
+| `qm-gpu` `pseudo_o_triplet_matches_cpu` | pseudo-O M = 3 33³ × 0.25 (8 Bohr, off-site) | \|ΔE\| 7.8e-7 | \|ΔF\| 8.05e-7 (bound 3e-6), components 5.0e-6 (1e-4), \|Δε\| 6.1e-7 over the tested levels (1e-5), forces 4.19e-6 = kernels 7.9e-8 + state 4.27e-6; GPU stop 1e-5, CPU 1e-6 | GPU and CPU 9.547611e-3 (the closed form 9.547712e-3: the off-site p levels split 8.8e-5 Ha, f 0.335 / 0.334 / 0.331) |
+| `gpu_vs_cpu` `gpu_pseudo_o_*` | pseudo-O M = 3 61³ × 0.20 | \|ΔE\| 4.99e-7 | \|ΔF\| 2.70e-7, \|Δε\| 3.4e-6, ΔF_I 5.05e-7 | 9.547712e-3 both |
+| `gpu_vs_cpu` `gpu_mixed_oh_*` | OH M = 2 61³ × 0.20 | \|ΔF_I\| 4.31e-5 | \|ΔF\| 5.58e-7, \|Δε\| 1.5e-6, **ΔF_I 5.56e-6** (8× below the shared-shell era's; its state part was the shared π cluster) | 6.931472e-3 = 2 kT ln 2 both |
+| `gpu_vs_cpu` `gpu_pseudo_c_*`, `gpu_pseudo_h2o_all_*` | CH₄, H₂O (All) | | \|ΔF\| 2.32e-7, 1.32e-6; ΔF_I 1.71e-6, 3.24e-6 | 5e-16, 3e-14 (gapped) |
+
+`pseudo_case` (validate) and `pseudo_vs_cpu` (qm-gpu) compare the GPU's **tested** levels (its untested FD buffer, the
+highest, left out — Task 9c (c): its Ritz value decides nothing) with the CPU's lowest as many, and no longer pin the
+two block sizes equal: under FD each solver grows and trims its own witness block (pseudo-O 33³ ↓: CPU 6 tested, GPU 5
+tested + buffer, the buffer 6.0e-5 Ha from the CPU's 6th level). The compared levels must cover every CPU-occupied
+level and at least one level above them (not necessarily an FD witness — that is each solver's own growth test; fix
+round 1, review M3); the ε bound (1e-5) is unchanged.
+
+The validate `pseudo` suite runs Fermi–Dirac (`solve_with`, the GPU probe, `eggbox`): 9/9 gates pass (2281 s).
+- `pseudo_o_triplet_below_singlet` (compares E = `energy.internal` with the radial atom): M = 1 −16.050054 vs radial
+  −16.049325 (Δ −0.73 mHa), M = 3 −16.106124 vs −16.105387 (Δ −0.74 mHa), splitting 56.069 mHa (radial 56.062); TS at
+  the closed forms, 1.909543e-2 (M = 1) and 9.547713e-3 (M = 3).
+- `lone_o_and_n_scan_picks_hund` (lowest F): O F(1) −16.068941, **F(3) −16.115461**, F(5) −15.739613 → M = 3;
+  N F(2) −9.872353, **F(4) −9.955924** (no partial level) → M = 4. The winners are unchanged.
+- `eggbox_passes_at_0_15`: O₂ G 6.752e-6 Ha/Bohr, u_I 9.39e-8; H₂O G 4.142e-6, u_I 6.32e-7 (gapped: F = E); PASSES.
+- The repurposed `degenerate_spread_at_low_symmetry_sites` (V0's site study under FD; 20 CPU solves at h_req, 12 Bohr,
+  four low-symmetry sites): every case the symmetric ensemble at every site, TS against the closed form within
+  1.5e-6 relative (worst: C M = 3 at the tetragonal sites, −1.45e-6; O M = 3 at (0, h/2, h/2) −1.0e-7; the rest ≤ 2.3e-9),
+  each channel's partial levels within 3.1e-5 Ha of each other (C M = 3; O M = 3 8.1e-6; F 1.9e-7). Site spread of F
+  over the four sites (reported): O M = 1 5.47e-6, O M = 3 5.50e-6, C M = 3 1.99e-5, N M = 2 9.20e-6, F M = 2 3.91e-7 Ha.
+
+`pseudo_oracles` (the dimer gate's H and He regenerated once under the moved hash; 11/11 gates, 4062 s): pseudo-H₂ R_e
+**1.4340 Bohr** (the shared-shell era's 1.4340; this run's AE σ→0 1.4488, the DS-era gate's 1.4489), the gate's
+same-procedure ω ratio −3.43 % (DS era −3.45 %; bound 5 %), bias-free −3.72 % — the verdict (pass, f = 1.2, s-local,
+h_req 0.35) reproduces within the backend margin (2e-3 Bohr, 0.5 %). H₂O (All) ∠HOH 104.811°, NH₃ 107.47°, CH₄
+tetrahedral, the egg-box records, the H₂O preset NVE (E spread 8.02e-6 Ha), the pseudo-O₂ NVE drift −9.85e-7 Ha/ps
+(bound 2e-4) and the CH₄ CSVR ⟨T⟩ 315.0 K (+5.0 %) all pass.
+
+**Resolved in fix rounds 1–2 (below the measurement):** `qm-gpu` `harris::tests::harris_block_follows_a_shared_shell` (renamed `harris_block_follows_a_partly_filled_shell` in fix round 1) fails its
+`out.at_cap == [false, false]` assertion under Fermi–Dirac (the fixture `solved_pseudo_o` ran the shared-shell rule
+before). Measured (a temporary per-solve trace, removed): ↓'s second Harris solve, split (8, 6, 7), ran to the
+200-iteration cap with its displayed tier at 2.33e-5 (tol 5.4e-6) and its guard tier at 6.9e-6 (GUARD_TOL 1e-3); the
+head's sixth level 0.406862 Ha is one of a box pair 9.2e-6 Ha apart (0.406862 / 0.406871) straddling the head boundary,
+its partner in the guard tier; the next solve raised the head over the shown pair and ended on the f32 floor in 13
+iterations. The splits and solve counts are the shared-shell era's ([2, 3], (9, 7, 8)); only the first call's cap
+moved. FD's ↓ density (f 0.335 / 0.334 / 0.331, the off-site p set split 8.8e-5 Ha) is what splits that box pair
+differently; the head boundary splitting a near-degenerate pair before the post-solve raise is a pre-existing Harris
+behaviour. **Fix rounds 1–2** (review I1), assertions unchanged:
+- fix round 1 tried closing the head inside `eigen::lobpcg_split` after every Rayleigh–Ritz step (while
+  θ_head − θ_{head−1} ≤ τ_scf + r_{head−1} + r_head). Alone it did **not** clear the cap — it pushed the head to `checked`,
+  emptying the guard tier and leaving the top head column under the untested buffer, and the 7-column head stalled at
+  2.3e-5 — and it can close and reopen across iterations; fix round 2 removed it;
+- the rule kept: a pass that grows the block holds the head inside the old block, at most cur.len − 1 (`next_split`,
+  `a_growing_pass_holds_the_head_inside_the_old_block`). ↓ now runs (6, 4, 5) → (8, 5, 7) → (9, 7, 8): 224 iterations in 3 solves, no cap, no floor exit
+  (265 with one capped solve before); ↑ is unchanged (153 in 2); the warm second call takes 0 iterations on both spins;
+  splits and solve counts are the shared-shell era's ([2, 3], (9, 7, 8)). The test is renamed
+  `harris_block_follows_a_partly_filled_shell` (review M5). Every other qm-gpu test passes unchanged. Accepted and
+  pre-existing: a warm call whose head boundary newly cuts a τ-set (no growth) can still spend one capped solve before
+  the post-solve raise.
+
+### V5: dynamics on Fermi–Dirac (plan 2026-11-13 Task 11; `tests/dynamics.rs`; spec §9 "V5 new tests", ruling R10)
+
+**Sign convention (ruling R10).** The forces are F_I = −∂F/∂R_I (`qm::forces` module doc), so the work the forces do
+along a path, W = ∫F·dR, satisfies ΔF + W = 0, and ΔE + W = ΔE − ΔF = Δ(TS). The spec's "W = −∫F_HF·dx" written with
+"|W + ΔF|" is inconsistent; the tests use W = +∫F·dx (the work the forces do), the same physics as `branch_jump`'s
+|ΔF − (−∫F·dR)|.
+
+#### Step 1: the NVE case measured and its bounds pre-registered (2026-11-17, release, RX 7900 XTX; written before the NVE test existed)
+
+Measured by `v5_co2_plus_cost_and_path_scatter` (`#[ignore]`d; `-- --ignored --nocapture v5_co2_plus`). CO₂⁺ (charge
++1, auto doublet, `Accepted`: pseudised C and O), 71³ × 0.20, C on the origin node, O at (∓R sin 55°, −R cos 55°, 0),
+R = 2.226, β = 70°, at rest; `GpuKs` asked for 1e-6, every solve stopped at `GPU_PARTIAL_TOL` = 1e-5 (`scf_tol_used`).
+
+| quantity | value |
+|---|---|
+| cold start | F −37.886924954, E −37.886411159, TS 5.1379e-4 Ha (A1: 0.514 mHa); 28 SCF steps, 37.8 s (incl. the first table load); face 4.3e-7 (rule `box_affected_face_density(0.20)` 1.28e-5); ↓ π pair f 0.99121 / 0.00879 |
+| warm − cold at the start, from a cold neighbour bent by δβ = +0.5°, −0.5°, +1°, −1°, +2° | F +3.9e-7, +5.9e-7, +1.06e-6, +1.60e-6, +2.15e-6 Ha (E within 1.4e-8 of F's); max force component 6.3e-6 … 1.31e-5 Ha/Bohr; warm 15–27 SCF steps |
+| **σ_path** (largest \|F_warm − F_cold\| of the 5, rounded up to two digits, as the `branch_jump` tiers are) | **2.2e-6 Ha** (RMS 1.33e-6); force σ_F = **1.31e-5 Ha/Bohr** (largest component) |
+| warm Verlet step (first 20 from rest, dt = 0.25 fs) | **1.35 s mean** (max 1.62), 8–15 SCF steps, 0 `branch_jump` flags; 600 steps ≈ 13.5 min, inside one 15-min GPU batch, so **no checkpointed split** |
+
+The warm − cold differences are all positive (the 1e-5 stop ends warm solves slightly above the cold one) and grow with
+the neighbour's distance: the stop's own error, ≤ 1.7 µHa in V0's measurement, not f32 noise.
+
+**Step count: `CO2_NVE_STEPS` = 600 = 150 fs ≥ 2 bend periods.** The harmonic bend period is 2π/ω_b = 2691 a.u. = 260
+steps (A1: ω_b = 2.335e-3 a.u.); the 70° amplitude stiffens the bend (F(70°) − F(0) = 98.75 mHa against ½k_ββ² = 80 mHa),
+so the period is shorter and 600 steps hold ≥ 2.3 periods. The test measures the period from the zero crossings of the
+signed bend coordinate and asserts the run covers ≥ 2 periods (a design guard on this count).
+
+**Fluctuation bound (pre-registered), `nve_energy_drift_is_bounded`'s rule**: FLUCT_MARGIN × (h_b²/4·E_mode + 2σ_path)
+with h_b = ω_b·dt = 2.335e-3 × 10.335 = 0.02413, E_mode = F(70°) − F(0°) = 98.75 mHa (A1), h_b²/4·E_mode = 1.438e-5 Ha:
+**3 × (1.438e-5 + 2 × 2.2e-6) = 5.6e-5 Ha**, on the peak-to-peak residual of F + K about its least-squares line. Not
+scaled per atom. The raw peak to peak is reported.
+
+**What I expect it to measure (a prediction, recorded before the run; not the bound).** h²/4·E_mode is exact for a
+harmonic mode. The shadow Hamiltonian of velocity Verlet, H̃ = H + dt²[(1/12)V″(M⁻¹p, M⁻¹p) − (1/24)∇V·M⁻¹∇V] + O(dt⁴)
+(Hairer, Lubich & Wanner, *Geometric Numerical Integration*, 2nd ed., §IX.8), gives H − H̃ = +dt²/24·∇V·M⁻¹∇V at a
+turning point and −(h²/6)·K at the linear crossing (h²/12 + h²/6 = h²/4 for a harmonic mode). On this anharmonic bend the
+turning-point term is h²V′(70°)²/(24k_β)·(G_ββ(110°)/G_ββ(180°)) = 5.82e-4 × 0.2207²/(24 × 0.1073) × 0.76 = 8.4e-6 and the
+crossing term h²/6 × 98.75 mHa = 9.6e-6, i.e. ≈ 1.8e-5 for the bend; the symmetric stretch, which the bent start feeds,
+adds h_s²/4·E_s ≈ 5.6e-6 (A1). So the Verlet swing is ≈ 2.4e-5 rather than 1.44e-5, and with the white per-solve noise
+(RMS ≈ 1.3e-6 Ha, ≈ 6σ peak to peak over 600 samples ≈ 8e-6) I expect a detrended peak to peak of ≈ 3e-5, 1.7× under
+the bound. The bound stays the brief's formula; the gap between 1.44e-5 and ≈ 2.4e-5 is recorded here, not absorbed.
+
+**Drift bound: `DRIFT_BOUND` = 2e-4 Ha/ps (the suite's), with this trajectory's budget by the suite's method.**
+- Force scatter: δW ≈ σ_F·‖ΔR‖ per step, random-walking. ‖v‖² = Σ v_i² ≤ 2K/m_C with K ≤ E_mode + the stretch's 5.8 mHa =
+  0.105 Ha, so ‖v‖ ≤ 3.1e-3 Bohr/a.u. and ‖ΔR‖ ≤ 0.032 Bohr per step. δW ≤ 1.31e-5 × 0.032 = 4.2e-7 Ha per step, so
+  √600 × 4.2e-7 = 1.0e-5 Ha over 0.15 ps: **≤ 6.9e-5 Ha/ps** apparent (≈ 4.9e-5 at the RMS speed).
+- The Verlet swing leaking into the slope: F + K oscillates at 2ω_b with amplitude a ≤ ½ × 2.4e-5. The least-squares
+  slope of a sin(ωt + φ) over a window T is at most 24a|sin x − x cos x|/(ω²T³), x = ωT/2; with ω = 2ω_b = 4.67e-3,
+  T = 6201 a.u. (x = 14.5): ≤ 7.2e-5·a per a.u. = **3.5e-5 Ha/ps**. (At 300 steps it would be 8× larger: the spec's
+  reason for ≥ 2 periods.)
+- Sum ≤ 1.0e-4 Ha/ps; `DRIFT_BOUND` is 1.9× above it and is kept. A systematic SCF-lag heating or cooling at the 1e-5
+  stop is not in the budget: it is what the drift assertion detects.
+
+**Other assertions (spec §9 V5 2, brief):** max TS − min TS ≥ 1e-3 Ha along the run (A1: 0.514 → 6.931 mHa at each
+linear crossing); the face density ≤ `box_affected_face_density(0.20)` = 1.28e-5 at every step (A1: ≤ 1.1e-6). The
+`branch_jump` flag count (expected 0) and the largest m/b over the run are recorded (Task 8 amendment I1), not asserted.
+
+#### Step 3: the runs (2026-11-17, release, RX 7900 XTX / Ryzen 7 9800X3D) — **both V5 tests FAIL as pre-registered; not re-bounded**
+
+`cargo test -p validate --release --test dynamics -- --nocapture`: 4 passed, **2 failed**, 2 ignored, 1621 s. The four
+existing tests pass (gapped H₂ and H₃⁺, where F = E): rewind max |Δr| 6.4e-7 Bohr (bound 5e-5); ω_MD/ω_static − 1 =
+−6.24e-4 (bound 5e-3); H₂ NVE drift −6.1e-7 Ha/ps, fluctuation 1.66e-6 Ha (bound 7.8e-6); thermostat ⟨T⟩ 335.1 K
+(+11.7 %, bound 20 %). The new tests' bounds are the pre-registered ones and stay as they are; the failures are
+diagnosed below and wait for a spec ruling.
+
+**`work_integral_matches_free_energy_change`** (CPU f64, `v3_h4()`, atom 0 along x, x ∈ [0, 0.2], 41 cold solves on 4
+threads, tol = eig_tol = 1e-9; 16–41 SCF steps, mean 22.3; wall 909 s in-suite). Every solve converged, the box warning
+alone (face density 1.70–1.96e-5).
+
+| quantity | value |
+|---|---|
+| W₄₀, W₂₀ (Simpson, 41 / 21 points) | −9.857857437783e-3, −9.857857424685e-3 Ha; \|W₄₀ − W₂₀\|/15 = 8.7e-13 |
+| ΔF, ΔE, Δ(TS) | +9.857937109e-3, +4.268823932e-3, −5.589113e-3 Ha (TS 10.42 → 4.83 mHa) |
+| σ_E, σ_F (start: warm from x₁ − cold) | F −1.15e-11 Ha (E −1.34e-11), F_x −2.56e-10 Ha/Bohr (24 steps); the end (warm from x₃₉ − cold): −4.5e-12, +1.2e-10 (19 steps) |
+| bound = \|W₄₀ − W₂₀\|/15 + 3(0.2σ_F + √2σ_E) | 8.7e-13 + 2.02e-10 = **2.03e-10 Ha** |
+| **ΔF + W₄₀** | **+7.97e-8 Ha: 392× the bound — FAILS** |
+| ΔE + W₄₀ (≥ 5 × bound) | −5.589034e-3 Ha = Δ(TS) to 1.4e-5 relative: passes (the test tells F from E by 7e4×) |
+
+*Diagnosis.* The residual is not quadrature (8.7e-13) and not noise (2e-10): it is the discrete Hellmann–Feynman
+force's own offset from −dF/dx, the b that V3 measured at x = 0 (+2.09e-7 Ha/Bohr). Per Simpson panel,
+(ΔF + W)/(2Δ) = +2.15e-7 at x = 0 (V3: +2.09e-7, independently), rising smoothly to +6.1e-7 Ha/Bohr at x = 0.19
+(relative 4.6e-6 … 1.1e-5), and its integral is the 7.97e-8. Probes (CPU f64, tol = eig_tol = 1e-9, a Simpson panel of
+3 warm solves 0.005 apart; scratch, not committed):
+
+| case | b = (ΔF + W)/(2δ) (Ha/Bohr) |
+|---|---|
+| V3 H₄ at x = 0, 41³ × 0.30 (12 Bohr box, face 1.7e-5, box warning) | +2.15e-7 |
+| the same, 61³ × 0.20 (12 Bohr box, σ = h = 0.20) | +2.8e-7 |
+| the same, **51³ × 0.30 (15 Bohr box)** | **+1.3e-8** (16× smaller) |
+| the same, atom 0 along y (41³ × 0.30) | −1.4e-7 |
+| H₂ R = 1.4, gapped (TS 1e-16), 41³ × 0.30, along the bond | −5.3e-8 |
+
+b falls 16× when the box grows from 12 to 15 Bohr, barely moves with h, and is present on gapped H₂: it is the
+pre-existing box term of the discrete force (`qm::forces` module doc, "Expected size …" (iii): the Dirichlet/multipole
+Hartree map's asymmetry makes the KS fixed point first-order non-stationary for E_h, ≲ 1e-5 Ha/Bohr), not Fermi–Dirac.
+The pre-registered bound has no term for it, so no case on this solver can meet it at L = 0.2: even the 15 Bohr box
+gives L·b ≈ 3e-9, 13× the bound. V3 bounds the same quantity at |b| ≤ 1e-4 Ha/Bohr (the "M7 forces" Richardson bound).
+**Spec decision needed** (options, not applied; **superseded by "V5 fix round 1" below**): add 3·L·b_max with b_max = V3's 1e-4 (bound ≈ 6e-5; 5 × bound = 3e-4
+still ≪ |Δ(TS)| = 5.6e-3), or measure b in the test (a V3-style Richardson pair at both ends) and add its 3σ, or move
+the oracle to a box where b is negligible against the noise term (needs ≳ 20 Bohr; not measured).
+
+**`fd_nve_conserves_f_plus_k_through_the_ts_swing`** (GPU, 600 steps; bit-identical in two runs, in-suite and solo).
+
+| quantity | value |
+|---|---|
+| F + K start / mean / end | −37.886924954 / −37.886959291 / −37.886950320 Ha |
+| **drift** (least-squares slope) | **+4.5e-6 Ha/ps** (bound 2e-4: passes, 44×) |
+| **fluctuation** (detrended peak to peak) | **7.92e-5 Ha > the pre-registered 5.63e-5: FAILS (1.41×)**; raw 7.97e-5 |
+| E + K, for contrast | detrended peak to peak 6.97e-3 Ha (88× F + K's): F, not E, is what Verlet conserves |
+| TS swing | 0.5138 → 6.9315 mHa: **6.42e-3** (≥ 1e-3: passes) |
+| face density | max 1.75e-6 (rule 1.28e-5: passes) |
+| bend | β 0.42° … 69.98°; 4 linear crossings, period 3020 a.u. = 73.0 fs = **292 steps ⇒ 2.05 periods** (≥ 2: passes, thinly; longer than the 260-step harmonic estimate, not shorter) |
+| stretch | **R 2.063 … 2.447 Bohr** (the pre-registration assumed the stretch keeps its 5.8 mHa, ±0.07 Bohr) |
+| `branch_jump` (I1) | **0 flagged of 600 judged; largest m/b 0.342** (step 138: m 6.3e-6, b 1.85e-5); the replica guard agreed with the provider at every step |
+| cost | 1.70 s per step solo (8–51 SCF steps, mean 13.5; 599 extrapolated; no cold retry); 1023 s MD wall, 1061 s GPU |
+| **shadow Hamiltonian H̃** (diagnostic, Verlet swing removed to O(dt⁴), below) | drift −3.0e-6 Ha/ps, **detrended peak to peak 4.90e-5 Ha** |
+
+*Diagnosis, part 1: the Verlet swing is larger than h_b²/4·E_mode.* The bend feeds the symmetric stretch (the bent
+geometry's longer bond and the anharmonic coupling; not a resonance: ω_s/2ω_b = 1.29, solver-half review M6): the
+stretch reaches ±0.19 Bohr, E_s = ½k_R(0.192)² ≈ 39 mHa, and its h_s = 0.062 swings 6.6× more per unit energy than the
+bend. The test now prints velocity Verlet's shadow Hamiltonian
+H̃ = H + dt²[(1/12)vᵀV″v − (1/24)Σ|F_I|²/m_I] (vᵀV″v = −v·Ḟ by central differences of the recorded forces), which
+the integrator conserves to O(dt⁴) for an exactly conservative force (its offset from H is constant only to O(h⁴),
+≈ h_s⁴·E_mode = 1.5e-6 here; solver-half review M7): it removes the fast swing (e.g. steps 121/141:
+F + K −67/−20 µHa, H̃ −40/−39 µHa), and what is left is 4.90e-5.
+
+*Diagnosis, part 2: what H̃ still does is a GPU force/energy inconsistency along the bend.* H̃ sits near 0 at the turning
+points of steps 0, 261–321 and 561–581 and near −40 µHa in between (a slow wave, history-dependent: steps 441 and 581
+have similar geometries and differ by 33 µHa). Work integrals of the `GpuKs` forces on this grid (scratch, not committed;
+41 points, Simpson, \|W − W₂\|/15 ≤ 1e-6):
+
+| path (71³ × 0.20, `Accepted`) | ΔF (Ha) | ΔF + W (Ha) |
+|---|---|---|
+| CO₂⁺ bend 0 → 70°, R 2.226, warm | +9.8748e-2 | **+4.00e-5** (18 of 20 panels positive) |
+| the same, **cold at every point** | +9.8746e-2 | **+2.95e-5** |
+| the same reversed, 70 → 0°, warm | −9.8743e-2 | **−3.11e-5** (antisymmetric: a static error, not SCF lag) |
+| **neutral CO₂** (closed shell at linear) bend 0 → 70°, cold | +1.6626e-1 | **+3.09e-5** |
+| CO₂⁺ symmetric stretch R 2.05 → 2.45, β = 50°, warm | −2.4926e-2 | −3.2e-6 (noise level) |
+| CO₂⁺ symmetric stretch R 2.05 → 2.45, linear, warm | +5.476e-4 | −1.35e-5 |
+
+So the GPU forces are −dF/dβ to ≈ 3e-5 Ha over the 70° bend (2–3e-4 of ΔF; ≈ 1e-5 Ha/Bohr per O, inside
+the "M7 forces" 1e-4 Ha/Bohr consistency bound and at the size of the measured σ_F = 1.3e-5), the same on gapped neutral
+CO₂ and on CO₂⁺: **a pre-existing property of the discrete pseudo force path on this 14 Bohr grid (GPU; CPU and box
+dependence not measured at the time), not of Fermi–Dirac** (wording per solver-half review I1; the attribution
+measurements are in "fix round 1" below). The NVE run converts it
+into F + K: H̃'s 4.9e-5 wave is the same size. The pre-registered formula has σ_path (a per-solve energy scatter,
+2.2e-6) but no term for a force bias integrated along the path, and its Verlet term misses the stretch. What the run does
+show: F + K does not drift (4.5e-6 Ha/ps), and it is conserved 88× better than E + K through a 6.4 mHa TS swing.
+**Spec decision needed** (options, not applied; **superseded by "V5 fix round 1" below**): a fluctuation bound that adds the path work bias (3 × the measured
+\|ΔF + W\| along the bend, ≈ 9e-5) and the stiffest fed mode's swing (h_s²/4·E_mode = 9.5e-5, A1's own worst case) —
+3 × (9.5e-5 + 4.4e-6) + 9e-5 ≈ 3.9e-4 —; or an assertion on H̃ against the work-bias term alone; or a CPU f64 NVE (not
+costed). Not measured: the CPU f64 work integral along the bend (whether f32 or the pseudo force expressions carry the
+3e-5), and whether a tighter GPU stop removes the history dependence.
+
+### V0's two accepted convergence misses on the CPU f64 path (plan 2026-11-13 Task 11 Step 4; 2026-11-17)
+
+V0 (the 2026-11-14 section of the V0 note) accepted two convergence misses against its ≤ 60-iteration rule on the GPU
+prototype: pseudo-S at M = 1 on Accurate (61 at the node) and all-electron O at M = 5 (over 60 at 2 of 4 sites on
+Balanced and 3 of 4 on Accurate; not converged in 100 at 3 of the 8: Balanced centre and generic, Accurate node; best
+Δρ ≈ 1.7e-5; solver-half review M2), and left the CPU f64 cross-check undone. Here both run cold
+through `providers::ks::problem` exactly as the providers build them (FD at kT = 5 mHa, tol 1e-5, cap 100, V0's 14 Bohr
+box with odd n and V0's sites), on `qm::scf_observed` (CPU f64, one thread per case) and on today's `qm_gpu::GpuSolver`
+(post-Task 10: one FD path, the 1e-5 partial-level stop). Scratch harness, not committed; release, Ryzen 7 9800X3D /
+RX 7900 XTX. F is `energy.total`; for a solve that did not converge, the last step's energy and the best Δρ.
+
+| case | site | V0 GPU prototype (iterations) | **CPU f64** today | GPU today |
+|---|---|---|---|---|
+| pseudo-S M = 1, 95³ × 0.15 | node | 61 (30-step plateau 1.3–2.5e-5) | **converged, 9**, F −10.546315801, TS 19.0954 mHa (1620 s) | converged, 12, F −10.546316123 |
+| | centre / face / generic | 35 / 38 / 41 | not run | converged, 10 / 10 / 10; F −10.546311940 / −10.546313422 / −10.546314895 |
+| all-electron O M = 5, 57³ × 0.25 | centre | ✗ (100) | **converged, 17**, F −35.790284804, TS 19.1445 mHa (1004 s) | converged, 50, F −35.790285331 |
+| | generic | ✗ (100) | **not converged in 100**: best Δρ 1.07e-5, Δρ oscillating 1.4–5.6e-5 over the last steps, energy steady at −35.79091076 (to 1e-8) (1390 s) | **not converged in 100**: best Δρ 1.03e-5, last energy −35.790911953 |
+| | node / face | 35 / 28 | not run | converged, 11 / 85; F −35.791649144 / −35.790737338 |
+| all-electron O M = 5, 95³ × 0.15 | node | ✗ (100) | **converged, 11**, F −44.606610968, TS 20.7538 mHa (5942 s) | converged, 12, F −44.606609477, TS 20.754 mHa |
+| | centre / face / generic | 21 / 62 / 72 | not run | converged, 45 / 55 / 64; F −44.605979090 / −44.606189982 / −44.606266497 |
+
+- **pseudo-S at M = 1 is not a CPU problem, and today's GPU clears it too**: the CPU f64 node solve converges in 9
+  iterations, and today's GPU in 10–12 at every site (the prototype's 61 at the node and its 30-step plateau are gone
+  with the production path). CPU and GPU F agree to 3.2e-7 Ha at the node.
+- **All-electron O at M = 5 at the Balanced generic site fails on the CPU f64 path as well** (best Δρ 1.07e-5 against
+  the GPU's 1.03e-5; F steady to 1e-8 while Δρ oscillates by 4×): it is not f32 noise but a slow mode of the SCF map and mixer on this
+  state (solver-half review M1: its TS, 19.14 / 20.75 mHa, is ≈ 2× the three-level closed form 3kT·s(⅓) = 9.55 mHa, so
+  the partly filled ↑ set is a diffuse level manifold at ≈ −0.02 Ha among the box states, not one triply degenerate level). Elsewhere the CPU converges where
+  the prototype did not (Balanced centre: 17 against ✗, today's GPU 50; Accurate node: 11 against ✗, today's GPU 12) and CPU and GPU F agree to 5.3e-7 Ha (Balanced centre) and 1.5e-6 Ha (Accurate node). Today's GPU
+  converges at 7 of 8 all-electron O M = 5 sites, but 5 of them need 45–85 iterations, so the V0 ≤ 60 rule is still
+  missed at the Balanced generic (✗), Balanced face (85) and Accurate generic (64) sites. Where the CPU f64 converges in
+  11–17 the GPU's extra iterations are its f32 floor straddling the 1e-5 stop (V0 "D. The noise floor": this state's floor
+  median is 3.3–6.5e-6 with single steps to 1.5e-5, so the stop is met by a downward fluctuation, not a contraction;
+  solver-half review M3). As in V0, the state is never a scan winner (it lies
+  ≈ 0.67 Ha above M = 1) and the scan leaves a failed multiplicity out.
+
+
+### V5 fix round 1 (2026-11-17; the V5 bound review `task-11-v5-bound-review.md` and its revision, the solver-half review)
+
+Both V5 bounds were re-derived from error sources documented before Task 11 that the pre-registered formulas left out.
+Each new term below says where it comes from (rule 7).
+
+**Work integral: the box term L·B_box.** The precondition (the review): b = HF − (−dF/dx) at the path's end must fall
+with the box if it is the box term of `qm::forces` (iii). `v5_work_integral_box_offset_probe` (CPU f64, tol = eig_tol =
+1e-9, h = 0.30, three warm solves 0.005 apart, Simpson):
+
+| box | x = 0 | x = 0.2 | face density at x = 0.2 |
+|---|---|---|---|
+| 41³ (12 Bohr, the test's) | +2.15e-7 | +6.66e-7 | 1.97e-5 |
+| 51³ (15 Bohr) | +1.3e-8 | +1.38e-7 | 2.37e-6 |
+| 61³ (18 Bohr) | not run | +2.59e-8 | 3.1e-7 |
+
+It falls 26× from 12 to 18 Bohr at x = 0.2 (16× from 12 to 15 at x = 0) and tracks the face density: the box term, not
+a Fermi–Dirac or force-expression error. B_box: the review's 1e-5 is (iii)'s estimated ceiling ("≲ 1e-5"), but the CO₂
+bend below measured the same box term at ≈ 1.6e-5 Ha/Bohr per O (14 Bohr box), at that ceiling; by the revision's rule
+B_box is therefore V3's bound on |HF − R_F|, **1e-4 Ha/Bohr** (the "M7 forces" Richardson bound), coefficient 1. σ_F and
+σ_E are now the larger warm − cold difference of the two ends (the start's, 2.56e-10 Ha/Bohr and 1.15e-11 Ha).
+bound = 8.7e-13 + 3·(0.2 × 2.56e-10 + √2 × 1.15e-11) + 0.2 × 1e-4 = **2.00e-5 Ha**: ΔF + W₄₀ = +7.97e-8 is 250× inside,
+and |ΔE + W₄₀| = 5.589e-3 is 56× above 5·bound. (With the review's 1e-5: 2.0e-6, 25× and 559×.)
+
+**The gate** (`cargo test -p validate --release --test dynamics -- --nocapture`, 2026-11-17 16:08–16:40, RX 7900 XTX /
+Ryzen 7 9800X3D, other agents' CPU jobs running): **6 passed, 0 failed, 5 ignored (the H₂O limitation and four `v5_*`
+measurements), 1948 s.** `work_integral_matches_free_energy_change`: ΔF + W₄₀ = +7.967e-8 ≤ 2.000e-5, ΔE + W₄₀ =
+−5.589e-3 ≥ 1.0e-4. `fd_nve_conserves_f_plus_k_through_the_ts_swing`: the numbers of the table below, bit for bit (GPU
+1303 s, wall 1610 s in-suite). The four existing tests as before: rewind 6.4e-7 Bohr, ω ratio −6.24e-4, H₂ NVE drift
+−6.1e-7 Ha/ps and fluctuation 1.66e-6, thermostat 335.1 K (+11.7 %).
+
+**NVE: the bounds split into F + K and the shadow Hamiltonian H̃, and 730 steps.**
+
+*Verlet swing (solver-half review M6: no resonance, ω_s/2ω_b = 1.29).* The test computes it from its own run:
+E_s = ½k_R((R_max − R_min)/2)² with k_R = 2.11 Ha/Bohr² (A1), the bend holding the rest of E_mode, swing =
+h_b²/4·(E_mode − E_s) + h_s²/4·E_s, capped at h_s²/4·E_mode = 9.52e-5 (h_s = ω_s·dt = 6.01e-3 × 10.335 = 0.0621, A1).
+This run: R ∈ [2.0629, 2.4465], E_s = 3.88e-2 Ha, swing = 8.7e-6 + 3.74e-5 = **4.62e-5 Ha**.
+
+*The work bias B_W.* `v5_co2_gpu_work_integrals` (committed `#[ignore]`d measurement, 71³ × 0.20, 41 points, Simpson;
+it reproduces the scratch numbers of Step 3 exactly):
+
+| path | ΔF (Ha) | ΔF + W (Ha) | \|W − W₂\|/15 |
+|---|---|---|---|
+| CO₂⁺ bend 0 → 70°, R 2.226, warm | +9.874839e-2 | **+3.998e-5** | 9.1e-8 |
+| the same, cold at every point | +9.874634e-2 | +2.952e-5 | 1.2e-7 |
+| the same reversed, 70 → 0°, warm | −9.874269e-2 | −3.107e-5 | 3.3e-8 |
+| neutral CO₂ bend 0 → 70°, cold | +1.662612e-1 | +3.086e-5 | 6.2e-7 |
+| CO₂⁺ stretch R 2.05 → 2.45, β = 50°, warm | −2.492635e-2 | −3.22e-6 | 1.1e-8 |
+| CO₂⁺ stretch R 2.05 → 2.45, linear, warm | +5.475671e-4 | **−1.354e-5** | 2.4e-8 |
+
+*Attribution (the revision's CPU discriminator; `v5_co2_bend_force_consistency_cpu`, CPU f64, neutral CO₂ at β = 35°,
+R = 2.226, `Accepted`, tol = eig_tol = 1e-9; the HF Q_β = Σ_I F_I·∂R_I/∂β of a cold solve against the Richardson
+−dF/dβ of solves at β ± 0.5°, ± 1°):*
+
+| grid | box | face density | HF Q_β (Ha/rad) | Richardson −dF/dβ | **HF − Richardson** | wall |
+|---|---|---|---|---|---|---|
+| 71³ × 0.20 (the NVE's) | 14 Bohr | 2.31e-6 | −0.1133735917 | −0.1134090324 | **+3.54e-5** | 85 min (centre 22 steps, displaced warm 18–26) |
+| 91³ × 0.20 (`V5_QBETA_N=91 V5_QBETA_COLD=1`) | 18 Bohr | 2.6e-8 | −0.1134006319 | −0.1134035636 | **+2.93e-6** (12× smaller) | 194 min (5 cold solves in parallel, 22–24 steps) |
+
+FD(0.5°) − FD(1°) = 1.05e-5 at both grids, so Richardson is certified far below these numbers (F scatter at tol 1e-9
+≲ 1e-11 Ha, ≲ 1e-9 Ha/rad in FD). The CPU f64 force misses −dF/dβ by the GPU's amount in the same box (the GPU bend
+work integrals give ≈ +3e-5 Ha/rad near 35°, the same sign), and the miss falls 12× when the box grows to 18 Bohr: it is
+the discrete force's box term (`qm::forces` (iii)), shared by both solvers, and **not a pseudo force bug**. The static
+part is the shared box term; a GPU share ≲ 1e-5 is not excluded (the kernel/state split and the 91³ GPU work integral
+were not run) and is the warm − cold remainder tracked below. Per O it is ≈ 1.6e-5 Ha/Bohr (‖∂R/∂β‖ = 1.57 Bohr/rad), at (iii)'s estimated ceiling of 1e-5;
+`qm::forces`' doc now records the measurement. **The bias is attributed**, so B_W takes the attributed form. The GPU
+kernel/state split was not run: the CPU f64 path already carries the bias, which settles that the GPU state is not its
+source (the 91³ GPU bend work integral, the revision's next step only if the CPU had not shown it, was not needed).
+
+*The bounds* (the review's derivation; `fd_nve_conserves_f_plus_k_through_the_ts_swing` computes each term):
+- (A) F + K, detrended peak to peak ≤ 3·(swing + 2σ_path) + B_W;
+- (B) shadow H̃, detrended peak to peak ≤ 3·2σ_path + B_W + h_s⁴·E_mode (h_s⁴·E_mode = 1.47e-6, the O(h⁴) remainder H̃
+  leaves, solver-half review M7).
+- B_W attributed = 3·(3.998e-5 + 1.354e-5) = 1.61e-4 (the suite's 3× rule on the measured bend and stretch biases).
+- B_W gate-only (provisional, the revision's form while the bias is not attributed) = (1e-4 + 6e-5)·ℓ¹ + 2·E_BOUND_PSEUDO:
+  1e-4 Ha/Bohr the M7 HF-vs-Richardson consistency bound, 6e-5 `gpu_vs_cpu`'s `F_BOUND_PSEUDO`, 6e-6 its
+  `E_BOUND_PSEUDO`, ℓ¹ the trajectory's L1 diameter in configuration space max_{i,j} Σ_{I,k}|R_Ik(i) − R_Ik(j)| (a static
+  per-component bias δF changes H̃ between two geometries by at most δF·ℓ¹; the reversed bend scan's antisymmetry shows
+  the bias is static). This run: ℓ¹ = 3.676 Bohr, B_W,gate = 6.00e-4.
+
+*The run* (730 steps = 5 half-periods, two batches of 365 with a 180 s pause, the provider's warm state kept; GPU,
+2026-11-17 15:11; solo except other agents' CPU jobs). The trajectory is bit-identical to the 600-step runs over their
+common steps (the pause changes nothing).
+
+| quantity | value | bound (attributed / gate-only) |
+|---|---|---|
+| **(A) F + K detrended peak to peak** | **8.65e-5 Ha** (raw 7.97e-5) | **3.12e-4** (asserted) / 7.52e-4 |
+| **(B) H̃ detrended peak to peak** | **5.08e-5 Ha** | **1.75e-4** (asserted) / 6.15e-4 |
+| drift (F + K; H̃) | **−5.89e-5 Ha/ps**; −5.92e-5 | 2e-4 |
+| E + K detrended peak to peak (contrast) | 6.50e-3 Ha | (E + K is not conserved: 75× (A)) |
+| TS swing | 6.418e-3 | ≥ 1e-3 |
+| face density max | 1.76e-6 | ≤ 1.28e-5 |
+| periods | 2.50 (5 crossings, period 292 steps = 73.0 fs) | ≥ 2 |
+| `branch_jump` (I1) | 0 flagged of 730 judged; largest m/b 0.342 (step 138) | recorded |
+| cost | 2.83 s per step (13.6 SCF steps per solve; other agents' jobs on the CPU), MD 2066 s, test 2301 s | — |
+
+*The drift budget, re-derived for 730 steps* (the review: `DRIFT_BOUND` 2e-4 stays; T = 7545 a.u. = 0.1825 ps):
+- force-scatter random walk: √730 × 4.2e-7 Ha = 1.13e-5 Ha over 0.1825 ps = **6.2e-5 Ha/ps** (as Step 1, ≤ max speed);
+- the Verlet swing's leakage into the slope, a sinusoid of amplitude a = swing/2 = 2.3e-5 at 2ω_b (ω = 4.16e-3 with the
+  measured period; x = ωT/2 = 5π): 24a·|sin x − x cos x|/(ω²T³) = 24 × 2.3e-5 × 15.7/(1.73e-5 × 4.30e11) = 1.2e-9 Ha
+  per a.u. = **4.8e-5 Ha/ps**;
+- the work bias's wave (H̃'s, ≤ 5.1e-5 peak to peak, period ≈ the bend's, ω_b = 2.08e-3; x = 2.5π, so
+  |sin x − x cos x| = 1 — the reason for ending at a turning point): as a sinusoid **1.3e-5 Ha/ps**;
+- the sinusoid estimate of that wave term is wrong for this wave: measured −5.9e-5, and H̃'s slope is the same −5.9e-5,
+  so the measured slope is the bias wave's (not a sinusoid: near 0 at alternate turning points, ≈ −40 µHa between).
+  With the measured wave term the budget is 6.2e-5 + 4.8e-5 + 5.9e-5 = **1.7e-4 Ha/ps, 1.2× under `DRIFT_BOUND`**.
+  **Rule 7:** a bounded wave of peak to peak A can put up to 1.5·A/T into a least-squares slope (4.2e-4 Ha/ps for
+  A = 5.1e-5). The trajectory is deterministic, so this wave, of fixed shape, can hide at most its measured 5.9e-5 of a
+  real drift: the assertion's effective detection threshold is ≈ 2.6e-4 Ha/ps, and its margin rests on the wave's
+  measured shape, not on a worst-case derivation. (A follow-up option: fit the drift at the bend turning points only,
+  where the static wave is at its node.)
+
+**Tracked (rule 7; linked to Task 8a review item 1(c), the GPU stop criterion / LOBPCG floor).** The static part of the
+bend bias is explained (the box term, above). What is not: H̃'s wave is history-dependent (steps 441 and 581 have similar
+geometries and H̃ 33 µHa apart), which a static, geometry-only bias cannot do, and the GPU's warm bend scan carries
++4.0e-5 where the cold one carries +2.95e-5. That ≈ 1e-5 Ha remainder is in the class of the GPU state error invisible to
+the f32 Δρ stop (`gpu_vs_cpu` "the GPU state", 0.9–4.3e-5 Ha/Bohr) and of the 1e-5 partial-level stop's warm − cold
+offset (Step 1: +0.4 … +2.2 µHa per solve, always positive); it is inside B_W (which uses the warm +4.0e-5) and is tracked
+with that item, not bounded separately.
+
+### Task 14: the collection migration engine and V7 (plan 2026-11-13 Task 14, 2026-11-17, release, RX 7900 XTX)
+
+The engine is `providers::sampling::migrate` (module doc: the cold re-solve, the checks, the classes, the writes, the
+resume; spec §7.2–7.5). **Thresholds** (spec §7.4; fix round 1, physics review I2): per sample, ε_E = max(1e-5,
+5σ_E) and ε_F = 3σ_F with σ from `branch_jump::noise_tier(all-electron, scf_tol_used, E_old)` ("The branch_jump guard":
+the tiers and σ_E = max(tier, c·|E|), c = 9e-8 pseudo, 1.0e-7 all-electron). Values: pseudo sample tier below ≈ 22 Ha
+1e-5 / 1.5e-4 (3 × `PSEUDO_FORCE_NOISE`); pseudo 35 Ha 1.58e-5, 70 Ha 3.15e-5; pseudo partial stop (`GPU_PARTIAL_TOL`,
+the app tier) ε_F 2.7e-4; all-electron sample tier 2.7e-5 / 7.2e-5 up to 54 Ha, 70 Ha 3.5e-5. **All-electron ε_F is
+7.2e-5 at either tier** (fix round 2): the all-electron app tier's σ_F = 1.4e-5 was measured on gapped H₂O only — the
+noise of an all-electron partial-level stop is **unmeasured** — so the all-electron surface takes the larger σ_F of its
+two tiers (2.4e-5). The floor 1e-5 is 5× the
+pseudo-H₂O warm-vs-cold 1.87e-6. U: |F_new − E_old| ≤ ε_E and every |ΔF| ≤ ε_F; T: not U, |E_new − E_old| ≤ ε_E (the
+internal energy) and every |ΔF| ≤ ε_F; S otherwise (NaN is S). V7's classes are the same under these thresholds: H₂ is
+on the sample tier at 1e-5 / 1.5e-4 (|ΔE| 7.6e-8); OH is a partial stop, ε_E 1e-5, ε_F 2.7e-4 (|ΔE_internal| 7.3e-7,
+|ΔF| 1.22e-5); H₄'s |ΔE| 1.45e-2.
+
+**V7, `migration_classifies_h2_oh_h4`** (`tests/surrogate.rs`; the DS-era fixture `tests/fixtures/ds_era_labels.txt`:
+`Accepted`, 61³ × 0.20, σ = h, tol 1e-6; three cold GPU solves plus one repeat; the run of record shared the GPU with
+another worktree's `providers` suite, timings only):
+
+| case | E_old (DS) | new label | ΔE = label − E_old | max \|ΔF\| | class, code |
+|---|---|---|---|---|---|
+| H₂ R = 1.4 | −1.1359545439 | the old record (F_new − E_old = 7.57e-8) | 0 (kept bit for bit) | 5.87e-6 | U, 0 |
+| linear OH, 1.83 | −16.7774555166 | F −16.7843862554 | −6.93074e-3 (−2 kT ln 2 = −6.931472e-3; off by +7.3e-7) | 1.22e-5 | T, 0 |
+| H₄ 1.8 × 1.809 (aspect 1.005) | −2.0289850168 | F −2.0144863903 | **+1.4499e-2** | 5.00e-3 | S, 9 |
+
+- The OH and H₂ margins reproduce the fixture's fix-round-1 measurement (OH E_FD − E_DS = +7.3e-7, 14× inside ε_E; max
+  |ΔF_I| 1.22e-5, 12× inside ε_F; H₂ 7.6e-8 and 5.9e-6).
+- **H₄'s state** (Task 10 review M4): a second cold solve of the geometry gives F bit-identical to the migrated label,
+  E −2.0006504640 and **TS 1.383593e-2 = the fixture's `fd_ts` to +0.00 %** (`V7_TS_BAND` 3 %): the symmetric Fermi–Dirac
+  ensemble, not a broken-symmetry landing (TS ≈ 0 there). **Rule 7: the migration replaces a lower-F label at this
+  geometry** — the shared-shell release found the broken-symmetry integer state 14.5 mHa below the state the cold FD
+  solve reaches (spec §4.7(e)); the new label is the new teacher's converged state, not the lowest.
+- The old folder's files hash identical after the pass. The code-9 review is Task 15's (below).
+
+**The providers tests** (`sampling::tests::migration`, synthetic pair-Morse teacher with the FD breakdown, 14 tests,
+0.4 s): `classify_thresholds`, `migrated_code_table`, `predecessor_by_exact_key`, `old_folder_bytes_identical_after_pass`,
+`refuses_while_old_folder_has_a_live_writer`, `resume_after_crash_between_append_and_cursor` (counts and the new
+`samples.bin` byte-identical to an uninterrupted run's), `failed_resolve_is_listed_not_migrated`,
+`masked_sample_compared_on_all_atoms_and_carried`, `references_resolved_not_carried`, `not_offered_when_complete`,
+`source_change_restarts_from_zero` (F3; byte-identical to an uninterrupted run on the changed source),
+`purge_refused_while_migration_runs`, `old_pass_checkpoint_resume_refused`, `migration_is_a_pass_through_dynamics`,
+`a_crafted_source_slug_never_leaves_the_collections_root` (security review: a `migration.txt` whose `source_slug` is not
+the predecessor recomputed from the key — `..\other`, an absolute, drive or UNC path, a separator — is ignored); fix round
+1: `a_crash_in_the_status_window_is_healed_at_attach` (I1: the `pending` code applied at attach for an S and a U of an 8,
+then byte-identical to an uninterrupted run), `a_reference_with_an_unsolved_multiplicity_is_retried_not_offered` (M2),
+`a_superseded_sample_without_its_superseder_is_listed` (M4), `classify_thresholds` with the large-|E| and partial-stop
+cases (I2); fix round 2: `a_stale_pending_status_never_lands_on_a_live_sample` (the pending entry carries the sample's
+energy bits and an FNV-1a print of its atoms, positions and forces, and an append that writes nothing drops it). Six
+mutations of the engine (the (8, S) code, the duplicate rule, the fingerprint restart, the warning check, the purge
+refusal, an all-atom force comparison cut to one atom) each fail their test.
+
+### Task 15: code 9 in the trust machinery and its leave-one-out review (plan 2026-11-13 Task 15, 2026-11-20, release, RX 7900 XTX)
+
+The review is `providers::surrogate` `review_resolved` (module doc, "Re-solved samples"; spec §7.6, §8 rulings A and B):
+inside a refit, after its first fit and before the trust judgement, once `migration.txt` is "complete" or "reviewed",
+while a code-9 sample remains and the store changed since the last review. A candidate is fitted on the fit's members
+plus every code-9 sample; each one's leave-one-out ratio ρ in it (`loo_ratio`, its own energy and force bounds) releases
+it at ρ ≤ 1 (9 → 0) or keeps it at 9 (fencing, not counted by `fencing()` or the held cap, never M, never code 1, never
+lifted; one agreeing fresh answer moves it like a held sample, ruling B). Verdicts: `migration.txt`'s review log.
+
+**V7's review** (`migration_classifies_h2_oh_h4`, extended): three samples form no model, so the new folder gets the H
+and O references of the 61³ box (H −0.47781324, O −16.11546232 Ha; every species in the store needs one before a fit
+forms — the first run without O failed `MissingReference(8)`) and 16 cold solves of the new teacher about the H₄ geometry
+(every coordinate N(0, 0.01²) Bohr, seed `0x7e570915`) as live code-0 samples; the next refit reviews H₄. The neighbours'
+F lie within −2.86 / +2.57 mHa of the migrated label, their TS 1.3555–1.3855e-2 Ha (the symmetric ensemble's, the
+label's 1.3836e-2). **H₄ is released: leave-one-out ratio 4.91e-3** in the candidate (state "reviewed", code 0 in the
+collection) — its neighbours on the new surface predict the re-solved label. **V7 is the review's no-sibling limit**
+(Task 15 review M7): H₄ is the only code 9, so the candidate without it is the plain fit and the ratio is
+release-by-reproduction on the real teacher. It tests the pipeline and the label's consistency with the new surface (a
+broken-symmetry landing 14.5 mHa off would read ρ ≈ 3.6, kept), not the sibling mechanism, which only the analytic
+providers tests below cover. The test took 310 s alone (the migration's
+three solves, the two reference scans and the 16 neighbours).
+
+**The providers tests** (`surrogate::tests::resolved`, the 40 pair-Morse H₂ samples of `forget::small_collection` and
+re-solved samples on an analytic changed state E_Morse + 0.06·(r − 2.3)² beyond the window, 13 tests, < 2 s; fix round 1 added the stray-atom wait, the policy re-review and the attach order):
+ten siblings on r ∈ [2.5, 3.0], none reproduced by the fit without them, are all released at ρ 0.02–0.11; a sample
+50 mHa off the Morse curve inside the window is kept at ρ = 26.3 and refused next to it by `NearQuarantine`; a sample
+beyond the siblings in a second change of state (+0.1·(r − 3)²) is kept at ρ = 14.2 and released at ρ = 0.18 by the
+review after six fresh answers of its state arrive. **The candidate's sensitivity** (measured while writing the tests,
+not asserted): one 50 mHa outlier beyond the siblings raised their ratios from 0.02–0.11 to 0.42–0.55 (all still
+released); with a second outlier inside the window they rose to 0.89–1.02 and three of ten consistent siblings were
+kept — the safe side (kept → DFT nearby), until the store changes.
+
+### Task 17: V11, the dry run on a copy of the user's collection — partial (plan 2026-11-13 Task 17, 2026-11-20, release, RX 7900 XTX)
+
+`dry_run_on_collection_copy` (`tests/migration.rs`, `#[ignore]`d; `FD_DRY_RUN_COPY=<copy>`), on a copy (without its
+`.lock`) of the user's BEST collection `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5` (Accurate h = σ = 0.15,
+`Accepted`, legacy tag `all/30a74d9bda495668/shared1e-3/1e-1/stop2x5e-8`): **1 657 samples** (codes 0 × 1 624, held 1 ×
+32, superseded 2 × 1; H₂ 944, H₂O 321, H₃ 175, H₃P 217; boxes 99–135³), 18 (species, box) references. The new folder's
+key is `…_all-9dfd104e13b8`. The GPU was shared at times (the user's app, another worktree's suites).
+
+**V11 stopped at 480/1 657 by user decision (the BEST collection is not kept); the full-collection review and trust
+comparison were not run.** The pass was killed at cursor 480 (state `running`, resumable, not resumed). What was measured:
+
+- **Classes (480 re-solved): U 479, T 0, S 1, not migrated 0.** Class U's largest |F_new − E_old| **3.9e-7 Ha** and
+  |ΔF| **3.9e-5 Ha/Bohr** (ε_E 1e-5, ε_F 1.5e-4: 26× and 3.9× inside). The 480 are H₂ (433, 109–123³) and H₃P (47,
+  127³), in file order. Every U record is the old one bit for bit (479 of 480 energies bit-identical, re-read from the
+  new `samples.bin`).
+- **The one S** is source 322, H₂ at R = 5.98 Bohr (115³, multiplicity 1, old code 1 = held): E_old −0.91084466,
+  F_new −0.91328568 Ha (**−2.44 mHa**), max |ΔF| 2.5e-3 Ha/Bohr — the stretched singlet, where Fermi–Dirac shares the
+  near-degenerate σ_g/σ_u pair the integer rule kept apart. It went 1 → 9 (a hold judged the old label: review), as
+  `migrated_code` says. The other held sample in range (source 327, U) kept code 1. **No sample changed code without a
+  logged reason** (codes re-read from both `samples.bin` files; the harness's own per-sample check ran only at the end and
+  was cut off with the run).
+- **False-S estimate:** 0 of 1 (the one S fails the forces too); not meaningful on 480 samples of H₂/H₃P.
+- **References** (old → new, Ha): H 99–135³ all within 3e-8 (−0.4781085 … −0.4781522); O 99³ −16.1144943 →
+  −16.1144944, 109³ −16.1145144 → −16.1145133, 115³ −16.1145168 → −16.1145177, 119³ −16.1145184 → −16.1145183, **123³
+  −16.1049716 → −16.1145195** (9.5 mHa above its neighbours before; not an F, which would lie below — its origin, perhaps the
+  patched preview build that wrote into this folder from 2026-11-16, is not established); P 109³ −6.7958418 → −6.7958417,
+  127³ −6.7960014 → −6.7960013, **131³ −6.7613601 → −6.7960104** (+34.6 mHa wrong before). The re-solved references are
+  consistent across boxes (O within 2.5e-5, P within 1.7e-4 Ha across 99–131³); two of the old ones were not, which the migration
+  repairs.
+- **Time.** The references (18 boxes, every allowed multiplicity) took 21.7 min. The 480 samples took **17 915 s, 37 s
+  per sample on average**, ranging over 50× per grid unit between blocks of 100: samples 0–99 (53 H₂ 115³, 47 H₃P 127³)
+  138 s each; 100–199 (H₂ 115³) 2.3 s; 200–299 (H₂ 115³) 4.1 s; 300–399 (mostly H₂ 123³) 16 s; 400–479 (H₂ 123³) 23 s
+  (cursor 432 → 435 in 150 s, the GPU shared). The pass's own median solve was 14 s after 100 samples and 2.1 s after
+  400, so the median-based estimate said 45 min left at sample 400, about 17× short.
+- **Estimate fix** (`providers::sampling::migrate`): the a-priori cost was 1.1 s × (n/57)³ per sample (one gapped H₂O at
+  57³; 4.5 h for this collection); it is now **4.1 s × (n/57)³** (V11's mean per grid unit, ≈ 41 s at 123³ — ≈ 17 h for
+  this collection), and after 20 solves the estimate takes the pass's **mean** cost per grid unit instead of the median.
+  The plan's and the spec's "1–2 h for ≈ 2 000 samples" was wrong by about 10× (spec §7.3 amended).
+- Not run: the code-9 review, the refit, the trust verdict before and after. (The baseline step did run: the old labels
+  in a new-key folder under this build's trust rule, no audit history — **trusted**, 1 620 fitted, energy residual
+  9.27e-4 / 1e-3 per atom, force residual 1.998e-3 / 2e-3, misfit 47 / 162; both class verdicts untrusted with κ 1.00
+  and no evidence. Nothing to compare it with.)
+- **The source copy and the original are byte-identical afterwards** (SHA-256 of every file before and after; the
+  original's 9 files including its stale `.lock`, the copy's 8).
+
 ## Live orbitals (Harris display; spec 2026-11-14)
 
 `tests/harris.rs` (spec `docs/superpowers/specs/2026-11-14-live-orbitals-design.md` §7, V-A1–V-A3; V-A4, a record for §9 Q2, below). First measured 2026-11-14; **re-measured 2026-11-15 after the Harris LOBPCG change of task 8b** (the stop test reads the displayed levels at the SCF's tol, the guards at τ_c/100, the top level a buffer — `qm_gpu::harris` "Three roles"): the tables below are the 2026-11-15 numbers, with the 2026-11-14 ones where they changed. **Re-run 2026-11-16 after task 8b fix 1** (the block memory keeps the last call's need, not the split it ran with; the record's last vector tested, under a buffer, when it can change the shown rows — `qm_gpu::harris` "The record's edge"; the at-cap note prints the displayed and guard tiers' residuals): every gate passes, the changes are noted where they occur. Release, RX 7900 XTX (Vulkan) / Ryzen 7 9800X3D, BelowNormal, the user's app open (the GPU shared with an idle window), each test its own invocation (`--test harris va1`, `va2`, `va3`) with a 3-minute cool-down between them. All cases: σ = h = 0.15 Bohr (the app's Accurate grid), ionic `Accepted` (the app default: H, N and O pseudised; `DegenerateShells` occupations), SCF tol 1e-6 (the floor-aware GPU tol, `effective_gpu_tol`, stays 1e-6 for N ≤ 8), cold SCF on a fresh `GpuSolver`, then `GpuSolver::harris` on the same solver with a new `HarrisState` (m = 0).
@@ -4889,6 +6059,58 @@ Three processes: H₂O 997 s (the 60-solve sampling pass 528 s at 97³; 60 SCF r
 
 **Suite time:** 2026-11-15: V-A1 87 s, V-A2 116 s, V-A3 97 s (2026-11-14: 126 / 150 / 126 s) as three processes (each regenerates the H pseudopotential, ≈ 75–85 s); one `cargo test -p validate --release --test harris` process would generate it once, ≈ 5 min (an estimate from the three runs; measured 2026-11-16 as one process with V-A4 added: 640 s).
 
+### Harris under Fermi–Dirac (the scf-stall ← main merge, 2026-11-16)
+
+The merge of `main` (live orbitals Phase A) into the smearing branch put every scene's occupations — and so the Harris
+display solve's — on `FermiDirac { kt = ELECTRON_KT }`. Ruling: the one-shot occupations are `qm::fermi_dirac` of the
+Harris levels at the same kT per spin at the scene's (n↑, n↓); the block grows to the SCF's witness
+(`qm::witness_reached`) up to `MAX_WITNESS_GROWTH`, and a window still short there is a note ("the occupations are
+approximate"), never an error; the occupied levels are those with f ≥ `PARTIAL_OCCUPATION_MIN`, never the witness
+column (`qm_gpu::harris` "Fermi–Dirac"). `harris_footprint_bytes` counts W = 16 for all-electron scenes too.
+
+qm-gpu tests (release, RX 7900 XTX, 2026-11-16):
+- `harris_fermi_dirac_on_gapped_h2_is_aufbau` (H₂ 33³ × 0.25, FD SCF density, m = 2): FD and `Aufbau` give the same
+  payload — n_occ [1, 1], f = {1, 0, 0, 0, 0} per spin (identical to 1e-12; printed bitwise 1.0 / 0.0), the same ε to
+  the last bit, split (6, 4, 5) in 2 solves per channel each, no note.
+- `harris_fermi_dirac_on_pseudo_o_m3_matches_the_scf` (pseudo-O `All`, 33³ × 0.25, off-site, M = 3; FD SCF 16 steps,
+  stop 1e-5, TS 9.5476e-3 Ha = 3kT s(⅓) to 1e-7): n_occ [4, 4]; ↓ p f = 0.334786, 0.334304, 0.330910 (lattice
+  splitting 8.7e-5 Ha ≪ kT); |Δε| ≤ 1.7e-7 Ha and |Δf| ≤ 3.9e-7 against the SCF's FD f (bound f(1 − f)·2·1e-5/kT =
+  8.9e-4).
+
+V-A1 under FD (`--test harris va1`, 142 s): ε and O gates pass for all four cases (max |Δε| 8.9e-8 / 9.1e-8 H₂,
+4.5e-8 / 3.6e-8 H₂ + H, 1.7e-7 / 9.9e-8 H₂O, 1.2e-7 / 1.7e-7 pseudo-O; 1 − O ≤ 1.03e-7). The gapped cases' f match
+to 1e-12. **Pseudo-O's FD f do not match to `OCC_EPS` = 1e-12**: the singlet's 2p ⅔ levels differ by 5.2e-7–5.8e-6
+(↑ #1–3: 5.2e-7, 2.0e-6, 2.6e-6; ↓ #1–3: 5.8e-6, 9.6e-7, 4.8e-6). OCC_EPS assumed `DegenerateShells`' exact fractions;
+FD's f are continuous in ε with slope f(1 − f)/kT = 44 per Ha, so the measured |Δε| ≤ 1.7e-7 implies |Δf| ≤ 1.5e-5.
+**The FD f gate** (controller ruling (1), 2026-11-16; `fd_occ_gate` in `tests/harris.rs`). The 1e-12 gate presumed
+`DegenerateShells`' exact fractions, f = (N − n_below)/|C|, a constant of the level count. Under FD,
+f = 1/(1 + e^{(ε − μ)/kT}) is smooth in ε with ∂f/∂ε = −f(1 − f)/kT, so a level that passes the ε gate
+(|Δε| ≤ `IDENTITY_EPS` = 1e-5 Ha) has |Δf| ≤ f(1 − f)/kT · 1e-5 to first order. The gate for a partly filled level
+(1e-6 < f < 1 − 1e-6) is that propagated ε gate: 4.4e-4 at f = ⅔, kT = 5 mHa. A level within 1e-6 of 0 or 1 keeps 1e-12.
+This is derived from an existing gate, not loosened to pass. The measured pseudo-O |Δf| ≤ 5.8e-6 is 76× inside it.
+V-A2 (O 0.988–0.999, gate ≥ 0.95) passes unchanged.
+
+**V-A3 after plan Task 9b** (2026-11-17, `--test harris va3`, run while the CPU `oracles` suite was running — CPU
+contended, GPU alone): warm median H₂ **0.155 s** (FD before 9b 0.172, main 0.115), H₂ + H **0.258 s** (0.402; the 0.3 s
+target is met again), H₂O **0.404 s** (0.792; main 0.46); cold 0.753 / 1.625 / 1.293 s; 0.1 Bohr step 0.174 / 0.320 /
+0.499 s. What changed for Harris: the lower-bound FD window, the doubled growth and the solver's cap (the guard tier
+was already 1e-3 there), and — for every LOBPCG — the memoised Gram plans and the formation check. V-A1 passes
+(identity on the converged density, all four cases).
+
+**V-A3 regression under FD (record; Task 9b owns the fix).** Warm Harris refresh after a 0.01 Bohr move, median of 5,
+through `GpuKs::harris_display` (`--test harris va3`, 2026-11-16, RX 7900 XTX, the user's preview app open):
+
+| case | grid | warm median, main (Aufbau/DS) | warm median, FD | ratio | 0.1 Bohr step, FD | cold, FD |
+|---|---|---|---|---|---|---|
+| H₂ | 81³ | 0.115 s | 0.172 s | 1.5× | 0.219 s | 0.833 s |
+| H₂ + H (doublet) | 81³ | 0.147 s | 0.402 s | 2.7× | 0.520 s | 2.470 s |
+| H₂O | 97³ | 0.46 s | 0.792 s | 1.7× | 1.002 s | 2.114 s |
+
+The 0.3 s target (spec §7) is missed by H₂ + H. Cause: the FD witness growth. The witness column above the occupied
+levels, and the tested guards up to it, are solved at the guard tier or above, where main's `Aufbau` block stopped at
+n + G. Plan Task 9b owns the fix: the Harris witness columns go to the guard tolerance by the same per-column rule as the
+SCF's; V-A3 is re-measured there; the 0.3 s target is restored or the miss explained.
+
 ## Refit speed-up (2026-11-17; branch `refit-speed`; `providers` `surrogate::tests::refit_profile` and `refit_golden`, `#[ignore]`d; release, Ryzen 7 9800X3D, 12 fit threads, another worktree's `oracles` suite running throughout — both columns measured back to back under the same load)
 
 A read-only copy of the user's BEST collection: 1 588 samples, H/O/P, body-3 + body-4, Q′ 2 460 at the recovery's degree cap 6 (1 902 without it). Four changes, each committed alone:
@@ -4925,6 +6147,284 @@ The second refit with nothing new: 192.6 → 10.6 s. What is left: `NullSpace::o
 
   (σ_F: the force std and its epistemic part, per atom.) The relative 3.4e-3 of the first report was a value of 3.7e-6 moving by 1.3e-8: the absolute differences are at most 0.4 % of a tier.
 - **Across machines.** faer picks its SIMD kernels at run time (AVX-512 here, AVX2 elsewhere), so a refit on a CPU with another instruction set differs from this one by the same ~κε spread — never in a verdict measured here, but a golden compares bit for bit only on the same ISA (the thread count never matters: `dense::SPLIT`).
+
+## Stray atoms (plan 2026-11-18 Task 7, 2026-11-19; spec `2026-11-18-stray-atom-composition-design.md` §6; `tests/surrogate.rs` and `tests/dynamics.rs`, release, RX 7900 XTX, teacher GpuKs tol 1e-6, `ionic accepted`, σ = h) — **H₂ + H clears and is answered after rulings 10–13; F₂ + Li refused; NVE re-entry conserves, every booked jump within 1 mHa**
+
+Geometry (`common::surrogate::diatomic_and_atom`): the diatomic's centre and the third atom on the cube's body diagonal,
+8 Bohr apart, the diatomic's axis ⊥ the diagonal, placed so the stray atom and the diatomic's outer atoms are equally far
+from the faces. Cold solves throughout (the auditor solves the parts cold). Box rule `box_affected_face_density(h)`:
+1.28e-5 e/Bohr³ at h = 0.20, 7.2e-6 at 0.15. Floor 27.6 kT = 138.0 mHa.
+
+**The box (`stray_box_probe`, `--ignored`;** `cargo test -p validate --release --test surrogate stray_box_probe -- --ignored --nocapture`**).**
+H₂ (1.4) + H at 8 Bohr, h = 0.20:
+
+| grid | cube (Bohr) | smallest face distance | face density scene / H₂ / H | E_scene − E_H₂ − E_H (mHa) | ↑ margins (mHa) |
+|---|---|---|---|---|---|
+| 61³ (the plan's) | 12.0 | **3.44 (floor refuses < 4)** | **3.05e-5 / 1.79e-5 / 3.04e-5 (all "box too small")** | −0.173 | +318.4 / +437.3 |
+| 81³ | 16.0 | 5.44 | 7.83e-7 / 2.62e-7 / 7.82e-7 | −0.087 | +299.0 / +413.3 |
+| 87³ | 17.2 | 6.04 | 2.71e-7 / 7.66e-8 / 2.70e-7 | −0.086 | +294.4 / +408.5 |
+| 91³ | 18.0 | 6.44 | 1.34e-7 / 3.40e-8 / 1.34e-7 | −0.086 | +291.9 / +405.8 |
+
+The residual is box-independent from 81³ on (−0.086 mHa: LSDA's overlap tail at 8 Bohr, not confinement); the lone H's
+energy is not (−0.477741 Ha at 81³, −0.478069 at 91³). **The stray tests run at 81³ × 0.20.** A 12 Bohr cube (the
+plan's 61³ × 0.20, and the app's Accurate default 81³ × 0.15) cannot hold a clean H₂ + H check at all: an H must be
+≈ 5 Bohr from every face for its face density to pass the rule, so two parts more than r_cut = 6 apart cannot both be
+clean. **Ruling 10c: the feature applies in larger boxes; in the default box (and any 12 Bohr cube) such scenes stay on
+DFT, floor-refused with the reason shown** (stray module doc, README); the "estimated box size" item would change that.
+
+**`stray_h_clears_and_matches_dft` — FAILS (blocked; not loosened, rule 6).** Default H₂ pass at 81³ × 0.20 (seed 7):
+272 samples, 216–253 s, Q′ 29, rmse 3.0e-7 Ha/atom, 8.6e-6 Ha/Bohr, E_ref(H) −0.478139 Ha, trusted. Composition checks
+through the provider (strict, background auditor, 2 auditor solves each, 1.1–2.0 s):
+
+| H₂ bond | step | check verdict |
+|---|---|---|
+| 1.434 | Fallback (5a), teacher − model +4.15e-4 Ha | **refused — "levels: the scene's LUMO ↑ is 25.5 mHa, the parts' 28.4 mHa"** (beyond `STRAY_LEVEL_TOL` 1.8); ε_pos +0.402 mHa |
+| 2.0 | Fallback, +5.37e-4 | **void — "frontier level not computed"**; ε_pos +0.473 |
+| 2.3 | Fallback, +6.24e-4 | **void** (same); ε_pos +0.516 |
+| 1.8 | Fallback, +4.93e-4 | **void** (same); ε_pos +0.447 |
+
+Two causes, both in the check's levels test (`providers::surrogate::stray::judge`), not in the physics of the case
+(energy residual −0.09 to −0.15 mHa against the 1 mHa tolerance; margins ≥ 181 mHa up to r = 2.5):
+1. **The ↑ LUMO near equilibrium is a positive-energy box state** (H₂ σu* +28.4, the H's ↑ LUMO +36.5 mHa; they fall
+   with the box: 61.2/68.8 at 61³, 19.7/23.4 at 91³). The scene's lowest continuum state spreads over both wells and lies
+   2.9 mHa (81³), 3.6 (87³), 3.7 (91³) below the parts' lowest: not a union of the parts' levels, and ~300 mHa above μ,
+   so no charge can move through it. Bound LUMOs do compose: at r = 2.0 the scene's ↑ LUMO −32.1 vs the fragment's −31.6,
+   at 2.5 −85.8 vs −85.7 (`stretched_h2_margin_is_reported`).
+2. **The stray H's ↓ channel has no level**: an empty channel stores no orbital (`providers::ks::frontier`; the atom's
+   ↓ HOMO/LUMO print "—/—"), while the scene's ↓ LUMO is that H's empty 1s↓ at −95 mHa. `judge` takes the parts' ↓ LUMO
+   only when every part has one, so `missing` is set and every H₂ + H check is void, at any geometry. The Morse-teacher
+   unit tests (synthetic levels) cannot show either.
+Options for the controller (not taken here: each changes the check's criterion): compare a LUMO only where it is a bound
+level / within reach of μ (the partial-level and margin tests already cover the charge-moving levels), and let an empty
+channel's absent LUMO count as "above every computed level" (as `acceptor` already does) — or have the solver store one
+level in an empty channel. `stray_h_returning_conserves_energy` (dynamics) needs the same clearing and was not run.
+
+**After controller ruling 10 (2026-11-19: frontier levels compared only within 27.6 kT of the scene's μ_σ; each part
+solve asks for one unoccupied level per channel through the orbital view; `sim::Frontier::mu`) — still FAILS, blocked
+on the window's width.** Same pass (272 samples, 273 s); the checks:
+
+| H₂ bond | check verdict |
+|---|---|
+| 1.434 | **passes** — residual 0.089 mHa, margin 282 mHa (1 of 3) |
+| 1.15 | **passes** — residual 0.074 mHa, margin 307 mHa (2 of 3) |
+| 1.75 | **refused — "levels: the scene's LUMO ↓ is −95.4 mHa, the parts' −91.1 mHa (μ −221.7 mHa)"** |
+
+The ↓ LUMO is the stray H's empty 1s↓ (now computed through the part's unoccupied level). It lies 126.3 mHa = 25.3 kT
+above μ↓ — inside the 27.6 kT window, so it is compared, and f there is ~e^−25 ≈ 1e-11 (no charge can move). The shift
+is not a box effect (a measurement with the unoccupied row requested on every solve; Ha × 10³, ↓ LUMO and μ↓):
+
+| grid (cube) | r | scene ↓ LUMO | H alone ↓ LUMO | shift | scene μ↓ | ↓ LUMO − μ↓ | scene ↑ LUMO / H₂ / H | μ↑ |
+|---|---|---|---|---|---|---|---|---|
+| 81³ (16.0) | 1.434 | −95.0 | −91.3 | −3.7 | −234.3 | **139.3 (outside by 1.3)** | +25.5 / +28.4 / +36.5 | −121.5 |
+| 81³ | 1.75 | −95.4 | −91.1 | −4.3 | −221.7 | **126.3 (inside)** | −4.6 / −3.6 / +36.4 | −135.7 |
+| 91³ (18.0) | 1.434 | −98.1 | −94.5 | −3.6 | −236.0 | 137.9 | +17.4 / +20.6 / +28.7 | −126.0 |
+| 91³ | 1.75 | −98.6 | −94.4 | −4.2 | −223.6 | 125.0 | −9.7 / −8.5 / +28.6 | −138.9 |
+| 101³ (20.0) | 1.434 | −99.2 | −95.6 | −3.6 | −236.6 | 137.4 | +12.6 / +16.1 / +23.2 | −128.5 |
+| 101³ | 1.75 | −99.7 | −95.6 | −4.1 | −224.2 | 124.5 | −12.3 / −11.0 / +23.2 | −140.4 |
+
+The empty 1s↓ of an LSDA H (κ = √(2·0.091) ≈ 0.43 Bohr⁻¹, its density decaying over ~1.2 Bohr) sits 3.6–4.3 mHa lower
+beside H₂ at 8 Bohr, at every box: a composition shift of an empty level ~25 kT from μ↓, not a transfer. μ↓ sits near
+the middle of the ↓ gap (σg↓ to 1s↓), so the 1s↓ lies 125–139 mHa from it — at the window's edge — and rises into it
+as the bond stretches (σg rises). The ↑ box states (LUMO ↑, 145–150 mHa above μ↑ at 1.434) now drop out as intended.
+For the controller: a window of ln(1/`PARTIAL_OCCUPATION_MIN`) kT = 13.8 kT (69 mHa) — the occupation threshold that
+defines a partial level — would leave this level out (f < 1e-6 beyond it); the margin keeps its 27.6 kT.
+
+**After controller ruling 11 (2026-11-19: the window is ln(1/`PARTIAL_OCCUPATION_MIN`) kT = 13.8 kT = 69 mHa about the
+scene's μ_σ; the margin keeps 27.6 kT) — H₂ + H clears, then blocked on the region's reach.** The shift of the stray H's
+empty 1s↓ above is the H₂'s potential perturbing a level ≈ 25 kT above μ↓ (f ≈ 1e-11), box-independent across
+81³/91³/101³: physical, not a composition failure, and now outside the window. The checks (pass 272 samples, 198 s):
+1.434 passes (0.089 mHa, margin 282), 1.15 passes (0.074, 307), **1.75 passes (0.105 mHa, margin 257) — cleared (3
+checks)**. But the cleared region holds **only the checked geometries themselves**: the provider's `would_answer` is
+`Ok` at r = 1.434, 1.15 and 1.75 exactly and refuses (rule 5a) at r ± 0.005 Bohr around each, and at every unchecked
+bond tried (1.37, 1.50, 1.27, 1.65, 1.40, 1.55, 1.20, 1.70). Cause (a CPU measurement of the default H basis: r_cut 6,
+n_max 8, l_max 3, body-3, 29 features): the radial features oscillate in r, so a point between the checks leaves the
+three checks' per-feature box in 1–3 features (r = 1.4: b2[n=3] −0.8656 ∉ [−0.8630, −0.7727] and b3[n=1,n=1,l=1];
+r = 1.434 + 0.001: b2[n=6] 0.8555 ∉ [0.6051, 0.8554], the checked bond sits at that feature's maximum). A geometry
+within the thinning radius of a check is "not distinct", so it queues no check either: it falls back for the session
+and the region never grows to it. The clears test cannot find its fourth geometry, and an NVE run's H₂ (which moves
+off its checked bond at the first step) would never be answered.
+
+**After controller ruling 12 (2026-11-19: a region covers its per-feature box or the thinning radius of a passed check,
+in the distinctness metric) — `stray_h_clears_and_matches_dft` PASSES.** `cargo test -p validate --release --test
+surrogate stray_h_clears_and_matches_dft -- --nocapture` (222 s; pass 272 samples; teacher 280 solves, auditor 8):
+checks at 1.434 / 1.15 / 1.75 pass and clear (residuals 0.089 / 0.074 / 0.105 mHa, margins 282 / 307 / 257 mHa);
+`would_answer` is `Ok` at ±0.005 Bohr around each check. The fourth, unchecked geometry — the first of the candidate
+list the provider answers — is **r = 1.37** (outside the box, within the radius of the 1.434 check): source
+`Surrogate`, the stray-atom note, E_model −1.61377446 Ha.
+
+| quantity | value |
+|---|---|
+| E_DFT − E_model | **+0.4027 mHa** = gap_frag +0.0943 + comp −0.0857 + ε_pos +0.3942 (sum +0.4027) |
+| per bonded atom (asserted ≤ the audit tier 1.000 mHa) | **0.2014 mHa** |
+| worst bonded force difference | 7.86e-5 Ha/Bohr (the policy's bound 2.21e-3) |
+| stray atom: DFT force / model force | 4.64e-4 Ha/Bohr / 0 exactly |
+| then H₂ (2.5) + H through the provider | check passes (residual 0.137 mHa, margin 181 mHa), region grows (4 checks); r = 1.37 still the model's |
+
+The largest term is the stray H's own box term ε_pos (its confinement at 5.4 Bohr from a face against the centre
+reference, +0.39 mHa), as the module doc predicts; the composition itself is −0.09 mHa.
+
+**`stray_h_returning_conserves_energy` (dynamics) — PASSES at 101³ × 0.20.** `cargo test -p validate --release --test
+dynamics stray_h_returning_conserves_energy -- --nocapture` (833 s: pass 296 s, 270 samples; NVE 218 s; the control 288 s).
+The H's path (3.9, s, s), s from +3.9 to −3.9, 0.03 Bohr/step (v 2.90e-3 a.u.), past H₂ (1.434, at rest, at x = −0.6):
+
+| run | phases (steps) | closest | E_conserved drift (bound 2e-4 Ha/ps) | detrended p-p | switches (ΔE_conserved) | booked jumps (check tolerance 1 mHa) |
+|---|---|---|---|---|---|---|
+| **101³ (20 Bohr), asserted** | model 36 → teacher 268 → model 57 | 4.22 Bohr | **+1.085e-5 Ha/ps** (driver +1.13e-5) | 7.44e-6 Ha | +5.6e-9, −3.9e-9 Ha | −0.365 mHa at 5.995 Bohr, +0.458 at 6.010 (both within) |
+| 101³ teacher phase alone | steps 36–303 | | −2.52e-5 Ha/ps (Δ +1.5e-6 Ha) | 8.41e-6 | | |
+| 101³ control (teacher only, same start, 360 steps) | | | +2.80e-5 Ha/ps (Δ +4.8e-6) | 7.05e-6 | | |
+| 81³ (16 Bohr), the first design | model 36 → teacher 288 → model 34 | 3.61 Bohr | **−6.815e-4 Ha/ps (fails)** | 6.43e-5 | +4.6e-8, −5.4e-9 Ha | **+1.444 mHa (beyond)** at 5.995, −0.639 at 6.017 |
+| 81³ teacher phase alone | steps 36–323 | | −5.34e-4 Ha/ps (Δ −6.65e-5 Ha) | 6.82e-5 | | |
+| 81³ control | | | −6.1e-5 Ha/ps (Δ −3.7e-5) | **1.21e-4**, 23 solves "box too small" | | |
+
+The model phases conserve E_conserved to 1e-10 Ha and each switch to ≤ 5e-8 Ha (the `transition_jump` booking); at 81³
+the whole drift was the teacher's own, with the path 4.1 Bohr from the x faces (the floor's edge): the control without
+any surrogate swung 1.2e-4 Ha peak to peak with face-density warnings. At 101³ every atom of the path stays ≥ 6.1 Bohr
+from every face, no teacher solve warns (asserted, the suite's NVE rule), and the run drifts 18× under the bound. The
+81³ entry jump (+1.44 mHa) carried the stray H's box term there; at 101³ both jumps are within the check's tolerance.
+
+**`stray_li_beside_f2_is_refused` — passes** (`cargo test -p validate --release --test surrogate stray_li_beside_f2_is_refused -- --nocapture`;
+3 cold solves, GPU 214 s: scene 68 s, F₂ 15 s, Li 115 s). The recipe refuses F at h = 0.20 ("h_req = 0.15", asserted),
+so the case runs at **107³ × 0.15** (15.9 Bohr; smallest face distance 5.17); Li is all-electron at σ = h under
+`Accepted` (the recipe refuses Li), Li alone at M = 2. Measured as the check measures it, **not through the provider**: a
+model with Li and F in its basis at this grid needs passes of hours (Li solves 60–115 s each).
+
+| solve | E (Ha) | face | ↑ HOMO / LUMO (mHa) | ↓ HOMO / LUMO | partial levels |
+|---|---|---|---|---|---|
+| F₂ + Li (M 2) | −54.69157421 | 4.10e-6 | −98.6 / −96.6 | −213.5 / −66.8 | ↑ −98.6 f 0.548, −96.6 f 0.451 (two levels pinned at μ), −60.5/−60.1/−54.2 f ≤ 6e-4 |
+| F₂ (M 1) | −48.93807414 | 4.48e-7 | −354.3 / −232.1 | −354.3 / −232.1 | — (f 1 / 0) |
+| Li (M 2) | −5.71628938 | 4.51e-6 | −75.7 / −29.8 | −1394.5 / −31.2 | ↑ 2s −75.7 f 0.985 |
+
+All three clean. **The check refuses it by the energy test first**: E_scene − E_F₂ − E_Li = **−37.211 mHa** (> 1 mHa).
+The margin fails too: F₂'s ↑ acceptor (σu*, −232.1) lies **331.6 mHa below** Li's ↑ donor (2s, −75.7) — margin −331.6 mHa
+against +138; the other three directions +156.3, +1040.2, +200.9 mHa. The transfer: in the scene the Li 2s↑ electron
+and F₂'s σu*↑ meet at μ (two ↑ levels at −98.6/−96.6 mHa with f 0.548/0.451) and the energy drops 37.2 mHa below the
+separated parts — LSDA's single μ_σ moving charge across 8 Bohr (physics honesty, rule 7: the separated limit would be
+neutral; the model must not answer where it disagrees with its teacher). The fraction transferred is not separated per
+orbital here (no projection is computed).
+
+**`stretched_h2_margin_is_reported` — passes** (`… --test surrogate stretched_h2_margin_is_reported -- --nocapture`;
+12 cold solves, 154 s incl. the first pseudo-H load). σu − 1s (↑) = fragment ↑ acceptor − stray ↑ donor, 81³ × 0.20:
+
+| H₂ bond | σu − 1s ↑ (mHa) | other direction ↑ | E_scene − E_frag − E_atom (mHa) | scene ↑ LUMO / fragment's |
+|---|---|---|---|---|
+| 1.434 | +295.9 | +410.1 | −0.089 | +25.5 / +28.4 |
+| 2.0 | +235.6 | +368.1 | −0.117 | −32.1 / −31.6 |
+| **2.5** | **+181.3** | +342.9 | −0.137 | −85.8 / −85.7 |
+| 3.0 | **+136.9 (below the 138.0 floor)** | +325.1 | −0.152 | −129.9 / −129.9 |
+
+At 2.5 Bohr the margin passes by 43 mHa; by 3.0 Bohr the stretched bond's σu has come within 27.6 kT of the H's 1s and
+the check would refuse by margin (the onset the margin test exists for).
+
+**After controller ruling 13 (2026-11-19, the final review's fix round: the region covers the stray atoms only as near
+the bonded part, and a face, as a pass put them; the thinning radius frozen at each pass; every booked NVE jump
+asserted) — both tests PASS.** Gates on 3f9a3149: `cargo test -p providers --release` 566/0; `--test surrogate` 11/1
+(the known `the_stuck_escape_repro_is_answered_honestly`, owned by the trust-tighten branch); `--test dynamics` 7/0.
+
+`stray_h_clears_and_matches_dft` (677 s; pass 272 samples; teacher 280 solves, auditor 8). The checks at 1.434 / 1.15 /
+1.75 pass and clear as before (0.089 / 0.074 / 0.105 mHa; margins 282 / 307 / 257 mHa). The region's place — the
+passes' smallest stray-to-H distance and face distance — is 8.0206 Bohr (the 1.15 check) and 5.3812 Bohr (the 1.75
+check): in `diatomic_and_atom` the stray atom moves with the bond (8 Bohr from H₂'s centre, so its distance to the
+nearer H grows with r and its face distance shrinks), so bonds below 1.15 and above 1.75 are refused by the place, not
+by the radius. `would_answer` scanned over 0.9–2.3 Bohr by 0.001 (312 of 1401 bonds answered); **the covered interval
+about each check** (the box and the frozen radius, on this run's model envelope):
+
+| check (Bohr) | covered | reach −/+ (Bohr) | what ends it below / above |
+|---|---|---|---|
+| 1.15 | 1.150–1.198 | 0.000 / **0.048** | the place (stray–H 8.0206 < the passes') / the radius |
+| 1.434 | 1.353–1.523 | **0.081 / 0.089** | the radius / the radius |
+| 1.75 | 1.659–1.750 | **0.091** / 0.000 | the radius / the place (face 5.3811 < 5.3812) |
+
+The radius reaches 0.05–0.09 Bohr of bond length on this model (0.75 training spreads). **The fourth geometry, the
+answered bond farthest from every check: r = 1.659** (0.091 Bohr from the 1.75 check; the test before ruling 13 took
+the first answered candidate, 1.37, 0.064 Bohr from a check): source `Surrogate`, the stray-atom note.
+
+| quantity | value |
+|---|---|
+| E_DFT − E_model | **+0.4621 mHa** = gap_frag +0.1337 + comp −0.1002 + ε_pos +0.4286 (sum +0.4621) |
+| per bonded atom (asserted ≤ the audit tier 1.000 mHa) | **0.2311 mHa** |
+| worst bonded force difference | 1.07e-4 Ha/Bohr (the policy's bound 5.04e-3) |
+| stray atom: DFT force / model force | 5.13e-4 Ha/Bohr / 0 exactly |
+| then H₂ (2.5) + H through the provider | queued (face 5.25 < the place's 5.38), passes (0.137 mHa, margin 181 mHa), region grows (4 checks); r = 1.659 still the model's |
+
+The CPU counterpart (`providers` `the_region_covers_the_thinning_radius_of_its_checks`, the default H basis, an H₂
+envelope over 1.0–2.5 Bohr, no place): about 1.15 −0.082 / +0.109 Bohr, about a check at 2.5 −0.109 / +0.105 (it stops
+at 2.605, short of 3.0 where σu − 1s falls under the 138 mHa floor — asserted), about 1.434 and 1.75 one joined
+interval 1.285–1.960.
+
+`stray_h_returning_conserves_energy` (2569 s: pass 271 samples, 1085 s; NVE 1107 s; the control). After the three
+checks at 8 Bohr, **an edge check** — the H 6.05 Bohr from the nearer H₂ atom and 5.6 Bohr from a face, at (4.400,
+2.740, 2.740) — passes: residual **0.437 mHa** (the H₂–H tail at 6 Bohr, within the 1 mHa test), margin 280 mHa,
+ε_pos +0.131 mHa; the region grows (4 checks). Same path as before (101³ × 0.20):
+
+| phases (steps) | closest | E_conserved drift (bound 2e-4 Ha/ps) | detrended p-p | switches (ΔE_conserved) | booked jumps (each asserted ≤ 1.000 mHa) |
+|---|---|---|---|---|---|
+| model 34 → teacher 272 → model 55 | 4.215 Bohr | **+1.071e-5 Ha/ps** (driver +1.11e-5) | 7.41e-6 Ha | +5.9e-9, −1.8e-9 Ha | **−0.3477 mHa** at 6.034 Bohr (model → teacher: the edge, rule 5a, still stray), **+0.4399 mHa** at 6.052 (teacher → model) |
+
+The control (the teacher alone, same start): +2.80e-5 Ha/ps; over the teacher's steps of the run −9.2e-6 Ha/ps. The
+switch in now happens at the region's edge (6.05 Bohr), not at r_cut: the step at 6.034 is still stray but nearer
+than every pass, so it falls back on rule 5a and queues a check (the auditor made 13 solves: 8 for the four checks
+before the run, 5 during it — not broken down here). Every teacher solve was clean (no "box too small").
+
+**Parked by ruling 13 (documented, not fixed):**
+- *Minor 3 — a thermal run may not clear on its own.* Before the region opens, a geometry within the radius of a pass
+  neither counts nor is covered. The radius above is 0.05–0.09 Bohr of H–H; an H₂ at 300 K changes its bond by about
+  0.05 Bohr rms (k = μω² ≈ 0.37 Ha/Bohr², kT = 0.95 mHa), so it may never visit three mutually distinct bonds, and
+  "H₂ + a drifting H runs on the model" (spec §1) may stay on DFT until a wider move. Both GPU tests clear with
+  synthetic bonds (1.434 / 1.15 / 1.75). Not measured with a thermal run.
+- *Minor 4 — the NVE test exercises two switch kinds only*: the r_cut crossing and now the place edge (stray distance).
+  A bonded geometry leaving coverage (a vibrating H₂) and an audit of a cleared answer are not in it; later.
+- *Minor 6 — a reach change has nothing enforcing the re-mask* (`mask_stray_atoms`' doc): for the long-reach branch.
+- *Scoped re-review I1 (ruling 14) — the place is blind to direction*: `reach` and `face` are single numbers. Induction −αμ²(1 + 3cos²θ)/2r⁶ is 4× larger on the dipole axis than beside it; H₂O + Mg (literature α, μ; not a teacher measurement): a pass beside the axis at 6.05 Bohr (−0.39 mHa) admits an answer on it (−1.54 mHa, 0.51 mHa per bonded atom, inside the 3 mHa audit tier). A corner d from three faces can carry ~3× a one-face pass's ε_pos (≤ ~0.7 mHa for H at d ≥ 5). Queued fix: per pass, the vector of stray-to-bonded-atom distances; cover only when one pass is dominated.
+- *Scoped re-review minor 1 — a box-affected bonded part marks the signature with the stray atom's face distance*: conservative (DFT answers), may block re-checks of that signature for the session. Queued fix: skip the check when the fallback answer is not clean; mark only on a stray atom's own boxed solve.
+- *Scoped re-review minor 2 — `clear_regions` leaves released samples in the fit* (doc'd at `clear_regions`).
+
+## Trust tightening (2026-11-19; spec `2026-11-18-trust-tightening-design.md` rev. 2, plan `2026-11-19-trust-tightening.md` Task 9; release, RX 7900 XTX, each GPU binary alone, BelowNormal)
+
+The evidence floor (12 fits and 60 comparisons before the calibrated verdict alone opens a key; below it the key's leave-one-out must pass too), the tail-aware inflations λ_T (forces, bound units) and λ_E (energy, tier units) on rules 6/7, and σ-blind calibration ticks every 25 in-envelope steps. Derivations: `providers::surrogate::calibrate` ("The evidence floor", "The tail-aware inflations") and `providers::surrogate` ("Calibration ticks").
+
+### The gate: `the_stuck_escape_repro_is_answered_honestly`, every constant unchanged
+
+`REPRO_FORCE_RATIO` 3, tier 1e-3, `REPRO_MIN_JUDGED_HOT` 10, `REPRO_BOOKING_RESIDUAL` 1e-9. Run alone 2026-11-20 14:05 at 7498cf96: **pass, 771 s**.
+
+| | 07939ac (pass) | 762159b (fail) | **trust-tighten 7498cf96** |
+|---|---|---|---|
+| test wall | 1036 s | 1378 s | **771 s** (teacher 2396 solves, GPU 646 s) |
+| NVE after the edit | 1 answer, 999 fallbacks | 51 answers (3 judged, worst 8.5e-4 Ha/atom, 2.47×) | 77 answers, 1 judged (4.84e-5, 0.34×), 19 box-affected; 920 teacher-surface + 3 model-surface fallbacks |
+| many-body at the end of NVE | untrusted (κ 5.85, 3 evidence) | **trusted** (κ 3.25, 3 evidence) | untrusted: calibrated 0.951 > 0.707, n_fit 3 / 12, n_pts 8 / 60 |
+| hot heating | 0 fallbacks / 1600 | 1600 / 1600 | 64 / 1600 |
+| hot after the edit | 219 answers, 116 judged, worst 5.23e-4, 1.91×, 0 beyond | 657 answers, 248 judged, worst **2.38e-3, 4.48×, 12 beyond** | **260 answers, 61 judged, worst 9.72e-4 Ha/atom, 1.82×, 0 beyond**; 199 box-affected (worst 2.00e-3) |
+| many-body at the end of the hot run | trusted | trusted | trusted once the floor was met: n_fit 14, n_pts 76 |
+
+- **Per key (the run's own printout).** Pair H{H}: trusted throughout, n_fit 62 → 124, n_pts 302 → 316, λ_sum 10.2 / 5.5 / 3.2 / 4.5 (after NVE heating / NVE end / hot heating / hot end). Many-body H{H}: λ_sum 22.6 while untrusted, 14.7 at the end. **λ_T = λ_E = 1.000 for every key throughout; 0 code-24 refusals**: here the floor, not the tail factors, decides.
+- **Judged z (hot, 61 answers), max_j ‖ΔF_j‖/σ_epi,j:** raw median 17.8, p90 29.6, max 38.4; inflated by the key's λ_F = max(λ_sum, λ_T): median 0.86, p90 1.93, max 2.49, rms 1.21. On √(σ_epi² + 3σ_f²): worst 7.45.
+- **Ticks (the harness has no auditor: all in the step, dead time D = 0, no skips):** NVE heating 54 due, all answered and recorded; NVE after the edit 3 due, all box-affected (unrecorded); hot heating 66 / 66; hot after the edit 15 due (10 at answers), 4 recorded, 11 unrecorded (box-affected).
+- **The fallback-energy check's population (moved, the controller's ruling at Task 9).** In-step ticks at box-affected answers keep the model's energy by the provider's box rule (the gap is the box's Dirichlet confinement). The first run therefore failed on five such steps (NVE 779, 804, 870; hot 314, 389; 1.42–8.86e-3 Ha/atom at face densities 2.1e-5–6.2e-4). The check now excludes in-step audit/tick steps whose structured verdict is `BoxAffected`, as the answer check already excludes box-affected answers. Excluded: NVE 3, hot 9 (face densities 2.02e-5–6.20e-4). The remaining model-surface fallbacks: worst |gap|/N 9.86e-4 (hot).
+- **Step 3b (Task 7 review I1/R1).** Hot run after the edit: population answered share 0.729 (274 / 376), due-tick share 0.667 (10 / 15) — within one binomial σ (0.115): no σ-coupling of which steps become ticks. Take rates 1.0 at answered and refused steps (no auditor, no skips); the skip path needs the app.
+- **Calibration ticks and model MD (the controller's ruling at Task 9).** With no background teacher a tick is a teacher step inside the model's MD every 25 in-envelope steps (teacher forces, model energy), so energy is not conserved there. **Measured in the harness** (GPU teacher, 49³ × 0.25, tol 1e-6, no auditor): `surrogate_nve_is_tight` with ticks on gave drift +3.1e-7 Ha/ps (model-only −2.6e-11, bound 1e-8; plain DFT MD −4.0e-6, so still ≈ 13× better than the teacher's own MD), swing ratio 1.11 (bound 1 ± 0.1) and rewind 9.5e-6 Bohr (bound 1e-12), at 59 steps/s; the frequencies still held (H₂ +3.4e-6, H₃⁺ −2.8e-4 / −2.7e-4). The app's CPU-teacher Estimated path (81³) is not measured; rule-8 in-step audits (every 2000 answered steps) already put teacher steps into model MD there. The three model-MD measurements (`surrogate_reproduces_the_h2_frequency`, `h3plus_tier`, `surrogate_nve_is_tight`) run with ticks off (`SurrogateKs::with_tick_every(0)`, a test hook). In the app, while the background auditor lives, ticks are asynchronous and never put a teacher step into the trajectory; if its thread dies they fall back to in-step, as rule 8 does (physics review M2).
+- **M4 (the ring lifts a parked lock first).** A parked key locked by λ_T = ∞ at the real cadence, with the worker's refit flow: the bad tick left the 4096-point ring at step 4096 with 163 newer P_A points (the window needs 300, ≈ 7500 steps); the next refit gave λ_T = 1.04 and the step after was answered (a CPU measurement, not kept as a test).
+
+### Task 0 re-run (the go/no-go report on a fresh copy of the user's collection)
+
+**A pre-Fermi–Dirac measurement of record** (the smearing branch's final review, M9): the collection below was taught before the Fermi–Dirac switch, so under the FD build it is a predecessor folder (v1 records, legacy tags), and the user has since dropped it. The report stays `#[ignore]`d and is not expected to run as written against it; its numbers are the record of that collection under the trust-tightening rules.
+
+`trust_tightening_go_no_go_report` on a scratchpad copy (no `.lock`) of `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5`, 1657 samples, 434 history points, attach + refit 54.1 s, 0 teacher calls; the original's SHA-256, sizes and mtimes identical before and after. 6 keys, 2 trusted at load; the 2 that lose trust are Task 0's: **pair H{H} (Floor, LOO force max 1.017×, evidence 38, n_fit 0)** and **many-body H{H,O} (Floor, 2.506×, evidence 3)**. Saved points carry no fit id, so n_fit = 0 for every key until new refits.
+
+### `trust_baseline_report`, before and after (audit every 50; 2026-11-20 20:08, alone, 800 s)
+
+Before: the open-shell gate's run (2026-11-14, above) for the missed large errors; the M8a fix-round-1 table for the per-class audit z. After: this branch at 75a87c0d + the gate ruling.
+
+| scenario | class | audits beyond 1× the bound or the tier while trusted (missed large errors), before → after | audit z = ‖ΔF‖/pred_force_std per point, rms (max), before → after |
+|---|---|---|---|
+| stuck-escape repro NVE + hot | pair | 0 / 64 → **0 / 122** | 1.4 → **0.65** (4.26) |
+| | many-body | 1 / 12 → **0 / 5** | — (2 audits) → **2.98** (4.69) |
+| active learning | pair | 0 / 5 → **0 / 10** | 3.49 (Task 1) → **2.72** (5.09) |
+
+Beyond the in-domain LOO p99 (the generalisation-gap statistic, which stays reported), after: repro pair audits 0 / 122 points, many-body 0 / 5, active-learning pair 2 / 10 (20 %); fallback points while trusted, pair 11 / 12, many-body 57 / 93 (these were refused, not answered).
+
+- The test's own checker on the hot run: before 513 answers, 269 judged, worst 5.15× the force bound, 21 beyond 3× or the tier; **after 132 answers, 53 judged, worst 6.78e-4 Ha/atom and 2.46×, 0 beyond** (3 of 53 beyond 1×). Every gated assertion held under these audits (no notes).
+- Many-body at the end of the hot run: trusted at n_fit 16, n_pts 63, evidence 10, with **λ_T 17.4 and λ_E 40.5** (λ_sum 25.9) — the tail factors bite here, unlike the gated run; 3 steps were labelled code 24 by their activity events and the history recorded none of them — probably box-affected answers, whose points `record_history_point` does not keep (physics review N3; not traced further). Its fallback points while trusted: 61 of 93 beyond 1× the bound or the tier — refused, not answered.
+- Class flips: pair 5 (3 entries, 2 losses; the losses by `LooFloor` at LOO rms 1.21 and 1.30), many-body 5 (3 + 2; one loss by `Floor` at LOO max 1.14 below the floor).
+- The fallback-energy exclusion (the gate ruling) covered 15 steps in this run, rule-8 in-step audits as well as ticks (face densities from 3.2e-5).
 
 ## Three-atom coverage map build cost (2026-11-17)
 

@@ -349,7 +349,7 @@ impl SurrogateKs {
                 let s = &store.samples[i];
                 let in_sample = match model.predict(&s.pos, &s.z, false) {
                     Ok(p) => {
-                        let n = s.pos.len().max(1) as f64;
+                        let n = self.audit_n(&s.pos) as f64;
                         let e = (p.energy - s.energy).abs() / n / self.policy.energy_std_per_atom;
                         p.forces.iter().zip(&s.forces).fold(e, |m, (fm, fs)| {
                             let (d, b) = self.policy.force_residual(fm, fs);
@@ -803,7 +803,7 @@ impl SurrogateKs {
             return;
         };
         let rule = box_affected_face_density(self.store.as_ref().map_or(0.25, |s| s.provenance.h));
-        let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
+        let ionic = self.store.as_ref().map_or_else(crate::pseudo::all_electron_tag, |s| s.provenance.ionic.clone());
         let has_store = self.store.is_some();
         let (mut judged, mut passed, mut deferred, mut worst) = (0usize, 0usize, 0usize, 0.0f64);
         let mut failed: Vec<FailedAudit> = Vec::new();
@@ -832,7 +832,7 @@ impl SurrogateKs {
             let mut sink = Vec::new();
             // outside strict mode's domain (Minor): held out like a draft guess, judged once strict
             // mode reaches it (`judge_held_out`)
-            if self.geometry_refusal(&pos, &z).is_some() {
+            if self.geometry_refusal(&pos, &z, prov).is_some() {
                 if self.keep_sample(&pos, &z, h.energy, &h.forces, h.face, h.multiplicity, prov, SampleTag::DraftAudit, &mut sink) {
                     deferred += 1;
                     *deferred_near.entry(h.blocker).or_insert(0) += 1;
@@ -845,7 +845,8 @@ impl SurrogateKs {
             } else {
                 match model.predict(&pos, &z, false) {
                     Ok(p) => {
-                        let n = pos.len().max(1) as f64;
+                        // per bonded atom at a scene with stray atoms (`stray` module doc, "Audits of a cleared answer")
+                        let n = self.audit_n(&pos) as f64;
                         let e = (e_c - p.energy).abs() / n / self.policy.energy_std_per_atom;
                         let f = worst_force_residual(&self.policy, &p.forces, &h.forces, audit_force_floor(&ionic)).map_or(0.0, |(d, b)| d / b);
                         Some(e.max(f))
@@ -1020,7 +1021,7 @@ impl SurrogateKs {
                 let pos: Vec<[f64; 3]> = h.scene.nuclei.iter().map(|n| n.pos).collect();
                 let z: Vec<u8> = h.scene.nuclei.iter().map(|n| n.z).collect();
                 let prov = &self.scene_provenance(&h.scene);
-                let outside = self.geometry_refusal(&pos, &z).is_some();
+                let outside = self.geometry_refusal(&pos, &z, prov).is_some();
                 let tag = if outside { SampleTag::DraftAudit } else { SampleTag::Targeted };
                 let mut sink = Vec::new();
                 if self.keep_sample(&pos, &z, h.energy, &h.forces, h.face, h.multiplicity, prov, tag, &mut sink) {
@@ -1054,9 +1055,9 @@ impl SurrogateKs {
     /// two ratios, `None` when the model cannot predict there.
     pub(super) fn check_ratios(&self, pos: &[[f64; 3]], z: &[u8], energy: f64, forces: &[[f64; 3]]) -> Option<(f64, f64)> {
         let model = self.model.as_ref()?;
-        let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
+        let ionic = self.store.as_ref().map_or_else(crate::pseudo::all_electron_tag, |s| s.provenance.ionic.clone());
         let p = model.predict(pos, z, false).ok()?;
-        let n = pos.len().max(1) as f64;
+        let n = self.audit_n(pos) as f64;
         let e = (energy - p.energy).abs() / n / self.policy.energy_std_per_atom;
         let f = worst_force_residual(&self.policy, &p.forces, forces, audit_force_floor(&ionic)).map_or(0.0, |(d, b)| d / b);
         Some((e, f))
@@ -1084,7 +1085,7 @@ impl SurrogateKs {
     pub(super) fn judge_shell_checks_with(&mut self, shells: Vec<crate::sampling::ShellCheck>, caveat: Option<&str>) {
         let tail = caveat.map_or(String::new(), |c| format!(" ({c}: possibly the fit's error, not the cutoff's — the next pass's shell check measures it again)"));
         let rule = box_affected_face_density(self.store.as_ref().map_or(0.25, |s| s.provenance.h));
-        let ionic = self.store.as_ref().map_or("none".to_string(), |s| s.provenance.ionic.clone());
+        let ionic = self.store.as_ref().map_or_else(crate::pseudo::all_electron_tag, |s| s.provenance.ionic.clone());
         for c in shells {
             let name = format!("{}–{}", units::elements::symbol(c.pair.0), units::elements::symbol(c.pair.1));
             if c.unfit || c.face.is_some_and(|f| f > rule) {

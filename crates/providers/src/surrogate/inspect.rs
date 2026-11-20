@@ -72,6 +72,8 @@ fn state_name(code: Option<u8>, below_prefix: bool) -> &'static str {
         Some(Q_BOX) => "box-excluded",
         Some(Q_DRAFT) => "held out (draft guess)",
         Some(Q_LONE) => "held out (lone atoms)",
+        Some(Q_STRAY) => "held out (stray atoms, until measured)",
+        Some(Q_RESOLVED) => "re-solved for the new solver, awaiting review",
         _ if !below_prefix => "unfitted",
         _ => "fitted",
     }
@@ -129,7 +131,10 @@ impl SurrogateKs {
         if let Some(r) = non_finite_answer(&pred) {
             return Some(r);
         }
-        if let (_, Some(r)) = self.envelope_outside(model, pos, z) {
+        // a cleared stray-atom scene, judged as `evaluate` judges it (spec §4.4)
+        let cleared = self.stray_cleared(pos, z, prov);
+        let part = cleared.as_ref().map(|c| &c.0);
+        if let (_, Some(r)) = self.envelope_outside_except(model, pos, z, part.map_or(&[][..], |s| &s.stray), None) {
             return Some(r);
         }
         let posterior = match (pred.energy_std, pred.force_std_epistemic.as_ref()) {
@@ -137,7 +142,7 @@ impl SurrogateKs {
             _ => None,
         };
         if posterior.is_some() {
-            if let Some((nu, at)) = self.novelty(pos, z).filter(|(nu, _)| *nu > 1.0) {
+            if let Some((nu, at)) = self.novelty_judged(pos, z, part).filter(|(nu, _)| *nu > 1.0) {
                 return Some(novelty_refusal(nu, at));
             }
         }
@@ -151,14 +156,14 @@ impl SurrogateKs {
                 return v.reason;
             }
         }
-        let near = self.near_quarantined_cached(pos, z);
+        let near = self.near_quarantined_judged(pos, z, part);
         if !near.is_empty() {
             return Some(Refusal::new(self.fence_refusal_text(&near), TeachRule::NearQuarantine, None));
         }
-        if let Some(r) = self.near_misfit_refusal(pos, z) {
+        if let Some(r) = self.near_misfit_refusal(pos, z, part) {
             return Some(r);
         }
-        self.audit_fence_refusal(pos, z)
+        self.audit_fence_refusal_judged(pos, z, part)
     }
 
     /// Whether the strict policy answers at `scene`'s geometry (module doc, "Readiness"); `None`
@@ -293,12 +298,15 @@ impl SurrogateKs {
                 return o;
             }
         };
-        let n = pos.len().max(1) as f64;
+        // per energy-row atom (`audit_n`, ruling 9a): n without a stray atom, the bonded atoms with some
+        let n_e = self.audit_n(&pos);
+        let n = n_e as f64;
+        let per = if n_e == pos.len().max(1) { "/atom" } else { " per bonded atom" };
         let e_ref: f64 = z.iter().map(|zi| self.refs.get(zi).copied().unwrap_or(f64::NAN)).sum();
         let fmax = pred.forces.iter().map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt()).fold(0.0f64, f64::max);
         let _ = writeln!(
             o,
-            "    model: E {:.6} Ha (E − Σ E_ref = {:+.5} Ha, {:+.5}/atom), max |F| {fmax:.4} Ha/Bohr, energy std {:?}",
+            "    model: E {:.6} Ha (E − Σ E_ref = {:+.5} Ha, {:+.5}{per}), max |F| {fmax:.4} Ha/Bohr, energy std {:?}",
             pred.energy,
             pred.energy - e_ref,
             (pred.energy - e_ref) / n,
@@ -444,7 +452,7 @@ impl SurrogateKs {
             // the sample's largest atom class over its fitted atoms (a readout; the rule classes
             // each atom: `class_loo`)
             let Some(c) = neighbour_counts(&s.pos, rc2).into_iter().enumerate().filter(|(j, _)| s.trains_atom(*j)).filter_map(|(_, c)| atom_class(c)).max() else { continue };
-            let n = s.pos.len().max(1) as f64;
+            let n = self.audit_n(&s.pos) as f64;
             match surrogate::loo::leave_one_out(model, s) {
                 None => loo.push((i, c, f64::INFINITY, f64::INFINITY)),
                 Some(l) => {
@@ -502,7 +510,12 @@ impl SurrogateKs {
         }
         let mut by_comp: BTreeMap<String, Comp> = BTreeMap::new();
         for (i, s) in samples.iter().enumerate() {
-            let st = state_name(self.quarantine.get(i).copied(), i < self.accumulated);
+            let st = match self.quarantine.get(i).copied() {
+                // a re-solved sample (spec §7.6): which of its three states (Task 15 review M8)
+                Some(Q_RESOLVED) if self.fences(i) => "re-solved for the new solver, kept by its review (fences)",
+                Some(Q_RESOLVED) if self.resolved_stray(i) => "re-solved for the new solver, not reviewed (stray atoms)",
+                code => state_name(code, i < self.accumulated),
+            };
             *by_tag.entry(format!("{:?}", s.tag)).or_default().entry(st).or_default() += 1;
             let c = by_comp.entry(composition(&s.z)).or_default();
             *c.states.entry(st).or_default() += 1;
@@ -516,7 +529,8 @@ impl SurrogateKs {
                 c.boxed += 1;
             }
             if let Ok(pr) = model.predict(&s.pos, &s.z, false) {
-                let n = s.pos.len().max(1) as f64;
+                // per energy-row atom, as the fit's row (`surrogate::energy_row_atoms`, ruling 9a)
+                let n = surrogate::energy_row_atoms(&model.basis, &s.pos).max(1) as f64;
                 c.e_max = super::trust::max_nan(c.e_max, (pr.energy - s.energy).abs() / n);
                 for (fm, fs) in pr.forces.iter().zip(&s.forces) {
                     let (d, bd) = p.force_residual(fm, fs);

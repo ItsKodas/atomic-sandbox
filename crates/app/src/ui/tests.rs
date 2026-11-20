@@ -192,7 +192,7 @@ pub(crate) fn model() -> ModelStatus {
         pending: 0,
         box_affected: 0,
         trust_floor: Some(70),
-        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0, 0, 0, 0, 0)),
+        fit_vs_held: Some(crate::sim::fit_vs_held(271, 273, 0, 2, 0, 0, 0, 0, 0, 0, 0)),
         audits_background: true,
         audit_in_flight: true,
         last_audit: Some(sim::AuditRecord {
@@ -204,7 +204,7 @@ pub(crate) fn model() -> ModelStatus {
             teacher_ms: 274.0,
         }),
         stuck: None,
-        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_rms: 0.05, energy_max: 0.152, trusted: true, refusal: None, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: Some(1), inflation: 1.0, species: Vec::new() }],
+        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_rms: 0.05, energy_max: 0.152, trusted: true, refusal: None, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: Some(1), inflation: 1.0, fits: 0, floor_points: 0, species: Vec::new() }],
         last_audit_this_fit: true,
         audits_box_unjudged: 0,
         solves: sim::SolveCounts::default(),
@@ -219,6 +219,9 @@ pub(crate) fn model() -> ModelStatus {
         retry_fit: false,
         source: sim::ModelSource::None,
         lone_note: None,
+        stray: Vec::new(),
+        stray_held_out: 0,
+        ticks: Default::default(),
         collections: false,
         last_import: None,
         purge_refusal: None,
@@ -231,6 +234,7 @@ pub(crate) fn model() -> ModelStatus {
         source_is_autosave: false,
         specialised: Vec::new(),
         model_species: Vec::new(),
+        migration: None,
     }
 }
 
@@ -485,12 +489,13 @@ fn a_model_at_other_settings_opens_the_card_and_apply_sends_the_edits_then_the_l
     let mut st = UiState::new("h2", &scene);
     (st.gpu_available, st.backend) = (true, Backend::Estimated);
     // matching: straight to the driver (the recorded D isotope does not matter)
-    let same = header_only_model("same.model", 49, 0.25, 0.25, 1e-6, 0, "null", "Kohn-Sham (GPU)", "none");
+    // the all-electron tag of this build (plan 2026-11-13 Task 9: `none/fd5e-3/pin1e-5`; a legacy "none" is plan Task 16's)
+    let same = header_only_model("same.model", 49, 0.25, 0.25, 1e-6, 0, "null", "Kohn-Sham (GPU)", "none/fd5e-3/pin1e-5");
     st.model_file = Some(same.clone());
     assert!(matches!(one_dyn(&act(&mut st, &inp, Action::LoadModel)), DynCommand::LoadModel(p) if *p == same));
     assert!(st.model_offer.is_none());
     // another grid, σ, charge and multiplicity: a card, nothing sent
-    let other = header_only_model("other.model", 81, 0.15, 0.2, 1e-6, 1, "2", "Kohn-Sham (GPU)", "none");
+    let other = header_only_model("other.model", 81, 0.15, 0.2, 1e-6, 1, "2", "Kohn-Sham (GPU)", "none/fd5e-3/pin1e-5");
     st.model_file = Some(other.clone());
     let out = act(&mut st, &inp, Action::LoadModel);
     assert!(out.commands.is_empty() && out.error.is_none(), "{:?}", out.commands);
@@ -543,7 +548,8 @@ fn settings_that_cannot_be_applied_disable_apply() {
     let inp = input(&scene, None, &cam);
     let mut st = UiState::new("h2", &scene);
     (st.gpu_available, st.backend) = (true, Backend::Estimated);
-    let p = header_only_model("blocked.model", 81, 0.15, 0.15, 1e-5, 0, "null", "Kohn-Sham (CPU)", "cores/0123456789abcdef/shared0/0/stop2x0");
+    // another recipe's Fermi–Dirac tag (a pre-Fermi–Dirac one is refused outright: `apply_settings_refuses_a_legacy_model_before_applying_anything`)
+    let p = header_only_model("blocked.model", 81, 0.15, 0.15, 1e-5, 0, "null", "Kohn-Sham (CPU)", "cores/0123456789abcdef/fd5e-3/stop2x5e-8/pin1e-5");
     st.model_file = Some(p);
     assert!(act(&mut st, &inp, Action::LoadModel).commands.is_empty());
     let o = st.model_offer.clone().unwrap();
@@ -560,7 +566,7 @@ fn settings_that_cannot_be_applied_disable_apply() {
     let out = frame(&ctx, &mut st, &inp, 1400.0, vec![]);
     assert!(out.commands.is_empty());
     // while a pass runs, Apply is refused even for an applicable offer
-    let p = header_only_model("pass.model", 81, 0.15, 0.15, 1e-6, 0, "null", "Kohn-Sham (GPU)", "none");
+    let p = header_only_model("pass.model", 81, 0.15, 0.15, 1e-6, 0, "null", "Kohn-Sham (GPU)", "none/fd5e-3/pin1e-5");
     st.model_file = Some(p);
     act(&mut st, &inp, Action::LoadModel);
     let mut snap = snapshot(&scene, Backend::Estimated, Some(model()));
@@ -569,6 +575,51 @@ fn settings_that_cannot_be_applied_disable_apply() {
     let out = act(&mut st, &busy, Action::ApplyModelSettings);
     assert!(out.commands.is_empty() && out.error.as_deref().is_some_and(|e| e.contains("sampling pass")), "{:?} {:?}", out.commands, out.error);
     assert!(st.model_offer.is_some());
+}
+
+/// Spec §7.9 (Task 16 review I2): a model taught before the Fermi–Dirac switch that also differs in another setting
+/// gets the card, but Apply-and-load refuses with the legacy reason before applying anything — no grid change, no
+/// policy change, no load — and the card stays; Apply the settings only still sets the scene to them (to re-teach the
+/// model there) without loading it. A model whose only difference is the occupation rule gets no card: the load goes
+/// to the driver, which refuses it with the same reason.
+#[test]
+fn apply_settings_refuses_a_legacy_model_before_applying_anything() {
+    let scene = Scene::preset("h2").unwrap(); // 49³ × 0.25, all-electron
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let mut st = UiState::new("h2", &scene);
+    (st.gpu_available, st.backend) = (true, Backend::Estimated);
+    let reason = providers::surrogate::legacy_model_refusal("none").unwrap();
+    // the occupation rule alone: no card, straight to the driver's refusal
+    let only = header_only_model("legacy-same.model", 49, 0.25, 0.25, 1e-6, 0, "null", "Kohn-Sham (GPU)", "none");
+    st.model_file = Some(only.clone());
+    assert!(matches!(one_dyn(&act(&mut st, &inp, Action::LoadModel)), DynCommand::LoadModel(p) if *p == only));
+    assert!(st.model_offer.is_none());
+    // and another grid: the card, which carries the reason
+    let legacy = header_only_model("legacy-grid.model", 81, 0.15, 0.15, 1e-6, 0, "null", "Kohn-Sham (GPU)", "none");
+    st.model_file = Some(legacy.clone());
+    assert!(act(&mut st, &inp, Action::LoadModel).commands.is_empty());
+    let o = st.model_offer.clone().expect("the card");
+    assert_eq!(o.refusal.as_deref(), Some(reason.as_str()));
+    assert!(o.rows.iter().all(|r| r.name != "ionic potential"), "the occupation rule is never a row: {:?}", o.rows);
+    let out = act(&mut st, &inp, Action::ApplyModelSettings);
+    assert!(out.commands.is_empty(), "nothing applied, nothing loaded: {:?}", out.commands);
+    assert!(out.error.as_deref().is_some_and(|e| e.starts_with("the model cannot be loaded") && e.contains(&reason)), "{:?}", out.error);
+    assert_eq!((st.grid_n, st.grid_h), (scene.grid_n, scene.grid_h), "the panel's grid untouched");
+    assert!(st.model_offer.is_some(), "the card stays up to read");
+    // the card draws its reason and its settings-only button
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let all = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    let t = texts_in(&ctx, &mut st, &inp, 1400.0, all);
+    assert!(t.contains("this model cannot be loaded here") && t.contains(super::overlays::OFFER_SETTINGS_ONLY), "{t}");
+    let outs = click_widget(&ctx, &mut st, &inp, "model-offer-settings-only");
+    assert!(matches!(actions(&outs).as_slice(), [Action::ApplyModelSettingsOnly(p)] if *p == legacy), "{:?}", actions(&outs));
+    // the settings only: the grid sent, no load
+    let out = act(&mut st, &inp, Action::ApplyModelSettingsOnly(legacy.clone()));
+    assert!(out.commands.iter().any(|c| matches!(c, Command::SetGrid { n: 81, .. })), "{:?}", out.commands);
+    assert!(!out.commands.iter().any(|c| matches!(c, Command::Dyn(DynCommand::LoadModel(_)))), "{:?}", out.commands);
 }
 
 /// Dock ▸ Model and File ▸ Estimated model: Forget needs two clicks; a long pass needs two
@@ -1438,7 +1489,7 @@ fn the_worst_fitting_samples_forget_and_restore_one() {
     assert_eq!(crate::replay::unreplayable_kind(&Action::ForgetSample(id)), Some("forget-sample"));
     assert_eq!(crate::replay::unreplayable_kind(&Action::RestoreSample(id)), Some("restore-sample"));
     // the forgotten count beside the held one
-    assert_eq!(crate::sim::fit_vs_held(270, 273, 0, 2, 0, 1, 0, 0, 0, 0), "270 of 273 held: 2 quarantined, 1 forgotten");
+    assert_eq!(crate::sim::fit_vs_held(270, 273, 0, 2, 0, 1, 0, 0, 0, 0, 0), "270 of 273 held: 2 quarantined, 1 forgotten");
     // no ranking yet (a model, no list), and no model: the section says why
     for (m, why) in [
         (ModelStatus { suspects: Vec::new(), forgotten_samples: Vec::new(), ..model() }, super::dock::model::SUSPECTS_NO_RANKING),
@@ -2771,14 +2822,14 @@ fn relax_progress(converged: Option<bool>) -> sim::RelaxProgress {
 #[test]
 fn the_relax_readout_shows_progress_the_drop_and_the_verification() {
     let r = relax_progress(None);
-    assert_eq!(relax_lines(&r), vec!["relaxing: step 42 · max|F| 3.1e-3 Ha/Bohr (stop < 1e-3) · ΔE -2.10e-3 Ha · Δt 0.60 fs"]);
+    assert_eq!(relax_lines(&r), vec!["relaxing: step 42 · max|F| 3.1e-3 Ha/Bohr (stop < 1e-3) · ΔF -2.10e-3 Ha · Δt 0.60 fs"]);
     let mut done = relax_progress(Some(true));
     done.max_force = 8.2e-4;
     done.max_force_augmented = 8.2e-4;
     done.verified_max_force = Some(6.1e-4);
     assert_eq!(
         relax_lines(&done),
-        vec!["relaxed in 42 steps: max|F| 8.2e-4 Ha/Bohr (< 1e-3) · ΔE -2.10e-3 Ha", "verified by one teacher solve: DFT max|F| 6.1e-4 Ha/Bohr"]
+        vec!["relaxed in 42 steps: max|F| 8.2e-4 Ha/Bohr (< 1e-3) · ΔF -2.10e-3 Ha", "verified by one teacher solve: DFT max|F| 6.1e-4 Ha/Bohr"]
     );
     let mut held = relax_progress(Some(false));
     held.max_force_augmented = 5e-4;
@@ -3066,12 +3117,15 @@ fn superscripts_are_drawn_raised() {
 /// before anything is sent (wgpu would otherwise panic on the allocation): 8 Ne in a 16 Bohr box at
 /// Custom 0.08 (201³, 80 electrons, ≈ 25.5 GB) on the GPU backend — and the refused value does not
 /// stay on the Custom slider. H₂O at Custom 0.08 on the estimated solver (177³ for its own 14 Bohr
-/// box, two GPU solvers — teacher and auditor — ≈ 9.9 GB) is under the 12 GB default and goes
-/// through — on the estimated solver's own box since 2026-11-14 (`ui::estimated_box`): H₂O's span
-/// 2.86 Bohr + 2 × (the provisional 5.98 Bohr cloud at h = 0.08 + 2 Bohr) = 18.8 Bohr asks for the
-/// largest grid (201³), over the budget, so it falls back to the largest grid the guard passes
-/// (189³ under the 12 GB default). (The action path reads `ATOMIC_SANDBOX_VRAM_GB`, unset here,
-/// and the card's memory when a viewer test reported it: the expected grid is the guard's own.)
+/// box, two GPU solvers — teacher and auditor — ≈ 12.10 GB with the counted witness vectors, plan
+/// 2026-11-13 Task 9c fix round 2) is over the 12 GB default (a card that reports no memory) and is
+/// refused there; on this card's 12.88 GB it goes through on the estimated solver's own box
+/// (`ui::estimated_box`, since 2026-11-14): H₂O's span 2.86 Bohr + 2 × (the provisional 5.98 Bohr
+/// cloud at h = 0.08 + 2 Bohr) = 18.8 Bohr asks for the largest grid (201³), over the budget, so it
+/// falls back to the largest grid the guard passes (179³; 189³ under the 12 GB default before plan
+/// Task 7 counted witness vectors). (The action path reads `ATOMIC_SANDBOX_VRAM_GB`, unset here, and
+/// the card's memory when a viewer test reported it: its refusal is asserted only when that budget
+/// is under the need.)
 #[test]
 fn a_change_over_the_vram_budget_is_refused() {
     use crate::quality::{gpu_solvers, vram_check, VramBudget, VRAM_BUDGET_GB};
@@ -3101,24 +3155,44 @@ fn a_change_over_the_vram_budget_is_refused() {
     assert_eq!(w8.grid_n, 177);
     let need = 2 * providers::gpu_footprint_bytes(&w8.to_sim().unwrap());
     eprintln!("H₂O at 0.08 (177³), estimated mode: ≈ {:.2} GB", need as f64 / 1e9);
-    assert!((9.5e9..10.3e9).contains(&(need as f64)), "{need}");
-    assert!(vram_check(&w8, gpu_solvers(Backend::Estimated, true), budget).is_ok());
-    let mut st = UiState::new("h2o", &w);
-    (st.backend, st.gpu_available) = (Backend::Estimated, true);
-    let out = act(&mut st, &input(&w, None, &cam), Action::Quality(0.08));
-    assert!(out.error.is_none(), "{:?}", out.error);
+    // re-pinned (plan 2026-11-13 Task 9c fix round 2, Decision 1): the guard counts the solver's start allocation, 3
+    // witness vectors per spin (`providers::ks::WITNESS_GROWTH_COUNTED`: the measured peak of 2 at this 14 Bohr box plus
+    // the buffer column), 12 fields each at 177³ in two solvers: 9.91 GB before any witness term + 2.19 GB = 12.10 GB
+    // (9.5–10.3 before plan Task 7 counted witnesses; 21.6 GB at Task 9b's count of 16)
+    assert!((12.0e9..12.2e9).contains(&(need as f64)), "{need}");
     let solvers = gpu_solvers(Backend::Estimated, true);
     let w8r = &w8;
     let fits = |b: VramBudget| move |n: usize| vram_check(&Scene { grid_n: n, ..w8r.clone() }, solvers, b).is_ok();
+    // over the 12 GB default (a card that reports no memory) the change is refused like the Ne one: no box from the
+    // base 177³ up passes, so the estimated box is the base's own and the guard refuses it, nothing changed
+    assert!(vram_check(&w8, solvers, budget).is_err());
     let default = crate::quality::estimated_box(&w8, 14.0, 0.08, &[], fits(budget));
-    assert_eq!((default.want_n, default.n, default.capped), (201, 189, true), "under the 12 GB default");
-    let n = crate::quality::estimated_box(&w8, 14.0, 0.08, &[], fits(crate::quality::vram_budget())).n;
-    assert!((177..201).contains(&n), "{n}");
-    assert!(
-        matches!(out.commands.as_slice(), [Command::SetGrid { n: g, h }, Command::Dyn(DynCommand::SetWalls(Some(_)))] if *h == 0.08 && *g == n),
-        "{:?}",
-        out.commands
-    );
+    assert_eq!((default.want_n, default.n, default.capped), (201, 177, true), "under the 12 GB default: the base box, refused");
+    let mut st = UiState::new("h2o", &w);
+    (st.backend, st.gpu_available) = (Backend::Estimated, true);
+    let before = (st.grid_n, st.quality_h);
+    let out = act(&mut st, &input(&w, None, &cam), Action::Quality(0.08));
+    if crate::quality::vram_budget().bytes < need {
+        assert!(out.commands.is_empty() && out.error.as_deref().is_some_and(|e| e.contains("GPU memory")), "{:?}", out.error);
+        assert_eq!((st.grid_n, st.quality_h), before, "nothing changed");
+    } else {
+        // a viewer test reported the card's memory first (test order): the change goes through on the estimated box the
+        // guard passes under that budget (task 9d review m7: the acceptance branch the test had before fix round 2)
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let n = crate::quality::estimated_box(&w8, 14.0, 0.08, &[], fits(crate::quality::vram_budget())).n;
+        assert!(
+            matches!(out.commands.as_slice(), [Command::SetGrid { n: g, h }, Command::Dyn(DynCommand::SetWalls(Some(_)))] if *h == 0.08 && *g == n),
+            "{:?}",
+            out.commands
+        );
+    }
+    // on this card's budget (half of the RX 7900 XTX's 25.76 GB) it goes through, on the estimated solver's own box: the
+    // largest grid the guard passes below the wanted 201³
+    let card = VramBudget::fixed(12_880_000_000);
+    assert!(vram_check(&w8, solvers, card).is_ok());
+    let on_card = crate::quality::estimated_box(&w8, 14.0, 0.08, &[], fits(card));
+    eprintln!("estimated box: 12 GB default {:?}, 12.88 GB card {:?}", default, on_card);
+    assert_eq!((on_card.want_n, on_card.n, on_card.capped), (201, 179, true), "under this card's 12.88 GB");
 }
 
 // ---- temperature units (user request 2026-10-14: K / °C / °F, display only) ----
@@ -3681,7 +3755,7 @@ mod orbital_viewer {
         let levels = Levels::of(&rows);
         assert!(levels.fractional && levels.gap().is_none(), "{levels:?}");
         let line = orbitals::levels_line(&levels).expect("a HOMO line");
-        assert!(line.starts_with("HOMO −0.280 Ha") && line.contains("partly filled shell: no HOMO–LUMO gap"), "{line}");
+        assert!(line.starts_with("HOMO −0.280 Ha") && line.contains("partly occupied levels: no HOMO–LUMO gap"), "{line}");
         assert!(!line.contains("Kohn–Sham gap"), "{line}");
         let v = RowView::of(&rows[3], &levels);
         assert_eq!(v.occupation, "0.33", "{v:?}");
@@ -3689,6 +3763,37 @@ mod orbital_viewer {
         // an integer-occupation list is unchanged
         let h2 = Levels::of(&h2_rows());
         assert!(!h2.fractional && h2.gap().is_some());
+    }
+
+    /// Plan 2026-11-13 Task 12 (spec §6.6): the rows show each level's Fermi–Dirac f — f = ⅓ shows its f (and its
+    /// "occ 1/3" badge's tip is the per-level wording, not the shared-shell rule's "shared equally" one); a level with
+    /// f < 1e-6 (a witness tail) shows as empty: not occupied, not the HOMO, and the LUMO when it is the lowest empty
+    /// level; one within 1e-6 of 1 shows as full.
+    #[test]
+    fn orbital_rows_per_level_f() {
+        let third = 1.0 / 3.0;
+        let rows = vec![
+            row(Spin::Up, 0, 1, 0, -0.87, 1.0 - 4e-7, idx(1)),
+            row(Spin::Down, 0, 2, 0, -0.83, 1.0, idx(1)),
+            row(Spin::Down, 1, 3, 1, -0.28, third, idx(2)),
+            row(Spin::Down, 2, 4, 2, 0.05, 9e-7, idx(3)),
+        ];
+        let levels = Levels::of(&rows);
+        assert_eq!(levels.homo, Some(-0.28), "the f-tail level is not the HOMO: {levels:?}");
+        assert_eq!(levels.lumo, Some(0.05), "{levels:?}");
+        let full = RowView::of(&rows[0], &levels);
+        assert_eq!((full.occupation.as_str(), full.occupied), ("1", true), "{full:?}");
+        let part = RowView::of(&rows[2], &levels);
+        assert_eq!((part.occupation.as_str(), part.occupied), ("0.33", true), "{part:?}");
+        assert_eq!(orbitals::fraction_text(orbitals::shown_f(&rows[2])), "1/3");
+        let empty = RowView::of(&rows[3], &levels);
+        assert_eq!((empty.occupation.as_str(), empty.occupied), ("0", false), "{empty:?}");
+        assert!(empty.tags.iter().any(|t| t.text == "LUMO") && !empty.tags.iter().any(|t| t.text.starts_with("HOMO")), "{empty:?}");
+        assert_eq!(orbitals::shown_f(&rows[3]), 0.0);
+        for tip in [orbitals::OCC_TIP, orbitals::OCC_PAIR_TIP] {
+            assert!(tip.contains("Fermi–Dirac f") && tip.contains("T_el") && tip.contains("f below 1e-6 shows as empty"), "{tip}");
+            assert!(!tip.contains("spherical-atom ensemble"), "the shared-shell wording is gone: {tip}");
+        }
     }
 
     /// ε = −0.5 Ha reads "−0.500" and "−13.61" (units::HARTREE_IN_EV); the tags the rows carry.
@@ -5783,7 +5888,7 @@ mod activity_words {
     fn the_box_clause_names_the_atom_at_the_edge() {
         use activity::words::{rule_sentence, RowCtx};
         use sim::activity::{TeachRule as R, TrustKey};
-        let cx = |box_affected, near_face, kept| RowCtx { box_affected, near_face, kept };
+        let cx = |box_affected, near_face, kept| RowCtx { box_affected, near_face, kept, tail: false };
         assert_eq!(
             rule_sentence(R::Spread, Some(0), cx(true, true, false)),
             "atom 0 is outside what the model has learned and is touching the box edge — move it inward"
@@ -5860,6 +5965,38 @@ mod activity_words {
         assert_eq!(rule_label(sim::activity::TeachRule::NearMisfit, None), "misfit");
         assert_eq!(rule_sentence(sim::activity::TeachRule::NearMisfit, Some(0), RowCtx::default()), "an atom here is next to a training sample the model cannot reproduce");
         assert_eq!(outcome_label(sim::activity::TeachOutcome::MisfitDisagrees), "not kept: misfit");
+    }
+
+    /// Stray atoms (spec 2026-11-18 §5): the composition checks' outcomes in the spec's words; a held sample's row says
+    /// it is held until measured, never "kept"; a check's row counts its parts' solves in its solve cell.
+    #[test]
+    fn stray_outcomes_have_their_words() {
+        use activity::words::{outcome_label, outcome_sentence};
+        use sim::activity::TeachOutcome as K;
+        assert_eq!(outcome_label(K::StrayChecking { n: 1, of: 3 }), "checking composition 1 of 3");
+        assert_eq!(outcome_label(K::StrayChecking { n: 2, of: 3 }), "checking composition 2 of 3");
+        assert_eq!(outcome_label(K::StrayCheckingNew), "checking composition (new geometry)");
+        assert_eq!(outcome_label(K::StrayRefused), "composition fails");
+        assert_eq!(outcome_label(K::StrayNotKept), "not kept: stray atoms");
+        assert_eq!(outcome_label(K::KeptStrayHeld), "held: stray atoms (until measured)");
+        assert!(!outcome_label(K::KeptStrayHeld).contains("kept") && outcome_sentence(K::KeptStrayHeld).starts_with("held until measured"));
+        for o in [K::StrayChecking { n: 3, of: 3 }, K::StrayCheckingNew, K::StrayRefused, K::StrayNotKept, K::KeptStrayHeld, K::StrayAuditAttributed { model: true }, K::StrayAuditAttributed { model: false }] {
+            assert!(!outcome_sentence(o).is_empty(), "{o:?}");
+        }
+        // rule 5a reads "5a stray atom" on the stray path (spec §5: "5a stray atom · composition fails"), "5a lone atom"
+        // for the isolated-atom refusal outside it
+        assert_eq!(activity::words::rule_label(sim::activity::TeachRule::IsolatedAtom, None), "5a lone atom");
+        for o in [K::StrayChecking { n: 1, of: 3 }, K::StrayCheckingNew, K::StrayRefused, K::StrayNotKept, K::KeptStrayHeld] {
+            let e = sim::TeachEvent::new(sim::activity::TeachOrigin::Fallback, sim::activity::TeachRule::IsolatedAtom, o);
+            assert_eq!(activity::log::rule_cell(&e), "5a stray atom", "{o:?}");
+        }
+        let lone = sim::TeachEvent::new(sim::activity::TeachOrigin::Fallback, sim::activity::TeachRule::IsolatedAtom, K::Kept);
+        assert_eq!(activity::log::rule_cell(&lone), "5a lone atom");
+        let mut e = sim::TeachEvent::new(sim::activity::TeachOrigin::Audit, sim::activity::TeachRule::IsolatedAtom, K::StrayChecking { n: 1, of: 3 });
+        e.solve_ms = 840.0;
+        assert_eq!(activity::log::solve_cell(&e), "840 ms");
+        e.solves = 2;
+        assert_eq!(activity::log::solve_cell(&e), "840 ms · 2 solves", "a check: the bonded part alone and the stray atom alone");
     }
 }
 
@@ -6028,7 +6165,7 @@ mod activity_headline {
         let pass = r.iter().find(|r| r.key == JobKey::Pass).unwrap();
         assert_eq!(pass.detail, "bond scan · sample 42 of 158 · iteration 37 / 200");
         let l = pass.scf.expect("the pass row carries the record");
-        assert_eq!(scf_lines(&l), ("Δρ 3.2e-5 → 1e-6 · ΔE −2.1e-4 Ha · 85 ms/iteration".to_string(), None));
+        assert_eq!(scf_lines(&l), ("Δρ 3.2e-5 → 1e-6 · ΔF_HF −2.1e-4 Ha · 85 ms/iteration".to_string(), None));
         // the stall countdown, from STALL_TAG_FROM on
         assert_eq!(scf_lines(&record(80, 1, STALL_TAG_FROM - 1)).1, None);
         assert_eq!(scf_lines(&record(80, 1, 31)).1.as_deref(), Some("no 2× gain for 31 / 50"));
@@ -6274,7 +6411,7 @@ mod activity_trust {
     fn the_class_line_words_the_failing_condition() {
         use activity::words::class_line;
         use sim::{ClassKey, ClassLoo};
-        let l = |class, refusal: Option<(ClassKey, f64, f64)>| ClassLoo { class, samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 300.0, energy_max: 1100.0, trusted: refusal.is_none(), refusal, calibration: 2.1, measured: Some(1.4), measured_energy: Some(0.2), worst_atom: Some(2.2), evidence: 12, trusted_since: None, inflation: 1.0, species: Vec::new() };
+        let l = |class, refusal: Option<(ClassKey, f64, f64)>| ClassLoo { class, samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 300.0, energy_max: 1100.0, trusted: refusal.is_none(), refusal, calibration: 2.1, measured: Some(1.4), measured_energy: Some(0.2), worst_atom: Some(2.2), evidence: 12, trusted_since: None, inflation: 1.0, fits: 12, floor_points: 60, species: Vec::new() };
         assert_eq!(class_line(&l("pair", None)), "Two-atom arrangements — learned");
         assert_eq!(class_line(&l("pair", Some((ClassKey::Energy, 1100.0, 1.0)))), "Two-atom arrangements — not yet (leave-one-out energy error 1100.0× the tier)");
         assert_eq!(class_line(&l("pair", Some((ClassKey::Force, 2.69, 1.0)))), "Two-atom arrangements — not yet (leave-one-out force error 2.7× the bound)");
@@ -6286,11 +6423,29 @@ mod activity_trust {
         assert_eq!(class_line(&l("pair", Some((ClassKey::MeasuredEnergy, 0.9, std::f64::consts::FRAC_1_SQRT_2)))), "Two-atom arrangements — not yet (DFT checks measured its energy error at 0.90× the tier over 12 DFT checks, limit 0.71×)");
         // open-shell model (the energy half of C1): the energy RMS with the misfits counted
         assert_eq!(class_line(&l("pair", Some((ClassKey::EnergyRms, 1.3, 1.0)))), "Two-atom arrangements — not yet (leave-one-out energy error 1.3× the tier on average, training samples the model cannot reproduce included)");
-        // the worst-atom guard: on entry with evidence, and both ways with fewer than three checks
+        // the worst-atom guard: on entry at the evidence floor, and both ways below it (trust
+        // tightening Task 4; the app's words follow it in Task 8, the Task 4 review's minor 4)
         assert_eq!(class_line(&l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0)))), "Two-atom arrangements — not yet (a recent DFT check found an atom's force 4.2× its bound; it starts answering only without one beyond 3×)");
-        assert_eq!(class_line(&ClassLoo { evidence: 2, ..l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0))) }), "Two-atom arrangements — not yet (a DFT check found an atom's force 4.2× its bound, with fewer than 3 checks to judge the class by)");
+        assert_eq!(
+            class_line(&ClassLoo { fits: 11, floor_points: 81, ..l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0))) }),
+            "Two-atom arrangements — not yet (a DFT check found an atom's force 4.2× its bound, limit 3× while it has too few independent DFT checks: 11 of 12 fits / 81 checks (60 needed))"
+        );
+        assert_eq!(
+            class_line(&ClassLoo { evidence: 2, fits: 0, floor_points: 2, ..l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0))) }),
+            "Two-atom arrangements — not yet (a DFT check found an atom's force 4.2× its bound, limit 3× while it has too few independent DFT checks: 0 of 12 fits / 2 of 60 checks)"
+        );
+        // trust tightening Task 4: the evidence floor, the leave-one-out ratio that decided, with
+        // its counts (Task 8): a count over its floor reads naturally, never "80 of 60"
+        assert_eq!(
+            class_line(&ClassLoo { fits: 1, floor_points: 4, ..l("pair", Some((ClassKey::Floor, 3.07, 1.0))) }),
+            "Two-atom arrangements — not yet (within the bound by too few independent DFT checks — 1 of 12 fits / 4 of 60 checks — and its leave-one-out error is 3.1× the bound)"
+        );
+        assert_eq!(
+            class_line(&ClassLoo { fits: 11, floor_points: 80, ..l("pair", Some((ClassKey::Floor, 3.07, 1.0))) }),
+            "Two-atom arrangements — not yet (within the bound by too few independent DFT checks — 11 of 12 fits / 80 checks (60 needed) — and its leave-one-out error is 3.1× the bound)"
+        );
         // no claim of the posterior's calibration is worded (no "1.0× less", no "inf× less")
-        for k in [ClassKey::Calibrated, ClassKey::LooFloor, ClassKey::MeasuredEnergy, ClassKey::WorstAtom, ClassKey::Window] {
+        for k in [ClassKey::Calibrated, ClassKey::LooFloor, ClassKey::MeasuredEnergy, ClassKey::WorstAtom, ClassKey::Window, ClassKey::Floor] {
             for cal in [1.0, f64::INFINITY] {
                 let t = class_line(&ClassLoo { calibration: cal, ..l("pair", Some((k, 1.4, 1.0))) });
                 assert!(!t.contains("less") && !t.contains("inf"), "{t}");
@@ -7896,6 +8051,58 @@ fn rewind_and_reverse_velocities_have_their_homes() {
     assert!(rewind::ago(std::time::Duration::from_secs(130)) == "2 min ago");
 }
 
+/// Stray atoms (spec 2026-11-18 §5): the Model tab's verdict card lists this session's stray-atom signatures — "Stray
+/// atoms: H₂ + H cleared (3 checks)", "… refused (why)" — and counts the stray-atom samples held out of the fit;
+/// nothing without any. The "fit vs held" line names them too.
+#[test]
+fn the_trust_card_lists_stray_signatures() {
+    use crate::ui::dock::model::stray_lines;
+    assert!(stray_lines(&model()).is_empty(), "no signature, nothing held: no line");
+    let m = ModelStatus {
+        stray: vec![
+            ("H2 + H".into(), "cleared (3 checks)".into()),
+            ("H2O + H".into(), "refused (composition fails: |ΔE| = 4.1 mHa)".into()),
+            ("C2H4 + H".into(), "checking (1 of 3)".into()),
+        ],
+        stray_held_out: 7,
+        ..model()
+    };
+    let lines = stray_lines(&m);
+    assert_eq!(
+        lines,
+        vec![
+            ("Stray atoms: H₂ + H cleared (3 checks)".to_string(), false),
+            ("Stray atoms: H₂O + H refused (composition fails: |ΔE| = 4.1 mHa)".to_string(), true),
+            ("Stray atoms: C₂H₄ + H checking (1 of 3)".to_string(), false),
+            ("7 stray-atom samples held out of the fit until measured".to_string(), false),
+        ]
+    );
+    // Task 6 review I1: stray atoms are separate atoms — only the bonded part's counts are subscripts — and one held
+    // sample is singular
+    let one = |label: &str| ModelStatus { stray: vec![(label.into(), "refused (spin)".into())], stray_held_out: 1, ..model() };
+    assert_eq!(stray_lines(&one("H2 + 2 H"))[0].0, "Stray atoms: H₂ + 2 H refused (spin)");
+    assert_eq!(stray_lines(&one("H2O + O"))[0].0, "Stray atoms: H₂O + O refused (spin)");
+    assert_eq!(stray_lines(&one("H2 + H"))[0].0, "Stray atoms: H₂ + H refused (spin)");
+    assert_eq!(stray_lines(&one("H2 + H"))[1].0, "1 stray-atom sample held out of the fit until measured");
+    // drawn on the card, sending nothing
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    st.open_tab(DockTab::Model);
+    let snap = snapshot(&scene, Backend::Estimated, Some(m));
+    let inp = input(&scene, Some(&snap), &cam);
+    PROBES.with(|p| p.borrow_mut().clear());
+    for _ in 0..3 {
+        assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+    }
+    for k in 0..4 {
+        assert!(probed_rect(&format!("model-stray-{k}")).width() > 0.0, "line {k} drawn");
+    }
+}
+
 /// The Model tab's amber lone-atom note (`ModelStatus::lone_note`) is drawn by Start sampling and
 /// sends nothing; without a note none is drawn.
 #[test]
@@ -7928,8 +8135,8 @@ fn the_model_tab_warns_of_atoms_without_a_neighbour() {
 /// only that key (rows per key used to appear only for classes of two or more keys).
 #[test]
 fn a_refused_class_names_its_short_key() {
-    let nn = sim::SpeciesVerdict { z: 7, neighbours: vec![7], trusted: false, refusal: Some((sim::ClassKey::Samples, 5.0, 29.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples: 5, columns: 29 };
-    let pair = sim::ClassLoo { class: "pair", samples: 5, force_rms: 0.1, force_max: 0.2, energy_rms: 0.1, energy_max: 0.2, trusted: false, refusal: nn.refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: vec![nn.clone()] };
+    let nn = sim::SpeciesVerdict { z: 7, neighbours: vec![7], trusted: false, refusal: Some((sim::ClassKey::Samples, 5.0, 29.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples: 5, columns: 29, fits: 0, floor_points: 0, rule_inflation: 1.0, tail_inflation: 1.0, energy_inflation: 1.0 };
+    let pair = sim::ClassLoo { class: "pair", samples: 5, force_rms: 0.1, force_max: 0.2, energy_rms: 0.1, energy_max: 0.2, trusted: false, refusal: nn.refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, fits: 0, floor_points: 0, species: vec![nn.clone()] };
     let m = ModelStatus { class_loo: vec![pair.clone()], ..model() };
     let scene = Scene::preset("h2").unwrap();
     let st = UiState::new("h2", &scene);
@@ -8109,6 +8316,11 @@ mod knowledge_map {
             inflation: 1.0,
             samples,
             columns,
+            fits: 0,
+            floor_points: 0,
+            rule_inflation: 1.0,
+            tail_inflation: 1.0,
+            energy_inflation: 1.0,
         };
         let mut m = model();
         let pair = m.class_loo[0].clone();
@@ -8546,6 +8758,11 @@ mod knowledge_map {
             inflation: 1.0,
             samples: 3,
             columns: 92,
+            fits: 0,
+            floor_points: 0,
+            rule_inflation: 1.0,
+            tail_inflation: 1.0,
+            energy_inflation: 1.0,
         };
         let learned = sim::SpeciesVerdict { trusted: true, refusal: None, neighbours: vec![1], ..short.clone() };
         let s = knowledge::pair_sentence(&map, p((1, 1)), &[("many-body", &short), ("pair", &learned)]);
@@ -8623,6 +8840,11 @@ mod knowledge_map {
             inflation: 1.0,
             samples: 3,
             columns: 92,
+            fits: 0,
+            floor_points: 0,
+            rule_inflation: 1.0,
+            tail_inflation: 1.0,
+            energy_inflation: 1.0,
         };
         assert_eq!(
             knowledge::pair_sentence(&map, &p(&map, (1, 1)), &[("many-body", &short)]),
@@ -8912,7 +9134,7 @@ mod triple_map {
     const TALL: egui::Vec2 = egui::vec2(1400.0, 2600.0);
 
     fn key(z: u8, nb: Vec<u8>, refusal: Option<(sim::ClassKey, f64, f64)>, samples: usize, columns: usize) -> sim::SpeciesVerdict {
-        sim::SpeciesVerdict { z, neighbours: nb, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples, columns }
+        sim::SpeciesVerdict { z, neighbours: nb, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples, columns, fits: 0, floor_points: 0, rule_inflation: 1.0, tail_inflation: 1.0, energy_inflation: 1.0 }
     }
 
     fn with_map(scene: &Scene, m: ModelStatus) -> Snapshot {
@@ -12346,7 +12568,7 @@ mod model_panel {
     }
 
     fn key(z: u8, nb: Vec<u8>, refusal: Option<(sim::ClassKey, f64, f64)>, samples: usize, columns: usize) -> sim::SpeciesVerdict {
-        sim::SpeciesVerdict { z, neighbours: nb, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples, columns }
+        sim::SpeciesVerdict { z, neighbours: nb, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples, columns, fits: 0, floor_points: 0, rule_inflation: 1.0, tail_inflation: 1.0, energy_inflation: 1.0 }
     }
 
     /// H₂S with an unlearned S–H pair key (12 of 60 samples), an unlearned O–S one (no O in the
@@ -12355,7 +12577,7 @@ mod model_panel {
         let sh = key(16, vec![1], Some((sim::ClassKey::Samples, 12.0, 60.0)), 12, 60);
         let os = key(8, vec![16], Some((sim::ClassKey::Samples, 5.0, 29.0)), 5, 29);
         let hh = key(1, vec![1], None, 400, 29);
-        let pair = sim::ClassLoo { class: "pair", samples: 417, force_rms: 0.1, force_max: 0.2, energy_rms: 0.1, energy_max: 0.2, trusted: false, refusal: sh.refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: vec![sh, os, hh] };
+        let pair = sim::ClassLoo { class: "pair", samples: 417, force_rms: 0.1, force_max: 0.2, energy_rms: 0.1, energy_max: 0.2, trusted: false, refusal: sh.refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, fits: 0, floor_points: 0, species: vec![sh, os, hh] };
         let readiness = sim::Readiness {
             answers: false,
             rule: Some(sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair)),
@@ -13535,6 +13757,72 @@ mod readouts_merge {
             assert!(checked > 30, "{checked} texts checked");
         }
     }
+
+    // ---- Fermi–Dirac smearing (plan 2026-11-13 Task 12, spec §6.6) ----
+
+    /// The breakdown reads kinetic … nuclear, then E (internal), −TS at T_el and F, with −TS the negative of
+    /// `energy.ts` and F the total.
+    #[test]
+    fn breakdown_rows() {
+        use super::super::dock::readouts::breakdown_rows;
+        let e = sim::EnergyBreakdown { kinetic: 1.0, external: -2.0, hartree: 0.5, xc: -0.25, nuclear: 0.125, internal: -0.625, ts: 9.5477e-3, total: -0.625 - 9.5477e-3 };
+        let rows = breakdown_rows(&e);
+        let names: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["kinetic (electrons)", "external", "Hartree", "xc", "nuclear", "E (internal)", "−TS (electronic entropy, T_el 1579 K)", "F"]);
+        let values: Vec<f64> = rows.iter().map(|(_, x)| *x).collect();
+        assert_eq!(values, [1.0, -2.0, 0.5, -0.25, 0.125, -0.625, -9.5477e-3, -0.625 - 9.5477e-3]);
+    }
+
+    /// "E total" is KE + F; the F row's label and tooltip; on screen in the Energies section and the breakdown.
+    #[test]
+    fn e_total_reads_ke_plus_f() {
+        use super::super::dock::readouts::{energy_tip, ENERGIES_INFO, E_TOTAL_TIP, CHART_TIP};
+        assert_eq!(E_TOTAL_TIP, "KE + F: conserved in NVE without tools");
+        assert!(ENERGIES_INFO.starts_with("E total = KE + F: conserved in NVE without tools") && CHART_TIP.starts_with("E total = KE + F:"));
+        assert!(!ENERGIES_INFO.contains("E_KS") && !CHART_TIP.contains("E_KS"));
+        assert!(energy_tip(&[]).starts_with(pseudo::ENERGY_TOOLTIP));
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = with_history(&scene, 50, |_| -1.1667, |_| 300.0);
+        snap.dynamics.source = Source::Dft;
+        snap.dynamics.eval.energy = sim::EnergyBreakdown { internal: -1.16, ts: 2e-3, total: -1.162, ..Default::default() };
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        alone(&mut st, DockTab::Readouts);
+        st.energy_units = EnergyUnits::Ha;
+        st.readouts_sections.set(Section::Breakdown, true);
+        let (t, _) = texts_and_shapes(&ctx, &mut st, &inp, egui::vec2(1400.0, 1600.0));
+        for want in ["F (electronic free energy, T_el 1579 K)", "E total", "E (internal)", "−TS (electronic entropy, T_el 1579 K)", "-0.002000"] {
+            assert!(t.contains(want), "{want:?}:\n{t}");
+        }
+        assert!(!t.contains("E_KS"), "{t}");
+    }
+
+    /// A flagged step's formatted branch-jump warning (`sim::branch_jump_warning`, not the `BRANCH_JUMP_WARNING` key)
+    /// is exactly one line of the readouts' warning list, and prints on screen.
+    #[test]
+    fn branch_jump_warning_shown() {
+        use super::super::dock::readouts::eval_warnings;
+        let want = "F changed by 12.0 mHa more than the forces' work: the SCF moved to another stationary state (not trained on)";
+        let mut eval = sim::EvalStats::default();
+        eval.branch_jump = Some(0.012);
+        eval.warnings.push(sim::branch_jump_warning(0.012));
+        assert_eq!(eval_warnings(&eval), vec![want.to_string()]);
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let mut snap = with_history(&scene, 50, |_| -1.1667, |_| 300.0);
+        snap.dynamics.eval = eval;
+        let inp = input(&scene, Some(&snap), &cam);
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        alone(&mut st, DockTab::Readouts);
+        let (t, _) = texts_and_shapes(&ctx, &mut st, &inp, egui::vec2(1400.0, 1200.0));
+        assert_eq!(t.matches(want).count(), 1, "{t}");
+        assert!(!t.contains(&format!("{}\n", sim::BRANCH_JUMP_WARNING)), "the formatted text, not the key:\n{t}");
+    }
 }
 
 /// The Selection panel (user request 2026-11-14, the approved mockup): the atom card with its
@@ -14455,4 +14743,373 @@ fn forget_by_rule_needs_its_inline_confirmation() {
     let line = crate::replay::write_line(&crate::replay::Line::Action(a));
     assert!(line.starts_with("# not replayable: forget-by-rule"), "{line}");
     assert!(!crate::replay::is_harmless("forget-by-rule"));
+}
+
+/// Fermi–Dirac smearing's words outside the Readouts (plan 2026-11-13 Task 12, spec §6.6, §4.7(i)).
+mod fermi_smearing_words {
+    use super::*;
+    use sim::activity::{TeachOrigin, TeachOutcome, TeachRule};
+
+    /// The solve line's −TS: 9.5477e-3 Ha (a lone O at M = 3 at 5 mHa) reads "−TS = −9.5 mHa" (signed); below 1e-6 Ha
+    /// nothing. The solve log's cell and hover carry it from `TeachEvent::ts`.
+    #[test]
+    fn solve_log_ts_line() {
+        use activity::log::ts_text;
+        // the signed value (rule 7: the spec's string dropped the sign; corrected 2026-11-16, Task 12 fix round)
+        assert!(ts_text(9.5477e-3).is_some_and(|t| t.contains("−TS = −9.5 mHa")), "{:?}", ts_text(9.5477e-3));
+        assert_eq!(ts_text(9e-7), None);
+        assert_eq!(ts_text(0.0), None);
+        assert_eq!(ts_text(f64::NAN), None);
+        assert_eq!(ts_text(2e-6).as_deref(), Some("−TS = −2.0 µHa"), "a small TS keeps its digits");
+        // the solve log's row: the cell and its hover carry it; a gapped or unreported TS says nothing
+        use activity::log::{solve_cell, solve_hover};
+        let mut e = sim::TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(sim::activity::PassJob::Scan), TeachOutcome::Kept);
+        (e.solve_ms, e.scf_steps, e.scf_end) = (840.0, Some(37), Some(sim::ScfEnd::Converged));
+        assert_eq!(solve_cell(&e), "840 ms · 37 it");
+        e.ts = Some(9e-7);
+        assert_eq!(solve_cell(&e), "840 ms · 37 it");
+        assert_eq!(solve_hover(&e).as_deref(), Some("37 SCF iterations — converged"));
+        e.ts = Some(9.5477e-3);
+        assert_eq!(solve_cell(&e), "840 ms · 37 it · −TS = −9.5 mHa");
+        assert!(solve_hover(&e).is_some_and(|h| h.starts_with("37 SCF iterations — converged; −TS = −9.5 mHa")), "{:?}", solve_hover(&e));
+    }
+
+    /// Spec §4.7(i): every text that shows energies against the isolated-atom references says they are free
+    /// energies at T_el — the parity toggle, axis and caption, the pair curve's axis, the lone-atom counter's hover.
+    #[test]
+    fn reference_energies_say_free_energy() {
+        let says = |t: &str| t.contains("free energies") && t.contains("T_el");
+        let note = pseudo::reference_free_energy_note();
+        assert!(says(&note) && note.contains("T_el = 1579 K"), "{note}");
+        for (site, text) in [
+            ("parity toggle", activity::plots::parity_toggle_tip()),
+            ("parity axis", activity::plots::PARITY_AXIS.to_string()),
+            ("parity caption", activity::plots::parity_caption("")),
+            ("pair curve axis", activity::plots::PAIR_AXIS.to_string()),
+            ("lone-atom counter", activity::log::lone_atom_tip(3)),
+        ] {
+            assert!(says(&text), "{site}: {text}");
+        }
+        assert!(activity::plots::parity_toggle_tip().contains("(E − Σ E_ref)/N") && activity::log::lone_atom_tip(3).contains("E = Σ E_ref"));
+    }
+
+    /// The Activity iteration energy is F_HF (spec §6.6: same row, renamed).
+    #[test]
+    fn iteration_energy_is_f_hf() {
+        assert!(activity::jobs::ITERATION_ENERGY_TIP.contains("F_HF") && activity::jobs::ITERATION_ENERGY_TIP.contains("T_el"));
+    }
+}
+
+/// The collection migration (Fermi–Dirac spec §7.8; plan 2026-11-13 Task 16, ruling R16): **Re-solve now** is
+/// `Action::StartMigration` — one `DynCommand::StartMigration` to the driver, refused while a pass runs — recorded by
+/// `--record` as `# not replayable: start-migration`, which a replay skips (it never starts a migration); **Later**
+/// (`Action::MigrationLater`, display only, replayable) folds the card into one line of the collection section that
+/// keeps its Re-solve now. Clicked as a user would, in the Model tab.
+#[test]
+fn start_migration_is_an_action() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let offered = sim::MigrationStatus {
+        source: "lsda-old".into(),
+        samples: 2412,
+        done: 0,
+        counts: [0; 4],
+        eta_s: Some(5400.0),
+        state: sim::MigrationPhase::Offered,
+        species: vec![1, 7, 8],
+        summary: None,
+    };
+    let shared = sim::ModelSource::Collection { slug: "lsda-new".into(), samples: 0, read_only: false };
+    let m = ModelStatus { migration: Some(offered.clone()), source: shared, collections: true, use_collection: true, ..model() };
+    let snap = snapshot(&scene, Backend::Estimated, Some(m));
+    let inp = input(&scene, Some(&snap), &cam);
+    // the action alone: one driver command; refused while a pass runs
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    assert!(matches!(one_dyn(&act(&mut st, &inp, Action::StartMigration)), DynCommand::StartMigration));
+    let mut busy = snapshot(&scene, Backend::Estimated, Some(model()));
+    busy.dynamics.sampling = Some(sim::SamplingProgress { done: 1, total: 4, stage: "perturbations", target: None, last_energy: f64::NAN, cancelled: false, skipped: 0, failed: 0, finished: false, paused: false });
+    let out = act(&mut st, &input(&scene, Some(&busy), &cam), Action::StartMigration);
+    assert!(out.commands.is_empty() && out.error.as_deref().is_some_and(|e| e.contains("a pass is running")), "{:?}", out.error);
+    // recorded, never replayed: a comment a replay skips with a warning
+    assert_eq!(Action::StartMigration.describe(), None);
+    assert_eq!(crate::replay::unreplayable_kind(&Action::StartMigration), Some("start-migration"));
+    let line = crate::replay::write_line(&crate::replay::Line::Action(Action::StartMigration));
+    assert!(line.starts_with("# not replayable: start-migration"), "{line}");
+    let parsed = crate::replay::parse_numbered(&line).unwrap();
+    assert!(matches!(parsed.as_slice(), [(1, crate::replay::Line::NotReplayable(k))] if k == "start-migration"), "{parsed:?}");
+    assert!(crate::replay::is_harmless("start-migration"), "a replay skips it (ruling R16)");
+    // Later: display only, a script word of its own
+    assert_eq!(Action::MigrationLater.describe().as_deref(), Some("migration-later"));
+    assert_eq!(Action::parse(&["migration-later"]).unwrap(), Action::MigrationLater);
+    let out = act(&mut st, &inp, Action::MigrationLater);
+    assert!(out.commands.is_empty() && st.migration_later);
+    // the card in the Model tab: its words, Re-solve now and Later clicked
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    st.backend = Backend::Estimated;
+    alone(&mut st, DockTab::Model);
+    let all = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    let t = texts_in(&ctx, &mut st, &inp, 1400.0, all);
+    assert!(t.contains(super::migration::OFFER_TITLE) && t.contains("About 1 h 30 min of GPU time"), "{t}");
+    let outs = click_widget(&ctx, &mut st, &inp, "migration-resolve");
+    assert!(matches!(dyn_commands(&outs).as_slice(), [DynCommand::StartMigration]), "{:?}", dyn_commands(&outs));
+    assert!(matches!(actions(&outs).as_slice(), [Action::StartMigration]));
+    let outs = click_widget(&ctx, &mut st, &inp, "migration-later");
+    assert!(matches!(actions(&outs).as_slice(), [Action::MigrationLater]) && dyn_commands(&outs).is_empty());
+    assert!(st.migration_later);
+    // folded: the card's text is gone, the line keeps its Re-solve now (in the collection section's fold)
+    for (section, open) in [(dock::model::Section::Teach, false), (dock::model::Section::Health, false), (dock::model::Section::File, true)] {
+        st.model_sections.set(section, open);
+    }
+    frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    let t = texts_in(&ctx, &mut st, &inp, 1400.0, all);
+    assert!(!t.contains("Atomic Sandbox now fills electron levels") && t.contains(&super::migration::later_line(&offered)), "{t}");
+    let outs = click_widget(&ctx, &mut st, &inp, "migration-resolve");
+    assert!(matches!(actions(&outs).as_slice(), [Action::StartMigration]));
+}
+
+/// Task 16 review M1: while the migration's re-solve pass runs, the Activity pass card is titled for it, its count line
+/// is the progress counts with no time in it, its one time left is the migration's own estimate (none while paused),
+/// and its bar is the migration's sample count; the hover holds the whole §7.8 line.
+#[test]
+fn migration_pass_card_shows_the_counts_and_one_time_left() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let mg = sim::MigrationStatus { source: "lsda-old".into(), samples: 2412, done: 412, counts: [380, 22, 10, 0], eta_s: Some(3120.0), state: sim::MigrationPhase::Running, species: vec![1, 7, 8], summary: None };
+    let m = ModelStatus { migration: Some(mg.clone()), pass_eta_s: Some(99.0), ..model() };
+    for paused in [false, true] {
+        let mut snap = snapshot(&scene, Backend::Estimated, Some(m.clone()));
+        snap.dynamics.sampling = Some(sim::SamplingProgress { stage: "re-solving", done: 412, total: 2412, skipped: 0, failed: 0, cancelled: false, last_energy: f64::NAN, finished: false, target: None, paused });
+        let inp = input(&scene, Some(&snap), &cam);
+        let rows = activity::jobs::rows(&inp, None);
+        let r = rows.iter().find(|r| r.key == activity::jobs::JobKey::Pass).expect("the pass card");
+        assert_eq!(r.title, super::migration::RESOLVING);
+        let counts = super::migration::progress_counts(&mg);
+        assert_eq!(r.count.as_deref(), Some(if paused { format!("paused · {counts}") } else { counts.clone() }.as_str()));
+        assert!(!r.count.as_deref().unwrap().contains("left"), "no time in the count line: {:?}", r.count);
+        assert_eq!(r.eta_s, if paused { None } else { Some(3120.0) }, "the migration's estimate, not the worker's pass rate");
+        assert!(matches!(r.progress, activity::jobs::JobProgress::Fraction { done: 412, total: 2412 }));
+        assert_eq!(r.detail, super::migration::progress_line(&mg));
+    }
+}
+
+/// Trust tightening Task 8 (spec 2026-11-18 §3–§4; plan Review Focus 3 and 4): the words and
+/// readouts of the evidence floor, the tail-aware inflations and the calibration ticks.
+mod activity_trust_tightening {
+    use super::super::dock::model::{floor_line, inflation_line, key_detail_line, skipped_line, taken_line, Section};
+    use super::*;
+
+    fn key(trusted: bool, inflation: f64, tail: f64, energy: f64) -> sim::SpeciesVerdict {
+        sim::SpeciesVerdict {
+            z: 1,
+            neighbours: vec![1],
+            trusted,
+            refusal: if trusted { None } else { Some((sim::ClassKey::Floor, 3.07, 1.0)) },
+            calibration: 1.0,
+            measured: None,
+            measured_energy: None,
+            worst_atom: None,
+            evidence: 4,
+            trusted_since: None,
+            inflation,
+            samples: 120,
+            columns: 29,
+            fits: 1,
+            floor_points: 4,
+            rule_inflation: inflation,
+            tail_inflation: tail,
+            energy_inflation: energy,
+        }
+    }
+
+    /// The Model tab's per-key readout: the floor's counts (a count at or over its floor reads
+    /// "80 (60 needed)", never "80 of 60" — the Task 4 review's minor 3) and λ_T, λ_E as the
+    /// provider's words print them.
+    #[test]
+    fn the_key_readout_names_its_floor_counts_and_inflations() {
+        assert_eq!(providers::surrogate::floor_count(80, 60, ""), "80 (60 needed)");
+        assert_eq!(providers::surrogate::floor_count(11, 12, "fits"), "11 of 12 fits");
+        assert_eq!(floor_line(3, 4), "independent checks: 3 of 12 fits, 4 of 60");
+        assert_eq!(floor_line(11, 80), "independent checks: 11 of 12 fits, 80 (60 needed)");
+        assert_eq!(floor_line(12, 60), "independent checks: 12 fits (12 needed), 60 (60 needed)");
+        assert_eq!(inflation_line(1.0, 1.0), "λ_T 1.0, λ_E 1.0");
+        assert_eq!(inflation_line(7.69, f64::INFINITY), "λ_T 7.7, λ_E ∞");
+        assert_eq!(inflation_line(f64::NAN, 1.0), "λ_T NaN, λ_E 1.0");
+        assert_eq!(key_detail_line(&key(true, 1.0, 1.0, 1.0)), "    independent checks: 1 of 12 fits, 4 of 60 · λ_T 1.0, λ_E 1.0");
+    }
+
+    /// Review Focus 3: a key the class rule trusts but λ_T or λ_E refuses (history code 24) is never
+    /// worded plain "learned": locked (∞, NaN) until the check ages out, or refused where its std
+    /// alone would pass (a finite factor above λ_sum). At or below λ_sum nothing is added, and a
+    /// refused key keeps its refusal's words.
+    #[test]
+    fn a_key_refused_by_its_tail_inflation_is_not_worded_plain_learned() {
+        use activity::words::{species_line, tail_note};
+        let name = "Two-atom arrangements around H, with H";
+        assert_eq!(species_line("pair", &key(true, 1.0, 1.0, 1.0)), format!("{name} — learned"));
+        assert_eq!(tail_note(&key(true, 1.2, 1.2, 1.0)), None, "λ_T = λ_sum: nothing beyond λ_sum");
+        assert_eq!(
+            species_line("pair", &key(true, 1.0, f64::INFINITY, 1.0)),
+            format!("{name} — learned, but every step with it goes to DFT until a check ages out of the window: a DFT check found an error beyond its limit where the model's std was 0 (λ_T ∞)")
+        );
+        assert_eq!(
+            species_line("pair", &key(true, 1.0, 1.0, f64::NAN)),
+            format!("{name} — learned, but every step with it goes to DFT until a check ages out of the window: a DFT comparison was not a number (λ_E NaN)")
+        );
+        assert_eq!(
+            species_line("pair", &key(true, 1.2, 7.69, 2.0)),
+            format!("{name} — learned, but steps its std alone would pass can still go to DFT: DFT checks measured larger errors where the model was sure (λ_T 7.7 against λ_sum 1.2)")
+        );
+        assert_eq!(
+            tail_note(&key(true, 1.2, 1.0, 5.04)).as_deref(),
+            Some("steps its std alone would pass can still go to DFT: DFT checks measured larger errors where the model was sure (λ_E 5.0 against λ_sum 1.2)")
+        );
+        // NaN before ∞, λ_T before λ_E on a tie
+        assert!(tail_note(&key(true, 1.0, f64::INFINITY, f64::NAN)).unwrap().ends_with("(λ_E NaN)"));
+        assert!(tail_note(&key(true, 1.0, f64::INFINITY, f64::INFINITY)).unwrap().ends_with("(λ_T ∞)"));
+        // refused: the refusal's words, no note
+        assert_eq!(
+            species_line("pair", &key(false, 1.0, f64::INFINITY, 1.0)),
+            format!("{name} — not yet (within the bound by too few independent DFT checks — 1 of 12 fits / 4 of 60 checks — and its leave-one-out error is 3.1× the bound)")
+        );
+    }
+
+    /// Review Focus 4 and the Task 7 review's M5: the calibration ticks reach the Model tab through
+    /// `TrainableStatus::ticks` (never a downcast), and skips are said with their cause.
+    #[test]
+    fn skipped_ticks_are_shown_with_their_cause() {
+        let t = |recorded, unrecorded, skipped_busy, lost, in_step| sim::CalibrationTicks { recorded, unrecorded, skipped_busy, lost, in_step, due: recorded + unrecorded + skipped_busy + lost };
+        assert_eq!(skipped_line(&t(0, 0, 100, 0, 0)), "calibration checks skipped: 100 (100 while the background teacher was busy)");
+        assert_eq!(skipped_line(&t(4, 0, 0, 0, 0)), "calibration checks skipped: 0");
+        assert_eq!(skipped_line(&t(0, 0, 7, 2, 0)), "calibration checks skipped: 9 (7 while the background teacher was busy, 2 lost: abandoned, failed or not judged)");
+        assert_eq!(skipped_line(&t(0, 0, 0, 1, 0)), "calibration checks skipped: 1 (1 lost: abandoned, failed or not judged)");
+        assert_eq!(taken_line(&t(3, 1, 0, 0, 2)), "calibration checks taken: 4 (2 in the step)");
+        assert_eq!(taken_line(&t(5, 0, 0, 0, 0)), "calibration checks taken: 5");
+    }
+
+    /// The Details fold draws them: the per-key readout under each key (a lone trusted key
+    /// included), the code-24 note, and the calibration row once a tick has fallen due.
+    #[test]
+    fn details_show_the_floor_the_inflations_and_the_skipped_ticks() {
+        fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+            fn walk(s: &egui::epaint::Shape, out: &mut String) {
+                match s {
+                    egui::epaint::Shape::Text(t) => {
+                        out.push_str(t.galley.text());
+                        out.push('\n');
+                    }
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            let mut out = String::new();
+            for _ in 0..3 {
+                let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 1800.0))), ..Default::default() };
+                let mut full = ctx.run_ui(raw, |root| {
+                    show(root, st, inp);
+                });
+                full.textures_delta.clear();
+                out.clear();
+                full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+            }
+            out.replace('\n', " ")
+        }
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        alone(&mut st, DockTab::Model);
+        st.model_sections.set(Section::Details, true);
+        let mut m = model();
+        m.class_loo[0].species = vec![key(true, 1.0, f64::INFINITY, 1.0)];
+        m.ticks = sim::CalibrationTicks { recorded: 3, skipped_busy: 100, due: 103, ..Default::default() };
+        let snap = snapshot(&scene, Backend::Estimated, Some(m.clone()));
+        let inp = input(&scene, Some(&snap), &cam);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("independent checks: 1 of 12 fits, 4 of 60 · λ_T ∞, λ_E 1.0"), "{t}");
+        assert!(t.contains("every step with it goes to DFT until a check ages out of the window"), "the code-24 note: {t}");
+        assert!(t.contains("calibration checks taken: 3") && t.contains("calibration checks skipped: 100 (100 while the background teacher was busy)"), "{t}");
+        // no tick due yet: no calibration row
+        m.ticks = sim::CalibrationTicks::default();
+        let snap = snapshot(&scene, Backend::Estimated, Some(m));
+        let inp = input(&scene, Some(&snap), &cam);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(!t.contains("calibration checks"), "{t}");
+    }
+
+    /// Task 8 review I2: the code-24 note compares with the λ_sum the rules read
+    /// (`SpeciesVerdict::rule_inflation`, a sparse key's class floor included), and prints it — never
+    /// the key's own `inflation` below that floor.
+    #[test]
+    fn the_code_24_note_compares_with_the_floored_lambda_sum() {
+        use activity::words::tail_note;
+        let sparse = |tail: f64| sim::SpeciesVerdict { inflation: 1.0, rule_inflation: 2.0, ..key(true, 1.0, tail, 1.0) };
+        assert_eq!(tail_note(&sparse(1.6)), None, "λ_T 1.6 under the floored λ_sum 2.0 refuses nothing");
+        assert_eq!(tail_note(&sparse(2.0)), None);
+        assert_eq!(
+            tail_note(&sparse(2.5)).as_deref(),
+            Some("steps its std alone would pass can still go to DFT: DFT checks measured larger errors where the model was sure (λ_T 2.5 against λ_sum 2.0)")
+        );
+    }
+
+    /// Task 8 review I1 (Review Focus 3): a lone key, trusted by the class rule but locked by λ_T = ∞
+    /// (H₂'s H{H}), is not a ✓ "learned" on the surfaces seen first — the Activity trust checklist
+    /// draws its row ✗ with the note and the class line ✗, the Learned fold carries the note, and
+    /// the Knowledge panel's sentence says DFT still answers it.
+    #[test]
+    fn a_lone_locked_key_is_never_a_plain_learned() {
+        let scene = Scene::preset("h2").unwrap();
+        let st = UiState::new("h2", &scene);
+        let mut m = model();
+        m.class_loo[0].species = vec![key(true, 1.0, f64::INFINITY, 1.0)];
+        assert!(m.class_loo[0].trusted, "the premise: the class rule trusts it");
+        let lines = activity::trust::lines(&m, &scene, &st);
+        let class = lines.iter().find(|l| l.text == "Two-atom arrangements — learned").expect("the class line");
+        assert!(!class.met, "no ✓ for a class whose key is locked");
+        let row = lines.iter().find(|l| l.text.contains("learned, but every step with it goes to DFT")).expect("the key's row");
+        assert!(!row.met && row.text == "    Two-atom arrangements around H, with H — learned, but every step with it goes to DFT until a check ages out of the window: a DFT check found an error beyond its limit where the model's std was 0 (λ_T ∞)", "{}", row.text);
+        // unlocked: the lone key's row is not drawn and the class line is a ✓, as before
+        let mut ok = m.clone();
+        ok.class_loo[0].species = vec![key(true, 1.0, 1.0, 1.0)];
+        let lines = activity::trust::lines(&ok, &scene, &st);
+        assert!(lines.iter().any(|l| l.met && l.text == "Two-atom arrangements — learned") && !lines.iter().any(|l| l.text.contains("around H, with H")));
+        // the Learned fold
+        let rows = super::super::dock::model::learned(&m);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].3.as_deref().is_some_and(|n| n.starts_with("every step with it goes to DFT")), "{rows:?}");
+        assert_eq!(super::super::dock::model::learned(&ok)[0].3, None);
+        // the Knowledge panel's sentence for a trusted pair
+        let map = knowledge::fixture_map();
+        let locked = key(true, 1.0, f64::INFINITY, 1.0);
+        assert_eq!(
+            knowledge::pair_sentence(&map, map.pair(1, 6).unwrap(), &[("pair", &locked)]),
+            "Taught 2.0–5.3 Bohr (610 samples). Trusted, but DFT still answers two-atom arrangements around H, with H: the model was measured too confident there."
+        );
+        let fine = key(true, 1.0, 1.0, 1.0);
+        assert_eq!(knowledge::pair_sentence(&map, map.pair(1, 6).unwrap(), &[("pair", &fine)]), "Taught 2.0–5.3 Bohr (610 samples). Trusted everywhere this pair was met.");
+    }
+
+    /// Task 8 review M4: a code-24 Log row (a rule-6/7 refusal that passes at λ_sum alone) says the
+    /// model was too confident here, not unsure; codes 14/15 keep their words.
+    #[test]
+    fn a_code_24_row_says_the_model_was_too_confident() {
+        use activity::words::{rule_sentence, RowCtx};
+        use sim::activity::TeachRule as R;
+        let tail = RowCtx { tail: true, ..RowCtx::default() };
+        assert_eq!(
+            rule_sentence(R::ForceUncertainty, Some(1), tail),
+            "the model was sure here (atom 1), but DFT checks found it too confident in places like this (its uncertainty scaled by λ_T/λ_E is over the bound)"
+        );
+        assert_eq!(
+            rule_sentence(R::EnergyUncertainty, None, RowCtx { kept: true, ..tail }),
+            "the model was sure here, but DFT checks found it too confident in places like this (its uncertainty scaled by λ_T/λ_E is over the bound) — this answer teaches it"
+        );
+        assert_eq!(rule_sentence(R::ForceUncertainty, Some(1), RowCtx::default()), "the model is unsure here (atom 1)");
+        assert_eq!(sim::TeachEvent::new(sim::activity::TeachOrigin::Fallback, R::ForceUncertainty, sim::activity::TeachOutcome::Kept).history_code, None, "defaulted in new");
+    }
 }

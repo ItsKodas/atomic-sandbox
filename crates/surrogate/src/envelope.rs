@@ -89,14 +89,15 @@
 //! The window m/3 ≤ C < m is still answered by extrapolation toward the pinned limit; there the
 //! variance and the audits are what judge it (a documented gap, not a guarantee).
 //!
-//! # Isolated atoms are not training atoms
+//! # Isolated atoms are not training atoms (stray-atoms Task 4 fix round 1, controller ruling 7)
 //!
 //! An atom with no neighbour inside r_cut ([`isolated_atom`]: every coordination feature is
 //! exactly 0, so every feature is) describes no environment: the model's answer for it is E_ref
 //! with zero force, whatever was fitted. It is never added to the envelope (the fit's call sites
-//! in `Accumulator` skip it, not [`Envelope::add_atom`]). Admitting one — the stray atom of a kept
-//! rule-5a fallback, in a scene whose other atoms are bonded — would put B = 0 into every feature
-//! of its species: the minimum of every coordination feature becomes 0, so
+//! in `Accumulator` skip it, not [`Envelope::add_atom`]: a stray atoms' cleared region is a box of
+//! chosen descriptors and adds them itself). Admitting one — the stray atom of a kept rule-5a
+//! fallback, in a scene whose other atoms are bonded — would put B = 0 into every feature of its
+//! species: the minimum of every coordination feature becomes 0, so
 //! [`Envelope::coordination_ratio`] skips the channel ("an empty neighbourhood was seen") and the
 //! vanishing direction is no longer judged for that species anywhere; the box of the spread rule
 //! contains 0; and zeros enter Σ B and Σ B², the spread unit. A stretched pair just inside r_cut,

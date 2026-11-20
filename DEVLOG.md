@@ -750,6 +750,86 @@ The user asked why the orbital views went blank in Estimated mode: the model has
 
 **Gate (Nov 16, the branch with main merged in, each suite alone):** units/qm/sim/surrogate 516, providers 428, qm-gpu 136, gpu_vs_cpu 9, `--test surrogate` 7, `--test orbitals` 12, `--test harris` 6 (V-A4 water alone after the fix: 0 failed samples, numbers identical to the record), app 752 (incl. replays), non-test app build clean.
 
+
+### The SCF stall on hand-built hydrogen clusters (Nov 13; branch `scf-stall`)
+
+**The report.** The user built a loose cluster of H atoms under the app's defaults (GPU, Accurate, pseudised H). Its SCF never settled: Δρ ≈ 0.3, the energy swinging about 30 mHa between iterations, until the stall stop (built Oct 17–18, the level-gated W = 50 rule) ended the solve.
+
+**The diagnosis (one afternoon, note committed Nov 13 15:31; no solver change that day):**
+- A headless harness reproduced it. Under the default policy 5 of 23 test clusters stalled, all of them lopsided; every symmetric chain and ring converged in 9–12 iterations. Six more needed a shell release and 30–55 iterations.
+- **The cause was the occupation rule, not the mixer or the box.** The shared-shell rule (`DegenerateShells`) put every level within 0.1 Ha of the Fermi level into one equally shared cluster. That is a discontinuous function of the eigenvalues at the window's edge. A level of a low-symmetry cluster within about 1e-3 Ha of the edge flipped its occupation every iteration, and neither branch was self-consistent. Loosely bound H clusters have HOMO–LUMO gaps of 0.03–0.15 Ha, so a hand-built one lands there often.
+- **The experiment:** Fermi–Dirac occupations at kT = 1e-3 Ha in place of the equal share. All 23 converged, the five stallers in 10–32 iterations.
+
+**What it became.** The fix was not a better stall stop. The stop was doing its job, ending a solve with no fixed point. The fix was a continuous occupation rule, which became the Fermi–Dirac plan below. Since that plan's Task 10 the stop runs in one phase: the release restart (`StallWatch::restart`) was deleted with the shared-shell rule.
+
+### Fermi–Dirac smearing and the collection migration (Nov 13–20; branch `scf-stall`, Tasks 0–18)
+
+**What was built (spec Nov 13 15:49, plan of 18 tasks 16:37; final whole-branch review Nov 20):**
+- **Every scene is Fermi–Dirac** at kT = 5 mHa (T_el ≈ 1 579 K), with μ found per spin channel. The reported energy is the Mermin free energy F = E − TS everywhere: forces, MD, relax and the readouts. `DegenerateShells` and its two-phase release were deleted.
+- **A `branch_jump` guard** replaced the old occupation watch. It refuses to train on a step whose energy jumps more than the forces that moved the atoms allow.
+- **The orbital viewer and Harris display solves** use FD occupations. The Activity and Orbitals tabs show T_el and the signed −TS.
+- **The collection migration.** A shared collection taught before the switch holds labels of the old rule. The new build learns into a new folder and offers to re-solve the old one into it: **Re-solve now** or **Later**, with pause, resume across restarts and a summary. Each re-solved sample is classed as identical, changed only by −TS, or changed state; the last kind is checked by leave-one-out at the next refit (code 9). The old folder is never written.
+- **Old models refused.** A `.model` file taught before the switch is refused on load with the reason, naming 0.2.0-beta.5, the last pre-FD release.
+- **No shipped models.** The user ruled on Nov 16 that the four shipped models (`hydrogen`, `h2o`, `h3+`, `SiH4`) be deleted rather than re-taught, so an install now carries no `.model` file.
+
+**How it went:**
+- **V0, the entry gate, failed first.** At kT = 1e-3 Ha lone open-shell atoms (O M = 1, N M = 2) polarised depending on where they sat on the grid (note Nov 13 21:52). The user chose kT = 5 mHa and a 1e-5 GPU stop for solves with a partly filled level (Nov 14 06:36). Under those, every species passed the state, spread and winner rules.
+- **Two usage stops:** at 95 % of the weekly usage (Nov 14–15, resumed when the limits lifted), and at the usage limit on Nov 17 around 18:10, which stopped Task 14 at its dispatch.
+- **The all-electron witness was expensive (Task 7).** FD needs eigenvectors above the Fermi level, and on all-electron grids the LOBPCG for them hit its cap. gpu_vs_cpu went from 3.5 to 23.7 min and the oracles from 31 to 51 min. A traced run found a transient, not a defect. Raising the cap would have cost the Precise auditor its VRAM, so it was reverted.
+- **The guard's first rule was biased (Task 8).** The review showed its running median locked in low on bond formation: 655 false flags in 2 999 steps of H₂ forming from rest. It now uses the derived bound κ_max: 0 flags.
+- **Tasks 9b–9d, three fix tasks nobody planned:**
+  - An H₃⁺ tier test cycled for 200 steps under FD. The cause was Task 7's witness columns: their residual entered the step's max_res, so the guess-tolerance accept alternated and reset DIIS every other step (fixed in 9b). nalgebra's `SymmetricEigen` losing a level in the Rayleigh–Ritz step was a separate defect, found by the 9b review (its I1).
+  - Cold all-electron water at 97³ took 123 s, because the blob start put μ in the wrong place. An atomic-density start from `qm::radial` (Z only) brought it to 11 steps and 11 s (9c). The VRAM guard's estimate of 21.6 GB for all-electron water at 177³ was an estimate, not a measured peak; it survived the new start and was fixed in 9d by counting the 3 witness vectors per spin the solver allocates.
+  - A DIIS stall at the orbital freeze was fixed by dropping stale pre-freeze entries when a frozen step fails to contract.
+- **V5's pre-registered bounds failed (Task 11),** the work integral by 392×. A physics review re-derived them from a measured, independent source: a box term that falls 26× from a 12 to an 18 Bohr box. The bound was never scaled to fit.
+- **The safety test failed again (Task 14).** The stuck-then-escape repro failed with labels that agreed to 1e-7 Ha. A bisect found the many-body class opening on 3 evidence points; the cause was not the solver. The user chose "Tighten trust", which became its own branch (below).
+- **The migration estimate was about 10× short (Task 17).** The V11 dry run on a copy of the user's 1 657-sample collection took 37 s per sample on average (H₂ 2–4 s, H₃P about 140 s), so a full re-solve is about 17 h of GPU, not the planned 1–2 h. It was stopped at 480 samples: 479 identical, 1 changed state, every hash unchanged. The estimate now scales from the pass's own mean. On Nov 20 the user dropped that collection ("dump that to save time") and trains fresh.
+- **Five merges of `main` along the way** (live orbitals, the knowledge graph, refit speed-up, variance support and more), each gated before work went on.
+
+**Wins:** every reproduced staller converges in one phase; the lone-atom rule works on partial levels; collections move to the new surface without losing the old one; and no gate was widened to pass: every re-pin carries its derivation in `references.md`.
+
+**Gate (Nov 20, Task 18, on the main-merged tree, beside another agent's GPU jobs):** all 11 solver-side suites passed: qm 249, units 10, qm-gpu 146, gpu_vs_cpu 12 (469 s), oracles 5 (54 min), dynamics 7 (42 min), charges 3, orbitals 13, harris 6, pseudo_gen 6, pseudo 9, pseudo_oracles 11. The final whole-branch review found no Critical; its fixes (the stray-atom × tick tests, the docs, the suite times and the version bump to 0.2.0-beta.6) landed before the merge.
+
+**Size:** the branch with its two merged sub-branches is 136 commits and about 36 000 lines added across 137 files against `main`.
+
+### Stray atoms (Nov 18–19; branch `stray-atoms`, fast-forwarded into `scf-stall`)
+
+**Why.** A molecule with one atom far away, like H₂ plus a hydrogen 6 Bohr off, was always DFT's. The lone-atom rule (rule 5a) refuses an atom with no neighbour within the cutoff in a scene of two or more, because a model of bonded environments says nothing about how a far atom's energy composes with the rest. That stays the rule until the composition has been measured.
+
+**What was built (spec Nov 18 21:12, physics review 21:20, plan of 7 tasks 21:24; last commit Nov 19 20:41, about 23.5 h):**
+- **Composition checks.** A scene splits into its bonded part and its stray atoms. The background teacher solves the scene, the bonded part alone and each stray atom alone. Three distinct passing checks clear a signature (the species, the charge, the surface) for a region of bonded geometries and stray places.
+- **The model answers inside a cleared region** as "bonded part + free atoms". The bonded part is judged on its own: the envelope with the stray atoms exempt, the fences on the bonded part, and rule 7 per bonded atom.
+- **One denominator (ruling 9a).** Every per-atom energy quantity, from the fit's row to the audits and the calibration's history, divides by the energy-row atoms N_e.
+- **The lone-atom rules otherwise stand.** Rule 5a still refuses a stray atom of any signature not cleared. Rule 0b, a scene of lone atoms only, answers from the isolated-atom references; since the Fermi–Dirac Task 10 two or more lone copies compose only for H or a species whose reference has a gap, because an open-shell atom's reference is a partial ensemble at 5 mHa.
+- **Audits attributed (ruling 9b).** A failed audit at a cleared scene refuses the signature at once. A check of the parts then decides whose failure it was, the model's on the bonded part or the composition's, and only the model's counts against trust.
+
+**How it went:**
+- On the real teacher, F₂ + Li was refused as it should be (−37.2 mHa off, margin −331.6 mHa). H₂ + H would not clear at first, because the frontier-level test did not fit FD levels. Rulings 10 and 11 set its window (finally 13.8 kT about the scene's μ_σ), and ruling 12 the region's reach.
+- **Ruling 13:** a region covers stray atoms only where its passes put them. **Ruling 14:** the stray atom's place is blind to direction, parked as a known limit with a direction-aware rule queued.
+- Measured: the farthest answered bond is r = 1.659 Bohr at 0.231 mHa per bonded atom. The NVE re-entry test at 101³ books every model ↔ teacher switch (asserted jumps −0.348 / +0.440 mHa).
+- **Cost:** the dynamics suite grew to about 43 min and the surrogate suite to about 28 min.
+- **What the final review caught after the trust merge:**
+  - The stray × calibration-tick path that the merge created had no test.
+  - A ticked audit whose failure the check called the composition's left no point. That made P_A depend on the outcome. The ruling: record the fragment point in both outcomes.
+  - The background audit judged its fences on the whole scene, unlike the step.
+
+  All three were fixed and tested before the merge.
+
+### Trust tightening (Nov 18–20; branch `trust-tighten`, Tasks 0–9)
+
+**Why.** The stuck-then-escape repro (the oldest safety test of the estimated solver) failed again once the teacher switched to Fermi–Dirac labels. A bisect (Nov 17) found the cause was not the solver: label changes of ~1e-7 Ha, far below the SCF tolerance, sent the chaotic 6000-solve trajectory down a path where the many-body class opened on **3** DFT comparisons and then answered hot H₃ up to 4.5× its force bound, with z-scores to 34. A green run had only meant the trajectory missed the gap.
+
+**What was built (spec Nov 18 22:31, rev. 2 approved Nov 19 00:52; first code Nov 19 01:40, Task 8 done Nov 20 08:28):**
+- **Task 0, before any code:** a read-only go/no-go report on the user's shared collection. Two of its six keys would lose trust at load (the H–H pair at a leave-one-out worst of 1.017×, H with H and O at 2.51×). The user said "go; fix H₂ with one teach".
+- **An evidence floor:** 12 distinct fits and 60 comparisons before measured evidence alone opens a key; below it the key's leave-one-out must pass too. Fit ids count only refits that solved new coefficients from new teacher data, so restarts, reloads and policy changes cannot manufacture fits (a review found that a Forget + Restore could, and a watermark fixed it).
+- **Tail-aware inflations** λ_T and λ_E: the smallest factor at which every DFT check the key has seen, the worst included, fits inside the inflated uncertainty. A step they alone refuse is logged as code 24, "the model was too confident".
+- **Calibration ticks:** every 25th answerable step is checked whatever σ says, so the factors are measured on a σ-blind sample. Getting "σ-blind" right took three rounds: the first rule (count from the previous tick's completion) over-weighted refused stretches by (25 + T)/25, which a re-review caught by simulation; the fix is a dead time after every tick, answered or not.
+- **The words:** the Model tab, Activity checklist and Knowledge map name the floor, the factors, code 24 and skipped checks.
+
+**Task 9, the gate (Nov 20).** The repro first failed in a new way: the harness has no background teacher, so its ticks run in the step, and five of them landed on box-affected answers, which the provider reports on the model's surface by design (the gap is the box's confinement). The test's fallback-energy check had not expected in-step audits. Ruled as a test-scope fix (exclude those steps, selected from the structured audit verdict, counted and printed), with the tier and every constant unchanged. Then it passed: **771 s** (07939ac's lucky pass took 1036 s, the failing 762159b 1378 s). The hot run answered 260 steps, 61 judged against DFT: worst 0.97× the energy tier and 1.82× the force bound, none beyond. The many-body class opened only once it had 14 fits and 76 comparisons. Raw z on the epistemic std still reaches 38; inflated by each key's factor its median is 0.86 and its max 2.49.
+
+**What it cost and what is open.** About 7,400 lines across 34 files, 24 commits, every task reviewed with one or two fix rounds. The harness's in-step ticks broke three surrogate-MD tests that assume the model answers every step: the H₂ and H₃⁺ frequencies still match (within 3.4e-6 and 2.8e-4), but the H₂ NVE drift went from below 1e-8 to 3.1e-7 Ha/ps and the rewind from 1e-12 to 1e-5 Bohr, because a teacher force now moves the atoms every 25 steps. No tolerance moved: the controller ruled that these three tests measure the model's own potential, so they run with calibration ticks off (a test hook), and the README and references say that on paths with no background teacher the ticks do disturb model MD.
+
 ## Failures and dead ends
 
 These are the places where the first idea was wrong, or an approach was tried and abandoned. They are
@@ -1281,28 +1361,21 @@ told to the user (Task 11, rounds 7 and 7b).
 
 ## What's next
 
-From the ledgers, the plans and the standing order of work:
+From the ledgers, the plans and the standing order of work (Nov 20, after the smearing branch):
 
-1. **Finish M7.** Task 7 (forces for the local, nonlocal and partial-core pieces), 8b (GPU force kernels),
-   9 (plumbing through `sim`, `providers`, `surrogate` and `app`), 10 (oracles and dynamics re-pins), 11
-   (pseudo-H and He, the dimer gate, the H₂O egg-box gate, making pseudopotentials the default), 12 (enable
-   Z = 11 to 18) and 13 (bond-angle overlay). Before the merge the full oracle, dynamics and surrogate suites
-   are owed on the merged tree. The target is honest C, N and O. The user-requests note sets the oracle:
-   VSEPR shapes must emerge (relaxed H2O 104.5°, NH3 106.7°, CH4 109.5° within a few degrees) rather than
-   be put in.
-2. **Merge the Activity tab** once its suites pass on the merged tree.
-3. **The spin-view fix** for the closed-shell noise (queued, Sonnet).
-4. **Orbital Task 8:** core shells reconstructed for display, which waits for M7.
-5. **M8: locality and transfer.** Per-atom models that carry between scenes, fragment training, a shared
-   growing model. M8a (the shared model) merged on Nov 12, with fragment transfer measured as not working and
-   Train this segment deferred (see the timeline); a long-chain capping gate is its follow-up.
-6. **After M8, unless reordered:** user data (model library, settings profiles), the small queued items
-   (per-atom charge with a Hirshfeld readout, bond-angle follow-ups, a refined bond point, auto-sizing the
-   cell, a lowest-of-spin-starts teacher that would also help the 3-hydrogen case), and the precision
-   milestone.
-7. **Later roadmap:** long-range electrostatics (M9), periodic cells with pressure (M10, for crystals and
-   "carbon under pressure"), and a nuclear-events layer (stochastic decay on top of point nuclei; explicit
-   nucleons are ruled out for scale and for rule 1).
+1. **Broken symmetry:** a broken-symmetry SCF start for stretched bonds (spec on branch `broken-symmetry`).
+2. **The app MCP server:** a dev-only `--mcp` localhost server to read live state and send `ui::Action`s.
+3. **Long reach, phase 1:** keep far-pair samples and the pair graph past 6 Bohr (plan on branch `long-reach`), then a Model reach setting beside Quality.
+4. **Charged collections:** per-charge and forced-multiplicity shared collections with an automatic switch.
+5. **Targeted teach:** drag-select a range on the pair graph, or Fill gaps, for a targeted pair scan.
+6. **PBE** beside LSDA, the default once its gates pass; published pseudopotentials as an opt-in after it.
+7. **rVV10 dispersion** on PBE, with its own GPU kernel.
+8. **Intermolecular accuracy:** a tighter target for between-molecule energies and forces (H₂–H₂ about 0.1 mHa).
+9. **Later roadmap:** long-range electrostatics (M9), periodic cells with pressure (M10), and a nuclear-events layer
+   (stochastic decay on top of point nuclei; explicit nucleons are ruled out for scale and for rule 1).
+
+**Owed to the user's hand-testing** (from the smearing ledger): the migration offer, Later, pause and resume, the
+summary and resume-on-attach; attach leaving the first fit to the background.
 
 ---
 
@@ -1311,7 +1384,6 @@ From the ledgers, the plans and the standing order of work:
 - Timestamps are commit times. Agents often worked before they committed, so a "duration" is the span
   between commits and not effort.
 - Parallel tracks overlap. The 4-day span is real; adding up milestone durations would double count.
-- Branches are still moving. M7 and the Activity tab are unmerged at the time of writing, and `main` is
-  at the orbital-viewer merge. Numbers for them come from branch ledgers and `references.md` on those
-  branches.
+- Branches are still moving. The timeline runs to the Fermi–Dirac branch's merge (Nov 20). Numbers for
+  unmerged work come from branch ledgers and `references.md` on those branches.
 - I did not verify the ledgers by re-running anything; no builds or tests were run for this document.

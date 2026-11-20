@@ -183,6 +183,17 @@
 //! for an offer. The format and what it leaves out are the `checkpoint` module's doc. The caller
 //! keeps the surrogate's samples next to it (`SurrogateKs`'s `Trainable::resume_pass` refuses a
 //! checkpoint whose sample count or surface differs from what it holds).
+//! A checkpoint whose provenance carries the tag the previous solver wrote for the scene's surface (the last
+//! shared-shell build's, `pseudo::legacy_tag_of`) is refused with "the interrupted pass was started with the previous
+//! solver" and left as it is (Fermi–Dirac spec §7.7).
+//!
+//! # The collection migration (plan 2026-11-13 Task 14)
+//!
+//! [`Sampler::migration`] is a pass of its own kind: the re-solve of a predecessor collection's samples for the new
+//! solver ([`migrate`], its module doc: the cold solves, the U/T/S classification against ε_E and ε_F, what is appended,
+//! the references, the resume through `migration.txt`). It is stepped, paused and cancelled like any pass, so it shares
+//! the GPU with the live scene the same way; it has no checkpoint (its cursor is in `migration.txt`), no ghost, and is
+//! never rescaled.
 
 use sim::activity::{PassJob, ScfEnd, TeachEvent, TeachOrigin, TeachOutcome, TeachRule};
 use sim::sampling::{GhostAtom, GhostFinished, GhostJob, GhostOutcome, PassGhost};
@@ -191,13 +202,15 @@ use sim::references::{AtomScan, ReferenceKey};
 use sim::sampling::{allowed_multiplicities, SamplingPlan, SamplingProgress, EMPTY_SCENE, MAX_JOBS};
 use sim::thermostat::{standard_normal, Csvr};
 use sim::{ForceProvider, ForceResult, ProviderError, ReferenceCache, Scene, CELL_MARGIN_H};
-use crate::surrogate::{box_affected_face_density, lone_pass_refusal, no_neighbours, SurrogateKs, MIN_RESIDUAL_DOF};
+use crate::surrogate::{box_affected_face_density, lone_pass_refusal, no_neighbours, PassKeep, SurrogateKs, MIN_RESIDUAL_DOF};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::collections::VecDeque;
 use std::time::Instant;
 use surrogate::{Basis, Provenance, Sample, SampleTag};
 use units::isotopes::symbol;
+
+pub mod migrate;
 
 /// The hot burst's CSVR coupling time (fs).
 pub const HOT_BURST_TAU_FS: f64 = 5.0;
@@ -438,6 +451,12 @@ pub struct Sampler {
     added: usize,
     /// Samples added whose teacher answer was box-affected (module doc, "Box-affected samples").
     boxed: usize,
+    /// Samples added with stray atoms, held out of the fit until a composition check measures them
+    /// (`surrogate::stray`, `PassKeep::Kept { held: true }`; the finish note beside the box-affected one).
+    stray_held: usize,
+    /// `added` when this pass was resumed from a checkpoint (`None` for a fresh pass): `stray_held` is not in the
+    /// checkpoint, so its finish note counts against the samples added since the resume.
+    added_at_resume: Option<usize>,
     /// Geometries the cell guard skipped (the burst's tail included), and scan points skipped
     /// beyond a failed one (`SamplingProgress::skipped` counts both, and the untrainable answers).
     cell_skipped: usize,
@@ -477,6 +496,8 @@ pub struct Sampler {
     time_limit_floor_s: f64,
     /// Sample solves given up in a row: each doubles the limit (module doc, "The time limit").
     timeouts_in_a_row: usize,
+    /// A collection migration's re-solve pass (`Sampler::migration`; the `migrate` module): every step is its step.
+    migration: Option<Box<migrate::Migrator>>,
 }
 
 /// Every nucleus at least [`CELL_MARGIN_H`]·h inside every face, finite (the providers' R12
@@ -649,6 +670,8 @@ impl Sampler {
             notes,
             added: 0,
             boxed: 0,
+            stray_held: 0,
+            added_at_resume: None,
             cell_skipped: 0,
             tail_skipped: 0,
             collection_skipped: 0,
@@ -668,6 +691,7 @@ impl Sampler {
             timed_out: None,
             time_limit_floor_s: TIME_LIMIT_FLOOR_S,
             timeouts_in_a_row: 0,
+            migration: None,
         })
     }
 
@@ -701,6 +725,8 @@ impl Sampler {
             notes: Vec::new(),
             added: 0,
             boxed: 0,
+            stray_held: 0,
+            added_at_resume: None,
             cell_skipped: 0,
             tail_skipped: 0,
             collection_skipped: 0,
@@ -720,6 +746,7 @@ impl Sampler {
             timed_out: None,
             time_limit_floor_s: TIME_LIMIT_FLOOR_S,
             timeouts_in_a_row: 0,
+            migration: None,
         }
     }
 
@@ -752,6 +779,33 @@ impl Sampler {
         sampler.progress.target = None;
         sampler.references_only = true;
         Ok(sampler)
+    }
+
+    /// A collection migration's **re-solve pass** (the `migrate` module; Fermi–Dirac spec §7.3): a pass of its own kind —
+    /// stepped, paused, cancelled and refused like any other (`SurrogateKs`' one running pass) — whose every step is
+    /// [`migrate::Migrator::step`]. It has no scene, no checkpoint (it resumes from its `migration.txt`), no ghost and no
+    /// rescale.
+    pub fn migration(m: migrate::Migrator) -> Sampler {
+        let empty = Scene { nuclei: Vec::new(), cell: sim::Cell { n: 1, h: 1.0 }, charge: 0, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::None, train_mask: None };
+        let mut sampler = Sampler::targeted(&empty, Vec::new());
+        sampler.progress = m.progress();
+        sampler.migration = Some(Box::new(m));
+        sampler
+    }
+
+    /// A collection migration's re-solve pass ([`migration`](Self::migration)).
+    pub fn is_migration(&self) -> bool {
+        self.migration.is_some()
+    }
+
+    /// The re-solve pass's state ([`migration`](Self::migration)).
+    pub fn migrator(&self) -> Option<&migrate::Migrator> {
+        self.migration.as_deref()
+    }
+
+    /// The re-solve pass's state, to change it (a test's injected crash).
+    pub fn migrator_mut(&mut self) -> Option<&mut migrate::Migrator> {
+        self.migration.as_deref_mut()
     }
 
     /// The species whose reference scan converged nothing in this pass, with how it failed (the
@@ -826,7 +880,10 @@ impl Sampler {
     }
 
     pub fn progress(&self) -> SamplingProgress {
-        self.progress.clone()
+        match &self.migration {
+            Some(m) => m.progress(),
+            None => self.progress.clone(),
+        }
     }
 
     /// The planned pair scans (as built: after a [`rescale`](Self::rescale) an evenly spaced
@@ -875,7 +932,11 @@ impl Sampler {
     /// Lines for the user (reference energies and their multiplicity, skipped pairs, failures);
     /// drained by the caller.
     pub fn take_notes(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.notes)
+        let mut notes = std::mem::take(&mut self.notes);
+        if let Some(m) = self.migration.as_mut() {
+            notes.extend(m.take_notes());
+        }
+        notes
     }
 
     /// Solves the queued jobs stand for (a reference job counts its multiplicities left).
@@ -903,7 +964,7 @@ impl Sampler {
     /// `SamplingProgress::total` follows. No-op on a finished pass.
     pub fn rescale(&mut self, plan: &SamplingPlan) {
         // a teach-around pass is its own fixed job list: never re-sized
-        if self.progress.finished || self.is_targeted() {
+        if self.progress.finished || self.is_targeted() || self.migration.is_some() {
             return;
         }
         let pairs = self.scans.len();
@@ -1020,7 +1081,7 @@ impl Sampler {
     /// evaluation, computed the way [`burst_step`](Self::burst_step) does (a half-kick and a drift
     /// from the last solved geometry; the thermostat's draws are untouched).
     pub fn ghost(&self, surrogate: &SurrogateKs) -> Option<PassGhost> {
-        if self.progress.finished {
+        if self.progress.finished || self.migration.is_some() {
             return None;
         }
         let base: Vec<[f64; 3]> = self.scene.nuclei.iter().map(|n| n.pos).collect();
@@ -1083,6 +1144,9 @@ impl Sampler {
 
     /// Ends the pass early: what was sampled stays in the surrogate.
     pub fn cancel(&mut self) {
+        if let Some(m) = self.migration.as_mut() {
+            m.cancel();
+        }
         if !self.progress.finished {
             self.progress.cancelled = true;
             self.progress.finished = true;
@@ -1134,6 +1198,9 @@ impl Sampler {
     }
 
     fn step_impl(&mut self, mut teacher: Option<&mut dyn ForceProvider>, surrogate: &mut SurrogateKs, should_abort: &mut dyn FnMut() -> bool) -> Result<Option<SamplingProgress>, ProviderError> {
+        if let Some(m) = self.migration.as_mut() {
+            return m.step(teacher, surrogate, should_abort);
+        }
         loop {
             if self.progress.finished {
                 return Ok(None);
@@ -1325,6 +1392,7 @@ impl Sampler {
                             ev.n_atoms = job.scene.nuclei.len();
                             ev.solve_ms = r.stats.solve_ms as f64;
                             ev.scf_steps = Some(r.stats.scf_steps);
+                            ev.ts = Some(r.stats.energy.ts);
                             ev.scf_end = converged(r.stats.scf_steps);
                             surrogate.push_event(ev);
                             self.holdouts.push(Holdout { blocker: job.blocker, unfit: r.stats.untrainable().is_some(), face: r.stats.face_density, multiplicity: r.stats.multiplicity, energy: r.energy, forces: r.forces, scene: job.scene });
@@ -1374,6 +1442,7 @@ impl Sampler {
                             ev.n_atoms = sc.nuclei.len();
                             ev.solve_ms = res.stats.solve_ms as f64;
                             ev.scf_steps = Some(res.stats.scf_steps);
+                            ev.ts = Some(res.stats.energy.ts);
                             ev.scf_end = converged(res.stats.scf_steps);
                             surrogate.push_event(ev);
                             self.shell_checks.push(ShellCheck { pair: pair_z, r, r_cut: self.r_cut, unfit: res.stats.untrainable().is_some(), face: res.stats.face_density, energy: res.energy, forces: res.forces, scene: sc });
@@ -1595,9 +1664,10 @@ impl Sampler {
     /// hot-burst geometry's temperature, module doc "Activity events").
     fn record(&mut self, surrogate: &mut SurrogateKs, scene: &Scene, r: ForceResult, tag: SampleTag, burst_t: Option<f64>) {
         let (face, multiplicity) = (r.stats.face_density, r.stats.multiplicity);
-        // M7 (spec §5.6; Task 6 review A.6): overlapping cores or a changed shared-shell pattern are never samples
+        // M7 (spec §5.6) and spec 2026-11-13 §6.3: overlapping cores or a flagged branch jump are never samples; the
+        // note cites each reason's own section (plan 2026-11-13 Task 8 review M5)
         if let Some(why) = r.stats.untrainable() {
-            let note = format!("sampling: a {} geometry was not kept ({why} — spec §5.6)", self.progress.stage);
+            let note = format!("sampling: a {} geometry was not kept ({why} — {})", self.progress.stage, sim::untrainable_citation(why));
             self.progress.done += 1;
             self.progress.skipped += 1;
             let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(pass_job(tag)), TeachOutcome::UnfitNotKept);
@@ -1605,6 +1675,7 @@ impl Sampler {
             ev.n_atoms = scene.nuclei.len();
             ev.solve_ms = r.stats.solve_ms as f64;
             ev.scf_steps = Some(r.stats.scf_steps);
+            ev.ts = Some(r.stats.energy.ts);
             ev.scf_end = converged(r.stats.scf_steps);
             ev.burst_t = burst_t;
             ev.detail = note.clone();
@@ -1625,6 +1696,7 @@ impl Sampler {
             ev.n_atoms = scene.nuclei.len();
             ev.solve_ms = r.stats.solve_ms as f64;
             ev.scf_steps = Some(r.stats.scf_steps);
+            ev.ts = Some(r.stats.energy.ts);
             ev.scf_end = converged(r.stats.scf_steps);
             ev.burst_t = burst_t;
             ev.detail = note.clone();
@@ -1633,7 +1705,7 @@ impl Sampler {
             self.mark(GhostOutcome::Skipped, ghost_atoms(scene));
             return;
         }
-        let (solve_ms, scf) = (r.stats.solve_ms as f64, r.stats.scf_steps);
+        let (solve_ms, scf, ts) = (r.stats.solve_ms as f64, r.stats.scf_steps, r.stats.energy.ts);
         let detail = format!("sampling: {} {}/{}", self.progress.stage, self.progress.done + 1, self.progress.total);
         let sample = Sample {
             pos: scene.nuclei.iter().map(|n| n.pos).collect(),
@@ -1645,13 +1717,43 @@ impl Sampler {
             force_mask: None, use_energy: true,
         };
         let boxed = face.is_some_and(|rho| rho > box_affected_face_density(scene.cell.h));
-        let outcome = match surrogate.add_sample_answer(sample, scene, face, multiplicity) {
-            Ok(()) => {
+        let mut detail = detail;
+        let outcome = match surrogate.add_pass_sample(sample, scene, face, multiplicity) {
+            // stray atoms the floor refuses (`surrogate::stray`, spec 2026-11-18 §4.3, review C1): never kept
+            Ok(PassKeep::StrayNotKept(why)) => {
+                let note = format!("sampling: a {} geometry was not kept (stray atoms — {why})", self.progress.stage);
+                self.progress.done += 1;
+                self.progress.skipped += 1;
+                let mut ev = TeachEvent::new(TeachOrigin::Pass, TeachRule::Pass(pass_job(tag)), TeachOutcome::StrayNotKept);
+                ev.face_density = face;
+                ev.n_atoms = scene.nuclei.len();
+                ev.solve_ms = solve_ms;
+                ev.scf_steps = Some(scf);
+                ev.ts = Some(ts);
+                ev.scf_end = converged(scf);
+                ev.burst_t = burst_t;
+                ev.detail = note.clone();
+                surrogate.push_event(ev);
+                self.notes.push(note);
+                self.mark(GhostOutcome::Skipped, ghost_atoms(scene));
+                return;
+            }
+            Ok(PassKeep::Kept { held }) => {
                 self.added += 1;
                 if boxed {
                     self.boxed += 1;
                 }
-                if boxed { TeachOutcome::KeptBoxAffected } else { TeachOutcome::Kept }
+                if held {
+                    self.stray_held += 1;
+                    detail.push_str(" — kept, held out of the fit until a composition check measures its stray atoms");
+                }
+                if held {
+                    TeachOutcome::KeptStrayHeld
+                } else if boxed {
+                    TeachOutcome::KeptBoxAffected
+                } else {
+                    TeachOutcome::Kept
+                }
             }
             Err(e) => {
                 self.progress.failed += 1;
@@ -1668,6 +1770,7 @@ impl Sampler {
         ev.n_atoms = scene.nuclei.len();
         ev.solve_ms = solve_ms;
         ev.scf_steps = Some(scf);
+        ev.ts = Some(ts);
         ev.scf_end = converged(scf);
         ev.burst_t = burst_t;
         ev.detail = detail;
@@ -1834,6 +1937,16 @@ impl Sampler {
                 self.boxed,
                 self.added,
                 box_affected_face_density(self.scene.cell.h)
+            ));
+        }
+        if self.stray_held > 0 {
+            let of = match self.added_at_resume {
+                Some(a0) => format!("{} samples kept since the resume", self.added.saturating_sub(a0)),
+                None => format!("{} samples", self.added),
+            };
+            self.notes.push(format!(
+                "sampling: {} of {of} have stray atoms (no neighbour within the model's cutoff) — kept, held out of the fit until a composition check measures that the molecule and its free atoms add up",
+                self.stray_held
             ));
         }
     }

@@ -119,7 +119,8 @@ pub(crate) fn standardised_rows(
             }
         }
     }
-    let per = if per_atom { 1.0 / n as f64 } else { 1.0 };
+    // the fit's own row (`crate::fit` module doc, "Design matrix"): per N_e
+    let per = if per_atom { 1.0 / crate::energy_row_atoms(basis, pos) as f64 } else { 1.0 };
     for (c, v) in e_row.iter_mut().enumerate() {
         *v *= per * d[c];
     }
@@ -232,7 +233,7 @@ pub fn leave_one_out(model: &Model, sample: &Sample) -> Option<SampleLoo> {
     }
     // in-sample residuals y − Φθ, from the model's own predictions (the same rows, expanded)
     let pred = model.predict(&sample.pos, &sample.z, false).ok()?;
-    let per = if model.energy_per_atom { 1.0 / n as f64 } else { 1.0 };
+    let per = if model.energy_per_atom { 1.0 / crate::energy_row_atoms(&model.basis, &sample.pos) as f64 } else { 1.0 };
     let mut e = Vec::with_capacity(m);
     if sample.use_energy {
         e.push((sample.energy - pred.energy) * per);

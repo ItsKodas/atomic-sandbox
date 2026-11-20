@@ -3,18 +3,28 @@
 //! envelope and can keep learning), the last [`FitReport`] and, optionally, the training
 //! [`Sample`]s themselves. Hand-written serialisation (no serde): the format is small and fixed.
 //!
-//! # Format (versions 1 to 8; this build writes a fitted model as version 7 — for a body-2 or a
-//! body-3 basis alike — or as version 8 for a body-4 basis, samples without a fit as version 6,
-//! and reads every version)
+//! # Format (versions 1 to 10; this build writes every file as version 9, which carries the body
+//! of version 7 for a fitted model — a body-2 or a body-3 basis alike —, of version 8 for a body-4
+//! basis, of version 6 for samples without a fit — or as version 10, the same with the audit
+//! history's trust-tightening arrays, when the history carries them; it reads every version)
 //!
 //! ```text
-//! "ASMODEL1" … "ASMODEL8"          8 bytes, magic (the version)
+//! "ASMODEL1" … "ASMODEL9", "ASMOD010"   8 bytes, magic (the version)
 //! header_len                       u64 little-endian
 //! header                           header_len bytes of UTF-8 JSON (below)
 //! array₁ … arrayₖ                  in the order the header's "arrays" lists them, each
 //!                                  u64 LE length n, then n f64 LE values
 //! (end of file — trailing bytes are an error)
 //! ```
+//!
+//! **The magic** names the version: `ASMODEL1` … `ASMODEL9` for versions 1 to 9, and — the
+//! eight bytes holding no two-digit `ASMODEL` — `ASMOD` followed by three decimal digits for
+//! version 10 on (`ASMOD010`, … `ASMOD999`; [`magic_version`]). The layout was fixed with version 9
+//! (plan 2026-11-13 Task 13 fix round 1) so that this build, and every build after it, refuses a
+//! later file as "format version N is newer than this build" — by its number — and treats any other
+//! `ASMOD…` magic it does not know as newer too, never as "not a model sidecar". (A build before
+//! version 9 knows only `ASMODEL<digit>`: it calls an `ASMOD010` file "not a model sidecar" — a
+//! refusal all the same, the file untouched.)
 //!
 //! The header is one JSON object with the keys `format` (the magic as a string), `created_by`
 //! (string), `provenance` {grid_n, h, sigma, tol, charge, multiplicity (int or null), teacher;
@@ -68,7 +78,7 @@
 //!
 //! | name | length | content |
 //! |---|---|---|
-//! | sample_quarantine | M | 0 trained on, 1 quarantined, 2 superseded, 3 box-affected and excluded, 7 forgotten by the user, 8 forgotten with its fence lifted (exact integral f64) |
+//! | sample_quarantine | M | 0 trained on, 1 quarantined, 2 superseded, 3 box-affected and excluded, 7 forgotten by the user, 8 forgotten with its fence lifted (exact integral f64); never 9 ("Version 9") |
 //!
 //! A file without it reads as "nothing quarantined", so every earlier file still reads, and a
 //! file with nothing quarantined is written exactly as before. Code 7 (`crate::quarantine::Q_FORGOTTEN`,
@@ -141,7 +151,8 @@
 //!
 //! **Version 4** (M7 pseudopotentials): identical to version 3
 //! except that `provenance` carries the required `ionic` string (`Provenance::ionic`: `"none"` for the
-//! all-electron surface, else `"<policy>/<recipe hash>"`, at most 256 characters). Unlike `masses`,
+//! all-electron surface — `none/fd5e-3/pin1e-5` since the Fermi–Dirac switch, plan 2026-11-13 Task 9 — else
+//! `"<policy>/<recipe hash>/…"`, at most 256 characters). Unlike `masses`,
 //! `ionic` **is compared** — a model taught on one ionic surface is never consulted on another.
 //! Versions 1 to 3 are still read, with `ionic = "none"`: every model before M7 was all-electron.
 //!
@@ -216,6 +227,51 @@
 //! before this one refuses a version-8 file as "newer than this build" instead of misreading its
 //! arrays.
 //!
+//! **Version 9** (the Fermi–Dirac switch, plan 2026-11-13 Task 13; spec
+//! `2026-11-13-fermi-smearing-design.md` §7.7, ruling R11, F1: the merged `main`'s eight versions,
+//! plus one): **every file this build writes**. The layout is unchanged; the meaning moved — a
+//! sample's energy is the Mermin free energy F on a Fermi–Dirac surface, and the provenance's ionic
+//! tag has the new form —, so the bump makes an older build refuse the file cleanly ("format version
+//! 9 is newer than this build") rather than by its tag, and puts `.model` files in the app's
+//! downgrade warnings (`app::update::formats`). The header's first two keys are `format`
+//! ("ASMODEL9") and `body`, the version whose layout the rest of the file has: **6** (samples without a fit, [`write_samples`]),
+//! **7** (a fitted model) or **8** (a fitted model with a body-4 basis) — R11's old-body set, every
+//! body the reader took from version 6 up (`purge-forgotten` added none). Everything after the
+//! header reads as that body's file, with that body's rules ([`read`] refuses body 6 as it refuses a
+//! version-6 file); a version-9 header without `body`, or naming any other, is refused. With the
+//! magic set back to the body's and the two keys to that body's `format`, the bytes are exactly the
+//! earlier writer's. One more entry in [`MAGICS`] covers all three bodies; it is the last version
+//! an `ASMODEL<digit>` magic can name.
+//!
+//! **Version 10** (trust tightening, plan 2026-11-19 Task 1: K = 9, plus one; magic `ASMOD010`,
+//! "The magic"): version 9 whose audit history carries the three per-point trust-tightening arrays
+//! (`crate::history`, "Trust-tightening fields") — `audit_fit`, `audit_flags`,
+//! `audit_energy_std_epistemic`, `points` each, declared and stored after the species array, last
+//! in the file. The header's first two keys are `format` ("ASMOD010") and `body`, **7** or **8**
+//! (only a fitted model has a history); everything else is that body's, as in version 9. Written
+//! only when some point carries a fit id, a flag or an epistemic energy std: every other file is
+//! still version 9, bit for bit. Strict: a version-10 file without an `audit_history` key, without
+//! the three arrays, or naming body 6 is refused, and so are the three arrays under the version-9
+//! magic. The bump is real: a version-9 build reads exactly the arrays its layout names, so it
+//! would refuse the three as undeclared — it refuses the file as "format version 10 is newer than
+//! this build" instead, and the app's downgrade warnings name it (`app::update::formats`).
+//!
+//! **The fit id** (trust tightening Task 2): a fitted model's file may carry the header key
+//! `fit_id` (a JSON integer below 2⁵³, after `class_memory`), the id of the fit it holds — the id
+//! its history points carry (`crate::history`, "Trust-tightening fields") and the one an install
+//! takes back, so a reload adds no fit. Optional, under version 9 or 10 alike: it bumps nothing,
+//! since every reader ignores header keys it does not read; absent, the header is the older
+//! writer's byte for byte and the field reads `None`. Strict when present: anything but such an
+//! integer (or null) is refused.
+//!
+//! **Code 9 is never written** (`crate::quarantine::Q_RESOLVED`, re-solved for the new solver and
+//! awaiting review, ruling R11): every writer leaves a sample whose quarantine code is 9 out of the
+//! file — its flag, face density, mask and box with it, the later samples moving down; a failed
+//! audit naming a left-out sample keeps no index, one naming a later sample follows it. Such a
+//! sample lives in its collection, the store of record, and nowhere else; the file is the one the
+//! store without it would give. So `sample_quarantine` never holds a 9, and its reader still
+//! refuses one (`crate::quarantine::is_persisted_code`).
+//!
 //! # Validation
 //!
 //! [`read`] never panics on a corrupt or hostile file: every length is checked against the
@@ -260,11 +316,44 @@ pub const MAGIC_V7: &[u8; 8] = b"ASMODEL7";
 /// The first eight bytes of a version-8 file: version 7 with a body-4 basis (module doc, "Version
 /// 8"; M8a Task 5). A basis without body-4 is still written as version 7, bit for bit.
 pub const MAGIC_V8: &[u8; 8] = b"ASMODEL8";
+/// The first eight bytes of a version-9 file, every file this build writes: the Fermi–Dirac
+/// switch's bump (module doc, "Version 9"; plan 2026-11-13 Task 13, ruling R11, F1: Task 2's
+/// `MAGICS.len()` of 8, plus one). Its header names the body it carries (6, 7 or 8).
+pub const MAGIC_V9: &[u8; 8] = b"ASMODEL9";
+/// The first eight bytes of a version-10 file: version 9 whose audit history carries the
+/// trust-tightening per-point arrays (module doc, "Version 10"; plan 2026-11-19 Task 1: K = 9 =
+/// `MAGICS.len()` before it, plus one). Written only when the history carries them; its header
+/// names the fitted body it carries (7 or 8).
+pub const MAGIC_V10: &[u8; 8] = b"ASMOD010";
 /// Every magic this build reads, oldest first (version = index + 1). Its length is the model-file
 /// format a release manifest records (`app::update::formats`): a new version's magic goes here
-/// with its reader in `parse_header` (the app's test that `ASMODEL<len + 1>` is refused as newer
-/// fails until it does).
-pub const MAGICS: [&[u8; 8]; 8] = [MAGIC, MAGIC_V2, MAGIC_V3, MAGIC_V4, MAGIC_V5, MAGIC_V6, MAGIC_V7, MAGIC_V8];
+/// with its reader in `parse_header`. `ASMODEL9` is the last version an `ASMODEL<digit>` magic
+/// holds: from 10 on the magic is `ASMOD<three digits>` (module doc, "The magic"; [`magic_version`]),
+/// which this build already refuses as newer, by number.
+pub const MAGICS: [&[u8; 8]; 10] = [MAGIC, MAGIC_V2, MAGIC_V3, MAGIC_V4, MAGIC_V5, MAGIC_V6, MAGIC_V7, MAGIC_V8, MAGIC_V9, MAGIC_V10];
+/// The version an 8-byte sidecar magic names under the magic layout (module doc, "The magic"):
+/// `ASMODEL<d>` is version d (1 to 9), `ASMOD<ddd>` — three decimal digits — version ddd (10 to 999);
+/// `None` for anything else (`ASMOD009`, `ASMODEL0`, another file's magic). Whether this build reads
+/// that version is [`MAGICS`]'s; `app::update::formats` reads a file's model version with it.
+pub fn magic_version(magic: &[u8]) -> Option<u32> {
+    let m = magic.get(..8)?;
+    if &m[..7] == b"ASMODEL" && (b'1'..=b'9').contains(&m[7]) {
+        return Some(u32::from(m[7] - b'0'));
+    }
+    if &m[..5] == b"ASMOD" && m[5..].iter().all(u8::is_ascii_digit) {
+        let v = m[5..].iter().fold(0u32, |a, &d| 10 * a + u32::from(d - b'0'));
+        return (v >= 10).then_some(v);
+    }
+    None
+}
+
+/// The bodies a version-9 file may carry (ruling R11's old-body set: every body the reader took
+/// from version 6 up; `purge-forgotten` added none): samples without a fit (6), a fitted model (7),
+/// a fitted model with a body-4 basis (8).
+const BODIES_V9: [u8; 3] = [6, 7, 8];
+/// The bodies a version-10 file may carry: a fitted model's (7, 8) — only a fitted model has an
+/// audit history (module doc, "Version 10").
+const BODIES_V10: [u8; 2] = [7, 8];
 /// Species a body-3 file may declare (a hostile-header guard: P₃ grows with (S·n_max)²).
 const MAX_SPECIES_V2: usize = 32;
 /// The `reference_rule` of references solved under ruling S9: each isolated atom at its
@@ -307,6 +396,9 @@ pub struct Sidecar {
     /// (trusted, the model generation it was entered at) — header key `class_memory` (version 7;
     /// module doc). Empty when absent.
     pub class_memory: ClassMemory,
+    /// The writer's fit id (header key `fit_id`, optional; module doc, "Version 10"): the id its
+    /// history points carry for this fit. `None` when absent (a file written before the key).
+    pub fit_id: Option<u64>,
 }
 
 /// What a version-6 file holds: training samples taught before any fit formed (module doc,
@@ -446,21 +538,80 @@ pub fn write_full_with_history(path: &Path, model: &Model, acc: &Accumulator, re
 /// `class_memory`, written only when `memory` is not empty — module doc, "Version 7").
 #[allow(clippy::too_many_arguments)]
 pub fn write_full_with_memory(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory, memory: &[(EnvKey, bool, Option<u64>)]) -> io::Result<()> {
+    write_full_with_fit_id(path, model, acc, report, samples, reference_rule, quarantine, face_density, solves, audits, history, memory, None)
+}
+
+/// [`write_full_with_memory`] with the writer's fit id (header key `fit_id`, written only when
+/// `fit_id` is `Some`; module doc, "Version 10"). `InvalidInput` for an id of 2⁵³ or more.
+#[allow(clippy::too_many_arguments)]
+pub fn write_full_with_fit_id(path: &Path, model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory, memory: &[(EnvKey, bool, Option<u64>)], fit_id: Option<u64>) -> io::Result<()> {
     if !quarantine.is_empty() && quarantine.len() != samples.len() {
         return Err(invalid_input(format!("sidecar: {} quarantine flags for {} samples", quarantine.len(), samples.len())));
     }
     if !face_density.is_empty() && face_density.len() != samples.len() {
         return Err(invalid_input(format!("sidecar: {} face densities for {} samples", face_density.len(), samples.len())));
     }
-    let bytes = encode(model, acc, report, samples, reference_rule, quarantine, face_density, solves, audits, history, memory)?;
+    // ruling R11: code-9 samples stay in the collection, never in a file (module doc, "Version 9")
+    let bytes = match resolved_left_out(quarantine) {
+        None => encode(model, acc, report, samples, reference_rule, quarantine, face_density, solves, audits, history, memory, fit_id)?,
+        Some(map) => {
+            // a failed audit naming a kept sample follows it; one naming a left-out sample keeps no
+            // index (its answer is not in this file)
+            let audits: Vec<AuditCase> = audits.iter().map(|a| AuditCase { index: a.index.and_then(|i| map.get(i).copied().unwrap_or(Some(i))), ..a.clone() }).collect();
+            encode(model, acc, report, &kept(samples, &map), reference_rule, &kept(quarantine, &map), &kept(face_density, &map), solves, &audits, history, memory, fit_id)?
+        }
+    };
     write_atomic(path, &bytes)
 }
 
-/// Writes a version-6 file (module doc, "Version 6"): training samples without a fit, through a
+/// The old → new index of every stored sample a file keeps when `quarantine` holds a code-9
+/// sample (`crate::quarantine::Q_RESOLVED`, left out: ruling R11), `None` when it holds none (the
+/// file is written as given).
+fn resolved_left_out(quarantine: &[u8]) -> Option<Vec<Option<usize>>> {
+    use crate::quarantine::Q_RESOLVED;
+    if !quarantine.contains(&Q_RESOLVED) {
+        return None;
+    }
+    let mut next = 0usize;
+    Some(
+        quarantine
+            .iter()
+            .map(|&q| {
+                (q != Q_RESOLVED).then(|| {
+                    next += 1;
+                    next - 1
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The entries of `v` (one per stored sample, or none at all) whose sample `map` keeps.
+fn kept<T: Clone>(v: &[T], map: &[Option<usize>]) -> Vec<T> {
+    v.iter().zip(map).filter(|(_, m)| m.is_some()).map(|(x, _)| x.clone()).collect()
+}
+
+/// Writes samples without a fit (body 6 under the version-9 magic; module doc, "Version 6", "Version 9"), through a
 /// temporary file renamed into place like [`write_full_with_audits`]. `InvalidInput` for an empty
 /// set, flags of the wrong length, or references that are not finite and strictly ascending in Z.
 pub fn write_samples(path: &Path, set: &SampleSet) -> io::Result<()> {
-    let bytes = encode_samples(set)?;
+    // ruling R11: code-9 samples stay in the collection, never in a file (module doc, "Version 9");
+    // flags of the wrong length are left for `encode_samples` to refuse
+    let n = set.samples.len();
+    let left_out = if set.quarantine.len() == n { resolved_left_out(&set.quarantine) } else { None };
+    let bytes = match left_out {
+        None => encode_samples(set)?,
+        Some(map) => {
+            let per_sample = |len: usize| len == n;
+            encode_samples(&SampleSet {
+                samples: kept(&set.samples, &map),
+                quarantine: kept(&set.quarantine, &map),
+                face_density: if per_sample(set.face_density.len()) { kept(&set.face_density, &map) } else { set.face_density.clone() },
+                sample_box: if per_sample(set.sample_box.len()) { kept(&set.sample_box, &map) } else { set.sample_box.clone() },
+                ..set.clone()
+            })?
+        }
+    };
     write_atomic(path, &bytes)
 }
 
@@ -586,10 +737,14 @@ fn invalid_input(msg: String) -> io::Error {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory, memory: &[(EnvKey, bool, Option<u64>)]) -> io::Result<Vec<u8>> {
+fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples: &[Sample], reference_rule: Option<&str>, quarantine: &[u8], face_density: &[f64], solves: Option<&TeacherSolves>, audits: &[AuditCase], history: &AuditHistory, memory: &[(EnvKey, bool, Option<u64>)], fit_id: Option<u64>) -> io::Result<Vec<u8>> {
+    if fit_id.is_some_and(|id| id >= FIT_ID_LIMIT) {
+        return Err(invalid_input(format!("sidecar: fit id {} is not below 2^53", fit_id.unwrap_or(0))));
+    }
     let basis = &model.basis;
     let body3 = basis.body3;
-    let magic: &[u8; 8] = if basis.body4 { MAGIC_V8 } else { MAGIC_V7 };
+    // the body this file carries under the version-9 magic (module doc, "Version 9")
+    let body: u8 = if basis.body4 { 8 } else { 7 };
     if (body3 || basis.body4) && basis.l_max > crate::basis::L_MAX_SUPPORTED {
         return Err(invalid_input(format!("sidecar: body-3 l_max {} exceeds the supported {}", basis.l_max, crate::basis::L_MAX_SUPPORTED)));
     }
@@ -672,6 +827,17 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         // the species array (`crate::history` "Species", M8a user-test fix 2), after the ten
         arrays.push((HistoryArrays::SPECIES, &a.species));
     }
+    // the trust-tightening arrays (version 10, module doc), last: only when the history carries
+    // them, so every other file is version 9's bytes
+    let trust = hist_arrays.as_ref().and_then(HistoryArrays::trust_fields);
+    if let Some(t) = &trust {
+        arrays.extend(t.iter().copied());
+        // the optional model-force magnitudes after the three (Task 5 fix round 1)
+        if let Some(a) = hist_arrays.as_ref().filter(|a| !a.model_force.is_empty()) {
+            arrays.push((HistoryArrays::MODEL_FORCE, &a.model_force));
+        }
+    }
+    let magic = if trust.is_some() { MAGIC_V10 } else { MAGIC_V9 };
 
     let provenance = provenance_json(&model.provenance);
     let species = format!("[{}]", basis.species.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(","));
@@ -737,8 +903,10 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
     // them differ from the energy rows, so every other file is byte-identical
     let acc_json = if acc.n_scale != acc.n_e { format!("{},\"n_scale\":{}}}", &acc_json[..acc_json.len() - 1], acc.n_scale) } else { acc_json };
     let arrays_json = arrays_json(&arrays);
+    let [format, body] = front(magic, body);
     let mut pairs: Vec<(&str, String)> = vec![
-        ("format", string(std::str::from_utf8(magic).expect("ASCII"))),
+        format,
+        body,
         ("created_by", string(CREATED_BY)),
         ("provenance", provenance),
         ("basis", basis_json),
@@ -753,17 +921,19 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
     ];
     if with_history {
         let u = history.unrecorded;
-        pairs.push((
-            "audit_history",
-            obj(&[
-                ("points", history.len().to_string()),
-                ("recorded", history.recorded().to_string()),
-                ("no_variance", u.no_variance.to_string()),
-                ("box_affected", u.box_affected.to_string()),
-                ("draft", u.draft.to_string()),
-                ("unfit", u.unfit.to_string()),
-            ]),
-        ));
+        let mut fields = vec![
+            ("points", history.len().to_string()),
+            ("recorded", history.recorded().to_string()),
+            ("no_variance", u.no_variance.to_string()),
+            ("box_affected", u.box_affected.to_string()),
+            ("draft", u.draft.to_string()),
+            ("unfit", u.unfit.to_string()),
+        ];
+        // `composition` (stray-atoms Task 5) only when counted: every other file stays byte-identical
+        if u.composition > 0 {
+            fields.push(("composition", u.composition.to_string()));
+        }
+        pairs.push(("audit_history", obj(&fields)));
     }
     if !memory.is_empty() {
         let list: Vec<String> = memory
@@ -774,6 +944,10 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
             })
             .collect();
         pairs.push(("class_memory", format!("[{}]", list.join(","))));
+    }
+    // optional (module doc, "Version 10"): absent, the header is byte-identical to the older writer's
+    if let Some(id) = fit_id {
+        pairs.push(("fit_id", id.to_string()));
     }
     // optional (module doc): absent, the header is byte-identical to the older writer's
     if let Some(t) = solves {
@@ -815,6 +989,15 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
         pairs.push(("failed_audits", format!("[{}]", list.join(","))));
     }
     Ok(assemble(magic, &obj(&pairs), &arrays))
+}
+
+/// The front of every header this build writes (module doc, "Version 9", "Version 10"): `format`
+/// the magic (version 9's, or version 10's for a history with the trust-tightening arrays), then
+/// `body` the body the file carries — so that, for version 9, with the magic and these two keys
+/// replaced by the body's own `format`, the bytes are the body's as the writer before version 9
+/// wrote them.
+fn front(magic: &[u8; 8], body: u8) -> [(&'static str, String); 2] {
+    [("format", string(std::str::from_utf8(magic).expect("ASCII"))), ("body", body.to_string())]
 }
 
 /// The file's bytes: magic, header length, header, then each array as its length and values.
@@ -948,7 +1131,7 @@ fn solves_json(t: &TeacherSolves) -> String {
     ])
 }
 
-/// A version-6 file's bytes (module doc, "Version 6").
+/// The bytes of a file of samples without a fit: body 6 under the version-9 magic (module doc, "Version 6", "Version 9").
 fn encode_samples(set: &SampleSet) -> io::Result<Vec<u8>> {
     let n = set.samples.len();
     if n == 0 {
@@ -989,8 +1172,10 @@ fn encode_samples(set: &SampleSet) -> io::Result<Vec<u8>> {
     let masks = mask_arrays(&set.samples);
     push_sample_tail(&mut arrays, &q_flags, &set.face_density, masks.as_ref());
     let references = format!("[{}]", set.references.iter().map(|&(z, e)| format!("[{z},{}]", num(e))).collect::<Vec<_>>().join(","));
+    let [format, body] = front(MAGIC_V9, 6);
     let mut pairs: Vec<(&str, String)> = vec![
-        ("format", string(std::str::from_utf8(MAGIC_V6).expect("ASCII"))),
+        format,
+        body,
         ("created_by", string(CREATED_BY)),
         ("provenance", provenance_json(&set.provenance)),
         ("references", references),
@@ -1010,7 +1195,7 @@ fn encode_samples(set: &SampleSet) -> io::Result<Vec<u8>> {
     if !set.box_references.is_empty() {
         pairs.push(("box_references", format!("[{}]", set.box_references.iter().map(|&(z, n, e)| format!("[{z},{n},{}]", num(e))).collect::<Vec<_>>().join(","))));
     }
-    Ok(assemble(MAGIC_V6, &obj(&pairs), &arrays))
+    Ok(assemble(MAGIC_V9, &obj(&pairs), &arrays))
 }
 
 /// `{"k":v,…}` from already-encoded values.
@@ -1056,24 +1241,26 @@ fn string(s: &str) -> String {
 
 /// The magic's version, the header JSON (`bytes` holds at least the 16 fixed bytes and the whole
 /// header) and the `format` string checked against the magic: the front of [`decode`], shared with
-/// [`read_provenance`].
+/// [`read_provenance`]. For a version-9 file the version returned is the body it carries (module
+/// doc, "Version 9"): everything after the header reads that body's layout.
 fn parse_header(bytes: &[u8]) -> Result<(u8, Json), String> {
     if bytes.len() < 16 {
         return Err(format!("{} bytes is too short for a sidecar", bytes.len()));
     }
-    let version = match &bytes[..8] {
-        m if m == MAGIC => 1,
-        m if m == MAGIC_V2 => 2,
-        m if m == MAGIC_V3 => 3,
-        m if m == MAGIC_V4 => 4,
-        m if m == MAGIC_V5 => 5,
-        m if m == MAGIC_V6 => 6,
-        m if m == MAGIC_V7 => 7,
-        m if m == MAGIC_V8 => 8,
-        m if &m[..7] == b"ASMODEL" && m[7].is_ascii_digit() => {
-            return Err(format!("format version {} is newer than this build (it reads versions 1 to 8)", m[7] as char));
+    let newest = MAGICS.len();
+    let version = match MAGICS.iter().position(|m| &bytes[..8] == *m) {
+        Some(i) => i as u8 + 1,
+        // the magic layout (module doc, "The magic"): a later version says so, by number when the
+        // layout gives one, and so does any other `ASMOD…` magic — never "not a model sidecar"
+        None => {
+            return Err(match magic_version(&bytes[..8]) {
+                Some(v) => format!("format version {v} is newer than this build (it reads versions 1 to {newest})"),
+                None if bytes.starts_with(b"ASMOD") => {
+                    format!("format {:?} is newer than this build (it reads versions 1 to {newest})", String::from_utf8_lossy(&bytes[..8]))
+                }
+                None => format!("not a model sidecar (magic is not ASMODEL1 … ASMODEL{newest})"),
+            });
         }
-        _ => return Err("not a model sidecar (magic is not ASMODEL1 … ASMODEL8)".into()),
     };
     let header_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
     let header_end = usize::try_from(header_len)
@@ -1085,18 +1272,21 @@ fn parse_header(bytes: &[u8]) -> Result<(u8, Json), String> {
     let header = std::str::from_utf8(&bytes[16..header_end]).map_err(|e| format!("header is not UTF-8: {e}"))?;
     let h = Parser::parse(header)?;
     let format = h.get("format")?.str()?;
-    let magic_of_version: &[u8; 8] = match version {
-        1 => MAGIC,
-        2 => MAGIC_V2,
-        3 => MAGIC_V3,
-        4 => MAGIC_V4,
-        5 => MAGIC_V5,
-        6 => MAGIC_V6,
-        7 => MAGIC_V7,
-        _ => MAGIC_V8,
-    };
-    if format.as_bytes() != magic_of_version {
+    if format.as_bytes() != MAGICS[version as usize - 1] {
         return Err(format!("header format {format:?} does not match the file's version {version}"));
+    }
+    // versions 9 and 10 (module doc): the body it carries is read as that version from here on
+    let bodies: Option<&[u8]> = match MAGICS[version as usize - 1] {
+        m if m == MAGIC_V9 => Some(&BODIES_V9),
+        m if m == MAGIC_V10 => Some(&BODIES_V10),
+        _ => None,
+    };
+    if let Some(bodies) = bodies {
+        let body = h.get("body").map_err(|_| format!("a version-{version} file names the body it carries (its header has no \"body\" key)"))?.u64()?;
+        return match u8::try_from(body).ok().filter(|b| bodies.contains(b)) {
+            Some(b) => Ok((b, h)),
+            None => Err(format!("a version-{version} file carries body {} (this one names {body})", bodies.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(", "))),
+        };
     }
     Ok((version, h))
 }
@@ -1271,6 +1461,21 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     if has_species {
         fixed.push((HistoryArrays::SPECIES, None));
     }
+    // version 10 (module doc): the three trust-tightening arrays, required, last
+    let has_trust = &bytes[..8] == MAGIC_V10;
+    if has_trust {
+        let Some((points, _, _)) = &history_counts else {
+            return Err("a version-10 file carries an audit history (its header has no \"audit_history\" key)".into());
+        };
+        for name in [HistoryArrays::FIT, HistoryArrays::FLAGS, HistoryArrays::ENERGY_STD_EPI] {
+            fixed.push((name, Some(*points)));
+        }
+    }
+    // the optional per-atom model-force magnitudes after the three (version 10 only)
+    let has_model_force = has_trust && declared.get(fixed.len()).is_some_and(|(n, _)| n == HistoryArrays::MODEL_FORCE);
+    if has_model_force {
+        fixed.push((HistoryArrays::MODEL_FORCE, None));
+    }
     let arrays = read_arrays(bytes, &declared, &fixed, version)?;
     let mut it = arrays.into_iter();
     let mut next = || it.next().expect("every declared array read");
@@ -1367,10 +1572,30 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         Some((_, recorded, unrecorded)) => {
             let a = HistoryArrays::from_vecs([next(), next(), next(), next(), next(), next(), next(), next(), next(), next()]);
             let a = HistoryArrays { species: if has_species { next() } else { Vec::new() }, ..a };
+            let a = if has_trust { HistoryArrays { fit: next(), flags: next(), energy_std_epistemic: next(), ..a } } else { a };
+            let a = if has_model_force { HistoryArrays { model_force: next(), ..a } } else { a };
             AuditHistory::from_arrays(&a, recorded, unrecorded).map_err(|e| format!("audit_history: {e}"))?
         }
     };
-    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits, audit_history, class_memory })
+    let fit_id = decode_fit_id(&h)?;
+    Ok(Sidecar { model, accumulator: acc, report, samples, created_by, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, failed_audits, audit_history, class_memory, fit_id })
+}
+
+/// Fit ids are below 2⁵³ (`crate::history`, "Trust-tightening fields": every id is exact in the
+/// history's f64 array).
+const FIT_ID_LIMIT: u64 = 1u64 << 53;
+
+/// The optional header key `fit_id` (module doc, "Version 10"): absent or null = `None`; strict
+/// when present (an integer below 2⁵³), like `class_memory`.
+fn decode_fit_id(h: &Json) -> Result<Option<u64>, String> {
+    match h.get("fit_id") {
+        Err(_) | Ok(Json::Null) => Ok(None),
+        Ok(v) => match v.u64() {
+            Ok(id) if id < FIT_ID_LIMIT => Ok(Some(id)),
+            Ok(id) => Err(format!("fit_id {id} is not below 2^53")),
+            Err(e) => Err(format!("fit_id: {e}")),
+        },
+    }
 }
 
 /// The version-7 header key `class_memory` (module doc): per environment key (class, z,
@@ -1417,7 +1642,9 @@ fn decode_history_key(h: &Json) -> Result<Option<(usize, u64, Unrecorded)>, Stri
         return Err(format!("audit_history.points {points} exceeds the ring's {}", crate::history::HISTORY_CAP));
     }
     let recorded = count("recorded")?;
-    let unrecorded = Unrecorded { no_variance: count("no_variance")?, box_affected: count("box_affected")?, draft: count("draft")?, unfit: count("unfit")? };
+    // `composition` (stray-atoms Task 5) is optional: a file written before it reads 0
+    let composition = if k.get("composition").is_ok() { count("composition")? } else { 0 };
+    let unrecorded = Unrecorded { no_variance: count("no_variance")?, box_affected: count("box_affected")?, draft: count("draft")?, unfit: count("unfit")?, composition };
     Ok(Some((points, recorded, unrecorded)))
 }
 
@@ -2186,7 +2413,7 @@ pub(crate) mod tests {
                 }
             })
             .collect();
-        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()), quarantine: Vec::new(), face_density: Vec::new(), teacher_solves: None, teacher_solves_note: None, failed_audits: Vec::new(), audit_history: AuditHistory::default(), class_memory: Vec::new() }
+        Sidecar { model, accumulator: acc, report: Some(report), samples, created_by: CREATED_BY.into(), reference_rule: Some(REFERENCE_RULE.into()), quarantine: Vec::new(), face_density: Vec::new(), teacher_solves: None, teacher_solves_note: None, failed_audits: Vec::new(), audit_history: AuditHistory::default(), class_memory: Vec::new(), fit_id: None }
     }
 
     /// A body-2 fixture and a directory of its own for test `name`.
@@ -2233,7 +2460,10 @@ pub(crate) mod tests {
         let path = dir.join("malformed.model");
         let t = TeacherSolves { pass: 1, fallback: 2, audit: 3, verification: 0, kept: 4, complete: true };
         write_full(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], Some(&t)).unwrap();
-        let bytes = std::fs::read(&path).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        assert_written(&written, 7);
+        // the body form (version 7's bytes, what the writer before version 9 wrote): the surgery below starts from it
+        let bytes = body_form(&written);
         let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
         let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
         let bad = header.replacen("\"kept\":4", "\"kept\":-4", 1);
@@ -2269,6 +2499,10 @@ pub(crate) mod tests {
             n_atoms: n,
             model_gen: 3 + i / 7,
             species: if i % 2 == 0 { Vec::new() } else { (0..n).map(|j| (1 + (j % 2) as u8 * 7, vec![1])).collect() },
+            fit_id: None,
+            flags: crate::history::PointFlags::default(),
+            energy_std_epistemic: None,
+            model_force: Vec::new(),
         }
     }
 
@@ -2328,6 +2562,55 @@ pub(crate) mod tests {
         assert!(e.contains("class_memory"), "{e}");
     }
 
+    /// Trust tightening Task 2: the optional header key `fit_id` (the writer's fit id) round-trips
+    /// under the version-9 magic (it bumps nothing: older readers ignore header keys they do not
+    /// read); absent, it reads `None` and the header is the older writer's, byte for byte; an id
+    /// that is not an integer below 2⁵³ is refused, naming the key.
+    #[test]
+    fn the_fit_id_key_round_trips() {
+        use crate::history::AuditHistory;
+        let orig = random_sidecar(49, false);
+        let header_of = |bytes: &[u8]| {
+            let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+            (std::str::from_utf8(&bytes[16..16 + hl]).unwrap().to_string(), hl)
+        };
+        let path = tmp("fit-id.model");
+        write_full_with_fit_id(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &AuditHistory::default(), &[], Some(41)).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..8], MAGIC_V9, "the key alone does not bump the version");
+        let (header, hl) = header_of(&bytes);
+        assert!(header.contains("\"fit_id\":41"), "{header}");
+        assert_eq!(read(&path).unwrap().fit_id, Some(41));
+        // absent: None, and the bytes are the older writer's
+        let plain = tmp("fit-id-none.model");
+        let older = tmp("fit-id-older.model");
+        write_full_with_fit_id(&plain, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &AuditHistory::default(), &[], None).unwrap();
+        write_full_with_memory(&older, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &AuditHistory::default(), &[]).unwrap();
+        assert_eq!(std::fs::read(&plain).unwrap(), std::fs::read(&older).unwrap());
+        assert_eq!(read(&plain).unwrap().fit_id, None);
+        // malformed: refused, naming the key
+        for bad in ["\"fit_id\":-1", "\"fit_id\":1.5", "\"fit_id\":\"41\"", "\"fit_id\":9007199254740992"] {
+            let h = header.replacen("\"fit_id\":41", bad, 1);
+            let mut b = bytes[..8].to_vec();
+            b.extend_from_slice(&(h.len() as u64).to_le_bytes());
+            b.extend_from_slice(h.as_bytes());
+            b.extend_from_slice(&bytes[16 + hl..]);
+            let pb = tmp("fit-id-bad.model");
+            std::fs::write(&pb, b).unwrap();
+            let e = read(&pb).unwrap_err().to_string();
+            assert!(e.contains("fit_id"), "{bad}: {e}");
+        }
+        // the largest id below 2⁵³ reads back
+        let h = header.replacen("\"fit_id\":41", "\"fit_id\":9007199254740991", 1);
+        let mut b = bytes[..8].to_vec();
+        b.extend_from_slice(&(h.len() as u64).to_le_bytes());
+        b.extend_from_slice(h.as_bytes());
+        b.extend_from_slice(&bytes[16 + hl..]);
+        let pb = tmp("fit-id-max.model");
+        std::fs::write(&pb, b).unwrap();
+        assert_eq!(read(&pb).unwrap().fit_id, Some((1u64 << 53) - 1));
+    }
+
     #[test]
     fn sidecar_round_trips_the_history() {
         use crate::history::{AuditHistory, HISTORY_CAP};
@@ -2342,8 +2625,10 @@ pub(crate) mod tests {
         hist.unrecorded.unfit = 4;
         let path = tmp("history-v7.model");
         write_full_with_history(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &hist).unwrap();
-        let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(&bytes[..8], MAGIC_V7);
+        let written = std::fs::read(&path).unwrap();
+        assert_written(&written, 7);
+        // the body form (version 7's bytes, what the writer before version 9 wrote): the surgery below starts from it
+        let bytes = body_form(&written);
         let back = read(&path).unwrap();
         assert_eq!(back.audit_history, hist);
         assert_eq!(back.audit_history.recorded(), 57);
@@ -2351,8 +2636,9 @@ pub(crate) mod tests {
         // a file without a history: the same header and arrays as version 5 under the new magic
         let plain = tmp("history-none.model");
         write(&plain, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
-        let plain_bytes = std::fs::read(&plain).unwrap();
-        assert_eq!(&plain_bytes[..8], MAGIC_V7);
+        let plain_written = std::fs::read(&plain).unwrap();
+        assert_written(&plain_written, 7);
+        let plain_bytes = body_form(&plain_written);
         assert_eq!(read(&plain).unwrap().audit_history, AuditHistory::default());
         let hl = u64::from_le_bytes(plain_bytes[8..16].try_into().unwrap()) as usize;
         let header = std::str::from_utf8(&plain_bytes[16..16 + hl]).unwrap();
@@ -2370,7 +2656,8 @@ pub(crate) mod tests {
         assert_eq!(old.model, orig.model);
         // the standalone encoding
         let enc = hist.encode();
-        assert_eq!(&enc[..8], crate::history::MAGIC);
+        // (version 1: these points carry none of the trust-tightening fields — trust tightening Task 1)
+        assert_eq!(&enc[..8], crate::history::MAGIC_V1);
         let dec = AuditHistory::decode(&enc).unwrap();
         assert_eq!(dec, hist);
         for (a, b) in dec.iter().zip(hist.iter()) {
@@ -2446,7 +2733,7 @@ pub(crate) mod tests {
 
     #[test]
     fn sidecar_round_trips_bit_exact() {
-        round_trip(random_sidecar(11, false), "round-trip.model", "bare.model", MAGIC_V7);
+        round_trip(random_sidecar(11, false), "round-trip.model", "bare.model", 7);
     }
 
     /// Masks the fixture's samples as capped segments would be (M8a Task 10): every third sample
@@ -2564,7 +2851,7 @@ pub(crate) mod tests {
         let orig = random_sidecar(17, true);
         assert_eq!(orig.model.basis.n_features(), 144);
         assert_eq!(orig.accumulator.q_prime, 423);
-        round_trip(orig, "round-trip-v2.model", "bare-v2.model", MAGIC_V7);
+        round_trip(orig, "round-trip-v2.model", "bare-v2.model", 7);
     }
 
     /// Task 9 fix round 1 (S1): the optional `sample_face_density` array round-trips with and
@@ -2638,6 +2925,435 @@ pub(crate) mod tests {
         }
     }
 
+    /// The header of a sidecar's bytes.
+    pub(crate) fn header_of(bytes: &[u8]) -> String {
+        let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        std::str::from_utf8(&bytes[16..16 + hl]).unwrap().to_string()
+    }
+
+    /// The body a version-9 file names (module doc, "Version 9"), `None` for any other file.
+    pub(crate) fn written_body(bytes: &[u8]) -> Option<u8> {
+        if &bytes[..8] != MAGIC_V9 {
+            return None;
+        }
+        let h = header_of(bytes);
+        let rest = h.strip_prefix("{\"format\":\"ASMODEL9\",\"body\":")?;
+        rest[..1].parse::<u8>().ok()
+    }
+
+    /// A version-9 file's **body form** (module doc, "Version 9"): the magic of the body it names
+    /// and its header without the `body` key — byte for byte what the writer before version 9
+    /// wrote for the same model. Header surgery in the tests starts from it.
+    pub(crate) fn body_form(bytes: &[u8]) -> Vec<u8> {
+        let body = written_body(bytes).expect("a version-9 file names its body");
+        let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let h = header_of(bytes).replacen(&format!("\"format\":\"ASMODEL9\",\"body\":{body}"), &format!("\"format\":\"ASMODEL{body}\""), 1);
+        let mut out = MAGICS[body as usize - 1].to_vec();
+        out.extend_from_slice(&(h.len() as u64).to_le_bytes());
+        out.extend_from_slice(h.as_bytes());
+        out.extend_from_slice(&bytes[16 + hl..]);
+        out
+    }
+
+    /// The file at `path` is version 9 carrying `body` (the writers' only magic since the
+    /// Fermi–Dirac switch; module doc, "Version 9").
+    pub(crate) fn assert_written(bytes: &[u8], body: u8) {
+        assert_eq!(&bytes[..8], MAGIC_V9, "this build writes the version-9 magic");
+        assert_eq!(written_body(bytes), Some(body), "{}", &header_of(bytes)[..60.min(header_of(bytes).len())]);
+    }
+
+    /// Task 13 fix round 1 (module doc, "The magic"): `ASMODEL<d>` names 1 to 9 and `ASMOD<ddd>` 10 to
+    /// 999; the reader takes exactly `MAGICS`, refuses a later version as newer by its number, any
+    /// other `ASMOD…` magic as newer, and anything else as not a sidecar.
+    #[test]
+    fn the_magic_layout_names_every_version() {
+        for (i, m) in MAGICS.iter().enumerate() {
+            assert_eq!(magic_version(&m[..]), Some(i as u32 + 1));
+        }
+        for (m, v) in [(b"ASMOD010", Some(10)), (b"ASMOD999", Some(999)), (b"ASMOD123", Some(123)), (b"ASMOD009", None), (b"ASMODEL0", None), (b"ASMODELX", None), (b"ASAUDIT1", None), (b"ASMOD01x", None)] {
+            assert_eq!(magic_version(&m[..]), v, "{}", String::from_utf8_lossy(m));
+        }
+        assert_eq!(magic_version(b"ASMOD01"), None, "short");
+        let refusal = |m: &[u8; 8]| {
+            let mut bytes = m.to_vec();
+            bytes.extend_from_slice(&2u64.to_le_bytes());
+            bytes.extend_from_slice(b"{}");
+            parse_header(&bytes).expect_err("no such version, or no provenance")
+        };
+        // version 10 is this build's own since trust tightening Task 1; 11 is the next
+        assert!(refusal(b"ASMOD011").contains("format version 11 is newer than this build (it reads versions 1 to 10)"), "{}", refusal(b"ASMOD011"));
+        assert!(!refusal(b"ASMOD010").contains("newer"), "{}", refusal(b"ASMOD010"));
+        assert!(refusal(b"ASMOD999").contains("format version 999 is newer"));
+        assert!(refusal(b"ASMODELX").contains("\"ASMODELX\" is newer than this build"), "{}", refusal(b"ASMODELX"));
+        assert!(refusal(b"ASMOD009").contains("is newer than this build"));
+        assert!(refusal(b"NOTAMODL").contains("not a model sidecar"));
+        assert!(!refusal(MAGIC_V9).contains("newer"), "this build's own");
+    }
+
+    /// Fermi–Dirac plan Task 13 (spec §7.7, ruling R11, F1): one new magic, `ASMODEL<K + 1>` with
+    /// K = 8 = Task 2's `MAGICS.len()`, carries every body this build writes — R11's old-body set
+    /// {6, 7, 8} (`purge-forgotten` added no body) — and names it in the header. Each round-trips
+    /// under the new magic; its body form (the earlier writer's bytes) reads back the same; a
+    /// version-9 header naming no body, a body outside the set, or a body its layout is not, is
+    /// refused.
+    #[test]
+    fn sidecar_new_magic_round_trips() {
+        // K + 1 (version 10, trust tightening Task 1, came after it)
+        assert_eq!(MAGICS[8], MAGIC_V9, "K + 1");
+        assert_eq!(MAGIC_V9, b"ASMODEL9");
+        for (what, body, orig) in [("body 7, body-2 basis", 7u8, random_sidecar(71, false)), ("body 7, body-3 basis", 7, random_sidecar(72, true)), ("body 8", 8, random_sidecar_with(73, true, true))] {
+            let n = orig.samples.len();
+            let flags: Vec<u8> = (0..n).map(|i| [0, 1, 7, 8, 0, 3][i % 6]).collect();
+            let face: Vec<f64> = (0..n).map(|i| 1e-7 * i as f64).collect();
+            let samples = masked_samples(&orig.samples);
+            let mut hist = AuditHistory::default();
+            hist.push(history_point(3, 2));
+            let p = tmp(&format!("v9-{body}-{}.model", orig.model.basis.body3));
+            write_full_with_history(&p, &orig.model, &orig.accumulator, orig.report.as_ref(), &samples, orig.reference_rule.as_deref(), &flags, &face, None, &[], &hist).unwrap();
+            let bytes = std::fs::read(&p).unwrap();
+            assert_written(&bytes, body);
+            assert!(header_of(&bytes).starts_with(&format!("{{\"format\":\"ASMODEL9\",\"body\":{body},\"created_by\":")), "{what}");
+            let back = read(&p).unwrap();
+            assert_eq!(back.model, orig.model, "{what}");
+            assert_accumulators_bit_equal(&back.accumulator, &orig.accumulator);
+            assert_eq!(back.samples, samples, "{what}");
+            assert_eq!((back.quarantine.clone(), bits(&back.face_density)), (flags.clone(), bits(&face)), "{what}");
+            assert_eq!(back.audit_history, hist, "{what}");
+            assert_eq!(read_provenance(&p).unwrap(), orig.model.provenance);
+            // the body form: the earlier writer's magic and header, the same contents
+            let old = body_form(&bytes);
+            assert_eq!(&old[..8], MAGICS[body as usize - 1], "{what}");
+            assert!(!header_of(&old).contains("\"body\":"), "{what}");
+            let q = tmp(&format!("v9-{body}-{}-old.model", orig.model.basis.body3));
+            std::fs::write(&q, &old).unwrap();
+            let back_old = read(&q).unwrap();
+            assert_eq!((back_old.model, back_old.samples, back_old.quarantine, back_old.audit_history), (back.model.clone(), back.samples.clone(), back.quarantine.clone(), back.audit_history.clone()), "{what}");
+            // refused: no body, a body outside {6, 7, 8}, the other fitted body, and the body's own
+            // format string under the new magic
+            let header = header_of(&bytes);
+            let with_header = |h: &str| {
+                let hl = header.len();
+                let mut v = MAGIC_V9.to_vec();
+                v.extend_from_slice(&(h.len() as u64).to_le_bytes());
+                v.extend_from_slice(h.as_bytes());
+                v.extend_from_slice(&bytes[16 + hl..]);
+                v
+            };
+            let other = if body == 7 { 8 } else { 7 };
+            for (case, h) in [
+                ("no body", header.replacen(&format!(",\"body\":{body}"), "", 1)),
+                ("body 5", header.replacen(&format!("\"body\":{body}"), "\"body\":5", 1)),
+                ("body 9", header.replacen(&format!("\"body\":{body}"), "\"body\":9", 1)),
+                ("body 6 on a fitted file", header.replacen(&format!("\"body\":{body}"), "\"body\":6", 1)),
+                ("the other fitted body", header.replacen(&format!("\"body\":{body}"), &format!("\"body\":{other}"), 1)),
+                ("the body's format string", header.replacen("\"format\":\"ASMODEL9\"", &format!("\"format\":\"ASMODEL{body}\""), 1)),
+            ] {
+                assert_ne!(h, header, "{what}: {case}");
+                std::fs::write(&q, with_header(&h)).unwrap();
+                let e = read(&q).unwrap_err();
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{what}: {case}: {e}");
+            }
+            for f in [p, q] {
+                let _ = std::fs::remove_file(f);
+            }
+        }
+        // body 6: samples without a fit
+        let orig = random_sidecar(74, false);
+        let n = orig.samples.len();
+        let set = SampleSet {
+            provenance: orig.model.provenance.clone(),
+            samples: orig.samples.clone(),
+            references: vec![(1, -0.47)],
+            reference_rule: Some(REFERENCE_RULE.into()),
+            quarantine: (0..n).map(|i| [0, 8, 0, 7][i % 4]).collect(),
+            face_density: (0..n).map(|i| 1e-6 * i as f64).collect(),
+            sample_box: (0..n).map(|i| 41 + 2 * (i % 2)).collect(),
+            specialised: Vec::new(),
+            box_references: Vec::new(),
+            teacher_solves: None,
+            teacher_solves_note: None,
+            created_by: CREATED_BY.into(),
+        };
+        let p = tmp("v9-6.model");
+        write_samples(&p, &set).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        assert_written(&bytes, 6);
+        let Contents::Samples(back) = read_any(&p).unwrap() else { panic!("body 6 reads as Samples") };
+        assert_eq!((back.samples.clone(), back.quarantine.clone(), back.sample_box.clone(), back.references.clone()), (set.samples.clone(), set.quarantine.clone(), set.sample_box.clone(), set.references.clone()));
+        assert!(read(&p).unwrap_err().to_string().contains("without a fitted model"));
+        let q = tmp("v9-6-old.model");
+        std::fs::write(&q, body_form(&bytes)).unwrap();
+        let Contents::Samples(old) = read_any(&q).unwrap() else { panic!("the body form reads as Samples") };
+        assert_eq!((old.samples, old.quarantine, old.sample_box), (back.samples, back.quarantine, back.sample_box));
+        // a fitted body named on a samples-only layout is refused
+        let h = header_of(&bytes).replacen("\"body\":6", "\"body\":7", 1);
+        let hl = header_of(&bytes).len();
+        let mut v = MAGIC_V9.to_vec();
+        v.extend_from_slice(&(h.len() as u64).to_le_bytes());
+        v.extend_from_slice(h.as_bytes());
+        v.extend_from_slice(&bytes[16 + hl..]);
+        std::fs::write(&q, v).unwrap();
+        assert!(read_any(&q).is_err());
+        for f in [p, q] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
+    /// A [`history_point`] carrying the trust-tightening fields (plan 2026-11-19 Task 1).
+    fn trust_point(i: u64, n: usize) -> crate::history::AuditPoint {
+        crate::history::AuditPoint { fit_id: (i % 3 != 0).then_some(11 * i), flags: crate::history::PointFlags((i % 16) as u8), energy_std_epistemic: (i % 4 != 1).then_some(3e-6 * i as f64), ..history_point(i, n) }
+    }
+
+    /// The file `bytes` with `header` in place of its own and `magic` for its first eight bytes;
+    /// `cut` bytes taken off its end.
+    fn reheader(bytes: &[u8], magic: &[u8; 8], header: &str, cut: usize) -> Vec<u8> {
+        let hl = header_of(bytes).len();
+        let mut v = magic.to_vec();
+        v.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        v.extend_from_slice(header.as_bytes());
+        v.extend_from_slice(&bytes[16 + hl..bytes.len() - cut]);
+        v
+    }
+
+    /// Task 5 fix round 1: the optional `audit_model_force` (per atom) is declared and stored after
+    /// the three version-10 arrays when a point carries it, and reads back equal; a version-10 file
+    /// without it (every point without magnitudes) reads as before.
+    #[test]
+    fn the_model_force_round_trips_in_the_sidecar() {
+        use crate::history::AuditHistory;
+        let orig = random_sidecar(85, false);
+        let mut hist = AuditHistory::default();
+        for i in 0..6u64 {
+            let mut p = trust_point(i, 2);
+            if i % 2 == 0 {
+                p.model_force = vec![1e-2 * (1 + i) as f64, 0.0];
+            }
+            hist.push(p);
+        }
+        let p = tmp("v10-model-force.model");
+        write_full_with_history(&p, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &hist).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        assert_eq!(&bytes[..8], MAGIC_V10);
+        assert!(header_of(&bytes).contains("[\"audit_energy_std_epistemic\",6],[\"audit_model_force\",12]]"), "{}", header_of(&bytes));
+        let back = read(&p).unwrap();
+        assert_eq!(back.audit_history, hist);
+        assert_eq!(back.audit_history.to_arrays().model_force.len(), 12);
+        // none carries it: no array declared
+        let mut plain = AuditHistory::default();
+        for i in 0..6u64 {
+            plain.push(trust_point(i, 2));
+        }
+        write_full_with_history(&p, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &plain).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        assert!(!header_of(&bytes).contains("audit_model_force"));
+        assert_eq!(read(&p).unwrap().audit_history, plain);
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// Trust tightening Task 1: a history whose points carry a fit id, a flags word or an epistemic
+    /// energy std is written under the version-10 magic `ASMOD010` — the body named as in version 9
+    /// (7, or 8 for a body-4 basis) — with `audit_fit`, `audit_flags` and
+    /// `audit_energy_std_epistemic` after the species array, and reads back equal: every flag bit,
+    /// Some and None of each field. The same model with a history that carries none of them is
+    /// version 9 as before and reads with the fields absent.
+    #[test]
+    fn the_new_fields_round_trip_in_the_sidecar() {
+        use crate::history::{AuditHistory, PointFlags};
+        assert_eq!(MAGICS.len(), 10);
+        assert_eq!((MAGICS[9], MAGIC_V10), (b"ASMOD010", b"ASMOD010"));
+        assert_eq!(magic_version(MAGIC_V10), Some(10));
+        for (what, body, orig) in [("body 7, body-2 basis", 7u8, random_sidecar(81, false)), ("body 7, body-3 basis", 7, random_sidecar(82, true)), ("body 8", 8, random_sidecar_with(83, true, true))] {
+            let mut hist = AuditHistory::default();
+            for i in 0..16u64 {
+                hist.push(trust_point(i, 1 + (i % 3) as usize));
+            }
+            assert!((0..=PointFlags::ALL).all(|f| hist.iter().any(|p| p.flags.0 == f)), "every flags word");
+            assert!(hist.iter().any(|p| p.fit_id.is_none()) && hist.iter().any(|p| p.energy_std_epistemic.is_none()));
+            hist.unrecorded.draft = 2;
+            let p = tmp(&format!("v10-{body}-{}.model", orig.model.basis.body3));
+            write_full_with_history(&p, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &hist).unwrap();
+            let bytes = std::fs::read(&p).unwrap();
+            assert_eq!(&bytes[..8], MAGIC_V10, "{what}");
+            let header = header_of(&bytes);
+            assert!(header.starts_with(&format!("{{\"format\":\"ASMOD010\",\"body\":{body},\"created_by\":")), "{what}: {header}");
+            assert!(header.contains("[\"audit_fit\",16],[\"audit_flags\",16],[\"audit_energy_std_epistemic\",16]]"), "{what}: {header}");
+            let back = read(&p).unwrap();
+            assert_eq!(back.audit_history, hist, "{what}");
+            for (a, b) in back.audit_history.iter().zip(hist.iter()) {
+                assert_eq!(a.energy_std_epistemic.map(f64::to_bits), b.energy_std_epistemic.map(f64::to_bits));
+            }
+            assert_eq!(back.model, orig.model, "{what}");
+            assert_eq!(read_provenance(&p).unwrap(), orig.model.provenance, "{what}");
+            // without the fields: version 9, the body 7 or 8 as before; the fields read absent
+            let mut legacy = AuditHistory::default();
+            for i in 0..12u64 {
+                legacy.push(history_point(i, 1 + (i % 3) as usize));
+            }
+            write_full_with_history(&p, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &legacy).unwrap();
+            let bytes9 = std::fs::read(&p).unwrap();
+            assert_written(&bytes9, body);
+            assert!(!header_of(&bytes9).contains("audit_fit"), "{what}");
+            let back9 = read(&p).unwrap();
+            assert_eq!(back9.audit_history, legacy, "{what}");
+            assert!(back9.audit_history.iter().all(|p| p.fit_id.is_none() && p.flags == PointFlags(0) && p.energy_std_epistemic.is_none()), "{what}");
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// Trust tightening Task 1: the sidecar holds the three new arrays to the history's rules —
+    /// a non-integral, too large or negative fit id, a flags word above 15, non-integral or
+    /// negative, a negative, NaN or infinite energy std, a wrong length are each refused as
+    /// `InvalidData` naming the array, never a panic — and to its own layout: the three arrays
+    /// under the version-9 magic, a version-10 file without them, without an audit history, or
+    /// naming body 6 are refused.
+    #[test]
+    fn hostile_new_arrays_are_rejected_by_the_sidecar() {
+        use crate::history::AuditHistory;
+        let orig = random_sidecar(84, false);
+        let mut hist = AuditHistory::default();
+        for i in 0..5u64 {
+            hist.push(trust_point(i, 2));
+        }
+        let p = tmp("v10-hostile.model");
+        write_full_with_history(&p, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &hist).unwrap();
+        let good = std::fs::read(&p).unwrap();
+        assert_eq!(&good[..8], MAGIC_V10);
+        assert_eq!(read(&p).unwrap().audit_history, hist);
+        let q = tmp("v10-hostile-case.model");
+        let refused = |what: &str, bytes: &[u8], name: &str| {
+            std::fs::write(&q, bytes).unwrap();
+            let e = read(&q).expect_err(what);
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{what}: {e}");
+            assert!(e.to_string().contains(name), "{what}: {e}");
+        };
+        // the three arrays are the file's last, five values each: fit, flags, energy std
+        let arr = 8 + 8 * 5;
+        let value_at = |k: usize, i: usize| good.len() - (3 - k) * arr + 8 + 8 * i;
+        for (k, i, x, name) in [
+            (0, 0, 1.5, "audit_fit"),
+            (0, 1, (1u64 << 53) as f64, "audit_fit"),
+            (0, 2, -3.0, "audit_fit"),
+            (0, 3, f64::NAN, "audit_fit"),
+            (1, 0, 16.0, "audit_flags"),
+            (1, 4, 0.25, "audit_flags"),
+            (1, 1, -1.0, "audit_flags"),
+            (2, 0, -0.5, "audit_energy_std_epistemic"),
+            (2, 2, f64::NAN, "audit_energy_std_epistemic"),
+            (2, 3, f64::INFINITY, "audit_energy_std_epistemic"),
+        ] {
+            let mut b = good.clone();
+            let at = value_at(k, i);
+            b[at..at + 8].copy_from_slice(&x.to_le_bytes());
+            refused(&format!("{name}[{i}] = {x}"), &b, name);
+        }
+        let header = header_of(&good);
+        // a wrong length: the fit array one short, its declaration and prefix agreeing
+        let short_header = header.replacen("[\"audit_fit\",5]", "[\"audit_fit\",4]", 1);
+        assert_ne!(short_header, header);
+        let mut short = reheader(&good, MAGIC_V10, &short_header, 0);
+        let fit_at = short.len() - 3 * arr;
+        short[fit_at..fit_at + 8].copy_from_slice(&4u64.to_le_bytes());
+        short.drain(fit_at + 8 + 8 * 4..fit_at + 8 + 8 * 5);
+        refused("a fit array one short", &short, "audit_fit");
+        // the layout: the three under the version-9 magic
+        let as_v9 = header.replacen("\"format\":\"ASMOD010\"", "\"format\":\"ASMODEL9\"", 1);
+        refused("the three arrays under the version-9 magic", &reheader(&good, MAGIC_V9, &as_v9, 0), "declared");
+        // a version-10 file without them
+        let without = header.replacen(",[\"audit_fit\",5],[\"audit_flags\",5],[\"audit_energy_std_epistemic\",5]", "", 1);
+        assert_ne!(without, header);
+        refused("version 10 without the three arrays", &reheader(&good, MAGIC_V10, &without, 3 * arr), "declared");
+        // naming body 6
+        refused("version 10 naming body 6", &reheader(&good, MAGIC_V10, &header.replacen("\"body\":7", "\"body\":6", 1), 0), "body");
+        // a version-10 file without an audit history: a blank history's file under the new magic
+        let plain = tmp("v10-hostile-plain.model");
+        write(&plain, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
+        let plain_bytes = std::fs::read(&plain).unwrap();
+        assert_written(&plain_bytes, 7);
+        let h = header_of(&plain_bytes).replacen("\"format\":\"ASMODEL9\"", "\"format\":\"ASMOD010\"", 1);
+        refused("version 10 without an audit history", &reheader(&plain_bytes, MAGIC_V10, &h, 0), "audit history");
+        // the good file still reads
+        std::fs::write(&q, &good).unwrap();
+        assert_eq!(read(&q).unwrap().audit_history, hist);
+        for f in [p, q, plain] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
+    /// Fermi–Dirac plan Task 13 (spec §7.7, rulings R11/R12): code 9 (`Q_RESOLVED`) is a collection
+    /// code and never a sidecar's — `is_collection_code` admits it, `is_persisted_code` does not
+    /// (and keeps `purge-forgotten`'s 8). A sidecar written from a store holding code-9 samples
+    /// leaves them out: the file is byte for byte the one written from the store without them
+    /// (their flags, face densities, masks and boxes go with them; a failed audit naming a later
+    /// sample follows it, one naming a left-out sample keeps no index).
+    #[test]
+    fn code_9_persists_in_collections_not_sidecars() {
+        use crate::quarantine::{is_collection_code, is_persisted_code, Q_FORGOTTEN_UNFENCED, Q_RESOLVED};
+        assert_eq!(Q_RESOLVED, 9);
+        assert!(is_collection_code(Q_RESOLVED) && !is_persisted_code(Q_RESOLVED));
+        assert!(is_persisted_code(Q_FORGOTTEN_UNFENCED) && is_collection_code(Q_FORGOTTEN_UNFENCED), "purge's code 8 is untouched");
+        for q in 0..=u8::MAX {
+            assert_eq!(is_collection_code(q), is_persisted_code(q) || q == Q_RESOLVED, "code {q}");
+        }
+        let orig = random_sidecar(67, false);
+        let samples = masked_samples(&orig.samples);
+        let n = samples.len();
+        let flags: Vec<u8> = (0..n).map(|i| [0, 9, 1, 0, 9, 7][i % 6]).collect();
+        let face: Vec<f64> = (0..n).map(|i| 1e-7 * (i + 1) as f64).collect();
+        let keep: Vec<usize> = (0..n).filter(|&i| flags[i] != Q_RESOLVED).collect();
+        assert!(keep.len() < n && keep.len() >= 3, "the fixture leaves some out and keeps some");
+        let audit = |index: Option<usize>| AuditCase {
+            pos: vec![[0.0, 0.0, 0.0], [1.4, 0.0, 0.0]],
+            z: vec![1, 1],
+            energy: -1.1,
+            forces: vec![[0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]],
+            index,
+            ionic: "none".into(),
+            rejudges: 1,
+            fenced: true,
+            origin: "audit".into(),
+            pair: None,
+        };
+        // sample 4 is at 9 (left out); sample 5 is kept and moves down by two
+        let audits = vec![audit(Some(5)), audit(Some(4)), audit(None), audit(Some(0))];
+        let moved = vec![audit(Some(keep.iter().position(|&i| i == 5).unwrap())), audit(None), audit(None), audit(Some(0))];
+        let pick = |v: &[u8]| keep.iter().map(|&i| v[i]).collect::<Vec<u8>>();
+        let kept_samples: Vec<Sample> = keep.iter().map(|&i| samples[i].clone()).collect();
+        let kept_face: Vec<f64> = keep.iter().map(|&i| face[i]).collect();
+        let (with, without) = (tmp("code9-with.model"), tmp("code9-without.model"));
+        write_full_with_audits(&with, &orig.model, &orig.accumulator, orig.report.as_ref(), &samples, None, &flags, &face, None, &audits).unwrap();
+        write_full_with_audits(&without, &orig.model, &orig.accumulator, orig.report.as_ref(), &kept_samples, None, &pick(&flags), &kept_face, None, &moved).unwrap();
+        assert_eq!(std::fs::read(&with).unwrap(), std::fs::read(&without).unwrap(), "the file of the store without its code-9 samples");
+        let back = read(&with).unwrap();
+        assert_eq!(back.samples, kept_samples);
+        assert!(!back.quarantine.contains(&Q_RESOLVED));
+        assert_eq!(back.failed_audits, moved);
+        // a samples-only file likewise (boxes included)
+        let set = SampleSet {
+            provenance: orig.model.provenance.clone(),
+            samples: samples.clone(),
+            references: vec![(1, -0.47)],
+            reference_rule: None,
+            quarantine: flags.clone(),
+            face_density: face.clone(),
+            sample_box: (0..n).map(|i| 41 + 2 * (i % 3)).collect(),
+            specialised: Vec::new(),
+            box_references: Vec::new(),
+            teacher_solves: None,
+            teacher_solves_note: None,
+            created_by: CREATED_BY.into(),
+        };
+        let kept_set = SampleSet { samples: kept_samples, quarantine: pick(&flags), face_density: kept_face, sample_box: keep.iter().map(|&i| set.sample_box[i]).collect(), ..set.clone() };
+        write_samples(&with, &set).unwrap();
+        write_samples(&without, &kept_set).unwrap();
+        assert_eq!(std::fs::read(&with).unwrap(), std::fs::read(&without).unwrap(), "the samples-only file of the store without its code-9 samples");
+        // a store of code-9 samples only has nothing to write as samples
+        let all9 = SampleSet { quarantine: vec![Q_RESOLVED; n], ..set };
+        assert!(write_samples(&with, &all9).is_err());
+        for f in [with, without] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
     /// Version 6 (2026-10-20, the PH₃ data loss): samples without a fit round-trip bit-exactly with
     /// their flags, partial references and solve record; `read` refuses the file (no model),
     /// `read_provenance` and `read_any` read it, and a fitted file still reads as `Fitted`.
@@ -2662,7 +3378,7 @@ pub(crate) mod tests {
         };
         let p = tmp("unfitted-v6.model");
         write_samples(&p, &set).unwrap();
-        assert_eq!(&std::fs::read(&p).unwrap()[..8], MAGIC_V6);
+        assert_written(&std::fs::read(&p).unwrap(), 6);
         let Contents::Samples(back) = read_any(&p).unwrap() else { panic!("a samples-only file reads as Samples") };
         assert_eq!(back.provenance, set.provenance);
         assert_eq!(back.references.len(), 1);
@@ -2717,15 +3433,15 @@ pub(crate) mod tests {
         assert!(matches!(read_any(&q).unwrap(), Contents::Fitted(_)));
     }
 
-    /// A body-4 basis (M8a Task 5) is written as version 8 and reads back bit for bit; a body-4-free
-    /// basis is still version 7; a version-8 header whose body-4 cap is outside
+    /// A body-4 basis (M8a Task 5) is written as body 8 (version 9 since the Fermi–Dirac switch)
+    /// and reads back bit for bit; a body-4-free basis is still body 7; a version-8 header whose body-4 cap is outside
     /// [`BODY4_DEGREE_START`] ..= [`BODY4_DEGREE_CAP`], or that says body4 false, is refused.
     #[test]
     fn a_body4_basis_round_trips_as_version_8() {
         let orig = random_sidecar_with(37, true, true);
         assert!(orig.model.basis.n_body4() > 0);
-        round_trip(orig.clone(), "round-trip-v8.model", "bare-v8.model", MAGIC_V8);
-        round_trip(random_sidecar_with(37, true, false), "round-trip-v7b3.model", "bare-v7b3.model", MAGIC_V7);
+        round_trip(orig.clone(), "round-trip-v8.model", "bare-v8.model", 8);
+        round_trip(random_sidecar_with(37, true, false), "round-trip-v7b3.model", "bare-v7b3.model", 7);
         let path = tmp("body4-cap.model");
         write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref()).unwrap();
         let bytes = std::fs::read(&path).unwrap();
@@ -2760,7 +3476,7 @@ pub(crate) mod tests {
             let path = tmp(&format!("body4-degree-{degree}.model"));
             write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref()).unwrap();
             let bytes = std::fs::read(&path).unwrap();
-            assert_eq!(&bytes[..8], MAGIC_V8);
+            assert_written(&bytes, 8);
             let header_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
             let header = std::str::from_utf8(&bytes[16..16 + header_len]).unwrap();
             assert!(header.contains(&format!("\"body4_cap\":{degree}")), "{header}");
@@ -2781,10 +3497,11 @@ pub(crate) mod tests {
         assert!(random_sidecar_at(37, true, true, 3).model.basis.n_body4() > random_sidecar_at(37, true, true, 2).model.basis.n_body4());
     }
 
-    fn round_trip(orig: Sidecar, name: &str, bare_name: &str, magic: &[u8; 8]) {
+    /// Round-trips `orig` through a file of version 9 carrying `body` (module doc, "Version 9").
+    fn round_trip(orig: Sidecar, name: &str, bare_name: &str, body: u8) {
         let path = tmp(name);
         write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, orig.reference_rule.as_deref()).unwrap();
-        assert_eq!(&std::fs::read(&path).unwrap()[..8], magic);
+        assert_written(&std::fs::read(&path).unwrap(), body);
         let back = read(&path).unwrap();
         // Model: PartialEq is bitwise for the finite values here except ±0 (== treats them equal),
         // so compare the bits of every float array as well
@@ -2850,8 +3567,10 @@ pub(crate) mod tests {
         orig.model.provenance.masses = vec![(1, 1), (1, 2)];
         let path = tmp("masses-v3.model");
         write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
-        let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(&bytes[..8], MAGIC_V7);
+        let written = std::fs::read(&path).unwrap();
+        assert_written(&written, 7);
+        // the body form (version 7's bytes, what the writer before version 9 wrote): the surgery below starts from it
+        let bytes = body_form(&written);
         let back = read(&path).unwrap();
         assert_eq!(back.model.provenance.masses, vec![(1, 1), (1, 2)]);
         assert_eq!(back.model.provenance, orig.model.provenance);
@@ -2894,8 +3613,10 @@ pub(crate) mod tests {
         b2.model.provenance.masses = vec![(6, 12), (8, 16)];
         let p3 = tmp("masses-v3-body2.model");
         write(&p3, &b2.model, &b2.accumulator, None, &[], None).unwrap();
-        let bytes2 = std::fs::read(&p3).unwrap();
-        assert_eq!(&bytes2[..8], MAGIC_V7, "version 7 is written for a body-2 basis too");
+        let written2 = std::fs::read(&p3).unwrap();
+        assert_written(&written2, 7);
+        let bytes2 = body_form(&written2);
+        assert_eq!(&bytes2[..8], MAGIC_V7, "body 7 is written for a body-2 basis too");
         let hl = u64::from_le_bytes(bytes2[8..16].try_into().unwrap()) as usize;
         let h1 = std::str::from_utf8(&bytes2[16..16 + hl]).unwrap().replacen("ASMODEL7","ASMODEL1", 1).replacen(",\"masses\":[[6,12],[8,16]]", "", 1).replacen(",\"ionic\":\"none\"", "", 1);
         let mut v1 = MAGIC.to_vec();
@@ -2939,7 +3660,10 @@ pub(crate) mod tests {
         orig.model.provenance.ionic = "cores/0123456789abcdef".into();
         let path = tmp("ionic-v4.model");
         write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
-        let bytes = std::fs::read(&path).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        assert_written(&written, 7);
+        // the body form (version 7's bytes, what the writer before version 9 wrote): the surgery below starts from it
+        let bytes = body_form(&written);
         assert_eq!(&bytes[..8], b"ASMODEL7");
         let back = read(&path).unwrap();
         assert_eq!(back.model.provenance.ionic, "cores/0123456789abcdef");
@@ -2994,8 +3718,9 @@ pub(crate) mod tests {
         std::fs::write(&cut, &bytes[..16 + hl]).unwrap();
         assert_eq!(read_provenance(&cut).unwrap(), orig.model.provenance);
         assert_eq!(read(&cut).unwrap_err().kind(), io::ErrorKind::InvalidData);
-        // an older version: header surgery as in `old_versions_read_as_all_electron` gives no mass record and "none"
-        let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
+        // an older version: header surgery as in `old_versions_read_as_all_electron` (on the body
+        // form, version 7's header) gives no mass record and "none"
+        let header = header_of(&body_form(&bytes));
         let v2 = header.replacen("ASMODEL7","ASMODEL2", 1).replacen(",\"ionic\":\"cores/0123456789abcdef\"", "", 1);
         let masses = format!(",\"masses\":[{}]", orig.model.provenance.masses.iter().map(|(z, a)| format!("[{z},{a}]")).collect::<Vec<_>>().join(","));
         let v2 = v2.replacen(&masses, "", 1);
@@ -3047,7 +3772,10 @@ pub(crate) mod tests {
         let audits = [case("shell-check", Some((1, 1))), case("audit", None)];
         let path = tmp("shell-pair-v5.model");
         write_full_with_audits(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &audits).unwrap();
-        let bytes = std::fs::read(&path).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        assert_written(&written, 7);
+        // the body form (version 7's bytes, what the writer before version 9 wrote): the surgery below starts from it
+        let bytes = body_form(&written);
         assert_eq!(&bytes[..8], MAGIC_V7);
         let back = read(&path).unwrap();
         assert_eq!(back.failed_audits, audits.to_vec());
@@ -3087,7 +3815,8 @@ pub(crate) mod tests {
         assert_eq!(orig.model.provenance.ionic, "none");
         let path = tmp("ionic-old-src.model");
         write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
-        let bytes = std::fs::read(&path).unwrap();
+        // the body form (version 7's bytes, what the writer before version 9 wrote): the surgery below starts from it
+        let bytes = body_form(&std::fs::read(&path).unwrap());
         let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
         let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap();
         let masses = format!(",\"masses\":[{}]", orig.model.provenance.masses.iter().map(|(z, a)| format!("[{z},{a}]")).collect::<Vec<_>>().join(","));
@@ -3118,7 +3847,10 @@ pub(crate) mod tests {
         let orig = random_sidecar(5, false);
         let path = tmp("corrupt-src.model");
         write(&path, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None).unwrap();
-        let good = std::fs::read(&path).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        assert_written(&written, 7);
+        // the body form (version 7's bytes, what the writer before version 9 wrote): the surgery below starts from it
+        let good = body_form(&written);
         let header_len = u64::from_le_bytes(good[8..16].try_into().unwrap()) as usize;
         let header = String::from_utf8(good[16..16 + header_len].to_vec()).unwrap();
         let body = &good[16 + header_len..];
@@ -3170,18 +3902,30 @@ pub(crate) mod tests {
         }
         assert_eq!(off, good.len(), "the test's own array walk");
         cases.push(("zero sample weight", zero_w));
-        // a newer format version says so instead of "not a model sidecar"
+        // the version-9 magic over a body's own header (its `format` string, no `body` key) is a
+        // mismatch, not a file; version 9 is the last `ASMODEL<digit>`, so no one-digit magic is
+        // newer than this build any more (module doc, "Version 9")
+        cases.push(("v9 magic on a v7 file", [MAGIC_V9.as_slice(), &good[8..]].concat()));
         let p = tmp("newer.model");
-        std::fs::write(&p, [b"ASMODEL9".as_slice(), &good[8..]].concat()).unwrap();
+        std::fs::write(&p, [MAGIC_V9.as_slice(), &good[8..]].concat()).unwrap();
         let e = read(&p).unwrap_err();
-        assert!(e.to_string().contains("format version 9 is newer than this build"), "{e}");
+        assert!(e.to_string().contains("does not match the file's version 9"), "{e}");
+        // so is version 10's magic (trust tightening Task 1)
+        std::fs::write(&p, [MAGIC_V10.as_slice(), &good[8..]].concat()).unwrap();
+        let e = read(&p).unwrap_err();
+        assert!(e.to_string().contains("does not match the file's version 10"), "{e}");
+        // a later version (the `ASMOD<ddd>` layout, module doc "The magic") says so, by number
+        let next = MAGICS.len() + 1;
+        std::fs::write(&p, [format!("ASMOD{next:03}").as_bytes(), &good[8..]].concat()).unwrap();
+        let e = read(&p).unwrap_err();
+        assert!(e.to_string().contains(&format!("format version {next} is newer than this build")), "{e}");
         // body-3 corruptions: a v1 format string under the v3 magic, an unsupported l_max, a
         // body-2 header over a body-3 body, a terms list that does not match the layout (two
         // swapped)
         let v2 = random_sidecar(6, true);
         let path_v2 = tmp("corrupt-src-v2.model");
         write(&path_v2, &v2.model, &v2.accumulator, None, &[], None).unwrap();
-        let good2 = std::fs::read(&path_v2).unwrap();
+        let good2 = body_form(&std::fs::read(&path_v2).unwrap());
         let hl2 = u64::from_le_bytes(good2[8..16].try_into().unwrap()) as usize;
         let header2 = String::from_utf8(good2[16..16 + hl2].to_vec()).unwrap();
         let body2 = good2[16 + hl2..].to_vec();

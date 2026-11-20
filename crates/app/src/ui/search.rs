@@ -159,7 +159,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Temperature T", "kelvin", Dock(D::Readouts), "d-tiles"),
     e("Drift", "energy conservation Ha/ps health", Dock(D::Readouts), "d-tiles"),
     e("KE (nuclei)", "kinetic energy", Dock(D::Readouts), "d-energies"),
-    e("E_KS", "Kohn-Sham energy", Dock(D::Readouts), "d-energies"),
+    e("F (electronic free energy)", "Kohn-Sham energy E_KS free energy Mermin T_el electronic temperature entropy TS smearing Fermi-Dirac", Dock(D::Readouts), "d-energies"),
     e("E total", "energy", Dock(D::Readouts), "d-energies"),
     e("E conserved", "energy invariant", Dock(D::Readouts), "d-energies"),
     e("Work done by tools", "drag thermostat pins", Dock(D::Readouts), "d-work"),
@@ -172,7 +172,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Box warning", "face edge health", Dock(D::Readouts), "d-health"),
     e("dt warning", "health", Dock(D::Readouts), "d-health"),
     e("Dynamics notes", "thermostat Maxwell-Boltzmann", Dock(D::Readouts), "d-health"),
-    e("Energy breakdown and solver", "kinetic external Hartree xc nuclear SCF residual Poisson ρ max", Dock(D::Readouts), "d-breakdown"),
+    e("Energy breakdown and solver", "kinetic external Hartree xc nuclear internal E entropy TS free energy F SCF residual Poisson ρ max", Dock(D::Readouts), "d-breakdown"),
     e("Set up PySCF", "install python pyscf wsl pip reference enable", Dock(D::Readouts), "d-compare"),
     e("Compare with reference (PySCF)", "pyscf reference forces dipole relax both bond lengths angles lda pbe b3lyp ccsd(t) deviation", Dock(D::Readouts), "d-compare"),
     // Graph

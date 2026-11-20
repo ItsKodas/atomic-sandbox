@@ -82,6 +82,7 @@
 //! in the order, so the composed verdict is exactly `would_answer`'s. Measured:
 //! `training_views_build_time_is_reported` (the task report). Nothing here runs inside
 //! `evaluate`.
+use super::stray::Split;
 use super::trust::max_nan;
 use super::*;
 use sim::activity::{
@@ -150,6 +151,9 @@ impl SurrogateKs {
     /// between fresh checks. Every installed model has a posterior (`install_sidecar` refuses a
     /// file without one, Task 4 review I4), so 5d and 6–7 are always judged; the branch without
     /// stds is unreachable and kept only so a hand-built model cannot panic here.
+    ///
+    /// A cleared stray-atom scene (`stray_cleared`; spec §4.4) is judged as `evaluate` judges it: its stray atoms
+    /// exempt from 5a–5e, rule 7 per bonded atom, 5d and the fences on the bonded part alone.
     pub fn would_answer(&self, pos: &[[f64; 3]], z: &[u8], prov: &Provenance) -> Verdict {
         self.gate(z, prov).map_err(|g| (g.reason.rule, g.reason.atom))?;
         let model = self.model.as_ref().expect("the gate passed: a model exists");
@@ -158,24 +162,33 @@ impl SurrogateKs {
             // what rule 2 names; `evaluate` returns an error there with no rule
             DescribeError::UnknownSpecies(zu) => (TeachRule::NewSpecies(zu), None),
         })?;
-        self.verdict_past_gate(model, pos, z, &pred)
+        let cleared = self.stray_cleared(pos, z, prov);
+        self.verdict_judged(model, pos, z, &pred, cleared.as_ref().map(|c| &c.0))
     }
 
     /// [`would_answer`](Self::would_answer) past the gate, on the caller's prediction at
     /// (`pos`, `z`) — `model.predict(pos, z, true)` (the curve's band shares it, plan review S2).
+    /// No stray-atom exemption (no provenance to key a signature by).
+    #[cfg(test)]
     pub(super) fn verdict_past_gate(&self, model: &Model, pos: &[[f64; 3]], z: &[u8], pred: &surrogate::Prediction) -> Verdict {
-        self.verdict_middle(model, pos, z, pred)?;
-        self.fence_verdict(pos, z)
+        self.verdict_judged(model, pos, z, pred, None)
+    }
+
+    /// [`would_answer`](Self::would_answer) past the gate, on the caller's prediction at (`pos`, `z`), with `part`
+    /// the split of a cleared stray-atom scene (`stray_cleared`), judged as `evaluate` judges it.
+    fn verdict_judged(&self, model: &Model, pos: &[[f64; 3]], z: &[u8], pred: &surrogate::Prediction, part: Option<&Split>) -> Verdict {
+        self.verdict_middle(model, pos, z, pred, part)?;
+        self.fence_verdict(pos, z, part)
     }
 
     /// The verdict between the gate and the fence: a function of the model and the policy only
-    /// (what the curve cache keeps).
-    fn verdict_middle(&self, model: &Model, pos: &[[f64; 3]], z: &[u8], pred: &surrogate::Prediction) -> Verdict {
+    /// (what the curve cache keeps; `part` as [`verdict_judged`](Self::verdict_judged)).
+    fn verdict_middle(&self, model: &Model, pos: &[[f64; 3]], z: &[u8], pred: &surrogate::Prediction, part: Option<&Split>) -> Verdict {
         let code = |r: Refusal| (r.rule, r.atom);
         if let Some(r) = non_finite_answer(pred) {
             return Err(code(r));
         }
-        if let (_, Some(r)) = self.envelope_outside(model, pos, z) {
+        if let (_, Some(r)) = self.envelope_outside_except(model, pos, z, part.map_or(&[][..], |s| &s.stray), None) {
             return Err(code(r));
         }
         let posterior = match (pred.energy_std, pred.force_std_epistemic.as_ref()) {
@@ -184,7 +197,7 @@ impl SurrogateKs {
         };
         // 5d beside the variance, as `evaluate` (the same threshold: ν > 1)
         if posterior.is_some() {
-            if let Some((_, at)) = self.null_space.as_ref().and_then(|ns| ns.novelty(pos, z).ok()).filter(|(nu, _)| *nu > 1.0) {
+            if let Some((_, at)) = self.novelty_judged(pos, z, part).filter(|(nu, _)| *nu > 1.0) {
                 return Err((TeachRule::NewEnvironment, at));
             }
         }
@@ -207,14 +220,14 @@ impl SurrogateKs {
     /// audit fence (`audit_fence_refusal` is the last two). Before the M7 leftovers (final review
     /// M1) this read `near_audit_fence` alone, so the curves drew a fenced shell band as answered
     /// while strict mode refused it.
-    fn fence_verdict(&self, pos: &[[f64; 3]], z: &[u8]) -> Verdict {
-        if !self.near_quarantined_cached(pos, z).is_empty() {
+    fn fence_verdict(&self, pos: &[[f64; 3]], z: &[u8], part: Option<&Split>) -> Verdict {
+        if !self.near_quarantined_judged(pos, z, part).is_empty() {
             return Err((TeachRule::NearQuarantine, None));
         }
-        if let Some(r) = self.near_misfit_refusal(pos, z) {
+        if let Some(r) = self.near_misfit_refusal(pos, z, part) {
             return Err((r.rule, r.atom));
         }
-        match self.audit_fence_refusal(pos, z) {
+        match self.audit_fence_refusal_judged(pos, z, part) {
             Some(r) => Err((r.rule, r.atom)),
             None => Ok(()),
         }
@@ -223,7 +236,7 @@ impl SurrogateKs {
     /// Whether any fence can refuse (a quarantined sample, a misfit atom, an audit or a shell
     /// fence): the views re-judge the cached answered points only then.
     fn any_fence(&self) -> bool {
-        self.fencing() > 0 || self.misfit_fence_stands() || !self.audit_fences.is_empty()
+        self.any_fences() || self.misfit_fence_stands() || !self.audit_fences.is_empty()
     }
 
     /// The model generation (`model_gen`): changes at every installed, restored or forgotten
@@ -233,6 +246,13 @@ impl SurrogateKs {
         self.model_gen
     }
 
+    /// The fit id (trust tightening, spec 2026-11-18 §3; the field's doc): the id a history point
+    /// recorded now carries. Unlike [`model_generation`](Self::model_generation) it moves only with
+    /// a refit that solved new coefficients; 0 before any fit.
+    pub fn fit_id(&self) -> u64 {
+        self.fit_id
+    }
+
     /// The training views (module doc); `None` without a fitted model and a store. Rebuilds the
     /// curve cache when the model generation moved, fills the fence's descriptor cache while
     /// samples are quarantined or M has misfit atoms (review m4: the fences work without it
@@ -240,7 +260,7 @@ impl SurrogateKs {
     /// Both caches decide nothing.
     pub fn training_views(&mut self) -> Option<TrainingViews> {
         let t0 = Instant::now();
-        if self.fencing() > 0 || self.misfit_fence_stands() {
+        if self.any_fences() || self.misfit_fence_stands() {
             self.ensure_desc_cache();
         }
         if self.curve_cache.as_ref().is_none_or(|c| c.model_gen != self.model_gen) {
@@ -287,7 +307,7 @@ impl SurrogateKs {
                         // rule 6's ratio: max over the atoms of σ_F,epi/(√3 · bound) (plan review M5)
                         c.force_ratio.push(self.variance_check(model, &p, e, f, &pos, &zs).atoms.iter().copied().fold(0.0, max_nan));
                     }
-                    c.middle.push(self.verdict_middle(model, &pos, &zs, &p).err().map(|e| e.0));
+                    c.middle.push(self.verdict_middle(model, &pos, &zs, &p, None).err().map(|e| e.0));
                     c.r.push(x);
                 }
                 curves.push(c);
@@ -309,8 +329,13 @@ impl SurrogateKs {
                 Q_DRAFT => SampleState::HeldOut,
                 // lone atoms loaded from before the keep rule: held out for good
                 Q_LONE => SampleState::Lone,
+                // stray atoms no composition check has measured yet: held out of the fit (`stray`)
+                Q_STRAY => SampleState::HeldOut,
                 // waiting for its box's reference (collection mode): not in the fit yet
                 Q_REF_WAIT => SampleState::Unfitted,
+                // re-solved for the new solver (Fermi–Dirac spec §7.6): held out until its review; kept by it, it fences
+                Q_RESOLVED if self.fences(i) => SampleState::Quarantined,
+                Q_RESOLVED => SampleState::HeldOut,
                 Q_NONE if i < *fit_n && fit_q.get(i).copied().unwrap_or(Q_NONE) == Q_NONE => SampleState::Fitted,
                 Q_NONE => SampleState::Unfitted,
                 // a code the sidecar does not write (it validates 0–3): excluded, as `excluded`
@@ -343,7 +368,9 @@ impl SurrogateKs {
                 parity_omitted += 1;
                 continue;
             }
-            let n = smp.pos.len() as f64;
+            // per energy-row atom, as the fit's own row (`surrogate::energy_row_atoms`, ruling 9a): n for every sample
+            // without a stray atom (bit for bit), the bonded atoms at one with stray atoms
+            let n = surrogate::energy_row_atoms(&model.basis, &smp.pos).max(1) as f64;
             let st = state(i);
             // a capped segment (M8a Task 10): no energy point (its energy is not fitted: it holds
             // the caps), the interior atoms' forces only
@@ -387,7 +414,7 @@ impl SurrogateKs {
                     .map(|(&x, middle)| match (gate, middle) {
                         (Some(rule), _) => Some(rule),
                         (None, Some(rule)) => Some(*rule),
-                        (None, None) if fence => self.fence_verdict(&dimer_at(x), &[c.z.0, c.z.1]).err().map(|e| e.0),
+                        (None, None) if fence => self.fence_verdict(&dimer_at(x), &[c.z.0, c.z.1], None).err().map(|e| e.0),
                         (None, None) => None,
                     })
                     .collect();

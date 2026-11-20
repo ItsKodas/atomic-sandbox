@@ -3,7 +3,9 @@
 //! the app-side histories. Pure painters over cached vectors: nothing here asks for a solve.
 //!
 //! What the plots say, and do not say (physics honesty, spec §9):
-//! - parity axes are (E − Σ E_ref)/N, the quantity the fit models and the energy tier bounds;
+//! - parity axes are (E − Σ E_ref)/N, the quantity the fit models and the energy tier bounds; E and the references are
+//!   Kohn–Sham free energies F = E − TS at T_el (Fermi–Dirac spec 2026-11-13 §4.7(i)), and every text that shows them
+//!   says so ([`PARITY_AXIS`], [`parity_toggle_tip`], [`parity_caption`], [`PAIR_AXIS`]);
 //! - the pair curve is the model's energy of an *isolated* dimer, not a pair potential; where the
 //!   policy would refuse that dimer (`PairCurve::refused`, from `would_answer`) the curve is dashed
 //!   and labelled with the rule — the dominant encoding, never read from the band;
@@ -231,11 +233,30 @@ pub fn rmse(ui: &mut Ui, st: &ActivityState) {
 
 // ---- parity ----
 
+/// The energy parity plot's x-axis label (spec 2026-11-13 §4.7(i): the references are free energies at T_el).
+pub const PARITY_AXIS: &str = "DFT (E − Σ E_ref)/N, mHa/atom, free energies at T_el →";
+
+/// The pair curve's axis label: the dimer's energy against its two atoms' references, free energies at T_el.
+pub const PAIR_AXIS: &str = "E − E_ref(a) − E_ref(b), mHa, free energies at T_el";
+
+/// The parity plot's E toggle tooltip.
+pub fn parity_toggle_tip() -> String {
+    format!("energy per atom: (E − Σ E_ref)/N — {}", crate::ui::pseudo::reference_free_energy_note())
+}
+
+/// The parity plot's caption; `omitted` is its "; n samples omitted …" tail (or empty).
+pub fn parity_caption(omitted: &str) -> String {
+    format!(
+        "model vs DFT for the training samples, (E − Σ E_ref)/N with the fit's own reference energies — {}; audits are counted as fallbacks until the model library (sidecar v4) tags them{omitted}",
+        crate::ui::pseudo::reference_free_energy_note()
+    )
+}
+
 /// Model vs DFT for the training samples (spec §3.3.5, §9.1): energies per atom or force components.
 pub fn parity(ui: &mut Ui, st: &mut ActivityState, v: &TrainingViews) {
     ui.horizontal(|ui| {
         theme::section(ui, "model vs DFT");
-        if let Some(f) = theme::segmented(ui, st.parity_forces, &[(false, "E", "energy per atom: (E − Σ E_ref)/N"), (true, "F", "force components of the fitted samples")]) {
+        if let Some(f) = theme::segmented(ui, st.parity_forces, &[(false, "E", parity_toggle_tip().as_str()), (true, "F", "force components of the fitted samples")]) {
             st.parity_forces = f;
         }
     });
@@ -282,7 +303,7 @@ pub fn parity(ui: &mut Ui, st: &mut ActivityState, v: &TrainingViews) {
             }
             small(&p, pos2(resp.rect.left() + 3.0, inner.top()), Align2::LEFT_TOP, &axis(r.1), theme::INK_FAINT);
             small(&p, pos2(resp.rect.left() + 3.0, inner.bottom()), Align2::LEFT_BOTTOM, &axis(r.0), theme::INK_FAINT);
-            small(&p, pos2(inner.center().x, resp.rect.bottom() - 1.0), Align2::CENTER_BOTTOM, "DFT (E − Σ E_ref)/N, mHa/atom →", theme::INK_FAINT);
+            small(&p, pos2(inner.center().x, resp.rect.bottom() - 1.0), Align2::CENTER_BOTTOM, PARITY_AXIS, theme::INK_FAINT);
             if let Some(pos) = resp.hover_pos().filter(|q| inner.contains(*q)) {
                 let best = pts
                     .iter()
@@ -309,7 +330,7 @@ pub fn parity(ui: &mut Ui, st: &mut ActivityState, v: &TrainingViews) {
     let omitted = if v.parity_omitted > 0 { format!("; {} samples omitted (no reference or no prediction)", v.parity_omitted) } else { String::new() };
     caption(
         ui,
-        format!("model vs DFT for the training samples, (E − Σ E_ref)/N with the fit's own reference energies; audits are counted as fallbacks until the model library (sidecar v4) tags them{omitted}"),
+        parity_caption(&omitted),
     );
 }
 
@@ -395,7 +416,7 @@ pub fn pair_curve(ui: &mut Ui, c: &PairCurve, v: &TrainingViews, hist: Option<&s
     small(&p, pos2(resp.rect.left() + 3.0, inner.top()), Align2::LEFT_TOP, &axis(yr.1), theme::INK_FAINT);
     small(&p, pos2(resp.rect.left() + 3.0, inner.bottom()), Align2::LEFT_BOTTOM, &axis(yr.0), theme::INK_FAINT);
     small(&p, pos2(inner.left(), resp.rect.bottom() - 1.0), Align2::LEFT_BOTTOM, &format!("{:.1} Bohr", xr.0), theme::INK_FAINT);
-    small(&p, pos2(inner.right(), resp.rect.bottom() - 1.0), Align2::RIGHT_BOTTOM, &format!("{:.1} Bohr   E − E_ref(a) − E_ref(b), mHa", xr.1), theme::INK_FAINT);
+    small(&p, pos2(inner.right(), resp.rect.bottom() - 1.0), Align2::RIGHT_BOTTOM, &format!("{:.1} Bohr   {PAIR_AXIS}", xr.1), theme::INK_FAINT);
     let k_at = |pos: Pos2| nearest_index(n, (pos.x - inner.left()) / inner.width());
     if let Some(pos) = resp.hover_pos().filter(|q| inner.contains(*q)) {
         let k = k_at(pos);

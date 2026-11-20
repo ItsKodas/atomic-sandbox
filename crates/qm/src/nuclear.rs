@@ -131,6 +131,127 @@ pub fn deposit_charge(grid: &Grid, nuclei: &[Nucleus], sigma: f64) -> Vec<f64> {
     })
 }
 
+/// The cold-start guess of an all-electron SCF (plan 2026-11-13 Task 9c (a)): the superposition of the free atoms'
+/// spin-restricted LSDA ground-state densities ρ_A(|r − R_A|) of `radial::ground_state(Z, Restricted)` — a function of
+/// Z alone (rule 1), solved once per (Z, σ) and cached — each convolved with the nuclear Gaussian of width `sigma`
+/// (`smear_radial`), sampled on the grid by linear interpolation in ln r (0 beyond the radial grid, the innermost value
+/// inside it), and rescaled per atom so that its grid sum Σ ρ_A dV is Z_A exactly — like the σ = 1 blobs it replaces,
+/// the guess carries each centre's charge (the caller scales the total to the electron count). `None` when a free atom
+/// does not solve (the caller then keeps the blobs) or an atom's samples sum to zero.
+///
+/// Why the convolution: the grid's nucleus is a Gaussian of width σ (`deposit_charge`; σ = h by default), and an
+/// all-electron core is far inside it (O 1s: ⟨r⟩ ≈ 0.19 Bohr against σ = h = 0.25). The free atom's point-nucleus core,
+/// sampled as is, sits where the smeared nucleus has little charge, over-screens it and pushes the first potential up:
+/// measured on all-electron H₂O 97³ × 0.25, every first-step level above −0.04 Ha and μ = −0.003 Ha (no witness within
+/// 32 extra vectors), against −0.13 Ha converged. Convolved with the same Gaussian, the electrons and the nucleus are
+/// smeared alike — the free atom's electrostatics as the grid can represent it — and the first step's μ is −0.127 Ha.
+/// Why the per-atom rescale: the samples of a core narrower than h mis-count its charge by electrons.
+///
+/// Why a free-atom start at all (task 9b review): the σ = 1 Bohr blobs put the early steps' μ near −0.06 Ha, high in a
+/// large box's continuum, so the 36 kT witness window held 15–20 box states on transient steps (H₂O 97³: a peak of 20
+/// extra vectors per spin, 114.5 s cold).
+pub fn free_atom_density(grid: &Grid, nuclei: &[Nucleus], sigma: f64) -> Option<Vec<f64>> {
+    use crate::radial::atom::{ground_state, SpinMode};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Profile = Option<Arc<(Vec<f64>, Vec<f64>)>>;
+    static CACHE: OnceLock<Mutex<HashMap<(u8, u64), Profile>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut profiles: Vec<Arc<(Vec<f64>, Vec<f64>)>> = Vec::with_capacity(nuclei.len());
+    for n in nuclei {
+        let entry = {
+            let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
+            c.entry((n.z, sigma.to_bits())).or_insert_with(|| ground_state(n.z, SpinMode::Restricted).ok().map(|a| {
+                let rho: Vec<f64> = (0..a.grid.r.len()).map(|i| a.rho[0][i] + a.rho[1][i]).collect();
+                Arc::new((a.grid.r.clone(), smear_radial(&a.grid.r, &rho, sigma)))
+            })).clone()
+        };
+        profiles.push(entry?);
+    }
+    let at = |p: &(Vec<f64>, Vec<f64>), d: f64| -> f64 {
+        let (r, rho) = (&p.0, &p.1);
+        if d <= r[0] { return rho[0]; }
+        if d >= r[r.len() - 1] { return 0.0; }
+        let i = r.partition_point(|&x| x <= d).max(1) - 1;
+        let t = (d.ln() - r[i].ln()) / (r[i + 1].ln() - r[i].ln());
+        rho[i] + t * (rho[i + 1] - rho[i])
+    };
+    // the per-atom grid sums (compensated), then the samples at Z_A / (Σ_A dV)
+    let mut weights = Vec::with_capacity(nuclei.len());
+    for (n, p) in nuclei.iter().zip(&profiles) {
+        let q = crate::grid::neumaier((0..grid.len()).map(|idx| at(p, dist2(grid.point(idx), n.pos).sqrt()))) * grid.dv();
+        if !(q.is_finite() && q > 0.0) { return None; }
+        weights.push(n.z as f64 / q);
+    }
+    Some(grid.sample(|r| nuclei.iter().zip(&profiles).zip(&weights).map(|((n, p), w)| w * at(p, dist2(r, n.pos).sqrt())).sum()))
+}
+
+/// The SCF's cold density guess and the charge it carries, per centre (plan 2026-11-13 Task 9c (a); task 9c review M4):
+/// under `free_atoms` (the `FermiDirac` solves) an all-electron centre starts from its σ-smeared free atom
+/// (`free_atom_density` at the centre's own σ — `sigma` without a setup) and a pseudised one from a σ = 1 Bohr blob of
+/// its valence charge Z_v; otherwise (`Aufbau`: its pinned bits) every centre is the σ = 1 blob of
+/// its charge (Z, or Z_v when pseudised), as before Task 9c. A free atom that does not solve falls back to its blob.
+/// Returns (Σ charges, the unnormalised density); the caller scales it to the electron count.
+pub fn cold_guess(grid: &Grid, nuclei: &[Nucleus], setup: Option<&IonicSetup>, sigma: f64, free_atoms: bool) -> (f64, Vec<f64>) {
+    let all: Vec<Centre> = match setup {
+        None => nuclei.iter().map(|n| Centre { pos: n.pos, charge: n.z as f64, sigma }).collect(),
+        Some(s) => centres(nuclei, s),
+    };
+    let z_tot = all.iter().map(|c| c.charge).sum::<f64>();
+    let all_electron = |i: usize| setup.is_none_or(|s| matches!(s.ionic(nuclei[i].z), Ionic::AllElectron { .. }));
+    if !free_atoms {
+        return (z_tot, match setup {
+            None => deposit_charge(grid, nuclei, 1.0),
+            Some(_) => deposit_centres(grid, &all.iter().map(|c| Centre { sigma: 1.0, ..*c }).collect::<Vec<_>>()),
+        });
+    }
+    let mut blobs = Vec::new();
+    let mut atoms: Option<Vec<f64>> = None;
+    for (i, c) in all.iter().enumerate() {
+        match all_electron(i).then(|| free_atom_density(grid, &nuclei[i..=i], c.sigma)).flatten() {
+            Some(rho) => match atoms.as_mut() {
+                Some(a) => a.iter_mut().zip(&rho).for_each(|(x, y)| *x += y),
+                None => atoms = Some(rho),
+            },
+            None => blobs.push(Centre { sigma: 1.0, ..*c }),
+        }
+    }
+    let guess = match (atoms, blobs.is_empty()) {
+        (Some(a), true) => a,
+        (Some(mut a), false) => { a.iter_mut().zip(deposit_centres(grid, &blobs)).for_each(|(x, y)| *x += y); a }
+        (None, _) => deposit_centres(grid, &blobs),
+    };
+    (z_tot, guess)
+}
+
+/// The spherical density ρ(r) (samples on the increasing radial grid `r`) convolved with the normalised 3D Gaussian
+/// of width σ: ρ̃(r) = 1/(r σ √(2π)) ∫₀^∞ r′ ρ(r′) [e^{−(r−r′)²/2σ²} − e^{−(r+r′)²/2σ²}] dr′ (the angular integral of
+/// the 3D convolution done analytically), the bracket written e^{−(r−r′)²/2σ²}·(−expm1(−2rr′/σ²)) so it neither
+/// overflows nor cancels; trapezoidal in r′ over |r − r′| ≤ 10σ. Charge-conserving up to the quadrature.
+fn smear_radial(r: &[f64], rho: &[f64], sigma: f64) -> Vec<f64> {
+    let c = 1.0 / (sigma * (2.0 * PI).sqrt());
+    let s2 = sigma * sigma;
+    let n = r.len();
+    let integrand = |ri: f64, j: usize| -> f64 {
+        let d = ri - r[j];
+        r[j] * rho[j] * (-d * d / (2.0 * s2)).exp() * -(-2.0 * ri * r[j] / s2).exp_m1()
+    };
+    (0..n).map(|i| {
+        let ri = r[i];
+        let lo = r.partition_point(|&x| x < ri - 10.0 * sigma);
+        let hi = r.partition_point(|&x| x <= ri + 10.0 * sigma).min(n);
+        if hi <= lo + 1 { return 0.0; }
+        let mut acc = 0.0;
+        let mut prev = integrand(ri, lo);
+        for j in lo + 1..hi {
+            let cur = integrand(ri, j);
+            acc += 0.5 * (prev + cur) * (r[j] - r[j - 1]);
+            prev = cur;
+        }
+        c * acc / ri
+    }).collect()
+}
+
 /// Potential energy of an electron in the field of the smeared nuclei:
 /// V_nuc(r) = −Σ_I Z_I erf(|r − R_I|/(σ√2))/|r − R_I|, with the exact limit −Z_I √(2/π)/σ at
 /// r = R_I. Equals −φ where φ is the Poisson potential of `deposit_charge`.
@@ -275,6 +396,57 @@ mod tests {
             if (a + b).abs() > err { err = (a + b).abs(); at = i; }
         }
         (err, g.point(at))
+    }
+
+    /// Task 9c (a): the free-atom guess carries each centre's charge Z_A on the grid (the caller's rescale assumes
+    /// it), all-electron O on h = 0.25 included, where the 1s core is below h and the raw samples mis-count it.
+    #[test]
+    fn free_atom_guess_carries_each_atoms_charge() {
+        let g = Grid::cube(33, 0.25);
+        let c = g.point(g.idx(16, 16, 16));
+        let o = Nucleus { pos: [c[0] + 0.07, c[1] - 0.03, c[2] + 0.11], z: 8 };
+        let h1 = Nucleus { pos: [o.pos[0] + 1.43, o.pos[1] + 1.11, o.pos[2]], z: 1 };
+        let h2 = Nucleus { pos: [o.pos[0] - 1.43, o.pos[1] + 1.11, o.pos[2]], z: 1 };
+        for nuc in [vec![o], vec![h1], vec![o, h1, h2]] {
+            let rho = free_atom_density(&g, &nuc, 0.25).expect("free atoms solve");
+            let z: f64 = nuc.iter().map(|n| n.z as f64).sum();
+            assert!(rho.iter().all(|&x| x >= 0.0 && x.is_finite()));
+            assert_relative_eq!(g.integrate(&rho), z, max_relative = 1e-12);
+        }
+        // H alone, a few Bohr out (well resolved by h): the LSDA free-atom density, close to the exact e^{−2r}/π
+        let rho = free_atom_density(&g, &[h1], 0.25).unwrap();
+        let p = g.point(g.idx(16, 16, 22));
+        let d = dist2(p, h1.pos).sqrt();
+        let exact = (-2.0 * d).exp() / PI;
+        assert!((rho[g.idx(16, 16, 22)] / exact - 1.0).abs() < 0.35, "ρ(H, {d:.2}) = {:.3e} vs e^(−2r)/π {exact:.3e}", rho[g.idx(16, 16, 22)]);
+    }
+
+    /// Task 9c review M4: the cold guess per centre. Without a setup and under FermiDirac it is `free_atom_density`
+    /// bit for bit; without free atoms it is the σ = 1 blobs bit for bit (the Aufbau pins); with a
+    /// CoresOnly setup (pseudo-O, all-electron H) the H is its free atom and the O a blob of Z_v, each centre carrying its
+    /// charge on the grid.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only (generates pseudo-O); run: cargo test -p qm --release")]
+    fn the_cold_guess_is_per_centre() {
+        use crate::ionic::{Ionic, IonicPolicy, IonicSetup};
+        let h = 0.25;
+        let g = Grid::cube(41, h);
+        let c = g.point(g.idx(20, 20, 20));
+        let o = Nucleus { pos: [c[0] + 0.07, c[1] - 0.03, c[2] + 0.11], z: 8 };
+        let hy = Nucleus { pos: [o.pos[0] + 1.83, o.pos[1], o.pos[2]], z: 1 };
+        let (z, free) = cold_guess(&g, &[o, hy], None, h, true);
+        assert_eq!(z, 9.0);
+        assert_eq!(free, free_atom_density(&g, &[o, hy], h).unwrap(), "no setup: the free atoms, bit for bit");
+        assert_eq!(cold_guess(&g, &[o, hy], None, h, false).1, deposit_charge(&g, &[o, hy], 1.0), "Aufbau: the blobs, bit for bit");
+        let t = crate::radial::test_cache::filtered_at(8, h);
+        let z_v = t.z_v;
+        let setup = IonicSetup::from_tables(IonicPolicy::CoresOnly, h, h, std::collections::BTreeMap::from([(8, Ionic::Pseudo(t)), (1, Ionic::AllElectron { sigma: h })]));
+        let (z, mixed) = cold_guess(&g, &[o, hy], Some(&setup), h, true);
+        assert_eq!(z, z_v + 1.0);
+        let want = free_atom_density(&g, &[hy], h).unwrap().iter().zip(deposit_centres(&g, &[Centre { pos: o.pos, charge: z_v, sigma: 1.0 }]))
+            .map(|(a, b)| a + b).collect::<Vec<_>>();
+        assert_eq!(mixed, want, "the H's free atom plus the O's Z_v blob");
+        assert_relative_eq!(g.integrate(&mixed), z_v + 1.0, max_relative = 1e-6);
     }
 
     #[test]

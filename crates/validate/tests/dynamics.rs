@@ -106,11 +106,24 @@
 //!   1e-6. Measured 5.8e-6 Bohr on this adapter, i.e. an effective δF ≈ 1.7e-7 between the two
 //!   passes. Bound `REWIND_BOUND` = 5e-5 (brief 1e-4; the margin is adapter-pinned, see the
 //!   constant).
+//! - V5 (Fermi–Dirac, spec 2026-11-13 §9; plan Task 11; `references.md` "V5"):
+//!   `work_integral_matches_free_energy_change` (CPU f64: the forces' work over 0.2 Bohr is −ΔF, not −ΔE) and
+//!   `fd_nve_conserves_f_plus_k_through_the_ts_swing` (GPU: CO₂⁺'s bend through a 6.4 mHa TS swing conserves F + K,
+//!   730 steps in two batches). Their pre-registered bounds failed (2026-11-17); fix round 1 re-derived both from error
+//!   sources documented before (the discrete force's box term, the stretch's Verlet swing, the forces' static work bias
+//!   along the bend), each test's doc and `references.md` say which. The `#[ignore]`d `v5_*` tests are the measurements
+//!   behind those terms. The two gates add ≈ 15 min (CPU) and ≈ 25 min (GPU) to the suite.
+//! - `stray_h_returning_conserves_energy` (stray atoms, spec 2026-11-18 §6 "Dynamics"; plan Task 7): after a default H₂
+//!   pass and K = 3 composition checks clear H₂ + H (101³ × 0.20, a 20 Bohr cube, `ionic accepted`, a background
+//!   auditor), NVE with a stray H flying past H₂ through r_cut (closest ≈ 3.6 Bohr) and out: model → teacher (rule 5b) →
+//!   model, each switch booked by the provider's `transition_jump`; `E_conserved` drift within `DRIFT_BOUND`, no teacher
+//!   solve box-affected, the booked jumps and E_conserved across each switch reported, and a control run (the teacher
+//!   alone from the same start) printed beside it.
 //!
 //! The GPU work of concurrently running tests is serialised through `GPU`, one evaluation at a
 //! time, so the per-solve times in the timing rows are uncontended while the tests interleave.
 use gpu::GpuContext;
-use sim::{DynCommand, Dynamics, Integrator, Nucleus, Scene};
+use sim::{DynCommand, Dynamics, ForceProvider, Integrator, Nucleus, Scene};
 use std::fmt::Write as _;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -552,4 +565,793 @@ fn rewind_retraces_on_the_gpu() {
     record(&ctx, timing_row("rewind", "H₂", N_H2, TOL_H2, &log, t_test.elapsed(), &format!("max Δr = {dr:.1e} Bohr")));
     assert!(far > 0.02, "test assumption: the molecule moved ({far})");
     assert!(dr <= REWIND_BOUND, "rewind missed the start by {dr:.3e} Bohr (bound {REWIND_BOUND:.0e})");
+}
+
+// ---- V5: the work integral (spec 2026-11-13 §9 "V5 new tests" 1; plan Task 11; ruling R10) ----
+//
+// Derivation (atomic units: Ha, Bohr, Ha/Bohr). `qm::forces` returns F_x = −dF/dx of the Mermin free energy
+// F = E − TS (stationary in ψ and f; `qm::forces` module doc, V3 confirms it on this geometry). Along a path x ∈ [0, L]
+// of one coordinate, the work the forces do is W = ∫₀ᴸ F_x dx = −[F(L) − F(0)], so
+//   ΔF + W = 0   and   ΔE + W = ΔE − ΔF = Δ(TS),
+// nonzero wherever a partly occupied level's f moves (ruling R10: W is the work the forces do, +∫F·dx; the spec's
+// "W = −∫F_HF·dx" written with "|W + ΔF|" is inconsistent, and `branch_jump` checks the same physics as
+// |ΔF − (−∫F·dR)|).
+// Quadrature: x_i = iΔ, Δ = L/40, i = 0 … 40. W₄₀ = composite Simpson on the 41 points, W₂₀ = Simpson on the 21 even
+// points (spacing 2Δ). Simpson's error is −L(Δ⁴/180)F_x⁗ + O(Δ⁶), so W₄₀ − W_exact ≈ (W₂₀ − W₄₀)/15 in magnitude: the
+// estimate |W₄₀ − W₂₀|/15.
+// Noise: each solve's F_x carries a path scatter σ_F and F a scatter σ_E (warm vs cold at the start point, measured
+// here). W₄₀ = Σ w_i F_x(x_i) with w_i > 0 and Σ w_i = L, so its noise is at most L·σ_F (fully correlated, the worst
+// case); ΔF = F(L) − F(0) carries √2·σ_E. Bound (spec §9 V5 1, re-review R-SHOULD-C, the brief's verbatim form):
+//   bound = |W₄₀ − W₂₀|/15 + 3·(L·σ_F + √2·σ_E) + L·B_box,   |ΔF + W₄₀| ≤ bound,   |ΔE + W₄₀| ≥ 5·bound.
+// The last term (fix round 1, the V5 bound review): the discrete HF force is the exact gradient of the discrete F only up
+// to the box term b = HF − (−dF/dx) of `qm::forces` (iii), ≤ B_box = 1e-4 Ha/Bohr (`WORK_B_BOX`), which the work over
+// L carries as L·b.
+// The pre-registered bound omitted it and failed by 392× (ΔF + W₄₀ = +7.97e-8 against 2.03e-10, 2026-11-17).
+// The second line tells F's derivative from E's: Δ(TS) = −5.6 mHa over this path (measured: TS 10.42 → 4.83 mHa as
+// the pinned pair's split widens; V3: d(TS)/dx ≈ −2.2e-2 Ha/Bohr at x = 0).
+
+/// The work integral's path: atom 0 of `common::v3_h4()` moved along x (toward atom 1) from its V3 position by 0 … L,
+/// L = 0.2 Bohr, in 40 steps (41 points). x ∈ [0, 0.2] widens the pinned pair's split from 12.9 mHa (u = 0.65, V3's
+/// certified point) away from the square, where the broken-symmetry branch competes (spec §4.7(e)).
+const WORK_PATH: f64 = 0.2;
+const WORK_POINTS: usize = 41;
+/// SCF and eigensolver tolerances of the work integral's CPU solves (plan Task 11: tol = eig_tol = 1e-9; `qm` asks its
+/// Poisson solves for 1e-12 at this tol).
+const WORK_TOL: f64 = 1e-9;
+const WORK_EIG_TOL: f64 = 1e-9;
+/// B_box (Ha/Bohr; fix round 1, the V5 bound review and its revision): a bound on the discrete force's box term
+/// |HF − (−dF/dx)| (`qm::forces` module doc, "Expected size …" (iii): the Dirichlet/multipole Hartree map's asymmetry),
+/// coefficient 1. Measured on this path b = +2.2 … +6.7e-7 (12 Bohr box); at x = 0.2 it falls with the box, 6.66e-7 /
+/// 1.38e-7 / 2.59e-8 at 12 / 15 / 18 Bohr (26×; `v5_work_integral_box_offset_probe`), so it is the box term. (iii)'s
+/// estimate is "≲ 1e-5", but the CO₂ bend (`v5_co2_bend_force_consistency_cpu`) measured the same box term at ≈ 1.6e-5
+/// Ha/Bohr per O in a 14 Bohr box, at that ceiling; so, by the revision's rule, B_box is V3's bound on |HF − R_F|,
+/// 1e-4 (the "M7 forces" Richardson bound), not 1e-5 (`references.md` "V5", fix round 1).
+const WORK_B_BOX: f64 = 1e-4;
+
+/// Neumaier-compensated sum (CLAUDE.md rule 4: energy reductions are compensated).
+fn neumaier(terms: impl Iterator<Item = f64>) -> f64 {
+    let (mut sum, mut c) = (0.0f64, 0.0f64);
+    for x in terms {
+        let t = sum + x;
+        c += if sum.abs() >= x.abs() { (sum - t) + x } else { (x - t) + sum };
+        sum = t;
+    }
+    sum + c
+}
+
+/// Composite Simpson on equally spaced samples `y` (odd count ≥ 3) at spacing `h`: (h/3)[y₀ + 4y₁ + 2y₂ + … + 4y_{n−1} + y_n].
+fn simpson(y: &[f64], h: f64) -> f64 {
+    assert!(y.len() >= 3 && y.len() % 2 == 1, "Simpson needs an odd number ≥ 3 of samples, got {}", y.len());
+    let n = y.len() - 1;
+    h / 3.0 * neumaier(y.iter().enumerate().map(|(i, &v)| v * if i == 0 || i == n { 1.0 } else if i % 2 == 1 { 4.0 } else { 2.0 }))
+}
+
+/// `f` over `items` on at most 4 threads (`qm` is single-threaded; the machine is shared), results in input order.
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out: Vec<Mutex<Option<R>>> = items.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|sc| {
+        for _ in 0..4.min(items.len()) {
+            sc.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if i >= items.len() { break; }
+                *out[i].lock().unwrap() = Some(f(&items[i]));
+            });
+        }
+    });
+    out.into_iter().map(|m| m.into_inner().unwrap().expect("every item ran")).collect()
+}
+
+/// One work-integral solve: x, F (`total`), E (`internal`), TS, F_x on the moved atom, SCF steps, final Δρ, face density.
+struct WorkPoint { x: f64, f: f64, e: f64, ts: f64, force: f64, iterations: usize, delta_rho: f64, face: f64 }
+
+/// V5 work integral [MUST-6] (spec 2026-11-13 §9 "V5 new tests" 1; plan Task 11; the derivation above): on V3's pinned
+/// H₄ (`common::v3_h4()`, CPU f64, 41³ × 0.30, σ = h, tol = eig_tol = 1e-9, `FermiDirac { kt: ELECTRON_KT }`), the work
+/// the Hellmann–Feynman forces do over 0.2 Bohr is −ΔF, and not −ΔE. 41 cold solves along the path (4 threads), the
+/// start re-solved warm from x₁ (σ_F, σ_E: its warm − cold) and the end re-solved warm from x₃₉ (reported). Every solve
+/// must converge with no warning but the box warning (V3's: the same Dirichlet box at every x, part of the discrete
+/// problem). Asserted: |ΔF + W₄₀| ≤ bound and |ΔE + W₄₀| ≥ 5·bound, bound = |W₄₀ − W₂₀|/15 + 3·(0.2·σ_F + √2·σ_E) +
+/// 0.2·B_box, σ_F and σ_E the larger warm − cold difference of the two ends. Numbers: `references.md` "V5".
+/// History: the pre-registered bound (without L·B_box) failed, ΔF + W₄₀ = +7.97e-8 Ha against 2.03e-10 (2026-11-17), the
+/// residual being the discrete force's box offset b = HF − (−dF/dx) (V3's +2.09e-7 Ha/Bohr at x = 0; +2.2 … +6.1e-7 along
+/// the path; far smaller in a 15 Bohr box, present on gapped H₂); fix round 1 adds the documented ceiling L·B_box.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test dynamics")]
+fn work_integral_matches_free_energy_change() {
+    use qm::{forces, scf, KsState, Occupations, ScfSettings, System, ELECTRON_KT};
+    let t_test = Instant::now();
+    let (g, sys, atom, axis) = common::v3_h4();
+    let mut set = ScfSettings::for_grid(&g);
+    (set.tol, set.eig_tol, set.occupations) = (WORK_TOL, WORK_EIG_TOL, Occupations::FermiDirac { kt: ELECTRON_KT });
+    let dx = WORK_PATH / (WORK_POINTS - 1) as f64;
+    let xs: Vec<f64> = (0..WORK_POINTS).map(|i| i as f64 * dx).collect();
+    let moved = |x: f64| {
+        let mut nuclei = sys.nuclei.clone();
+        nuclei[atom].pos[axis] += x;
+        System { nuclei, n_up: sys.n_up, n_dn: sys.n_dn, ionic: None }
+    };
+    let point = |x: f64, warm: Option<&KsState>| -> (KsState, WorkPoint) {
+        let m = moved(x);
+        let (st, stats) = scf(&g, &m, &set, warm).unwrap_or_else(|e| panic!("work integral x = {x} ({}): {e}", if warm.is_some() { "warm" } else { "cold" }));
+        let is_box = |w: &String| w.starts_with("density on box faces is ") && w.ends_with(": box too small");
+        assert!(stats.warnings.iter().all(is_box) && stats.warnings.len() <= 1, "work integral x = {x}: {:?}", stats.warnings);
+        let force = forces(&g, &st, &m.nuclei, set.sigma).unwrap()[atom][axis];
+        let p = WorkPoint { x, f: stats.energy.total, e: stats.energy.internal, ts: stats.energy.ts, force, iterations: stats.iterations, delta_rho: stats.delta_rho, face: stats.boundary_density };
+        (st, p)
+    };
+    let solved = par_map(&xs, |&x| point(x, None));
+    let (start_warm, end_warm) = std::thread::scope(|sc| {
+        let a = sc.spawn(|| point(xs[0], Some(&solved[1].0)).1);
+        let b = sc.spawn(|| point(xs[WORK_POINTS - 1], Some(&solved[WORK_POINTS - 2].0)).1);
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    let pts: Vec<&WorkPoint> = solved.iter().map(|(_, p)| p).collect();
+    let fx: Vec<f64> = pts.iter().map(|p| p.force).collect();
+    let fx_even: Vec<f64> = fx.iter().step_by(2).copied().collect();
+    let w40 = simpson(&fx, dx);
+    let w20 = simpson(&fx_even, 2.0 * dx);
+    let (first, last) = (pts[0], pts[WORK_POINTS - 1]);
+    let (d_f, d_e, d_ts) = (last.f - first.f, last.e - first.e, last.ts - first.ts);
+    // the path scatters: the larger warm − cold difference of the two ends (fix round 1), of the force F_x (σ_F) and of
+    // the free energy F (σ_E in the spec's notation: the scatter of the energy that is differenced, F)
+    let sigma_force = (start_warm.force - first.force).abs().max((end_warm.force - last.force).abs());
+    let sigma_free = (start_warm.f - first.f).abs().max((end_warm.f - last.f).abs());
+    let simpson_err = (w40 - w20).abs() / 15.0;
+    let noise = 3.0 * (WORK_PATH * sigma_force + 2f64.sqrt() * sigma_free);
+    let box_term = WORK_PATH * WORK_B_BOX;
+    let bound = simpson_err + noise + box_term;
+    let wall = t_test.elapsed().as_secs_f64();
+    let mut out = String::new();
+    let _ = writeln!(out, "V5 work integral: H₄ 1.8 × 1.95 (`v3_h4`), atom {atom} along axis {axis}, x ∈ [0, {WORK_PATH}] in {} steps; 41³ × 0.30, σ = h, CPU f64, tol {WORK_TOL:.0e}, eig_tol {WORK_EIG_TOL:.0e}, FD kT {ELECTRON_KT}; wall {wall:.0} s", WORK_POINTS - 1);
+    for p in &pts {
+        let _ = writeln!(out, "  x {:.3}  F {:+.12}  E {:+.12}  TS {:.9e}  F_x {:+.10}  {} steps  Δρ {:.1e}  face {:.2e}", p.x, p.f, p.e, p.ts, p.force, p.iterations, p.delta_rho, p.face);
+    }
+    let _ = writeln!(out, "  start warm (from x₁) − cold: F {:+.3e}, E {:+.3e}, F_x {:+.3e} ({} steps); end warm (from x₃₉) − cold: F {:+.3e}, E {:+.3e}, F_x {:+.3e} ({} steps)",
+                     start_warm.f - first.f, start_warm.e - first.e, start_warm.force - first.force, start_warm.iterations,
+                     end_warm.f - last.f, end_warm.e - last.e, end_warm.force - last.force, end_warm.iterations);
+    let _ = writeln!(out, "  W₄₀ {w40:+.12e}  W₂₀ {w20:+.12e}  |W₄₀ − W₂₀|/15 {simpson_err:.3e}");
+    let _ = writeln!(out, "  ΔF {d_f:+.12e}  ΔE {d_e:+.12e}  Δ(TS) {d_ts:+.6e}");
+    let _ = writeln!(out, "  ΔF + W₄₀ {:+.3e} (≤ bound {bound:.3e} = {simpson_err:.2e} + 3·({WORK_PATH}·σ_F {sigma_force:.2e} + √2·σ_E {sigma_free:.2e}) + L·B_box {box_term:.2e} = {simpson_err:.2e} + {noise:.2e} + {box_term:.2e})", d_f + w40);
+    let _ = writeln!(out, "  ΔE + W₄₀ {:+.6e} (≥ 5·bound {:.3e}); ΔF + W₂₀ {:+.3e}", d_e + w40, 5.0 * bound, d_f + w20);
+    println!("{out}");
+    assert!((d_f + w40).abs() <= bound, "|ΔF + W₄₀| = {:.3e} > bound {bound:.3e}: the forces' work is not −ΔF", (d_f + w40).abs());
+    assert!((d_e + w40).abs() >= 5.0 * bound, "|ΔE + W₄₀| = {:.3e} < 5 × bound {bound:.3e}: the test does not tell F from E here", (d_e + w40).abs());
+}
+
+// ---- V5: Fermi–Dirac NVE through the TS swing (spec 2026-11-13 §9 "V5 new tests" 2; plan Task 11) ----
+/// CO₂⁺'s grid (A1 note §2.3): 71³ × 0.20 = a 14 Bohr box, h_req of pseudo-O; the origin is a grid node.
+const CO2_N: usize = 71;
+const CO2_H: f64 = 0.20;
+/// The start: both C–O bonds at R = 2.226 Bohr (R_e = 2.225), bent by β = 70° from linear (bond angle 110°), at rest.
+const CO2_R: f64 = 2.226;
+const CO2_BETA_DEG: f64 = 70.0;
+/// The SCF tolerance asked of the GPU (the suite's); every solve along this trajectory has a partly occupied ↓ π level,
+/// so the GPU stops at `qm::GPU_PARTIAL_TOL` = 1e-5 (spec §5.1) whatever is asked — `scf_tol_used` records it.
+const CO2_TOL: f64 = TOL_H2;
+/// Verlet steps of the NVE run (fix round 1, the V5 bound review): 730 = 5 half-periods of the measured 146-step half
+/// bend period (2.5 periods; the run ends at a turning point, which also zeroes the bend wave's leakage into the drift
+/// slope, `references.md` "V5", fix round 1). Pre-registered at 600 (2.05 periods measured). At 1.70 s per warm step solo
+/// (600 steps took 17.7 min) the run is 20.7 min of GPU, so it runs as `CO2_NVE_BATCHES` batches of ≤ 15 min.
+const CO2_NVE_STEPS: usize = 730;
+/// Batches of the NVE run, with `CO2_BATCH_PAUSE_S` between them; the provider (and its warm state and extrapolation
+/// history) is kept across the pause, so the trajectory is the one an unbroken run computes.
+const CO2_NVE_BATCHES: usize = 2;
+const CO2_BATCH_PAUSE_S: u64 = 180;
+/// The bend's harmonic frequency (a.u.) and the energy the start puts in it, F(70°) − F(0°) (Ha): A1 note §2.2.
+const CO2_OMEGA_B: f64 = 2.335e-3;
+const CO2_E_MODE: f64 = 98.75e-3;
+/// The symmetric stretch: ω_s = √(k_R/2m_O) = 6.01e-3 a.u. and k_R = 2.11 Ha/Bohr² (A1 note §2.2, linear CO₂⁺).
+const CO2_OMEGA_S: f64 = 6.01e-3;
+const CO2_K_R: f64 = 2.11;
+/// The GPU work bias of the `Accepted` force path on this grid (Ha; `v5_co2_gpu_work_integrals`, `references.md` "V5",
+/// fix round 1): |ΔF + W| along the 0 → 70° bend (warm, 4.00e-5) and along the linear stretch (1.35e-5).
+const CO2_WORK_BIAS_BEND: f64 = 4.00e-5;
+const CO2_WORK_BIAS_STRETCH: f64 = 1.35e-5;
+/// Whether that bias is attributed (fix round 1 ruling and its revision): it is. The CPU f64 Q_β of neutral CO₂ at 35°
+/// misses −dF/dβ by the GPU's amount in the same 14 Bohr box (+3.54e-5 Ha/rad) and by 12× less in an 18 Bohr box
+/// (+2.9e-6): the discrete force's box term (`qm::forces` (iii)), shared by both solvers
+/// (`v5_co2_bend_force_consistency_cpu`, `references.md` "V5", fix round 1). So B_W = 3 × (bend + stretch bias).
+/// `false` would select the provisional, gate-only B_W from the documented force and energy bounds.
+const CO2_BIAS_ATTRIBUTED: bool = true;
+/// The documented bounds the gate-only B_W is built from: the M7 HF-vs-Richardson consistency bound (Ha/Bohr,
+/// `qm::forces` "Expected size", "M7 forces"), `gpu_vs_cpu`'s `F_BOUND_PSEUDO` (Ha/Bohr) and `E_BOUND_PSEUDO` (Ha).
+const M7_FORCE_CONSISTENCY: f64 = 1e-4;
+const GPU_F_BOUND_PSEUDO: f64 = 6e-5;
+const GPU_E_BOUND_PSEUDO: f64 = 6e-6;
+/// σ_path of F at the start under the 1e-5 partial-level stop (Ha): the largest |F_warm − F_cold| of five repeats
+/// (2.154e-6), rounded up to two digits (`v5_co2_plus_cost_and_path_scatter`, `references.md` "V5" Step 1).
+const CO2_PATH_SCATTER: f64 = 2.2e-6;
+/// max TS − min TS along the run must reach this (Ha; spec §9 V5 2): the trajectory crosses the TS swing.
+const TS_SWING_MIN: f64 = 1e-3;
+
+/// CO₂⁺ (charge +1, auto multiplicity = doublet, `Accepted`: pseudised C and O) bent by `beta_deg` from linear with both
+/// bonds `r`: C at the origin (a grid node), the O at (∓r sin(θ/2), −r cos(θ/2), 0) with θ = 180° − β the bond angle.
+fn co2_plus(beta_deg: f64, r: f64) -> Scene { co2_at(beta_deg, r, CO2_N, CO2_H, 1) }
+
+/// CO₂ of charge `charge` on an `n`³ × `h` grid, otherwise as [`co2_plus`] (C on the origin node, `Accepted`, auto M).
+fn co2_at(beta_deg: f64, r: f64, n: usize, h: f64, charge: i32) -> Scene {
+    let half = (180.0 - beta_deg).to_radians() / 2.0;
+    let (sx, cy) = (r * half.sin(), r * half.cos());
+    let nuclei = vec![Nucleus::new(6, [0.0; 3]), Nucleus::new(8, [-sx, -cy, 0.0]), Nucleus::new(8, [sx, -cy, 0.0])];
+    Scene { nuclei, cell: sim::Cell { n, h }, charge, multiplicity: None, sigma: None, external_field: [0.0; 3], ionic: sim::IonicPolicy::Accepted, train_mask: None }
+}
+
+/// Q_β = Σ_I F_I·∂R_I/∂β (Ha/rad, β in radians) of `forces` on the CO₂ bend at (β, R): the generalized force along the
+/// bend, whose exact value is −dF/dβ. ∂R/∂β by a central difference of the geometry map (exact for it to ≈ 1e-12).
+fn q_beta(forces: &[[f64; 3]], beta_deg: f64, r: f64) -> f64 {
+    let eps = 1e-6;
+    let (a, b) = (co2_at((beta_deg.to_radians() - eps).to_degrees(), r, 3, 1.0, 0), co2_at((beta_deg.to_radians() + eps).to_degrees(), r, 3, 1.0, 0));
+    (0..3).map(|i| (0..3).map(|k| forces[i][k] * (b.nuclei[i].pos[k] - a.nuclei[i].pos[k]) / (2.0 * eps)).sum::<f64>()).sum()
+}
+
+/// V5 fix round 1, the bias attribution (a measurement, CPU f64; `references.md` "V5", fix round 1): neutral CO₂ at
+/// β = 35°, R = 2.226 on `V5_QBETA_N`³ × 0.20 (default 71, the NVE grid; 91 for the box check), `Accepted`, tol =
+/// eig_tol = 1e-9: the Hellmann–Feynman Q_β of a cold solve against the Richardson −dF/dβ of warm solves at β ± 0.5° and
+/// ± 1° (R_F = (4·FD(0.5°) − FD(1°))/3, FD(d) = −[F(β + d) − F(β − d)]/(2d)). The GPU bend work integral shows a bias of
+/// ≈ 2.5e-5 Ha/rad; this tells whether the f64 discrete force carries it.
+/// Run: `cargo test -p validate --release --test dynamics -- --ignored --nocapture v5_co2_bend_force_consistency_cpu`.
+#[test]
+#[ignore = "measurement (plan 2026-11-13 Task 11 fix round 1): CPU f64 Q_β vs −dF/dβ on neutral CO₂; numbers in references.md"]
+fn v5_co2_bend_force_consistency_cpu() {
+    let n: usize = std::env::var("V5_QBETA_N").ok().and_then(|v| v.parse().ok()).unwrap_or(CO2_N);
+    let h: f64 = std::env::var("V5_QBETA_H").ok().and_then(|v| v.parse().ok()).unwrap_or(CO2_H);
+    // `V5_QBETA_COLD=1`: the four displaced points cold and in parallel with the centre (5 threads; the box and grid
+    // checks), instead of warm from the centre
+    let cold = std::env::var_os("V5_QBETA_COLD").is_some();
+    let (beta, r) = (35.0, CO2_R);
+    let t0 = Instant::now();
+    let setup = |b: f64| {
+        let mut notes = Vec::new();
+        let (g, sys, mut s) = providers::ks::problem(&co2_at(b, r, n, h, 0), 1e-9, &mut notes).unwrap_or_else(|e| panic!("{e}"));
+        (s.tol, s.eig_tol) = (1e-9, 1e-9);
+        (g, sys, s)
+    };
+    let (g, sys, s) = setup(beta);
+    let ds = [-1.0, -0.5, 0.5, 1.0];
+    let displaced = |d: f64, warm: Option<&qm::KsState>| {
+        let (g, sys, s) = setup(beta + d);
+        let (_, st) = qm::scf(&g, &sys, &s, warm).unwrap_or_else(|e| panic!("β {}: {e}", beta + d));
+        println!("  β {:+.1}°: F {:+.12}, {} steps, Δρ {:.1e}", d, st.energy.total, st.iterations, st.delta_rho);
+        st.energy.total
+    };
+    let cold_fs = std::thread::scope(|sc| {
+        let h = cold.then(|| sc.spawn(|| par_map(&ds, |&d| displaced(d, None))));
+        let c = qm::scf(&g, &sys, &s, None).unwrap_or_else(|e| panic!("centre: {e}"));
+        (c, h.map(|h| h.join().unwrap()))
+    });
+    let ((centre, st0), cold_fs) = cold_fs;
+    let f0 = qm::forces(&g, &centre, &sys.nuclei, s.sigma).unwrap();
+    let hf = q_beta(&f0, beta, r);
+    println!("neutral CO₂ {n}³ × {h}, β = {beta}°, R = {r}: cold F {:+.12} TS {:.3e}, {} steps, Δρ {:.1e}, face {:.2e}, HF Q_β {hf:+.10} Ha/rad ({:.0} s)",
+             st0.energy.total, st0.energy.ts, st0.iterations, st0.delta_rho, st0.boundary_density, t0.elapsed().as_secs_f64());
+    let fs = cold_fs.unwrap_or_else(|| par_map(&ds, |&d| displaced(d, Some(&centre))));
+    let fd = |i_lo: usize, i_hi: usize, d: f64| -(fs[i_hi] - fs[i_lo]) / (2.0 * d.to_radians());
+    let (fd_half, fd_one) = (fd(1, 2, 0.5), fd(0, 3, 1.0));
+    let rich = (4.0 * fd_half - fd_one) / 3.0;
+    println!("  FD(0.5°) {fd_half:+.10}, FD(1°) {fd_one:+.10}, Richardson −dF/dβ {rich:+.10}; HF Q_β − Richardson {:+.3e} Ha/rad (GPU bend bias ≈ +2.5e-5 in ΔF + W per rad); wall {:.0} s",
+             hf - rich, t0.elapsed().as_secs_f64());
+}
+
+/// One GPU work integral along a path s₀ … s_n of `scene(s)` (fix round 1, a measurement helper): `GpuKs` solves in order
+/// (`cold`: a reset before each), g(s) = Σ_I F_I·∂R_I/∂s by a central difference of the geometry map, W by composite
+/// Simpson; returns (ΔF, W, W₂ on every other point) and prints per-panel ΔF + W.
+fn gpu_path_work(p: &mut providers::GpuKs, label: &str, ss: &[f64], scene: &dyn Fn(f64) -> Scene, cold: bool) -> (f64, f64, f64) {
+    p.reset();
+    let (mut fs, mut gs, mut ts) = (Vec::new(), Vec::new(), Vec::new());
+    for &x in ss {
+        if cold { p.reset(); }
+        let r = solve(p, &scene(x), label);
+        let eps = 1e-6;
+        let (a, b) = (scene(x - eps), scene(x + eps));
+        gs.push((0..3).map(|i| (0..3).map(|k| r.forces[i][k] * (b.nuclei[i].pos[k] - a.nuclei[i].pos[k]) / (2.0 * eps)).sum::<f64>()).sum::<f64>());
+        fs.push(r.energy);
+        ts.push(r.stats.energy.ts);
+    }
+    let d = ss[1] - ss[0];
+    let (w, w2) = (simpson(&gs, d), simpson(&gs.iter().step_by(2).copied().collect::<Vec<_>>(), 2.0 * d));
+    let df = fs[fs.len() - 1] - fs[0];
+    println!("{label}: ΔF {df:+.6e}, W {w:+.6e} (W₂ {w2:+.6e}, |W − W₂|/15 {:.1e}), ΔF + W {:+.3e} (relative {:.2e}); TS {:.3e} → {:.3e}",
+             (w - w2).abs() / 15.0, df + w, (df + w) / df.abs(), ts[0], ts[ts.len() - 1]);
+    let panels: Vec<String> = (0..ss.len() - 2).step_by(2).map(|k| format!("{:+.1e}", fs[k + 2] - fs[k] + d / 3.0 * (gs[k] + 4.0 * gs[k + 1] + gs[k + 2]))).collect();
+    println!("  per-panel ΔF + W: {}", panels.join(" "));
+    (df, w, w2)
+}
+
+/// V5 fix round 1 (a measurement, GPU; `references.md` "V5", fix round 1): the work the `GpuKs` forces do along CO₂ paths
+/// against ΔF, 41 points each, on `V5_PATH_N`³ × 0.20 (default 71, the NVE grid; 91 for the box split): CO₂⁺'s bend
+/// 0 → 70° at R = 2.226 warm, cold at every point, and reversed; neutral CO₂'s bend cold; CO₂⁺'s symmetric stretch
+/// R 2.05 → 2.45 at β = 50° and at linear. The NVE's B_W comes from the bend and linear-stretch numbers.
+/// Run: `cargo test -p validate --release --test dynamics -- --ignored --nocapture v5_co2_gpu_work_integrals`.
+#[test]
+#[ignore = "measurement (plan 2026-11-13 Task 11 fix round 1): GPU work integrals along CO₂'s bend and stretch; numbers in references.md"]
+fn v5_co2_gpu_work_integrals() {
+    let Some(ctx) = gpu() else { return };
+    let n: usize = std::env::var("V5_PATH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(CO2_N);
+    let _gpu = common::GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let mut p = providers::GpuKs::new(ctx, CO2_TOL);
+    p.set_display(false);
+    println!("GPU work integrals, {n}³ × {CO2_H}, `Accepted`, tol asked {CO2_TOL:.0e}");
+    let bs: Vec<f64> = (0..=40).map(|i| (1.75 * i as f64).to_radians()).collect();
+    let rev: Vec<f64> = bs.iter().rev().copied().collect();
+    let rs: Vec<f64> = (0..=40).map(|i| 2.05 + 0.01 * i as f64).collect();
+    let bend = |q: i32| move |b: f64| co2_at(b.to_degrees(), CO2_R, n, CO2_H, q);
+    gpu_path_work(&mut p, "CO₂⁺ bend 0 → 70° (s = β in rad), warm", &bs, &bend(1), false);
+    gpu_path_work(&mut p, "CO₂⁺ bend 0 → 70°, cold at every point", &bs, &bend(1), true);
+    gpu_path_work(&mut p, "CO₂⁺ bend 70 → 0°, warm (reversed)", &rev, &bend(1), false);
+    gpu_path_work(&mut p, "neutral CO₂ bend 0 → 70°, cold at every point", &bs, &bend(0), true);
+    gpu_path_work(&mut p, "CO₂⁺ stretch R 2.05 → 2.45 at β = 50°, warm", &rs, &|r| co2_at(50.0, r, n, CO2_H, 1), false);
+    gpu_path_work(&mut p, "CO₂⁺ stretch R 2.05 → 2.45 at linear, warm", &rs, &|r| co2_at(0.0, r, n, CO2_H, 1), false);
+}
+
+/// V5 fix round 1 (a measurement, CPU f64): the work integral's discrete-force offset b = (ΔF + W)/(2δ) at the path's end
+/// x = 0.2 on `v3_h4()`'s geometry at h = 0.30 in the boxes `V5_BOX_N` (comma-separated n, default 51 = 15 Bohr; the
+/// record ran 41, 51 and 61: 12, 15, 18 Bohr): three warm solves 0.005 apart per box, Simpson, one thread per box. A box
+/// term (`qm::forces` (iii)) falls as the box grows (`references.md` "V5", fix round 1).
+#[test]
+#[ignore = "measurement (plan 2026-11-13 Task 11 fix round 1): the box dependence of b at x = 0.2; numbers in references.md"]
+fn v5_work_integral_box_offset_probe() {
+    let ns: Vec<usize> = std::env::var("V5_BOX_N").ok().map(|v| v.split(',').map(|n| n.trim().parse().expect("V5_BOX_N: grid sizes")).collect()).unwrap_or_else(|| vec![51]);
+    par_map(&ns, |&n| box_offset_at(n));
+}
+
+fn box_offset_at(n: usize) {
+    use qm::{forces, scf, KsState, Occupations, ScfSettings, System, ELECTRON_KT};
+    let (_, sys, atom, axis) = common::v3_h4();
+    let g = qm::Grid::cube(n, 0.30);
+    let mut s = ScfSettings::for_grid(&g);
+    (s.tol, s.eig_tol, s.occupations) = (WORK_TOL, WORK_EIG_TOL, Occupations::FermiDirac { kt: ELECTRON_KT });
+    let d = 0.005;
+    let mut prev: Option<KsState> = None;
+    let (mut f, mut fx) = (Vec::new(), Vec::new());
+    for i in 0..3 {
+        let x = WORK_PATH + i as f64 * d;
+        let mut nuclei = sys.nuclei.clone();
+        nuclei[atom].pos[axis] += x;
+        let m = System { nuclei, n_up: sys.n_up, n_dn: sys.n_dn, ionic: None };
+        let (st, stats) = scf(&g, &m, &s, prev.as_ref()).unwrap_or_else(|e| panic!("x = {x}: {e}"));
+        fx.push(forces(&g, &st, &m.nuclei, s.sigma).unwrap()[atom][axis]);
+        f.push(stats.energy.total);
+        println!("  {n}³ x {x:.3}: F {:+.12}, F_x {:+.10}, {} steps, face {:.2e}", stats.energy.total, fx[i], stats.iterations, stats.boundary_density);
+        prev = Some(st);
+    }
+    let w = d / 3.0 * (fx[0] + 4.0 * fx[1] + fx[2]);
+    println!("v3_h4 at x = {WORK_PATH}, {n}³ × 0.30 ({:.1} Bohr): b = (ΔF + W)/(2δ) = {:+.3e} Ha/Bohr", (n - 1) as f64 * 0.30, (f[2] - f[0] + w) / (2.0 * d));
+}
+
+/// The bend β = 180° − ∠O–C–O (degrees) and the two C–O bond lengths of a CO₂ scene (C first).
+fn co2_shape(s: &Scene) -> (f64, f64, f64) {
+    let c = s.nuclei[0].pos;
+    let d = |i: usize| -> [f64; 3] { std::array::from_fn(|k| s.nuclei[i].pos[k] - c[k]) };
+    let (a, b) = (d(1), d(2));
+    let (la, lb) = ((a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt(), (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt());
+    let cos = ((a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (la * lb)).clamp(-1.0, 1.0);
+    (180.0 - cos.acos().to_degrees(), la, lb)
+}
+
+/// V5 Step 1 (plan Task 11), a measurement, not a gate: CO₂⁺ at the NVE start on the GPU — one cold solve, then five
+/// warm-vs-cold repeats (reset, a cold solve at a neighbour bent by δβ ∈ {+0.5°, −0.5°, +1°, −1°, +2°}, then the start
+/// warm from it: F_warm − F_cold and the largest force-component change), then 20 Verlet steps from rest timed one by
+/// one. Its numbers pre-register the NVE bounds in `references.md` ("Fermi–Dirac migration", V5).
+/// Run: `cargo test -p validate --release --test dynamics -- --ignored --nocapture v5_co2_plus_cost_and_path_scatter`.
+#[test]
+#[ignore = "measurement (plan 2026-11-13 Task 11 Step 1): σ_path and the per-step cost of the V5 NVE case; numbers in references.md"]
+fn v5_co2_plus_cost_and_path_scatter() {
+    let Some(ctx) = gpu() else { return };
+    let (mut p, log) = Locked::new(ctx.clone(), CO2_TOL);
+    let start = co2_plus(CO2_BETA_DEG, CO2_R);
+    let t = Instant::now();
+    let cold = solve(&mut p, &start, "CO₂⁺ start, cold");
+    let cold_s = t.elapsed().as_secs_f64();
+    let e = &cold.stats.energy;
+    println!("CO₂⁺ {CO2_N}³ × {CO2_H}, β = {CO2_BETA_DEG}°, R = {CO2_R}: cold F {:+.9} E {:+.9} TS {:.6e}, {} SCF steps, {cold_s:.1} s, tol used {:?}, face {:?} (rule {:.2e}), partial {:?}, forces {:?}",
+             e.total, e.internal, e.ts, cold.stats.scf_steps, cold.stats.scf_tol_used, cold.stats.face_density, providers::box_affected_face_density(CO2_H),
+             cold.stats.partial, cold.forces);
+    let (mut d_f, mut d_e, mut d_force) = (Vec::new(), Vec::new(), Vec::new());
+    for db in [0.5, -0.5, 1.0, -1.0, 2.0] {
+        p.reset();
+        let t = Instant::now();
+        let nb = solve(&mut p, &co2_plus(CO2_BETA_DEG + db, CO2_R), "neighbour");
+        let nb_s = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let w = solve(&mut p, &start, "CO₂⁺ start, warm");
+        let w_s = t.elapsed().as_secs_f64();
+        let df = w.stats.energy.total - e.total;
+        let de = w.stats.energy.internal - e.internal;
+        let dfo = w.forces.iter().flatten().zip(cold.forces.iter().flatten()).fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
+        println!("  δβ {db:+.1}°: neighbour {} steps {nb_s:.1} s; warm {} steps {w_s:.1} s: F_warm − F_cold {df:+.3e}, E {de:+.3e}, max |ΔF_I| {dfo:.3e} Ha/Bohr, tol used {:?}",
+                 nb.stats.scf_steps, w.stats.scf_steps, w.stats.scf_tol_used);
+        d_f.push(df);
+        d_e.push(de);
+        d_force.push(dfo);
+    }
+    let rms = |v: &[f64]| (v.iter().map(|x| x * x).sum::<f64>() / v.len() as f64).sqrt();
+    let maxabs = |v: &[f64]| v.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    println!("  path scatter of F: max |ΔF| {:.3e}, RMS {:.3e} (RMS/√2 {:.3e}); of E: max {:.3e}; forces: max {:.3e} Ha/Bohr",
+             maxabs(&d_f), rms(&d_f), rms(&d_f) / 2f64.sqrt(), maxabs(&d_e), maxabs(&d_force));
+    // 20 Verlet steps from rest, timed
+    p.reset();
+    let integ = Integrator::new_fs(DT_FS);
+    let mut s = start.clone();
+    let r0 = solve(&mut p, &s, "MD start");
+    let mut f = r0.forces.clone();
+    let mut walls = Vec::new();
+    for i in 1..=20 {
+        let t = Instant::now();
+        let (f_new, st) = integ.step(&mut s, &f, &mut p, &mut no_augment(), &mut never()).unwrap_or_else(|e| panic!("MD step {i}: {e}"));
+        let w = t.elapsed().as_secs_f64();
+        f = f_new;
+        let (beta, ra, rb) = co2_shape(&s);
+        println!("  step {i}: {w:.2} s, {} SCF steps, F + K {:+.9}, TS {:.4e}, β {beta:.3}°, R {ra:.4}/{rb:.4}, tol used {:?}, branch_jump {:?}",
+                 st.eval.scf_steps, st.total, st.eval.energy.ts, st.eval.scf_tol_used, st.eval.branch_jump);
+        walls.push(w);
+    }
+    let mean = walls.iter().sum::<f64>() / walls.len() as f64;
+    println!("  warm MD step: mean {mean:.2} s over 20 (max {:.2}); ⇒ 600 steps ≈ {:.1} min", walls.iter().fold(0.0f64, |m, &x| m.max(x)), 600.0 * mean / 60.0);
+    println!("  {}", log.lock().unwrap().summary());
+}
+
+/// V5 NVE [MUST-6] (spec 2026-11-13 §9 "V5 new tests" 2; plan Task 11; bounds pre-registered in `references.md` "V5"
+/// before this test existed). Under Fermi–Dirac occupations the forces are −dF/dR (F = E − TS, `qm::forces`), so
+/// velocity Verlet conserves F + K, not E + K (E + K = (F + K) + TS moves with TS). CO₂⁺ (linear ²Π_g: at linearity the
+/// ↓ π pair holds one hole and TS = 2kT ln 2 = 6.93 mHa; bending splits the pair and TS falls toward 0), started at
+/// rest bent by 70° (TS 0.51 mHa), swings through linear and back, so TS sweeps its whole range twice per bend period.
+/// `CO2_NVE_STEPS` velocity-Verlet steps at dt = 0.25 fs through `Integrator::step` on the GPU teacher. Asserted:
+/// - the drift of F + K (least-squares slope) ≤ `DRIFT_BOUND` = 2e-4 Ha/ps (the suite's; this trajectory's budget is in
+///   `references.md` "V5", fix round 1);
+/// - (A) the peak-to-peak residual of F + K about that line ≤ FLUCT_MARGIN × (swing + 2σ_path) + B_W, and (B) that of
+///   velocity Verlet's shadow Hamiltonian H̃ ≤ FLUCT_MARGIN × 2σ_path + B_W + h_s⁴·E_mode (fix round 1: the V5 bound
+///   review and its revision; the terms are derived in the code below and in `references.md`). σ_path =
+///   `CO2_PATH_SCATTER`; never scaled per atom;
+/// - max TS − min TS ≥ `TS_SWING_MIN` = 1 mHa;
+/// - the face density ≤ `providers::box_affected_face_density(0.20)` at every evaluation (every evaluation must report one);
+/// - the run covers ≥ 2 bend periods (a design guard on the step count: the period from the zero crossings of the
+///   signed bend coordinate ȳ_O − y_C).
+/// Recorded, not asserted (Task 8 amendment I1): the `branch_jump` flag count (expected 0) and the largest m/b, from a
+/// replica of the provider's guard fed the same evaluations (its flags must equal the provider's).
+/// History: the pre-registered bound 3 × (h_b²/4·E_mode + 2σ_path) = 5.63e-5 failed at 600 steps (7.92e-5, 2026-11-17):
+/// it held neither the stretch's Verlet swing (the bend feeds ≈ 40 mHa into the stiffer stretch) nor the forces' static
+/// work bias along the bend (≈ 3e-5 Ha over 70°, the same on gapped neutral CO₂). Fix round 1 re-derives the bound from
+/// those documented sources (`references.md` "V5").
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test dynamics")]
+fn fd_nve_conserves_f_plus_k_through_the_ts_swing() {
+    use providers::branch_jump::{noise_tier, BranchJumpGuard, Evaluation};
+    let Some(ctx) = gpu() else { return };
+    let t_test = Instant::now();
+    let (mut p, log) = Locked::new(ctx.clone(), CO2_TOL);
+    let integ = Integrator::new_fs(DT_FS);
+    let (h_b, h_s) = (CO2_OMEGA_B * integ.dt, CO2_OMEGA_S * integ.dt);
+    let face_rule = providers::box_affected_face_density(CO2_H);
+    let origin = qm::Grid::cube(CO2_N, CO2_H).origin;
+    let z: Vec<u8> = co2_plus(CO2_BETA_DEG, CO2_R).nuclei.iter().map(|n| n.z).collect();
+    // the replica of the provider's `branch_jump` guard (`providers::ks::judge_branch`: the same inputs; N↑ ≠ N↓, so no spin measure)
+    let mut guard = BranchJumpGuard::new();
+    let mut judge = |s: &Scene, forces: &[[f64; 3]], stats: &sim::EvalStats| {
+        let positions: Vec<[f64; 3]> = s.nuclei.iter().map(|n| n.pos).collect();
+        let tol_used = stats.scf_tol_used.expect("a Kohn-Sham evaluation records its stop");
+        guard.judge(&Evaluation { z: &z, positions: &positions, forces, energy: stats.energy.total, cell: s.cell.clone(), origin, spin_abs: None,
+                                  tier: noise_tier(false, tol_used, stats.energy.total) })
+    };
+    // the signed bend coordinate: mean O height minus C height (negative at the start, 0 at linear)
+    let bend_y = |s: &Scene| 0.5 * (s.nuclei[1].pos[1] + s.nuclei[2].pos[1]) - s.nuclei[0].pos[1];
+
+    let mut s = co2_plus(CO2_BETA_DEG, CO2_R);
+    let r0 = solve(&mut p, &s, "CO₂⁺ NVE start");
+    let j0 = judge(&s, &r0.forces, &r0.stats);
+    assert!(!j0.judged && r0.stats.branch_jump.is_none());
+    let mut f = r0.forces.clone();
+    // per evaluation: velocities and forces, for the shadow-Hamiltonian diagnostic below (reported, never asserted)
+    let (mut vels, mut frcs) = (vec![s.nuclei.iter().map(|n| n.vel).collect::<Vec<_>>()], vec![f.clone()]);
+    let masses: Vec<f64> = s.nuclei.iter().map(|n| n.mass).collect();
+    let mut shape = vec![(CO2_BETA_DEG, CO2_R)];
+    let (mut t, mut total, mut ts, mut e_int, mut y) = (vec![0.0], vec![r0.energy], vec![r0.stats.energy.ts], vec![r0.stats.energy.internal], vec![bend_y(&s)]);
+    let face_of = |st: &sim::EvalStats, what: &str| st.face_density.unwrap_or_else(|| panic!("{what}: the Kohn-Sham evaluation reported no face density"));
+    let (mut face_max, mut tol_max, mut iters) = (face_of(&r0.stats, "start"), r0.stats.scf_tol_used.expect("the start's stop"), vec![r0.stats.scf_steps]);
+    let mut pos = vec![s.nuclei.iter().map(|n| n.pos).collect::<Vec<_>>()];
+    let (mut flags, mut judged, mut worst) = (0usize, 0usize, (0.0f64, 0usize, 0.0f64, 0.0f64));
+    let (mut beta_lo, mut beta_hi, mut r_lo, mut r_hi) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+    let mut md_wall = std::time::Duration::ZERO;
+    let per_batch = CO2_NVE_STEPS.div_ceil(CO2_NVE_BATCHES);
+    for i in 1..=CO2_NVE_STEPS {
+        if i > 1 && (i - 1) % per_batch == 0 {
+            println!("  batch boundary after step {}: {CO2_BATCH_PAUSE_S} s pause, the provider's warm state kept", i - 1);
+            std::thread::sleep(std::time::Duration::from_secs(CO2_BATCH_PAUSE_S));
+        }
+        let t_md = Instant::now();
+        let (f_new, st) = integ.step(&mut s, &f, &mut p, &mut no_augment(), &mut never()).unwrap_or_else(|e| panic!("CO₂⁺ NVE step {i}: {e}"));
+        f = f_new;
+        let j = judge(&s, &f, &st.eval);
+        assert_eq!(j.flagged, st.eval.branch_jump.is_some(), "step {i}: the replica guard disagrees with the provider's ({j:?} vs {:?})", st.eval.branch_jump);
+        if j.judged {
+            judged += 1;
+            if j.mismatch / j.bound > worst.0 { worst = (j.mismatch / j.bound, i, j.mismatch, j.bound); }
+        }
+        flags += st.eval.branch_jump.is_some() as usize;
+        t.push(i as f64 * integ.dt);
+        total.push(st.total);
+        ts.push(st.eval.energy.ts);
+        e_int.push(st.eval.energy.internal);
+        y.push(bend_y(&s));
+        iters.push(st.eval.scf_steps);
+        vels.push(s.nuclei.iter().map(|n| n.vel).collect());
+        frcs.push(f.clone());
+        pos.push(s.nuclei.iter().map(|n| n.pos).collect());
+        face_max = face_max.max(face_of(&st.eval, &format!("step {i}")));
+        tol_max = tol_max.max(st.eval.scf_tol_used.unwrap_or_else(|| panic!("step {i}: no recorded stop")));
+        let (beta, ra, rb) = co2_shape(&s);
+        shape.push((beta, 0.5 * (ra + rb)));
+        (beta_lo, beta_hi) = (beta_lo.min(beta), beta_hi.max(beta));
+        (r_lo, r_hi) = (r_lo.min(ra.min(rb)), r_hi.max(ra.max(rb)));
+        if i % 50 == 0 {
+            println!("  step {i}: F + K {:+.9}, TS {:.4e}, β {beta:.2}°, R {ra:.4}/{rb:.4}, {} SCF steps, face {:.2e}", st.total, st.eval.energy.ts, st.eval.scf_steps,
+                     face_of(&st.eval, "print"));
+        }
+        md_wall += t_md.elapsed();
+    }
+    let (slope_au, fluct, mean) = fit_line(&t, &total);
+    let drift = slope_au * au_per_ps();
+    let (e_lo, e_hi) = total.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+    let (ts_lo, ts_hi) = ts.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+    // E + K = (F + K) + TS: the quantity that is *not* conserved, for contrast
+    let ek: Vec<f64> = total.iter().zip(&ts).map(|(a, b)| a + b).collect();
+    let (_, ek_fluct, _) = fit_line(&t, &ek);
+    // the bend period from every zero crossing of the signed bend coordinate (half a period apart)
+    let mut crossings = Vec::new();
+    for k in 1..y.len() {
+        if (y[k - 1] < 0.0) != (y[k] < 0.0) { crossings.push(t[k - 1] + (t[k] - t[k - 1]) * y[k - 1] / (y[k - 1] - y[k])); }
+    }
+    assert!(crossings.len() >= 2, "the bend crossed linear only {} times", crossings.len());
+    let period = 2.0 * (crossings[crossings.len() - 1] - crossings[0]) / (crossings.len() - 1) as f64;
+    // Diagnostic (reported, never asserted): velocity Verlet conserves the shadow Hamiltonian
+    //   H̃ = H + dt²[(1/12)·vᵀV″v − (1/24)·Σ_I |F_I|²/m_I] + O(dt⁴)
+    // (Hairer, Lubich & Wanner, Geometric Numerical Integration, 2nd ed., §IX.8; up to a multiple of H, which is
+    // conserved to the same order), not H = F + K, which swings about it by h²/4 of each mode's energy. With
+    // dF/dt = −V″v, vᵀV″v ≈ −v_n·(F_{n+1} − F_{n−1})/(2dt). What H̃ still does — its drift and its detrended peak to
+    // peak — is the force and energy error of the solves, the Verlet swing removed to O(dt⁴).
+    let dt = integ.dt;
+    let shadow: Vec<f64> = (1..total.len() - 1).map(|n| {
+        let vf: f64 = (0..masses.len()).flat_map(|i| (0..3).map(move |k| (i, k))).map(|(i, k)| vels[n][i][k] * (frcs[n + 1][i][k] - frcs[n - 1][i][k])).sum();
+        let ff: f64 = (0..masses.len()).map(|i| frcs[n][i].iter().map(|c| c * c).sum::<f64>() / masses[i]).sum();
+        total[n] + dt * dt * (-vf / (2.0 * dt) / 12.0 - ff / 24.0)
+    }).collect();
+    let (sh_slope, sh_fluct, _) = fit_line(&t[1..t.len() - 1], &shadow);
+    let mut series = String::from("  step: F + K − start, H̃ − H̃₁ (µHa); TS (mHa); β (°); R (Bohr)
+");
+    for n in (1..total.len() - 1).step_by(20) {
+        let _ = writeln!(series, "    {n:4}: {:+8.2} {:+8.2}  {:.3}  {:6.2}  {:.4}", (total[n] - total[0]) * 1e6, (shadow[n - 1] - shadow[0]) * 1e6, ts[n] * 1e3, shape[n].0, shape[n].1);
+    }
+    let periods = t[t.len() - 1] / period;
+    // The bounds (fix round 1, the V5 bound review and its revision; derivation in `references.md` "V5", fix round 1):
+    // - the Verlet swing of H = F + K about H̃, h²/4 per mode: the bend at h_b, the symmetric stretch at h_s = ω_s·dt, with
+    //   the stretch's energy E_s = ½k_R((R_max − R_min)/2)² from this run's own amplitude, the bend the rest of E_mode,
+    //   capped at h_s²/4·E_mode (all of E_mode in the stiffer mode);
+    // - B_W, the work the forces' static bias does along the path (the GPU bend and stretch work integrals): attributed,
+    //   3 × the measured bend + stretch bias; not attributed, the gate-only (M7 consistency + F_BOUND_PSEUDO) × ℓ¹ +
+    //   2·E_BOUND_PSEUDO, ℓ¹ the trajectory's L1 diameter in configuration space, max_{i,j} Σ_{I,k} |R_Ik(i) − R_Ik(j)|
+    //   (a static bias δF per component changes H̃ between two geometries by at most δF·ℓ¹, as the reversed bend scan's
+    //   antisymmetry shows it is static);
+    // - (A) F + K: FLUCT_MARGIN·(swing + 2σ_path) + B_W; (B) H̃: FLUCT_MARGIN·2σ_path + B_W + h_s⁴·E_mode (the O(h⁴)
+    //   remainder H̃ leaves, review M7).
+    let e_s = 0.5 * CO2_K_R * (0.5 * (r_hi - r_lo)).powi(2);
+    let swing_cap = h_s * h_s / 4.0 * CO2_E_MODE;
+    let swing = (h_b * h_b / 4.0 * (CO2_E_MODE - e_s).max(0.0) + h_s * h_s / 4.0 * e_s).min(swing_cap);
+    let l1 = (0..pos.len()).flat_map(|i| (i + 1..pos.len()).map(move |j| (i, j)))
+        .map(|(i, j)| pos[i].iter().zip(&pos[j]).map(|(a, b)| (0..3).map(|k| (a[k] - b[k]).abs()).sum::<f64>()).sum::<f64>())
+        .fold(0.0f64, f64::max);
+    let b_w = if CO2_BIAS_ATTRIBUTED { 3.0 * (CO2_WORK_BIAS_BEND + CO2_WORK_BIAS_STRETCH) } else { (M7_FORCE_CONSISTENCY + GPU_F_BOUND_PSEUDO) * l1 + 2.0 * GPU_E_BOUND_PSEUDO };
+    let fluct_bound = FLUCT_MARGIN * (swing + 2.0 * CO2_PATH_SCATTER) + b_w;
+    let shadow_bound = FLUCT_MARGIN * 2.0 * CO2_PATH_SCATTER + b_w + h_s.powi(4) * CO2_E_MODE;
+    let log = log.lock().unwrap().clone();
+    let mut out = String::new();
+    let _ = writeln!(out, "CO₂⁺ FD NVE, {CO2_N}³ × {CO2_H}, `Accepted`, charge +1, tol asked {CO2_TOL:.0e} (stopped at ≤ {tol_max:.0e}), dt = {DT_FS} fs, {CO2_NVE_STEPS} steps from β = {CO2_BETA_DEG}°, R = {CO2_R} at rest");
+    let _ = writeln!(out, "  F + K: start {:+.9}, mean {mean:+.9}, end {:+.9}; drift {drift:+.3e} Ha/ps (bound {DRIFT_BOUND:.0e})", total[0], total[total.len() - 1]);
+    let _ = writeln!(out, "  Verlet swing: E_s = ½k_R((R_max − R_min)/2)² = {e_s:.4e} Ha; h_b²/4·(E_mode − E_s) + h_s²/4·E_s = {swing:.3e} Ha (cap h_s²/4·E_mode {swing_cap:.3e}; h_b {h_b:.5}, h_s {h_s:.5})");
+    let _ = writeln!(out, "  B_W = {b_w:.3e} Ha ({}; ℓ¹ = {l1:.3} Bohr)", if CO2_BIAS_ATTRIBUTED { "attributed: 3 × (bend + stretch work bias)" } else { "NOT attributed: gate-only (1e-4 + 6e-5)·ℓ¹ + 2·6e-6" });
+    let _ = writeln!(out, "  (A) F + K fluctuation: detrended peak-to-peak {fluct:.3e} Ha ≤ {fluct_bound:.3e} = {FLUCT_MARGIN} × (swing + 2 × {CO2_PATH_SCATTER:.1e}) + B_W; raw {:.3e}; E + K for contrast: detrended {ek_fluct:.3e}",
+                     e_hi - e_lo);
+    out += &series;
+    let _ = writeln!(out, "  (B) shadow Hamiltonian H̃ (Verlet swing removed to O(h⁴)): detrended peak-to-peak {sh_fluct:.3e} Ha ≤ {shadow_bound:.3e} = {FLUCT_MARGIN} × 2 × {CO2_PATH_SCATTER:.1e} + B_W + h_s⁴·E_mode; drift {:+.3e} Ha/ps", sh_slope * au_per_ps());
+    let _ = writeln!(out, "  TS ∈ [{ts_lo:.6e}, {ts_hi:.6e}] (swing {:.3e}, needs ≥ {TS_SWING_MIN:.0e}); E ∈ [{:+.9}, {:+.9}]", ts_hi - ts_lo,
+                     e_int.iter().fold(f64::INFINITY, |m, &v| m.min(v)), e_int.iter().fold(f64::NEG_INFINITY, |m, &v| m.max(v)));
+    let _ = writeln!(out, "  bend: β ∈ [{beta_lo:.2}°, {beta_hi:.2}°], R ∈ [{r_lo:.4}, {r_hi:.4}]; {} linear crossings, period {:.0} a.u. = {:.1} fs = {:.0} steps ⇒ {periods:.2} periods",
+                     crossings.len(), period, units::au_time_to_fs(period), period / integ.dt);
+    let _ = writeln!(out, "  face density max {face_max:.2e} (rule {face_rule:.2e}); SCF steps per solve {}–{} (mean {:.1})", iters.iter().min().unwrap(), iters.iter().max().unwrap(),
+                     iters.iter().sum::<usize>() as f64 / iters.len() as f64);
+    let _ = writeln!(out, "  branch_jump: {flags} flagged of {judged} judged; largest m/b {:.3} at step {} (m {:.3e}, b {:.3e})", worst.0, worst.1, worst.2, worst.3);
+    let _ = writeln!(out, "  {}; MD wall {:.1} s ({:.0} ms/step); test wall {:.1} s", log.summary(), md_wall.as_secs_f64(), ms(md_wall) / CO2_NVE_STEPS as f64, t_test.elapsed().as_secs_f64());
+    println!("{out}");
+    let result = format!("drift {drift:+.2e} Ha/ps, F + K {fluct:.2e} (bound {fluct_bound:.1e}), H̃ {sh_fluct:.2e} (bound {shadow_bound:.1e}), TS swing {:.2e}, {flags} branch_jump", ts_hi - ts_lo);
+    record(&ctx, timing_row("fd_nve_co2_plus", "CO₂⁺", CO2_N, CO2_TOL, &log, t_test.elapsed(), &result));
+    assert!(face_max <= face_rule, "face density {face_max:.3e} above the box rule {face_rule:.3e}");
+    assert!(periods >= 2.0, "test design: {CO2_NVE_STEPS} steps cover {periods:.2} bend periods (< 2)");
+    assert!(ts_hi - ts_lo >= TS_SWING_MIN, "TS swing {:.3e} Ha < {TS_SWING_MIN:.0e}: the trajectory did not cross the TS swing", ts_hi - ts_lo);
+    assert!(drift.abs() <= DRIFT_BOUND, "F + K drift {drift:+.3e} Ha/ps (bound {DRIFT_BOUND:.0e})");
+    assert!(fluct <= fluct_bound, "(A) F + K fluctuation {fluct:.3e} Ha > {fluct_bound:.3e}");
+    assert!(sh_fluct <= shadow_bound, "(B) shadow Hamiltonian fluctuation {sh_fluct:.3e} Ha > {shadow_bound:.3e}");
+}
+
+// ---- stray atoms: NVE through re-entry (spec 2026-11-18 §6 "Dynamics"; plan Task 7; `references.md`, "Stray atoms") ----
+
+/// The re-entry run's grid (h = `STRAY_H`): 101³, a 20 Bohr cube, so every atom of the path stays ≥ 6.1 Bohr from every
+/// face. At the stray tests' 81³ (16 Bohr) the same path runs 4.1 Bohr from the x faces (the floor's edge): the teacher's
+/// solves there warn "density on box faces … box too small" and its own E_conserved swings by 1.2e-4 Ha peak to peak
+/// with no surrogate at all (the control), which put −5.3e-4 Ha/ps of drift into the teacher's phase of the run while the
+/// switches conserved E_conserved to 5e-8 Ha (`references.md`, "Stray atoms").
+const REENTRY_N: usize = 101;
+/// The returning H's path: the line (`REENTRY_X`, s, s), s from +`REENTRY_S0` to −`REENTRY_S0`, past H₂ centred at
+/// (`REENTRY_XH`, 0, 0) along z. Its ends are 6.1 Bohr from the faces at `REENTRY_N` and 6.0 Bohr from
+/// the nearest H₂ atom at s = ±3.14 (r_cut 6): stray for |s| > 3.14, inside r_cut between, closest 4.56 Bohr at s ≈ 0.
+const REENTRY_X: f64 = 3.9;
+const REENTRY_XH: f64 = -0.6;
+const REENTRY_S0: f64 = 3.9;
+/// The H's speed as path length per step (Bohr; 0.03 at dt 0.25 fs: v = 2.9e-3 a.u., K_H = 7.7 mHa).
+const REENTRY_STEP: f64 = 0.03;
+/// The edge check before the run (controller ruling 13: a region answers no nearer the bonded part, nor a face, than its
+/// passes put the stray atom): the H `REENTRY_EDGE_D` Bohr from the nearer H₂ atom and `REENTRY_EDGE_FACE` Bohr from a
+/// face, on the path's side of H₂ — nearer than the path's model steps reach on both counts (the path keeps x = 3.9, 6.1
+/// Bohr from the x faces while the model answers; the teacher's steps may deflect it), so the model answers the path
+/// down to 6.05 Bohr.
+const REENTRY_EDGE_D: f64 = 6.05;
+const REENTRY_EDGE_FACE: f64 = 5.6;
+
+/// Spec §6 "Dynamics" (review M3): an NVE run in which a stray H comes back within r_cut of a cleared H₂ and leaves
+/// again, under the surrogate (strict mode, H₂ + H cleared on the real teacher first; `common::surrogate`). Outside
+/// r_cut the model answers (its bonded part + E_ref(H), F_H = 0); within it the stray H is no longer stray and the
+/// ordinary rules send the step to the teacher (rule 5b); each switch of surface is booked by the provider's
+/// `transition_jump` into W (`sim::dynamics` "Energy bookkeeping"), so `E_conserved` must stay within the suite's
+/// drift bound `DRIFT_BOUND` across both switches. The booked jumps are reported separately, and each is asserted within
+/// the composition check's energy tolerance, `energy_std_per_atom` × 1 stray atom = 1 mHa (spec §6; final review I3,
+/// controller ruling 13). Since ruling 13 the region answers the stray H no nearer H₂ (or a face) than a pass put it,
+/// so an edge check at 6.05 Bohr (`REENTRY_EDGE_D`) runs before the NVE: the model answers the path down to it, the
+/// steps between it and r_cut fall back on rule 5a (a check is queued there), and the switch in is that boundary's.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p validate --release --test dynamics")]
+fn stray_h_returning_conserves_energy() {
+    use common::surrogate::{accepted, clear_h2_h, stray_check, stray_student, train_h2, STRAY_CHECK_R, STRAY_H, STRAY_R0};
+    use sim::Source;
+    let Some(ctx) = gpu() else { return };
+    let t_test = Instant::now();
+    let (mut s, log, alog) = stray_student(&ctx);
+    let tol = s.policy().energy_std_per_atom;
+    let mut out = String::new();
+    let _ = writeln!(out, "H₂ + a returning H, NVE, {REENTRY_N}³ × {STRAY_H} (σ = h), accepted, tol {TOL_H2:e}, dt {DT_FS} fs:");
+    train_h2(&mut s, REENTRY_N, STRAY_R0, seed(), &mut out);
+    let passed = clear_h2_h(&mut s, REENTRY_N, &STRAY_CHECK_R, &mut out);
+    let _ = writeln!(out, "  H₂ + H cleared by the checks at r = {passed:?}");
+    // the edge check (ruling 13): the H on the path's side of H₂ (x = REENTRY_EDGE_FACE from the +x face, y = z = e)
+    // with its nearer H₂ atom (z = +r/2) REENTRY_EDGE_D away: 2e² − r e + r²/4 + (x − x_H)² − D² = 0
+    let edge = {
+        let x = sim::Cell { n: REENTRY_N, h: STRAY_H }.half_extent() - REENTRY_EDGE_FACE;
+        let (z0, dx) = (0.5 * STRAY_R0, x - REENTRY_XH);
+        let e = 0.5 * (z0 + (z0 * z0 - 2.0 * (z0 * z0 + dx * dx - REENTRY_EDGE_D * REENTRY_EDGE_D)).sqrt());
+        accepted(REENTRY_N, STRAY_H, vec![Nucleus::new(1, [REENTRY_XH, 0.0, 0.5 * STRAY_R0]), Nucleus::new(1, [REENTRY_XH, 0.0, -0.5 * STRAY_R0]), Nucleus::new(1, [x, e, e])])
+    };
+    let _ = writeln!(out, "  the edge check: H at ({:.3}, {:.3}, {:.3}), {REENTRY_EDGE_D} Bohr from the nearer H₂ atom, {REENTRY_EDGE_FACE} from a face:", edge.nuclei[2].pos[0], edge.nuclei[2].pos[1], edge.nuclei[2].pos[2]);
+    let ev = stray_check(&mut s, &edge, &mut out).unwrap_or_else(|| panic!("the edge check was not queued\n{out}"));
+    assert!(matches!(ev.outcome, sim::activity::TeachOutcome::StrayCheckingNew), "the edge check must pass and extend the region: {ev:?}\n{out}");
+    let v = REENTRY_STEP / units::fs_to_au_time(DT_FS);
+    let (c, w) = (std::f64::consts::FRAC_1_SQRT_2, REENTRY_S0);
+    let mut h = Nucleus::new(1, [REENTRY_X, w, w]);
+    h.vel = [0.0, -v * c, -v * c];
+    let start = accepted(REENTRY_N, STRAY_H, vec![Nucleus::new(1, [REENTRY_XH, 0.0, 0.5 * STRAY_R0]), Nucleus::new(1, [REENTRY_XH, 0.0, -0.5 * STRAY_R0]), h]);
+    let pos: Vec<[f64; 3]> = start.nuclei.iter().map(|n| n.pos).collect();
+    let z: Vec<u8> = start.nuclei.iter().map(|n| n.z).collect();
+    let premise = s.would_answer(&pos, &z, &s.provenance_for(&start));
+    let _ = writeln!(out, "  start: H at ({REENTRY_X}, {w}, {w}) moving {REENTRY_STEP} Bohr/step (v {v:.3e} a.u.) along (0, −1, −1)/√2; H₂ ({STRAY_R0}) at rest at x = {REENTRY_XH}; would_answer {premise:?}");
+    assert!(premise.is_ok(), "premise: the start is inside the cleared region\n{out}");
+    let mut d = Dynamics::new(start.clone(), Box::new(s), DT_FS, seed());
+    let s0 = d.snapshot();
+    assert!(s0.last_error.is_none(), "{:?}", s0.last_error);
+    let nearest = |sc: &Scene| (0..2).map(|i| (0..3).map(|k| (sc.nuclei[2].pos[k] - sc.nuclei[i].pos[k]).powi(2)).sum::<f64>().sqrt()).fold(f64::INFINITY, f64::min);
+    let (mut t, mut e_cons, mut sources, mut jumps) = (vec![s0.sim_time], vec![s0.energy_conserved], vec![s0.source], Vec::new());
+    let (mut refit_prev, mut hist_prev, mut restarts, mut r_min) = (s0.work_refit, s0.history.len(), 0, nearest(&s0.scene));
+    let max_steps = (2.0 * REENTRY_S0 * std::f64::consts::SQRT_2 / REENTRY_STEP) as usize + 20;
+    let t_md = Instant::now();
+    let mut last = s0;
+    for i in 1..=max_steps {
+        d.apply(DynCommand::Step(1));
+        let snap = d.tick(f64::INFINITY, &mut never());
+        assert!(snap.last_error.is_none(), "step {i}: {:?}\n{out}", snap.last_error);
+        if snap.history.len() < hist_prev {
+            restarts += 1;
+        }
+        hist_prev = snap.history.len();
+        let j = snap.work_refit - refit_prev;
+        if j != 0.0 {
+            jumps.push((i, j, sources[sources.len() - 1], snap.source, nearest(&snap.scene)));
+        }
+        refit_prev = snap.work_refit;
+        r_min = r_min.min(nearest(&snap.scene));
+        t.push(snap.sim_time);
+        e_cons.push(snap.energy_conserved);
+        sources.push(snap.source);
+        let done = snap.scene.nuclei[2].pos[1] <= -REENTRY_S0;
+        last = snap;
+        if done {
+            break;
+        }
+    }
+    let md_wall = t_md.elapsed();
+    let n = t.len() - 1;
+    let (slope_au, fluct, _) = fit_line(&t, &e_cons);
+    let drift = slope_au * au_per_ps();
+    let (lo, hi) = e_cons.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)));
+    // the run's phases: model (stray), teacher (within r_cut), model again
+    let mut phases: Vec<(Source, usize)> = Vec::new();
+    for &src in &sources {
+        match phases.last_mut() {
+            Some((p, k)) if *p == src => *k += 1,
+            _ => phases.push((src, 1)),
+        }
+    }
+    let _ = writeln!(out, "  {n} steps ({:.1} fs); closest approach {r_min:.3} Bohr; phases {phases:?}; history restarts {restarts}", units::au_time_to_fs(t[n] - t[0]));
+    // per phase: E_conserved at its ends and its own drift (where the run's drift accrues)
+    let mut at = 0;
+    for (src, k) in &phases {
+        let (a, b) = (at, at + k - 1);
+        let (slope, fl, _) = if b > a + 2 { fit_line(&t[a..=b], &e_cons[a..=b]) } else { (0.0, 0.0, 0.0) };
+        let _ = writeln!(out, "  phase {src:?} steps {a}–{b}: E_conserved {:+.9} → {:+.9} (Δ {:+.3e} Ha), drift {:+.3e} Ha/ps, detrended p-p {fl:.2e}", e_cons[a], e_cons[b], e_cons[b] - e_cons[a], slope * au_per_ps());
+        if b + 1 <= n {
+            let _ = writeln!(out, "    switch at step {}: E_conserved {:+.9} → {:+.9} (Δ {:+.3e} Ha)", b + 1, e_cons[b], e_cons[b + 1], e_cons[b + 1] - e_cons[b]);
+        }
+        at = b + 1;
+    }
+    let _ = writeln!(
+        out,
+        "  E_conserved: drift {drift:+.3e} Ha/ps (bound {DRIFT_BOUND:.0e}; the driver's {:?}), detrended peak-to-peak {fluct:.3e} Ha, raw {:.3e} Ha; start {:+.9}, end {:+.9}",
+        last.drift_per_ps,
+        hi - lo,
+        e_cons[0],
+        e_cons[n]
+    );
+    let _ = writeln!(out, "  booked jumps (W, `refit_jump`; the check's energy tolerance {:.3} mHa): {} in all, Σ {:+.4} mHa, force-mismatch work {:+.4} mHa", tol * 1e3, jumps.len(), last.work_refit * 1e3, last.work_mismatch * 1e3);
+    for (i, j, from, to, r) in &jumps {
+        let _ = writeln!(out, "    step {i}: {from:?} → {to:?} at {r:.3} Bohr: {:+.4} mHa ({})", j * 1e3, if j.abs() <= tol { "within" } else { "BEYOND the check's tolerance" });
+    }
+    // the control: the teacher alone (no surrogate) from the same start for the same steps — its own drift on this
+    // path, and over the steps the stray run handed to it
+    let (ctl, clog) = Locked::new(ctx.clone(), TOL_H2);
+    let mut dc = Dynamics::new(start, Box::new(ctl), DT_FS, seed());
+    let c0 = dc.snapshot();
+    let (mut ct, mut ce) = (vec![c0.sim_time], vec![c0.energy_conserved]);
+    for i in 1..=n {
+        dc.apply(DynCommand::Step(1));
+        let snap = dc.tick(f64::INFINITY, &mut never());
+        assert!(snap.last_error.is_none(), "control step {i}: {:?}", snap.last_error);
+        ct.push(snap.sim_time);
+        ce.push(snap.energy_conserved);
+    }
+    let (c_slope, c_fl, _) = fit_line(&ct, &ce);
+    let fb = phases.iter().position(|p| p.0 == Source::Fallback).map(|k| {
+        let a: usize = phases[..k].iter().map(|p| p.1).sum();
+        (a, a + phases[k].1 - 1)
+    });
+    let c_part = fb.filter(|&(a, b)| b > a + 2).map(|(a, b)| (fit_line(&ct[a..=b], &ce[a..=b]).0 * au_per_ps(), ce[b] - ce[a]));
+    let _ = writeln!(
+        out,
+        "  control (the teacher alone, same start, {n} steps): drift {:+.3e} Ha/ps, detrended p-p {c_fl:.2e} Ha, Δ {:+.3e} Ha; over the steps the stray run gave the teacher ({fb:?}): drift {:+.3e} Ha/ps, Δ {:+.3e} Ha; {}",
+        c_slope * au_per_ps(),
+        ce[n] - ce[0],
+        c_part.map_or(f64::NAN, |c| c.0),
+        c_part.map_or(f64::NAN, |c| c.1),
+        clog.lock().unwrap().summary()
+    );
+    let tl = log.lock().unwrap().clone();
+    let _ = writeln!(out, "  teacher: {}\n  auditor: {}\n  MD wall {:.0} s; test wall {:.0} s", tl.summary(), alog.lock().unwrap().summary(), md_wall.as_secs_f64(), t_test.elapsed().as_secs_f64());
+    println!("{out}");
+    record(&ctx, timing_row("stray_h_returning", "H₂ + H", REENTRY_N, TOL_H2, &tl, t_test.elapsed(), &format!("drift {drift:+.2e} Ha/ps, {} booked jumps Σ {:+.2e} Ha", jumps.len(), last.work_refit)));
+    // model → teacher → model: the H came back within r_cut and left again (otherwise the test is vacuous)
+    let kinds: Vec<Source> = phases.iter().map(|p| p.0).collect();
+    assert!(r_min < 6.0, "the H re-entered r_cut\n{out}");
+    assert_eq!(kinds.first(), Some(&Source::Surrogate), "stray at the start: the model's\n{out}");
+    assert_eq!(kinds.last(), Some(&Source::Surrogate), "stray again at the end: the model's\n{out}");
+    assert!(kinds.contains(&Source::Fallback), "within r_cut: the teacher's\n{out}");
+    assert!(!jumps.is_empty(), "each switch of surface is booked\n{out}");
+    // spec §6 (final review I3): each booked jump within the check's energy tolerance, 1 mHa × 1 stray atom
+    for (i, j, from, to, r) in &jumps {
+        assert!(j.abs() <= tol, "step {i}: the booked jump {from:?} → {to:?} at {r:.3} Bohr is {:+.4} mHa, beyond the check's tolerance {:.3} mHa\n{out}", j * 1e3, tol * 1e3);
+    }
+    assert_eq!(restarts, 0, "no unbooked surface change restarted the history\n{out}");
+    assert!(tl.warnings.iter().all(|w| !w.contains("box too small")), "a clean path (the suite's NVE rule): {:?}\n{out}", tl.warnings);
+    assert!(drift.abs() <= DRIFT_BOUND, "E_conserved drift {drift:+.3e} Ha/ps (bound {DRIFT_BOUND:.0e})\n{out}");
 }

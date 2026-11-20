@@ -1524,7 +1524,8 @@ fn the_autosave_keeps_samples_taught_before_a_fit_formed() {
     assert!(!model(&s).retry_fit, "too few samples: a pass, not the Retry, is the remedy");
     assert!(w.retire(Duration::from_secs(30)), "the worker did not retire");
     let bytes = std::fs::read(&path).expect("the autosave was written, not removed");
-    assert_eq!(&bytes[..8], surrogate::sidecar::MAGIC_V6, "a samples-only file");
+    assert_eq!(&bytes[..8], surrogate::sidecar::MAGIC_V9, "the current format");
+    assert!(String::from_utf8_lossy(&bytes[16..64]).starts_with("{\"format\":\"ASMODEL9\",\"body\":6,"), "a samples-only file (body 6)");
     // the next worker restores them
     let w = SimWorker::spawn_with(h2_41(), Backend::Estimated, Some(ctx), Vec::new(), Some(path.clone()));
     idle(&w);
@@ -3116,7 +3117,7 @@ impl Trainable for HarrisFake {
             trust_floor: None, unfitted: 0, pending: 0, recovery: None, audits_background: true, audit_in_flight: false, last_audit: None,
             last_audit_this_fit: false, audits_box_unjudged: 0, stuck: None, class_loo: Vec::new(), solves: Default::default(),
             trust_checks: Vec::new(), stuck_info: None, model_gen: 0, readiness: None, teach_offer: None, no_model: None, retry_fit: false,
-            model_source: Default::default(), lone_note: None,
+            model_source: Default::default(), lone_note: None, stray: Vec::new(), stray_held_out: 0, ticks: Default::default(),
         }
     }
     fn fitted(&self) -> bool {
@@ -4154,7 +4155,7 @@ impl Trainable for RefitFake {
             trust_floor: None, unfitted: 0, pending: 0, recovery: None, audits_background: true, audit_in_flight: false, last_audit: None,
             last_audit_this_fit: false, audits_box_unjudged: 0, stuck: None, class_loo: Vec::new(), solves: Default::default(),
             trust_checks: Vec::new(), stuck_info: None, model_gen: 0, readiness: None, teach_offer: None, no_model: None, retry_fit: false,
-            model_source: Default::default(), lone_note: None,
+            model_source: Default::default(), lone_note: None, stray: Vec::new(), stray_held_out: 0, ticks: Default::default(),
         }
     }
     fn fitted(&self) -> bool {
@@ -4493,4 +4494,67 @@ fn the_triple_map_ships_only_while_shown() {
     // shown again: built for the new generation
     w.send(Command::SetTripleView(true));
     snapshot_until(&w, "a rebuild for the new model generation", |s| s.activity.triples.is_some());
+}
+
+/// Plan 2026-11-13 Task 8 review M7: the sampling teacher's tolerance is the one the `branch_jump` guard's sample tier
+/// keys on (`providers::branch_jump::SAMPLE_TOL` mirrors this private constant).
+#[test]
+fn sample_tol_is_the_branch_jump_guards() {
+    assert_eq!(SAMPLE_TOL, providers::branch_jump::SAMPLE_TOL);
+}
+
+/// The smearing branch's final review, I4: this build's version is not the last pre-Fermi–Dirac release. Released under
+/// the same version, the updater on beta.5 would not offer it, and the legacy-model refusal ("open it in <version>")
+/// would send the user to the version they already run.
+#[test]
+fn version_is_past_the_last_pre_fd_release() {
+    assert_ne!(env!("CARGO_PKG_VERSION"), providers::surrogate::LAST_PRE_FD_RELEASE, "bump the workspace version past the last pre-Fermi–Dirac release");
+}
+
+/// Spec §7.9 (plan 2026-11-13 Task 16; ruling R17): a model file taught before the Fermi–Dirac switch — its ionic tag
+/// the legacy all-electron "none", or a shared-shell one — is refused on load with the reason, naming the last
+/// pre-Fermi–Dirac release (R17 as revised), never the generic "another Kohn-Sham surface"; nothing is loaded. This build's own tags are
+/// not legacy. Analytic teacher: no solve.
+#[test]
+fn legacy_tag_model_refused_with_reason() {
+    use providers::surrogate::legacy_model_refusal;
+    // both slots name the last pre-Fermi–Dirac release (ruling R17 as revised at Task 16 fix round 1)
+    assert_eq!(providers::surrogate::LAST_PRE_FD_RELEASE, "0.2.0-beta.5");
+    let reason = "taught with the solver of 0.2.0-beta.5 or earlier (integer / shared occupations); this version uses Fermi–Dirac smearing: re-teach it, or open it in 0.2.0-beta.5".to_string();
+    assert_eq!(legacy_model_refusal("none").as_deref(), Some(reason.as_str()));
+    for p in [sim::IonicPolicy::CoresOnly, sim::IonicPolicy::All] {
+        assert_eq!(legacy_model_refusal(&providers::pseudo::legacy_tag_of(p)).as_deref(), Some(reason.as_str()), "{p:?}");
+        assert_eq!(legacy_model_refusal(&providers::pseudo::tag_of(p)), None, "this build's {p:?} tag");
+    }
+    assert_eq!(legacy_model_refusal(&providers::pseudo::all_electron_tag()), None);
+    assert_eq!(legacy_model_refusal("weird/1"), None, "not a tag of any build: refused as another surface instead");
+    // the load: a samples file of the scene's surface but for its legacy tag
+    let dir = std::env::temp_dir().join(format!("atomic-sandbox-legacy-model-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let scene = h2_33().to_sim().unwrap();
+    let mut s = SurrogateKs::new(Box::new(sim::MorseDimer::h2()), FallbackPolicy::default()).with_teacher_tol(SAMPLE_TOL);
+    let mut prov = s.provenance_for(&scene);
+    assert_eq!(prov.ionic, providers::pseudo::all_electron_tag());
+    prov.ionic = "none".into();
+    let set = surrogate::SampleSet {
+        provenance: prov,
+        samples: vec![surrogate::fit::Sample::new(vec![[-0.7, 0.0, 0.0], [0.7, 0.0, 0.0]], vec![1, 1], -1.17, vec![[0.01, 0.0, 0.0], [-0.01, 0.0, 0.0]], surrogate::fit::SampleTag::Perturbation, 1.0)],
+        references: Vec::new(),
+        reference_rule: None,
+        quarantine: Vec::new(),
+        face_density: Vec::new(),
+        sample_box: Vec::new(),
+        specialised: Vec::new(),
+        box_references: Vec::new(),
+        teacher_solves: None,
+        teacher_solves_note: None,
+        created_by: surrogate::sidecar::CREATED_BY.into(),
+    };
+    let path = dir.join("legacy.model");
+    surrogate::sidecar::write_samples(&path, &set).unwrap();
+    let e = sim::Trainable::load(&mut s, &path, &scene).unwrap_err();
+    assert!(e.ends_with(&reason) && !e.contains("another Kohn-Sham surface"), "{e}");
+    assert!(!sim::Trainable::fitted(&s) && s.store().is_none(), "nothing loaded");
+    let _ = std::fs::remove_dir_all(&dir);
 }

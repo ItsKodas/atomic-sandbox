@@ -69,7 +69,7 @@ impl Sampler {
     /// count and the pass's first store index, `provenance` the surface's `describe()`. `None` for a
     /// finished, teach-around or references-only pass.
     pub fn checkpoint(&self, provenance: &str, samples: usize, pass_start: usize) -> Option<String> {
-        if self.progress.finished || self.is_targeted() || self.references_only {
+        if self.progress.finished || self.is_targeted() || self.references_only || self.migration.is_some() {
             return None;
         }
         let mut o = String::new();
@@ -390,6 +390,10 @@ fn parse(text: &str) -> Result<(Sampler, CheckpointInfo), String> {
         notes: Vec::new(),
         added: c[1],
         boxed: c[2],
+        // not in the checkpoint's counters line (its format is unchanged): a resumed pass's finish note counts the
+        // stray-atom samples it held since the resume, against the samples added since (`added_at_resume`)
+        stray_held: 0,
+        added_at_resume: Some(c[1]),
         cell_skipped: c[3],
         tail_skipped: c[4],
         collection_skipped: 0,
@@ -409,6 +413,7 @@ fn parse(text: &str) -> Result<(Sampler, CheckpointInfo), String> {
         timed_out: None,
         time_limit_floor_s: floor,
         timeouts_in_a_row: 0,
+        migration: None,
     };
     Ok((sampler, info))
 }

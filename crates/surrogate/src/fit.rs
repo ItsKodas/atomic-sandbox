@@ -15,9 +15,16 @@
 //!
 //! * one **energy row**: features φ_E with block s = Σ_{i: s_i = s} B_i, target
 //!   y_E = E − Σ_i ref[s_i] (the binding energy; the references are per species and are not
-//!   fitted — see "Isolated-atom limit"), both divided by N when `energy_per_atom` (default),
+//!   fitted — see "Isolated-atom limit"), both divided by N_e when `energy_per_atom` (default),
 //!   so that one energy row carries a per-atom quantity (spec review C2c). Row weight
-//!   w = `Sample::weight`.
+//!   w = `Sample::weight`. N_e = [`crate::energy_row_atoms`]: the atoms with a neighbour the
+//!   model can see — N for every sample without an isolated atom (so its row is bit for bit what
+//!   it was), the bonded part's count for a sample with stray atoms (stray-atoms spec
+//!   2026-11-18, controller ruling 9a). A stray atom has B = 0 and adds nothing to φ_E, so its
+//!   sample's row is exactly its bonded part's row; divided by N it would carry the sample's
+//!   label noise at N_e/N of its weight and bias σ_e low. The one denominator of every per-atom
+//!   energy quantity: this row, the training residuals below, `loo`'s rows and residuals and
+//!   `Model::predict`'s floor (N_e σ_e)². One row per sample either way (n_E unchanged).
 //! * **3N force rows**, one per atom j and component a: features φ_{F,ja} with block s =
 //!   −Σ_{i: s_i = s} ∂B_i/∂r_{j,a} (the gradient lists of [`describe`]; the sum over centre
 //!   atoms i is what makes the force depend on every atom's coefficient row), target F_{j,a},
@@ -922,7 +929,8 @@ impl Accumulator {
         }
         if sample.use_energy {
             if per_atom {
-                let inv = 1.0 / n as f64;
+                // N_e (module doc, "Design matrix"): n for every sample without an isolated atom
+                let inv = 1.0 / crate::energy_row_atoms(basis, &sample.pos) as f64;
                 phi.iter_mut().for_each(|v| *v *= inv);
                 y *= inv;
             }
@@ -2426,7 +2434,7 @@ pub fn fit(
     let mut n_f = 0usize;
     for s in &store.samples {
         let (e, f) = energy_and_forces(&model, &s.pos, &s.z)?;
-        let scale = if opts.energy_per_atom { 1.0 / s.pos.len() as f64 } else { 1.0 };
+        let scale = if opts.energy_per_atom { 1.0 / crate::energy_row_atoms(basis, &s.pos) as f64 } else { 1.0 };
         if s.use_energy {
             ss_e += s.weight * ((e - s.energy) * scale).powi(2);
             n_e += 1;
@@ -3296,6 +3304,44 @@ mod tests {
                 Sample { pos, z, energy: e, forces: f, tag: SampleTag::Perturbation, weight: 1.0, force_mask: None, use_energy: true }
             })
             .collect()
+    }
+
+    #[test]
+    fn a_stray_samples_energy_row_is_its_bonded_parts() {
+        // Controller ruling 9a: a sample with a stray atom (B = 0) has the energy row of its bonded part —
+        // the same features bit for bit (the stray atom adds exact zeros), the same target to rounding
+        // (its label E_frag + E_ref(H): the extra E_ref subtracted again) — so it enters G, b and yy as
+        // its fragment does; one row each (n_E unchanged). Whole and batched paths, body-2/3/4 bases.
+        let mut rng = StdRng::seed_from_u64(78);
+        let opts = FitOptions::default();
+        let train: Vec<Sample> = (0..12).map(|i| dimer_sample(1.0 + 0.1 * i as f64, unit_vector(&mut rng), [0.0, -3.0, 0.0], None)).collect();
+        for basis in [h2_basis(6), Basis::new(&[H]), small_body4_basis()] {
+            let refs: Vec<f64> = basis.species.iter().map(|&z| if z == H { E_ATOM_H } else { -74.8 }).collect();
+            let with_stray = |s: &Sample| {
+                let mut t = s.clone();
+                t.pos.push([0.0, 12.0, 0.0]);
+                t.z.push(H);
+                t.forces.push([0.0; 3]);
+                t.force_mask = Some(vec![true, true, false]);
+                t.energy += E_ATOM_H;
+                t
+            };
+            let (mut plain, mut stray, mut batched) = (Accumulator::new(&basis), Accumulator::new(&basis), Accumulator::new(&basis));
+            for s in &train {
+                plain.add(s, &basis, &refs, &opts).unwrap();
+                stray.add(&with_stray(s), &basis, &refs, &opts).unwrap();
+            }
+            let strays: Vec<Sample> = train.iter().map(with_stray).collect();
+            batched.add_many(&strays.iter().collect::<Vec<_>>(), &basis, &refs, &opts).unwrap();
+            for acc in [&stray, &batched] {
+                let (a, b) = (acc.sums(), plain.sums());
+                assert_eq!(acc.n_e, plain.n_e, "one energy row per sample");
+                assert_eq!(a.gram_e.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), b.gram_e.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "G_E bit for bit");
+                let close = |x: f64, y: f64| (x - y).abs() <= 1e-13 * y.abs().max(1e-300);
+                assert!(a.rhs_e.iter().zip(&b.rhs_e).all(|(x, y)| close(*x, *y)), "b_E to rounding");
+                assert!(close(a.yy_e, b.yy_e), "yy_E {} vs {}", a.yy_e, b.yy_e);
+            }
+        }
     }
 
     /// An isolated atom (no neighbour within r_cut; `envelope` module doc, "Isolated atoms are not

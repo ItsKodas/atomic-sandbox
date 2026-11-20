@@ -145,7 +145,8 @@ pub struct PartialCharges {
     pub t: f64,
     pub step: u64,
     pub source: ChargeSource,
-    /// The ionic surface's tag (`ForceProvider::ionic_tag`): `"none"` = all-electron.
+    /// The ionic surface's tag (`ForceProvider::ionic_tag`): `"none"` or `"none/…"` = all-electron
+    /// (`providers::pseudo::is_all_electron_tag`; the Fermi–Dirac tag `none/fd5e-3/pin1e-5` since plan 2026-11-13 Task 9).
     pub ionic: String,
     /// The electric dipole μ = Σ_A Z_A R_A − ∫ ρ r d³r of the same density ([`dipole`]; e·Bohr,
     /// about the cell centre — origin-dependent for a charged scene). Display only (the reference
