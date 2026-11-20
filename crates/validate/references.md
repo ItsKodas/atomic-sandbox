@@ -5858,6 +5858,51 @@ not asserted): one 50 mHa outlier beyond the siblings raised their ratios from 0
 released); with a second outlier inside the window they rose to 0.89–1.02 and three of ten consistent siblings were
 kept — the safe side (kept → DFT nearby), until the store changes.
 
+### Task 17: V11, the dry run on a copy of the user's collection — partial (plan 2026-11-13 Task 17, 2026-11-20, release, RX 7900 XTX)
+
+`dry_run_on_collection_copy` (`tests/migration.rs`, `#[ignore]`d; `FD_DRY_RUN_COPY=<copy>`), on a copy (without its
+`.lock`) of the user's BEST collection `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5` (Accurate h = σ = 0.15,
+`Accepted`, legacy tag `all/30a74d9bda495668/shared1e-3/1e-1/stop2x5e-8`): **1 657 samples** (codes 0 × 1 624, held 1 ×
+32, superseded 2 × 1; H₂ 944, H₂O 321, H₃ 175, H₃P 217; boxes 99–135³), 18 (species, box) references. The new folder's
+key is `…_all-9dfd104e13b8`. The GPU was shared at times (the user's app, another worktree's suites).
+
+**V11 stopped at 480/1 657 by user decision (the BEST collection is not kept); the full-collection review and trust
+comparison were not run.** The pass was killed at cursor 480 (state `running`, resumable, not resumed). What was measured:
+
+- **Classes (480 re-solved): U 479, T 0, S 1, not migrated 0.** Class U's largest |F_new − E_old| **3.9e-7 Ha** and
+  |ΔF| **3.9e-5 Ha/Bohr** (ε_E 1e-5, ε_F 1.5e-4: 26× and 3.9× inside). The 480 are H₂ (433, 109–123³) and H₃P (47,
+  127³), in file order. Every U record is the old one bit for bit (479 of 480 energies bit-identical, re-read from the
+  new `samples.bin`).
+- **The one S** is source 322, H₂ at R = 5.98 Bohr (115³, multiplicity 1, old code 1 = held): E_old −0.91084466,
+  F_new −0.91328568 Ha (**−2.44 mHa**), max |ΔF| 2.5e-3 Ha/Bohr — the stretched singlet, where Fermi–Dirac shares the
+  near-degenerate σ_g/σ_u pair the integer rule kept apart. It went 1 → 9 (a hold judged the old label: review), as
+  `migrated_code` says. The other held sample in range (source 327, U) kept code 1. **No sample changed code without a
+  logged reason** (codes re-read from both `samples.bin` files; the harness's own per-sample check ran only at the end and
+  was cut off with the run).
+- **False-S estimate:** 0 of 1 (the one S fails the forces too); not meaningful on 480 samples of H₂/H₃P.
+- **References** (old → new, Ha): H 99–135³ all within 3e-8 (−0.4781085 … −0.4781522); O 99³ −16.1144943 →
+  −16.1144944, 109³ −16.1145144 → −16.1145133, 115³ −16.1145168 → −16.1145177, 119³ −16.1145184 → −16.1145183, **123³
+  −16.1049716 → −16.1145195** (9.5 mHa above its neighbours before; not an F, which would lie below — its origin, perhaps the
+  patched preview build that wrote into this folder from 2026-11-16, is not established); P 109³ −6.7958418 → −6.7958417,
+  127³ −6.7960014 → −6.7960013, **131³ −6.7613601 → −6.7960104** (+34.6 mHa wrong before). The re-solved references are
+  consistent across boxes (O within 2.5e-5, P within 1.7e-4 Ha across 99–131³); two of the old ones were not, which the migration
+  repairs.
+- **Time.** The references (18 boxes, every allowed multiplicity) took 21.7 min. The 480 samples took **17 915 s, 37 s
+  per sample on average**, ranging over 50× per grid unit between blocks of 100: samples 0–99 (53 H₂ 115³, 47 H₃P 127³)
+  138 s each; 100–199 (H₂ 115³) 2.3 s; 200–299 (H₂ 115³) 4.1 s; 300–399 (mostly H₂ 123³) 16 s; 400–479 (H₂ 123³) 23 s
+  (cursor 432 → 435 in 150 s, the GPU shared). The pass's own median solve was 14 s after 100 samples and 2.1 s after
+  400, so the median-based estimate said 45 min left at sample 400, about 17× short.
+- **Estimate fix** (`providers::sampling::migrate`): the a-priori cost was 1.1 s × (n/57)³ per sample (one gapped H₂O at
+  57³; 4.5 h for this collection); it is now **4.1 s × (n/57)³** (V11's mean per grid unit, ≈ 41 s at 123³ — ≈ 17 h for
+  this collection), and after 20 solves the estimate takes the pass's **mean** cost per grid unit instead of the median.
+  The plan's and the spec's "1–2 h for ≈ 2 000 samples" was wrong by about 10× (spec §7.3 amended).
+- Not run: the code-9 review, the refit, the trust verdict before and after. (The baseline step did run: the old labels
+  in a new-key folder under this build's trust rule, no audit history — **trusted**, 1 620 fitted, energy residual
+  9.27e-4 / 1e-3 per atom, force residual 1.998e-3 / 2e-3, misfit 47 / 162; both class verdicts untrusted with κ 1.00
+  and no evidence. Nothing to compare it with.)
+- **The source copy and the original are byte-identical afterwards** (SHA-256 of every file before and after; the
+  original's 9 files including its stale `.lock`, the copy's 8).
+
 ## Live orbitals (Harris display; spec 2026-11-14)
 
 `tests/harris.rs` (spec `docs/superpowers/specs/2026-11-14-live-orbitals-design.md` §7, V-A1–V-A3; V-A4, a record for §9 Q2, below). First measured 2026-11-14; **re-measured 2026-11-15 after the Harris LOBPCG change of task 8b** (the stop test reads the displayed levels at the SCF's tol, the guards at τ_c/100, the top level a buffer — `qm_gpu::harris` "Three roles"): the tables below are the 2026-11-15 numbers, with the 2026-11-14 ones where they changed. **Re-run 2026-11-16 after task 8b fix 1** (the block memory keeps the last call's need, not the split it ran with; the record's last vector tested, under a buffer, when it can change the shown rows — `qm_gpu::harris` "The record's edge"; the at-cap note prints the displayed and guard tiers' residuals): every gate passes, the changes are noted where they occur. Release, RX 7900 XTX (Vulkan) / Ryzen 7 9800X3D, BelowNormal, the user's app open (the GPU shared with an idle window), each test its own invocation (`--test harris va1`, `va2`, `va3`) with a 3-minute cool-down between them. All cases: σ = h = 0.15 Bohr (the app's Accurate grid), ionic `Accepted` (the app default: H, N and O pseudised; `DegenerateShells` occupations), SCF tol 1e-6 (the floor-aware GPU tol, `effective_gpu_tol`, stays 1e-6 for N ≤ 8), cold SCF on a fresh `GpuSolver`, then `GpuSolver::harris` on the same solver with a new `HarrisState` (m = 0).

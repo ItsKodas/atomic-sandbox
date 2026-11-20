@@ -763,6 +763,12 @@ sample's append.
 RX 7900 XTX at the app's grids (`references.md`: H₂O 1.1 s cold at 57³, more at 81³). The user's H/N/O collection
 (≈ 1 700–2 500 samples) needs about 1–2 h. Before starting, the offer shows a count and an estimate. The estimate is
 updated from the measured median after the first 20 solves.
+- **Amended (plan Task 17, V11, 2026-11-20): the cost was wrong by about 10×.** V11's 480 cold re-solves of the user's
+  Accurate collection (109–127³) took 17 915 s, 37 s per sample on average, and ranged over 50× per
+  grid unit between blocks (equilibrium H₂ at 115³ 2–4 s, H₃P at 127³ ≈ 140 s): about 17 h for 1 657 samples, not 1–2
+  h. The a-priori cost is now 4.1 s × (n/57)³ per sample (`MIGRATION_PRIOR_SOLVE_S`, the V11 mean), and after 20
+  solves the estimate takes the pass's own **mean** cost per grid unit, not the median — the times are heavy-tailed
+  (median 2.1 s, mean 37 s), so a median under-estimated the time left about 17×.
 
 **Why re-solve everything (the classification criterion).** Nothing the collection stores tells an unchanged label
 from a changed one. A sample keeps Z, positions, energy, forces, the box, the multiplicity, the tag, the weight, the

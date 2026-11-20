@@ -131,12 +131,17 @@ pub fn migration_eps(all_electron: bool, scf_tol_used: f64, e_old: f64) -> Migra
     let sigma_f = if all_electron { ALL_ELECTRON_SAMPLE_TIER.sigma_f.max(ALL_ELECTRON_APP_TIER.sigma_f) } else { t.sigma_f };
     MigrationEps { e: MIGRATION_EPS_E.max(MIGRATION_EPS_E_SIGMAS * t.sigma_e), f: MIGRATION_EPS_F_SIGMAS * sigma_f }
 }
-/// The time estimate uses the median of the pass's own sample solves once it has made this many (spec §7.3, "Cost").
+/// The time estimate uses the mean of the pass's own sample solves, per [`prior_solve_s`]'s grid unit, once it has made
+/// this many (spec §7.3, "Cost").
 pub const MIGRATION_ETA_SOLVES: usize = 20;
-/// The a-priori cost of one cold solve (s) at [`MIGRATION_PRIOR_GRID_N`]³ on the RX 7900 XTX: H₂O cold at 57³, 1.1 s
-/// (`validate/references.md`, quoted in spec §7.3 "Cost"); scaled by (n/57)³ for another box. An estimate for the offer,
-/// replaced by the measured median after [`MIGRATION_ETA_SOLVES`] solves.
-pub const MIGRATION_PRIOR_SOLVE_S: f64 = 1.1;
+/// The a-priori cost of one cold sample solve (s) per [`MIGRATION_PRIOR_GRID_N`]³ of box on the RX 7900 XTX, scaled by
+/// (n/57)³ for another box: **4.1 s**, the mean of V11's 480 cold sample re-solves of a real Accurate collection (plan
+/// Task 17, 2026-11-20: 17 915 s for Σ(n/57)³ = 4 350 at 109–127³, ≈ 41 s per sample at 123³; `validate/references.md`
+/// "V11"). It was 1.1 s — one gapped H₂O solve at 57³ — which put a 1 657-sample collection at 4.5 h against ≈ 17 h
+/// at the measured rate: stretched, hot and open-shell samples cost far more than one equilibrium molecule (the measured per-unit cost
+/// ranged 0.28–14 s over blocks of 100). An estimate for the offer, replaced by the pass's own measured mean after
+/// [`MIGRATION_ETA_SOLVES`] solves.
+pub const MIGRATION_PRIOR_SOLVE_S: f64 = 4.1;
 /// The box of [`MIGRATION_PRIOR_SOLVE_S`] (grid points per side).
 pub const MIGRATION_PRIOR_GRID_N: usize = 57;
 /// The pass's progress stage while it re-solves samples (`SamplingProgress::stage`).
@@ -266,7 +271,7 @@ pub struct Migrator {
     all_electron: bool,
     /// The model's cutoff (Bohr): a sample without a neighbour within it is not migrated (module doc, 1.).
     r_cut: f64,
-    /// Wall times (s) of this run's sample solves (the estimate's median).
+    /// This run's sample solves' wall times (s), each per [`prior_solve_s`]'s grid unit (the estimate's mean).
     walls: Vec<f64>,
     progress: SamplingProgress,
     notes: Vec<String>,
@@ -389,17 +394,15 @@ impl Migrator {
     }
 
     /// The time left (s; spec §7.3 "Cost"): the a-priori [`prior_solve_s`] of every solve left, or — once the pass has
-    /// made [`MIGRATION_ETA_SOLVES`] sample solves — their median × the solves left.
+    /// made [`MIGRATION_ETA_SOLVES`] sample solves — the same sum with the pass's own **mean** cost per grid unit in place
+    /// of [`MIGRATION_PRIOR_SOLVE_S`]. The mean, not the median (plan Task 17, V11): the time left is a sum, and the solve
+    /// times are heavy-tailed — V11's median was 2.1 s while its mean was 37 s per sample, so a median put 1 257 samples
+    /// at 45 min that were taking ≈ 13 h.
     pub fn eta_s(&self) -> f64 {
         let left = &self.source_samples[self.log.cursor.min(self.source_samples.len())..];
         let ref_solves = |r: &RefJob| r.scan.as_ref().map_or(allowed_multiplicities(r.z as u32).len(), |s| s.remaining().len());
-        if self.walls.len() >= MIGRATION_ETA_SOLVES {
-            let mut w = self.walls.clone();
-            w.sort_by(f64::total_cmp);
-            let solves = left.len() + self.refs.iter().map(ref_solves).sum::<usize>();
-            return w[w.len() / 2] * solves as f64;
-        }
-        left.iter().map(|s| prior_solve_s(s.grid_n)).sum::<f64>() + self.refs.iter().map(|r| ref_solves(r) as f64 * prior_solve_s(r.n)).sum::<f64>()
+        let per_unit = if self.walls.len() >= MIGRATION_ETA_SOLVES { self.walls.iter().sum::<f64>() / self.walls.len() as f64 / MIGRATION_PRIOR_SOLVE_S } else { 1.0 };
+        per_unit * (left.iter().map(|s| prior_solve_s(s.grid_n)).sum::<f64>() + self.refs.iter().map(|r| ref_solves(r) as f64 * prior_solve_s(r.n)).sum::<f64>())
     }
 
     /// The isolated neutral atom's scene parts of a reference job, and the cold scan.
@@ -564,7 +567,8 @@ impl Migrator {
             }
             Ok(r) => r,
         };
-        self.walls.push(started.elapsed().as_secs_f64());
+        // per grid unit: a measured solve of a 123³ box predicts a 109³ one by the same (n/57)³ as the prior (`eta_s`)
+        self.walls.push(started.elapsed().as_secs_f64() * MIGRATION_PRIOR_SOLVE_S / prior_solve_s(old.grid_n));
         self.progress.last_energy = r.energy;
         // 3. the checks
         if let Err((code, why)) = check_solve(&r, old.sample.z.len(), self.h, old.multiplicity) {
