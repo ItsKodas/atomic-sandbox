@@ -29,7 +29,7 @@ pub use integrator::{Integrator, StepStats};
 pub use knowledge::{atom_coverage, Confidence, ElementKnowledge, KnowledgeMap, PairKnowledge};
 pub use relax::{Fire, FireOutcome, FireParams, FireStep, RelaxProgress, F_TOL};
 pub use provider::{
-    AuditRecord, AuditVerdict, ClassKey, ClassLoo, SpeciesVerdict, key_words, ImportSummary, MigrationPhase, MigrationStatus, ModelSource, PurgeReport, Readiness, TeachOffer, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, Extrapolation, ForceProvider, ForceResult,
+    AuditRecord, AuditVerdict, CalibrationTicks, ClassKey, ClassLoo, SpeciesVerdict, key_words, ImportSummary, MigrationPhase, MigrationStatus, ModelSource, PurgeReport, Readiness, TeachOffer, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, Extrapolation, ForceProvider, ForceResult,
     ColourLook, ExperienceUse, HarrisAnswer, HarrisAtoms, LoneAtomLabels, OrbitalDisplay, OrbitalKind, OrbitalField, OrbitalInfo, OrbitalLabel, OrbitalRequest, OrbitalViewRequest, CORE_GAP, ProviderError, SideDisplay, SideKind,
     RefitPoll, SampleId, SampleSuspect, ShareTables, SolverError, Source, Spin, SpinSummary, Surface, Trainable, TrainableStatus, UnoccupiedStatus, nothing_to_solve, PseudoSummary, PartialLevel, Frontier, CORE_OVERLAP_WARNING, BRANCH_JUMP_WARNING, branch_jump_warning, untrainable_citation, ORBITAL_MIN_INTERVAL, TRACK_HOMO,
 };

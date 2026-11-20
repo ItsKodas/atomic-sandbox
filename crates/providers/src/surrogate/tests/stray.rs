@@ -1444,17 +1444,17 @@ fn rule7_uses_n_bonded() {
     let pred = m.predict(&pos, &z, true).unwrap();
     let (e, f) = (pred.energy_std.unwrap(), pred.force_std_epistemic.clone().unwrap());
     let infl = s.atom_inflation(&m, &pos, &z);
-    assert!(infl.iter().all(|&k| k == 1.0), "the premise: no class inflation");
+    assert!(infl.iter().all(|k| k.sum == 1.0 && k.tail == 1.0 && k.energy == 1.0), "the premise: no class inflation");
     // bit for bit: the scene's energy std is the bonded part's alone (the floor (N_e s_E)², N_e = 2; B_s adds zeros)
     let frag = m.predict(&pos[..2], &z[..2], true).unwrap();
     assert_eq!(e.to_bits(), frag.energy_std.unwrap().to_bits(), "the energy std of H₂ + H is H₂'s");
     let tier = 5e-4;
     let per_scene_atom = (e * e - (3.0 * m.sigma_e).powi(2)).max(0.0).sqrt() / 3.0;
     assert!(per_scene_atom <= tier, "the premise: per scene atom it would pass ({per_scene_atom:e})");
-    assert!(s.energy_variance_refusal(&m, &pos, e, &infl).is_some(), "per energy-row atom it fails");
+    assert!(s.energy_variance(&m, &pos, e, &infl).1.is_some(), "per energy-row atom it fails");
     assert_eq!(
-        format!("{:?}", s.energy_variance_refusal(&m, &pos, e, &infl)),
-        format!("{:?}", s.energy_variance_refusal(&m, &pos[..2], frag.energy_std.unwrap(), &infl[..2])),
+        format!("{:?}", s.energy_variance(&m, &pos, e, &infl).1),
+        format!("{:?}", s.energy_variance(&m, &pos[..2], frag.energy_std.unwrap(), &infl[..2]).1),
         "rule 7 at the scene is rule 7 on its bonded part"
     );
     let v = s.variance_check(&m, &pred, e, &f, &pos, &z);
@@ -2322,7 +2322,7 @@ fn failed_stray_audits_queue_for_their_attribution() {
     let (pos, z) = (positions(&sc), zs(&sc));
     let (e, f) = SpeciesMorse::energy_and_forces(&pos, &z);
     let case = FailedAudit { pos: pos.clone(), z: z.clone(), energy: e + AUDIT_OFFSET, forces: f.clone(), index: None, ionic: s.provenance_for(&sc).ionic.clone(), rejudges: 0, origin: AuditOrigin::Audit, pair: None };
-    match s.stray_audit_failed(&sc, e + AUDIT_OFFSET, &f, &case, AUDIT_OFFSET, "test".into()) {
+    match s.stray_audit_failed(&sc, e + AUDIT_OFFSET, &f, &case, AUDIT_OFFSET, "test".into(), Default::default()) {
         StrayAudit::Attributing(w) => assert!(w.contains("queued behind 1 other"), "{w}"),
         other => panic!("queued: {other:?}"),
     }

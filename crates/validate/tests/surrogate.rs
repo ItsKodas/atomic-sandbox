@@ -460,7 +460,9 @@ fn snapshot(log: &Arc<Mutex<EvalLog>>) -> EvalLog { log.lock().unwrap().clone() 
 fn surrogate_reproduces_the_h2_frequency() {
     let Some(ctx) = gpu() else { return };
     let t_test = Instant::now();
-    let (mut s, log) = student(&ctx, 0);
+    // spec 2026-11-18 §4 "How ticks are served": in-step ticks only where no auditor serves them; this measures the model's own potential, so ticks are off (plan Task 9 ruling)
+    let (s, log) = student(&ctx, 0);
+    let mut s = s.with_tick_every(0);
     let mut out = String::new();
     let _ = writeln!(out, "H₂ surface reproduction and frequency, {N_H2}³, σ = h = {H}, teacher tol {TOL_H2:.0e}");
     // the DFT statics of this surface (the M4 helper): R_e, k, E_mode and the MD start's forces
@@ -542,7 +544,9 @@ fn surrogate_reproduces_the_h2_frequency() {
 fn surrogate_nve_is_tight() {
     let Some(ctx) = gpu() else { return };
     let t_test = Instant::now();
-    let (mut s, log) = student(&ctx, 0);
+    // spec 2026-11-18 §4 "How ticks are served": in-step ticks only where no auditor serves them; this measures the model's own potential, so ticks are off (plan Task 9 ruling)
+    let (s, log) = student(&ctx, 0);
+    let mut s = s.with_tick_every(0);
     let mut out = String::new();
     let _ = writeln!(out, "H₂ NVE on the surrogate, {N_H2}³ teacher, dt = {DT_FS} fs, {NVE_STEPS} steps = {:.0} ps", NVE_STEPS as f64 * DT_FS / 1000.0);
     let (_rep, pass_wall) = sample_and_fit(&mut s, &h2(SCAN_R0), &h2_plan(), &mut out);
@@ -612,6 +616,24 @@ fn h3_neutral(side: f64) -> Scene {
     let mut sc = h3_plus(side);
     sc.charge = 0;
     sc
+}
+
+/// A fallback step's rule for the repro's log, from the step's structured teaching event — its
+/// `origin`, its history code (`TeachEvent::history_code`, else the code of `TeachEvent::rule`) named
+/// by the provider's own table (`history_rule_name`), and the provider's in-step tick count — never
+/// from note text (plan 2026-11-19 Task 9: an in-step calibration tick's note says "in-envelope
+/// steps", which [`which_rule`] read as "rule 5 (envelope)"). Without an event (none drained for
+/// the step) the note-text reading stands, marked "(from notes)".
+fn repro_step_rule(e: Option<&sim::activity::TeachEvent>, in_step_tick: bool, notes: &[String]) -> String {
+    use providers::surrogate::{history_rule_code, history_rule_name};
+    use sim::activity::TeachOrigin;
+    let Some(e) = e else { return format!("{} (from notes)", which_rule(notes)) };
+    let box_tag = if e.audit == Some(sim::AuditVerdict::BoxAffected) { ", box-affected" } else { "" };
+    match e.origin {
+        TeachOrigin::Audit if in_step_tick => format!("calibration tick (in step{box_tag})"),
+        TeachOrigin::Audit => format!("rule 8 audit (in step{box_tag})"),
+        _ => history_rule_name(e.history_code.unwrap_or_else(|| history_rule_code(e.rule))).to_string(),
+    }
 }
 
 fn which_rule(notes: &[String]) -> &'static str {
@@ -770,7 +792,9 @@ fn displaced(sc: &Scene, f: [f64; 3]) -> Scene {
 fn h3plus_tier() {
     let Some(ctx) = gpu() else { return };
     let t_test = Instant::now();
-    let (mut s, log) = student(&ctx, 0);
+    // spec 2026-11-18 §4 "How ticks are served": in-step ticks only where no auditor serves them; this measures the model's own potential, so ticks are off (plan Task 9 ruling)
+    let (s, log) = student(&ctx, 0);
+    let mut s = s.with_tick_every(0);
     let mut out = String::new();
     let _ = writeln!(out, "H₃⁺ tier, {N_H2}³, σ = h = {H}, teacher tol {TOL_H2:.0e}");
     // relax on the teacher surface
@@ -1078,7 +1102,20 @@ fn repro_steps() -> usize {
 ///   unless the teacher's answer is box-affected (not judged — the box's confinement; counted and
 ///   reported);
 /// - every fallback's reported energy within the tier of the teacher's (the teacher's own on the
-///   teacher's surface, |gap|/N ≤ tier on the model's);
+///   teacher's surface, |gap|/N ≤ tier on the model's). **Not** the steps of an in-step audit or
+///   calibration tick whose teacher answer is box-affected (its activity event's verdict
+///   `AuditVerdict::BoxAffected`, selected from that structured record, never from note text):
+///   by the provider's box rule (`providers::surrogate` `teach`, the audit branch; the
+///   `box_affected_face_density` cut) such a step keeps the model's energy, because its gap is the
+///   box's Dirichlet confinement as much as the model's error — it is not a fallback's energy, and
+///   the answer check excludes box-affected answers the same way. One-sided (the Task 9 physics
+///   review's M4): confinement only raises the teacher's energy, so an excluded step's signed gap
+///   E_teacher − E_model must stay ≥ −tier·N — asserted, and printed signed. Since trust tightening Task 7
+///   the harness's calibration ticks are such in-step audits (25 in-envelope steps apart; the gated
+///   scenario has `audit_every` 0, so before them none ran here). Ruled by the controller at plan
+///   2026-11-19 Task 9 (the gate failed on 5 such steps, 1.4–8.9e-3 Ha/atom at face densities
+///   2.1e-5–6.2e-4); the tier and every other constant are unchanged. The excluded steps are
+///   counted and printed with their face densities;
 /// - every published scene inside the cell's margin; a pause only with the teacher's "left the
 ///   simulation cell" message (requirement 1);
 /// - a step that changes surface moves E_conserved by exactly Verlet's dt²Σ Δ|F|²/8m (the
@@ -1140,12 +1177,119 @@ fn stuck_escape_repro_with(runs: &[bool], audit_every: usize, mut baseline: Opti
     let mut first = Some(p);
     for &hot in runs {
         let provider = first.take().unwrap_or_else(|| SharedTrainable::from_handle(hs.clone()));
+        let (l0, t0) = (snapshot(&log), Instant::now());
         repro_run(&ctx, Box::new(provider), &hs, hot, n_steps, &mut out, baseline.as_deref_mut());
+        // trust tightening Task 9 Step 1 (a printout): the run's own teacher solves and wall time
+        let l1 = snapshot(&log);
+        let _ = writeln!(out, "  {} run: {} teacher solves of the provider (GPU {:.1} s; in-step ticks included, the test's own checker not), run wall {:.1} s", if hot { "hot" } else { "NVE" }, l1.calls - l0.calls, (l1.gpu - l0.gpu).as_secs_f64(), t0.elapsed().as_secs_f64());
     }
     let l = snapshot(&log);
     let _ = writeln!(out, "  teacher: {} solves, GPU {:.1} s; pass wall {:.1} s; test wall {:.1} s", l.calls, l.gpu.as_secs_f64(), pass_wall.as_secs_f64(), t_test.elapsed().as_secs_f64());
     println!("{out}");
     record(&ctx, timing_row("stuck_escape_repro", "H₂ + H", N_H2, TOL_H2, &l, t_test.elapsed(), &format!("runs (hot) {runs:?}: see the log")));
+}
+
+/// The trust-tightening readouts of the standing judgement, per environment key (plan 2026-11-19
+/// Task 9 Step 1; a printout, never an assertion): the verdict, the evidence floor's n_fit and n_pts,
+/// the evidence, λ_sum as rules 6/7 read it (floored), λ_T and λ_E, the measured error and worst atom.
+fn trust_key_lines(s: &SurrogateKs) -> String {
+    use providers::surrogate::{FLOOR_FITS, FLOOR_POINTS};
+    let opt = |x: Option<f64>| x.map_or("—".to_string(), |v| format!("{v:.3}"));
+    s.class_loo()
+        .iter()
+        .flat_map(|c| {
+            c.species.iter().map(move |k| {
+                format!(
+                    "{} {}: {}{}, n_fit {}/{FLOOR_FITS} n_pts {}/{FLOOR_POINTS}, evidence {}, λ_sum {:.3} λ_T {:.3} λ_E {:.3}, measured {} worst atom {}",
+                    c.class, k.words(), if k.trusted { "trusted" } else { "untrusted" },
+                    k.refusal.as_ref().map_or(String::new(), |r| format!(" ({:?} {:.3} > {:.3})", r.0, r.1, r.2)),
+                    k.fits, k.floor_points, k.evidence, k.rule_inflation, k.tail_inflation, k.energy_inflation, opt(k.measured), opt(k.worst_atom)
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The history points a step left (plan 2026-11-19 Task 9 Step 1): tallied by what the trust
+/// tightening reads — code-24 refusals, calibration ticks at answers (audits) and at fallbacks, and
+/// the answer sample P_A (`calibrate::in_answer_sample`'s predicate on the flags and kind, restated
+/// here: the provider's own is crate-private). A printout.
+#[derive(Default, Clone, Copy)]
+struct PointTally {
+    points: usize,
+    code_24: usize,
+    tick_audits: usize,
+    tick_fallbacks: usize,
+    p_a: usize,
+}
+
+impl PointTally {
+    fn add(&mut self, h: &surrogate::AuditHistory, recorded_before: u64) {
+        use providers::surrogate::{history_rule_code, HISTORY_RULE_CLASS_AND_VARIANCE, HISTORY_RULE_TAIL_INFLATION};
+        use sim::activity::{EnvClass, TeachRule};
+        use surrogate::history::{PointFlags, PointKind};
+        let new = (h.recorded().saturating_sub(recorded_before) as usize).min(h.len());
+        let class_codes = [history_rule_code(TeachRule::Class(EnvClass::Pair)), history_rule_code(TeachRule::Class(EnvClass::ManyBody)), HISTORY_RULE_CLASS_AND_VARIANCE];
+        for p in h.iter().rev().take(new) {
+            self.points += 1;
+            let tick = p.flags.has(PointFlags::TICK);
+            match p.kind {
+                PointKind::Audit => self.tick_audits += tick as usize,
+                PointKind::Fallback { rule } => {
+                    self.tick_fallbacks += tick as usize;
+                    self.code_24 += (rule == HISTORY_RULE_TAIL_INFLATION) as usize;
+                }
+            }
+            let class_refused = matches!(p.kind, PointKind::Fallback { rule } if class_codes.contains(&rule));
+            let in_pa = !p.flags.has(PointFlags::FENCED) && !p.flags.has(PointFlags::NOVEL) && (tick || (p.flags.has(PointFlags::CADENCE_FRESH) && class_refused));
+            self.p_a += in_pa as usize;
+        }
+    }
+
+    fn line(&self) -> String {
+        format!("{} history points: {} code-24 refusals (rule 6/7 at λ_T/λ_E, passing at λ_sum), ticks recorded {} at answers + {} at fallbacks, {} in P_A", self.points, self.code_24, self.tick_audits, self.tick_fallbacks, self.p_a)
+    }
+}
+
+/// The calibration ticks of one phase (`SurrogateKs::tick_counts`, `now` − `then`) and the plan's
+/// Step 3b diagnostic (Task 7 review I1/R1): the population's answered share against the due ticks'
+/// and the taken ticks', and the take rates at answered and at refused steps. The harness has no
+/// auditor, so D (the dead time) is 0 and every taken tick is served in the step. A printout.
+fn tick_line(now: providers::surrogate::TickCounts, then: providers::surrogate::TickCounts, tally: &PointTally) -> String {
+    let d = |a: u64, b: u64| a.saturating_sub(b);
+    let (due, ans_due, ans_busy) = (d(now.due, then.due), d(now.answered_due, then.answered_due), d(now.answered_skipped_busy, then.answered_skipped_busy));
+    let (busy, pop, pop_ans) = (d(now.skipped_busy, then.skipped_busy), d(now.population, then.population), d(now.population_answered, then.population_answered));
+    let share = |a: u64, b: u64| if b == 0 { f64::NAN } else { a as f64 / b as f64 };
+    let taken_rec = tally.tick_audits + tally.tick_fallbacks;
+    format!(
+        "ticks: due {due} (at answers {ans_due}), recorded {}, unrecorded {}, skipped busy {busy} (at answers {ans_busy}), lost {}, in-step {}; D 0 (no auditor); \
+         answered share — population {:.3} ({pop_ans}/{pop}), due {:.3}, recorded ticks {:.3} ({}/{taken_rec}); take rate at answered {:.3}, at refused {:.3}",
+        d(now.recorded, then.recorded), d(now.unrecorded, then.unrecorded), d(now.lost, then.lost), d(now.in_step, then.in_step),
+        share(pop_ans, pop), share(ans_due, due), share(tally.tick_audits as u64, taken_rec as u64), tally.tick_audits,
+        1.0 - share(ans_busy, ans_due), 1.0 - share(busy - ans_busy.min(busy), due - ans_due.min(due))
+    )
+}
+
+/// The class of atom `a` (0 pair, 1 many-body; `None` isolated) and its key's rule-6 factor
+/// λ_F = max(λ_sum, λ_T) from the standing judgement — the key: Z and the neighbours' distinct
+/// species within `r_cut`, ascending; NaN when the judgement does not list it. For the inflated z of
+/// Task 9 Step 1.
+fn atom_force_factor(s: &SurrogateKs, pos: &[[f64; 3]], z: &[u8], a: usize, r_cut: f64) -> Option<(usize, f64)> {
+    let nb: Vec<usize> = (0..pos.len()).filter(|&b| b != a && (0..3).map(|k| (pos[a][k] - pos[b][k]).powi(2)).sum::<f64>() < r_cut * r_cut).collect();
+    let class = providers::surrogate::atom_class(nb.len())?;
+    let mut species: Vec<u8> = nb.iter().map(|&b| z[b]).collect();
+    species.sort_unstable();
+    species.dedup();
+    let name = providers::surrogate::ENV_CLASSES[class];
+    let k = s.class_loo().iter().find(|c| c.class == name).and_then(|c| c.species.iter().find(|k| k.z == z[a] && k.neighbours == species));
+    // NaN stays NaN (never through f64::max)
+    Some((class, k.map_or(f64::NAN, |k| if k.rule_inflation.is_nan() || k.tail_inflation.is_nan() { f64::NAN } else { k.rule_inflation.max(k.tail_inflation) })))
+}
+
+/// The larger of two, NaN propagating (a NaN is never dropped by the max).
+fn max_nan(m: f64, x: f64) -> f64 {
+    if m.is_nan() || x.is_nan() { f64::NAN } else { m.max(x) }
 }
 
 /// One run of the repro (the test's doc) on the shared model: heat, the edit, `n_steps` steps
@@ -1182,10 +1326,18 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
     }
     d.apply(DynCommand::SetThermostat(Some((4000.0, 20.0))));
     let mut heat_fb = 0;
+    // trust tightening Task 9 Step 1 (printouts): the ticks and the points each phase left
+    let tick_counts = |hs: &Arc<Mutex<SurrogateKs>>| hs.lock().unwrap_or_else(|e| e.into_inner()).tick_counts();
+    let recorded = |hs: &Arc<Mutex<SurrogateKs>>| hs.lock().unwrap_or_else(|e| e.into_inner()).audit_history().recorded();
+    let tally = |hs: &Arc<Mutex<SurrogateKs>>, t: &mut PointTally, before: u64| t.add(hs.lock().unwrap_or_else(|e| e.into_inner()).audit_history(), before);
+    let ticks_start = tick_counts(hs);
+    let mut heat_tally = PointTally::default();
     for i in 0..1600 {
         d.apply(DynCommand::Step(1));
         let tb = !gate && trusted_now(hs);
+        let before = recorded(hs);
         let snap = d.tick(f64::INFINITY, &mut never());
+        tally(hs, &mut heat_tally, before);
         observe(&mut baseline, tb);
         heat_fb += (snap.source == Source::Fallback) as usize;
         check!(gate, soft, snap.last_error.is_none(), "{what} heating, step {i}: {:?}", snap.last_error);
@@ -1196,11 +1348,26 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
     }
     let pre = d.snapshot();
     let _ = writeln!(out, "  {what} run — heated: {heat_fb} fallbacks in 1600 steps, bond {:.3} Bohr, T {:.0} K, samples {}", bond(&pre.scene), pre.temperature, hs.lock().unwrap().samples());
+    let ticks_heated = tick_counts(hs);
+    let _ = writeln!(out, "    trust (heating): {}; {}", heat_tally.line(), tick_line(ticks_heated, ticks_start, &heat_tally));
+    let _ = writeln!(out, "    keys after heating: {}", trust_key_lines(&hs.lock().unwrap_or_else(|e| e.into_inner())));
+    let mut edit_tally = PointTally::default();
+    // the steps excluded from the model-surface fallback-energy check: in-step audits and ticks
+    // whose teacher answer was box-affected (the controller's Task 9 ruling; `repro_step_rule`)
+    let mut box_audit_steps: Vec<String> = Vec::new();
+    // the heating phase's teaching events are not this phase's: drained before the edit
+    let _ = d.take_teach_events();
+    // judged answers' z per atom, raw ‖ΔF‖/σ_epi and inflated ‖ΔF‖/(λ_F σ_epi) (max over atoms), and
+    // the worst force residual / bound per class (pair, many-body)
+    let (mut z_raw, mut z_inflated) = (Vec::new(), Vec::new());
+    let mut worst_class = [0.0f64; 2];
     let c = centroid(&pre.scene);
     d.apply(DynCommand::AddNucleus(Nucleus::new(1, [c[0], c[1] + 3.0, c[2]])));
     let mut checker = Locked::new(ctx.clone(), TOL_H2).0;
     let pol = FallbackPolicy::default();
     let (mut answered, mut on_teacher, mut on_model_fb, mut checked, mut boxed) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    // the model-surface fallbacks the fallback-energy check judged (box-excluded steps apart; review N2)
+    let mut fb_checked = 0usize;
     let (mut worst_e, mut worst_f, mut worst_fb_gap, mut worst_boxed_e) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     let mut bad: Vec<String> = Vec::new();
     let (mut worst_z, mut zscores) = (0.0f64, Vec::new());
@@ -1224,7 +1391,12 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
         d.apply(DynCommand::Step(1));
         let tb = !gate && trusted_now(hs);
         let recorded_before = hs.lock().unwrap_or_else(|e| e.into_inner()).audit_history().recorded();
+        let in_step_before = tick_counts(hs).in_step;
         let snap = d.tick(f64::INFINITY, &mut never());
+        tally(hs, &mut edit_tally, recorded_before);
+        // the step's own teaching event (structured: its rule, origin and audit verdict)
+        let step_event = d.take_teach_events().into_iter().rev().find(|e| matches!(e.origin, sim::activity::TeachOrigin::Fallback | sim::activity::TeachOrigin::Audit | sim::activity::TeachOrigin::Verification));
+        let in_step_tick = tick_counts(hs).in_step > in_step_before;
         observe(&mut baseline, tb);
         if snap.source == Source::Fallback && which_rule(&snap.eval.notes) == "rule 4b (class LOO)" {
             // before the refit below: the model that refused is the one judged
@@ -1260,7 +1432,10 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
             stopped = Some(i);
             break;
         }
-        let n = snap.scene.nuclei.len() as f64;
+        // N_e, the energy-row atoms (`surrogate::energy_row_atoms`, stray-atoms ruling 9a): the count the provider's
+        // per-atom energy tiers divide by (rule 7 and λ_E through `policy::energy_atoms`, the audits' `audit_n`), so
+        // |ΔE|/N, gap/N and the box-excluded audit's −tier·N guard agree with them; N for this H₂ (no isolated atom)
+        let n = surrogate::energy_row_atoms_at(r_cut, &snap.scene.nuclei.iter().map(|x| x.pos).collect::<Vec<_>>()) as f64;
         let surface = snap.eval.energy_surface();
         if let Some((e0, s0)) = prev {
             let de = snap.energy_conserved - e0;
@@ -1305,6 +1480,24 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
                 let zs = snap.forces.iter().zip(&t.forces).zip(pr.force_std.as_ref().expect("variance")).map(|((fm, ft), sd)| ((0..3).map(|k| (fm[k] - ft[k]).powi(2)).sum::<f64>()).sqrt() / sd).fold(0.0f64, f64::max);
                 worst_z = worst_z.max(zs);
                 zscores.push(zs);
+                // Task 9 Step 1: z on the epistemic std alone, raw and at the key's λ_F (a printout)
+                {
+                    let s = hs.lock().unwrap_or_else(|e| e.into_inner());
+                    let epi = pr.force_std_epistemic.as_ref().expect("variance");
+                    let (mut zr, mut zi) = (0.0f64, 0.0f64);
+                    for (j, ((fm, ft), e)) in snap.forces.iter().zip(&t.forces).zip(epi).enumerate() {
+                        let dd = ((0..3).map(|k| (fm[k] - ft[k]).powi(2)).sum::<f64>()).sqrt();
+                        let (class, lf) = atom_force_factor(&s, &pos, &z, j, r_cut).unwrap_or((usize::MAX, f64::NAN));
+                        zr = max_nan(zr, dd / e);
+                        zi = max_nan(zi, dd / (lf * e));
+                        if class < 2 {
+                            let (dr, b) = pol.force_residual(fm, ft);
+                            worst_class[class] = max_nan(worst_class[class], dr / b);
+                        }
+                    }
+                    z_raw.push(zr);
+                    z_inflated.push(zi);
+                }
                 let gamma = hs.lock().unwrap_or_else(|e| e.into_inner()).extrapolation_grade(&pos, &z).unwrap_or(f64::NAN);
                 graded.push((gamma, f_ratio, de));
                 worst_e = worst_e.max(de);
@@ -1314,7 +1507,8 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
                 }
             }
             Source::Fallback => {
-                *reasons.entry(which_rule(&snap.eval.notes).to_string()).or_default() += 1;
+                let label = repro_step_rule(step_event.as_ref(), in_step_tick, &snap.eval.notes);
+                *reasons.entry(label.clone()).or_default() += 1;
                 match surface {
                     // the teacher's own total is in the breakdown (EvalStats doc)
                     Surface::Teacher => {
@@ -1324,8 +1518,21 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
                     Surface::Model => {
                         on_model_fb += 1;
                         let g = snap.teacher_gap.expect("a model-surface fallback carries its gap").abs() / n;
+                        // an in-step audit or tick whose teacher answer is box-affected keeps the
+                        // model's energy by the provider's box rule: not a fallback's energy, not
+                        // checked here (the test's doc, the fallback-energy bullet)
+                        // (the step's own event: an audit, its teacher answer box-affected — physics review N4)
+                        if let Some(e) = step_event.as_ref().filter(|e| e.origin == sim::activity::TeachOrigin::Audit && e.box_affected && e.audit == Some(sim::AuditVerdict::BoxAffected)) {
+                            // one-sided (physics review M4): the confinement only raises E_teacher, so
+                            // the signed gap E_teacher − E_model of an excluded step stays ≥ −tier·N
+                            let signed = snap.teacher_gap.expect("a model-surface fallback carries its gap");
+                            box_audit_steps.push(format!("step {i} ({label}): face density {}, gap/N {:+.2e}", e.face_density.map_or("—".to_string(), |f| format!("{f:.2e}")), signed / n));
+                            check!(gate, soft, signed >= -tier * n, "{what} step {i}: a box-excluded in-step audit's gap E_teacher − E_model = {:+.2e} Ha/atom is below −tier: confinement only raises the teacher's energy, so this is the model's error ({label})", signed / n);
+                            continue;
+                        }
+                        fb_checked += 1;
                         worst_fb_gap = worst_fb_gap.max(g);
-                        check!(gate, soft, g <= tier, "{what} step {i}: a model-surface fallback {g:.2e} Ha/atom off the teacher ({})", which_rule(&snap.eval.notes));
+                        check!(gate, soft, g <= tier, "{what} step {i}: a model-surface fallback {g:.2e} Ha/atom off the teacher ({label})");
                     }
                 }
             }
@@ -1336,7 +1543,7 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
         }
     }
     let end = d.snapshot();
-    let _ = writeln!(out, "  {what} run — after the edit: {answered} model answers ({checked} judged against fresh DFT: worst |ΔE|/N {worst_e:.2e} Ha (tier {tier:.0e}), worst force residual / bound {worst_f:.2}; {boxed} box-affected, not judged, worst |ΔE|/N there {worst_boxed_e:.2e}), {on_teacher} teacher-surface fallbacks, {on_model_fb} model-surface fallbacks (worst |gap|/N {worst_fb_gap:.2e}); paused at the cell margin at step {stopped:?}");
+    let _ = writeln!(out, "  {what} run — after the edit: {answered} model answers ({checked} judged against fresh DFT: worst |ΔE|/N {worst_e:.2e} Ha (tier {tier:.0e}), worst force residual / bound {worst_f:.2}; {boxed} box-affected, not judged, worst |ΔE|/N there {worst_boxed_e:.2e}), {on_teacher} teacher-surface fallbacks, {on_model_fb} model-surface fallbacks ({fb_checked} checked against the tier, worst |gap|/N {worst_fb_gap:.2e}; {} box-affected in-step audits/ticks excluded); paused at the cell margin at step {stopped:?}", box_audit_steps.len());
     let _ = writeln!(out, "    E_conserved: {switches} surface changes, largest step there {max_switch:.2e} Ha (NVE: residual vs dt²Σ Δ|F|²/8m ≤ {max_residual:.1e} Ha); largest on one surface {max_same:.2e} Ha; W_jumps {:+.3e}, W_mismatch {:+.3e}", end.work_refit, end.work_mismatch);
     let _ = writeln!(out, "    classes at the end: {}", class_summary(&hs.lock().unwrap_or_else(|e| e.into_inner())));
     let _ = writeln!(out, "    fallback rules: {}", reasons.iter().map(|(k, v)| format!("{v}× {k}")).collect::<Vec<_>>().join("; "));
@@ -1358,6 +1565,12 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
     let _ = writeln!(out, "    class-refused steps' would-be answers against the teacher — the verdict's jurisdiction (rule-4b points, codes 5/6, over the refusing class's atoms): {} steps, per-step rms ‖ΔF‖/√3 / bound {} — rms over them {refused_rms:.3} (ENTER {:.3}: the refusal is warranted beyond it)",
                      refused_ratio.len(), quantiles(&refused_ratio), providers::surrogate::ENTER);
     let _ = writeln!(out, "      every step with the class's note (code 21 and box-affected steps included, over every atom): {} steps, {} — rms {noted_rms:.3}", noted_ratio.len(), quantiles(&noted_ratio));
+    let _ = writeln!(out, "    model-surface steps of in-step audits/ticks with a box-affected teacher answer, not checked against the tier (the test's doc): {}{}", box_audit_steps.len(), if box_audit_steps.is_empty() { String::new() } else { format!(" — {}", box_audit_steps.join("; ")) });
+    // trust tightening Task 9 Step 1 (printouts, no assertion)
+    let _ = writeln!(out, "    trust (after the edit): {}; {}", edit_tally.line(), tick_line(tick_counts(hs), ticks_heated, &edit_tally));
+    let _ = writeln!(out, "    keys at the end: {}", trust_key_lines(&hs.lock().unwrap_or_else(|e| e.into_inner())));
+    let _ = writeln!(out, "    judged answers' z on the epistemic std, max_j ‖ΔF_j‖/σ_epi,j — raw: {}; inflated by the key's λ_F = max(λ_sum, λ_T): {}", quantiles(&z_raw), quantiles(&z_inflated));
+    let _ = writeln!(out, "    judged answers' worst force residual / bound per class: pair {:.2}, many-body {:.2}", worst_class[0], worst_class[1]);
     println!("{out}");
     out.clear();
     check!(gate, soft, bad.is_empty(), "{what}: model answers beyond the energy tier or {REPRO_FORCE_RATIO}× the force bound: {bad:#?}");
@@ -1735,7 +1948,7 @@ impl TrustBaseline {
                     continue;
                 }
                 let _ = writeln!(o, "    {what}: {} points touching the class ({} atoms; {} atoms while the class verdict was trusted, {} while the model was untrusted before the step)", b.points, b.atoms, b.atoms_trusted, b.atoms_model_untrusted);
-                let _ = writeln!(o, "      beyond the in-domain LOO p99: {} / {} points = {:.1} % (the independent count — a point's atoms are one draw per N − 1; {} points had no p99); atoms: {} / {} = {:.1} % while the class verdict was trusted (the brief's \"missed large error\"), {} while it was not",
+                let _ = writeln!(o, "      beyond the in-domain LOO p99: {} / {} points = {:.1} % (the independent count — a point's atoms are one draw per N − 1; {} points had no p99); atoms: {} / {} = {:.1} % while the class verdict was trusted (beyond p99 per atom — a generalisation gap, not the bound-scale miss below), {} while it was not",
                                  b.points_beyond, b.points_with_p99, share(b.points_beyond, b.points_with_p99), b.points - b.points_with_p99, b.atoms_beyond_trusted, b.atoms_trusted, share(b.atoms_beyond_trusted, b.atoms_trusted), b.atoms_beyond_untrusted);
                 let _ = writeln!(o, "      per point while the class verdict was trusted: {} beyond the p99 (the generalisation-gap statistic), {} beyond 1× the force bound or the energy tier (the restated C1, fix round 3), of {} points", b.points_beyond_trusted, b.points_beyond_bound_trusted, b.points_trusted);
                 let _ = writeln!(o, "      err/p99 per point (max over its atoms): {}; per atom: {}", quantiles(&b.err_over_p99_point), quantiles(&b.err_over_p99_atom));
@@ -1784,7 +1997,7 @@ fn trust_baseline_report() {
     active_learning_run(Some(&mut al), every);
     let mut out = String::new();
     let _ = writeln!(out, "# M8a trust measurement (`validate::surrogate::trust_baseline_report`, {} UTC; {} ({:?}); teacher GpuKs σ = h = {H}, {N_H2}³, tol {TOL_H2:e}; audit every {every}; wall {:.0} s; the class verdict in force: the calibrated, hysteretic one of M8a Task 2 fix round 3 — the measured error with the LOO floor over an evidence window of model generations, the worst-atom guard on entry, rules 6/7 inflated by the class's λ; ENTER {:.3}, LEAVE {:.1}, MIN_EVIDENCE {}, WORST_ATOM {:.0}, WINDOW_POINTS {})\n", chrono_free_date(), ctx.adapter.get_info().name, ctx.adapter.get_info().backend, t.elapsed().as_secs_f64(), providers::surrogate::ENTER, providers::surrogate::LEAVE, providers::surrogate::MIN_EVIDENCE, providers::surrogate::WORST_ATOM, providers::surrogate::WINDOW_POINTS);
-    let _ = writeln!(out, "Per environment class (rule 4b) and per kind of point (audits — the model answered and the teacher checked; fallbacks — a rule refused the model's answer and the teacher answered, the model's prediction with its variance recorded alongside): points and atoms, how many lie beyond the fit's in-domain 99th-percentile leave-one-out force error (a generalisation-gap statistic; the brief's \"missed large error\" is its per-atom form while the class verdict was trusted), the calibration ratio z = ‖ΔF‖/pred_force_std (E[z²] = 1 when calibrated; only the rms is shape-free), and the class verdict's consecutive-step flips. Per-point counts are the independent ones: the model's ΣF = 0 makes a dimer's two atoms one draw. A measurement, not a gate.\n");
+    let _ = writeln!(out, "Per environment class (rule 4b) and per kind of point (audits — the model answered and the teacher checked; fallbacks — a rule refused the model's answer and the teacher answered, the model's prediction with its variance recorded alongside): points and atoms, how many lie beyond the fit's in-domain 99th-percentile leave-one-out force error (a generalisation-gap statistic, reported per atom while the class verdict was trusted; the missed large errors are the restated C1's, beyond 1× the bound or the tier), the calibration ratio z = ‖ΔF‖/pred_force_std (E[z²] = 1 when calibrated; only the rms is shape-free), and the class verdict's consecutive-step flips. Per-point counts are the independent ones: the model's ΣF = 0 makes a dimer's two atoms one draw. A measurement, not a gate.\n");
     out += &repro.report();
     out += &al.report();
     println!("{out}");
@@ -2598,4 +2811,254 @@ fn stretched_h2_margin_is_reported() {
     println!("{out}");
     record(&ctx, timing_row("stretched_h2_margin_is_reported", "H₂ + H", STRAY_N, TOL_H2, &snapshot(&log), t_test.elapsed(), &format!("σu − 1s at {STRETCHED_R}: {:+.1} mHa", at_stretched * 1e3)));
     assert!(at_stretched.is_finite(), "σu − 1s at {STRETCHED_R} Bohr: {at_stretched}\n{out}");
+}
+
+/// Trust tightening Task 0 (plan 2026-11-19, spec 2026-11-18 §6): the go/no-go report on the
+/// user's BEST collection, before any trust change is built. A measurement: CPU only, no GPU
+/// context, no teacher (`ReportNoTeacher` returns `Err`, so nothing is solved; its calls are
+/// counted and reported), and the user's folder is never opened for writing — it is copied without
+/// its `.lock` into `BEST_COPY_DIR` (default: the system temp folder) and only the copy is opened,
+/// attached and refitted. The source's every file keeps its size, mtime and (but the `.lock`,
+/// which is never opened) content hash, asserted at the end. The source is `BEST_COLLECTION` or
+/// the first `models/collections/<slug>` above this crate.
+///
+/// Per environment key it prints today's verdict (trusted, refusal, evidence, λ_sum), the key's
+/// leave-one-out force rms / max and energy max, its attributed history points and their distinct
+/// `model_gen`s (information only), and the verdict at load under the evidence floor: saved points
+/// carry no fit ids, so n_fit = 0 and the floor is never met; a key trusted today on evidence ≥ 3
+/// keeps trust only if its LOO force rms, force max and energy max are all ≤ 1× (`class_refusal`,
+/// the rule of before). λ_T = λ_E = 1 on legacy points, so only the floor's effect is previewed.
+/// Per key also the collection's scene names whose samples hold it. No assertion on the count.
+///
+/// Since trust tightening Task 4 the evidence floor is built: "trusted today" is the implemented
+/// verdict of the attach + refit, i.e. the new rule at load, and its refusal names `Floor` for a key
+/// the floor shuts. Checked per key (whatever the collection): a key whose attributed verdict points
+/// carry no fit id and that stands trusted on evidence ≥ 3 has its LOO force rms, max and energy max
+/// ≤ 1, and a key refused as `Floor` has one of them > 1 with the ratio that decided as its value.
+#[test]
+#[ignore = "go/no-go measurement: cargo test -p validate --release --test surrogate trust_tightening_go_no_go_report -- --ignored --nocapture"]
+fn trust_tightening_go_no_go_report() {
+    use providers::surrogate::{atom_class, history_rule_code, MIN_EVIDENCE};
+    use sim::activity::{EnvClass, TeachRule};
+    use sim::ProviderError;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+    use surrogate::history::PointKind;
+    use surrogate::{Collection, EnvKey, SurfaceKey};
+
+    const SLUG: &str = "lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5";
+
+    /// The copy's teacher: named as the collection's (the provenance check reads the name), never
+    /// solving — every call is counted and refused.
+    struct ReportNoTeacher(&'static str, Arc<std::sync::atomic::AtomicUsize>);
+    impl ForceProvider for ReportNoTeacher {
+        fn evaluate(&mut self, _scene: &Scene, _should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ProviderError::Invalid("the go/no-go report has no teacher".into()))
+        }
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn reset(&mut self) {}
+    }
+
+    // the source folder (read only) and a fingerprint of every file in it
+    let source: PathBuf = match std::env::var_os("BEST_COLLECTION") {
+        Some(p) => PathBuf::from(p),
+        None => Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .map(|a| a.join("models").join("collections").join(SLUG))
+            .find(|p| p.join("key.txt").is_file())
+            .expect("the BEST collection under some models/collections above this crate (or set BEST_COLLECTION)"),
+    };
+    let fingerprint = |dir: &Path| -> Vec<(String, u64, std::time::SystemTime, Option<u64>)> {
+        let mut v: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_file())
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let md = e.metadata().unwrap();
+                // FNV-1a 64 of the content; the lock is never opened (size and mtime only)
+                let hash = (name != ".lock").then(|| std::fs::read(e.path()).unwrap().iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3)));
+                (name, md.len(), md.modified().unwrap(), hash)
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let before = fingerprint(&source);
+
+    // the copy: every file but the lock, into <BEST_COPY_DIR>/<slug>/
+    let copy_root = std::env::var_os("BEST_COPY_DIR").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("atomic-sandbox-best-copy"));
+    let copy = copy_root.join(SLUG);
+    let _ = std::fs::remove_dir_all(&copy);
+    std::fs::create_dir_all(&copy).unwrap();
+    for (name, ..) in &before {
+        if name != ".lock" {
+            std::fs::copy(source.join(name), copy.join(name)).unwrap();
+        }
+    }
+    let key = SurfaceKey::from_text(&std::fs::read_to_string(copy.join("key.txt")).unwrap()).unwrap();
+    assert_eq!(key.slug(), SLUG);
+    let (c, open) = Collection::open(&copy_root, &key).unwrap_or_else(|e| panic!("the copy: {e}"));
+    assert!(!c.read_only, "the copy is ours: {:?}", open.notes);
+    let r_cut = surrogate::COLLECTION_R_CUT;
+    // per environment key the collection's scene names holding it (from the samples' own records)
+    let neighbour_keys = |pos: &[[f64; 3]], z: &[u8]| -> Vec<Option<EnvKey>> {
+        (0..pos.len())
+            .map(|i| {
+                let near: Vec<usize> = (0..pos.len()).filter(|&j| j != i && (0..3).map(|a| (pos[i][a] - pos[j][a]).powi(2)).sum::<f64>() < r_cut * r_cut).collect();
+                let mut nb: Vec<u8> = near.iter().map(|&j| z[j]).collect();
+                nb.sort_unstable();
+                nb.dedup();
+                atom_class(near.len()).map(|cl| EnvKey { class: cl as u8 + 1, z: z[i], neighbours: nb })
+            })
+            .collect()
+    };
+    let mut scenes_of: BTreeMap<EnvKey, BTreeMap<String, usize>> = BTreeMap::new();
+    for (i, cs) in c.samples.iter().enumerate() {
+        let s = &cs.sample;
+        let held_out = c.quarantine.get(i).is_some_and(|&q| q != 0);
+        let keys: BTreeSet<EnvKey> = neighbour_keys(&s.pos, &s.z).into_iter().enumerate().filter(|(j, _)| s.trains_atom(*j)).filter_map(|(_, k)| k).collect();
+        for k in keys {
+            let name = if held_out { format!("{} (held out)", cs.scene) } else { cs.scene.clone() };
+            *scenes_of.entry(k).or_default().entry(name).or_default() += 1;
+        }
+    }
+    let (n_samples, n_history) = (c.samples.len(), c.history.len());
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let teacher: &'static str = Box::leak(key.teacher.clone().into_boxed_str());
+    let mut s = SurrogateKs::new(Box::new(ReportNoTeacher(teacher, calls.clone())), FallbackPolicy::default()).with_teacher_tol(key.tol);
+    let t0 = Instant::now();
+    s.attach(c).unwrap_or_else(|e| panic!("attach: {e}"));
+    let rep = s.refit();
+    let wall = t0.elapsed().as_secs_f64();
+    let teacher_calls = calls.load(std::sync::atomic::Ordering::SeqCst);
+    println!(
+        "BEST copy: {} — {n_samples} samples, {n_history} history points; attach + refit {wall:.1} s; refit {}; teacher calls {teacher_calls} (all refused: nothing solved); model generation {}",
+        copy.display(),
+        match &rep {
+            Ok(r) => format!("ok (σ_F {:.2e}, Q′ {})", r.sigma_f, r.q_prime),
+            Err(e) => format!("FAILED: {e}"),
+        },
+        s.model_generation()
+    );
+    rep.expect("the refit of the copy");
+    assert_eq!(s.cutoff(), r_cut, "the scenes' keys were read at the model's own cutoff");
+
+    // per key its attributed verdict points (audits and class fallbacks, codes 5/6) over the whole
+    // history and their distinct generations (information only: the verdict reads `evidence`)
+    let class_codes = [history_rule_code(TeachRule::Class(EnvClass::Pair)), history_rule_code(TeachRule::Class(EnvClass::ManyBody))];
+    let mut points: BTreeMap<EnvKey, (usize, BTreeSet<u64>)> = BTreeMap::new();
+    let mut fit_ids: BTreeMap<EnvKey, BTreeSet<u64>> = BTreeMap::new();
+    for p in s.audit_history().iter() {
+        let verdict_point = match p.kind {
+            PointKind::Audit => true,
+            PointKind::Fallback { rule } => class_codes.contains(&rule),
+        };
+        if !verdict_point {
+            continue;
+        }
+        let keys: BTreeSet<EnvKey> = (0..p.n_atoms).filter_map(|j| p.key(j)).collect();
+        for k in keys {
+            if let Some(id) = p.fit_id {
+                fit_ids.entry(k.clone()).or_default().insert(id);
+            }
+            let e = points.entry(k).or_default();
+            e.0 += 1;
+            e.1.insert(p.model_gen);
+        }
+    }
+
+    let stats: BTreeMap<EnvKey, providers::surrogate::ClassStats> = s.key_class_stats().into_iter().collect();
+    let le1 = |x: f64| x <= 1.0; // NaN fails
+    let mut table = String::new();
+    let _ = writeln!(table, "| class | key | trusted today | refusal today | evidence | n_fit | n_pts (gens) | LOO F rms | LOO F max | LOO E max | λ_sum | at load | why | scenes (samples) |");
+    let _ = writeln!(table, "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    let (mut total, mut trusted_today, mut trusted_new) = (0usize, 0usize, 0usize);
+    let mut losing: Vec<String> = Vec::new();
+    for (c, l) in s.class_loo().iter().enumerate() {
+        if l.species.is_empty() {
+            let _ = writeln!(
+                table,
+                "| {} | (class-wide: no keys) | {} | {:?} | {} | 0 | – | {:.3} | {:.3} | {:.3} | {:.2} | – | judged class-wide | – |",
+                l.class,
+                if l.trusted { "yes" } else { "no" },
+                l.refusal,
+                l.evidence,
+                l.force_rms,
+                l.force_max,
+                l.energy_max,
+                l.inflation
+            );
+            continue;
+        }
+        for v in &l.species {
+            let k = EnvKey { class: c as u8 + 1, z: v.z, neighbours: v.neighbours.clone() };
+            let st = stats.get(&k).copied().expect("every species key has its statistics");
+            total += 1;
+            let loo_ok = le1(st.force_rms) && le1(st.force_max) && le1(st.energy_max);
+            // the implemented floor (Task 4), checked against its rule on this collection
+            let n_fit = fit_ids.get(&k).map_or(0, |f| f.len());
+            if v.trusted && v.evidence >= MIN_EVIDENCE && n_fit == 0 {
+                assert!(loo_ok, "{k:?}: trusted below the floor with a LOO beyond 1×: {st:?}");
+            }
+            if let Some((sim::ClassKey::Floor, value, limit)) = v.refusal {
+                let decided = if le1(st.force_rms) && le1(st.force_max) { st.energy_max } else { st.force_max.max(st.force_rms) };
+                assert!(!loo_ok && limit == 1.0 && value == decided, "{k:?}: Floor {value} / {limit} against {st:?}");
+            }
+            let floor_shut = matches!(v.refusal, Some((sim::ClassKey::Floor, ..)));
+            let (new, why) = if floor_shut {
+                (false, format!("shut by the evidence floor at load (n_fit {n_fit}): the implemented rule (Task 4)"))
+            } else if !v.trusted {
+                (false, "untrusted (unchanged)".to_string())
+            } else if v.evidence < MIN_EVIDENCE {
+                (true, format!("evidence {} < {MIN_EVIDENCE}: today's rule", v.evidence))
+            } else if loo_ok {
+                (true, "floor not met (n_fit 0); LOO ≤ 1×: keeps trust".to_string())
+            } else {
+                let worst = [("force rms", st.force_rms), ("force max", st.force_max), ("energy max", st.energy_max)]
+                    .into_iter()
+                    .filter(|(_, x)| !le1(*x))
+                    .map(|(n, x)| format!("{n} {x:.2}×"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (false, format!("floor not met (n_fit 0); LOO {worst} > 1×: LOSES trust"))
+            };
+            trusted_today += v.trusted as usize;
+            trusted_new += new as usize;
+            let (n_pts, gens) = points.get(&k).map_or((0, 0), |(n, g)| (*n, g.len()));
+            let scenes = scenes_of.get(&k).map_or("–".to_string(), |m| m.iter().map(|(n, c)| format!("{n} ({c})")).collect::<Vec<_>>().join(", "));
+            let refusal = v.refusal.map_or("–".to_string(), |(key, value, limit)| format!("{key:?} {value:.3} / {limit:.3}"));
+            let words = v.words();
+            let _ = writeln!(
+                table,
+                "| {} | {words} | {} | {refusal} | {} | {n_fit} | {n_pts} ({gens}) | {:.3} | {:.3} | {:.3} | {:.2} | {} | {why} | {scenes} |",
+                l.class,
+                if v.trusted { "yes" } else { "no" },
+                v.evidence,
+                st.force_rms,
+                st.force_max,
+                st.energy_max,
+                v.inflation,
+                if new { "yes" } else { "**no**" }
+            );
+            if (v.trusted && !new) || floor_shut {
+                losing.push(format!("- {} {words}: evidence {}, LOO force rms {:.2}×, max {:.2}×, energy max {:.2}×; scenes: {scenes}", l.class, v.evidence, st.force_rms, st.force_max, st.energy_max));
+            }
+        }
+    }
+    println!("\n{table}");
+    println!("keys {total}; trusted today {trusted_today}; trusted under the new rule at load {trusted_new}; keys that lose trust {}", losing.len());
+    for line in &losing {
+        println!("{line}");
+    }
+
+    drop(s);
+    let after = fingerprint(&source);
+    assert_eq!(after, before, "the user's collection folder is unchanged (sizes, mtimes, content hashes)");
+    println!("source folder {}: {} files, sizes, mtimes and content hashes unchanged", source.display(), after.len());
+    assert_eq!(teacher_calls, 0, "no teacher call (no DFT path) — {teacher_calls} were refused");
 }

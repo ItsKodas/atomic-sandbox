@@ -204,7 +204,7 @@ pub(crate) fn model() -> ModelStatus {
             teacher_ms: 274.0,
         }),
         stuck: None,
-        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_rms: 0.05, energy_max: 0.152, trusted: true, refusal: None, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: Some(1), inflation: 1.0, species: Vec::new() }],
+        class_loo: vec![sim::ClassLoo { class: "pair", samples: 273, force_rms: 0.009, force_max: 0.1, energy_rms: 0.05, energy_max: 0.152, trusted: true, refusal: None, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: Some(1), inflation: 1.0, fits: 0, floor_points: 0, species: Vec::new() }],
         last_audit_this_fit: true,
         audits_box_unjudged: 0,
         solves: sim::SolveCounts::default(),
@@ -221,6 +221,7 @@ pub(crate) fn model() -> ModelStatus {
         lone_note: None,
         stray: Vec::new(),
         stray_held_out: 0,
+        ticks: Default::default(),
         collections: false,
         last_import: None,
         purge_refusal: None,
@@ -5797,7 +5798,7 @@ mod activity_words {
     fn the_box_clause_names_the_atom_at_the_edge() {
         use activity::words::{rule_sentence, RowCtx};
         use sim::activity::{TeachRule as R, TrustKey};
-        let cx = |box_affected, near_face, kept| RowCtx { box_affected, near_face, kept };
+        let cx = |box_affected, near_face, kept| RowCtx { box_affected, near_face, kept, tail: false };
         assert_eq!(
             rule_sentence(R::Spread, Some(0), cx(true, true, false)),
             "atom 0 is outside what the model has learned and is touching the box edge — move it inward"
@@ -6320,7 +6321,7 @@ mod activity_trust {
     fn the_class_line_words_the_failing_condition() {
         use activity::words::class_line;
         use sim::{ClassKey, ClassLoo};
-        let l = |class, refusal: Option<(ClassKey, f64, f64)>| ClassLoo { class, samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 300.0, energy_max: 1100.0, trusted: refusal.is_none(), refusal, calibration: 2.1, measured: Some(1.4), measured_energy: Some(0.2), worst_atom: Some(2.2), evidence: 12, trusted_since: None, inflation: 1.0, species: Vec::new() };
+        let l = |class, refusal: Option<(ClassKey, f64, f64)>| ClassLoo { class, samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 300.0, energy_max: 1100.0, trusted: refusal.is_none(), refusal, calibration: 2.1, measured: Some(1.4), measured_energy: Some(0.2), worst_atom: Some(2.2), evidence: 12, trusted_since: None, inflation: 1.0, fits: 12, floor_points: 60, species: Vec::new() };
         assert_eq!(class_line(&l("pair", None)), "Two-atom arrangements — learned");
         assert_eq!(class_line(&l("pair", Some((ClassKey::Energy, 1100.0, 1.0)))), "Two-atom arrangements — not yet (leave-one-out energy error 1100.0× the tier)");
         assert_eq!(class_line(&l("pair", Some((ClassKey::Force, 2.69, 1.0)))), "Two-atom arrangements — not yet (leave-one-out force error 2.7× the bound)");
@@ -6332,11 +6333,29 @@ mod activity_trust {
         assert_eq!(class_line(&l("pair", Some((ClassKey::MeasuredEnergy, 0.9, std::f64::consts::FRAC_1_SQRT_2)))), "Two-atom arrangements — not yet (DFT checks measured its energy error at 0.90× the tier over 12 DFT checks, limit 0.71×)");
         // open-shell model (the energy half of C1): the energy RMS with the misfits counted
         assert_eq!(class_line(&l("pair", Some((ClassKey::EnergyRms, 1.3, 1.0)))), "Two-atom arrangements — not yet (leave-one-out energy error 1.3× the tier on average, training samples the model cannot reproduce included)");
-        // the worst-atom guard: on entry with evidence, and both ways with fewer than three checks
+        // the worst-atom guard: on entry at the evidence floor, and both ways below it (trust
+        // tightening Task 4; the app's words follow it in Task 8, the Task 4 review's minor 4)
         assert_eq!(class_line(&l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0)))), "Two-atom arrangements — not yet (a recent DFT check found an atom's force 4.2× its bound; it starts answering only without one beyond 3×)");
-        assert_eq!(class_line(&ClassLoo { evidence: 2, ..l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0))) }), "Two-atom arrangements — not yet (a DFT check found an atom's force 4.2× its bound, with fewer than 3 checks to judge the class by)");
+        assert_eq!(
+            class_line(&ClassLoo { fits: 11, floor_points: 81, ..l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0))) }),
+            "Two-atom arrangements — not yet (a DFT check found an atom's force 4.2× its bound, limit 3× while it has too few independent DFT checks: 11 of 12 fits / 81 checks (60 needed))"
+        );
+        assert_eq!(
+            class_line(&ClassLoo { evidence: 2, fits: 0, floor_points: 2, ..l("pair", Some((ClassKey::WorstAtom, 4.2, 3.0))) }),
+            "Two-atom arrangements — not yet (a DFT check found an atom's force 4.2× its bound, limit 3× while it has too few independent DFT checks: 0 of 12 fits / 2 of 60 checks)"
+        );
+        // trust tightening Task 4: the evidence floor, the leave-one-out ratio that decided, with
+        // its counts (Task 8): a count over its floor reads naturally, never "80 of 60"
+        assert_eq!(
+            class_line(&ClassLoo { fits: 1, floor_points: 4, ..l("pair", Some((ClassKey::Floor, 3.07, 1.0))) }),
+            "Two-atom arrangements — not yet (within the bound by too few independent DFT checks — 1 of 12 fits / 4 of 60 checks — and its leave-one-out error is 3.1× the bound)"
+        );
+        assert_eq!(
+            class_line(&ClassLoo { fits: 11, floor_points: 80, ..l("pair", Some((ClassKey::Floor, 3.07, 1.0))) }),
+            "Two-atom arrangements — not yet (within the bound by too few independent DFT checks — 11 of 12 fits / 80 checks (60 needed) — and its leave-one-out error is 3.1× the bound)"
+        );
         // no claim of the posterior's calibration is worded (no "1.0× less", no "inf× less")
-        for k in [ClassKey::Calibrated, ClassKey::LooFloor, ClassKey::MeasuredEnergy, ClassKey::WorstAtom, ClassKey::Window] {
+        for k in [ClassKey::Calibrated, ClassKey::LooFloor, ClassKey::MeasuredEnergy, ClassKey::WorstAtom, ClassKey::Window, ClassKey::Floor] {
             for cal in [1.0, f64::INFINITY] {
                 let t = class_line(&ClassLoo { calibration: cal, ..l("pair", Some((k, 1.4, 1.0))) });
                 assert!(!t.contains("less") && !t.contains("inf"), "{t}");
@@ -8026,8 +8045,8 @@ fn the_model_tab_warns_of_atoms_without_a_neighbour() {
 /// only that key (rows per key used to appear only for classes of two or more keys).
 #[test]
 fn a_refused_class_names_its_short_key() {
-    let nn = sim::SpeciesVerdict { z: 7, neighbours: vec![7], trusted: false, refusal: Some((sim::ClassKey::Samples, 5.0, 29.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples: 5, columns: 29 };
-    let pair = sim::ClassLoo { class: "pair", samples: 5, force_rms: 0.1, force_max: 0.2, energy_rms: 0.1, energy_max: 0.2, trusted: false, refusal: nn.refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: vec![nn.clone()] };
+    let nn = sim::SpeciesVerdict { z: 7, neighbours: vec![7], trusted: false, refusal: Some((sim::ClassKey::Samples, 5.0, 29.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples: 5, columns: 29, fits: 0, floor_points: 0, rule_inflation: 1.0, tail_inflation: 1.0, energy_inflation: 1.0 };
+    let pair = sim::ClassLoo { class: "pair", samples: 5, force_rms: 0.1, force_max: 0.2, energy_rms: 0.1, energy_max: 0.2, trusted: false, refusal: nn.refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, fits: 0, floor_points: 0, species: vec![nn.clone()] };
     let m = ModelStatus { class_loo: vec![pair.clone()], ..model() };
     let scene = Scene::preset("h2").unwrap();
     let st = UiState::new("h2", &scene);
@@ -8207,6 +8226,11 @@ mod knowledge_map {
             inflation: 1.0,
             samples,
             columns,
+            fits: 0,
+            floor_points: 0,
+            rule_inflation: 1.0,
+            tail_inflation: 1.0,
+            energy_inflation: 1.0,
         };
         let mut m = model();
         let pair = m.class_loo[0].clone();
@@ -8644,6 +8668,11 @@ mod knowledge_map {
             inflation: 1.0,
             samples: 3,
             columns: 92,
+            fits: 0,
+            floor_points: 0,
+            rule_inflation: 1.0,
+            tail_inflation: 1.0,
+            energy_inflation: 1.0,
         };
         let learned = sim::SpeciesVerdict { trusted: true, refusal: None, neighbours: vec![1], ..short.clone() };
         let s = knowledge::pair_sentence(&map, p((1, 1)), &[("many-body", &short), ("pair", &learned)]);
@@ -8721,6 +8750,11 @@ mod knowledge_map {
             inflation: 1.0,
             samples: 3,
             columns: 92,
+            fits: 0,
+            floor_points: 0,
+            rule_inflation: 1.0,
+            tail_inflation: 1.0,
+            energy_inflation: 1.0,
         };
         assert_eq!(
             knowledge::pair_sentence(&map, &p(&map, (1, 1)), &[("many-body", &short)]),
@@ -11581,7 +11615,7 @@ mod model_panel {
     }
 
     fn key(z: u8, nb: Vec<u8>, refusal: Option<(sim::ClassKey, f64, f64)>, samples: usize, columns: usize) -> sim::SpeciesVerdict {
-        sim::SpeciesVerdict { z, neighbours: nb, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples, columns }
+        sim::SpeciesVerdict { z, neighbours: nb, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples, columns, fits: 0, floor_points: 0, rule_inflation: 1.0, tail_inflation: 1.0, energy_inflation: 1.0 }
     }
 
     /// H₂S with an unlearned S–H pair key (12 of 60 samples), an unlearned O–S one (no O in the
@@ -11590,7 +11624,7 @@ mod model_panel {
         let sh = key(16, vec![1], Some((sim::ClassKey::Samples, 12.0, 60.0)), 12, 60);
         let os = key(8, vec![16], Some((sim::ClassKey::Samples, 5.0, 29.0)), 5, 29);
         let hh = key(1, vec![1], None, 400, 29);
-        let pair = sim::ClassLoo { class: "pair", samples: 417, force_rms: 0.1, force_max: 0.2, energy_rms: 0.1, energy_max: 0.2, trusted: false, refusal: sh.refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: vec![sh, os, hh] };
+        let pair = sim::ClassLoo { class: "pair", samples: 417, force_rms: 0.1, force_max: 0.2, energy_rms: 0.1, energy_max: 0.2, trusted: false, refusal: sh.refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, fits: 0, floor_points: 0, species: vec![sh, os, hh] };
         let readiness = sim::Readiness {
             answers: false,
             rule: Some(sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair)),
@@ -13906,5 +13940,223 @@ fn migration_pass_card_shows_the_counts_and_one_time_left() {
         assert_eq!(r.eta_s, if paused { None } else { Some(3120.0) }, "the migration's estimate, not the worker's pass rate");
         assert!(matches!(r.progress, activity::jobs::JobProgress::Fraction { done: 412, total: 2412 }));
         assert_eq!(r.detail, super::migration::progress_line(&mg));
+    }
+}
+
+/// Trust tightening Task 8 (spec 2026-11-18 §3–§4; plan Review Focus 3 and 4): the words and
+/// readouts of the evidence floor, the tail-aware inflations and the calibration ticks.
+mod activity_trust_tightening {
+    use super::super::dock::model::{floor_line, inflation_line, key_detail_line, skipped_line, taken_line, Section};
+    use super::*;
+
+    fn key(trusted: bool, inflation: f64, tail: f64, energy: f64) -> sim::SpeciesVerdict {
+        sim::SpeciesVerdict {
+            z: 1,
+            neighbours: vec![1],
+            trusted,
+            refusal: if trusted { None } else { Some((sim::ClassKey::Floor, 3.07, 1.0)) },
+            calibration: 1.0,
+            measured: None,
+            measured_energy: None,
+            worst_atom: None,
+            evidence: 4,
+            trusted_since: None,
+            inflation,
+            samples: 120,
+            columns: 29,
+            fits: 1,
+            floor_points: 4,
+            rule_inflation: inflation,
+            tail_inflation: tail,
+            energy_inflation: energy,
+        }
+    }
+
+    /// The Model tab's per-key readout: the floor's counts (a count at or over its floor reads
+    /// "80 (60 needed)", never "80 of 60" — the Task 4 review's minor 3) and λ_T, λ_E as the
+    /// provider's words print them.
+    #[test]
+    fn the_key_readout_names_its_floor_counts_and_inflations() {
+        assert_eq!(providers::surrogate::floor_count(80, 60, ""), "80 (60 needed)");
+        assert_eq!(providers::surrogate::floor_count(11, 12, "fits"), "11 of 12 fits");
+        assert_eq!(floor_line(3, 4), "independent checks: 3 of 12 fits, 4 of 60");
+        assert_eq!(floor_line(11, 80), "independent checks: 11 of 12 fits, 80 (60 needed)");
+        assert_eq!(floor_line(12, 60), "independent checks: 12 fits (12 needed), 60 (60 needed)");
+        assert_eq!(inflation_line(1.0, 1.0), "λ_T 1.0, λ_E 1.0");
+        assert_eq!(inflation_line(7.69, f64::INFINITY), "λ_T 7.7, λ_E ∞");
+        assert_eq!(inflation_line(f64::NAN, 1.0), "λ_T NaN, λ_E 1.0");
+        assert_eq!(key_detail_line(&key(true, 1.0, 1.0, 1.0)), "    independent checks: 1 of 12 fits, 4 of 60 · λ_T 1.0, λ_E 1.0");
+    }
+
+    /// Review Focus 3: a key the class rule trusts but λ_T or λ_E refuses (history code 24) is never
+    /// worded plain "learned": locked (∞, NaN) until the check ages out, or refused where its std
+    /// alone would pass (a finite factor above λ_sum). At or below λ_sum nothing is added, and a
+    /// refused key keeps its refusal's words.
+    #[test]
+    fn a_key_refused_by_its_tail_inflation_is_not_worded_plain_learned() {
+        use activity::words::{species_line, tail_note};
+        let name = "Two-atom arrangements around H, with H";
+        assert_eq!(species_line("pair", &key(true, 1.0, 1.0, 1.0)), format!("{name} — learned"));
+        assert_eq!(tail_note(&key(true, 1.2, 1.2, 1.0)), None, "λ_T = λ_sum: nothing beyond λ_sum");
+        assert_eq!(
+            species_line("pair", &key(true, 1.0, f64::INFINITY, 1.0)),
+            format!("{name} — learned, but every step with it goes to DFT until a check ages out of the window: a DFT check found an error beyond its limit where the model's std was 0 (λ_T ∞)")
+        );
+        assert_eq!(
+            species_line("pair", &key(true, 1.0, 1.0, f64::NAN)),
+            format!("{name} — learned, but every step with it goes to DFT until a check ages out of the window: a DFT comparison was not a number (λ_E NaN)")
+        );
+        assert_eq!(
+            species_line("pair", &key(true, 1.2, 7.69, 2.0)),
+            format!("{name} — learned, but steps its std alone would pass can still go to DFT: DFT checks measured larger errors where the model was sure (λ_T 7.7 against λ_sum 1.2)")
+        );
+        assert_eq!(
+            tail_note(&key(true, 1.2, 1.0, 5.04)).as_deref(),
+            Some("steps its std alone would pass can still go to DFT: DFT checks measured larger errors where the model was sure (λ_E 5.0 against λ_sum 1.2)")
+        );
+        // NaN before ∞, λ_T before λ_E on a tie
+        assert!(tail_note(&key(true, 1.0, f64::INFINITY, f64::NAN)).unwrap().ends_with("(λ_E NaN)"));
+        assert!(tail_note(&key(true, 1.0, f64::INFINITY, f64::INFINITY)).unwrap().ends_with("(λ_T ∞)"));
+        // refused: the refusal's words, no note
+        assert_eq!(
+            species_line("pair", &key(false, 1.0, f64::INFINITY, 1.0)),
+            format!("{name} — not yet (within the bound by too few independent DFT checks — 1 of 12 fits / 4 of 60 checks — and its leave-one-out error is 3.1× the bound)")
+        );
+    }
+
+    /// Review Focus 4 and the Task 7 review's M5: the calibration ticks reach the Model tab through
+    /// `TrainableStatus::ticks` (never a downcast), and skips are said with their cause.
+    #[test]
+    fn skipped_ticks_are_shown_with_their_cause() {
+        let t = |recorded, unrecorded, skipped_busy, lost, in_step| sim::CalibrationTicks { recorded, unrecorded, skipped_busy, lost, in_step, due: recorded + unrecorded + skipped_busy + lost };
+        assert_eq!(skipped_line(&t(0, 0, 100, 0, 0)), "calibration checks skipped: 100 (100 while the background teacher was busy)");
+        assert_eq!(skipped_line(&t(4, 0, 0, 0, 0)), "calibration checks skipped: 0");
+        assert_eq!(skipped_line(&t(0, 0, 7, 2, 0)), "calibration checks skipped: 9 (7 while the background teacher was busy, 2 lost: abandoned, failed or not judged)");
+        assert_eq!(skipped_line(&t(0, 0, 0, 1, 0)), "calibration checks skipped: 1 (1 lost: abandoned, failed or not judged)");
+        assert_eq!(taken_line(&t(3, 1, 0, 0, 2)), "calibration checks taken: 4 (2 in the step)");
+        assert_eq!(taken_line(&t(5, 0, 0, 0, 0)), "calibration checks taken: 5");
+    }
+
+    /// The Details fold draws them: the per-key readout under each key (a lone trusted key
+    /// included), the code-24 note, and the calibration row once a tick has fallen due.
+    #[test]
+    fn details_show_the_floor_the_inflations_and_the_skipped_ticks() {
+        fn texts(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>) -> String {
+            fn walk(s: &egui::epaint::Shape, out: &mut String) {
+                match s {
+                    egui::epaint::Shape::Text(t) => {
+                        out.push_str(t.galley.text());
+                        out.push('\n');
+                    }
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            let mut out = String::new();
+            for _ in 0..3 {
+                let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 1800.0))), ..Default::default() };
+                let mut full = ctx.run_ui(raw, |root| {
+                    show(root, st, inp);
+                });
+                full.textures_delta.clear();
+                out.clear();
+                full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+            }
+            out.replace('\n', " ")
+        }
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        alone(&mut st, DockTab::Model);
+        st.model_sections.set(Section::Details, true);
+        let mut m = model();
+        m.class_loo[0].species = vec![key(true, 1.0, f64::INFINITY, 1.0)];
+        m.ticks = sim::CalibrationTicks { recorded: 3, skipped_busy: 100, due: 103, ..Default::default() };
+        let snap = snapshot(&scene, Backend::Estimated, Some(m.clone()));
+        let inp = input(&scene, Some(&snap), &cam);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(t.contains("independent checks: 1 of 12 fits, 4 of 60 · λ_T ∞, λ_E 1.0"), "{t}");
+        assert!(t.contains("every step with it goes to DFT until a check ages out of the window"), "the code-24 note: {t}");
+        assert!(t.contains("calibration checks taken: 3") && t.contains("calibration checks skipped: 100 (100 while the background teacher was busy)"), "{t}");
+        // no tick due yet: no calibration row
+        m.ticks = sim::CalibrationTicks::default();
+        let snap = snapshot(&scene, Backend::Estimated, Some(m));
+        let inp = input(&scene, Some(&snap), &cam);
+        let t = texts(&ctx, &mut st, &inp);
+        assert!(!t.contains("calibration checks"), "{t}");
+    }
+
+    /// Task 8 review I2: the code-24 note compares with the λ_sum the rules read
+    /// (`SpeciesVerdict::rule_inflation`, a sparse key's class floor included), and prints it — never
+    /// the key's own `inflation` below that floor.
+    #[test]
+    fn the_code_24_note_compares_with_the_floored_lambda_sum() {
+        use activity::words::tail_note;
+        let sparse = |tail: f64| sim::SpeciesVerdict { inflation: 1.0, rule_inflation: 2.0, ..key(true, 1.0, tail, 1.0) };
+        assert_eq!(tail_note(&sparse(1.6)), None, "λ_T 1.6 under the floored λ_sum 2.0 refuses nothing");
+        assert_eq!(tail_note(&sparse(2.0)), None);
+        assert_eq!(
+            tail_note(&sparse(2.5)).as_deref(),
+            Some("steps its std alone would pass can still go to DFT: DFT checks measured larger errors where the model was sure (λ_T 2.5 against λ_sum 2.0)")
+        );
+    }
+
+    /// Task 8 review I1 (Review Focus 3): a lone key, trusted by the class rule but locked by λ_T = ∞
+    /// (H₂'s H{H}), is not a ✓ "learned" on the surfaces seen first — the Activity trust checklist
+    /// draws its row ✗ with the note and the class line ✗, the Learned fold carries the note, and
+    /// the Knowledge panel's sentence says DFT still answers it.
+    #[test]
+    fn a_lone_locked_key_is_never_a_plain_learned() {
+        let scene = Scene::preset("h2").unwrap();
+        let st = UiState::new("h2", &scene);
+        let mut m = model();
+        m.class_loo[0].species = vec![key(true, 1.0, f64::INFINITY, 1.0)];
+        assert!(m.class_loo[0].trusted, "the premise: the class rule trusts it");
+        let lines = activity::trust::lines(&m, &scene, &st);
+        let class = lines.iter().find(|l| l.text == "Two-atom arrangements — learned").expect("the class line");
+        assert!(!class.met, "no ✓ for a class whose key is locked");
+        let row = lines.iter().find(|l| l.text.contains("learned, but every step with it goes to DFT")).expect("the key's row");
+        assert!(!row.met && row.text == "    Two-atom arrangements around H, with H — learned, but every step with it goes to DFT until a check ages out of the window: a DFT check found an error beyond its limit where the model's std was 0 (λ_T ∞)", "{}", row.text);
+        // unlocked: the lone key's row is not drawn and the class line is a ✓, as before
+        let mut ok = m.clone();
+        ok.class_loo[0].species = vec![key(true, 1.0, 1.0, 1.0)];
+        let lines = activity::trust::lines(&ok, &scene, &st);
+        assert!(lines.iter().any(|l| l.met && l.text == "Two-atom arrangements — learned") && !lines.iter().any(|l| l.text.contains("around H, with H")));
+        // the Learned fold
+        let rows = super::super::dock::model::learned(&m);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].3.as_deref().is_some_and(|n| n.starts_with("every step with it goes to DFT")), "{rows:?}");
+        assert_eq!(super::super::dock::model::learned(&ok)[0].3, None);
+        // the Knowledge panel's sentence for a trusted pair
+        let map = knowledge::fixture_map();
+        let locked = key(true, 1.0, f64::INFINITY, 1.0);
+        assert_eq!(
+            knowledge::pair_sentence(&map, map.pair(1, 6).unwrap(), &[("pair", &locked)]),
+            "Taught 2.0–5.3 Bohr (610 samples). Trusted, but DFT still answers two-atom arrangements around H, with H: the model was measured too confident there."
+        );
+        let fine = key(true, 1.0, 1.0, 1.0);
+        assert_eq!(knowledge::pair_sentence(&map, map.pair(1, 6).unwrap(), &[("pair", &fine)]), "Taught 2.0–5.3 Bohr (610 samples). Trusted everywhere this pair was met.");
+    }
+
+    /// Task 8 review M4: a code-24 Log row (a rule-6/7 refusal that passes at λ_sum alone) says the
+    /// model was too confident here, not unsure; codes 14/15 keep their words.
+    #[test]
+    fn a_code_24_row_says_the_model_was_too_confident() {
+        use activity::words::{rule_sentence, RowCtx};
+        use sim::activity::TeachRule as R;
+        let tail = RowCtx { tail: true, ..RowCtx::default() };
+        assert_eq!(
+            rule_sentence(R::ForceUncertainty, Some(1), tail),
+            "the model was sure here (atom 1), but DFT checks found it too confident in places like this (its uncertainty scaled by λ_T/λ_E is over the bound)"
+        );
+        assert_eq!(
+            rule_sentence(R::EnergyUncertainty, None, RowCtx { kept: true, ..tail }),
+            "the model was sure here, but DFT checks found it too confident in places like this (its uncertainty scaled by λ_T/λ_E is over the bound) — this answer teaches it"
+        );
+        assert_eq!(rule_sentence(R::ForceUncertainty, Some(1), RowCtx::default()), "the model is unsure here (atom 1)");
+        assert_eq!(sim::TeachEvent::new(sim::activity::TeachOrigin::Fallback, R::ForceUncertainty, sim::activity::TeachOutcome::Kept).history_code, None, "defaulted in new");
     }
 }

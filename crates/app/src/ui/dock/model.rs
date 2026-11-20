@@ -424,6 +424,8 @@ fn refusal_words(refusal: Option<(sim::ClassKey, f64, f64)>, samples: usize, col
         Some((K::LooFloor, x, _)) => (samples, columns, format!("left-out {x:.2}×")),
         Some((K::MeasuredEnergy, x, _)) => (samples, columns, format!("DFT energy {x:.2}×")),
         Some((K::EnergyRms, x, _)) => (samples, columns, format!("energy {x:.1}× avg")),
+        // trust tightening §3: below the evidence floor, the leave-one-out ratio that decided
+        Some((K::Floor, x, _)) => (samples, columns, format!("floor, left-out {x:.1}×")),
         None => (samples, columns, format!("{samples} / {columns}")),
     }
 }
@@ -482,18 +484,19 @@ pub fn gaps_with(m: &ModelStatus, scene_z: &[u8], pending: Option<&sim::Knowledg
     out
 }
 
-/// The learned environment keys (the Learned fold): (label, samples, the full verdict line).
-fn learned(m: &ModelStatus) -> Vec<(String, usize, String)> {
+/// The learned environment keys (the Learned fold): (label, samples, the full verdict line, what
+/// its tail-aware inflations still send to DFT — `words::tail_note`, Task 8 review I1).
+pub fn learned(m: &ModelStatus) -> Vec<(String, usize, String, Option<String>)> {
     let mut out = Vec::new();
     for c in &m.class_loo {
         if c.species.is_empty() {
             if c.trusted {
-                out.push((c.class.to_string(), c.samples, class_line(c)));
+                out.push((c.class.to_string(), c.samples, class_line(c), None));
             }
             continue;
         }
         for s in c.species.iter().filter(|s| s.trusted) {
-            out.push((gap_label(c.class, s.z, &s.neighbours), s.samples, species_line(c.class, s).trim().to_string()));
+            out.push((gap_label(c.class, s.z, &s.neighbours), s.samples, species_line(c.class, s).trim().to_string(), crate::ui::activity::words::tail_note(s)));
         }
     }
     out
@@ -586,7 +589,8 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
     });
     // 4. the folds
     let learned_rows = m.map(learned).unwrap_or_default();
-    let learned_summary = (!learned_rows.is_empty()).then(|| (format!("✓ {} learned", learned_rows.len()), GREEN));
+    let held = learned_rows.iter().filter(|r| r.3.is_some()).count();
+    let learned_summary = (!learned_rows.is_empty()).then(|| if held > 0 { (format!("⚠ {held} of {} still on DFT", learned_rows.len()), AMBER) } else { (format!("✓ {} learned", learned_rows.len()), GREEN) });
     let title = format!("Learned ({} {})", learned_rows.len(), if learned_rows.len() == 1 { "class" } else { "classes" });
     fold(ui, st, Section::Learned, &title, learned_summary, None, |ui, st| {
         super::group(ui, st, "d-model-learned", |ui, _| learned_fold(ui, &learned_rows));
@@ -1001,16 +1005,22 @@ fn health(ui: &mut Ui, m: Option<&ModelStatus>, d: Option<&sim::DynSnapshot>) {
 
 /// The Learned fold: one row per learned environment key (its samples on the right, its verdict
 /// line and the class rule on hover).
-fn learned_fold(ui: &mut Ui, rows: &[(String, usize, String)]) {
+fn learned_fold(ui: &mut Ui, rows: &[(String, usize, String, Option<String>)]) {
     if rows.is_empty() {
         theme::note(ui, "nothing learned yet: the classes are judged after the first fit");
         return;
     }
-    for (label, n, words) in rows {
+    for (label, n, words, note) in rows {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("✓ {label}")).size(12.0).color(GREEN)).on_hover_text(format!("{words}\n\n{CLASS_LOO_HELP}"));
+            // a key its tail-aware inflations still send to DFT (code 24): ⚠ in amber, the note on
+            // the row (Task 8 review I1), never a plain ✓
+            let (mark, colour) = if note.is_some() { ("⚠", AMBER) } else { ("✓", GREEN) };
+            ui.label(RichText::new(format!("{mark} {label}")).size(12.0).color(colour)).on_hover_text(format!("{words}\n\n{CLASS_LOO_HELP}"));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.label(RichText::new(format!("{n} samples")).size(11.5).color(theme::INK_DIM)));
         });
+        if let Some(note) = note {
+            ui.add(egui::Label::new(RichText::new(format!("learned, but {note}")).size(11.0).color(AMBER)).wrap());
+        }
     }
 }
 
@@ -2061,7 +2071,10 @@ fn plan_fields(ui: &mut Ui, plan: &mut SamplingPlan, tu: super::super::TempUnits
 }
 
 /// The hover text of the "learned classes" rows.
-pub const CLASS_LOO_HELP: &str = "after every refit each training sample is left out (exactly, in closed form) and the fit without it must predict it within the force bound and the energy tier — separately for \"pair\" environments (every atom with at most one neighbour within the model's cutoff) and \"many-body\" ones. The numbers are the worst left-out errors as multiples of those bounds (1× = at the bound). A class that fails, or holds fewer samples than the model directions its atoms can move along (per kind of atom and neighbours: the columns those environments touch, not the whole model's), is not answered by the model: its steps fall back to DFT. Until DFT has checked the model at three or more geometries of a class, one badly predicted sample is enough to keep the whole class on DFT; from then on the class is judged by the error those DFT checks measured (on average, with a margin to start answering), with the left-out average as a floor.";
+pub const CLASS_LOO_HELP: &str = "after every refit each training sample is left out (exactly, in closed form) and the fit without it must predict it within the force bound and the energy tier — separately for \"pair\" environments (every atom with at most one neighbour within the model's cutoff) and \"many-body\" ones. The numbers are the worst left-out errors as multiples of those bounds (1× = at the bound). A class that fails, or holds fewer samples than the model directions its atoms can move along (per kind of atom and neighbours: the columns those environments touch, not the whole model's), is not answered by the model: its steps fall back to DFT. Until DFT has checked the model at 60 geometries of a kind of environment, over 12 different fits (\"independent checks\"), one badly predicted sample is enough to keep it on DFT, and from three checks on the error those checks measured must pass as well; past that floor it is judged by the measured error alone (on average, with a margin to start answering), with the left-out average as a floor.";
+
+/// The hover of a key's floor-and-inflations line.
+const KEY_DETAIL_TIP: &str = "independent checks: the distinct fits and the DFT comparisons behind this key's verdict; below 12 fits or 60 comparisons the DFT checks alone cannot open it (its leave-one-out must pass too). λ_T, λ_E: how much the model's own force and energy uncertainty is scaled for this key, from the DFT errors measured where the model was confident (1 = taken as it is; ∞ = a check found an error beyond its limit where the model's std was 0, so its steps go to DFT until that check ages out).";
 
 /// One class's row: "pair: trusted · 273 samples · left-out force ≤ 0.10× · energy ≤ 0.15×".
 /// One environment species' row under its class ("  many-body around O, with H: learned · 967
@@ -2075,6 +2088,53 @@ pub fn species_line(class: &str, s: &sim::SpeciesVerdict) -> String {
     };
     format!("  {class} {}: {} · {count}", s.words(), if s.trusted { "learned" } else { "not learned yet (DFT)" })
 }
+
+/// A key's evidence-floor readout (trust tightening, spec 2026-11-18 §3; plan Task 8): its n_fit
+/// and n_pts against `FLOOR_FITS` = 12 and `FLOOR_POINTS` = 60 — "independent checks: 3 of 12
+/// fits, 4 of 60"; a count at or over its floor reads "80 (60 needed)", never "80 of 60" (the
+/// Task 4 review's minor 3; `providers::surrogate::floor_count`, the provider's own words).
+pub fn floor_line(fits: usize, floor_points: usize) -> String {
+    use providers::surrogate::{floor_count, FLOOR_FITS, FLOOR_POINTS};
+    format!("independent checks: {}, {}", floor_count(fits, FLOOR_FITS, "fits"), floor_count(floor_points, FLOOR_POINTS, ""))
+}
+
+/// A key's tail-aware inflations, as rules 6 and 7 read them (spec 2026-11-18 §4; plan Task 8):
+/// "λ_T 1.0, λ_E 1.0" — one decimal, "∞", "NaN", as the provider's refusal words print them.
+pub fn inflation_line(tail: f64, energy: f64) -> String {
+    use crate::ui::activity::words::factor;
+    format!("λ_T {}, λ_E {}", factor(tail), factor(energy))
+}
+
+/// The readout under a key's row in Details: "    independent checks: 3 of 12 fits, 4 of 60 ·
+/// λ_T 1.0, λ_E 1.0".
+pub fn key_detail_line(s: &sim::SpeciesVerdict) -> String {
+    format!("    {} · {}", floor_line(s.fits, s.floor_points), inflation_line(s.tail_inflation, s.energy_inflation))
+}
+
+/// The calibration ticks skipped, with their causes (plan Task 8, Review Focus 4: at full speed a
+/// saturated background teacher skips every tick, and the calibration starves visibly):
+/// "calibration checks skipped: 100 (100 while the background teacher was busy)".
+pub fn skipped_line(t: &sim::CalibrationTicks) -> String {
+    let mut why = Vec::new();
+    if t.skipped_busy > 0 {
+        why.push(format!("{} while the background teacher was busy", t.skipped_busy));
+    }
+    if t.lost > 0 {
+        why.push(format!("{} lost: abandoned, failed or not judged", t.lost));
+    }
+    let why = if why.is_empty() { String::new() } else { format!(" ({})", why.join(", ")) };
+    format!("calibration checks skipped: {}{why}", t.skipped())
+}
+
+/// The calibration ticks taken, and of them those served by a solve in the step (no background
+/// teacher): "calibration checks taken: 4 (2 in the step)".
+pub fn taken_line(t: &sim::CalibrationTicks) -> String {
+    let in_step = if t.in_step > 0 { format!(" ({} in the step)", t.in_step) } else { String::new() };
+    format!("calibration checks taken: {}{in_step}", t.taken())
+}
+
+/// The hover of the calibration row.
+const CALIBRATION_TIP: &str = "counted since the estimated solver started, across Load model, Forget model, installs and refits (they measure the background teacher's cadence, not one model's; a solver switch starts them again). Every 25th step inside the model's envelope is checked against DFT whatever the model's std says (with a background teacher the count also pauses for about one solve's time after each check): these checks measure how far the model's own uncertainty can be trusted (λ_T, λ_E). With a background teacher a check that falls due while it is busy is skipped, never deferred and never run in the step: at full speed most can be skipped, and the calibration then moves slowly.";
 
 pub fn class_line(c: &sim::ClassLoo) -> String {
     format!(
@@ -2091,9 +2151,9 @@ pub fn class_line(c: &sim::ClassLoo) -> String {
 mod tests {
     #[test]
     fn a_class_row_names_the_class_its_trust_and_its_left_out_errors() {
-        let c = sim::ClassLoo { class: "many-body", samples: 41, force_rms: 0.9, force_max: 2.69, energy_rms: 0.3, energy_max: 0.52, trusted: false, refusal: Some((sim::ClassKey::Force, 2.69, 1.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: Vec::new() };
+        let c = sim::ClassLoo { class: "many-body", samples: 41, force_rms: 0.9, force_max: 2.69, energy_rms: 0.3, energy_max: 0.52, trusted: false, refusal: Some((sim::ClassKey::Force, 2.69, 1.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, fits: 0, floor_points: 0, species: Vec::new() };
         assert_eq!(super::class_line(&c), "many-body: not learned yet (DFT) · 41 samples · left-out force ≤ 2.69× · energy ≤ 0.52×");
-        let s = |z, nb: Vec<u8>, refusal: Option<(sim::ClassKey, f64, f64)>, samples, columns| sim::SpeciesVerdict { z, neighbours: nb, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples, columns };
+        let s = |z, nb: Vec<u8>, refusal: Option<(sim::ClassKey, f64, f64)>, samples, columns| sim::SpeciesVerdict { z, neighbours: nb, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, samples, columns, fits: 0, floor_points: 0, rule_inflation: 1.0, tail_inflation: 1.0, energy_inflation: 1.0 };
         assert_eq!(super::species_line("many-body", &s(8, vec![1], None, 967, 38)), "  many-body around O, with H: learned · 967 samples for 38 columns");
         assert_eq!(super::species_line("many-body", &s(1, vec![1, 8], Some((sim::ClassKey::Samples, 12.0, 146.0)), 12, 146)), "  many-body around H, with H and O: not learned yet (DFT) · 12 of 146 samples needed");
         assert_eq!(super::species_line("pair", &s(1, vec![7], Some((sim::ClassKey::Force, 2.5, 1.0)), 300, 29)), "  pair around H, with N: not learned yet (DFT) · 300 samples for 29 columns");
@@ -2168,8 +2228,16 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::s
                 ui.colored_label(if c.trusted { GREEN } else { AMBER }, mono(class_line(c))).on_hover_text(CLASS_LOO_HELP);
                 // per environment species (M8a user-test fix 2): an atom answers by its own
                 // … and always under a refused class, so the short key is named (M8a user-fix 3)
-                for s in c.species.iter().filter(|_| c.species.len() > 1 || !c.trusted) {
-                    ui.colored_label(if s.trusted { GREEN } else { AMBER }, mono(species_line(c.class, s))).on_hover_text(CLASS_LOO_HELP);
+                for s in &c.species {
+                    if c.species.len() > 1 || !c.trusted {
+                        ui.colored_label(if s.trusted { GREEN } else { AMBER }, mono(species_line(c.class, s))).on_hover_text(CLASS_LOO_HELP);
+                    }
+                    // trust tightening (plan Task 8): every key's floor counts and inflations, and
+                    // what its tail-aware inflations refuse beyond λ_sum (code 24)
+                    ui.label(mono(key_detail_line(s)).color(theme::INK_DIM)).on_hover_text(KEY_DETAIL_TIP);
+                    if let Some(note) = crate::ui::activity::words::tail_note(s).filter(|_| s.trusted) {
+                        ui.colored_label(AMBER, mono(format!("    {note}")));
+                    }
                 }
             }
         });
@@ -2201,6 +2269,13 @@ fn readouts(ui: &mut Ui, d: &sim::DynSnapshot, m: &ModelStatus, scene: &crate::s
         let (c, full, _) = audit_words(m);
         ui.colored_label(c, full).on_hover_text(audit_tip(m));
     });
+    // the calibration ticks (trust tightening; Review Focus 4), once one has fallen due
+    if m.ticks.due > 0 {
+        row(ui, "calibration", |ui| {
+            ui.label(mono(taken_line(&m.ticks))).on_hover_text(CALIBRATION_TIP);
+            ui.colored_label(if m.ticks.skipped() > m.ticks.taken() { AMBER } else { theme::INK }, mono(skipped_line(&m.ticks))).on_hover_text(CALIBRATION_TIP);
+        });
+    }
     row(ui, "mismatch work", |ui| {
         ui.label(mono(format!("{:+.2e} Ha", d.work_mismatch)))
             .on_hover_text("work of (F_DFT − F_model) on fallback steps, booked into E conserved so the drift measures the integrator, not the model");

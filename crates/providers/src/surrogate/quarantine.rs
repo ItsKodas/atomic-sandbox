@@ -1459,7 +1459,7 @@ impl SurrogateKs {
     /// quarantine codes when it was installed, the samples with no code). Right after a fit they are
     /// the class pass's and the training residuals' members; between fits a code may move without
     /// the fit (a hold, a release, a forget), and these stay the fit's.
-    fn fit_member_indices(&self) -> impl Iterator<Item = usize> + '_ {
+    pub(super) fn fit_member_indices(&self) -> impl Iterator<Item = usize> + '_ {
         let (n, codes) = (&self.fit_members.0, &self.fit_members.1);
         let n = self.store.as_ref().map_or(0, |st| (*n).min(st.len()));
         (0..n).filter(move |&i| codes.get(i).is_none_or(|&q| q == Q_NONE))

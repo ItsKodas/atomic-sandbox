@@ -84,6 +84,9 @@ pub(in crate::surrogate) struct Attribution {
     pub why: String,
     pub surface: String,
     pub fits: u64,
+    /// The failed audit's history flags (trust tightening: the dispatching step's cadence-fresh, fenced and tick
+    /// bits), carried to the point the check records (ruling 9b), so a deferred point keeps its P_A membership.
+    pub flags: surrogate::history::PointFlags,
 }
 
 /// A failed audit's attribution check waiting behind another (Task 5 fix round 1, M4): what `enqueue_stray_check` takes.
@@ -310,7 +313,7 @@ impl SurrogateKs {
     /// The caller records `case` (and its history point) as any failed audit unless this says
     /// [`StrayAudit::Attributing`]: then the history point is the check's (ruling 9b).
     #[allow(clippy::too_many_arguments)]
-    pub(in crate::surrogate) fn stray_audit_failed(&mut self, scene: &Scene, raw_energy: f64, forces: &[[f64; 3]], case: &FailedAudit, gap: f64, why: String) -> StrayAudit {
+    pub(in crate::surrogate) fn stray_audit_failed(&mut self, scene: &Scene, raw_energy: f64, forces: &[[f64; 3]], case: &FailedAudit, gap: f64, why: String, flags: surrogate::history::PointFlags) -> StrayAudit {
         let prov = self.scene_provenance(scene);
         let Some((split, sig, _)) = self.stray_split(&case.pos, &case.z, &prov) else { return StrayAudit::NotStray };
         self.stray_book_current();
@@ -326,7 +329,7 @@ impl SurrogateKs {
         );
         let ans = PartAnswer { energy: raw_energy, forces: forces.to_vec(), frontier: [Frontier::default(); 2], partial: Vec::new(), clean: true, boxed: false };
         let surface = self.model.as_ref().map_or_else(String::new, |m| reference_settings_key(&m.provenance));
-        let a = Attribution { case: case.clone(), grid_n: prov.grid_n, gap, why, surface, fits: self.fits };
+        let a = Attribution { case: case.clone(), grid_n: prov.grid_n, gap, why, surface, fits: self.fits, flags };
         let busy = self.stray_pending.as_ref().is_some_and(|p| p.attribution.is_some());
         if self.auditor.is_none() || (busy && self.stray_attributions.len() >= STRAY_ATTRIBUTION_QUEUE) {
             let reason = if busy { "the attribution queue is full" } else { "no background teacher" };
@@ -383,7 +386,7 @@ impl SurrogateKs {
     /// was the last, and its history point recorded now at the scene's geometry with the model current (deferred at
     /// the audit, ruling 9b; the conservative side, as a `CountsNow` audit records it).
     fn count_stray_audit(&mut self, a: Attribution, why: &str) {
-        let case = a.case;
+        let (case, flags) = (a.case, a.flags);
         let pred = self.model.as_ref().and_then(|m| m.predict(&case.pos, &case.z, true).ok());
         match pred {
             Some(p) => {
@@ -391,7 +394,9 @@ impl SurrogateKs {
                     (Some(e), Some(f), Some(fe)) => Some((e, f.clone(), fe.clone())),
                     _ => None,
                 };
-                self.record_history_point(PointKind::Audit, &case.pos, &case.z, stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), p.energy, &p.forces, case.energy, &case.forces, false, false, false);
+                // the epistemic energy std over the scene's N_e energy-row atoms (`policy::epistemic_energy_std`)
+                let e_epi = p.energy_std.zip(self.model.as_ref()).map(|(e, m)| crate::surrogate::policy::epistemic_energy_std(m, surrogate::energy_row_atoms(&m.basis, &case.pos), e));
+                self.record_history_point(PointKind::Audit, &case.pos, &case.z, stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), p.energy, &p.forces, case.energy, &case.forces, false, false, false, flags, e_epi);
             }
             None => self.audit_history.unrecorded.no_variance += 1,
         }
@@ -802,7 +807,9 @@ impl SurrogateKs {
                 (Some(e), Some(f), Some(fe)) => Some((e, f.clone(), fe.clone())),
                 _ => None,
             };
-            self.record_history_point(PointKind::Audit, &fp, &fz, stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), pred.energy, &pred.forces, e_frag, &frag.forces, false, false, false);
+            // the fragment's epistemic energy std over its N_e (every bonded atom: `policy::epistemic_energy_std`)
+            let e_epi = pred.energy_std.zip(self.model.as_ref()).map(|(e, m)| crate::surrogate::policy::epistemic_energy_std(m, surrogate::energy_row_atoms(&m.basis, &fp), e));
+            self.record_history_point(PointKind::Audit, &fp, &fz, stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), pred.energy, &pred.forces, e_frag, &frag.forces, false, false, false, a.flags, e_epi);
             self.failed_audits.push(case);
             self.sync_audit_failed();
             self.audit_flip = self.last.as_ref().is_some_and(|l| l.on_model);

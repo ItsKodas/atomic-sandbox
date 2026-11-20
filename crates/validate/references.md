@@ -1225,6 +1225,8 @@ from the first run's kept fallbacks (samples 273 → 315): one sample spans its 
 lets the posterior judge there, as designed. Box-affected checks are not judged (the box rule);
 the hot run's worst there is 4.6e-2 Ha/atom of confinement and model error together.
 
+**Since then (2026-11-17/20).** Under Fermi–Dirac labels the test passed at 07939ac (1036 s) and failed at 762159b (1378 s: hot run 12 answers beyond, worst 2.38e-3 Ha/atom and 4.48×) — one chaotic trajectory, the many-body class opening on 3 evidence points (bisect: `scf-stall/.superpowers/sdd/2026-11-13-fermi-smearing/stuck-escape-bisect.md`). Trust tightening closes that gap: the many-body key opens only at 12 fits and 60 comparisons. **Run of record 2026-11-20 at 7498cf96: pass, 771 s** — hot run 260 answers, 61 judged, worst 9.72e-4 Ha/atom and 1.82×, 0 beyond; the fallback-energy check now leaves out in-step ticks at box-affected answers (the controller's ruling). Numbers: "Trust tightening (2026-11-19)" below.
+
 ### Runtime (in-suite, five tests concurrent, GPU evaluations serialised; run of record 2026-10-14)
 
 | test | system | grid | tol | teacher solves | GPU s | ms/solve | SCF steps/solve | readbacks/solve | test wall s | result |
@@ -6375,3 +6377,49 @@ before the run, 5 during it — not broken down here). Every teacher solve was c
 - *Scoped re-review I1 (ruling 14) — the place is blind to direction*: `reach` and `face` are single numbers. Induction −αμ²(1 + 3cos²θ)/2r⁶ is 4× larger on the dipole axis than beside it; H₂O + Mg (literature α, μ; not a teacher measurement): a pass beside the axis at 6.05 Bohr (−0.39 mHa) admits an answer on it (−1.54 mHa, 0.51 mHa per bonded atom, inside the 3 mHa audit tier). A corner d from three faces can carry ~3× a one-face pass's ε_pos (≤ ~0.7 mHa for H at d ≥ 5). Queued fix: per pass, the vector of stray-to-bonded-atom distances; cover only when one pass is dominated.
 - *Scoped re-review minor 1 — a box-affected bonded part marks the signature with the stray atom's face distance*: conservative (DFT answers), may block re-checks of that signature for the session. Queued fix: skip the check when the fallback answer is not clean; mark only on a stray atom's own boxed solve.
 - *Scoped re-review minor 2 — `clear_regions` leaves released samples in the fit* (doc'd at `clear_regions`).
+
+## Trust tightening (2026-11-19; spec `2026-11-18-trust-tightening-design.md` rev. 2, plan `2026-11-19-trust-tightening.md` Task 9; release, RX 7900 XTX, each GPU binary alone, BelowNormal)
+
+The evidence floor (12 fits and 60 comparisons before the calibrated verdict alone opens a key; below it the key's leave-one-out must pass too), the tail-aware inflations λ_T (forces, bound units) and λ_E (energy, tier units) on rules 6/7, and σ-blind calibration ticks every 25 in-envelope steps. Derivations: `providers::surrogate::calibrate` ("The evidence floor", "The tail-aware inflations") and `providers::surrogate` ("Calibration ticks").
+
+### The gate: `the_stuck_escape_repro_is_answered_honestly`, every constant unchanged
+
+`REPRO_FORCE_RATIO` 3, tier 1e-3, `REPRO_MIN_JUDGED_HOT` 10, `REPRO_BOOKING_RESIDUAL` 1e-9. Run alone 2026-11-20 14:05 at 7498cf96: **pass, 771 s**.
+
+| | 07939ac (pass) | 762159b (fail) | **trust-tighten 7498cf96** |
+|---|---|---|---|
+| test wall | 1036 s | 1378 s | **771 s** (teacher 2396 solves, GPU 646 s) |
+| NVE after the edit | 1 answer, 999 fallbacks | 51 answers (3 judged, worst 8.5e-4 Ha/atom, 2.47×) | 77 answers, 1 judged (4.84e-5, 0.34×), 19 box-affected; 920 teacher-surface + 3 model-surface fallbacks |
+| many-body at the end of NVE | untrusted (κ 5.85, 3 evidence) | **trusted** (κ 3.25, 3 evidence) | untrusted: calibrated 0.951 > 0.707, n_fit 3 / 12, n_pts 8 / 60 |
+| hot heating | 0 fallbacks / 1600 | 1600 / 1600 | 64 / 1600 |
+| hot after the edit | 219 answers, 116 judged, worst 5.23e-4, 1.91×, 0 beyond | 657 answers, 248 judged, worst **2.38e-3, 4.48×, 12 beyond** | **260 answers, 61 judged, worst 9.72e-4 Ha/atom, 1.82×, 0 beyond**; 199 box-affected (worst 2.00e-3) |
+| many-body at the end of the hot run | trusted | trusted | trusted once the floor was met: n_fit 14, n_pts 76 |
+
+- **Per key (the run's own printout).** Pair H{H}: trusted throughout, n_fit 62 → 124, n_pts 302 → 316, λ_sum 10.2 / 5.5 / 3.2 / 4.5 (after NVE heating / NVE end / hot heating / hot end). Many-body H{H}: λ_sum 22.6 while untrusted, 14.7 at the end. **λ_T = λ_E = 1.000 for every key throughout; 0 code-24 refusals**: here the floor, not the tail factors, decides.
+- **Judged z (hot, 61 answers), max_j ‖ΔF_j‖/σ_epi,j:** raw median 17.8, p90 29.6, max 38.4; inflated by the key's λ_F = max(λ_sum, λ_T): median 0.86, p90 1.93, max 2.49, rms 1.21. On √(σ_epi² + 3σ_f²): worst 7.45.
+- **Ticks (the harness has no auditor: all in the step, dead time D = 0, no skips):** NVE heating 54 due, all answered and recorded; NVE after the edit 3 due, all box-affected (unrecorded); hot heating 66 / 66; hot after the edit 15 due (10 at answers), 4 recorded, 11 unrecorded (box-affected).
+- **The fallback-energy check's population (moved, the controller's ruling at Task 9).** In-step ticks at box-affected answers keep the model's energy by the provider's box rule (the gap is the box's Dirichlet confinement). The first run therefore failed on five such steps (NVE 779, 804, 870; hot 314, 389; 1.42–8.86e-3 Ha/atom at face densities 2.1e-5–6.2e-4). The check now excludes in-step audit/tick steps whose structured verdict is `BoxAffected`, as the answer check already excludes box-affected answers. Excluded: NVE 3, hot 9 (face densities 2.02e-5–6.20e-4). The remaining model-surface fallbacks: worst |gap|/N 9.86e-4 (hot).
+- **Step 3b (Task 7 review I1/R1).** Hot run after the edit: population answered share 0.729 (274 / 376), due-tick share 0.667 (10 / 15) — within one binomial σ (0.115): no σ-coupling of which steps become ticks. Take rates 1.0 at answered and refused steps (no auditor, no skips); the skip path needs the app.
+- **Calibration ticks and model MD (the controller's ruling at Task 9).** With no background teacher a tick is a teacher step inside the model's MD every 25 in-envelope steps (teacher forces, model energy), so energy is not conserved there. **Measured in the harness** (GPU teacher, 49³ × 0.25, tol 1e-6, no auditor): `surrogate_nve_is_tight` with ticks on gave drift +3.1e-7 Ha/ps (model-only −2.6e-11, bound 1e-8; plain DFT MD −4.0e-6, so still ≈ 13× better than the teacher's own MD), swing ratio 1.11 (bound 1 ± 0.1) and rewind 9.5e-6 Bohr (bound 1e-12), at 59 steps/s; the frequencies still held (H₂ +3.4e-6, H₃⁺ −2.8e-4 / −2.7e-4). The app's CPU-teacher Estimated path (81³) is not measured; rule-8 in-step audits (every 2000 answered steps) already put teacher steps into model MD there. The three model-MD measurements (`surrogate_reproduces_the_h2_frequency`, `h3plus_tier`, `surrogate_nve_is_tight`) run with ticks off (`SurrogateKs::with_tick_every(0)`, a test hook). In the app, while the background auditor lives, ticks are asynchronous and never put a teacher step into the trajectory; if its thread dies they fall back to in-step, as rule 8 does (physics review M2).
+- **M4 (the ring lifts a parked lock first).** A parked key locked by λ_T = ∞ at the real cadence, with the worker's refit flow: the bad tick left the 4096-point ring at step 4096 with 163 newer P_A points (the window needs 300, ≈ 7500 steps); the next refit gave λ_T = 1.04 and the step after was answered (a CPU measurement, not kept as a test).
+
+### Task 0 re-run (the go/no-go report on a fresh copy of the user's collection)
+
+`trust_tightening_go_no_go_report` on a scratchpad copy (no `.lock`) of `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5`, 1657 samples, 434 history points, attach + refit 54.1 s, 0 teacher calls; the original's SHA-256, sizes and mtimes identical before and after. 6 keys, 2 trusted at load; the 2 that lose trust are Task 0's: **pair H{H} (Floor, LOO force max 1.017×, evidence 38, n_fit 0)** and **many-body H{H,O} (Floor, 2.506×, evidence 3)**. Saved points carry no fit id, so n_fit = 0 for every key until new refits.
+
+### `trust_baseline_report`, before and after (audit every 50; 2026-11-20 20:08, alone, 800 s)
+
+Before: the open-shell gate's run (2026-11-14, above) for the missed large errors; the M8a fix-round-1 table for the per-class audit z. After: this branch at 75a87c0d + the gate ruling.
+
+| scenario | class | audits beyond 1× the bound or the tier while trusted (missed large errors), before → after | audit z = ‖ΔF‖/pred_force_std per point, rms (max), before → after |
+|---|---|---|---|
+| stuck-escape repro NVE + hot | pair | 0 / 64 → **0 / 122** | 1.4 → **0.65** (4.26) |
+| | many-body | 1 / 12 → **0 / 5** | — (2 audits) → **2.98** (4.69) |
+| active learning | pair | 0 / 5 → **0 / 10** | 3.49 (Task 1) → **2.72** (5.09) |
+
+Beyond the in-domain LOO p99 (the generalisation-gap statistic, which stays reported), after: repro pair audits 0 / 122 points, many-body 0 / 5, active-learning pair 2 / 10 (20 %); fallback points while trusted, pair 11 / 12, many-body 57 / 93 (these were refused, not answered).
+
+- The test's own checker on the hot run: before 513 answers, 269 judged, worst 5.15× the force bound, 21 beyond 3× or the tier; **after 132 answers, 53 judged, worst 6.78e-4 Ha/atom and 2.46×, 0 beyond** (3 of 53 beyond 1×). Every gated assertion held under these audits (no notes).
+- Many-body at the end of the hot run: trusted at n_fit 16, n_pts 63, evidence 10, with **λ_T 17.4 and λ_E 40.5** (λ_sum 25.9) — the tail factors bite here, unlike the gated run; 3 steps were labelled code 24 by their activity events and the history recorded none of them — probably box-affected answers, whose points `record_history_point` does not keep (physics review N3; not traced further). Its fallback points while trusted: 61 of 93 beyond 1× the bound or the tier — refused, not answered.
+- Class flips: pair 5 (3 entries, 2 losses; the losses by `LooFloor` at LOO rms 1.21 and 1.30), many-body 5 (3 + 2; one loss by `Floor` at LOO max 1.14 below the floor).
+- The fallback-energy exclusion (the gate ruling) covered 15 steps in this run, rule-8 in-step audits as well as ticks (face densities from 3.2e-5).

@@ -754,6 +754,11 @@ pub struct TeachEvent {
     /// and each stray atom alone, 1 + n_stray solves in one row (`providers::surrogate::stray`). Every counter of
     /// solves ([`SolveCounts`], the Activity tab's) adds this, never 1 per row.
     pub solves: u32,
+    /// The surrogate's history code for this step's teacher answer (`providers::surrogate`,
+    /// `history_rule_name`), where the provider set one: it tells a rule-6/7 refusal that passes at
+    /// λ_sum alone (code 24, the tail-aware inflations: the model was measured too confident) from
+    /// one where the model's own std refuses (14, 15). `None` from `new`.
+    pub history_code: Option<u8>,
 }
 
 impl TeachEvent {
@@ -778,6 +783,7 @@ impl TeachEvent {
             audit_lag: None,
             burst_t: None,
             solves: 1,
+            history_code: None,
         }
     }
 

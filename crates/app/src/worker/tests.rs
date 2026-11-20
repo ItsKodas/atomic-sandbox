@@ -3107,7 +3107,7 @@ impl Trainable for HarrisFake {
             trust_floor: None, unfitted: 0, pending: 0, recovery: None, audits_background: true, audit_in_flight: false, last_audit: None,
             last_audit_this_fit: false, audits_box_unjudged: 0, stuck: None, class_loo: Vec::new(), solves: Default::default(),
             trust_checks: Vec::new(), stuck_info: None, model_gen: 0, readiness: None, teach_offer: None, no_model: None, retry_fit: false,
-            model_source: Default::default(), lone_note: None, stray: Vec::new(), stray_held_out: 0,
+            model_source: Default::default(), lone_note: None, stray: Vec::new(), stray_held_out: 0, ticks: Default::default(),
         }
     }
     fn fitted(&self) -> bool {

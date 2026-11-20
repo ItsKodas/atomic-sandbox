@@ -704,11 +704,22 @@ fn a_box_reference_arriving_mid_refit_discards_it() {
 /// Review finding 2: a key the live provider's between-refit evidence made leave while a background
 /// refit ran stays out at the install — the state is a synchronous refit's followed by the same
 /// leave and its re-judge, line by line.
+///
+/// Trust tightening Task 4 (spec 2026-11-18 §3, no grandfathering): the fixture's saved points
+/// carry no fit id, so none of its keys opens at load any more; each provider is given a floor's
+/// worth of attributed comparisons of the pair key H{H} (60 over 12 fits, at 0.29× the bound) so
+/// that a key stands trusted to leave.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn a_key_that_left_during_a_background_refit_stays_out() {
     let mut sync = stuck_live("bg-left-sync", false);
     let mut bg = stuck_live("bg-left-bg", false);
+    for s in [&mut sync, &mut bg] {
+        let gen = s.model_gen;
+        for i in 0..calibrate::FLOOR_POINTS as u64 {
+            s.audit_history.push(surrogate::AuditPoint { model_gen: gen, ..floor_point(surrogate::history::PointKind::Audit, 1.0, Some(i % calibrate::FLOOR_FITS as u64 + 1)) });
+        }
+    }
     // a first refit each, so that keys stand trusted in the memory
     SurrogateKs::refit(&mut sync).unwrap();
     SurrogateKs::refit(&mut bg).unwrap();

@@ -1433,7 +1433,9 @@ fn a_gross_energy_misfit_refuses_its_key() {
 /// Task 7c's promise: with M empty the energy-RMS guard decides nothing. Built on the verdict
 /// function itself (a calibrated store whose key has an energy LOO RMS beyond 1 with M empty and is
 /// answered — 3+ audits of that key and an energy LOO beyond the tier with no misfit — is not
-/// practical to build from samples): in the calibrated path (20 audits at z = 1, W 0.33) a key
+/// practical to build from samples): in the calibrated path at the evidence floor (60 attributed
+/// audits at z = 1 over 12 fits, W 0.32 — trust tightening Task 4: below the floor the rule of
+/// before, energy max 5 > 1, would refuse first) a key
 /// with energy LOO RMS 3 and max 5 is answered exactly as before when no M sample counts
 /// (`energy_misfits` 0), and refused on `EnergyRms` at the bound 1 (no ENTER band) when one does;
 /// the uncalibrated path the same (RMS ≤ 1 with M passes; NaN with M fails). And on real stores
@@ -1443,14 +1445,10 @@ fn a_gross_energy_misfit_refuses_its_key() {
 fn an_energy_rms_without_misfits_decides_nothing() {
     use calibrate::{calibrate, ClassStats, ClassVerdict};
     use sim::ClassKey;
-    use surrogate::history::PointKind;
     let pol = FallbackPolicy::default();
-    let mut ok = surrogate::AuditHistory::default();
-    for _ in 0..20 {
-        ok.push(history_point(PointKind::Audit, 2, 1, 1.0));
-    }
+    let ok = floor_history(12, 60);
     let cal = calibrate(&ok, &pol);
-    assert!(cal.per_class[0].calibrated() && !cal.per_class[1].calibrated(), "the premise: the pair class calibrated, the many-body not");
+    assert!(cal.per_class[0].floor_met() && !cal.per_class[1].calibrated(), "the premise: the pair class at the evidence floor, the many-body not calibrated");
     let st = ClassStats { samples: 100, force_rms: 0.4, force_max: 3.0, energy_rms: 3.0, energy_max: 5.0, energy_misfits: 0 };
     for was in [false, true] {
         assert_eq!(cal.class_verdict(0, &st, 29, was), ClassVerdict::Trusted, "calibrated, M empty: answered (was {was})");
@@ -3536,6 +3534,9 @@ fn one_tail_sample_no_longer_lets_a_free_atom_in() {
 /// largest per-step change, Verlet's, switches).
 fn excursion(dt: f64, live: &dyn Fn() -> Box<dyn ForceProvider>) -> (f64, f64, f64, f64, usize, f64, f64) {
     let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    // no in-step audits, as `audit_every` 0 says: the calibration ticks (trust tightening Task 7)
+    // are in-step audits here too (no auditor), and the run measures the envelope's switches alone
+    s.tick_every = 0;
     s.teacher = live();
     let mut probe = live();
     let mut scene = h2(2.0);
@@ -3803,11 +3804,15 @@ fn a_noisy_fit_loses_trust_recovers_and_a_clean_one_never_cycles() {
     // a clean model near equilibrium: answered on every consultation, no cycle
     s.discontinuity();
     let mut answered = 0;
+    let ticks0 = s.ticks_in_step();
     for k in 0..200 {
         let r = 1.4 + 0.08 * (k as f64 * 0.3).sin();
         answered += (s.evaluate(&h2(r), &mut never()).unwrap().stats.source == Source::Surrogate) as usize;
     }
-    assert_eq!(answered, 200);
+    // (trust tightening Task 7) every 25th in-envelope step is a calibration tick served in the
+    // step (no auditor): 8 of the 200, the rest answered
+    let ticks = s.ticks_in_step() - ticks0;
+    assert_eq!((answered, ticks), (200 - 8, 8));
 }
 
 // ---- M6 Task 11 round 2 (controller ruling on concern 1): unspanned directions, the
@@ -4551,6 +4556,10 @@ fn scripted_session_with(views: bool) -> String {
     let mut t = String::new();
     let policy = FallbackPolicy { audit_every: 7, ..FallbackPolicy::default() };
     let mut s = SurrogateKs::new(Box::new(SessionMorse), policy).with_teacher_tol(1e-6);
+    // the decisions pinned before the calibration ticks (trust tightening Task 7): with ticks off
+    // the golden is unchanged, so moving the envelope, class and fences ahead of the variance moved
+    // nothing; the ticks themselves are pinned by their own tests (`…tick…`)
+    s.tick_every = 0;
     for (i, r) in [1.5, 1.55, 1.6].into_iter().enumerate() {
         peek(&mut s, Some(&h2(r)));
         let out = s.evaluate(&h2(r), &mut never());
@@ -4641,7 +4650,7 @@ fn scripted_session_with(views: bool) -> String {
     let (mut s, h, _open, _calls) = with_gated_auditor(0, 0.0);
     let answer = |s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>| {
         let generation = s.auditor.as_ref().expect("an auditor").generation.load(Ordering::Relaxed);
-        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
+        let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: Default::default(), tick_only: false };
         AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps: None, ts: None }
     };
     let mut teacher = MorseDimer::h2();
@@ -5047,7 +5056,7 @@ fn solved(r: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>)
 /// fields; the tests below hand its answer to `handle_answer` directly).
 fn audit_answer(s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>) -> AuditAnswer {
     let generation = s.auditor.as_ref().expect("an auditor").generation();
-    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
+    let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: Default::default(), tick_only: false };
     let scf_steps = result.is_ok().then_some(5);
     AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps, ts: None }
 }
@@ -5304,7 +5313,7 @@ fn the_class_verdict_names_its_failing_condition() {
     assert!(class_refusal(40, 16, f64::NAN, 0.4, 0.3).unwrap().1.is_nan(), "a failing check never shows a value inside its limit");
     let (mut s, _) = trained(1.2, 2.2, 120, FallbackPolicy::default());
     assert!(s.class_loo().iter().all(|l| l.trusted == l.refusal.is_none()));
-    s.class_loo[0] = sim::ClassLoo { class: "pair", samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 110.0, energy_max: 1100.0, trusted: false, refusal: Some((ClassKey::Energy, 1100.0, 1.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: Vec::new() };
+    s.class_loo[0] = sim::ClassLoo { class: "pair", samples: 120, force_rms: 0.1, force_max: 0.4, energy_rms: 110.0, energy_max: 1100.0, trusted: false, refusal: Some((ClassKey::Energy, 1100.0, 1.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, fits: 0, floor_points: 0, species: Vec::new() };
     let (r, short) = s.class_untrusted(&h_keys(&[1, 1])).unwrap();
     assert!(!short && r.text.contains("LOO energy error 1100.0× the tier"), "{}", r.text);
     assert_eq!(r.rule, sim::activity::TeachRule::Class(sim::activity::EnvClass::Pair));
@@ -5528,7 +5537,7 @@ fn the_class_verdict_reproduces_the_pre_task3_rule_on_a_sweep() {
         let samples = [q.saturating_sub(1), q, q + 1, 0][rng.gen_range(0..4)];
         let (force_rms, force_max, energy_max) = (around(&mut rng, 1.0), around(&mut rng, 1.0), around(&mut rng, 1.0));
         let refusal = class_refusal(samples, q, force_rms, force_max, energy_max);
-        let l = sim::ClassLoo { class: ENV_CLASSES[0], samples, force_rms, force_max, energy_rms: energy_max, energy_max, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: Vec::new() };
+        let l = sim::ClassLoo { class: ENV_CLASSES[0], samples, force_rms, force_max, energy_rms: energy_max, energy_max, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, fits: 0, floor_points: 0, species: Vec::new() };
         let old = pre_task3_class_untrusted(&l, q);
         assert_eq!(l.trusted, old.is_none(), "round {i}: {l:?}");
         if let Some((key, value, limit)) = refusal {
@@ -5541,7 +5550,7 @@ fn the_class_verdict_reproduces_the_pre_task3_rule_on_a_sweep() {
                 }
                 ClassKey::Energy => assert!(limit == 1.0 && !(value <= 1.0) && value.to_bits() == energy_max.to_bits(), "round {i}: {l:?}"),
                 // `EnergyRms` is `calibrate::verdict`'s (open-shell Task 7c), never `class_refusal`'s
-                ClassKey::Calibrated | ClassKey::LooFloor | ClassKey::MeasuredEnergy | ClassKey::WorstAtom | ClassKey::Window | ClassKey::EnergyRms => unreachable!("the uncalibrated rule never names the calibrated verdict"),
+                ClassKey::Calibrated | ClassKey::LooFloor | ClassKey::MeasuredEnergy | ClassKey::WorstAtom | ClassKey::Window | ClassKey::EnergyRms | ClassKey::Floor => unreachable!("the uncalibrated rule never names the calibrated verdict"),
             }
         }
         s.class_loo[0] = l.clone();
@@ -5815,6 +5824,9 @@ fn pos_z(sc: &Scene) -> (Vec<[f64; 3]>, Vec<u8>) {
 fn would_answer_agrees_with_evaluate() {
     let policy = FallbackPolicy { variance_cadence: 1, audit_every: 0, ..FallbackPolicy::default() };
     let (mut s, h) = trained(1.2, 2.2, 120, policy);
+    // no in-step audits, as `audit_every` 0 says: `would_answer` is the answer decision, and a
+    // calibration tick (trust tightening Task 7) is an in-step audit on top of an answer here
+    s.tick_every = 0;
     let mut rng = StdRng::seed_from_u64(0x5EED);
     let mut scenes = Vec::new();
     for _ in 0..150 {
@@ -7919,9 +7931,9 @@ fn a_short_class_is_never_an_acceptance() {
     use teach::tests_api::{teach_verdict, TeachVerdict};
     let class = |samples: usize, q: usize, f: f64, e: f64| {
         let refusal = super::trust::class_refusal(samples, q, f.min(1.0), f, e);
-        sim::ClassLoo { class: "pair", samples, force_rms: f.min(1.0), force_max: f, energy_rms: e, energy_max: e, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: Vec::new() }
+        sim::ClassLoo { class: "pair", samples, force_rms: f.min(1.0), force_max: f, energy_rms: e, energy_max: e, trusted: refusal.is_none(), refusal, calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, fits: 0, floor_points: 0, species: Vec::new() }
     };
-    let none = sim::ClassLoo { class: "many-body", samples: 0, force_rms: 0.0, force_max: 0.0, energy_rms: 0.0, energy_max: 0.0, trusted: false, refusal: Some((sim::ClassKey::Samples, 0.0, 344.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, species: Vec::new() };
+    let none = sim::ClassLoo { class: "many-body", samples: 0, force_rms: 0.0, force_max: 0.0, energy_rms: 0.0, energy_max: 0.0, trusted: false, refusal: Some((sim::ClassKey::Samples, 0.0, 344.0)), calibration: 1.0, measured: None, measured_energy: None, worst_atom: None, evidence: 0, trusted_since: None, inflation: 1.0, fits: 0, floor_points: 0, species: Vec::new() };
     assert_eq!(teach_verdict(&[class(400, 344, 0.8, 0.5), none.clone()], false, false, 0, 0, false), TeachVerdict::Accepted, "a class without samples is not involved");
     assert_eq!(teach_verdict(&[class(201, 344, 0.78, 0.48), none.clone()], false, false, 0, 0, false), TeachVerdict::NeedsSamples);
     assert_eq!(teach_verdict(&[class(201, 344, 1.6, 0.48), none.clone()], false, false, 0, 0, false), TeachVerdict::NotAccepted, "short AND leave-one-out beyond 1×");
@@ -8477,7 +8489,7 @@ fn nothing_inside_a_fenced_band_is_fitted_or_judged() {
     // a background audit landing in the band, its answer 0.5 Ha off the model
     let scene = h2(5.5);
     let prov = s.provenance_for(&scene);
-    let job = AuditJob { scene, prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
+    let job = AuditJob { scene, prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: Default::default(), tick_only: false };
     s.judge_audit(job, t.energy - 0.5, t.forces.clone(), None, None, None, 1.0, Some(10), None);
     let note = s.pending_notes.last().cloned().unwrap_or_default();
     println!("{note}");
@@ -8503,7 +8515,7 @@ fn judged_audits_are_recorded_in_the_history() {
     let (pos, z) = pos_z(&scene);
     let pred = s.model().unwrap().predict(&pos, &z, true).unwrap();
     let prov = s.provenance_for(&scene);
-    let job = || AuditJob { scene: scene.clone(), prov: prov.clone(), generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None };
+    let job = || AuditJob { scene: scene.clone(), prov: prov.clone(), generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: Default::default(), tick_only: false };
     s.judge_audit(job(), t.energy, t.forces.clone(), None, None, None, 1.0, Some(10), None);
     assert_eq!(s.audit_history().len(), 1);
     let p = s.audit_history().iter().next().unwrap().clone();
@@ -8598,9 +8610,11 @@ fn fallback_steps_are_recorded_in_the_history_with_their_rule() {
     assert_eq!(codes.len(), rules.len(), "distinct codes");
     assert!(codes.iter().all(|&c| history_rule_name(c) != "?"));
     assert!(!codes.contains(&HISTORY_RULE_CLASS_AND_VARIANCE) && history_rule_name(HISTORY_RULE_CLASS_AND_VARIANCE) != "?", "code 21 is the provider's own, beside the rules'");
-    // 22 is the capped segment's (M8a Task 10), 23 `NearMisfit`'s (spec 2026-11-13 §4.3); the
-    // next code is unnamed
-    assert_eq!(history_rule_name(24), "?");
+    // 22 is the capped segment's (M8a Task 10), 23 `NearMisfit`'s (spec 2026-11-13 §4.3), 24 the
+    // tail-aware inflations' (trust tightening Task 6: the provider's own, like 21); the next code
+    // is unnamed
+    assert!(!codes.contains(&HISTORY_RULE_TAIL_INFLATION) && history_rule_name(HISTORY_RULE_TAIL_INFLATION) != "?");
+    assert_eq!(history_rule_name(25), "?");
     // the sidecar keeps the kind
     let path = std::env::temp_dir().join(format!("fallback-history-{}.model", std::process::id()));
     s.save_sidecar(&path).unwrap();
@@ -8724,6 +8738,10 @@ fn history_point_full(kind: surrogate::history::PointKind, n: usize, code: u8, e
         n_atoms: n,
         model_gen: 1,
         species: Vec::new(),
+        fit_id: None,
+        flags: surrogate::history::PointFlags::default(),
+        energy_std_epistemic: None,
+        model_force: Vec::new(),
     }
 }
 
@@ -8793,6 +8811,10 @@ fn calibration_widens_when_audits_disagree() {
 /// than three) while the inflation counts the points, fallbacks by other rules are not evidence, a
 /// comparison that is not a number is infinite evidence against, and with fewer than three points
 /// the rule of before stands — except that one atom measured beyond 3× its bound refuses (I4).
+///
+/// Trust tightening Task 4 (spec 2026-11-18 §3): the hysteresis and measured-energy checks run on
+/// attributed audits over 12 fits (`floor_point`), so the evidence floor is met and the LOO max 3.0
+/// / energy max 5.0 do not decide — below the floor the rule of before would refuse first.
 #[test]
 fn the_verdict_has_hysteresis_and_counts_evidence_per_point_and_per_rule() {
     use calibrate::{calibrate, ClassStats, ClassVerdict, ENTER, LEAVE, MIN_EVIDENCE, WORST_ATOM};
@@ -8801,27 +8823,27 @@ fn the_verdict_has_hysteresis_and_counts_evidence_per_point_and_per_rule() {
     let pol = FallbackPolicy::default();
     let code_4b = history_rule_code(TeachRule::Class(sim::activity::EnvClass::Pair));
     let code_5 = history_rule_code(TeachRule::Spread);
-    // 400 audits at z: W = z × 0.2887 × (1 + 1/√800)
+    // 400 audits at z over 12 fits (the evidence floor met): W = z × 0.2887 × (1 + 1/√800)
     let infl = 1.0 + 1.0 / 800f64.sqrt();
     let audits = |z: f64| {
         let mut h = surrogate::AuditHistory::default();
-        for _ in 0..400 {
-            h.push(history_point(PointKind::Audit, 2, 1, z));
+        for i in 0..400 {
+            h.push(floor_point(PointKind::Audit, z, Some(i % 12 + 1)));
         }
         calibrate(&h, &pol)
     };
     let z_for = |w: f64| w / (w_of(1.0) * infl); // z such that W_inflated = w
     let st = ClassStats { samples: 100, force_rms: 0.1, force_max: 3.0, energy_rms: 0.1, energy_max: 5.0, energy_misfits: 0 };
     let inside = audits(z_for(0.85));
-    assert!((inside.per_class[0].measured - 0.85).abs() < 1e-9, "{:?}", inside.per_class[0]);
+    assert!((inside.per_class[0].measured - 0.85).abs() < 1e-9 && inside.per_class[0].floor_met(), "{:?}", inside.per_class[0]);
     assert_eq!(inside.class_verdict(0, &st, 29, true), ClassVerdict::Trusted, "stays");
     assert!(matches!(inside.class_verdict(0, &st, 29, false), ClassVerdict::Untrusted { key: ClassKey::Calibrated, limit, .. } if limit == ENTER), "does not enter");
     assert_eq!(audits(z_for(0.6)).class_verdict(0, &st, 29, false), ClassVerdict::Trusted, "enters below ENTER");
     assert!(matches!(audits(z_for(1.05)).class_verdict(0, &st, 29, true), ClassVerdict::Untrusted { key: ClassKey::Calibrated, limit, .. } if limit == LEAVE), "leaves beyond LEAVE");
-    // the max no longer decides once calibrated (force_max 3.0 above); the measured energy does
+    // the max no longer decides at the evidence floor (force_max 3.0 above); the measured energy does
     let mut he = surrogate::AuditHistory::default();
-    for _ in 0..400 {
-        he.push(history_point_full(PointKind::Audit, 2, 1, 0.5e-3, 0.9 * 2.0 * pol.energy_std_per_atom / infl));
+    for i in 0..400 {
+        he.push(surrogate::AuditPoint { species: vec![(1, vec![1]); 2], fit_id: Some(i % 12 + 1), ..history_point_full(PointKind::Audit, 2, 1, 0.5e-3, 0.9 * 2.0 * pol.energy_std_per_atom / infl) });
     }
     let cal = calibrate(&he, &pol);
     assert!((cal.per_class[0].measured_energy - 0.9).abs() < 1e-9, "{:?}", cal.per_class[0]);
@@ -8893,6 +8915,16 @@ fn the_verdict_has_hysteresis_and_counts_evidence_per_point_and_per_rule() {
     h.push(bad);
     let cal = calibrate(&h, &pol);
     assert_eq!((cal.per_class[0].factor, cal.per_class[0].measured), (f64::INFINITY, f64::INFINITY));
+    // below the evidence floor (trust tightening Task 4) the worst-atom guard refuses both ways: the
+    // non-number is an infinite worst atom
+    assert!(matches!(cal.class_verdict(0, &ClassStats { force_rms: 1e-6, ..st }, 29, true), ClassVerdict::Untrusted { key: ClassKey::WorstAtom, value, .. } if value == f64::INFINITY));
+    // at the floor a trusted class is judged by its measured error: infinite, refused
+    let mut h = floor_history(12, 60);
+    let mut bad = floor_point(PointKind::Audit, 1.0, Some(1));
+    bad.err_force[0] = f64::NAN;
+    h.push(bad);
+    let cal = calibrate(&h, &pol);
+    assert!(cal.per_class[0].floor_met() && cal.per_class[0].measured == f64::INFINITY);
     assert!(matches!(cal.class_verdict(0, &ClassStats { force_rms: 1e-6, ..st }, 29, true), ClassVerdict::Untrusted { key: ClassKey::Calibrated, .. }));
     // isolated atoms (code 0) and the other class's atoms are not this class's evidence
     let mut h = surrogate::AuditHistory::default();
@@ -8919,6 +8951,11 @@ fn the_verdict_has_hysteresis_and_counts_evidence_per_point_and_per_rule() {
 /// class stayed refused for the whole run (0 model answers) — the brief's `class_verdict_does_not_flip`
 /// scenario moved from the cutoff to the outlier: a pair crossing r_cut is the shell check's
 /// structural case (`sampling`, R3-1), not the class verdict's.
+///
+/// Trust tightening Task 4 (spec 2026-11-18 §3, the evidence floor): with LOO max 1.08× > 1 the
+/// calibrated verdict cannot open the class alone until its comparisons span 12 fits and 60
+/// points — the first refit plus 11 more, every 10 steps: it enters after step 119 (was step 9),
+/// and 80 of the 200 steps are answered (was 190; the 120 before are its fallbacks).
 #[test]
 fn a_class_refused_for_one_outlier_earns_the_calibrated_verdict_and_holds() {
     use surrogate::history::PointKind;
@@ -8957,7 +8994,13 @@ fn a_class_refused_for_one_outlier_earns_the_calibrated_verdict_and_holds() {
     assert!(l.trusted, "the class did not earn trust: {l:?}");
     assert!(l.calibration >= 1.0 && l.evidence >= calibrate::MIN_EVIDENCE && l.trusted_since.is_some(), "{l:?}");
     assert!(l.force_max > 1.0, "the outlier is still in the fit: {l:?}");
-    assert!(answered >= 100, "{answered} answered");
+    // refits every 10 steps, each a new fit id: the 12th fit stands at steps 110-119 and the refit at 119 meets
+    // the floor; every step before entry falls back, every step after is answered (it holds)
+    assert_eq!(first, Some(10 * calibrate::FLOOR_FITS - 1), "the floor: the 12th fit's comparisons open it");
+    // (trust tightening Task 7) every step after entry is answered, but every 25th in-envelope one
+    // is a calibration tick served in the step (no auditor): 80 steps, 3 ticks
+    assert_eq!(s.ticks_in_step(), ((200 - (first.unwrap() + 1)) / TICK_EVERY) as u64, "the ticks after entry");
+    assert_eq!(answered + s.ticks_in_step() as usize, 200 - (first.unwrap() + 1), "every step after entry is answered or a tick");
 }
 
 /// The hysteresis memory through the provider (M8a Task 2, `class_memory`): the verdict a refit
@@ -9101,6 +9144,12 @@ fn the_evidence_count_is_exact_at_47_fallbacks() {
 /// model alone and the class enters. The worst-atom guard: one atom at 3.46× its bound among 100 good
 /// comparisons keeps an untrusted class out although the rms would enter, leaves a trusted class
 /// trusted (its rms judges it), and ages with its generation.
+///
+/// Trust tightening Task 4 (spec 2026-11-18 §3): the window keeps generations, and the evidence
+/// floor counts fits inside it. The newer model's comparisons are attributed points over 12 fits
+/// (`floor_point`), so its full window meets the floor and the LOO max 3.0 does not decide; the
+/// worst-atom guard's 101 comparisons span 12 fits as well — below the floor the guard applies both
+/// ways and the trusted class would leave (`the_worst_atom_guard_applies_both_ways_below_the_floor`).
 #[test]
 fn evidence_ages_by_model_generation_both_ways() {
     use calibrate::{calibrate, ClassStats, ClassVerdict, ENTER, LEAVE, WINDOW_POINTS, WORST_ATOM};
@@ -9126,7 +9175,7 @@ fn evidence_ages_by_model_generation_both_ways() {
     assert!(matches!(calibrate(&h, &pol).class_verdict(0, &st, 29, false), ClassVerdict::Untrusted { key: ClassKey::Calibrated, value, .. } if value > LEAVE), "blocked: {c:?}");
     // the refit (generation 2): its comparisons supersede the old ones only once they fill a window
     for k in 1..=WINDOW_POINTS {
-        h.push(at(history_point(PointKind::Fallback { rule: code_4b }, 2, 1, 0.2), 2));
+        h.push(at(floor_point(PointKind::Fallback { rule: code_4b }, 0.2, Some(k as u64 % 12 + 1)), 2));
         let cal = calibrate(&h, &pol);
         let c = cal.per_class[0];
         let v = cal.class_verdict(0, &st, 29, false);
@@ -9136,6 +9185,7 @@ fn evidence_ages_by_model_generation_both_ways() {
         } else {
             println!("generation 2 fills the window: {c:?}");
             assert_eq!((c.window_from, c.aged, c.audits, c.fallbacks, c.evidence), (Some(2), 48, 0, WINDOW_POINTS, 3), "{c:?}");
+            assert_eq!((c.fits, c.floor_points), (12, WINDOW_POINTS), "the floor counts the window's fits: {c:?}");
             assert!(c.measured < ENTER, "{c:?}");
             assert_eq!(v, ClassVerdict::Trusted, "released by the newer model's own evidence");
         }
@@ -9143,13 +9193,13 @@ fn evidence_ages_by_model_generation_both_ways() {
     // the worst-atom guard on entry, at every evidence count, aged by generation
     let fine = ClassStats { force_max: 0.5, ..st };
     let mut g = surrogate::AuditHistory::default();
-    g.push(at(history_point(PointKind::Audit, 2, 1, 12.0), 1)); // 3.46× its bound
-    for _ in 0..100 {
-        g.push(at(history_point(PointKind::Audit, 2, 1, 0.5), 1));
+    g.push(at(floor_point(PointKind::Audit, 12.0, Some(1)), 1)); // 3.46× its bound
+    for i in 0..100u64 {
+        g.push(at(floor_point(PointKind::Audit, 0.5, Some(i % 12 + 1)), 1));
     }
     let cal = calibrate(&g, &pol);
     let c = cal.per_class[0];
-    assert!(c.calibrated() && c.measured < ENTER && c.worst_atom > WORST_ATOM, "the premise: the rms alone would enter: {c:?}");
+    assert!(c.floor_met() && c.measured < ENTER && c.worst_atom > WORST_ATOM, "the premise: the rms alone would enter: {c:?}");
     assert!(
         matches!(cal.class_verdict(0, &fine, 29, false), ClassVerdict::Untrusted { key: ClassKey::WorstAtom, value, limit, .. } if limit == WORST_ATOM && (value - w_of(12.0)).abs() < 1e-12),
         "does not enter"
@@ -9284,6 +9334,10 @@ const TRIMER_COMPRESSED: f64 = 0.8;
 /// triangle breathing inside the taught window, refitting every 10 steps while samples are pending,
 /// the verdict changes at most once (untrusted → trusted), and it is judged by its evidence — the
 /// rule-4b comparisons of those steps — with the compressed sample still in the fit.
+///
+/// Trust tightening Task 4 (spec 2026-11-18 §3, the evidence floor): with LOO max 1.57× > 1 the
+/// class opens only once its comparisons span 12 fits and 60 points — after step 119 (was 9) —
+/// and 80 of the 200 steps are answered (was 190).
 #[test]
 fn a_compressed_trimer_does_not_flip_the_many_body_verdict() {
     use surrogate::history::PointKind;
@@ -9320,7 +9374,13 @@ fn a_compressed_trimer_does_not_flip_the_many_body_verdict() {
     assert!(flips <= 1, "the verdict flipped {flips} times: {verdicts:?}");
     assert!(l.trusted && l.evidence >= calibrate::MIN_EVIDENCE && l.measured.is_some(), "judged by its evidence: {l:?}");
     assert!(l.force_max > 1.0, "the compressed sample is still in the fit: {l:?}");
-    assert!(answered >= 100, "{answered} answered");
+    // as the outlier test: the 12th fit's refit at step 119 meets the floor; every step after entry is answered
+    let first = verdicts.iter().position(|&t| t);
+    assert_eq!(first, Some(10 * calibrate::FLOOR_FITS - 1), "the floor: the 12th fit's comparisons open it");
+    // (trust tightening Task 7) every step after entry is answered, but every 25th in-envelope one
+    // is a calibration tick served in the step (no auditor): 80 steps, 3 ticks
+    assert_eq!(s.ticks_in_step(), ((200 - (first.unwrap() + 1)) / TICK_EVERY) as u64, "the ticks after entry");
+    assert_eq!(answered + s.ticks_in_step() as usize, 200 - (first.unwrap() + 1), "every step after entry is answered or a tick");
 }
 
 
@@ -9408,6 +9468,9 @@ fn the_variance_inflation_is_a_ratio_of_sums_over_the_posteriors_jurisdiction() 
         (history_rule_code(TeachRule::ForceUncertainty), true),
         (history_rule_code(TeachRule::EnergyUncertainty), true),
         (HISTORY_RULE_CLASS_AND_VARIANCE, true),
+        // rule 6/7 refusing only at the tail-aware factors (trust tightening Task 6 ruling 1: in
+        // λ_sum's sample like 14/15, out of P_A — `the_inflations_never_read_what_they_selected`)
+        (HISTORY_RULE_TAIL_INFLATION, true),
         (history_rule_code(TeachRule::Spread), false),
         (history_rule_code(TeachRule::Grade), false),
     ] {
@@ -10738,6 +10801,11 @@ fn three_body_point(gen: u64, ratio: f64, species: Option<Vec<(u8, Vec<u8>)>>) -
 /// (class, Z, neighbour species) key water's O{H} and H{H, O} enter, H₃'s H{H} stays out until
 /// 300 newer H{H} comparisons age its bad point; a point recorded before species were kept counts
 /// for every key of its class.
+///
+/// Trust tightening Task 4 (spec 2026-11-18 §3): the class's LOO max is 1.27× > 1, so a key opens
+/// only at the evidence floor — water's 81 comparisons carry the fit ids 1..=21 (one per 4 points)
+/// and H₃'s 300 newer ones 22..=33; the same 81 water points saved without fit ids (as every point
+/// before Task 2) stay shut on the floor.
 #[test]
 fn class_trust_is_per_environment_species_the_users_water_after_h3() {
     use calibrate::{calibrate_with, ClassVerdict};
@@ -10747,10 +10815,18 @@ fn class_trust_is_per_environment_species_the_users_water_after_h3() {
     let water = || Some(vec![(8u8, vec![1u8]), (1, vec![1, 8]), (1, vec![1, 8])]);
     let key = |z: u8, nb: &[u8]| surrogate::EnvKey { class: 2, z, neighbours: nb.to_vec() };
     let st = ClassStats { samples: 775, force_rms: 0.13, force_max: 1.27, energy_rms: 0.10, energy_max: 0.49, energy_misfits: 0 };
+    let fit = |p: surrogate::AuditPoint, id: u64| surrogate::AuditPoint { fit_id: Some(id), ..p };
     let mut h = surrogate::AuditHistory::default();
     h.push(three_body_point(416, 5.66, h3()));
+    let mut legacy = h.clone();
     for g in 0..81u64 {
-        h.push(three_body_point(436 + g / 4, 0.02, water()));
+        h.push(fit(three_body_point(436 + g / 4, 0.02, water()), 1 + g / 4));
+        legacy.push(three_body_point(436 + g / 4, 0.02, water()));
+    }
+    // without fit ids: within the bound, but below the floor and LOO max 1.27 > 1
+    let cal = calibrate_with(&legacy, &pol, [0.0; 2], &Default::default());
+    for k in [key(8, &[1]), key(1, &[1, 8])] {
+        assert!(matches!(cal.key_verdict(&k, &st, 452, false), ClassVerdict::Untrusted { key: ClassKey::Floor, value, .. } if value == 1.27), "{k:?}: {:?}", cal.key(&k));
     }
     let cal = calibrate_with(&h, &pol, [0.0; 2], &Default::default());
     // the class-wide reading (what decided before): the H₃ atom keeps every many-body environment out
@@ -10765,7 +10841,7 @@ fn class_trust_is_per_environment_species_the_users_water_after_h3() {
     // H₃'s key leaves the guard once 300 newer comparisons of its own fill its window
     let mut aged = h.clone();
     for i in 0..300u64 {
-        aged.push(three_body_point(470 + i / 100, 0.02, h3()));
+        aged.push(fit(three_body_point(470 + i / 100, 0.02, h3()), 22 + i / 25));
     }
     let cal = calibrate_with(&aged, &pol, [0.0; 2], &Default::default());
     assert_eq!(cal.key_verdict(&key(1, &[1]), &st, 452, false), ClassVerdict::Trusted, "{:?}", cal.key(&key(1, &[1])));
@@ -10810,7 +10886,7 @@ fn new_evidence_rejudges_the_class_verdict_without_a_refit() {
     let (e, f, fe) = (pred.energy_std.unwrap(), pred.force_std.clone().unwrap(), pred.force_std_epistemic.clone().unwrap());
     let teacher: Vec<[f64; 3]> = pred.forces.iter().map(|f| [f[0] + 2e-5, f[1], f[2]]).collect();
     for i in 0..300 {
-        s.record_history_point(PointKind::Fallback { rule: code }, &pos, &[1, 1], Some((e, &f, &fe)), pred.energy, &pred.forces, pred.energy, &teacher, false, false, false);
+        s.record_history_point(PointKind::Fallback { rule: code }, &pos, &[1, 1], Some((e, &f, &fe)), pred.energy, &pred.forces, pred.energy, &teacher, false, false, false, Default::default(), None);
         if i == 0 {
             assert!(s.audit_history.iter().last().unwrap().species == vec![(1, vec![1]), (1, vec![1])], "species recorded");
         }
@@ -11820,4 +11896,2276 @@ fn a_fallback_event_carries_its_solves_ts() {
     let solved: Vec<_> = events.iter().filter(|e| e.is_solve() && e.origin == sim::activity::TeachOrigin::Fallback).collect();
     assert!(!solved.is_empty(), "no model yet: the teacher answered — {events:?}");
     assert!(solved.iter().all(|e| e.ts == Some(4.2e-3)), "{solved:?}");
+}
+
+/// Trust tightening Task 0 (plan 2026-11-19): the go/no-go readout `key_class_stats` lists every
+/// key of `class_loo()`'s species once, in their order, and each key's leave-one-out numbers are
+/// the class pass's own per-key sums (`compute_class_loo_full`, recomputed here) — the
+/// statistics the standing verdict read.
+#[test]
+fn key_class_stats_match_the_verdicts_inputs() {
+    let mut s = dimer_model_three_atom_teacher();
+    let mut rng = StdRng::seed_from_u64(1019);
+    for _ in 0..40 {
+        let sc = random_h3(&mut rng);
+        s.add_sample(pair_morse_sample(&sc), &sc).unwrap();
+    }
+    s.refit().unwrap();
+    let stats = s.key_class_stats();
+    let species: Vec<surrogate::EnvKey> = s.class_loo().iter().enumerate().flat_map(|(c, l)| l.species.iter().map(move |v| surrogate::EnvKey { class: c as u8 + 1, z: v.z, neighbours: v.neighbours.clone() })).collect();
+    assert!(species.iter().any(|k| k.class == 1) && species.iter().any(|k| k.class == 2), "the fixture holds pair and many-body keys: {species:?}");
+    let listed: Vec<surrogate::EnvKey> = stats.iter().map(|(k, _)| k.clone()).collect();
+    assert_eq!(listed, species, "every species key once, in the verdicts' order");
+    let (fresh, ..) = s.compute_class_loo_full();
+    let (_, judge) = fresh.expect("a judgement after the refit");
+    for (k, st) in &stats {
+        let own = judge.key_stats.get(k).expect("every key here has fitted atoms");
+        println!("{k:?}: samples {} force rms {:.3e} max {:.3e} energy max {:.3e}", st.samples, st.force_rms, st.force_max, st.energy_max);
+        assert_eq!((st.force_max, st.force_rms, st.energy_max, st.samples), (own.force_max, own.force_rms, own.energy_max, own.samples), "{k:?}");
+        let v = s.class_loo()[(k.class - 1) as usize].species.iter().find(|v| v.z == k.z && v.neighbours == k.neighbours).unwrap();
+        assert_eq!(v.samples, st.samples, "the verdict's own sample count: {k:?}");
+    }
+}
+
+// ---- the fit id (trust tightening Task 2; spec 2026-11-18 §3, plan 2026-11-19 Review Focus 5) ----
+
+/// Records one audit point at `scene` (`record_history_point`, where every judged audit and
+/// fallback is recorded): the current model's prediction against `teacher`'s answer — one history
+/// point of the current fit, with no sample kept (so a later refit has no new data from it).
+fn record_audit(s: &mut SurrogateKs, scene: &Scene, teacher: &mut dyn ForceProvider) {
+    let t = teacher.evaluate(scene, &mut never()).unwrap();
+    let (pos, z) = pos_z(scene);
+    let p = s.model().unwrap().predict(&pos, &z, true).unwrap();
+    let stds = (p.energy_std.unwrap(), p.force_std.clone().unwrap(), p.force_std_epistemic.clone().unwrap());
+    let before = s.audit_history().recorded();
+    s.record_history_point(surrogate::history::PointKind::Audit, &pos, &z, Some((stds.0, &stds.1[..], &stds.2[..])), p.energy, &p.forces, t.energy, &t.forces, false, false, false, Default::default(), None);
+    assert_eq!(s.audit_history().recorded(), before + 1, "the point is recorded");
+}
+
+/// The distinct fit ids the history's points carry (what the floor's n_fit counts), and whether
+/// every point carries one.
+fn fit_ids(s: &SurrogateKs) -> (std::collections::BTreeSet<u64>, bool) {
+    (s.audit_history().iter().filter_map(|p| p.fit_id).collect(), s.audit_history().iter().all(|p| p.fit_id.is_some()))
+}
+
+/// Adds H₂ dimers at `rs` (random orientations) to `s`.
+fn add_dimers(s: &mut SurrogateKs, rs: &[f64], seed: u64) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    for &r in rs {
+        let sc = dimer(r, unit_vector(&mut rng), [0.0; 3], 1, 1);
+        s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+}
+
+/// A provider over a stub teacher of the file's teacher name holding `sc` (`install_sidecar`).
+fn installed(sc: surrogate::Sidecar) -> SurrogateKs {
+    let name: &'static str = Box::leak(sc.model.provenance.teacher.clone().into_boxed_str());
+    let mut s = SurrogateKs::new(Box::new(NamedStub(name)), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(sc.model.provenance.tol);
+    s.install_sidecar(sc).unwrap();
+    s
+}
+
+/// Spec §3: the fit id is bumped only by a refit that solved new coefficients, by one per refit;
+/// a history point carries the id of the fit that judged it; a refit that re-solves the same
+/// coefficients, a forget and a policy change leave it; a background refit's install brings the id
+/// it was solved under.
+#[test]
+fn a_refit_advances_the_fit_id_and_nothing_else_does() {
+    let (s0, _h0) = trained(1.2, 2.2, 0, FallbackPolicy::default());
+    assert_eq!(s0.fit_id(), 0, "no fit yet");
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    assert_eq!(s.fit_id(), 1, "the first refit");
+    // the same coefficients again (nothing new to fit): not a new fit
+    s.refit().unwrap();
+    assert_eq!(s.fit_id(), 1, "a refit that re-solved the same coefficients");
+    record_audit(&mut s, &h2(1.5), &mut MorseDimer::h2());
+    assert_eq!(s.audit_history().iter().last().unwrap().fit_id, Some(1), "a point carries the fit that judged it");
+    // new samples: one refit, one new id
+    add_dimers(&mut s, &[1.5, 1.7, 1.9, 2.1], 9);
+    s.refit().unwrap();
+    assert_eq!(s.fit_id(), 2);
+    record_audit(&mut s, &h2(1.6), &mut MorseDimer::h2());
+    assert_eq!(fit_ids(&s), ([1, 2].into(), true));
+    // a policy change: nothing
+    s.set_policy(FallbackPolicy { audit_every: 3, ..FallbackPolicy::default() });
+    assert_eq!(s.fit_id(), 2);
+    // a background refit: the install brings the id the copy solved under
+    add_dimers(&mut s, &[1.3, 1.45, 2.0], 10);
+    assert!(s.begin_background_refit());
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Installed(Ok(_))));
+    assert_eq!(s.fit_id(), 3, "the copy's refit");
+    record_audit(&mut s, &h2(1.55), &mut MorseDimer::h2());
+    assert_eq!(fit_ids(&s).0, [1, 2, 3].into());
+    // a forget leaves the counter: the next fit is a new one
+    SurrogateKs::forget(&mut s);
+    assert_eq!(s.fit_id(), 3, "a forget");
+    s.set_reference_energy(1, MorseDimer::h2().e_atom);
+    add_dimers(&mut s, &(0..40).map(|i| 1.2 + i as f64 / 39.0).collect::<Vec<_>>(), 11);
+    s.refit().unwrap();
+    assert_eq!(s.fit_id(), 4);
+}
+
+/// Review Focus 5: reloads manufacture no fits. The fit id — the id a new point carries — and the
+/// distinct ids the history holds are the same before and after a sidecar save + load, a restore of
+/// the fit state, a fork for a background refit with the carried model, 12 policy changes, a
+/// collection's detach + attach, and a re-spawned provider attaching it again; a later refit with
+/// new samples still advances it.
+#[test]
+fn reloading_reattaching_and_respawning_add_no_fit() {
+    // per scene: save + load (the worker's re-spawn carries the model through the autosave)
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    add_dimers(&mut s, &[1.5, 1.7, 1.9, 2.1], 9);
+    s.refit().unwrap();
+    record_audit(&mut s, &h2(1.5), &mut MorseDimer::h2());
+    let (id, ids) = (s.fit_id(), fit_ids(&s));
+    assert_eq!((id, ids.clone()), (2, ([2].into(), true)));
+    let path = std::env::temp_dir().join(format!("fit-id-reload-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let (mut back, _, _) = installed_from(&path);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!((back.fit_id(), fit_ids(&back)), (id, ids.clone()), "a save + load");
+    record_audit(&mut back, &h2(1.6), &mut MorseDimer::h2());
+    assert_eq!(fit_ids(&back), ids, "a point after the load is the same fit's");
+    // a restore of the fit state, a fork with the carried model, 12 policy changes
+    let st = s.save_state();
+    s.restore_state(st);
+    assert_eq!(s.fit_id(), id, "a restore");
+    s.refit().unwrap();
+    assert_eq!(s.fit_id(), id, "a refit after the restore, with no new samples");
+    assert_eq!(s.fork_for_refit().fit_id(), id, "a fork carries the model's id");
+    for k in 0..12 {
+        s.set_policy(FallbackPolicy { audit_every: k % 4, never_fallback: k % 2 == 1, ..FallbackPolicy::default() });
+    }
+    assert_eq!(s.fit_id(), id, "12 policy changes");
+    s.refit().unwrap();
+    assert_eq!(s.fit_id(), id, "a refit after the policy changes, with no new samples");
+    record_audit(&mut s, &h2(1.7), &mut MorseDimer::h2());
+    assert_eq!(fit_ids(&s), ids);
+
+    // a collection: detach + attach, then a re-spawned provider attaching it
+    let dir = collection_root("fit-id");
+    let (mut c, _t) = pair_student();
+    c.attach_collection(&dir, &h2(1.4)).unwrap();
+    c.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));
+    let mut rng = StdRng::seed_from_u64(31);
+    for i in 0..40 {
+        c.evaluate(&h2_at(1.1 + 1.2 * i as f64 / 39.0, &mut rng), &mut never()).unwrap();
+    }
+    c.refit().unwrap();
+    record_audit(&mut c, &h2(1.5), &mut SpeciesMorse::new());
+    let (id, ids) = (c.fit_id(), fit_ids(&c));
+    assert!(id >= 1 && ids == ([id].into(), true), "{id} {ids:?}");
+    SurrogateKs::forget(&mut c);
+    c.attach_collection(&dir, &h2(1.4)).unwrap();
+    assert!(c.model().is_some(), "the attach fits: {:?}", c.no_model());
+    assert_eq!((c.fit_id(), fit_ids(&c)), (id, ids.clone()), "a detach + attach");
+    record_audit(&mut c, &h2(1.6), &mut SpeciesMorse::new());
+    assert_eq!(fit_ids(&c), ids, "a point after the attach is the same fit's");
+    drop(c);
+    let (mut r, _t2) = pair_student();
+    r.attach_collection(&dir, &h2(1.4)).unwrap();
+    assert_eq!((r.fit_id(), fit_ids(&r)), (id, ids.clone()), "a re-spawned provider attaching the collection");
+    // a refit with new samples is a new fit, past every id the collection holds
+    for i in 0..6 {
+        r.evaluate(&h2_at(1.15 + 0.3 * i as f64, &mut rng), &mut never()).unwrap();
+    }
+    r.refit().unwrap();
+    assert_eq!(r.fit_id(), id + 1);
+}
+
+/// The plan's ruling (fit ids across sessions): a refit takes max(its own id, the history's largest)
+/// + 1, and an install takes the file's id — or, from a file without one, the history's largest. A
+/// history holding ids up to 40 under a provider at 1: the next refit is 41.
+#[test]
+fn fit_ids_stay_unique_across_an_install() {
+    use surrogate::history::PointKind;
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    assert_eq!(s.fit_id(), 1);
+    for id in 1..=40u64 {
+        s.audit_history.push(surrogate::AuditPoint { fit_id: Some(id), ..history_point_full(PointKind::Audit, 2, 1, 1e-4, 0.0) });
+    }
+    let path = std::env::temp_dir().join(format!("fit-id-unique-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let file = surrogate::sidecar::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!((file.fit_id, file.audit_history.max_fit_id()), (Some(1), Some(40)), "the writer's own id, and the history's");
+    // the file's id; the next refit passes the history's ids
+    let mut own = installed(file.clone());
+    assert_eq!(own.fit_id(), 1, "the file's id");
+    add_dimers(&mut own, &[1.5, 1.7, 1.9, 2.1], 9);
+    own.refit().unwrap();
+    assert_eq!(own.fit_id(), 41);
+    // a file without the key: the history's largest
+    let mut old = installed(surrogate::Sidecar { fit_id: None, ..file.clone() });
+    assert_eq!(old.fit_id(), 40);
+    add_dimers(&mut old, &[1.5, 1.7, 1.9, 2.1], 9);
+    old.refit().unwrap();
+    assert_eq!(old.fit_id(), 41);
+    record_audit(&mut old, &h2(1.6), &mut MorseDimer::h2());
+    assert_eq!(old.audit_history().iter().last().unwrap().fit_id, Some(41));
+    // a file whose id is past the history's: its own
+    let mut ahead = installed(surrogate::Sidecar { fit_id: Some(45), ..file });
+    assert_eq!(ahead.fit_id(), 45);
+    add_dimers(&mut ahead, &[1.5, 1.7, 1.9, 2.1], 9);
+    ahead.refit().unwrap();
+    assert_eq!(ahead.fit_id(), 46);
+}
+
+/// Fix round 1 (review I1): fits cannot be manufactured from old data. Forgetting a fitted sample
+/// and refitting (new coefficients B), then restoring it and refitting (A again), twelve times
+/// over, solves new coefficients 24 times from no new teacher data: the fit id stays. A refit after
+/// one new kept sample takes one new id, and the cycles after it none again.
+#[test]
+fn forget_restore_cycles_manufacture_no_fit() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let id = s.fit_id();
+    assert_eq!(id, 1);
+    let cycle = |s: &mut SurrogateKs, i: usize| {
+        let before = s.model().unwrap().coeffs.clone();
+        s.forget_sample(s.sample_id(i).unwrap()).unwrap();
+        s.refit().unwrap();
+        assert_ne!(s.model().unwrap().coeffs, before, "premise: the refit without sample {i} solved other coefficients");
+        s.restore_sample(s.sample_id(i).unwrap()).unwrap();
+        s.refit().unwrap();
+    };
+    for k in 0..12 {
+        cycle(&mut s, 3 + 2 * k);
+        assert_eq!(s.fit_id(), id, "cycle {k}: no new teacher data, no new fit");
+    }
+    add_dimers(&mut s, &[1.63], 12);
+    s.refit().unwrap();
+    assert_eq!(s.fit_id(), id + 1, "one new kept sample: one new fit");
+    for k in 0..3 {
+        cycle(&mut s, 4 + 2 * k);
+        assert_eq!(s.fit_id(), id + 1);
+    }
+}
+
+/// Fix round 1 (review M1): a standing model's id is never 0 — a file without a fit id and with no
+/// id in its history installs at 1, and a collection with no id on record takes 1 at the attach's
+/// fit; its refit of what it holds keeps it.
+#[test]
+fn a_legacy_install_or_attach_stands_at_fit_id_one() {
+    let (s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let path = std::env::temp_dir().join(format!("fit-id-legacy-{}.model", std::process::id()));
+    s.save_sidecar(&path).unwrap();
+    let file = surrogate::sidecar::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(file.audit_history.max_fit_id().is_none());
+    let mut legacy = installed(surrogate::Sidecar { fit_id: None, ..file.clone() });
+    assert_eq!(legacy.fit_id(), 1);
+    record_audit(&mut legacy, &h2(1.5), &mut MorseDimer::h2());
+    assert_eq!(legacy.audit_history().iter().last().unwrap().fit_id, Some(1));
+    assert_eq!(installed(surrogate::Sidecar { fit_id: Some(0), ..file }).fit_id(), 1, "a key of 0 too");
+    // a collection whose history carries no id (written before the key)
+    let dir = collection_root("fit-id-legacy");
+    let (mut c, _t) = pair_student();
+    c.attach_collection(&dir, &h2(1.4)).unwrap();
+    c.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));
+    let mut rng = StdRng::seed_from_u64(31);
+    for i in 0..40 {
+        c.evaluate(&h2_at(1.1 + 1.2 * i as f64 / 39.0, &mut rng), &mut never()).unwrap();
+    }
+    SurrogateKs::forget(&mut c);
+    c.attach_collection(&dir, &h2(1.4)).unwrap();
+    assert!(c.model().is_some() && c.audit_history().max_fit_id().is_none(), "{:?}", c.no_model());
+    assert_eq!(c.fit_id(), 1, "the attach's fit of a collection with no id on record");
+    c.refit().unwrap();
+    assert_eq!(c.fit_id(), 1, "its refit of what it holds");
+}
+
+// ---- the history's flags and epistemic energy std (trust tightening Task 3; spec 2026-11-18 §4,
+// "The sample P_A"; module doc, "The history's flags") ----
+
+/// Pins the pair class untrusted by hand (no re-judging from the history), as
+/// `a_class_refusal_the_variance_would_also_refuse_is_not_the_verdicts_evidence` does: every
+/// consulted pair step is then a class fallback (rule 4b, code 5 or 21) and leaves a history point.
+fn pin_pair_class_refused(s: &mut SurrogateKs) {
+    s.class_judge = None;
+    s.class_loo[0].trusted = false;
+    s.class_loo[0].refusal = Some((sim::ClassKey::Force, 2.0, 1.0));
+    for k in &mut s.class_loo[0].species {
+        k.trusted = false;
+        k.refusal = Some((sim::ClassKey::Force, 2.0, 1.0));
+    }
+}
+
+/// The newest history point.
+fn last_point(s: &SurrogateKs) -> surrogate::AuditPoint {
+    s.audit_history().iter().last().expect("a history point").clone()
+}
+
+/// Scales the model's epistemic stds by `f` (the Cholesky factor of Σ⁻¹ by 1/f: Σ by f², every
+/// epistemic std by f; the mean, σ_f and s_E untouched) without touching the cadence's state.
+fn scale_epistemic(s: &mut SurrogateKs, f: f64) {
+    for x in s.model.as_mut().expect("a fitted model").sigma_inv_chol.as_mut().expect("a posterior").iter_mut() {
+        *x /= f;
+    }
+}
+
+/// Spec §4 (review I4): the cadence-fresh bit follows a counter of consulted steps that nothing
+/// resets, never `consults`, whose phase a rule-6/7 refusal restarts. Two runs of 14 class-refused
+/// steps (every step leaves a point) at k = 4 from the same model, whose posterior is first scaled
+/// so the variance verdict accepts at ×1 (worst ratio 0.5 of the rule-6/7 limit) and refuses at
+/// ×10: run A at ×1 with a ×2³⁰ spike on step 4 — rule 6/7 refuses there, so the variance is fresh
+/// again on step 5 and then on 9 and 13; run B at ×10 throughout — refused, fresh on every step.
+/// The flagged steps are 0, 4, 8, 12 in both runs.
+#[test]
+fn the_cadence_flag_does_not_follow_refusals() {
+    use surrogate::history::PointFlags;
+    let k = 4;
+    let steps = 14;
+    let scene = |i: usize| h2(1.6 + 0.001 * i as f64);
+    // (`trained` is deterministic: each run builds the same model)
+    let make = || trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, variance_cadence: k, ..FallbackPolicy::default() }).0;
+    let base = make();
+    // the verdict's worst ratio to its limit at each geometry: rule 6 per atom, rule 7
+    let worst_ratio = |s: &SurrogateKs, sc: &Scene| {
+        let (pos, z) = pos_z(sc);
+        let m = s.model().unwrap();
+        let p = m.predict(&pos, &z, true).unwrap();
+        let infl = s.atom_inflation(m, &pos, &z);
+        // rule 6 at λ_F, rule 7 at max(max λ_F, max λ_E) (trust tightening Task 6)
+        let f = p.force_std_epistemic.as_ref().unwrap().iter().zip(&p.forces).zip(&infl).map(|((sd, f), l)| sd / 3f64.sqrt() * l.force() / s.policy().force_bound((f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt())).fold(0.0, f64::max);
+        let e = epistemic_energy_std(m, pos.len(), p.energy_std.unwrap()) / pos.len() as f64 * infl.iter().map(|l| l.force().max(l.energy)).fold(1.0, f64::max) / s.policy().energy_std_per_atom;
+        f.max(e)
+    };
+    let ratios: Vec<f64> = (0..steps).map(|i| worst_ratio(&base, &scene(i))).collect();
+    let (lo, hi) = ratios.iter().fold((f64::INFINITY, 0.0f64), |(a, b), &r| (a.min(r), b.max(r)));
+    let g = 0.5 / hi;
+    println!("worst rule-6/7 ratio at ×1 over the run: {lo:.3e} – {hi:.3e}; posterior scaled ×{g:.3e}");
+    assert!(10.0 * g * lo > 1.0, "the premise: ×10 refuses every step ({lo:.3e} – {hi:.3e})");
+    let prepared = |f: f64| {
+        let mut s = make();
+        scale_epistemic(&mut s, g * f);
+        pin_pair_class_refused(&mut s);
+        s
+    };
+    let run = |s: &mut SurrogateKs, spike: Option<usize>| {
+        let mut fresh = Vec::new();
+        let mut flagged = Vec::new();
+        for i in 0..steps {
+            if spike == Some(i) {
+                scale_epistemic(s, 2f64.powi(30));
+            }
+            let before = (s.variance_checks(), s.audit_history().recorded());
+            let r = s.evaluate(&scene(i), &mut never()).unwrap();
+            assert_eq!((r.stats.source, s.audit_history().recorded()), (Source::Fallback, before.1 + 1), "step {i}: a recorded class fallback: {:?}", r.stats.notes);
+            if spike == Some(i) {
+                scale_epistemic(s, 0.5f64.powi(30)); // exact: a power of two
+            }
+            if s.variance_checks() > before.0 {
+                fresh.push(i);
+            }
+            if last_point(s).flags.has(PointFlags::CADENCE_FRESH) {
+                flagged.push(i);
+            }
+        }
+        (fresh, flagged)
+    };
+    let cadence: Vec<usize> = (0..steps).filter(|i| i % k == 0).collect();
+    // run A: ×1, the spike refused on step 4
+    let (fresh_a, flagged_a) = run(&mut prepared(1.0), Some(4));
+    println!("run A (×1, spike at 4): variance fresh on {fresh_a:?}, cadence-fresh {flagged_a:?}");
+    assert_eq!(fresh_a, vec![0, 4, 5, 9, 13], "the premise: the refusal on step 4 restarts `consults`");
+    // run B: ×10, every verdict refused
+    let (fresh_b, flagged_b) = run(&mut prepared(10.0), None);
+    println!("run B (×10): variance fresh on {fresh_b:?}, cadence-fresh {flagged_b:?}");
+    assert_eq!(fresh_b, (0..steps).collect::<Vec<_>>(), "the premise: ×10 refuses, so every step is fresh");
+    assert_eq!(flagged_a, cadence, "run A: every k-th consulted step, whatever rule 6 refused");
+    assert_eq!(flagged_b, cadence, "run B: identical to run A");
+}
+
+/// Spec §4 (review I4): a class-refused step (code 5) inside a fence is flagged `FENCED` although
+/// the class rule named the refusal and the fences were never consulted for it — the quarantine
+/// fence (a stray label held out of the fit), the misfit fence (a label the fit cannot reproduce)
+/// and an audit fence (a failed audit not re-earned), each asked on every consulted step, the audit
+/// fence read-only. A class-refused step far from every fence is not flagged.
+#[test]
+fn a_class_refused_step_near_a_quarantined_sample_is_flagged_fenced() {
+    use surrogate::history::{PointFlags, PointKind};
+    let code_4b = PointKind::Fallback { rule: history_rule_code(TeachRule::Class(sim::activity::EnvClass::Pair)) };
+    // one class-refused step at `sc`: its point, checked to be the class rule's (code 5)
+    let step = |s: &mut SurrogateKs, sc: &Scene| {
+        let before = s.audit_history().recorded();
+        let r = s.evaluate(sc, &mut never()).unwrap();
+        assert_eq!((r.stats.source, s.audit_history().recorded()), (Source::Fallback, before + 1), "{:?}", r.stats.notes);
+        assert!(r.stats.notes[0].contains("isn't learned well enough yet"), "the class rule names the refusal: {:?}", r.stats.notes);
+        let p = last_point(s);
+        assert_eq!(p.kind, code_4b, "{:?}", r.stats.notes);
+        p.flags
+    };
+    // the quarantine fence: the stray label at 1.63 Bohr is held out of the fit
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let stray = dimer(1.63, [0.0, 1.0, 0.0], [0.1, 0.0, 0.0], 1, 1);
+    let mut bad = morse_sample(&MorseDimer::h2(), &stray);
+    bad.energy += 0.1;
+    s.add_sample(bad, &stray).unwrap();
+    s.refit().unwrap();
+    assert_eq!(s.quarantined(), 1, "the premise: the stray is quarantined");
+    pin_pair_class_refused(&mut s);
+    let far = h2(2.1);
+    let (pf, zf) = pos_z(&far);
+    assert!(s.near_quarantined(&pf, &zf).is_empty(), "the premise: 2.1 Bohr is outside the fence");
+    assert_eq!(step(&mut s, &far), PointFlags(PointFlags::CADENCE_FRESH), "far from every fence; the first consult, cadence-fresh");
+    let (ps, zs) = pos_z(&stray);
+    assert!(!s.near_quarantined(&ps, &zs).is_empty(), "the premise: the stray's geometry is fenced");
+    let f = step(&mut s, &stray);
+    assert!(f.has(PointFlags::FENCED), "near the quarantined sample: {f:?}");
+    // the misfit fence
+    let mut m = near_misfit_store();
+    m.policy.audit_every = 0;
+    pin_pair_class_refused(&mut m);
+    let near = h2(1.63);
+    let (pn, zn) = pos_z(&near);
+    assert!(m.near_misfit(&pn, &zn).contains(&true) && m.near_quarantined(&pn, &zn).is_empty(), "the premise: near a misfit, no quarantine");
+    let f = step(&mut m, &near);
+    assert!(f.has(PointFlags::FENCED), "near a misfit: {f:?}");
+    // an audit fence, asked only for the bit (the class rule refused before it is consulted)
+    let (mut a, _ha) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let fenced_at = h2(1.75);
+    let (pa, za) = pos_z(&fenced_at);
+    let p = a.model().unwrap().predict(&pa, &za, false).unwrap();
+    a.audit_fences.push(FailedAudit { pos: pa.clone(), z: za.clone(), energy: p.energy, forces: p.forces.clone(), index: None, ionic: "none".into(), rejudges: AUDIT_REJUDGE_LIMIT, origin: AuditOrigin::Audit, pair: None });
+    assert!(a.audit_fence_refusal(&pa, &za).is_some() && a.near_quarantined(&pa, &za).is_empty() && !a.near_misfit(&pa, &za).contains(&true), "the premise: the audit fence alone");
+    pin_pair_class_refused(&mut a);
+    let f = step(&mut a, &fenced_at);
+    assert!(f.has(PointFlags::FENCED) && f.has(PointFlags::CADENCE_FRESH), "inside the audit fence, the first consult: {f:?}");
+    assert_eq!(a.audit_fences.len(), 1, "asking for the bit changed no fence");
+}
+
+/// The point's epistemic energy std is the prediction's total std less the fit's aleatoric floor,
+/// √(σ_E² − (N s_E)²) for a model fitted on energies per atom (the number rule 7 divides by N), on
+/// a class fallback, an in-step audit and a background audit — the last two also carrying the
+/// step's flags.
+#[test]
+fn the_recorded_epistemic_energy_std_matches_the_prediction() {
+    use surrogate::history::{PointFlags, PointKind};
+    let expected = |s: &SurrogateKs, sc: &Scene| {
+        let (pos, z) = pos_z(sc);
+        let m = s.model().unwrap();
+        assert!(m.energy_per_atom, "the premise: a per-atom energy fit (floor N·s_E)");
+        let e = m.predict(&pos, &z, true).unwrap().energy_std.unwrap();
+        let floor = pos.len() as f64 * m.sigma_e;
+        (e, floor, (e * e - floor * floor).sqrt())
+    };
+    let check = |what: &str, p: &surrogate::AuditPoint, (e, floor, want): (f64, f64, f64)| {
+        let got = p.energy_std_epistemic.unwrap_or_else(|| panic!("{what}: an epistemic std is recorded"));
+        println!("{what}: σ_E {e:.6e} Ha, floor N·s_E {floor:.6e} Ha, epistemic {got:.6e} Ha (expected {want:.6e})");
+        assert!(want > 0.0 && want.is_finite(), "{what}: the premise, a resolvable epistemic part");
+        assert!((got - want).abs() <= 1e-15 * want, "{what}: {got:e} vs {want:e}");
+        assert_eq!(p.pred_energy_std, e, "{what}: the total std is recorded beside it");
+    };
+    // a class fallback
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    pin_pair_class_refused(&mut s);
+    let sc = h2(1.6);
+    let want = expected(&s, &sc);
+    s.evaluate(&sc, &mut never()).unwrap();
+    check("class fallback", &last_point(&s), want);
+    // an in-step audit (no auditor; every answered step audited): the first consult
+    let (mut t, _ht) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 1, ..FallbackPolicy::default() });
+    let sc = h2(1.57);
+    let want = expected(&t, &sc);
+    let r = t.evaluate(&sc, &mut never()).unwrap();
+    assert!(r.stats.notes.iter().any(|n| n.contains("audit")), "{:?}", r.stats.notes);
+    let p = last_point(&t);
+    assert_eq!((p.kind, p.flags), (PointKind::Audit, PointFlags(PointFlags::CADENCE_FRESH)), "the step's flags: the first consult, no fence");
+    check("in-step audit", &p, want);
+    // a background audit: the dispatching step's flags travel with the job
+    let (mut b, _hb) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let sc = h2(1.53);
+    let want = expected(&b, &sc);
+    let ta = MorseDimer::h2().evaluate(&sc, &mut never()).unwrap();
+    let prov = b.provenance_for(&sc);
+    let job = AuditJob { scene: sc.clone(), prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: PointFlags(PointFlags::CADENCE_FRESH), tick_only: false };
+    b.judge_audit(job, ta.energy, ta.forces.clone(), None, None, None, 1.0, Some(10), None);
+    let p = last_point(&b);
+    assert_eq!((p.kind, p.flags), (PointKind::Audit, PointFlags(PointFlags::CADENCE_FRESH)));
+    check("background audit", &p, want);
+}
+
+/// Task 1 review (a HARD requirement for Task 3): `AuditHistory::push` panics on a non-finite or
+/// negative epistemic std, and a panic on the worker thread takes the provider down — so no value
+/// reaches it unsanitised. (a) Through `evaluate`, with the epistemic part made negligible: the total
+/// std is the floor itself (√fl(f²) = f exactly in binary floating point) and σ_E² − f² cancels to
+/// exactly 0, recorded as +0. On this path the radicand is never negative — σ_E = √fl(f² + φ̃ᵀΣφ̃) ≥ f
+/// and correctly rounded squaring is monotone — but a total std one ulp below its floor (a floor
+/// rounded differently from the one the std was built with) gives a negative radicand, whose root is
+/// NaN: (b) `epistemic_energy_std` clamps it to +0 and the point records +0. (c) The sanitiser: −0
+/// as +0; NaN, ±∞ and a negative value as absent; the point is recorded every time.
+#[test]
+fn a_cancelled_epistemic_energy_std_is_recorded_as_zero_never_a_panic() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    pin_pair_class_refused(&mut s);
+    let sc = h2(1.6);
+    let (pos, z) = pos_z(&sc);
+    let n = pos.len();
+    // (a) the epistemic part made negligible (Σ × 2⁻⁴⁰⁰: the total std is the floor's, to rounding)
+    scale_epistemic(&mut s, 2f64.powi(-200));
+    s.last_variance = None;
+    let f = n as f64 * s.model().unwrap().sigma_e;
+    let e = s.model().unwrap().predict(&pos, &z, true).unwrap().energy_std.unwrap();
+    println!("N·s_E {f:.17e} Ha, σ_E {e:.17e} Ha: σ_E² − (N·s_E)² = {:e}", e * e - f * f);
+    assert_eq!(e.to_bits(), f.to_bits(), "the premise: the total std is the floor, bit for bit");
+    let before = s.audit_history().recorded();
+    let r = s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!((r.stats.source, s.audit_history().recorded()), (Source::Fallback, before + 1), "{:?}", r.stats.notes);
+    let p = last_point(&s);
+    assert_eq!(p.pred_energy_std, e);
+    assert_eq!(p.energy_std_epistemic.map(f64::to_bits), Some(0f64.to_bits()), "cancelled to +0");
+    // (b) one ulp below the floor: a negative radicand, clamped
+    let below = f64::from_bits(f.to_bits() - 1);
+    assert!(below * below - f * f < 0.0 && (below * below - f * f).sqrt().is_nan(), "the premise: the unclamped root is NaN");
+    let clamped = epistemic_energy_std(s.model().unwrap(), n, below);
+    assert_eq!(clamped.to_bits(), 0f64.to_bits(), "clamped to +0");
+    assert!(epistemic_energy_std(s.model().unwrap(), n, f64::NAN).is_nan(), "a NaN stays NaN (rule 7 refuses it)");
+    // the sanitiser on every value it must not pass on
+    for (given, want) in [(Some(clamped), Some(0.0)), (Some(-0.0), Some(0.0)), (Some(f64::NAN), None), (Some(f64::INFINITY), None), (Some(f64::NEG_INFINITY), None), (Some(-1e-300), None), (Some(-1e-3), None), (Some(2.5e-6), Some(2.5e-6)), (None, None)] {
+        let t = MorseDimer::h2().evaluate(&sc, &mut never()).unwrap();
+        let p0 = s.model().unwrap().predict(&pos, &z, true).unwrap();
+        let stds = (p0.energy_std.unwrap(), p0.force_std.clone().unwrap(), p0.force_std_epistemic.clone().unwrap());
+        let before = s.audit_history().recorded();
+        s.record_history_point(surrogate::history::PointKind::Audit, &pos, &z, Some((stds.0, &stds.1[..], &stds.2[..])), p0.energy, &p0.forces, t.energy, &t.forces, false, false, false, Default::default(), given);
+        assert_eq!(s.audit_history().recorded(), before + 1, "{given:?}: recorded");
+        assert_eq!(last_point(&s).energy_std_epistemic.map(f64::to_bits), want.map(f64::to_bits), "{given:?}");
+    }
+}
+
+/// The fit id end to end (Task 2 review, carried to Task 3): a background audit judged by the
+/// standing fit records `Some(fit_id())`; its answer is kept, so the next refit fits new teacher
+/// data and takes `fit_id + 1`. An audit judged inside an audit fence is flagged `FENCED` at its
+/// judgement although the dispatching step's flags had no fence.
+#[test]
+fn a_judged_audit_carries_its_fit_and_its_kept_answer_makes_the_next_fit() {
+    use surrogate::history::{PointFlags, PointKind};
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let id = s.fit_id();
+    assert!(id >= 1);
+    let audit = |s: &mut SurrogateKs, sc: &Scene, flags: PointFlags| {
+        let t = MorseDimer::h2().evaluate(sc, &mut never()).unwrap();
+        let prov = s.provenance_for(sc);
+        let job = AuditJob { scene: sc.clone(), prov, generation: 0, answered: 0, kind: JobKind::Audit, id: 0, view: OrbitalViewRequest::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags, tick_only: false };
+        s.judge_audit(job, t.energy, t.forces.clone(), None, None, None, 1.0, Some(10), None);
+    };
+    let samples = s.samples();
+    audit(&mut s, &h2(1.537), PointFlags(PointFlags::CADENCE_FRESH));
+    let p = last_point(&s);
+    assert_eq!((p.kind, p.fit_id, p.flags), (PointKind::Audit, Some(id), PointFlags(PointFlags::CADENCE_FRESH)), "the fit that judged it");
+    assert_eq!(s.samples(), samples + 1, "the audited answer is kept");
+    s.refit().unwrap();
+    assert_eq!(s.fit_id(), id + 1, "the next refit fits the kept answer: a new fit");
+    // the fence at the judgement
+    let sc = h2(1.81);
+    let (pos, z) = pos_z(&sc);
+    let p = s.model().unwrap().predict(&pos, &z, false).unwrap();
+    s.audit_fences.push(FailedAudit { pos: pos.clone(), z: z.clone(), energy: p.energy, forces: p.forces.clone(), index: None, ionic: "none".into(), rejudges: AUDIT_REJUDGE_LIMIT, origin: AuditOrigin::Audit, pair: None });
+    audit(&mut s, &sc, PointFlags(0));
+    let p = last_point(&s);
+    assert_eq!((p.fit_id, p.flags), (Some(id + 1), PointFlags(PointFlags::FENCED)), "fenced at its judgement");
+}
+
+// ---- trust tightening Task 4 (spec 2026-11-18 §3): the evidence floor ----
+
+/// An H–H dimer's verdict point at `z` (see [`history_point`]) attributed to the pair key H{H}
+/// (`species`) and judged by fit `fit` (`None`: a point without a fit id).
+fn floor_point(kind: surrogate::history::PointKind, z: f64, fit: Option<u64>) -> surrogate::AuditPoint {
+    surrogate::AuditPoint { species: vec![(1, vec![1]); 2], fit_id: fit, ..history_point(kind, 2, 1, z) }
+}
+
+/// `points` audits at z = 1 (measured 0.29× the bound, far inside ENTER) of the pair key H{H},
+/// their fit ids cycling over 1..=`fits`.
+fn floor_history(fits: usize, points: usize) -> surrogate::AuditHistory {
+    let mut h = surrogate::AuditHistory::default();
+    for i in 0..points {
+        h.push(floor_point(surrogate::history::PointKind::Audit, 1.0, Some((i % fits) as u64 + 1)));
+    }
+    h
+}
+
+/// Spec §3: below the floor (12 distinct fits **and** 60 attributed points) the calibrated verdict
+/// cannot open a key alone — the rule of before (LOO force rms and max ≤ 1, LOO energy max ≤ 1)
+/// must pass as well, refused as `ClassKey::Floor` with the leave-one-out ratio that decided. At
+/// 11 fits / 80 points and at 12 fits / 59 points a key measured well inside ENTER with LOO max
+/// 3.07× (the spec's measured case, 762159b) stays shut, entering or staying; at 12 / 60 it is
+/// today's calibrated verdict (trusted); below the floor with LOO max 0.9 it opens. Below three
+/// points of evidence today's rule is unchanged (`Force`), and where the calibrated verdict itself
+/// refuses, its own refusal is named (the floor is not why it is shut).
+#[test]
+fn a_class_below_the_floor_needs_its_leave_one_out_as_well() {
+    use calibrate::{calibrate, ClassStats, ClassVerdict, ENTER, FLOOR_FITS, FLOOR_POINTS};
+    use sim::ClassKey;
+    let pol = FallbackPolicy::default();
+    let st = ClassStats { samples: 100, force_rms: 0.3, force_max: 3.07, energy_rms: 0.2, energy_max: 0.5, energy_misfits: 0 };
+    for (fits, points) in [(11, 80), (12, 59)] {
+        let cal = calibrate(&floor_history(fits, points), &pol);
+        let kc = cal.key(&hk_pair());
+        assert_eq!((kc.fits, kc.floor_points, kc.points), (fits, points, points), "{kc:?}");
+        assert!(kc.calibrated() && !kc.floor_met() && kc.measured <= ENTER, "{kc:?}");
+        for was in [false, true] {
+            match cal.key_verdict(&hk_pair(), &st, 29, was) {
+                ClassVerdict::Untrusted { key: ClassKey::Floor, value, limit, reason } => {
+                    assert_eq!((value, limit), (3.07, 1.0));
+                    // a count at or over its floor never reads "80 of 60" (trust tightening Task 8;
+                    // the Task 4 review's minor 3)
+                    let counts = if fits < FLOOR_FITS { format!("{fits} of 12 fits / {points} checks (60 needed)") } else { format!("{fits} fits (12 needed) / {points} of 60 checks") };
+                    assert_eq!(reason, format!("within the bound over {counts}, and its leave-one-out is 3.1× the bound; 100 samples"));
+                }
+                v => panic!("{fits} fits / {points} points, was {was}: {v:?}"),
+            }
+        }
+        // the energy decides when it is the leave-one-out ratio that fails
+        let e = ClassStats { force_max: 0.9, energy_max: 1.5, ..st };
+        assert!(matches!(cal.key_verdict(&hk_pair(), &e, 29, false), ClassVerdict::Untrusted { key: ClassKey::Floor, value, limit, .. } if value == 1.5 && limit == 1.0));
+        // LOO max 0.9 below the floor: the rule of before passes, the calibrated verdict opens it
+        assert_eq!(cal.key_verdict(&hk_pair(), &ClassStats { force_max: 0.9, ..st }, 29, false), ClassVerdict::Trusted);
+    }
+    // at the floor: today's calibrated verdict, the max no longer decides
+    let cal = calibrate(&floor_history(FLOOR_FITS, FLOOR_POINTS), &pol);
+    assert!(cal.key(&hk_pair()).floor_met());
+    for was in [false, true] {
+        assert_eq!(cal.key_verdict(&hk_pair(), &st, 29, was), ClassVerdict::Trusted, "was {was}");
+    }
+    // below three points of evidence: today's rule, unchanged
+    let cal = calibrate(&floor_history(2, 2), &pol);
+    assert!(!cal.key(&hk_pair()).calibrated());
+    assert!(matches!(cal.key_verdict(&hk_pair(), &st, 29, true), ClassVerdict::Untrusted { key: ClassKey::Force, value, .. } if value == 3.07));
+    // the calibrated verdict refusing too (the LOO floor R 0.8 > ENTER): its refusal is named
+    let cal = calibrate(&floor_history(11, 80), &pol);
+    assert!(matches!(cal.key_verdict(&hk_pair(), &ClassStats { force_rms: 0.8, ..st }, 29, false), ClassVerdict::Untrusted { key: ClassKey::LooFloor, .. }));
+}
+
+/// Spec §3: a point counts toward the floor only with species **and** a fit id. Points without a
+/// fit id (attributed or not) and species-less legacy points with one still enter W, the evidence
+/// and the worst-atom guard, but leave n_fit and n_pts unchanged — so they never open a key.
+#[test]
+fn points_without_a_fit_id_or_species_do_not_open_a_key() {
+    use calibrate::{calibrate, ClassStats, ClassVerdict};
+    use sim::ClassKey;
+    use surrogate::history::PointKind;
+    let pol = FallbackPolicy::default();
+    let st = ClassStats { samples: 100, force_rms: 0.3, force_max: 3.07, energy_rms: 0.2, energy_max: 0.5, energy_misfits: 0 };
+    // 11 fits / 80 points, then 40 attributed points without a fit id and 40 species-less points
+    // with new fit ids 100..139: still 11 / 80, still shut by the floor
+    let mut h = floor_history(11, 80);
+    for i in 0..40 {
+        h.push(floor_point(PointKind::Audit, 1.0, None));
+        h.push(surrogate::AuditPoint { fit_id: Some(100 + i), ..history_point(PointKind::Audit, 2, 1, 1.0) });
+    }
+    let cal = calibrate(&h, &pol);
+    let kc = cal.key(&hk_pair());
+    assert_eq!((kc.fits, kc.floor_points, kc.points), (11, 80, 160), "{kc:?}");
+    assert!(matches!(cal.key_verdict(&hk_pair(), &st, 29, false), ClassVerdict::Untrusted { key: ClassKey::Floor, .. }));
+    // at the floor (12 / 60): one bad point of each kind raises W and trips the entry guard, and
+    // leaves the floor's counts as they were
+    let base = calibrate(&floor_history(12, 60), &pol).key(&hk_pair());
+    assert!(base.floor_met() && base.worst_atom < 1.0);
+    for bad in [floor_point(PointKind::Audit, 12.0, None), surrogate::AuditPoint { fit_id: Some(99), ..history_point(PointKind::Audit, 2, 1, 12.0) }] {
+        let mut h = floor_history(12, 60);
+        h.push(bad);
+        let cal = calibrate(&h, &pol);
+        let kc = cal.key(&hk_pair());
+        assert_eq!((kc.fits, kc.floor_points, kc.points), (12, 60, 61), "{kc:?}");
+        assert!(kc.measured > base.measured && kc.worst_atom > calibrate::WORST_ATOM, "{kc:?}");
+        assert!(matches!(cal.key_verdict(&hk_pair(), &st, 29, false), ClassVerdict::Untrusted { key: ClassKey::WorstAtom, .. }));
+    }
+}
+
+/// Spec §3: below the floor the worst-atom guard applies both ways (as below three points before):
+/// one atom at 3.46× its bound makes a trusted key leave at 11 fits / 81 points, with the floor's
+/// words; at 12 fits / 81 points the trusted key is judged by its rms and stays (the guard holds on
+/// entry only), as today.
+#[test]
+fn the_worst_atom_guard_applies_both_ways_below_the_floor() {
+    use calibrate::{calibrate, ClassStats, ClassVerdict, WORST_ATOM};
+    use sim::ClassKey;
+    use surrogate::history::PointKind;
+    let pol = FallbackPolicy::default();
+    let fine = ClassStats { samples: 100, force_rms: 0.3, force_max: 0.9, energy_rms: 0.2, energy_max: 0.5, energy_misfits: 0 };
+    for fits in [11usize, 12] {
+        let mut h = floor_history(fits, 80);
+        h.push(floor_point(PointKind::Audit, 12.0, Some(1)));
+        let cal = calibrate(&h, &pol);
+        let kc = cal.key(&hk_pair());
+        assert_eq!((kc.fits, kc.floor_points), (fits, 81), "{kc:?}");
+        assert!(kc.calibrated() && kc.measured < calibrate::ENTER && kc.worst_atom > WORST_ATOM, "the rms alone would enter: {kc:?}");
+        assert!(matches!(cal.key_verdict(&hk_pair(), &fine, 29, false), ClassVerdict::Untrusted { key: ClassKey::WorstAtom, .. }), "{fits}: no entry");
+        let stay = cal.key_verdict(&hk_pair(), &fine, 29, true);
+        if fits < calibrate::FLOOR_FITS {
+            match stay {
+                ClassVerdict::Untrusted { key: ClassKey::WorstAtom, value, limit, reason } => {
+                    assert!((value - w_of(12.0)).abs() < 1e-12 && limit == WORST_ATOM);
+                    assert_eq!(reason, "a DFT check found an atom's force 3.5× its bound, limit 3× while the class is below its evidence floor: 11 of 12 fits / 81 checks (60 needed); 100 samples");
+                }
+                v => panic!("leaves below the floor: {v:?}"),
+            }
+        } else {
+            assert_eq!(stay, ClassVerdict::Trusted, "at the floor a trusted key is judged by its rms");
+        }
+    }
+}
+
+/// Spec §3, no grandfathering: a saved model is re-judged at load. A file whose `class_memory`
+/// holds the pair key trusted on 3 attributed comparisons (3 fits) inside the band, its fit's LOO
+/// force max 3.91× (the gap fixture's leverage outlier; measured), loads closed (`ClassKey::Floor`,
+/// value 3.91, limit 1); the same file
+/// with 12 fits / 60 comparisons in the band loads trusted (the memory holds it, as before).
+#[test]
+fn a_class_saved_open_on_three_points_loads_closed() {
+    use calibrate::{ENTER, LEAVE};
+    use surrogate::history::PointKind;
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    let l = s.class_loo()[0].clone();
+    println!("the fixture's pair class: {l:?}");
+    assert!(l.force_max > 1.0 && l.force_rms < ENTER, "premise: refused by the max alone: {l:?}");
+    let since = s.model_generation();
+    let path = std::env::temp_dir().join(format!("floor-at-load-{}.model", std::process::id()));
+    for (fits, points, open) in [(3usize, 3usize, false), (12, 60, true)] {
+        // the band: W inflated = 0.85 over `points` comparisons
+        let z = 0.85 / (w_of(1.0) * (1.0 + 1.0 / (2.0 * points as f64).sqrt()));
+        s.audit_history = surrogate::AuditHistory::default();
+        for i in 0..points {
+            s.audit_history.push(surrogate::AuditPoint { model_gen: since, ..floor_point(PointKind::Audit, z, Some((i % fits) as u64 + 1)) });
+        }
+        // a file written open (by the build of before)
+        s.class_memory = [(hk_pair(), (true, Some(since)))].into();
+        s.save_sidecar(&path).unwrap();
+        let (back, _, _) = installed_from(&path);
+        let b = back.class_loo()[0].clone();
+        let k = &b.species[0];
+        println!("{fits} fits / {points} points, loaded: {k:?}");
+        assert!((k.measured.unwrap() - 0.85).abs() < 1e-9 && 0.85 > ENTER && 0.85 <= LEAVE, "premise, in the band: {k:?}");
+        if open {
+            assert!(b.trusted && k.trusted_since == Some(since), "the floor met: the memory holds it: {b:?}");
+        } else {
+            assert!(!b.trusted, "re-judged at load: {b:?}");
+            assert!(matches!(k.refusal, Some((sim::ClassKey::Floor, v, lim)) if v == l.force_max.max(l.force_rms) && lim == 1.0), "{k:?}");
+            assert_eq!(back.class_memory.get(&hk_pair()).copied(), Some((false, None)), "committed closed");
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Review Focus 2 (the dead end, spec §3): a key below the floor refused at a parked scene says
+/// why and offers the way out. The gap fixture's pair key (LOO force max 3.91× at its far outlier) asked
+/// at 1.5 Bohr: its rule-4b comparisons there are good — they would open it today once a window
+/// (300) of them stood — but they come from one fit, so after `TEACH_PROMPT_STREAK` (5) class
+/// fallbacks the note names the floor (n_fit of 12, n_pts of 60, the leave-one-out ratio; measured:
+/// "within the bound over 1 of 12 fits / 4 of 60 checks, and its leave-one-out is 3.9× the bound")
+/// and the offer carries the prompt to teach around the blocker.
+#[test]
+fn a_parked_key_below_the_floor_raises_the_teach_prompt_and_says_why() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    let max = s.class_loo()[0].force_max;
+    assert!(!s.class_loo()[0].trusted && max > 1.0, "premise");
+    let id = s.fit_id();
+    let here = in_big_cell(h2(1.5));
+    let mut note = String::new();
+    for _ in 0..teach::TEACH_PROMPT_STREAK {
+        s.discontinuity();
+        let r = s.evaluate(&here, &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
+        note = r.stats.notes[0].clone();
+    }
+    assert_eq!(s.fit_id(), id, "parked: no refit");
+    let l = s.class_loo()[0].clone();
+    println!("{note}\n{l:?}");
+    assert!(matches!(l.refusal, Some((sim::ClassKey::Floor, v, lim)) if v == max.max(l.force_rms) && lim == 1.0), "{l:?}");
+    let n = teach::TEACH_PROMPT_STREAK;
+    assert!(note.contains(&format!("within the bound over 1 of 12 fits / {} of 60 checks, and its leave-one-out is {max:.1}× the bound", n - 1)), "{note}");
+    let p = s.teach_offer().unwrap().prompt.expect("the prompt");
+    println!("{p}");
+    assert!(p.contains("two-atom environments are untrusted everywhere") && p.ends_with("teach around it"), "{p}");
+}
+
+// ---- trust tightening Task 5 (spec 2026-11-18 §4): λ_T and λ_E over the answer sample P_A ----
+
+/// The pair class's rule-4b code (5): a class-refused point of P_A.
+fn code_pair() -> u8 {
+    history_rule_code(TeachRule::Class(sim::activity::EnvClass::Pair))
+}
+
+/// An H–H dimer point of the pair key H{H}, both atoms alike: each atom's epistemic std is `r`× and
+/// its force error `e`× the absolute bound (2e-3 Ha/Bohr, teacher force 0), so s/b = r and e/b = e
+/// up to rounding — and rule 6's bound is the same 2e-3 for e ≤ 5.77, the model's force magnitude
+/// being ‖ΔF‖ there (recorded as such; beyond it rule 6's bound is the wider 10 % of |F_m|); judged by fit `fit` with the flags word `flags`; `rule` `None` is an audit, else
+/// a fallback with that code. `energy` = (r_p, e_p) in tier units — σ_E,epi/N and |ΔE|/N over the
+/// 1e-3 Ha/atom tier — or `None` for a point without an epistemic energy std.
+fn answer_point(rule: Option<u8>, r: f64, e: f64, fit: u64, flags: u8, energy: Option<(f64, f64)>) -> surrogate::AuditPoint {
+    use surrogate::history::{PointFlags, PointKind};
+    let (b, tier, n) = (2e-3, 1e-3, 2usize);
+    let epi = r * 3f64.sqrt() * b;
+    let err = e * 3f64.sqrt() * b;
+    let kind = rule.map_or(PointKind::Audit, |rule| PointKind::Fallback { rule });
+    surrogate::AuditPoint {
+        kind,
+        classes: vec![1; n],
+        pred_force_std: vec![(epi * epi + 3e-8).sqrt(); n],
+        pred_force_std_epistemic: vec![epi; n],
+        pred_energy_std: energy.map_or(1e-5, |(rp, _)| ((rp * n as f64 * tier).powi(2) + 1e-10).sqrt()),
+        err_force: vec![err; n],
+        teacher_force: vec![0.0; n],
+        err_energy: energy.map_or(0.0, |(_, ep)| ep * n as f64 * tier),
+        n_atoms: n,
+        model_gen: 1,
+        species: vec![(1, vec![1]); n],
+        fit_id: Some(fit),
+        flags: PointFlags(flags),
+        energy_std_epistemic: energy.map(|(rp, _)| rp * n as f64 * tier),
+        // the teacher's force is 0, so the model's magnitude is the error's
+        model_force: vec![err; n],
+    }
+}
+
+/// `n` benign class-refused, cadence-fresh points of H{H} over `fits` fits: r from 0.05 to 0.9,
+/// e/b 0.1–0.5, energy r_p 0.1, e_p 0.05.
+fn benign_answers(n: usize, fits: usize) -> surrogate::AuditHistory {
+    use surrogate::history::PointFlags;
+    let mut h = surrogate::AuditHistory::default();
+    for i in 0..n {
+        let r = 0.05 + 0.85 * i as f64 / (n - 1) as f64;
+        let e = 0.1 * (1 + i % 5) as f64;
+        h.push(answer_point(Some(code_pair()), r, e, (i % fits) as u64 + 1, PointFlags::CADENCE_FRESH, Some((0.1, 0.05))));
+    }
+    h
+}
+
+/// Spec §4 (review C1): the measured tail the ratio of sums cannot see. 80 benign answer-sample
+/// points over 16 fits and one point whose atoms sit at r = s/b = 0.13 with e/b = 4.48 (the hot
+/// run's worst force ratio): every A(λ) that admits the 4.48× atoms breaks the max condition, so
+/// λ_T is the next float above 1/0.13 = 7.69 — rule 6 then refuses s ≥ b/7.69 — while λ_sum, a
+/// ratio of sums dominated by the high-std points, stays near 1.2.
+#[test]
+fn the_tail_inflation_refuses_the_measured_tail() {
+    use surrogate::history::PointFlags;
+    let pol = FallbackPolicy::default();
+    let base = calibrate::calibrate(&benign_answers(80, 16), &pol).key(&hk_pair());
+    println!("benign: λ_T {} λ_E {} λ_sum {:.4} over {} answer points", base.tail_inflation, base.energy_inflation, base.inflation, base.answer_points);
+    assert_eq!((base.tail_inflation, base.energy_inflation, base.answer_points), (1.0, 1.0, 80));
+    let mut h = benign_answers(80, 16);
+    h.push(answer_point(Some(code_pair()), 0.13, 4.48, 1, PointFlags::CADENCE_FRESH, Some((0.1, 0.05))));
+    let cal = calibrate::calibrate(&h, &pol);
+    let kc = cal.key(&hk_pair());
+    println!("with the tail: λ_T {:.15} (1/0.13 = {:.15}) λ_E {} λ_sum {:.4} over {} answer points", kc.tail_inflation, 1.0 / 0.13, kc.energy_inflation, kc.inflation, kc.answer_points);
+    let lo = 1.0 / 0.13;
+    assert!(kc.tail_inflation > lo && kc.tail_inflation <= lo * (1.0 + 1e-12), "{}", kc.tail_inflation);
+    assert!(kc.inflation >= 1.0 && kc.inflation < 2.0, "λ_sum {}", kc.inflation);
+    assert_eq!((kc.energy_inflation, kc.answer_points), (1.0, 81));
+    // the class-wide readout reads the same sample
+    assert_eq!(cal.per_class[0].tail_inflation, kc.tail_inflation);
+}
+
+/// Spec §4, "Why bound units": a confident point with an error harmless to the policy — e = 0.3 b
+/// at r = 0.02 (a mean of ratios e/s would read 15) — among 60 benign points over 12 fits leaves
+/// λ_T = 1 exactly: every A(λ) is good (max 0.5 ≤ 3; from the floor on, its rms × (1 + 1/√(2n))
+/// is ≈ 0.36 ≤ ENTER).
+#[test]
+fn a_harmless_confident_point_does_not_inflate() {
+    use surrogate::history::PointFlags;
+    let pol = FallbackPolicy::default();
+    let mut h = benign_answers(60, 12);
+    h.push(answer_point(Some(code_pair()), 0.02, 0.3, 3, PointFlags::CADENCE_FRESH, Some((0.1, 0.05))));
+    let kc = calibrate::calibrate(&h, &pol).key(&hk_pair());
+    println!("λ_T {} λ_E {} λ_sum {:.4} over {} answer points", kc.tail_inflation, kc.energy_inflation, kc.inflation, kc.answer_points);
+    assert_eq!((kc.tail_inflation, kc.energy_inflation, kc.answer_points), (1.0, 1.0, 61));
+}
+
+/// Spec §4 (rev. 2): the energy-only failures. 30 benign points (r_p 0.05–0.9 avoiding 0.2,
+/// e_p ≤ 0.1) and 7 at r_p = 0.2 with e_p 1.03–1.39 (the hot run's 485–489, 700, 701): 37 points,
+/// below the floor, so only the max condition can fire — at 1× the tier it does, and λ_E is the
+/// next float above 1/0.2 = 5. Rev. 1's max of 4.53 never fired on them: λ_E = 1. The forces are
+/// benign (λ_T = 1).
+#[test]
+fn the_energy_inflation_refuses_energy_only_failures() {
+    use calibrate::{energy_inflation, energy_inflation_with_max, TailPoint};
+    use surrogate::history::PointFlags;
+    let pol = FallbackPolicy::default();
+    let mut h = surrogate::AuditHistory::default();
+    let mut direct = Vec::new();
+    for i in 0..30 {
+        let rp = 0.05 + 0.85 * i as f64 / 29.0;
+        assert!((rp - 0.2).abs() > 1e-3);
+        let ep = 0.1 * (i % 4) as f64 / 3.0;
+        h.push(answer_point(Some(code_pair()), 0.3, 0.2, (i % 12) as u64 + 1, PointFlags::CADENCE_FRESH, Some((rp, ep))));
+        direct.push(TailPoint { point: i, fit: Some((i % 12) as u64 + 1), r: rp, e: ep });
+    }
+    for i in 0..7 {
+        let ep = 1.03 + 0.06 * i as f64;
+        h.push(answer_point(Some(code_pair()), 0.3, 0.2, i as u64 + 1, PointFlags::CADENCE_FRESH, Some((0.2, ep))));
+        direct.push(TailPoint { point: 30 + i, fit: Some(i as u64 + 1), r: 0.2, e: ep });
+    }
+    let kc = calibrate::calibrate(&h, &pol).key(&hk_pair());
+    println!("λ_E {:.17} λ_T {} over {} answer points", kc.energy_inflation, kc.tail_inflation, kc.answer_points);
+    assert!(kc.energy_inflation > 5.0 && kc.energy_inflation <= 5.0 * (1.0 + 1e-12), "{}", kc.energy_inflation);
+    assert_eq!((kc.tail_inflation, kc.answer_points), (1.0, 37));
+    let below = |_: &[TailPoint]| false;
+    assert_eq!(energy_inflation(&direct, below), 5.0f64.next_up(), "the max condition alone: just above 1/0.2");
+    assert_eq!(energy_inflation_with_max(&direct, 4.53, below), 1.0, "rev. 1's max 4.53 never fires on 1.03–1.39");
+}
+
+/// Spec §4, "The sample P_A": chosen without reading σ or λ. Points the inflations select or that
+/// a fence holds — codes 14, 15 and 24, ordinary audits, fenced class-refused points, class-refused
+/// points fresh only by a refusal (not cadence-fresh), novel ones (bit 8, and code 11 = 5d), the
+/// envelope's code 9, a fenced or novel tick — leave λ_T, λ_E and the count bit for bit, though
+/// each carries a 50× error at r = 0.01; the same point as a cadence-fresh code 5, 6 or 21, or as
+/// a tick (an audit or a code-14 fallback), moves λ_E to ≈ 100 and λ_T above 100 (rule 6's bound
+/// at |F_m| = ‖ΔF‖ = 0.17 Ha/Bohr is the 1e-2 cap: r = 0.002, λ_T ≈ 500).
+#[test]
+fn the_inflations_never_read_what_they_selected() {
+    use surrogate::history::PointFlags;
+    let pol = FallbackPolicy::default();
+    let (cf, fenced, novel, tick) = (PointFlags::CADENCE_FRESH, PointFlags::FENCED, PointFlags::NOVEL, PointFlags::TICK);
+    let bad = |rule: Option<u8>, flags: u8| answer_point(rule, 0.01, 50.0, 7, flags, Some((0.01, 50.0)));
+    let base = calibrate::calibrate(&benign_answers(80, 16), &pol).key(&hk_pair());
+    let bits = |k: &calibrate::ClassCalibration| (k.tail_inflation.to_bits(), k.energy_inflation.to_bits(), k.answer_points);
+    let left_out = [
+        ("code 14", bad(Some(14), cf)),
+        ("code 15", bad(Some(15), cf)),
+        ("code 24", bad(Some(24), cf)),
+        ("an ordinary audit", bad(None, cf)),
+        ("a fenced code 5", bad(Some(code_pair()), cf | fenced)),
+        ("a code 5 fresh only by a refusal", bad(Some(code_pair()), 0)),
+        ("a novel code 5", bad(Some(code_pair()), cf | novel)),
+        ("code 11 (5d)", bad(Some(11), cf | novel)),
+        ("code 9 (envelope)", bad(Some(9), cf)),
+        ("a fenced tick", bad(None, tick | cf | fenced)),
+        ("a novel tick", bad(None, tick | novel)),
+    ];
+    let mut all = benign_answers(80, 16);
+    for (what, p) in &left_out {
+        assert!(!calibrate::in_answer_sample(p), "{what}");
+        let mut h = benign_answers(80, 16);
+        h.push(p.clone());
+        all.push(p.clone());
+        assert_eq!(bits(&calibrate::calibrate(&h, &pol).key(&hk_pair())), bits(&base), "{what}");
+    }
+    assert_eq!(bits(&calibrate::calibrate(&all, &pol).key(&hk_pair())), bits(&base), "all of them together");
+    for (what, p) in [
+        ("a cadence-fresh code 5", bad(Some(code_pair()), cf)),
+        ("a cadence-fresh code 6", bad(Some(history_rule_code(TeachRule::Class(sim::activity::EnvClass::ManyBody))), cf)),
+        ("a cadence-fresh code 21", bad(Some(HISTORY_RULE_CLASS_AND_VARIANCE), cf)),
+        ("a tick at an audit", bad(None, tick)),
+        ("a tick at a code-14 fallback", bad(Some(14), tick)),
+    ] {
+        assert!(calibrate::in_answer_sample(&p), "{what}");
+        let mut h = benign_answers(80, 16);
+        h.push(p);
+        let k = calibrate::calibrate(&h, &pol).key(&hk_pair());
+        assert!(k.tail_inflation > 499.0 && k.tail_inflation < 501.0 && k.energy_inflation > 99.0 && k.energy_inflation < 101.0 && k.answer_points == 81, "{what}: {k:?}");
+    }
+}
+
+/// Spec §4: λ ≥ λ_sum ≥ 1 — no inflation ever shrinks the posterior's std. Over 1000 seeded random
+/// histories (random codes, flags, fits, generations, classes, r and e from 0 and 1e-3 to 10, energy
+/// stds present or not), every key's and class's λ_sum, λ_T and λ_E are numbers ≥ 1.
+#[test]
+fn no_inflation_shrinks_the_std() {
+    let pol = FallbackPolicy::default();
+    let mut rng = StdRng::seed_from_u64(0x7a11);
+    let codes = [None, Some(5u8), Some(6), Some(14), Some(15), Some(21), Some(24), Some(11), Some(17)];
+    let draw = |rng: &mut StdRng, hi: f64| if rng.gen_bool(0.05) { 0.0 } else { 10f64.powf(rng.gen_range(-3.0..hi.log10())) };
+    let (mut inflated_t, mut inflated_e, mut infinite, mut n) = (0usize, 0usize, 0usize, 0usize);
+    for _ in 0..1000 {
+        let mut h = surrogate::AuditHistory::default();
+        for _ in 0..rng.gen_range(0..120) {
+            let rule = codes[rng.gen_range(0..codes.len())];
+            let energy = rng.gen_bool(0.7).then(|| (draw(&mut rng, 3.0), draw(&mut rng, 10.0)));
+            let (r, e) = (draw(&mut rng, 3.0), draw(&mut rng, 10.0));
+            let mut p = answer_point(rule, r, e, rng.gen_range(1..20), rng.gen_range(0..16), energy);
+            p.model_gen = rng.gen_range(1..5);
+            if rng.gen_bool(0.3) {
+                p.classes = vec![2; 2];
+            }
+            h.push(p);
+        }
+        let cal = calibrate::calibrate(&h, &pol);
+        for k in cal.per_key.values().chain(cal.per_class.iter()) {
+            assert!(k.inflation >= 1.0, "λ_sum {k:?}");
+            assert!(k.tail_inflation >= 1.0 && k.inflation.max(k.tail_inflation) >= k.inflation, "λ_T {k:?}");
+            assert!(k.energy_inflation >= 1.0, "λ_E {k:?}");
+            inflated_t += (k.tail_inflation > 1.0) as usize;
+            inflated_e += (k.energy_inflation > 1.0) as usize;
+            infinite += (k.tail_inflation.is_infinite() || k.energy_inflation.is_infinite()) as usize;
+            n += 1;
+        }
+    }
+    println!("{n} calibrations: λ_T > 1 in {inflated_t}, λ_E > 1 in {inflated_e}, an infinite one in {infinite}");
+    assert!(inflated_t > 100 && inflated_e > 100 && infinite > 10, "the draws exercise the inflations");
+}
+
+/// The NaN and zero rules (plan M1, spec §4): an atom with e = s = 0 adds nothing (not to the
+/// max, the rms, the point count or the floor — 200 of them leave a floor-met set's failing rms
+/// failing); s = 0 with e/b > 3 gives ∞ (at e/b = 3 exactly the max holds); any NaN, admitted or
+/// not, gives NaN; an infinite error is the worst atom (∞ at s = 0, else the next float above
+/// 1/r); an atom never admitted at λ ≥ 1 (r > 1, or r = ∞) decides nothing; a tie group is
+/// admitted together. λ_E alike at 1× the tier. Through `calibrate`: a NaN force error gives
+/// λ_T = NaN, a NaN energy error with an epistemic std gives λ_E = NaN, and a point without that
+/// std is not in λ_E's sample.
+#[test]
+fn non_finite_and_zero_rules() {
+    use calibrate::{atoms_meet_floor, energy_inflation, points_meet_floor, tail_inflation, TailAtom, TailPoint};
+    use surrogate::history::PointFlags;
+    let at = |point: usize, r: f64, e: f64| TailAtom { point, fit: Some(point as u64 % 12 + 1), r, e };
+    let none = |_: &[TailAtom]| false;
+    assert_eq!(tail_inflation(&[], atoms_meet_floor), 1.0, "nothing measured");
+    // a floor-met set whose rms fails: 60 points over 12 fits at e 0.7, r 0.5 — 0.7 × (1 + 1/√120) = 0.764 > ENTER
+    let failing: Vec<TailAtom> = (0..60).map(|p| at(p, 0.5, 0.7)).collect();
+    assert!(atoms_meet_floor(&failing) && !atoms_meet_floor(&failing[..59]));
+    assert_eq!(tail_inflation(&failing, atoms_meet_floor), 2.0f64.next_up(), "the rms fails at the floor: λ just above 1/0.5");
+    let mut zeros = failing.clone();
+    zeros.extend((60..260).map(|p| at(p, 0.0, 0.0)));
+    assert_eq!(tail_inflation(&zeros, atoms_meet_floor), 2.0f64.next_up(), "e = s = 0 adds nothing (counted, 200 zeros would dilute the rms to 0.34)");
+    // s = 0
+    assert_eq!(tail_inflation(&[at(0, 0.0, 3.0)], none), 1.0, "e/b = 3 at s = 0: the max holds");
+    assert_eq!(tail_inflation(&[at(0, 0.0, 3.0f64.next_up())], none), f64::INFINITY, "s = 0 with e/b > 3");
+    assert_eq!(tail_inflation(&[at(0, 0.3, 0.1), at(1, 0.0, 4.0)], none), f64::INFINITY);
+    // NaN, anywhere
+    for bad in [at(0, f64::NAN, 0.1), at(0, 0.5, f64::NAN), at(0, 2.0, f64::NAN), at(0, f64::INFINITY, f64::NAN)] {
+        assert!(tail_inflation(&[at(1, 0.3, 0.1), bad], none).is_nan(), "{bad:?}");
+    }
+    // ∞ errors and stds
+    assert_eq!(tail_inflation(&[at(0, 0.5, f64::INFINITY)], none), 2.0f64.next_up());
+    assert_eq!(tail_inflation(&[at(0, 0.0, f64::INFINITY)], none), f64::INFINITY);
+    assert_eq!(tail_inflation(&[at(0, f64::INFINITY, 100.0), at(1, 2.0, 100.0), at(2, 1.0, 0.2)], none), 1.0, "never admitted at λ ≥ 1");
+    assert_eq!(tail_inflation(&[at(0, 1.0, 3.5)], none), 1.0f64.next_up(), "admitted at λ = 1 exactly (1·1 ≤ 1)");
+    // ties: the group enters together
+    assert_eq!(tail_inflation(&[at(0, 0.25, 0.1), at(1, 0.25, 9.0), at(2, 0.1, 0.1)], none), 4.0f64.next_up());
+    // λ_E at 1× the tier
+    let pt = |point: usize, r: f64, e: f64| TailPoint { point, fit: Some(1), r, e };
+    let nonep = |_: &[TailPoint]| false;
+    assert_eq!(energy_inflation(&[pt(0, 0.0, 1.0)], nonep), 1.0);
+    assert_eq!(energy_inflation(&[pt(0, 0.0, 1.0f64.next_up())], nonep), f64::INFINITY);
+    assert!(energy_inflation(&[pt(0, 0.4, 0.1), pt(1, 3.0, f64::NAN)], nonep).is_nan());
+    assert_eq!(energy_inflation(&[pt(0, 0.0, 0.0), pt(1, 0.5, 1.2)], points_meet_floor), 2.0f64.next_up());
+    // through `calibrate`
+    let pol = FallbackPolicy::default();
+    let cf = PointFlags::CADENCE_FRESH;
+    let mut h = benign_answers(20, 4);
+    let mut p = answer_point(Some(code_pair()), 0.3, 0.2, 1, cf, Some((0.2, 0.1)));
+    p.err_force[0] = f64::NAN;
+    h.push(p);
+    let k = calibrate::calibrate(&h, &pol).key(&hk_pair());
+    assert!(k.tail_inflation.is_nan() && k.energy_inflation == 1.0, "{k:?}");
+    let mut h = benign_answers(20, 4);
+    h.push(answer_point(Some(code_pair()), 0.3, 0.2, 1, cf, Some((0.2, f64::NAN))));
+    let k = calibrate::calibrate(&h, &pol).key(&hk_pair());
+    assert!(k.energy_inflation.is_nan() && k.tail_inflation == 1.0, "{k:?}");
+    let mut h = benign_answers(20, 4);
+    let mut p = answer_point(Some(code_pair()), 0.3, 0.2, 1, cf, None);
+    p.err_energy = 1.0; // 500× the tier per atom, but no epistemic std: not in λ_E's sample
+    h.push(p);
+    let k = calibrate::calibrate(&h, &pol).key(&hk_pair());
+    assert_eq!((k.energy_inflation, k.tail_inflation, k.answer_points), (1.0, 1.0, 21), "{k:?}");
+}
+
+/// Spec §4: the rms condition applies only to a set that meets the floor (12 fits, 60 points) —
+/// without that restriction one admitted atom at 0.8× the bound would make λ_T infinite. 80
+/// points over 16 fits, every atom at e/b = 0.8 (the max holds), r rising with the point: the first
+/// prefix to meet the floor holds 60 points, its rms × (1 + 1/√120) = 0.873 > ENTER, so λ_T is the
+/// next float above 1/r of the 60th point. With 59 points, or with 11 fits, the floor is never met
+/// and λ_T = 1.
+#[test]
+fn the_tail_inflation_applies_its_rms_only_where_the_set_meets_the_floor() {
+    use calibrate::{atoms_meet_floor, tail_inflation, TailAtom};
+    use surrogate::history::PointFlags;
+    let r_of = |i: usize| 0.1 + 0.8 * i as f64 / 79.0;
+    let atoms = |n: usize, fits: usize| -> Vec<TailAtom> { (0..n).flat_map(|i| [0, 1].map(|_| TailAtom { point: i, fit: Some((i % fits) as u64 + 1), r: r_of(i), e: 0.8 })).collect() };
+    assert_eq!(tail_inflation(&atoms(80, 16), atoms_meet_floor), (1.0 / r_of(59)).next_up());
+    assert_eq!(tail_inflation(&atoms(59, 16), atoms_meet_floor), 1.0);
+    assert_eq!(tail_inflation(&atoms(80, 11), atoms_meet_floor), 1.0);
+    // through `calibrate`: the same sample as history points
+    let pol = FallbackPolicy::default();
+    let mut h = surrogate::AuditHistory::default();
+    for i in 0..80 {
+        h.push(answer_point(Some(code_pair()), r_of(i), 0.8, (i % 16) as u64 + 1, PointFlags::CADENCE_FRESH, None));
+    }
+    let k = calibrate::calibrate(&h, &pol).key(&hk_pair());
+    println!("λ_T {:.15} (1/r₆₀ = {:.15}) over {} answer points; λ_E {}", k.tail_inflation, 1.0 / r_of(59), k.answer_points, k.energy_inflation);
+    assert!((k.tail_inflation / (1.0 / r_of(59)) - 1.0).abs() < 1e-12, "{k:?}");
+    assert_eq!(k.energy_inflation, 1.0, "no point carries an epistemic energy std");
+}
+
+/// Task 3 review MUST (carried): rule 5d's novelty is evaluated on every cadence-fresh step, read-only
+/// where the variance verdict was reused, and recorded as bit 8, so P_A's membership does not follow
+/// the σ-coupled variance phase. H₂ + H under an H₂-only model, the spread envelope and the per-atom
+/// grade (5e) off so that 5d alone sees the unspanned direction (as in
+/// `would_answer_agrees_with_evaluate_on_the_novelty_and_the_class`): (a) with the variance fresh,
+/// 5d names the refusal (code 11) and the point is NOVEL; (b) on a cadence-fresh step
+/// that reuses an accepting verdict, the class rule names it (a class code — in P_A by its code
+/// alone) and the read-only novelty marks it NOVEL; neither is in P_A. (c) Reused and not
+/// cadence-fresh, nothing is evaluated: no bit (and not in P_A, not being cadence-fresh). (d) A
+/// dimer the model knows, class-refused on a reused cadence-fresh step: no bit, in P_A. Nothing
+/// decided moves: the reused step's note is the class rule's.
+#[test]
+fn a_novel_geometry_is_flagged_on_every_cadence_fresh_step_whether_or_not_the_verdict_was_reused() {
+    use surrogate::history::{PointFlags, PointKind};
+    let class_codes = [code_pair(), history_rule_code(TeachRule::Class(sim::activity::EnvClass::ManyBody)), HISTORY_RULE_CLASS_AND_VARIANCE];
+    let mut s = dimer_model_three_atom_teacher();
+    s.set_policy(FallbackPolicy { max_descriptor_distance: f64::INFINITY, audit_every: 0, variance_cadence: 4, ..FallbackPolicy::default() });
+    s.active_set = None;
+    s.ensure_desc_cache();
+    // an accepting verdict at `sc` for its neighbour counts, as a reused one would be
+    let reuse = |s: &mut SurrogateKs, sc: &Scene, count: u64| {
+        let (pos, z) = pos_z(sc);
+        let model = s.model().unwrap().clone();
+        let pred = model.predict(&pos, &z, true).unwrap();
+        let mut v = s.variance_check(&model, &pred, pred.energy_std.unwrap(), pred.force_std_epistemic.as_ref().unwrap(), &pos, &z);
+        (v.accept, v.reason, v.novel) = (true, None, false);
+        s.last_variance = Some(v);
+        s.verdict_counts = neighbour_counts(&pos, model.basis.r_cut * model.basis.r_cut);
+        s.consults = 0;
+        s.cadence_steps = count;
+    };
+    let step = |s: &mut SurrogateKs, sc: &Scene| {
+        let (checks, recorded) = (s.variance_checks(), s.audit_history().recorded());
+        let r = s.evaluate(sc, &mut never()).unwrap();
+        assert_eq!((r.stats.source, s.audit_history().recorded()), (Source::Fallback, recorded + 1), "{:?}", r.stats.notes);
+        (last_point(s), s.variance_checks() > checks, r.stats.notes[0].clone())
+    };
+    let mut shown = 0;
+    for d in [2.0, 3.0, 5.0] {
+        let sc = h2_plus_h(d);
+        let (pos, z) = pos_z(&sc);
+        let nu = s.null_space.as_ref().unwrap().novelty(&pos, &z).unwrap().0;
+        assert!(nu > 1.0, "the premise: novel at {d} Bohr (ν {nu:.2e})");
+        // (a) the variance fresh, on a cadence-fresh step
+        s.last_variance = None;
+        s.cadence_steps = 8;
+        let (a, fresh, note) = step(&mut s, &sc);
+        println!("H₂ + H at {d}: fresh variance {fresh}, {:?} {:?}: {note}", a.kind, a.flags);
+        assert!(fresh && a.kind == PointKind::Fallback { rule: history_rule_code(TeachRule::NewEnvironment) }, "5d names it: {a:?}");
+        assert!(a.flags.has(PointFlags::NOVEL | PointFlags::CADENCE_FRESH) && !calibrate::in_answer_sample(&a), "{a:?}");
+        // (b) reused on a cadence-fresh step
+        reuse(&mut s, &sc, 12);
+        let (b, fresh, note) = step(&mut s, &sc);
+        println!("  reused: fresh variance {fresh}, {:?} {:?}: {note}", b.kind, b.flags);
+        assert!(!fresh, "the premise: the verdict was reused");
+        assert!(b.flags.has(PointFlags::NOVEL | PointFlags::CADENCE_FRESH) && !calibrate::in_answer_sample(&b), "{b:?}");
+        if matches!(b.kind, PointKind::Fallback { rule } if class_codes.contains(&rule)) {
+            assert!(note.contains("isn't learned well enough yet"), "the class rule decided, as before: {note}");
+            shown += 1;
+        }
+        // (c) reused, not cadence-fresh: not evaluated
+        reuse(&mut s, &sc, 13);
+        let (c, fresh, _) = step(&mut s, &sc);
+        assert!(!fresh && c.flags.0 & (PointFlags::NOVEL | PointFlags::CADENCE_FRESH) == 0 && !calibrate::in_answer_sample(&c), "{c:?}");
+    }
+    assert!(shown > 0, "a reused step at a novel geometry carried a class code (the σ-coupled case the bit closes)");
+    // (d) a dimer the model knows, its pair class refused, on a reused cadence-fresh step
+    pin_pair_class_refused(&mut s);
+    let sc = in_cell_65(h2(1.6));
+    reuse(&mut s, &sc, 16);
+    let (d, fresh, _) = step(&mut s, &sc);
+    assert!(!fresh && d.kind == PointKind::Fallback { rule: code_pair() } && d.flags == PointFlags(PointFlags::CADENCE_FRESH) && calibrate::in_answer_sample(&d), "{d:?}");
+}
+
+/// Plan Task 5: draft-mode points are not in P_A. Draft mode records a consulted step's point only
+/// at a relax verification (or a background audit), and the verification's code is the rule that
+/// fired before draft mode overrode it — a class code at a class-refused geometry. So a draft-mode
+/// step is never cadence-fresh for the history: the same verification in strict mode is in P_A,
+/// in draft mode it is not. (A draft guess's audit is never recorded at all: `Unrecorded::draft`.)
+#[test]
+fn draft_mode_points_are_not_in_the_answer_sample() {
+    use surrogate::history::{PointFlags, PointKind};
+    for draft in [false, true] {
+        let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, never_fallback: draft, ..FallbackPolicy::default() });
+        pin_pair_class_refused(&mut s);
+        s.force_teacher_next();
+        let before = s.audit_history().recorded();
+        let r = s.evaluate(&h2(1.6), &mut never()).unwrap();
+        assert_eq!((r.stats.source, s.audit_history().recorded()), (Source::Fallback, before + 1), "{:?}", r.stats.notes);
+        let p = last_point(&s);
+        println!("draft {draft}: {:?} {:?}", p.kind, p.flags);
+        assert_eq!(p.kind, PointKind::Fallback { rule: code_pair() }, "the class rule fired first");
+        assert_eq!((p.flags.has(PointFlags::CADENCE_FRESH), calibrate::in_answer_sample(&p)), (!draft, !draft), "draft {draft}");
+    }
+}
+
+/// Task 3 review minor: the cadence counter counts every step reaching the gate, the ones rules
+/// 1–4 refuse included, so its phase does not follow rule 4's untrust (audit failures on an
+/// answered-step cadence that σ-refusals shift). A step of a species the model never saw (rule 2)
+/// advances it.
+#[test]
+fn the_cadence_counter_counts_every_step_reaching_the_gate() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    let c = s.cadence_steps;
+    let r = s.evaluate(&dimer(1.5, [1.0, 0.0, 0.0], [0.0; 3], 1, 3), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback, "{:?}", r.stats.notes);
+    assert_eq!(s.cadence_steps, c + 1, "{:?}", r.stats.notes);
+    s.evaluate(&h2(1.6), &mut never()).unwrap();
+    assert_eq!(s.cadence_steps, c + 2);
+}
+
+/// Task 5 review I1: λ_T is formed on rule 6's own bound, force_bound(|F_m,j|), not the teacher's.
+/// The 10 % regime: |F_t| = 0.05 Ha/Bohr (b_t = 5e-3), the tail atom at e/b_t = 4.48 (‖ΔF‖ = 0.0388)
+/// with s = 0.13 b_t among 80 benign points. Rule 6 sees |F_m| anywhere in |F_t| ± ‖ΔF‖, its bound
+/// from 2e-3 to 8.88e-3 (0.4× to 1.78× b_t). For both ends, recorded or not (an older point: the
+/// bound at |F_t| + ‖ΔF‖), rule 6's own comparison at λ_T — λ_T·s against force_bound(|F_m|) —
+/// refuses the atom (to within rounding: λ_T = next_up(1/r) is not asserted as a bit-exact
+/// boundary). On the teacher's bound (before the fix) λ_T was 7.69 and rule 6 admitted it at 0.56×
+/// its bound.
+#[test]
+fn the_tail_inflation_is_formed_on_rule_6s_own_bound() {
+    use calibrate::{tail_inflation, TailAtom};
+    use surrogate::history::PointFlags;
+    let pol = FallbackPolicy::default();
+    let ft = 0.05;
+    let b_t = pol.force_bound(ft);
+    let err = 4.48 * 3f64.sqrt() * b_t;
+    let epi = 0.13 * 3f64.sqrt() * b_t;
+    let s = epi / 3f64.sqrt();
+    let (lo, hi) = (ft - err, ft + err);
+    println!("b_t {b_t:.3e}; rule 6's bound over |F_m| ∈ [{lo:.4}, {hi:.4}]: {:.3e} – {:.3e} ({:.2}× – {:.2}× b_t)", pol.force_bound(lo), pol.force_bound(hi), pol.force_bound(lo) / b_t, pol.force_bound(hi) / b_t);
+    assert!(pol.force_bound(hi) / b_t > 1.77, "the premise: the 10 % regime");
+    let tail = |recorded: Option<f64>| {
+        let mut p = answer_point(Some(code_pair()), 0.13, 4.48, 1, PointFlags::CADENCE_FRESH, Some((0.1, 0.05)));
+        p.teacher_force = vec![ft; 2];
+        p.err_force = vec![err; 2];
+        p.pred_force_std_epistemic = vec![epi; 2];
+        p.pred_force_std = vec![(epi * epi + 3e-8).sqrt(); 2];
+        p.model_force = recorded.map_or(Vec::new(), |f| vec![f; 2]);
+        p
+    };
+    for fm in [lo, hi] {
+        for recorded in [Some(fm), None] {
+            let mut h = benign_answers(80, 16);
+            h.push(tail(recorded));
+            let lt = calibrate::calibrate(&h, &pol).key(&hk_pair()).tail_inflation;
+            // rule 6 (`variance_check`): fs = σ_epi/√3 · λ, refused when !(fs ≤ force_bound(|F_m|))
+            let ratio = s * lt / pol.force_bound(fm);
+            println!("|F_m| {fm:.4}, recorded {}: λ_T {lt:.6}; rule 6 at λ_T: {ratio:.15}× its bound (strictly refused: {})", recorded.is_some(), !(s * lt <= pol.force_bound(fm)));
+            assert!(ratio >= 1.0 - 1e-12, "rule 6 at λ_T refuses the measured tail atom (|F_m| {fm}, recorded {}): {ratio}", recorded.is_some());
+            if recorded.is_some() {
+                // on the recorded |F_m| the factor is rule 6's own boundary, no wider (review N2)
+                assert!(ratio <= 1.0 + 1e-12, "the recorded |F_m| is used, not the fallback (|F_m| {fm}): {ratio}");
+            }
+        }
+    }
+    // the teacher's bound, as before the fix: λ_T 7.69, and rule 6 admits the atom at |F_m| = |F_t| + ‖ΔF‖
+    let before = tail_inflation(&[TailAtom { point: 0, fit: Some(1), r: s / b_t, e: err / 3f64.sqrt() / b_t }], |_| false);
+    let ratio = s * before / pol.force_bound(hi);
+    println!("on the teacher's bound: λ_T {before:.4}, rule 6 at it {ratio:.3}× its bound");
+    assert!(ratio < 0.6, "the teeth: before the fix rule 6 admitted it ({ratio})");
+}
+
+/// Task 5 review M1: a tie group is admitted together — goodness is judged after the whole group,
+/// never after each item. 60 points over 12 fits at r = 0.1, e = 0.55 (the floor met, its rms ×
+/// (1 + 1/√120) = 0.600 ≤ ENTER); then at r = 0.5 one point at e = 3.0 (the max holds) listed first
+/// and 20 points at e = 0: judged after the 3.0 alone the rms is 0.727 > ENTER (λ_T would be the next
+/// float above 2), after the whole group 0.624 — good, λ_T = 1.
+#[test]
+fn the_tail_inflation_admits_a_tie_group_together() {
+    use calibrate::{atoms_meet_floor, tail_inflation, TailAtom};
+    let mut atoms: Vec<TailAtom> = (0..60).map(|p| TailAtom { point: p, fit: Some(p as u64 % 12 + 1), r: 0.1, e: 0.55 }).collect();
+    atoms.push(TailAtom { point: 60, fit: Some(1), r: 0.5, e: 3.0 });
+    atoms.extend((61..81).map(|p| TailAtom { point: p, fit: Some(p as u64 % 12 + 1), r: 0.5, e: 0.0 }));
+    assert_eq!(tail_inflation(&atoms[..61], atoms_meet_floor), 2.0f64.next_up(), "the premise: judged after the 3.0 alone the set is bad");
+    assert_eq!(tail_inflation(&atoms, atoms_meet_floor), 1.0, "the group enters together");
+}
+
+/// Task 5 review I1: a consulted-model point records the model's per-atom force magnitudes — the
+/// same |F_m| (and the same expression) rule 6's bound reads in `variance_check`.
+#[test]
+fn a_point_records_the_model_force_rule_6_bounds_with() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() });
+    pin_pair_class_refused(&mut s);
+    let sc = h2(1.6);
+    let (pos, z) = pos_z(&sc);
+    let f = s.model().unwrap().predict(&pos, &z, false).unwrap().forces;
+    s.evaluate(&sc, &mut never()).unwrap();
+    let p = last_point(&s);
+    let want: Vec<f64> = f.iter().map(|f| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt()).collect();
+    println!("|F_m| {:?} (|F_t| {:?})", p.model_force, p.teacher_force);
+    assert_eq!(p.model_force.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), want.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+}
+
+// ---- trust tightening Task 6 (spec 2026-11-18 §4): rules 6 and 7 on λ_F and λ_E; code 24 ----
+
+/// The dimer model with its pair class judged and trusted, every consultation through rules 6–7
+/// (variance cadence 1), no audits: it answers `h2(1.6)` (each test asserts it). The noise-free
+/// Morse posterior puts rule 6 at ≈ 5e-7 of the bound there; its epistemic stds are scaled so the
+/// worst atom sits at 0.13 of it (the hot run's confident atom), so the factors that refuse are of
+/// the size the spec discusses (≈ 15) rather than ≈ 10⁶.
+fn inflations_fixture() -> SurrogateKs {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every: 0, variance_cadence: 1, ..FallbackPolicy::default() });
+    assert!(s.class_judge.is_some() && s.class_loo()[0].trusted, "the premise: a judged, trusted pair class");
+    let (r6, _, _) = sum_ratios(&s, &h2(1.6));
+    scale_epistemic(&mut s, 0.13 / r6);
+    s
+}
+
+/// Sets a key's λ_T and λ_E (with what decided them) and its P_A count in the refit's calibration —
+/// what a refit would have measured — and drops the cached variance verdict, as
+/// `refresh_class_loo` does.
+fn set_key_tail(s: &mut SurrogateKs, k: &surrogate::EnvKey, tail: (f64, calibrate::TailCause), energy: (f64, calibrate::TailCause), answer_points: usize) {
+    let j = s.class_judge.as_mut().expect("a class judge");
+    let base = j.refit_cal.key(k);
+    j.refit_cal.per_key.insert(k.clone(), calibrate::ClassCalibration { tail_inflation: tail.0, tail_cause: tail.1, energy_inflation: energy.0, energy_cause: energy.1, answer_points, ..base });
+    s.last_variance = None;
+}
+
+/// Sets a key's λ_sum where rule 6 reads it (the class verdict's species readout and the refit's
+/// calibration, with enough points of its own).
+fn set_key_sum(s: &mut SurrogateKs, k: &surrogate::EnvKey, lambda: f64) {
+    for sp in s.class_loo[0].species.iter_mut().filter(|sp| sp.z == k.z && sp.neighbours == k.neighbours) {
+        sp.inflation = lambda;
+    }
+    let j = s.class_judge.as_mut().expect("a class judge");
+    let base = j.refit_cal.key(k);
+    j.refit_cal.per_key.insert(k.clone(), calibrate::ClassCalibration { inflation: lambda, inflation_points: 10, ..base });
+    s.last_variance = None;
+}
+
+/// At `sc`: rule 6's worst atom ratio and rule 7's ratio at λ_sum (the factors of before), and the
+/// largest λ_sum among its atoms.
+fn sum_ratios(s: &SurrogateKs, sc: &Scene) -> (f64, f64, f64) {
+    let (pos, z) = pos_z(sc);
+    let m = s.model().unwrap();
+    let p = m.predict(&pos, &z, true).unwrap();
+    let infl = s.atom_inflation(m, &pos, &z);
+    let norm = |f: &[f64; 3]| (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
+    let r6 = p.force_std_epistemic.as_ref().unwrap().iter().zip(&p.forces).zip(&infl).map(|((sd, f), l)| sd / 3f64.sqrt() * l.sum / s.policy().force_bound(norm(f))).fold(0.0, f64::max);
+    let lsum = infl.iter().map(|l| l.sum).fold(1.0, f64::max);
+    let r7 = epistemic_energy_std(m, pos.len(), p.energy_std.unwrap()) / pos.len() as f64 * lsum / s.policy().energy_std_per_atom;
+    (r6, r7, lsum)
+}
+
+/// One step at `sc`: its source, its history point's code (`None` when it left none) and its note.
+fn inflation_step(s: &mut SurrogateKs, sc: &Scene) -> (Source, Option<u8>, String) {
+    use surrogate::history::PointKind;
+    let before = s.audit_history().recorded();
+    let r = s.evaluate(sc, &mut never()).unwrap();
+    let code = (s.audit_history().recorded() > before).then(|| match last_point(s).kind {
+        PointKind::Fallback { rule } => rule,
+        PointKind::Audit => panic!("no audits here"),
+    });
+    (r.stats.source, code, r.stats.notes.first().cloned().unwrap_or_default())
+}
+
+/// Key `k`'s verdict as the Model tab lists it (`class_loo().species`).
+fn key_verdict(s: &SurrogateKs, k: &surrogate::EnvKey) -> sim::SpeciesVerdict {
+    s.class_loo()[(k.class - 1) as usize].species.iter().find(|v| v.z == k.z && v.neighbours == k.neighbours).cloned().expect("the key's verdict")
+}
+
+/// Spec §4 (M2): a **sparse key** — fewer than 3 points of its own answer sample P_A in the window —
+/// takes its class's λ_T and λ_E as floors, as λ_sum takes its class's; with 3 it keeps its own, and
+/// one above its class keeps its own. A NaN class factor reaches a sparse key (`max_nan`, never
+/// `f64::max`). Through `evaluate`: the sparse key at its class's λ_T is refused (code 24) where
+/// its own λ_T of 1 answers, the note saying the factor is its class's; with 3 own points it answers.
+#[test]
+fn a_sparse_key_takes_its_class_inflations_as_floors() {
+    use calibrate::TailCause;
+    let mut s = inflations_fixture();
+    let (k, sc) = (hk_pair(), h2(1.6));
+    let (r6, _, lsum) = sum_ratios(&s, &sc);
+    assert_eq!(s.key_inflations(&k), (lsum, 1.0), "the premise: no tail evidence");
+    // the class's λ_T puts rule 6 at 2× the bound here
+    let class_t = 2.0 * lsum / r6;
+    let set_class = |s: &mut SurrogateKs, t: f64, e: f64| {
+        let c = &mut s.class_judge.as_mut().unwrap().refit_cal.per_class[0];
+        (c.tail_inflation, c.tail_cause, c.energy_inflation, c.energy_cause) = (t, TailCause::Max { e: 4.5, r: 0.13 }, e, TailCause::Max { e: 1.2, r: 0.3 });
+        s.last_variance = None;
+    };
+    set_class(&mut s, class_t, 3.0);
+    println!("λ_sum {lsum}, rule 6 at λ_sum {r6:.3e}; the class's λ_T {class_t:.3}, λ_E 3");
+    for own in [0, 1, 2] {
+        set_key_tail(&mut s, &k, (1.0, TailCause::None), (1.0, TailCause::None), own);
+        assert_eq!(s.key_inflations(&k), (class_t.max(lsum), 3.0), "{own} own points: the class's floors");
+        // the Model tab's readout (plan Task 8) shows the factors the rules read, floors included
+        s.rejudge_classes();
+        let v = key_verdict(&s, &k);
+        assert_eq!((v.tail_inflation, v.energy_inflation), (class_t, 3.0), "{own} own points: the readout");
+        assert_eq!(v.rule_inflation, s.key_factors(&k).sum, "{own} own points: the readout's λ_sum is the rules'");
+    }
+    // Task 8 review I2: a key with fewer than 3 points of its own posterior evidence reads its
+    // class's λ_sum where larger — the readout carries that floored λ_sum, and its own stays apart
+    {
+        let j = s.class_judge.as_mut().unwrap();
+        let base = j.refit_cal.key(&k);
+        j.refit_cal.per_key.insert(k.clone(), calibrate::ClassCalibration { inflation: 1.0, inflation_points: 2, ..base });
+        j.refit_cal.per_class[0].inflation = 2.0 * lsum.max(1.0);
+    }
+    s.rejudge_classes();
+    let v = key_verdict(&s, &k);
+    let floored = 2.0 * lsum.max(1.0);
+    assert_eq!((v.inflation, v.rule_inflation, s.key_factors(&k).sum), (1.0, floored, floored), "a sparse key's λ_sum: its class's floor");
+    {
+        let j = s.class_judge.as_mut().unwrap();
+        let base = j.refit_cal.key(&k);
+        j.refit_cal.per_key.insert(k.clone(), calibrate::ClassCalibration { inflation: lsum, inflation_points: 10, ..base });
+        j.refit_cal.per_class[0].inflation = 1.0;
+    }
+    s.rejudge_classes();
+    assert_eq!(key_verdict(&s, &k).rule_inflation, lsum, "with its own evidence: its own λ_sum");
+    set_key_tail(&mut s, &k, (1.0, TailCause::None), (1.0, TailCause::None), 3);
+    assert_eq!(s.key_inflations(&k), (lsum, 1.0), "3 own points: its own");
+    set_key_tail(&mut s, &k, (2.0 * class_t, TailCause::Max { e: 9.0, r: 0.1 }), (6.0, TailCause::Max { e: 2.0, r: 0.2 }), 2);
+    assert_eq!(s.key_inflations(&k), (2.0 * class_t, 6.0), "above its class: its own");
+    assert_eq!(s.key_factors(&k).sum, lsum, "λ_sum's own rule is untouched");
+    // NaN class factors reach a sparse key
+    set_class(&mut s, f64::NAN, f64::NAN);
+    set_key_tail(&mut s, &k, (1.0, TailCause::None), (1.0, TailCause::None), 2);
+    let (f, e) = s.key_inflations(&k);
+    assert!(f.is_nan() && e.is_nan(), "a sparse key at NaN class factors: ({f}, {e})");
+    set_key_tail(&mut s, &k, (1.0, TailCause::None), (1.0, TailCause::None), 3);
+    assert_eq!(s.key_inflations(&k), (lsum, 1.0), "not sparse: its own");
+    // through `evaluate`
+    set_class(&mut s, class_t, 1.0);
+    set_key_tail(&mut s, &k, (1.0, TailCause::None), (1.0, TailCause::None), 3);
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    assert_eq!((src, code), (Source::Surrogate, None), "its own λ_T of 1: answered ({note})");
+    set_key_tail(&mut s, &k, (1.0, TailCause::None), (1.0, TailCause::None), 2);
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    println!("sparse: {note}");
+    assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "{note}");
+    assert!(
+        note.contains(&format!("(the model's std × λ_T {class_t:.1}, its class's (this environment has fewer than 3 checks of its own): a measured atom at 4.5× the bound with the model's std 0.13× of it)")),
+        "{note}"
+    );
+}
+
+/// Spec §4, code 24: a step rule 6 refuses only at λ_F = max(λ_sum, λ_T) — at λ_sum it passes — is
+/// a fallback coded 24, never in the answer sample P_A; the note names λ_T and its measured cause
+/// ("λ_T 7.7: a measured atom at 4.5× the bound with the model's std 0.13× of it"). A step that
+/// λ_sum already refuses is code 14 whatever λ_T is, and its words are byte-identical to before
+/// unless λ_T is the larger factor (at λ_T = 1 and at λ_T = λ_sum alike).
+#[test]
+fn a_step_refused_only_by_the_tail_inflation_is_code_24() {
+    use calibrate::TailCause;
+    let mut s = inflations_fixture();
+    let (k, sc) = (hk_pair(), h2(1.6));
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    assert_eq!((src, code), (Source::Surrogate, None), "the premise: answered at λ_sum ({note})");
+    let (r6, r7, lsum) = sum_ratios(&s, &sc);
+    let lt = 2.0 * lsum / r6;
+    println!("at λ_sum {lsum}: rule 6 {r6:.3e}, rule 7 {r7:.3e} of the limit; λ_T {lt:.3}");
+    let cause = TailCause::Max { e: 4.48, r: 0.13 };
+    set_key_tail(&mut s, &k, (lt, cause), (1.0, TailCause::None), 81);
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    println!("{note}");
+    assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "{note}");
+    // Task 8 review M4: the Activity event carries the code, so its row can say why
+    assert_eq!(s.ledger.events.back().map(|e| e.history_code), Some(Some(HISTORY_RULE_TAIL_INFLATION)), "the event's history code");
+    let p = last_point(&s);
+    assert!(!calibrate::in_answer_sample(&p) && p.flags.has(surrogate::history::PointFlags::CADENCE_FRESH), "cadence-fresh, but λ selected it: {p:?}");
+    assert!(note.starts_with("surrogate: epistemic force std"), "rule 6 named it: {note}");
+    assert!(note.contains(&format!(" (the model's std × λ_T {lt:.1}: a measured atom at 4.5× the bound with the model's std 0.13× of it)")), "{note}");
+    assert_eq!(history_rule_name(HISTORY_RULE_TAIL_INFLATION), "rule 6/7 at the tail-aware inflation (passes at λ_sum)");
+    // review I1: code 24 needs **both** rules to pass at λ_sum — each half alone fails it (code 14,
+    // never 24). At the verdict itself, σ_E,epi/N set through the total std as in `rule_7_…`:
+    {
+        use sim::activity::TeachRule as R;
+        let (pos, z) = pos_z(&sc);
+        let model = s.model().unwrap().clone();
+        let pred = model.predict(&pos, &z, true).unwrap();
+        let f_std = pred.force_std_epistemic.clone().unwrap();
+        let n = pos.len();
+        let tier = s.policy().energy_std_per_atom;
+        let floor = if model.energy_per_atom { n as f64 * model.sigma_e } else { model.sigma_e };
+        let e_std_at = |x: f64| (floor * floor + (x * tier * n as f64).powi(2)).sqrt();
+        // (a) rule 6 passes at λ_sum (0.13) and fails at λ_T; rule 7 at 1.5× the tier at λ_sum
+        let v = s.variance_check(&model, &pred, e_std_at(1.5), &f_std, &pos, &z);
+        let (energy_at_sum, _) = s.energy_variance(&model, &pos, e_std_at(1.5), &s.atom_inflation(&model, &pos, &z));
+        assert!(!v.accept && !v.by_tail && !energy_at_sum && v.atoms.iter().any(|&a| a > 1.0) && v.reason.as_ref().map(|r| r.rule) == Some(R::ForceUncertainty), "(a) forces pass at λ_sum, the energy does not: code 14 ({:?})", v.reason.map(|r| r.text));
+        // (b) rule 6 at 2× at λ_sum, rule 7 at 0.5× the tier with λ_E 3 (refuses at the factor, passes at λ_sum)
+        set_key_tail(&mut s, &k, (1.0, TailCause::None), (3.0, TailCause::Max { e: 1.2, r: 0.3 }), 81);
+        let wide: Vec<f64> = f_std.iter().map(|sd| sd * 2.0 / r6).collect();
+        let v = s.variance_check(&model, &pred, e_std_at(0.5), &wide, &pos, &z);
+        let (energy_at_sum, energy) = s.energy_variance(&model, &pos, e_std_at(0.5), &s.atom_inflation(&model, &pos, &z));
+        assert!(energy_at_sum && energy.is_some(), "(b) the premise: rule 7 passes at λ_sum and refuses at λ_E");
+        assert!(!v.accept && !v.by_tail && v.reason.as_ref().map(|r| r.rule) == Some(R::ForceUncertainty), "(b) the energy passes at λ_sum, the forces do not: code 14 ({:?})", v.reason.map(|r| r.text));
+        set_key_tail(&mut s, &k, (lt, cause), (1.0, TailCause::None), 81);
+    }
+    // refused at λ_sum already: code 14 whatever λ_T is (λ_sum 1.5 here, so its words are not empty)
+    set_key_sum(&mut s, &k, 1.5);
+    scale_epistemic(&mut s, 4.0 / r6);
+    set_key_tail(&mut s, &k, (1.0, TailCause::None), (1.0, TailCause::None), 81);
+    let (src, code, plain) = inflation_step(&mut s, &sc);
+    println!("{plain}");
+    assert_eq!((src, code), (Source::Fallback, Some(history_rule_code(TeachRule::ForceUncertainty))), "{plain}");
+    assert_eq!(s.ledger.events.back().map(|e| e.history_code), Some(Some(history_rule_code(TeachRule::ForceUncertainty))), "code 14 on the event");
+    assert!(plain.contains(" (the model's std × 1.50, its measured calibration for this environment class)"), "the words of before: {plain}");
+    set_key_tail(&mut s, &k, (1.5, cause), (1.0, TailCause::None), 81);
+    let (src, code, same) = inflation_step(&mut s, &sc);
+    assert_eq!((src, code, &same), (Source::Fallback, Some(history_rule_code(TeachRule::ForceUncertainty)), &plain), "λ_T = λ_sum: byte-identical");
+    set_key_tail(&mut s, &k, (4.0 * lt, cause), (1.0, TailCause::None), 81);
+    let (src, code, named) = inflation_step(&mut s, &sc);
+    println!("{named}");
+    assert_eq!((src, code), (Source::Fallback, Some(history_rule_code(TeachRule::ForceUncertainty))), "refused at λ_sum: code 14");
+    assert!(named.contains(&format!("λ_T {:.1}: a measured atom at 4.5× the bound", 4.0 * lt)), "the larger factor is named: {named}");
+}
+
+/// Plan M1: a NaN factor refuses — λ_T NaN refuses rule 6 (code 24: at λ_sum it passes), λ_E NaN
+/// refuses rule 7 — and their words say the measurement is not a number; an infinite factor
+/// refuses an atom whose std is 0 (∞·0 counts as ∞: its ratio is ∞, never NaN) and rule 7 at an
+/// energy std of 0.
+#[test]
+fn a_nan_inflation_refuses() {
+    use calibrate::TailCause;
+    use sim::activity::TeachRule as R;
+    let mut s = inflations_fixture();
+    let (k, sc) = (hk_pair(), h2(1.6));
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    assert_eq!((src, code), (Source::Surrogate, None), "the premise: answered ({note})");
+    set_key_tail(&mut s, &k, (f64::NAN, TailCause::NotANumber), (1.0, TailCause::None), 81);
+    assert!(s.key_inflations(&k).0.is_nan());
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    println!("{note}");
+    assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "{note}");
+    assert!(note.starts_with("surrogate: epistemic force std NaN") && note.contains("(the model's std × λ_T NaN: a measured comparison is not a number; it lifts as the window ages)"), "{note}");
+    set_key_tail(&mut s, &k, (1.0, TailCause::None), (f64::NAN, TailCause::NotANumber), 81);
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    println!("{note}");
+    assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "{note}");
+    assert!(note.starts_with("surrogate: epistemic energy std NaN") && note.contains("λ_E NaN"), "{note}");
+    // ∞·0 = ∞
+    set_key_tail(&mut s, &k, (f64::INFINITY, TailCause::Max { e: 4.0, r: 0.0 }), (1.0, TailCause::None), 81);
+    let (pos, z) = pos_z(&sc);
+    let model = s.model().unwrap().clone();
+    let pred = model.predict(&pos, &z, true).unwrap();
+    let v = s.variance_check(&model, &pred, 0.0, &[0.0, 0.0], &pos, &z);
+    println!("{:?} {:?}", v.atoms, v.reason.as_ref().map(|r| &r.text));
+    assert!(!v.accept && v.by_tail && v.atoms == [f64::INFINITY; 2] && v.uncertainty == f64::INFINITY, "{:?}", v.atoms);
+    assert_eq!(v.reason.as_ref().map(|r| r.rule), Some(R::ForceUncertainty));
+    let (at_sum, r7) = s.energy_variance(&model, &pos, 0.0, &s.atom_inflation(&model, &pos, &z));
+    assert!(at_sum && r7.is_some_and(|r| r.text.contains("λ_T = ∞")), "rule 7 at an energy std of 0 and λ_F ∞");
+}
+
+/// Review Focus 3 (spec §4, "No lockout follows"): a trusted key locked by λ_T = ∞ says so and keeps
+/// measuring. One calibration tick of H{H} (at a code-15 fallback: no solve, its stds at hand) with
+/// the model's force std 0 and both atoms' errors 4× the bound: at the next calibration of a refit
+/// (`refresh_class_loo`: the inflations move there, never on a step) λ_T = ∞. Every atom of the
+/// key is then refused (rule 6, code 24 — at λ_sum it answers), the note names λ_T = ∞, the
+/// measured atom and "lifts as the window ages", while the class panel still says trusted. The
+/// locked steps keep leaving history points (code 24, not in P_A: the factor never reads its own
+/// refusals), a tick at one of them would be in P_A, and recalibrating on them changes nothing.
+/// Once 300 newer answer-sample points have moved the window past the bad tick, the next
+/// calibration lifts λ_T and the step is answered again. The ticks here are pushed by hand; the
+/// same lock on ticks `evaluate` takes is `a_key_locked_by_its_tail_inflation_keeps_measuring_on_real_ticks`
+/// (Task 7). This version is kept for what the real one cannot reach: the per-atom verdicts
+/// (`atom_verdicts`) of the locked key, and a lift whose newer window meets the evidence floor
+/// (300 ticks over 16 fits, so λ_T's rms condition applies; a real run of locked steps carries one
+/// or two fit ids).
+#[test]
+fn a_key_locked_by_its_tail_inflation_says_so_and_keeps_measuring() {
+    use sim::activity::TeachRule as R;
+    use surrogate::history::PointFlags;
+    let mut s = inflations_fixture();
+    let (k, sc) = (hk_pair(), h2(1.6));
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    assert_eq!((src, code), (Source::Surrogate, None), "the premise: answered ({note})");
+    let (lsum, le) = s.key_inflations(&k);
+    let (g, fit) = (s.model_gen, s.fit_id());
+    let code_15 = history_rule_code(R::EnergyUncertainty);
+    let tick = |r: f64, e: f64, gen: u64, fit: u64| surrogate::AuditPoint { model_gen: gen, ..answer_point(Some(code_15), r, e, fit, PointFlags::TICK, None) };
+    s.audit_history.push(tick(0.0, 4.0, g, fit));
+    s.refresh_class_loo();
+    let kf = s.key_factors(&k);
+    println!("before: λ_F {lsum}, λ_E {le}; after the tick: {kf:?}");
+    assert_eq!((kf.force(), kf.energy), (f64::INFINITY, 1.0), "{kf:?}");
+    assert!(s.class_loo()[0].trusted, "the panel says trusted");
+    // … and shows the lock (plan Task 8: the readout carries λ_T, λ_E and the floor's counts)
+    let v = key_verdict(&s, &k);
+    let kc = s.class_judge.as_ref().unwrap().cal.key(&k);
+    assert_eq!((v.trusted, v.tail_inflation, v.energy_inflation, v.fits, v.floor_points), (true, f64::INFINITY, 1.0, kc.fits, kc.floor_points), "{v:?}");
+    // every atom of the key is refused
+    let v = s.atom_verdicts(&sc).unwrap();
+    assert!(v.atoms.iter().all(|a| *a == Some(R::ForceUncertainty)), "{:?}", v.atoms);
+    let mut note = String::new();
+    for _ in 0..5 {
+        let (src, code, n) = inflation_step(&mut s, &sc);
+        assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "{n}");
+        assert!(!calibrate::in_answer_sample(&last_point(&s)));
+        note = n;
+    }
+    println!("{note}");
+    assert!(note.contains("(the model's std × λ_T = ∞: a measured atom at 4.0× the bound where the model's std was 0; it lifts as the window ages)"), "{note}");
+    let mut p = last_point(&s);
+    p.flags = PointFlags(p.flags.0 | PointFlags::TICK);
+    assert!(calibrate::in_answer_sample(&p), "a tick at a locked step is in P_A");
+    s.refresh_class_loo();
+    assert_eq!(s.key_inflations(&k).0, f64::INFINITY, "its own refusals do not move it");
+    // the window ages: 300 benign ticks of a newer generation over 16 fits
+    for i in 0..300 {
+        s.audit_history.push(tick(0.3, 0.2, g + 1, (i % 16) as u64 + 1));
+    }
+    s.refresh_class_loo();
+    let kf = s.key_factors(&k);
+    println!("after 300 newer ticks: {kf:?}");
+    assert_eq!(kf.tail, 1.0, "{kf:?}");
+    assert!(kf.force().is_finite());
+    assert_eq!(key_verdict(&s, &k).tail_inflation, 1.0, "the readout lifts with it");
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    assert_eq!((src, code), (Source::Surrogate, None), "lifted: answered again ({note})");
+}
+
+/// Spec §4, rule 7: max(max_j λ_F(j), max_k λ_E(k))·σ_E,epi/N ≤ tier. With λ_T = 1 and λ_E set so
+/// rule 7 is at 2× the tier while every atom's rule 6 passes (its factor λ_sum unchanged), the step
+/// falls back on rule 7, coded 24, and the note names λ_E and its measured energy. At the verdict
+/// itself, with σ_E,epi/N = 0.5× the tier: the factor is the max of both — λ_T 3 alone refuses
+/// (λ_T named), λ_T 1.5 passes, λ_E 3 above λ_T 2.5 refuses (λ_E named), λ_E 2.5 below λ_T 3 does
+/// not lower it (λ_T named), and a NaN in either refuses; at λ_sum alone all of them pass.
+#[test]
+fn rule_7_uses_the_energy_inflation_while_forces_pass() {
+    use calibrate::TailCause;
+    use sim::activity::TeachRule as R;
+    let mut s = inflations_fixture();
+    let (k, sc) = (hk_pair(), h2(1.6));
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    assert_eq!((src, code), (Source::Surrogate, None), "the premise: answered ({note})");
+    let (r6, r7, lsum) = sum_ratios(&s, &sc);
+    let le = 2.0 * lsum / r7;
+    println!("at λ_sum {lsum}: rule 6 {r6:.3e}, rule 7 {r7:.3e}; λ_E {le:.3}");
+    set_key_tail(&mut s, &k, (1.0, TailCause::None), (le, TailCause::Max { e: 1.2, r: 0.2 }), 81);
+    let (pos, z) = pos_z(&sc);
+    let model = s.model().unwrap().clone();
+    let pred = model.predict(&pos, &z, true).unwrap();
+    let v = s.variance_check(&model, &pred, pred.energy_std.unwrap(), pred.force_std_epistemic.as_ref().unwrap(), &pos, &z);
+    assert!(v.atoms.iter().all(|&a| a <= 1.0) && v.by_tail && v.reason.as_ref().map(|r| r.rule) == Some(R::EnergyUncertainty), "rule 6 passes on every atom: {:?}", v.atoms);
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    println!("{note}");
+    assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "{note}");
+    assert!(note.starts_with("surrogate: epistemic energy std"), "{note}");
+    assert!(note.contains(&format!(" (the model's std × λ_E {le:.1}: a measured energy at 1.2× the tier with the model's std 0.20× of it)")), "{note}");
+    // the factor at the verdict, σ_E,epi/N = 0.5× the tier
+    let n = 2usize;
+    let tier = s.policy().energy_std_per_atom;
+    let floor = if model.energy_per_atom { n as f64 * model.sigma_e } else { model.sigma_e };
+    let e_std = (floor * floor + (0.5 * tier * n as f64).powi(2)).sqrt();
+    let epi = epistemic_energy_std(&model, n, e_std) / n as f64 / tier;
+    assert!((epi - 0.5).abs() < 1e-9, "{epi}");
+    let at = |tail: f64, energy: f64| {
+        let f = KeyFactors { tail, energy, tail_cause: TailCause::Max { e: 4.0, r: 0.2 }, energy_cause: TailCause::Max { e: 1.3, r: 0.25 }, ..KeyFactors::ONE };
+        s.energy_variance(&model, &pos, e_std, &[KeyFactors::ONE, f])
+    };
+    let words = |r: &Option<Refusal>| r.as_ref().map(|r| r.text.clone()).unwrap_or_default();
+    let (sum_ok, r) = at(3.0, 1.0);
+    assert!(sum_ok && words(&r).contains("λ_T 3.0: a measured atom at 4.0× the bound"), "λ_T alone: {}", words(&r));
+    assert!(at(1.5, 1.0).1.is_none(), "1.5 × 0.5 ≤ 1");
+    let (sum_ok, r) = at(2.5, 3.0);
+    assert!(sum_ok && words(&r).contains("λ_E 3.0: a measured energy at 1.3× the tier"), "{}", words(&r));
+    let (sum_ok, r) = at(3.0, 2.5);
+    assert!(sum_ok && words(&r).contains("λ_T 3.0"), "λ_E below λ_F does not lower it: {}", words(&r));
+    for (t, e) in [(f64::NAN, 1.0), (1.0, f64::NAN)] {
+        let (sum_ok, r) = at(t, e);
+        assert!(sum_ok && r.is_some(), "NaN ({t}, {e}) refuses");
+    }
+}
+
+/// Task 6: what decided a tail-aware inflation is carried with it, and the refusal names it.
+/// Through `calibrate`: the measured tail (80 benign points and one at r 0.13, e/b 4.48) is the max
+/// condition at that atom; 80 points at e/b 0.8 fail the rms from the floor on (60 points, 0.873 ×
+/// ENTER's 0.707); a NaN comparison is not a number; a benign sample decided nothing. The rms words
+/// through `evaluate`: "the error rms with its small-sample margin 0.87× the bound over 60 checks,
+/// limit 0.71, with the model's std up to 0.50× of it" (0.873 = 0.8 × (1 + 1/√120): the margin
+/// is named, the inflated value is not called the measured rms — review M5).
+#[test]
+fn the_inflations_name_their_cause() {
+    use calibrate::TailCause;
+    use surrogate::history::PointFlags;
+    let pol = FallbackPolicy::default();
+    let cf = PointFlags::CADENCE_FRESH;
+    assert_eq!(calibrate::calibrate(&benign_answers(80, 16), &pol).key(&hk_pair()).tail_cause, TailCause::None);
+    let mut h = benign_answers(80, 16);
+    h.push(answer_point(Some(code_pair()), 0.13, 4.48, 1, cf, Some((0.1, 0.05))));
+    let kc = calibrate::calibrate(&h, &pol).key(&hk_pair());
+    println!("{:?}", kc.tail_cause);
+    assert!(matches!(kc.tail_cause, TailCause::Max { e, r } if (e - 4.48).abs() < 1e-9 && (r - 0.13).abs() < 1e-9), "{:?}", kc.tail_cause);
+    let r_of = |i: usize| 0.1 + 0.8 * i as f64 / 79.0;
+    let mut h = surrogate::AuditHistory::default();
+    for i in 0..80 {
+        h.push(answer_point(Some(code_pair()), r_of(i), 0.8, (i % 16) as u64 + 1, cf, None));
+    }
+    let kc = calibrate::calibrate(&h, &pol).key(&hk_pair());
+    println!("{:?}", kc.tail_cause);
+    assert!(matches!(kc.tail_cause, TailCause::Rms { value, points: 60, r } if value > ENTER && (value - 0.8 * (1.0 + 1.0 / 120f64.sqrt())).abs() < 1e-9 && (r - r_of(59)).abs() < 1e-9), "{:?}", kc.tail_cause);
+    let mut h = benign_answers(20, 4);
+    h.push(answer_point(Some(code_pair()), 0.3, 0.2, 1, cf, Some((0.2, f64::NAN))));
+    assert_eq!(calibrate::calibrate(&h, &pol).key(&hk_pair()).energy_cause, TailCause::NotANumber);
+    // the rms words
+    let mut s = inflations_fixture();
+    let (k, sc) = (hk_pair(), h2(1.6));
+    let (r6, _, lsum) = sum_ratios(&s, &sc);
+    set_key_tail(&mut s, &k, (2.0 * lsum / r6, TailCause::Rms { value: 0.873, points: 60, r: 0.5 }), (1.0, TailCause::None), 81);
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    println!("{note}");
+    assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "{note}");
+    assert!(note.contains(": the error rms with its small-sample margin 0.87× the bound over 60 checks, limit 0.71, with the model's std up to 0.50× of it)"), "{note}");
+}
+
+/// Review M2: rule 6's factor is per atom — λ_F(j) of atom j's **own** key. A linear H₃ chain, the
+/// middle atom 1.6 Bohr from one end and r_cut − 1.1 from the other (the ends r_cut + 0.5 apart):
+/// the end atoms hold the pair key H{H}, the middle atom a many-body key. λ_T = ∞ on the many-body
+/// key alone makes the middle atom's ratio ∞ and leaves the end atoms' ratios bit for bit as
+/// before (their λ_sum); on the pair key alone, the end atoms ∞ and the middle unchanged.
+#[test]
+fn rule_6_applies_each_atoms_own_tail_inflation() {
+    use calibrate::TailCause;
+    let mut s = inflations_fixture();
+    let model = s.model().unwrap().clone();
+    let rc = model.basis.r_cut;
+    let pos = vec![[0.0, 0.0, 0.0], [1.6, 0.0, 0.0], [rc + 0.5, 0.0, 0.0]];
+    let z = vec![1u8; 3];
+    let keys = env_keys(&pos, &z, rc * rc);
+    let (end, mid) = (keys[0].clone().expect("a key"), keys[1].clone().expect("a key"));
+    assert!(keys[2] == keys[0] && end.class == 1 && mid.class == 2, "the premise: two keys {keys:?}");
+    let pred = model.predict(&pos, &z, true).unwrap();
+    let (f, e) = (pred.force_std_epistemic.clone().unwrap(), pred.energy_std.unwrap());
+    let base = s.variance_check(&model, &pred, e, &f, &pos, &z).atoms;
+    println!("r_cut {rc}: keys {keys:?}; rule-6 ratios at λ_sum {base:?}");
+    assert!(base.iter().all(|r| r.is_finite()), "{base:?}");
+    let lock = (f64::INFINITY, TailCause::Max { e: 4.0, r: 0.0 });
+    let none = (1.0, TailCause::None);
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    set_key_tail(&mut s, &mid, lock, none, 81);
+    let v = s.variance_check(&model, &pred, e, &f, &pos, &z).atoms;
+    assert_eq!(v[1], f64::INFINITY, "the many-body atom: {v:?}");
+    assert_eq!(bits(&[v[0], v[2]]), bits(&[base[0], base[2]]), "the pair atoms keep their own factor: {v:?}");
+    set_key_tail(&mut s, &mid, none, none, 81);
+    set_key_tail(&mut s, &end, lock, none, 81);
+    let v = s.variance_check(&model, &pred, e, &f, &pos, &z).atoms;
+    assert_eq!((v[0], v[2]), (f64::INFINITY, f64::INFINITY), "the pair atoms: {v:?}");
+    assert_eq!(v[1].to_bits(), base[1].to_bits(), "the many-body atom keeps its own factor: {v:?}");
+}
+
+// ---- trust tightening Task 7 (spec 2026-11-18 §4): calibration ticks ----
+
+/// The tick tests' step `i`: an in-envelope dimer at 1.5, 1.6 or 1.7 Bohr, and on every 10th step
+/// H₂ at 4.0 Bohr, which rule 5c refuses (outside the envelope: not counted toward a tick).
+fn tick_scene(i: usize) -> Scene {
+    if i % 10 == 9 {
+        h2(4.0)
+    } else {
+        h2(1.5 + 0.1 * (i % 3) as f64)
+    }
+}
+
+/// The steps among the first `n` of [`tick_scene`] at which every `every`-th in-envelope step falls.
+fn expected_tick_steps(n: usize, every: usize) -> Vec<usize> {
+    let mut c = 0;
+    (0..n)
+        .filter(|&i| {
+            if i % 10 == 9 {
+                return false;
+            }
+            c += 1;
+            c % every == 0
+        })
+        .collect()
+}
+
+/// The tick tests' dimer model: [`trained`] on 40 Morse dimers r ∈ [1.2, 2.2] (its pair class judged
+/// and trusted), rule 8 every `audit_every` answered steps, its epistemic stds scaled so the
+/// largest rule-6/7 ratio over the in-envelope [`tick_scene`]s is 0.5 of the limit and the smallest
+/// above 0.1 — every one of them answered at ×1 and refused at ×10.
+fn tick_fixture(audit_every: usize) -> (SurrogateKs, Arc<Mutex<MorseDimer>>) {
+    let (mut s, h) = trained(1.2, 2.2, 40, FallbackPolicy { audit_every, ..FallbackPolicy::default() });
+    assert!(s.class_judge.is_some() && s.class_loo()[0].trusted, "the premise: a judged, trusted pair class");
+    let ratio = |s: &SurrogateKs, i: usize| {
+        let (r6, r7, _) = sum_ratios(s, &tick_scene(i));
+        r6.max(r7)
+    };
+    let worst = (0..3).map(|i| ratio(&s, i)).fold(0.0, f64::max);
+    scale_epistemic(&mut s, 0.5 / worst);
+    let least = (0..3).map(|i| ratio(&s, i)).fold(f64::INFINITY, f64::min);
+    assert!(least > 0.1, "the premise: ×10 refuses every in-envelope scene ({least})");
+    s.last_variance = None;
+    (s, h)
+}
+
+/// A gated auditor on the fixture's teacher (`Gated`): (the provider, the gate, its call count).
+/// The ticks' dead time is fixed at 0 (a test that needs another sets `tick_dead_fixed`).
+#[allow(clippy::type_complexity)]
+fn with_tick_auditor(s: SurrogateKs, h: &Arc<Mutex<MorseDimer>>, open: bool) -> (SurrogateKs, Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicUsize>) {
+    let gate = Arc::new(std::sync::atomic::AtomicBool::new(open));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let auditor = Gated { inner: h.clone(), open: gate.clone(), rho: 0.0, calls: calls.clone() };
+    let mut s = s.with_auditor(Box::new(auditor));
+    // a deterministic schedule: no dead time after a tick (the timed one follows wall clocks)
+    s.tick_dead_fixed = Some(0);
+    (s, gate, calls)
+}
+
+/// Waits (≤ 5 s) until the auditor has no job in flight and its answer is taken in (held for the
+/// next `evaluate`, or handled), so every step of a test sees a free auditor.
+fn settle(s: &mut SurrogateKs) {
+    let t0 = Instant::now();
+    while s.auditor.as_ref().is_some_and(|a| a.busy.is_some()) {
+        assert!(t0.elapsed().as_secs_f64() < 5.0, "the auditor did not answer within 5 s");
+        s.poll_side_jobs();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// One step: its source, its notes, and the history points it left (newest last).
+fn tick_step(s: &mut SurrogateKs, sc: &Scene) -> (Source, Vec<String>, Vec<surrogate::AuditPoint>) {
+    let before = s.audit_history().recorded();
+    let r = s.evaluate(sc, &mut never()).unwrap();
+    let new = (s.audit_history().recorded() - before) as usize;
+    let mut points: Vec<surrogate::AuditPoint> = s.audit_history().iter().rev().take(new).cloned().collect();
+    points.reverse();
+    (r.stats.source, r.stats.notes, points)
+}
+
+/// Spec §4 ("Ticks on their own cadence"), test 10: the tick decision never reads the std. Every
+/// 25th in-envelope step is a tick — steps 26, 54 and 82 of 100, the 4.0 Bohr steps (rule 5c) not
+/// counted.
+/// - **No auditor**, σ ×1 (every in-envelope step answered) and ×10 (none answered): the same tick
+///   steps; at ×1 each is served **in the step** (an audit point with `TICK`, one teacher solve, the
+///   tick's own note), at ×10 at the fallback (its point with `TICK`, no extra solve). Every tick
+///   point is in P_A and carries the stds the tick forces.
+/// - **A busy auditor** (a display job held at its gate), ×1 for 50 steps then ×10: every due tick
+///   is skipped and counted — the one at an answered step and the two at fallbacks alike — none is
+///   served in the step (answered steps stay the model's, no extra teacher solve) and none leaves a
+///   `TICK` point.
+/// - **A free auditor**, ×1: the ticks go to it (the model answers, no in-step solve), and each
+///   comes back as a judged audit point with `TICK`.
+#[test]
+fn a_calibration_tick_does_not_read_the_std() {
+    use std::sync::atomic::Ordering::SeqCst;
+    use surrogate::history::{PointFlags, PointKind};
+    let n = 100;
+    let want = expected_tick_steps(n, TICK_EVERY);
+    assert_eq!(want, [26, 54, 82]);
+    let tick_of = |points: &[surrogate::AuditPoint]| points.iter().find(|p| p.flags.has(PointFlags::TICK)).cloned();
+    // no auditor
+    for scale in [1.0, 10.0] {
+        let (mut s, h) = tick_fixture(0);
+        scale_epistemic(&mut s, scale);
+        let mut ticks = Vec::new();
+        for i in 0..n {
+            let calls0 = calls(&h);
+            let (src, notes, points) = tick_step(&mut s, &tick_scene(i));
+            if i % 10 == 9 {
+                assert_eq!(src, Source::Fallback, "the envelope refuses 4.0 Bohr: {notes:?}");
+            } else {
+                assert_eq!(src == Source::Surrogate, scale == 1.0 && !want.contains(&i), "step {i} at ×{scale}: {notes:?}");
+            }
+            let Some(p) = tick_of(&points) else { continue };
+            ticks.push(i);
+            assert!(calibrate::in_answer_sample(&p) && p.energy_std_epistemic.is_some() && p.pred_force_std_epistemic.len() == 2, "step {i}: {p:?}");
+            assert_eq!(calls(&h), calls0 + 1, "one teacher solve at step {i}");
+            if scale == 1.0 {
+                assert!(p.kind == PointKind::Audit && notes[0].starts_with("surrogate calibration tick (every 25 in-envelope steps"), "in the step: {notes:?}");
+            } else {
+                assert!(matches!(p.kind, PointKind::Fallback { rule } if rule != HISTORY_RULE_TAIL_INFLATION), "at the fallback: {p:?}");
+            }
+        }
+        println!("×{scale}: tick steps {ticks:?}, taken {} skipped {} in the step {}", s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step());
+        assert_eq!(ticks, want, "×{scale}: the same steps");
+        assert_eq!((s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step()), (3, 0, if scale == 1.0 { 3 } else { 0 }));
+    }
+    // a busy auditor: skipped whatever answers the step
+    let (s, h) = tick_fixture(0);
+    let (mut s, gate, auditor_calls) = with_tick_auditor(s, &h, false);
+    assert!(s.request_display(&h2(1.6)) && !s.auditor_idle(), "the premise: the auditor is busy");
+    assert!(want.iter().any(|&i| i < 50) && want.iter().any(|&i| i >= 50), "ticks fall at answered and refused steps");
+    for i in 0..n {
+        if i == 50 {
+            scale_epistemic(&mut s, 10.0);
+            s.last_variance = None;
+        }
+        let calls0 = calls(&h);
+        let (src, notes, points) = tick_step(&mut s, &tick_scene(i));
+        assert!(tick_of(&points).is_none(), "step {i}: no tick while the auditor is busy");
+        if i % 10 != 9 {
+            let answered = i < 50;
+            assert_eq!(src == Source::Surrogate, answered, "step {i}: never served in the step ({notes:?})");
+            assert_eq!(calls(&h), calls0 + usize::from(!answered), "step {i}: no extra teacher solve");
+        }
+    }
+    println!("busy: taken {} skipped {} in the step {}", s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step());
+    assert_eq!((s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step()), (0, 3, 0));
+    assert_eq!(auditor_calls.load(SeqCst), 0);
+    gate.store(true, SeqCst);
+    // a free auditor: the answered steps' ticks go to it
+    let (s, h) = tick_fixture(0);
+    let (mut s, _gate, auditor_calls) = with_tick_auditor(s, &h, true);
+    let (mut dispatched, mut judged) = (Vec::new(), 0);
+    // the stepping teacher's solves: the auditor solves on the same Morse handle, so its own calls
+    // are taken out (read once it is settled: its solve runs on its own thread)
+    let stepping = |h: &Arc<Mutex<MorseDimer>>| calls(h) - auditor_calls.load(SeqCst);
+    for i in 0..n + 1 {
+        settle(&mut s);
+        let calls0 = stepping(&h);
+        let (src, notes, points) = tick_step(&mut s, &tick_scene(i));
+        settle(&mut s);
+        if notes.iter().any(|n| n.starts_with("surrogate calibration tick dispatched to the background teacher (every 25 in-envelope steps")) {
+            dispatched.push(i);
+            assert_eq!((src, stepping(&h)), (Source::Surrogate, calls0), "step {i}: the model answers, no solve in the step");
+        }
+        if let Some(p) = tick_of(&points) {
+            assert!(p.kind == PointKind::Audit && calibrate::in_answer_sample(&p), "{p:?}");
+            judged += 1;
+        }
+    }
+    assert_eq!((dispatched, judged), (want.clone(), 3));
+    assert_eq!((s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step()), (3, 0, 0));
+}
+
+/// Review Focus 4 (calibration starves at full speed): with the auditor kept busy, 100 due ticks give
+/// 100 skips — `ticks_skipped()` = 100, the Model tab's "calibration checks skipped" (Task 8) — and
+/// none is served in the step: all 2500 in-envelope steps are the model's, no teacher solve, no
+/// history point.
+#[test]
+fn skipped_ticks_are_counted_and_shown() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (s, h) = tick_fixture(0);
+    let (mut s, gate, auditor_calls) = with_tick_auditor(s, &h, false);
+    assert!(s.request_display(&h2(1.6)) && !s.auditor_idle(), "the premise: the auditor is busy");
+    let calls0 = calls(&h);
+    for i in 0..100 * TICK_EVERY {
+        let r = s.evaluate(&h2(1.5 + 0.1 * (i % 3) as f64), &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Surrogate, "step {i}: {:?}", r.stats.notes);
+    }
+    println!("taken {} skipped {} in the step {}", s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step());
+    assert_eq!((s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step()), (0, 100, 0));
+    assert_eq!(s.tick_counts(), TickCounts { skipped_busy: 100, due: 100, answered_due: 100, answered_skipped_busy: 100, population: 2500, population_answered: 2500, ..TickCounts::default() }, "skipped because the auditor was busy (with other work), every one at an answered step");
+    assert_eq!((calls(&h), s.audit_history().recorded(), auditor_calls.load(SeqCst)), (calls0, 0, 0));
+    gate.store(true, SeqCst);
+}
+
+/// Spec §4: rule 8's own cadence is unchanged by the ticks. 150 steps of [`tick_scene`] with rule 8
+/// every 10 answered steps, ticks on (every 25 in-envelope steps: 5 of them, two on a rule-8 step,
+/// where one audit serves both) and off: rule 8 falls due on the same steps and the answered count
+/// ends equal — in the step (no auditor) and on a free auditor alike.
+#[test]
+fn rule_8s_cadence_is_unchanged_by_ticks() {
+    for asynchronous in [false, true] {
+        let mut runs = Vec::new();
+        for every in [TICK_EVERY, 0] {
+            let (mut s, h) = tick_fixture(10);
+            s.tick_every = every;
+            let mut s = if asynchronous { with_tick_auditor(s, &h, true).0 } else { s };
+            let mut rule_8 = Vec::new();
+            for i in 0..150 {
+                settle(&mut s);
+                let r = s.evaluate(&tick_scene(i), &mut never()).unwrap();
+                let notes = &r.stats.notes;
+                let due = match asynchronous {
+                    true => notes.iter().any(|n| n.starts_with("surrogate audit dispatched to the background teacher (every 10 answered steps")),
+                    false => notes.first().is_some_and(|n| n.starts_with("surrogate audit (every 10 answered steps)")),
+                };
+                if due {
+                    rule_8.push(i);
+                }
+            }
+            settle(&mut s);
+            println!("asynchronous {asynchronous}, ticks every {every}: rule 8 at {rule_8:?}, answered {}; ticks taken {}", s.answered, s.ticks_taken());
+            assert_eq!(s.ticks_taken(), if every > 0 { 5 } else { 0 });
+            assert_eq!(s.ticks_skipped(), 0);
+            runs.push((rule_8, s.answered));
+        }
+        assert_eq!(runs[0].0.len(), 13, "the premise: 135 answered steps, rule 8 at every 10th");
+        assert_eq!(runs[0], runs[1], "asynchronous {asynchronous}: rule 8's steps with ticks on and off");
+    }
+}
+
+/// The Task 5 review's carried MUST: a tick off the variance cadence forces the novelty (5d) and the
+/// stds for its point, read-only. H₂ + H under an H₂-only model (the spread envelope and 5e off, as
+/// in `a_novel_geometry_is_flagged_…`), its classes held trusted, on a reused accepting verdict off
+/// the cadence (count 13, k = 4): as a tick the step is an in-step audit whose point carries `TICK`
+/// and `NOVEL` (not cadence-fresh) with its stds, and is **not** in P_A; not a tick, the model
+/// answers and nothing is recorded. The verdict is reused either way (no variance check is
+/// counted): nothing decided moves.
+#[test]
+fn an_off_cadence_tick_records_the_novelty_and_the_stds() {
+    use surrogate::history::{PointFlags, PointKind};
+    let mut s = dimer_model_three_atom_teacher();
+    s.set_policy(FallbackPolicy { max_descriptor_distance: f64::INFINITY, audit_every: 0, variance_cadence: 4, ..FallbackPolicy::default() });
+    s.active_set = None;
+    s.ensure_desc_cache();
+    // every class trusted, so rule 4b does not refuse (without a class judge a key answers by its
+    // class's verdict)
+    s.class_judge = None;
+    for c in &mut s.class_loo {
+        (c.trusted, c.refusal) = (true, None);
+        for k in &mut c.species {
+            (k.trusted, k.refusal) = (true, None);
+        }
+    }
+    let sc = h2_plus_h(3.0);
+    let (pos, z) = pos_z(&sc);
+    let nu = s.null_space.as_ref().unwrap().novelty(&pos, &z).unwrap().0;
+    assert!(nu > 1.0, "the premise: novel (ν {nu:.2e})");
+    for tick in [false, true] {
+        // an accepting verdict at `sc`, as a reused one would be, off the cadence
+        let model = s.model().unwrap().clone();
+        let pred = model.predict(&pos, &z, true).unwrap();
+        let mut v = s.variance_check(&model, &pred, pred.energy_std.unwrap(), pred.force_std_epistemic.as_ref().unwrap(), &pos, &z);
+        (v.accept, v.reason, v.novel) = (true, None, false);
+        s.last_variance = Some(v);
+        s.verdict_counts = neighbour_counts(&pos, model.basis.r_cut * model.basis.r_cut);
+        s.consults = 0;
+        s.cadence_steps = 13;
+        s.tick_steps = if tick { TICK_EVERY as u64 - 1 } else { 0 };
+        let checks = s.variance_checks();
+        let (src, notes, points) = tick_step(&mut s, &sc);
+        println!("tick {tick}: {src:?} {notes:?} {points:?}");
+        assert_eq!(s.variance_checks(), checks, "the verdict was reused");
+        if !tick {
+            assert!(src == Source::Surrogate && points.is_empty(), "answered, nothing recorded");
+            continue;
+        }
+        let [p] = &points[..] else { panic!("one point: {points:?}") };
+        assert_eq!((src, p.kind), (Source::Fallback, PointKind::Audit), "{notes:?}");
+        assert_eq!(p.flags, PointFlags(PointFlags::TICK | PointFlags::NOVEL), "{p:?}");
+        assert!(p.energy_std_epistemic.is_some() && p.pred_force_std_epistemic.len() == 3, "the stds: {p:?}");
+        assert!(!calibrate::in_answer_sample(p), "a novel tick is not in P_A");
+        assert_eq!((s.ticks_taken(), s.ticks_in_step()), (1, 1));
+    }
+}
+
+/// The Task 5 review's carried MUST: a tick in draft mode never sets `TICK` (draft points stay out
+/// of P_A). In draft mode, with a free auditor and rule 8 every 5 steps, 100 steps at ×10 (strict
+/// mode would refuse every in-envelope one: the draft audits are ordinary, recorded audits): no
+/// tick is due, taken or skipped, the count does not move, and no recorded point carries `TICK`.
+/// Back in strict mode the count starts where it stood: the first tick is the 25th strict
+/// in-envelope step.
+#[test]
+fn a_tick_in_draft_mode_is_never_taken() {
+    use surrogate::history::PointFlags;
+    let (s, h) = tick_fixture(5);
+    let (mut s, _gate, _) = with_tick_auditor(s, &h, true);
+    scale_epistemic(&mut s, 10.0);
+    let strict = *s.policy();
+    s.set_policy(FallbackPolicy { never_fallback: true, ..strict });
+    let mut recorded = 0;
+    for i in 0..100 {
+        settle(&mut s);
+        let (src, notes, points) = tick_step(&mut s, &tick_scene(i));
+        assert_eq!(src, Source::Surrogate, "draft: {notes:?}");
+        assert!(points.iter().all(|p| !p.flags.has(PointFlags::TICK)), "{points:?}");
+        recorded += points.len();
+    }
+    settle(&mut s);
+    println!("draft: {recorded} points recorded; tick count {}", s.tick_steps);
+    assert!(recorded > 0, "the premise: draft audits were recorded");
+    assert_eq!((s.tick_steps, s.ticks_taken(), s.ticks_skipped(), s.ticks_in_step()), (0, 0, 0, 0));
+    s.set_policy(strict);
+    let mut first = None;
+    for i in 0..30 {
+        settle(&mut s);
+        let (_, _, points) = tick_step(&mut s, &h2(1.5 + 0.1 * (i % 3) as f64));
+        if first.is_none() && points.iter().any(|p| p.flags.has(PointFlags::TICK)) {
+            first = Some(i);
+        }
+    }
+    assert_eq!(first, Some(TICK_EVERY - 1), "strict: the 25th in-envelope step");
+}
+
+/// Spec §4 (Task 7 brief): an abandoned tick job counts as skipped. A tick dispatched to an auditor
+/// held at its gate is in flight (counted neither way); a Forget abandons it — one skip, and its
+/// answer, arriving once the gate opens, is discarded and counted no further. Unabandoned, the same
+/// tick is taken once its answer is judged (an audit point carrying `TICK`).
+#[test]
+fn an_abandoned_tick_counts_as_skipped() {
+    use std::sync::atomic::Ordering::SeqCst;
+    use surrogate::history::{PointFlags, PointKind};
+    for forget in [true, false] {
+        let (s, h) = tick_fixture(0);
+        let (mut s, gate, auditor_calls) = with_tick_auditor(s, &h, false);
+        s.tick_steps = TICK_EVERY as u64 - 1;
+        let (src, notes, _) = tick_step(&mut s, &h2(1.6));
+        assert!(src == Source::Surrogate && notes.iter().any(|n| n.starts_with("surrogate calibration tick dispatched")), "{notes:?}");
+        assert!(s.audit_in_flight() && s.tick_in_flight);
+        assert_eq!((s.ticks_taken(), s.ticks_skipped()), (0, 0), "in flight: neither");
+        if forget {
+            s.forget();
+            assert_eq!((s.ticks_taken(), s.ticks_skipped()), (0, 1), "abandoned: skipped");
+            assert_eq!(s.tick_counts(), TickCounts { lost: 1, due: 1, answered_due: 1, population: 1, population_answered: 1, ..TickCounts::default() }, "lost, not busy");
+        }
+        gate.store(true, SeqCst);
+        settle(&mut s);
+        let _ = s.evaluate(&h2(1.6), &mut never()).unwrap();
+        println!("forget {forget}: taken {} skipped {}; auditor calls {}", s.ticks_taken(), s.ticks_skipped(), auditor_calls.load(SeqCst));
+        if forget {
+            assert_eq!((s.ticks_taken(), s.ticks_skipped()), (0, 1), "the stale answer is not counted again");
+            assert_eq!(s.audit_history().recorded(), 0);
+        } else {
+            assert_eq!((s.ticks_taken(), s.ticks_skipped()), (1, 0));
+            let p = last_point(&s);
+            assert!(p.kind == PointKind::Audit && p.flags.has(PointFlags::TICK) && calibrate::in_answer_sample(&p), "{p:?}");
+        }
+    }
+}
+
+/// Review Focus 3 on real ticks (the Task 6 review's M3): a key locked by λ_T = ∞ keeps measuring on
+/// ticks `evaluate` takes, and lifts when the window turns over on them, with no hand-pushed point
+/// but the lock's own. That one point (an H{H} tick at a code-15 fallback, std 0 and errors 4× the
+/// bound) is pushed: a real posterior's std is never exactly 0, and λ_T = ∞ needs r = 0 — the case
+/// `a_key_locked_by_its_tail_inflation_says_so_and_keeps_measuring` keeps for its words.
+/// - **Locked, measuring.** 100 steps at H₂ 1.6 Bohr, every one a code-24 fallback: the 25th, 50th,
+///   75th and 100th in-envelope steps are ticks (their points carry `TICK` and are in P_A), the rest
+///   are not in P_A. Recalibrating on them leaves λ_T = ∞: the window still holds the bad point.
+/// - **The window turns over.** A refit starts a new generation (λ_T still ∞: its window reaches
+///   back to the bad point while the new generation holds fewer than 300 points); 300 ticks land in
+///   it; the next refit's window holds only them, λ_T = 1 and the step is answered again. Those 300
+///   are taken at one tick per locked step (`tick_every` = 1): at 25 steps per tick the 7500 locked
+///   steps' code-24 points would push the bad point off the 4096-point history ring first — a lift
+///   by the ring, not by the window this test is about.
+#[test]
+fn a_key_locked_by_its_tail_inflation_keeps_measuring_on_real_ticks() {
+    use sim::activity::TeachRule as R;
+    use surrogate::history::PointFlags;
+    let mut s = inflations_fixture();
+    let (k, sc) = (hk_pair(), h2(1.6));
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    assert_eq!((src, code), (Source::Surrogate, None), "the premise: answered ({note})");
+    let (g, fit) = (s.model_gen, s.fit_id());
+    let code_15 = history_rule_code(R::EnergyUncertainty);
+    s.audit_history.push(surrogate::AuditPoint { model_gen: g, ..answer_point(Some(code_15), 0.0, 4.0, fit, PointFlags::TICK, None) });
+    s.refresh_class_loo();
+    assert_eq!(s.key_inflations(&k).0, f64::INFINITY);
+    assert!(s.class_loo()[0].trusted, "the panel says trusted");
+    // locked, measuring on real ticks
+    let start = s.tick_steps;
+    let mut ticks = 0;
+    for i in 0..100u64 {
+        let (src, code, note) = inflation_step(&mut s, &sc);
+        assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "step {i}: {note}");
+        let p = last_point(&s);
+        let tick = (start + i + 1) % TICK_EVERY as u64 == 0;
+        assert_eq!((p.flags.has(PointFlags::TICK), calibrate::in_answer_sample(&p)), (tick, tick), "step {i}: {p:?}");
+        ticks += usize::from(tick);
+    }
+    assert_eq!((ticks, s.ticks_taken(), s.ticks_skipped()), (4, 4, 0));
+    s.refresh_class_loo();
+    assert_eq!(s.key_inflations(&k).0, f64::INFINITY, "the window still holds the bad point");
+    // the window turns over
+    s.refit().expect("refit");
+    assert!(s.model_gen > g);
+    assert_eq!(s.key_inflations(&k).0, f64::INFINITY, "a new generation alone does not age it");
+    s.tick_every = 1;
+    let taken = s.ticks_taken();
+    while s.ticks_taken() < taken + WINDOW_POINTS as u64 {
+        let (src, code, note) = inflation_step(&mut s, &sc);
+        assert_eq!((src, code), (Source::Fallback, Some(HISTORY_RULE_TAIL_INFLATION)), "{note}");
+        assert!(calibrate::in_answer_sample(&last_point(&s)));
+    }
+    assert!(s.audit_history().iter().any(|p| p.model_gen == g && p.err_force[0] > 0.0 && p.pred_force_std_epistemic[0] == 0.0), "the bad point is still on the ring");
+    s.refit().expect("refit");
+    let kf = s.key_factors(&k);
+    println!("after {} real ticks in a newer generation and a refit: {kf:?}", WINDOW_POINTS);
+    assert_eq!(kf.tail, 1.0, "{kf:?}");
+    // back at the real cadence, on a step that is not a tick (one would be an in-step audit)
+    s.tick_every = TICK_EVERY;
+    while (s.tick_steps + 1) % TICK_EVERY as u64 == 0 {
+        s.tick_steps += 1;
+    }
+    let (src, code, note) = inflation_step(&mut s, &sc);
+    assert_eq!((src, code), (Source::Surrogate, None), "lifted: answered again ({note})");
+}
+
+// ---- Task 7 fix round 1 (review I1, M1, M2) ----
+
+/// The Task 7 re-review's R1 and the controller's re-ruling: after **every** due tick, answered or
+/// refused, the count pauses for a σ-blind dead time D, so the ticks sample answered steps at their
+/// share of the in-envelope population. The reviewer's check, on a slow-correlation schedule: σ ×1
+/// (every step answered) for 500 steps, then ×10 (every step refused) for 500, four times over
+/// (population share 0.5 exactly); an auditor whose every solve is held 40 steps (T); a fixed
+/// D = 40 ≥ T. The answered share among the ticks taken matches the population's within 0.05, and
+/// no tick is skipped (no job outlives D).
+/// - Under the round-1 rule (counting from the previous tick's completion, no dead time) an
+///   answered tick is followed by T uncounted steps and a refused one by none, so refused stretches
+///   are over-weighted by (25 + T)/25: the share is 0.29 (the re-review's simulation; its slow
+///   limit 0.278).
+/// - Under the original rule (count every step, no dead time) the tick due 25 steps after an
+///   answered one finds its job in flight and is skipped: 0.33.
+///
+/// Both fail this test (mutations in the Task 7 report). The diagnostic counters agree: `due`,
+/// `answered_due`, `population` and `population_answered` give the same two shares.
+#[test]
+fn a_tick_samples_answered_steps_at_their_population_share() {
+    use std::sync::atomic::Ordering::SeqCst;
+    use surrogate::history::{PointFlags, PointKind};
+    let (hold, period, n) = (40usize, 1000usize, 4000usize);
+    let (s, h) = tick_fixture(0);
+    let (mut s, gate, _) = with_tick_auditor(s, &h, false);
+    s.tick_dead_fixed = Some(hold as u64);
+    let (mut scaled, mut release_at) = (false, None);
+    let (mut answered_ticks, mut refused_ticks) = (Vec::new(), Vec::new());
+    for i in 0..n {
+        let answered_stretch = i % period < period / 2;
+        if answered_stretch == scaled {
+            scale_epistemic(&mut s, if scaled { 0.1 } else { 10.0 });
+            scaled = !scaled;
+            s.last_variance = None;
+        }
+        if release_at == Some(i) {
+            // the job's solve ends: its answer arrives and waits for this step's evaluate
+            gate.store(true, SeqCst);
+            settle(&mut s);
+            gate.store(false, SeqCst);
+            release_at = None;
+        }
+        let (src, notes, points) = tick_step(&mut s, &h2(1.5 + 0.1 * (i % 3) as f64));
+        assert_eq!(src == Source::Surrogate, answered_stretch, "step {i}: the schedule ({notes:?})");
+        if notes.iter().any(|n| n.starts_with("surrogate calibration tick dispatched")) {
+            answered_ticks.push(i);
+            release_at = Some(i + hold);
+        }
+        if points.iter().any(|p| p.flags.has(PointFlags::TICK) && matches!(p.kind, PointKind::Fallback { .. })) {
+            refused_ticks.push(i);
+        }
+    }
+    gate.store(true, SeqCst);
+    let c = s.tick_counts();
+    let taken = answered_ticks.len() + refused_ticks.len();
+    let tick_share = answered_ticks.len() as f64 / taken as f64;
+    let population_share = c.population_answered as f64 / c.population as f64;
+    let due_share = c.answered_due as f64 / c.due as f64;
+    println!("D = {hold}, T = {hold}: {} answered and {} refused ticks, share {tick_share:.3}; due share {due_share:.3}; population share {population_share:.3}; {c:?}", answered_ticks.len(), refused_ticks.len());
+    assert_eq!((c.population, c.population_answered), (n as u64, (n / 2) as u64), "the population: every step in-envelope, half answered");
+    assert!((tick_share - population_share).abs() <= 0.05, "the answered share among ticks {tick_share:.3} vs the population's {population_share:.3}");
+    assert!((due_share - population_share).abs() <= 0.05, "the diagnostic's due share {due_share:.3}");
+    assert_eq!((s.ticks_skipped(), c.due, taken as u64 + u64::from(s.tick_in_flight)), (0, c.due, c.due), "no job outlives D: every due tick taken");
+}
+
+/// The Task 7 review's M2: a cancelled teacher solve on a counted step is a step that did not
+/// happen. Its count is rolled back and the retry is the tick — at a fallback tick (σ ×10) and at
+/// an in-step tick (σ ×1) alike — so cancels do not remove the σ-refused ticks preferentially.
+#[test]
+fn a_cancelled_tick_is_retried_as_the_tick() {
+    use std::sync::atomic::Ordering::SeqCst;
+    use surrogate::history::PointFlags;
+    for scale in [10.0, 1.0] {
+        let (mut s, h) = tick_fixture(0);
+        scale_epistemic(&mut s, scale);
+        s.last_variance = None;
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        s.teacher = Box::new(Gated { inner: h.clone(), open: gate.clone(), rho: 0.0, calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)) });
+        s.tick_steps = TICK_EVERY as u64 - 1;
+        let r = s.evaluate(&h2(1.6), &mut || true);
+        assert!(matches!(r, Err(ProviderError::Cancelled)), "×{scale}: the premise: cancelled ({:?})", r.as_ref().map(|r| &r.stats.notes));
+        assert_eq!((s.tick_steps, s.tick_counts()), (TICK_EVERY as u64 - 1, TickCounts::default()), "×{scale}: rolled back, nothing booked");
+        gate.store(true, SeqCst);
+        let (src, notes, points) = tick_step(&mut s, &h2(1.6));
+        println!("×{scale}: retry {src:?} {notes:?}; {:?}", s.tick_counts());
+        assert!(points.iter().any(|p| p.flags.has(PointFlags::TICK)), "×{scale}: the retry is the tick: {points:?}");
+        assert_eq!((s.tick_steps, s.ticks_taken(), s.ticks_skipped()), (TICK_EVERY as u64, 1, 0));
+        let answered = u64::from(scale == 1.0);
+        assert_eq!(s.tick_counts(), TickCounts { recorded: 1, in_step: answered, due: 1, answered_due: answered, population: 1, population_answered: answered, ..TickCounts::default() }, "×{scale}: booked once");
+    }
+}
+
+/// The Task 7 review's M1: a tick whose answer leaves no point (here box-affected, on the auditor) is
+/// taken but unrecorded — counted apart from the recorded ones, so the readout cannot show
+/// calibration going on while P_A does not grow — and, a tick alone, it does not make rule 8
+/// audit again (`audit_due` stays false).
+#[test]
+fn a_box_affected_tick_is_taken_without_a_point() {
+    let (s, h) = tick_fixture(0);
+    let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let auditor = Gated { inner: h.clone(), open, rho: 1.0, calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)) };
+    let mut s = s.with_auditor(Box::new(auditor));
+    s.tick_steps = TICK_EVERY as u64 - 1;
+    let (_, notes, _) = tick_step(&mut s, &h2(1.6));
+    assert!(notes.iter().any(|n| n.starts_with("surrogate calibration tick dispatched")), "{notes:?}");
+    settle(&mut s);
+    let (_, notes, points) = tick_step(&mut s, &h2(1.6));
+    println!("{notes:?}; {:?}", s.tick_counts());
+    assert!(points.is_empty() && notes.iter().any(|n| n.contains("box-affected") && n.contains("a calibration tick: rule 8's cadence is unchanged")), "{notes:?}");
+    assert_eq!(s.tick_counts(), TickCounts { unrecorded: 1, due: 1, answered_due: 1, population: 2, population_answered: 2, ..TickCounts::default() });
+    assert_eq!((s.ticks_taken(), s.ticks_skipped(), s.audit_due), (0, 0, false));
 }

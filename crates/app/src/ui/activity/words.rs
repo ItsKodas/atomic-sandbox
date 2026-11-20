@@ -75,6 +75,10 @@ pub struct RowCtx {
     pub near_face: bool,
     /// The answer was kept as a sample (`TeachOutcome::is_kept`).
     pub kept: bool,
+    /// A rule-6/7 refusal that passes at λ_sum alone (history code 24, `TeachEvent::history_code`):
+    /// the tail-aware inflations decided — the model was measured too confident here, not unsure
+    /// (Task 8 review M4).
+    pub tail: bool,
 }
 
 /// `box_advice`'s distance: where a hydrogen-like tail e^(−2r)/π falls to the box rule's face
@@ -200,9 +204,16 @@ pub fn rule_sentence(rule: R, atom: Option<usize>, cx: RowCtx) -> String {
         R::IsolatedAtom => with_box(format!("{} has no neighbour within reach — the model can't describe a lone atom inside a molecule's spin state", a(atom)), true),
         R::Coordination | R::Spread | R::NoGrade | R::UnspannedAtom | R::NewEnvironment | R::Grade => with_box(format!("{} {OUTSIDE}", a(atom)), true),
         R::ForceUncertainty | R::EnergyUncertainty => {
-            let base = match atom {
-                Some(i) => format!("the model is unsure here (atom {i})"),
-                None => "the model is unsure here".into(),
+            let here = match atom {
+                Some(i) => format!("here (atom {i})"),
+                None => "here".into(),
+            };
+            let base = if cx.tail {
+                // code 24: its own std passed; DFT checks measured it too small for this kind of
+                // environment (λ_T / λ_E), and the scaled std refuses
+                format!("the model was sure {here}, but DFT checks found it too confident in places like this (its uncertainty scaled by λ_T/λ_E is over the bound)")
+            } else {
+                format!("the model is unsure {here}")
             };
             // "teaches it" only for a kept answer that no box clause explains (plan review S13)
             if cx.box_affected {
@@ -394,7 +405,7 @@ pub fn trust_line(c: &sim::activity::TrustCheck, seen: AuditSeen<'_>, audit_ever
 /// checks measured" only for the error the teacher measured, "leave-one-out" only for the fit's own
 /// left-out error (M8a Task 2 review I3).
 pub fn class_line(l: &sim::ClassLoo) -> String {
-    verdict_line(class_name(l.class), l.refusal, l.evidence)
+    verdict_line(class_name(l.class), l.refusal, Counts { evidence: l.evidence, fits: l.fits, floor_points: l.floor_points })
 }
 
 /// The plain name of an environment class.
@@ -403,13 +414,82 @@ fn class_name(class: &str) -> &'static str {
 }
 
 /// One environment species' line under its class (M8a user-test fix 2: an atom answers by its own
-/// species' verdict): "Three-or-more-atom arrangements around O, with H — learned".
+/// species' verdict): "Three-or-more-atom arrangements around O, with H — learned". A key the
+/// class rule trusts but its tail-aware inflations refuse is never worded plain "learned" (trust
+/// tightening, Review Focus 3): "— learned, but …" with [`tail_note`].
 pub fn species_line(class: &str, s: &sim::SpeciesVerdict) -> String {
-    verdict_line(&format!("{} {}", class_name(class), s.words()), s.refusal, s.evidence)
+    let name = format!("{} {}", class_name(class), s.words());
+    match tail_note(s).filter(|_| s.trusted && s.refusal.is_none()) {
+        Some(note) => format!("{name} — learned, but {note}"),
+        None => verdict_line(&name, s.refusal, Counts { evidence: s.evidence, fits: s.fits, floor_points: s.floor_points }),
+    }
 }
 
-fn verdict_line(name: &str, refusal: Option<(sim::ClassKey, f64, f64)>, evidence: usize) -> String {
+/// The evidence counts a verdict line words: the evidence (`ClassLoo::evidence`) and the evidence
+/// floor's n_fit and n_pts (trust tightening, spec 2026-11-18 §3).
+#[derive(Clone, Copy, Debug)]
+struct Counts {
+    evidence: usize,
+    fits: usize,
+    floor_points: usize,
+}
+
+/// The evidence floor's two counts in words, as the provider's refusal says them
+/// (`providers::surrogate::floor_count`): "1 of 12 fits / 4 of 60 checks", "11 of 12 fits / 80
+/// checks (60 needed)" — never "80 of 60".
+pub fn floor_counts(fits: usize, floor_points: usize) -> String {
+    use providers::surrogate::{floor_count, FLOOR_FITS, FLOOR_POINTS};
+    format!("{} / {}", floor_count(fits, FLOOR_FITS, "fits"), floor_count(floor_points, FLOOR_POINTS, "checks"))
+}
+
+/// An inflation factor as the provider's refusal words print it: one decimal, "∞", "NaN".
+pub fn factor(x: f64) -> String {
+    if x.is_nan() {
+        "NaN".into()
+    } else if x.is_infinite() {
+        "∞".into()
+    } else {
+        format!("{x:.1}")
+    }
+}
+
+/// What the tail-aware inflations do to a key's steps beyond its λ_sum (trust tightening, spec
+/// 2026-11-18 §4; the steps they refuse that pass at λ_sum alone are history code 24), `None`
+/// while λ_T and λ_E are both at most the λ_sum the rules read for it
+/// (`SpeciesVerdict::rule_inflation`: a sparse key's class floor included, Task 8 review I2):
+///
+/// - a factor that is not a number, or infinite, refuses every step with the key (rule 6 at ∞·0 =
+///   ∞, rule 7 alike) until the comparison that set it ages out of the evidence window ("No lockout
+///   follows": the refused steps keep being measured) — the factor named, NaN before ∞, λ_T before
+///   λ_E on a tie;
+/// - a finite one above λ_sum refuses the steps where the model's std passes at λ_sum but not at
+///   the factor: DFT checks measured errors larger than the std claimed where it was confident —
+///   the larger factor named, λ_T on a tie.
+pub fn tail_note(s: &sim::SpeciesVerdict) -> Option<String> {
+    let (t, e) = (s.tail_inflation, s.energy_inflation);
+    let named = |x: f64, name: &str| format!("{name} {}", factor(x));
+    let locked = "every step with it goes to DFT until a check ages out of the window";
+    if t.is_nan() || e.is_nan() {
+        let which = if t.is_nan() { named(t, "λ_T") } else { named(e, "λ_E") };
+        return Some(format!("{locked}: a DFT comparison was not a number ({which})"));
+    }
+    if t.is_infinite() || e.is_infinite() {
+        let which = if t.is_infinite() { named(t, "λ_T") } else { named(e, "λ_E") };
+        return Some(format!("{locked}: a DFT check found an error beyond its limit where the model's std was 0 ({which})"));
+    }
+    let (x, name) = if t >= e { (t, "λ_T") } else { (e, "λ_E") };
+    (x > s.rule_inflation).then(|| {
+        format!(
+            "steps its std alone would pass can still go to DFT: DFT checks measured larger errors where the model was sure ({} against λ_sum {})",
+            named(x, name),
+            factor(s.rule_inflation)
+        )
+    })
+}
+
+fn verdict_line(name: &str, refusal: Option<(sim::ClassKey, f64, f64)>, counts: Counts) -> String {
     use sim::ClassKey;
+    let evidence = counts.evidence;
     let checks = |n: usize| format!("{n} DFT check{}", if n == 1 { "" } else { "s" });
     match refusal {
         None => format!("{name} — learned"),
@@ -419,10 +499,12 @@ fn verdict_line(name: &str, refusal: Option<(sim::ClassKey, f64, f64)>, evidence
         Some((ClassKey::Energy, x, _)) => format!("{name} — not yet (leave-one-out energy error {x:.1}× the tier)"),
         // open-shell Task 7c: the energy RMS with the samples the model cannot reproduce
         Some((ClassKey::EnergyRms, x, _)) => format!("{name} — not yet (leave-one-out energy error {x:.1}× the tier on average, training samples the model cannot reproduce included)"),
-        // M8a Task 2: one atom a DFT check found beyond `WORST_ATOM` = 3× its bound
-        Some((ClassKey::WorstAtom, x, _)) if evidence < providers::surrogate::MIN_EVIDENCE => format!(
-            "{name} — not yet (a DFT check found an atom's force {x:.1}× its bound, with fewer than {} checks to judge the class by)",
-            providers::surrogate::MIN_EVIDENCE
+        // M8a Task 2: one atom a DFT check found beyond `WORST_ATOM` = 3× its bound — both ways
+        // below the evidence floor (trust tightening §3, Task 4; fewer than three checks is below it
+        // too), on entry only at the floor
+        Some((ClassKey::WorstAtom, x, lim)) if counts.fits < providers::surrogate::FLOOR_FITS || counts.floor_points < providers::surrogate::FLOOR_POINTS => format!(
+            "{name} — not yet (a DFT check found an atom's force {x:.1}× its bound, limit {lim:.0}× while it has too few independent DFT checks: {})",
+            floor_counts(counts.fits, counts.floor_points)
         ),
         Some((ClassKey::WorstAtom, x, lim)) => format!("{name} — not yet (a recent DFT check found an atom's force {x:.1}× its bound; it starts answering only without one beyond {lim:.0}×)"),
         // the calibrated verdict: the error the DFT checks measured where the class answers …
@@ -432,6 +514,14 @@ fn verdict_line(name: &str, refusal: Option<(sim::ClassKey, f64, f64)>, evidence
         // … and the energy the DFT checks measured
         Some((ClassKey::Window, n, w)) => format!("{name} — not yet (within its bound over {n:.0} DFT checks; it starts answering before the next refit only after {w:.0})"),
         Some((ClassKey::MeasuredEnergy, x, lim)) => format!("{name} — not yet (DFT checks measured its energy error at {x:.2}× the tier over {}, limit {lim:.2}×)", checks(evidence)),
+        // trust tightening §3, the evidence floor: within the bound by the DFT checks, but too few
+        // independent ones (fits, checks) to open it alone, and the fit's own leave-one-out fails
+        // (the counts as the provider's refusal says them; a count over its floor reads "80 checks
+        // (60 needed)", the Task 4 review's minor 3)
+        Some((ClassKey::Floor, x, _)) => format!(
+            "{name} — not yet (within the bound by too few independent DFT checks — {} — and its leave-one-out error is {x:.1}× the bound)",
+            floor_counts(counts.fits, counts.floor_points)
+        ),
     }
 }
 
@@ -442,6 +532,6 @@ pub fn stuck_sentence(i: &sim::activity::StuckInfo, scene: &sim::Scene) -> Strin
         return format!("trusted, but not answering here (the last {} steps were DFT)", i.steps);
     };
     let near = i.atom.and_then(|a| scene.nuclei.get(a)).is_some_and(|n| face_distance(scene, n.pos) < d_box(scene.cell.h));
-    let s = rule_sentence(rule, i.atom, RowCtx { box_affected: i.box_streak, near_face: near, kept: false });
+    let s = rule_sentence(rule, i.atom, RowCtx { box_affected: i.box_streak, near_face: near, kept: false, tail: false });
     format!("trusted, but not answering here: {s} (the last {} steps were DFT)", i.steps)
 }

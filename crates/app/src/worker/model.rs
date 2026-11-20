@@ -198,6 +198,9 @@ pub struct ModelStatus {
     /// Samples with stray atoms held out of the fit until a composition check measures them
     /// (`sim::TrainableStatus::stray_held_out`): the card's count line and the "fit vs held" line's part.
     pub stray_held_out: usize,
+    /// The calibration ticks' counts (`sim::TrainableStatus::ticks`; trust tightening): the Model
+    /// tab's "calibration checks skipped", with their causes.
+    pub ticks: sim::CalibrationTicks,
     /// A collections folder is set ([`Command::Collections`]): the Model tab offers the switch.
     pub collections: bool,
     /// The last [`Command::ImportModel`]: what was taken and refused, or why nothing was.
@@ -1108,6 +1111,7 @@ impl Worker {
             lone_note: st.lone_note,
             stray: st.stray,
             stray_held_out: st.stray_held_out,
+            ticks: st.ticks,
             collections,
             last_import,
             purge_refusal: s.purge_refusal(),
