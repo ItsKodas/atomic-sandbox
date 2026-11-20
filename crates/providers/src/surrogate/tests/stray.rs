@@ -1509,6 +1509,11 @@ impl ForceProvider for Shifted {
 #[test]
 fn reentry_and_exit_book_every_switch() {
     let (mut s, sig) = cleared_student();
+    // no calibration ticks (trust tightening Task 7; as `tests.rs`'s excursion and session-golden tests): a tick falls
+    // due at the 25th in-envelope step, on the way out, and its audit's teacher answer is kept like any audit's — one
+    // sample the count below would read as a flood. The run measures the stray atom's re-entry and its bookings; the
+    // ticks are pinned by their own tests
+    s.tick_every = 0;
     // since ruling 13 the region reaches the stray atom no nearer than its passes: a check at the path's nearest stray
     // point (6 Bohr from H₂'s centre, 6.04 from its atoms) extends it there before the run
     let edge = h2_with(INSIDE, &[[H2_AT[0], H2_AT[1] + R_CUT, H2_AT[2]]]);
