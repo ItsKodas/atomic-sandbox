@@ -319,7 +319,13 @@
 //! while those atoms are stray at the model's cutoff: a re-judgement fences a case that no longer splits. **The audit
 //! history** (ruling 9b) takes the attribution's point, not the audit's: the fragment's (its atoms, the model's
 //! prediction of it, the fragment's answer) when the model is blamed; none, and an `unrecorded.composition` count,
-//! when it is not — no composition failure is calibration evidence. Until the check answers, the model stays trusted
+//! when it is not — no composition failure is calibration evidence. **A calibration tick** (the final review's I1, the
+//! controller's ruling) is the exception: a ticked audit's point records the fragment's in **both** outcomes, so the
+//! answer sample P_A, chosen without reading errors, never keeps the checks that fail and drops the ones that pass.
+//! At a cleared scene the tick is decided on the bonded part (the envelope with the stray atoms exempt, the fences
+//! judged on the bonded part), the dispatching step's flags travel in the `Attribution`, and the tick counts as
+//! "taken, unrecorded" when the audit is judged (`TickCounts::unrecorded`): its point, if the check records one,
+//! arrives later with `TICK` set. Until the check answers, the model stays trusted
 //! (the signature itself is already on DFT). **The conservative side:** when no check can run (no background teacher,
 //! the queue full) or it cannot attribute (a part solve failed or not clean, the model cannot describe the bonded
 //! part), the failure counts against the model with the scene's own labels and its history point, as any failed

@@ -2596,7 +2596,8 @@ impl SurrogateKs {
         r.energy = self.to_canonical(&h.z, h.prov.grid_n, r.energy);
         // the event's record of the solve (read before `r` and `h` are consumed below)
         let (teacher_ms, scf, ts) = (r.stats.solve_ms as f64, r.stats.scf_steps, r.stats.energy.ts);
-        let (h_audit, rule_code, atom, n_atoms) = (h.audit, h.reason.rule, h.reason.atom, h.pos.len());
+        // the event's atom count is N_e (`audit_n`), what the step's per-atom gap divides by (the Activity hover's)
+        let (h_audit, rule_code, atom, n_atoms) = (h.audit, h.reason.rule, h.reason.atom, self.audit_n(&h.pos));
         let history_code = h.history_rule;
         let gap = h.model.as_ref().map(|m| r.energy - m.energy);
         let mut notes = Vec::new();

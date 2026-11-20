@@ -362,7 +362,7 @@ impl KeyFactors {
 /// 9a) N is N_e, the **energy-row atoms** (`surrogate::energy_row_atoms`: the atoms with a neighbour
 /// within the model's cutoff, N when none is isolated), the count the fit's energy row and
 /// `Model::predict`'s aleatoric floor are per. Callers pass it: rule 7 ([`SurrogateKs::energy_variance`])
-/// computes `energy_row_atoms` at the scene; λ_E (`calibrate`) passes a history point's `n_atoms`,
+/// computes `energy_row_atoms` at the scene; λ_E and the verdict's energy evidence e2 (`calibrate`) pass a history point's `n_atoms`,
 /// which is its N_e because a point is recorded over its bonded part (`record_history_point`: a
 /// stray-atom scene's split, every recorded atom with a neighbour). For a scene with no isolated
 /// atom N_e = N, so nothing changes there.

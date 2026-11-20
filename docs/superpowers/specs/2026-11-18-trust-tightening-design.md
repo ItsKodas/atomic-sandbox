@@ -357,8 +357,34 @@ factor and its measured cause, e.g. "λ_T 7.7: a measured atom at 4.5× the boun
   is a sample, not a point.
 - **Stray atoms (branch `stray-atoms`, I4/I6).** Compatible.
   - Rule 7 and audits there divide by n_bonded. The inflations multiply σ_E,epi before the division,
-    and λ_E's e_p and r_p use the same N, so set N = n_bonded there.
+    and λ_E's e_p and r_p use the same N, so set N = n_bonded there. Since the merge N is N_e, the
+    energy-row atoms (`policy::energy_atoms`): n_bonded at a stray-atom scene, N elsewhere.
   - Stray atoms are class 0: they carry no key, no P_A atoms and no fits.
+  - **Ticks at a cleared stray-atom scene** (the merge rulings, amended by the smearing branch's final
+    review, I1 and M1):
+    - *The decision is the bonded part's.* The envelope runs with the stray atoms exempt, and the
+      quarantine, misfit, shell and audit fences judge the bonded part alone, in the step and in the
+      background audit's judgement alike (`policy::judged_part`). The class rule reads the whole scene,
+      which is the same thing: a stray atom has no neighbour, so it carries no key.
+    - *The flags are carried.* A ticked audit that fails there is attributed by a check of the parts
+      (the stray-atom spec §4.5). The dispatching step's flags, `TICK` included, travel in the
+      check's `Attribution` and are the flags of the point the check records.
+    - *The point is recorded in both outcomes.* Whether the check finds the model wrong on the bonded
+      part or finds the failure to be the composition's, a ticked audit's point is the fragment's: its
+      geometry, the model's prediction of it and the fragment's teacher answer. That pair is at hand in
+      both outcomes, so P_A stays outcome-blind. Dropping the composition outcome's point would keep
+      the fragment checks that fail and drop the ones that pass. An ordinary (unticked) audit's
+      composition outcome still records no point (stray ruling 9b), since it is not in P_A.
+    - *Where no comparable pair exists the drop stays, as a conservative bias.* A check discarded by a
+      Forget, an installed model or a surface change counts nothing. A check that cannot attribute (a
+      part's solve not clean, a model that cannot describe the bonded part) counts against the model
+      with the scene's point. Neither reads the error the check would have measured. Any residual
+      selection of this kind can only keep failing measurements, so it can only inflate λ, never
+      shrink it.
+    - *How the tick is counted.* At the audit's judgement the tick is "taken, unrecorded"
+      (`TickCounts::unrecorded`), because the point is deferred to the check. The point the check
+      records later carries `TICK`, so the history can hold more `TICK` points than
+      `TickCounts::recorded`. The count measures the cadence, the points are the evidence.
 - **Draft mode.** `DraftAudit` points are not in P_A.
 
 ## 6. Validation

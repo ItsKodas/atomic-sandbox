@@ -1045,7 +1045,7 @@ impl SurrogateKs {
             let note = "surrogate audit: discarded — the model changed settings or species since its dispatch";
             let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, TeachOutcome::Discarded);
             ev.detail = note.to_string();
-            ev.n_atoms = pos.len();
+            ev.n_atoms = self.audit_n(&pos);
             ev.solve_ms = ms;
             ev.scf_steps = scf_steps;
             ev.ts = ts;
@@ -1055,15 +1055,20 @@ impl SurrogateKs {
             self.pending_notes.push(note.into());
             return None;
         };
+        // at a cleared stray-atom scene the fences judge the bonded part alone, as `evaluate`'s do
+        // (`policy::judged_part`; the smearing branch's final review, M1): the FENCED bit and the
+        // keep decision of a background tick are the in-step ones
+        let cleared = self.stray_cleared(&pos, &z, &prov);
+        let part = cleared.as_ref().map(|c| &c.0);
         // inside a fenced shell band (the shell fence; final review I1, the coordinator's ruling):
         // strict mode refuses the geometry, so the answer is no judgement of the model — not
         // judged, not kept (a draft guess's included: a band row is never fitted, now or after a
         // later shell check lifts the fence)
-        if let Some(why) = self.shell_fence_refusal(&pos, &z) {
+        if let Some(why) = self.shell_fence_refusal_judged(&pos, &z, part) {
             let note = format!("surrogate audit not judged: {} — not a judgement of the model; the answer is not fitted", why.text.trim_start_matches("surrogate: "));
             let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, TeachOutcome::ShellNotKept);
             ev.detail = note.clone();
-            ev.n_atoms = pos.len();
+            ev.n_atoms = self.audit_n(&pos);
             ev.solve_ms = ms;
             ev.scf_steps = scf_steps;
             ev.ts = ts;
@@ -1077,12 +1082,12 @@ impl SurrogateKs {
         let n = self.audit_n(&pos) as f64;
         let unit = self.per_atom_unit(&pos);
         let gap = energy - pred.energy;
-        let near = self.near_quarantined(&pos, &z);
+        let near = super::policy::judged_part(&pos, &z, part, |p, q| self.near_quarantined(p, q));
         // next to a misfit the answer is kept only if it agrees with the model (spec 2026-11-13 §4.3)
-        let near_misfit = self.near_misfit(&pos, &z).contains(&true);
+        let near_misfit = super::policy::judged_part(&pos, &z, part, |p, q| self.near_misfit(p, q)).contains(&true);
         // the history's flags (module doc, "The history's flags"): the dispatching step's, fenced
         // as well when a fence applies at the judgement (read-only; the shell fence returned above)
-        let fenced = !near.is_empty() || near_misfit || self.audit_fence_refusal(&pos, &z).is_some();
+        let fenced = !near.is_empty() || near_misfit || self.audit_fence_refusal_judged(&pos, &z, part).is_some();
         let flags = surrogate::history::PointFlags(dispatched.0 | if fenced { surrogate::history::PointFlags::FENCED } else { 0 });
         let energy_std_epistemic = pred.energy_std.zip(self.model.as_ref()).map(|(e, m)| epistemic_energy_std(m, surrogate::energy_row_atoms(&m.basis, &pos), e));
         let mut notes = Vec::new();
@@ -1187,7 +1192,8 @@ impl SurrogateKs {
         ev.face_density = face;
         ev.box_affected = box_rho.is_some();
         ev.gap = Some(gap);
-        ev.n_atoms = pos.len();
+        // the atoms the verdict's per-atom gap divides by (N_e: `audit_n`), the Activity hover's count
+        ev.n_atoms = n as usize;
         ev.solve_ms = ms;
         ev.scf_steps = scf_steps;
         ev.ts = ts;

@@ -748,7 +748,9 @@ impl SurrogateKs {
     /// energy plus Σ_s E_ref(Z_s), its forces on the bonded atoms, 0 on the stray ones; never fitted, so `index` is
     /// none; `AuditOrigin::StrayAttributed`), and the audit history takes the **fragment's** point (ruling 9b). Right
     /// there: the composition's or the box term's, and the model's trust is untouched — no history point (an
-    /// `unrecorded.composition` count), and after a refit since the audit the next answered steps are audited
+    /// `unrecorded.composition` count; a calibration tick's audit, `a.flags` carrying `TICK`, records the fragment's
+    /// point in this outcome too, so the answer sample P_A never reads which way the check went — the final review's
+    /// I1 ruling), and after a refit since the audit the next answered steps are audited
     /// (`AUDIT_BURST`, M5, as a re-earned failed audit). A fragment solve that is not clean or a model that cannot
     /// describe the bonded part cannot attribute: the audit counts as recorded (the conservative side). A model gone
     /// (a Forget) or of another surface: discarded, nothing counted (I1).
@@ -795,28 +797,40 @@ impl SurrogateKs {
             Some((d, b)) => format!("its worst bonded atom's force is off by {d:.1e} > {b:.1e} Ha/Bohr"),
             None => format!("{:.1e} {} {tier:.1e} Ha per bonded atom", gap.abs() / n, if wrong { ">" } else { "≤" }),
         };
+        // the history's point is the fragment's (ruling 9b): its geometry, the model's prediction of it, the fragment's
+        // teacher answer — n_atoms n_bonded, the (n_bonded s_E)² floor, err_energy = gap_frag
+        let stds = match (pred.energy_std, pred.force_std.as_ref(), pred.force_std_epistemic.as_ref()) {
+            (Some(e), Some(f), Some(fe)) => Some((e, f.clone(), fe.clone())),
+            _ => None,
+        };
+        // the fragment's epistemic energy std over its N_e (every bonded atom: `policy::epistemic_energy_std`)
+        let e_epi = pred.energy_std.zip(self.model.as_ref()).map(|(e, m)| crate::surrogate::policy::epistemic_energy_std(m, surrogate::energy_row_atoms(&m.basis, &fp), e));
+        // a calibration tick's point is recorded whichever way the check attributes the failure (the controller's
+        // ruling on the final review's I1): the fragment point is the same σ-blind measurement of the model on the
+        // bonded part in both outcomes, so P_A stays outcome-blind (trust spec §4, the self-reference guard) — dropping
+        // the composition outcome's would keep the fragment checks that fail and drop the ones that pass
+        let tick = a.flags.has(surrogate::history::PointFlags::TICK);
         let detail = if wrong {
             let mut case = a.case;
             case.energy = e_frag + compensated_sum(&refs);
             case.forces = split.scene_values(&frag.forces, pos.len(), [0.0; 3]);
             case.index = None;
             case.origin = AuditOrigin::StrayAttributed;
-            // the history's point is the fragment's (ruling 9b): its geometry, the model's prediction of it, the
-            // fragment's teacher answer — n_atoms n_bonded, the (n_bonded s_E)² floor, err_energy = gap_frag
-            let stds = match (pred.energy_std, pred.force_std.as_ref(), pred.force_std_epistemic.as_ref()) {
-                (Some(e), Some(f), Some(fe)) => Some((e, f.clone(), fe.clone())),
-                _ => None,
-            };
-            // the fragment's epistemic energy std over its N_e (every bonded atom: `policy::epistemic_energy_std`)
-            let e_epi = pred.energy_std.zip(self.model.as_ref()).map(|(e, m)| crate::surrogate::policy::epistemic_energy_std(m, surrogate::energy_row_atoms(&m.basis, &fp), e));
             self.record_history_point(PointKind::Audit, &fp, &fz, stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), pred.energy, &pred.forces, e_frag, &frag.forces, false, false, false, a.flags, e_epi);
             self.failed_audits.push(case);
             self.sync_audit_failed();
             self.audit_flip = self.last.as_ref().is_some_and(|l| l.on_model);
             format!("surrogate: stray atoms ({label}) — the failed audit is the model's: on the bonded part alone {on_frag} ({terms_words}) — untrusted until a refit predicts that geometry")
         } else {
-            // not the model's: no history point (a composition count), and a refit since the audit is audited at once
-            self.audit_history.unrecorded.composition += 1;
+            // not the model's: no history point (a composition count) — unless it was a calibration tick, whose
+            // fragment point is recorded as in the model's outcome (above) — and a refit since the audit is audited
+            // at once
+            // (a tick's point that cannot be recorded, without a variance factor, is counted by `record_history_point`)
+            if tick {
+                self.record_history_point(PointKind::Audit, &fp, &fz, stds.as_ref().map(|(e, f, fe)| (*e, &f[..], &fe[..])), pred.energy, &pred.forces, e_frag, &frag.forces, false, false, false, a.flags, e_epi);
+            } else {
+                self.audit_history.unrecorded.composition += 1;
+            }
             if self.fits != a.fits {
                 self.audit_burst = AUDIT_BURST;
             }
@@ -828,7 +842,8 @@ impl SurrogateKs {
         let mut ev = TeachEvent::new(TeachOrigin::Audit, TeachRule::Audit, TeachOutcome::StrayAuditAttributed { model: wrong });
         ev.detail = detail.clone();
         ev.gap = Some(gap);
-        ev.n_atoms = pos.len();
+        // the bonded atoms the check's per-atom gap divides by (`n`), the Activity hover's count
+        ev.n_atoms = n as usize;
         ev.solve_ms = ms;
         ev.solves = 1 + atoms.len() as u32;
         self.push_event(ev);

@@ -729,6 +729,10 @@ pub struct TeachEvent {
     pub box_affected: bool,
     /// E_teacher − E_model where the model was consulted.
     pub gap: Option<f64>,
+    /// The atom count the row's per-atom gap divides by (the Activity hover's "per atom over N
+    /// atoms"). For a surrogate row it is the provider's N_e, the energy-row atoms its verdicts
+    /// divide by: the scene's atom count unless an atom has no neighbour within the model's cutoff,
+    /// so a stray-atom scene's row counts its bonded atoms. Elsewhere, the scene's atom count.
     pub n_atoms: usize,
     /// Wall time of the teacher's solve (ms); 0 for a row with no solve (`NotSolved`).
     pub solve_ms: f64,

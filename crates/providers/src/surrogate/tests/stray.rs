@@ -2947,3 +2947,104 @@ fn the_thinning_radius_is_frozen_at_the_checks() {
     assert_eq!(s.quarantine[s.samples() - 1], Q_STRAY, "{notes:?}");
     assert_eq!(s.release_stray_samples(&sig), 0);
 }
+
+// ---- the smearing branch's final review: the stray-atom × calibration-tick path (I1, M1) ----
+
+/// The cleared H₂ + H student of [`cleared_student`] with `auditor` as its background teacher, its next in-envelope
+/// step a calibration tick (`tick_steps` one short of [`TICK_EVERY`], no dead time) and rule 8's cadence off
+/// (`audit_every` 0), so the tick is the audit alone (`dispatch_tick_only`). One strict step at [`INSIDE`]: answered by
+/// the model, the tick due and dispatched; the auditor settled, its answer held unjudged. The student and the tick
+/// counts before the step.
+fn ticked_student(auditor: Box<dyn ForceProvider>) -> (SurrogateKs, TickCounts) {
+    let (s, _) = cleared_student();
+    let mut s = s.with_auditor(auditor);
+    assert_eq!(s.policy().audit_every, 0, "the premise: only the tick audits");
+    (s.tick_every, s.tick_steps, s.tick_dead) = (TICK_EVERY, TICK_EVERY as u64 - 1, 0);
+    let before = s.tick_counts();
+    let sc = h2_with(INSIDE, &[STRAY_AT]);
+    // the premise: judged on the whole scene the stray H is outside the envelope (rule 5a, an isolated atom), so only
+    // the bonded-part judgement makes the step in-envelope
+    let model = s.model().unwrap().clone();
+    assert!(s.envelope_outside(&model, &positions(&sc), &zs(&sc)).1.is_some(), "the premise: the whole scene is outside the envelope");
+    let r = s.evaluate(&sc, &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Surrogate, "{:?}", r.stats.notes);
+    assert!(r.stats.notes.iter().any(|n| n.starts_with("surrogate calibration tick dispatched")), "{:?}", r.stats.notes);
+    assert!(s.tick_in_flight && s.audit_in_flight());
+    settle(&mut s);
+    s.take_events();
+    (s, before)
+}
+
+/// Final review I1 (a): a calibration tick falls due at a cleared stray-atom scene. The decision is the bonded part's
+/// (the stray H, outside the envelope on the whole scene, is exempt), the tick is counted due (`ticks.due`, the
+/// in-envelope population), and its passing audit leaves a point that carries `TICK`, over the bonded part (2 atoms),
+/// in the answer sample P_A — counted "taken, recorded".
+#[test]
+fn a_tick_at_a_cleared_scene_is_decided_on_the_bonded_part_and_counted() {
+    use surrogate::history::PointFlags;
+    let (mut s, before) = ticked_student(Box::new(Composing::new(0.0)));
+    let due = s.tick_counts();
+    assert_eq!((due.due, due.population), (before.due + 1, before.population + 1), "due and in the population: {due:?}");
+    let history = s.audit_history().len();
+    s.poll_audit();
+    assert!(!s.tick_in_flight);
+    assert_eq!(s.tick_counts().recorded, before.recorded + 1, "taken, recorded: {:?}", s.tick_counts());
+    assert_eq!(s.audit_history().len(), history + 1);
+    let p = s.audit_history().iter().last().unwrap().clone();
+    assert_eq!((p.n_atoms, p.kind), (2, surrogate::history::PointKind::Audit), "over the bonded part");
+    assert!(p.flags.has(PointFlags::TICK) && !p.flags.has(PointFlags::FENCED), "{:?}", p.flags);
+    assert!(crate::surrogate::calibrate::in_answer_sample(&p), "{p:?}");
+}
+
+/// Final review I1 (b): a ticked audit that fails at a cleared stray-atom scene leaves its point to the attribution
+/// check (ruling 9b): no point at the judgement — the tick reads "taken, unrecorded" — and the `Attribution` carries
+/// the dispatching step's flags, `TICK` included. Whichever way the check attributes the failure, the fragment's point
+/// is recorded with those flags and is in P_A (the controller's ruling: P_A outcome-blind):
+/// - the model's ([`BondedShift`]: the model off by [`AUDIT_OFFSET`] on the bonded part): its gap, the model untrusted;
+/// - the composition's (the [`Composing`] offset, the bonded part exact): a gap ≈ 0, no `composition` count (the point
+///   is recorded instead), the model's trust untouched.
+#[test]
+fn a_failed_tick_at_a_cleared_scene_records_its_point_in_both_outcomes() {
+    use surrogate::history::PointFlags;
+    for model_wrong in [true, false] {
+        let auditor: Box<dyn ForceProvider> = if model_wrong { Box::new(BondedShift { inner: Composing::new(0.0), shift: AUDIT_OFFSET }) } else { Box::new(Composing::new(AUDIT_OFFSET)) };
+        let (mut s, before) = ticked_student(auditor);
+        let history = s.audit_history().len();
+        let composition = s.audit_history().unrecorded.composition;
+        s.poll_audit();
+        assert_eq!(s.tick_counts().unrecorded, before.unrecorded + 1, "model wrong {model_wrong}: taken, unrecorded at the judgement: {:?}", s.tick_counts());
+        assert_eq!(s.audit_history().len(), history, "no point until the check answers");
+        let a = s.stray_pending.as_ref().and_then(|p| p.attribution.as_ref()).expect("an attribution check in flight");
+        assert!(a.flags.has(PointFlags::TICK) && !a.flags.has(PointFlags::FENCED), "the dispatching step's flags: {:?}", a.flags);
+        settle(&mut s);
+        let ev = s.take_events();
+        assert!(ev.iter().any(|e| e.outcome == TeachOutcome::StrayAuditAttributed { model: model_wrong }), "{ev:?}");
+        assert_eq!(s.audit_history().len(), history + 1, "model wrong {model_wrong}: the fragment's point");
+        let p = s.audit_history().iter().last().unwrap().clone();
+        assert_eq!((p.n_atoms, p.kind), (2, surrogate::history::PointKind::Audit));
+        assert!(p.flags.has(PointFlags::TICK) && crate::surrogate::calibrate::in_answer_sample(&p), "model wrong {model_wrong}: {p:?}");
+        let gap = if model_wrong { AUDIT_OFFSET } else { 0.0 };
+        assert!((p.err_energy - gap).abs() < 1e-6, "model wrong {model_wrong}: err_energy = gap_frag {:e}", p.err_energy);
+        assert_eq!(s.audit_history().unrecorded.composition, composition, "a tick's composition outcome is a point, not a count");
+        assert_eq!(s.trusted(), !model_wrong, "{:?}", s.untrusted_reason());
+    }
+}
+
+/// Final review M1: the background judgement of a tick at a cleared stray-atom scene reads the fences on the bonded
+/// part, as `evaluate` does. A quarantine fence at the bonded H₂ placed after the dispatch fences the tick's point
+/// (`FENCED`, out of P_A); on the whole scene the stray H would carry the geometry outside it (the premise,
+/// `a_fence_on_the_bonded_part_fences_the_cleared_scene`).
+#[test]
+fn a_background_tick_judges_the_fences_on_the_bonded_part() {
+    use surrogate::history::PointFlags;
+    let (mut s, _) = ticked_student(Box::new(Composing::new(0.0)));
+    let h2 = big(dimer(INSIDE, [1.0, 0.0, 0.0], H2_AT, 1, 1));
+    s.add_sample(exact_sample(&h2), &h2).unwrap();
+    let i = s.samples() - 1;
+    s.quarantine.resize(s.samples(), Q_NONE);
+    s.quarantine[i] = Q_FORGOTTEN;
+    let sc = h2_with(INSIDE, &[STRAY_AT]);
+    assert!(s.near_quarantined_cached(&positions(&sc), &zs(&sc)).is_empty(), "the premise: the whole scene escapes the fence");
+    s.poll_audit();
+    assert!(s.audit_history().iter().last().unwrap().flags.has(PointFlags::FENCED), "the bonded part is fenced");
+}

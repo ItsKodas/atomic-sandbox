@@ -766,7 +766,8 @@ fn point_evidence(p: &AuditPoint, atoms: &[usize], aleatoric: f64, policy: &Fall
         audit: p.kind.is_audit(),
         w2: w2 / n,
         z2: z2 / n,
-        e2: sq(p.err_energy.abs() / p.n_atoms.max(1) as f64 / policy.energy_std_per_atom),
+        // per N_e through the one normalisation (`policy::energy_atoms`; a point's `n_atoms` is its N_e)
+        e2: sq(p.err_energy.abs() / super::policy::energy_atoms(p.n_atoms.max(1)) / policy.energy_std_per_atom),
         worst,
         s2: s2 / n,
         a2: a2 / n,
