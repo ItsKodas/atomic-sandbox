@@ -750,6 +750,22 @@ The user asked why the orbital views went blank in Estimated mode: the model has
 
 **Gate (Nov 16, the branch with main merged in, each suite alone):** units/qm/sim/surrogate 516, providers 428, qm-gpu 136, gpu_vs_cpu 9, `--test surrogate` 7, `--test orbitals` 12, `--test harris` 6 (V-A4 water alone after the fix: 0 failed samples, numbers identical to the record), app 752 (incl. replays), non-test app build clean.
 
+
+### Trust tightening (Nov 18–20; branch `trust-tighten`, Tasks 0–9)
+
+**Why.** The stuck-then-escape repro (the oldest safety test of the estimated solver) failed again once the teacher switched to Fermi–Dirac labels. A bisect (Nov 17) found the cause was not the solver: label changes of ~1e-7 Ha, far below the SCF tolerance, sent the chaotic 6000-solve trajectory down a path where the many-body class opened on **3** DFT comparisons and then answered hot H₃ up to 4.5× its force bound, with z-scores to 34. A green run had only meant the trajectory missed the gap.
+
+**What was built (spec Nov 18 22:31, rev. 2 approved Nov 19 00:52; first code Nov 19 01:40, Task 8 done Nov 20 08:28):**
+- **Task 0, before any code:** a read-only go/no-go report on the user's shared collection. Two of its six keys would lose trust at load (the H–H pair at a leave-one-out worst of 1.017×, H with H and O at 2.51×). The user said "go; fix H₂ with one teach".
+- **An evidence floor:** 12 distinct fits and 60 comparisons before measured evidence alone opens a key; below it the key's leave-one-out must pass too. Fit ids count only refits that solved new coefficients from new teacher data, so restarts, reloads and policy changes cannot manufacture fits (a review found that a Forget + Restore could, and a watermark fixed it).
+- **Tail-aware inflations** λ_T and λ_E: the smallest factor at which every DFT check the key has seen, the worst included, fits inside the inflated uncertainty. A step they alone refuse is logged as code 24, "the model was too confident".
+- **Calibration ticks:** every 25th answerable step is checked whatever σ says, so the factors are measured on a σ-blind sample. Getting "σ-blind" right took three rounds: the first rule (count from the previous tick's completion) over-weighted refused stretches by (25 + T)/25, which a re-review caught by simulation; the fix is a dead time after every tick, answered or not.
+- **The words:** the Model tab, Activity checklist and Knowledge map name the floor, the factors, code 24 and skipped checks.
+
+**Task 9, the gate (Nov 20).** The repro first failed in a new way: the harness has no background teacher, so its ticks run in the step, and five of them landed on box-affected answers, which the provider reports on the model's surface by design (the gap is the box's confinement). The test's fallback-energy check had not expected in-step audits. Ruled as a test-scope fix (exclude those steps, selected from the structured audit verdict, counted and printed), with the tier and every constant unchanged. Then it passed: **771 s** (07939ac's lucky pass took 1036 s, the failing 762159b 1378 s). The hot run answered 260 steps, 61 judged against DFT: worst 0.97× the energy tier and 1.82× the force bound, none beyond. The many-body class opened only once it had 14 fits and 76 comparisons. Raw z on the epistemic std still reaches 38; inflated by each key's factor its median is 0.86 and its max 2.49.
+
+**What it cost and what is open.** About 7,400 lines across 34 files, 24 commits, every task reviewed with one or two fix rounds. The harness's in-step ticks broke three surrogate-MD tests that assume the model answers every step: the H₂ and H₃⁺ frequencies still match (within 3.4e-6 and 2.8e-4), but the H₂ NVE drift went from below 1e-8 to 3.1e-7 Ha/ps and the rewind from 1e-12 to 1e-5 Bohr, because a teacher force now moves the atoms every 25 steps. Not re-pinned: open for a ruling.
+
 ## Failures and dead ends
 
 These are the places where the first idea was wrong, or an approach was tried and abandoned. They are
