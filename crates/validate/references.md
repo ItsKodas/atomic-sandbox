@@ -6405,6 +6405,8 @@ The evidence floor (12 fits and 60 comparisons before the calibrated verdict alo
 
 ### Task 0 re-run (the go/no-go report on a fresh copy of the user's collection)
 
+**A pre-Fermi–Dirac measurement of record** (the smearing branch's final review, M9): the collection below was taught before the Fermi–Dirac switch, so under the FD build it is a predecessor folder (v1 records, legacy tags), and the user has since dropped it. The report stays `#[ignore]`d and is not expected to run as written against it; its numbers are the record of that collection under the trust-tightening rules.
+
 `trust_tightening_go_no_go_report` on a scratchpad copy (no `.lock`) of `lsda_h0.15_s0.15_tol1e-6_kohn-sham-gpu_all-54eedc40ddc5`, 1657 samples, 434 history points, attach + refit 54.1 s, 0 teacher calls; the original's SHA-256, sizes and mtimes identical before and after. 6 keys, 2 trusted at load; the 2 that lose trust are Task 0's: **pair H{H} (Floor, LOO force max 1.017×, evidence 38, n_fit 0)** and **many-body H{H,O} (Floor, 2.506×, evidence 3)**. Saved points carry no fit id, so n_fit = 0 for every key until new refits.
 
 ### `trust_baseline_report`, before and after (audit every 50; 2026-11-20 20:08, alone, 800 s)

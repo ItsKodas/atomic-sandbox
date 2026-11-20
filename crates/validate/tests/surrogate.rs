@@ -2835,6 +2835,11 @@ fn stretched_h2_margin_is_reported() {
 /// the floor shuts. Checked per key (whatever the collection): a key whose attributed verdict points
 /// carry no fit id and that stands trusted on evidence ≥ 3 has its LOO force rms, max and energy max
 /// ≤ 1, and a key refused as `Floor` has one of them > 1 with the ratio that decided as its value.
+///
+/// **A pre-Fermi–Dirac measurement of record** (the smearing branch's final review, M9): `SLUG` names a collection
+/// taught before the Fermi–Dirac switch. Under the FD build that folder is a predecessor (v1 records, legacy tags) and the
+/// user has dropped it, so the report is kept `#[ignore]`d as the record of its numbers (`references.md` "Trust
+/// tightening", "Task 0 re-run"), not as a measurement this build is expected to repeat as written.
 #[test]
 #[ignore = "go/no-go measurement: cargo test -p validate --release --test surrogate trust_tightening_go_no_go_report -- --ignored --nocapture"]
 fn trust_tightening_go_no_go_report() {
