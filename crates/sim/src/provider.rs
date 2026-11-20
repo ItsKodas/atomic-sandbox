@@ -1156,13 +1156,51 @@ pub trait Trainable {
     /// Starts a refit off the step path: the model that stands keeps answering — judged by its own
     /// verdicts, as between two refits — until [`poll_refit_background`](Self::poll_refit_background)
     /// installs the new one between ticks. `false` when the provider cannot, or one is running or
-    /// nothing is fitted: the caller refits synchronously then. Default: cannot.
+    /// nothing is fitted (unless [`first_fit_ready`](Self::first_fit_ready): the first fit of
+    /// samples that have no model yet starts the same way): the caller refits synchronously then.
+    /// Default: cannot.
     fn begin_refit_background(&mut self) -> bool {
         false
     }
+    /// A counter of the changes to what a refit fits (quiet refits, 2026-11-17): samples appended,
+    /// the user's Forget / Restore, a reference that moved the labels, samples loaded, imported or
+    /// attached. Bumped by those changes only — never by a refit's own outcome, installed, failed
+    /// or discarded. The worker refits on its own only when it moved since the last refit that ran
+    /// to completion (`app::worker`, "Refits"). `None` (the default): not tracked — every pending
+    /// refit counts as new data.
+    fn fit_inputs_gen(&self) -> Option<u64> {
+        None
+    }
+    /// The caller runs the fits this provider would otherwise run in place itself, in the
+    /// background ([`first_fit_ready`](Self::first_fit_ready),
+    /// [`begin_refit_background`](Self::begin_refit_background)): the first fit of an attached
+    /// shared collection ([`attach_collection`](Self::attach_collection)) and a sampling pass's or
+    /// teach round's end fit, whose verdicts (the outcome note, the shell checks, the round's
+    /// judgement) then follow at the install — minutes in place on a large collection. Off by
+    /// default. The default: nothing to defer.
+    fn set_fits_in_background(&mut self, _on: bool) {}
+    /// A fit the provider left to the caller is due now and no pass or refit runs: the first fit
+    /// of samples with no model yet (every reference in, enough samples), or a pass's end fit
+    /// (with or without a model). [`begin_refit_background`](Self::begin_refit_background) starts
+    /// it; the caller runs it even when it would hold an automatic refit (the user's pass asked
+    /// for it). The default: never.
+    fn first_fit_ready(&self) -> bool {
+        false
+    }
+    /// The Retry of a model whose fit did not form, when every reference is in (a fit can form from
+    /// the samples held): instead of [`retry_fit`](Self::retry_fit)'s fit in place, the provider
+    /// leaves it to the caller, who starts it in the background — `true`, and
+    /// [`first_fit_ready`](Self::first_fit_ready) says so from now on. `false` (nothing changed):
+    /// not that case — a reference missing, too few samples, a model, a pass or refit running —
+    /// and `retry_fit` decides. The default: never.
+    fn request_first_fit(&mut self) -> bool {
+        false
+    }
     /// A background refit's state; `Done` once it is installed, with [`refit`](Self::refit)'s
-    /// outcome; `Discarded` when what changed while it ran was more than appended data (it is due
-    /// again). Default: `Idle`.
+    /// outcome; `Discarded` when what changed while it ran was more than appended data. The
+    /// provider calls a discarded refit due again (`pending_refit`); the worker then makes **one**
+    /// more attempt on the same data and otherwise waits for new data (`app::worker`, "Refits").
+    /// Default: `Idle`.
     fn poll_refit_background(&mut self) -> RefitPoll {
         RefitPoll::Idle
     }
@@ -1258,6 +1296,9 @@ pub trait Trainable {
     /// A sample was kept since the last refit (`status().pending_refit`, without building the
     /// readouts).
     fn pending_refit(&self) -> bool;
+    /// The audits run on a background teacher (`status().audits_background`, without building the
+    /// readouts: the worker reads it every round, and the status's teach offer can cost ms).
+    fn audits_background(&self) -> bool;
     /// The audit cadence (answered steps per audit; 0 disables).
     fn set_audit_every(&mut self, n: usize);
     /// **Forgets** stored sample `id` (the Model tab's "Worst-fitting samples" › Forget; spec
@@ -1380,6 +1421,12 @@ pub trait Trainable {
     /// What the model's fitted samples cover (`crate::knowledge::KnowledgeMap`, M8a Task 9),
     /// built from what the provider holds without a teacher solve; `None` without a fitted model.
     fn knowledge_map(&self) -> Option<crate::knowledge::KnowledgeMap> {
+        None
+    }
+    /// The three-atom coverage map (`crate::knowledge::TripleMap`, spec 2026-11-17 §6.4): the
+    /// fitted samples' triples and the pending ones apart, built from what the provider holds
+    /// without a teacher solve; `None` without a fitted model.
+    fn triple_map(&self) -> Option<crate::knowledge::TripleMap> {
         None
     }
     /// Asks for a display-only Kohn-Sham solve at `scene` off the stepping path; it arrives as a
@@ -1526,7 +1573,8 @@ pub struct TrainableStatus {
     /// `stuck` in structured form (the plain wording's input).
     pub stuck_info: Option<crate::activity::StuckInfo>,
     /// The model generation (`TrainingViews::model_gen`): changes at every installed, restored or
-    /// forgotten model and every policy change, also where the surface epoch does not (an
+    /// forgotten model and every change of a policy threshold the verdicts read (not draft mode or
+    /// the audit cadence, which no view reads), also where the surface epoch does not (an
     /// untrusted refit). The app keys its training-view rebuilds on it (activity Task 5).
     pub model_gen: u64,
     /// Whether the strict policy answers at the scene's current geometry, and if not the rule that

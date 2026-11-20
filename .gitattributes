@@ -5,3 +5,6 @@
 crates/providers/testdata/** -text
 # the updater's fixtures: signed bytes (SHA256SUMS.txt and its .minisig) must not change at checkout
 crates/app/src/update/fixtures/** -text
+
+# the release public key: minisign's two lines, LF on every checkout (the release job reads it with minisign -V -p)
+crates/app/release-key.pub text eol=lf

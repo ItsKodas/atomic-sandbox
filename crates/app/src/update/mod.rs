@@ -11,7 +11,7 @@
 //!   constants, and the downgrade warnings drawn from them and the files under the per-user root.
 //! - [`verify`]: an asset's SHA-256 checked against `SHA256SUMS.txt`, whose minisign signature is
 //!   checked against the compiled-in release key first. Fails closed; a build without a real key
-//!   (`crates/app/release-key.pub` holds a placeholder until Task 6) installs nothing.
+//!   (`crates/app/release-key.pub` held a placeholder before 0.2.0-beta.3) installs nothing.
 //!
 //! - [`net`] (Task 3): the HTTPS GETs — the releases list ([`fetch_releases`]) and the asset
 //!   downloads — blocking, for worker threads only.

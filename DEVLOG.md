@@ -1098,6 +1098,125 @@ Every trust verdict is identical. The largest absolute difference is 0.38 % of a
 1e-9 bar was unreachable: at κ ≈ 1e13, the old kernels differ from themselves by κε when reordered. One
 side finding: the active set's τ sits in no spectral gap on this collection (recorded in references.md).
 
+### Warm-started recovery trials (2026-11-17, merge d16b5cf)
+
+The user approved one of two follow-ups from the refit profile: start a recovery's trial fits from the
+previous fit's noise levels. They chose option B, which keeps the property that a reopened collection
+reproduces its fit bit for bit. A trial is searched from the last fit, and when it would stand it is
+re-searched cold and judged on that cold fit. They declined skipping a recovery that already failed on the
+same samples.
+
+- Misfit-driven recovery on the user's collection: 61 search rounds → 45 (−26 %); every verdict, note and
+  fit identical to main on the golden.
+- Two review rounds: the cap retries (steps 1 and 1b) went back to cold, so an ordinary refit costs what
+  it did; and a warm pass that fails its cold check now continues the quarantine rounds as main does.
+- Accepted cost: a recovery that stands after one quarantine round pays that round's warm search, about
+  0.5 s.
+- The measured saving was about 13 % of a recovery's wall time, not the estimated 20–40 %: on this
+  collection each quarantine round moves the noise levels far enough that warm trials still need 2–5
+  rounds.
+
+### Estimated mode is fast again (2026-11-17, merge status-cache)
+
+The user reported that H₂ in estimated mode had dropped from 14 fs/s to 1.4. A diagnosis on a copy of
+their collection found the step was not the cost. The worker read `status()` twice per round, and
+each read spent about 70 ms recounting environment keys for the teach offer's "richer basis" note.
+That note exists only while a class is untrusted, which is why the slowdown appeared once the many-body
+class lost trust; main had the same cost.
+
+- The note is now cached on a fingerprint of everything it reads, and the worker reads
+  `audits_background` directly. `status()` went from 124 ms to 1.05 ms.
+- The every-4th-step variance check was rescheduled with the same arithmetic in the same order:
+  - novelty uses component-major null directions and skips exact zeros;
+  - `predict(var)` runs 8 rows at once through the Cholesky factor (AVX2, no FMA).
+- Results, under uneven load: novelty 21.5 → 0.18 ms, `predict(var)` 15.6 → 1.5 ms, mean step
+  12.6 → 1.3 ms.
+- Exactness: the golden shows 0 differences in 6,193 items, and an independent reviewer's scratch check
+  found 61,740 quadratic forms bit-equal, including ±0, denormals, NaN and inf.
+- Lesson: profile the worker round, not only the provider step. Each per-step suspect (refits, panels,
+  the knowledge graph) was ruled out by the user's own observations before the profile found the real
+  cost.
+
+### The three-atom coverage map (2026-11-17, merge triple-map)
+
+The pair graph shows which distances the model was taught. It cannot show which angles were. Phase A
+adds a **Three-atom arrangements** fold to the Knowledge panel. It reads the fitted samples' arrangements
+around each training centre (a neighbour–centre–neighbour triple within the 6 Bohr cutoff) and bins them
+in r₁, r₂ and cos θ. Each cell is drawn as taught, thin, or missing within reach. The map has a 2D slice
+view and a 3D voxel cloud. It was built in 11 tasks, each with its own review, followed by a whole-branch
+review: 0 Critical, 0 Important, 8 Minor, all fixed. The app gate passes 795 tests.
+
+- The reach rule decides which empty cells count as gaps, so only arrangements the model could plausibly
+  meet are shown as missing:
+  - both distances lie inside their pairs' taught ranges;
+  - the neighbour–neighbour side, from the law of cosines, is no shorter than that pair was ever taught.
+- The map is a count. The README and the cell card both say so: green is not the model's trust, and the
+  model's 4-body terms are not drawn.
+- The map costs 0.45 ms to build cold and 0.016 ms to update on the user's collection. The final review
+  found the UI re-summarising every type several times a frame. Those summaries are now memoised per map,
+  and a counter test pins it.
+- Screenshots and layout:
+  - Screenshot mode cannot attach the shared collection, so the README shots show a fresh one-pass water
+    model.
+  - The shots also exposed a layout bug older than the branch. Between 760 and 894 pt, the Knowledge
+    panel's right column ran off its edge. It now switches to two columns only once both fit.
+- Phase B ("Teach this cell") waits for targeted teach.
+
+### The teach-around button takes one click (2026-11-18, merge teach-one-click)
+
+- **Report:** "Fix it: Teach around N blockers" needed two clicks, and the first did "nothing at all".
+- **Cause:** egui gives every widget an id from the widgets drawn before it in the same `Ui`. In egui 0.36 a salted child's ids include that count too. A warning that appeared above the button between the press and the release (any new snapshot could add one) gave the button a new id mid-click, and egui drops a click whose pressed widget has gone.
+- **Fix:** the teach box, the no-model row and the first-pass offer each sit in a child `Ui` with an explicit id (`fixed_row`).
+- **Test:** `one_click_teaches_around_even_when_the_panel_changes_mid_click` failed before the fix in the in-section-warning case. A first attempt with `push_id` still failed, which is how we learnt that salted children are not stable in 0.36.
+- **Gates:** app 796/0.
+- **Time:** about an hour, mostly spent pinning down the mechanism. The user's "nothing at all" pointed at the widget id rather than the worker.
+
+### Quiet refits (2026-11-17 to 2026-11-19, merge quiet-refits)
+
+- **Report:** "Can we PLEASE stop refitting all the samples on repeat whilst in model only mode", plus freezes.
+- **Round 1:**
+  - Paused refits run in the background.
+  - A discarded fit gets one bounded retry per generation.
+  - With no model yet, the first fit is shown: "the model's first fit is running — Play once it lands".
+- **Round 2:**
+  - The end-of-pass fit runs in the background. It froze the app at the end of a teach pass, and its verdict now follows when the fit lands (PassTail).
+  - `set_policy` re-judges only when a field it reads changes, so a Model only toggle went from 1.7 s to about 0 ms.
+  - One extra worker round runs after a refit lands.
+- **Round 3** (review: 4 Important):
+  - A new pass, a load, an attach or Forget ends a waiting tail first, so an old teach round never reads the new round's state and is never judged against another model.
+  - A draft or audit-cadence change no longer moves the model generation. A Model only toggle therefore no longer discards a running fit (the pass-end fit included) or blanks Worst-fitting.
+  - The pace wait comes before the extra round: the test saw 590 of 622 snapshots published without a tick before the fix.
+- **Test fallout:** three worker tests used an audit change as a cheap "new generation". They now use a real new fit and also check that an audit change rebuilds nothing.
+- **Gates (merged tree):** providers 457/0, validate surrogate 7/0, app 808/0.
+- **Lesson:** a cheap test trigger ("change the audit cadence to force a generation") hid exactly the coupling the user complained about.
+
+### Isolated atoms are no envelope atoms (2026-11-19, merge envelope-isolated)
+
+- **Found by:** the stray-atoms branch's Task 4 physics review.
+- **Bug:** a kept rule-5a fallback with a stray atom (no neighbour within r_cut, other atoms bonded) put a zero-descriptor atom into the fit's envelope. That set every feature's minimum to 0 for the species. Rule 5b (coordination ratio) then never fired for it, and the 5c box contained 0.
+- **Consequence:** a stretched ordinary dimer just below r_cut, whose descriptors go to 0 continuously, could be answered by the model at ≈ Σ E_ref, while the restricted singlet lies 4.6e-2 Ha above that (the M6 Task 11 failure, back).
+- **Fix (ported from stray-atoms f40f65e3):**
+  - one predicate, `surrogate::envelope::isolated_atom`, shared with rule 5a;
+  - the fit skips isolated atoms at its two envelope call sites;
+  - `spread_distance` is NaN-safe;
+  - a loaded model rebuilds its envelope without them (no refit, no DFT).
+- **Tests:** RED before the fix (coordination minimum 0, 36 envelope atoms instead of 24). A stretched-H₂ scan over 4.5–6 Bohr has the same verdicts with and without the stray sample.
+- **Gates:** providers 460/0, validate surrogate 7/0.
+
+### Large shared models are fast in Estimated mode (2026-11-20, merge variance-support)
+
+- **Found by:** the user. An H₂ model trained alone ran far faster than the same molecule on the shared BEST collection.
+- **Measured:** an H₂ step's `predict` with variance took 679 µs on BEST (3 species, Q′ = 1902) against 5 µs on `hydrogen.model` (Q′ = 29). The variance solved against all 1902 columns for every force component, though H₂ touches only 52 of them.
+- **Fix (spec `2026-11-20-variance-support-design.md`):**
+  - the variance is computed on the composition's support S(C), one cached factor per species set;
+  - the factor is built in double-double, because the plain f64 QR missed the accuracy target on fitted posteriors;
+  - a self-check against the full path runs on a fixed cluster per composition, with a 1e-10 fallback, so the std is a pure function of (L, geometry, species set);
+  - `describe` skips body-3/4 terms whose species are absent, bit for bit.
+- **Result:** 679 → 66–76 µs per H₂ step on BEST. Over 1000 BEST geometries, measured against a double-double reference, the support path is off by at most 3.18e-12 and the full path by 3.26e-12. No trust decision moved. The 60 µs target was missed, because the plain energy/force prediction is about 60 µs on its own.
+- **Not fixed by this:** fallbacks in trained areas on BEST, which come from the H₂ vs H₃/H₄ fit clash (a separate design).
+- **Reviews:** physics review, then two re-review rounds. The composition key replaced a growing support whose bits depended on call order.
+- **Gates:** surrogate 161, providers 461, sim 180, validate surrogate 7/0.
+
 ### Process wins
 
 - An input-replay harness (M6 Task 8) that found a real app bug on its first scripts: a running relax

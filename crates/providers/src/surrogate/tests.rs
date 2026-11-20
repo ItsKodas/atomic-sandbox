@@ -63,6 +63,9 @@ fn always_unsure(s: &mut SurrogateKs) {
     for x in m.sigma_inv_chol.as_mut().expect("a posterior").iter_mut() {
         *x *= 1e-9;
     }
+    // L changed in place: its derived support factors with it (the model's field rule; the
+    // cache's fingerprint would catch it too)
+    m.variance_support = surrogate::SupportCache::new();
     s.last_variance = None;
 }
 
@@ -8670,6 +8673,220 @@ fn a_pass_reports_its_shell_check_after_the_refit() {
     }));
 }
 
+/// Quiet refits round 2: with `fits_in_background` (the app's worker) the same pass ends without
+/// fitting in place — its fit is due (`first_fit_ready`), its outcome and shell-check verdict not
+/// yet said — and the background refit that begins carries it: at its install the outcome note
+/// ("refit on N samples") and the shell check's verdict follow, judged against the installed fit,
+/// and nothing more is due. A second pass ending first, or one starting, completes a waiting tail
+/// as not landed, its shell checks unjudged.
+#[test]
+fn a_pass_end_fit_in_the_background_completes_the_pass_at_its_install() {
+    let teacher = Shared::new(MorseDimer::h2());
+    let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6);
+    Trainable::set_fits_in_background(&mut s, true);
+    let scene = in_big_cell(h2(3.3));
+    let prov = s.provenance_for(&scene);
+    let mut refs = sim::AtomReferences::default();
+    refs.seed_energy(crate::sampling::atom_key(&prov, 1), MorseDimer::h2().e_atom, None, prov.tol, &prov.teacher);
+    let plan = SamplingPlan { perturbations: 60, hot_burst_steps: 0, scan_points_per_pair: 12, seed: 3, ..SamplingPlan::default() };
+    Trainable::start_pass(&mut s, &scene, &plan, &mut refs).unwrap();
+    let g0 = s.fit_inputs_gen();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    let notes = Trainable::take_notes(&mut s);
+    assert!(s.model().is_none() && s.pending_refit() && Trainable::first_fit_ready(&s), "not fitted in place: {notes:?}");
+    assert!(s.fit_inputs_gen() > g0, "the pass's samples are new data");
+    assert!(notes.iter().any(|n| n.contains("the refit runs in the background")), "{notes:?}");
+    assert!(!notes.iter().any(|n| n.contains("refit on") || n.contains("still interacts at r =") || n.contains("cutoff holds for")), "nothing judged yet: {notes:?}");
+    assert!(s.begin_background_refit(), "the pass's fit starts in the background with no model");
+    assert!(!Trainable::first_fit_ready(&s), "carried by the running refit");
+    match s.finish_background_refit() {
+        BackgroundPoll::Installed(Ok(_)) => {}
+        BackgroundPoll::Installed(Err(e)) => panic!("the pass's fit failed: {e}"),
+        BackgroundPoll::Discarded(why) => panic!("discarded: {why}"),
+        _ => panic!("no background refit"),
+    }
+    let notes = Trainable::take_notes(&mut s);
+    assert!(s.model().is_some() && !s.pending_refit() && !Trainable::first_fit_ready(&s), "{notes:?}");
+    assert!(notes.iter().any(|n| n.starts_with("sampling pass finished") && n.contains("refit on")), "the outcome at the install: {notes:?}");
+    let shell: Vec<&String> = notes.iter().filter(|n| n.contains("still interacts at r =") || n.contains("cutoff holds for")).collect();
+    assert_eq!(shell.len(), 1, "the shell check judged at the install: {notes:?}");
+    // a pass that starts while another's fit is still due: that tail completes, not landed
+    Trainable::start_pass(&mut s, &scene, &SamplingPlan { perturbations: 30, hot_burst_steps: 0, scan_points_per_pair: 12, seed: 4, ..SamplingPlan::default() }, &mut refs).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    let _ = Trainable::take_notes(&mut s);
+    assert!(Trainable::first_fit_ready(&s), "the second pass's fit is due");
+    Trainable::start_pass(&mut s, &scene, &SamplingPlan { perturbations: 30, hot_burst_steps: 0, scan_points_per_pair: 0, seed: 5, ..SamplingPlan::default() }, &mut refs).unwrap();
+    let notes = Trainable::take_notes(&mut s);
+    assert!(notes.iter().any(|n| n.contains("did not land (a new pass started first")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("could not be judged (the pass's refit did not land")), "its shell check said unjudged: {notes:?}");
+    // (without the switch the pass fits in place at its end: `a_pass_reports_its_shell_check_after_the_refit`)
+}
+
+/// A regular sampling pass on `s`'s scene with its fit left waiting (`fits_in_background`): the
+/// pass's tail waits, its fit due.
+fn pass_with_fit_waiting(s: &mut SurrogateKs, seed: u64) {
+    Trainable::set_fits_in_background(s, true);
+    let scene = in_big_cell(h2(1.6));
+    let prov = s.provenance_for(&scene);
+    let mut refs = sim::AtomReferences::default();
+    refs.seed_energy(crate::sampling::atom_key(&prov, 1), MorseDimer::h2().e_atom, None, prov.tol, &prov.teacher);
+    let plan = SamplingPlan { perturbations: 4, hot_burst_steps: 0, scan_points_per_pair: 0, seed, ..SamplingPlan::default() };
+    Trainable::start_pass(s, &scene, &plan, &mut refs).unwrap();
+    while Trainable::pass_step(s, &mut never()).unwrap().is_some() {}
+    assert!(s.pass_tail.is_some() && Trainable::first_fit_ready(s), "the pass's fit waits");
+}
+
+/// Quiet refits round 3 (review I1): a teach-around round whose fit still waits when a second
+/// round starts is completed as not landed **before** the new round touches the teaching state —
+/// its round is not counted (as a cancelled one), nothing is judged against the standing model (it
+/// is not the round's fit: no failed teach checks), its checks are kept as samples, unjudged, and
+/// the new round keeps its own count, start and span. The new round's fit, in the background,
+/// judges it at the install ("accepted").
+#[test]
+fn a_teach_round_waiting_for_its_fit_is_dropped_before_the_next_round_counts() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    Trainable::set_fits_in_background(&mut s, true);
+    let scene = in_big_cell(h2(1.6));
+    s.start_teach(&scene).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    let notes = Trainable::take_notes(&mut s);
+    assert!(Trainable::first_fit_ready(&s), "the round's fit is due: {notes:?}");
+    assert!(!notes.iter().any(|n| n.starts_with("teaching around #60:")), "not judged before its fit: {notes:?}");
+    assert_eq!(s.teach_rounds.get(&0).copied(), Some(1));
+    let (failed0, samples0) = (s.failed_audits.len(), s.samples());
+    s.start_teach(&scene).unwrap();
+    let notes = Trainable::take_notes(&mut s);
+    assert_eq!(s.teach_rounds.get(&0).copied(), Some(1), "the dropped round is not counted, the new one is: {notes:?}");
+    assert!(s.teach_start.is_some() && s.teach_classes == vec![0], "the new round's own state");
+    assert_eq!(s.failed_audits.len(), failed0, "nothing judged against the standing model");
+    assert!(s.samples() > samples0, "its checks are kept as samples");
+    assert_eq!(s.pass_start, Some(s.samples()), "the new round's span starts after them");
+    assert!(notes.iter().any(|n| n.starts_with("teaching around #60: the round's refit did not land (a new pass started first") && n.contains("not counted")), "{notes:?}");
+    // the new round runs, its fit lands in the background and judges it
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    let _ = Trainable::take_notes(&mut s);
+    assert!(s.begin_background_refit());
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Installed(Ok(_))));
+    let notes = Trainable::take_notes(&mut s);
+    let outcome = notes.iter().find(|n| n.starts_with("teaching around #60:")).unwrap_or_else(|| panic!("the round judged at the install: {notes:?}"));
+    assert!(outcome.contains(": accepted"), "{outcome}");
+    assert!(s.teach_rounds.is_empty() && s.teach_start.is_none(), "accepted: the count restarts");
+}
+
+/// … a regular pass's tail waiting when a teach-around round starts: its completion (a regular
+/// pass restarts the round count) runs before the round counts itself, so the new round is counted
+/// and the two-round cap holds.
+#[test]
+fn a_regular_pass_waiting_for_its_fit_does_not_reset_a_new_rounds_count() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    s.teach_rounds.insert(0, 1);
+    pass_with_fit_waiting(&mut s, 7);
+    assert_eq!(s.teach_rounds.get(&0).copied(), Some(1), "a regular pass restarts the count when its tail completes (SHOULD-T6)");
+    let _ = Trainable::take_notes(&mut s);
+    s.start_teach(&in_big_cell(h2(1.6))).unwrap();
+    let notes = Trainable::take_notes(&mut s);
+    assert!(notes.iter().any(|n| n.starts_with("sampling pass finished: the refit of its") && n.contains("did not land (a new pass started first")), "{notes:?}");
+    assert_eq!(s.teach_rounds.get(&0).copied(), Some(1), "the new round is counted: {notes:?}");
+    assert!(s.teach_start.is_some() && s.teach_classes == vec![0]);
+}
+
+/// Quiet refits round 3 (review I2): a model file loaded while a pass's fit waits — and runs in the
+/// background — ends that pass's tail with its samples (one note); the running refit no longer
+/// carries it, so its discard (the load moved the model) makes nothing due: the loaded file is not
+/// refitted on its own, and the old pass's outcome, shell checks or teach judgement are never read
+/// against the loaded model.
+#[test]
+fn loading_a_model_file_ends_a_waiting_pass_tail() {
+    let (m, _) = gap_blocked(2.0, 3.6);
+    let path = std::env::temp_dir().join(format!("quiet-refits-load-{}.model", std::process::id()));
+    m.save_sidecar(&path).unwrap();
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    pass_with_fit_waiting(&mut s, 8);
+    let _ = Trainable::take_notes(&mut s);
+    assert!(s.begin_background_refit(), "the pass's fit runs");
+    Trainable::load(&mut s, &path, &in_big_cell(h2(1.6))).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let notes = Trainable::take_notes(&mut s);
+    assert!(s.pass_tail.is_none() && !s.pass_fit_due, "{notes:?}");
+    assert!(notes.iter().any(|n| n.starts_with("sampling pass finished: its refit will not land (a model file was loaded)")), "{notes:?}");
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Discarded(_)), "the load moved the model");
+    let notes = Trainable::take_notes(&mut s);
+    assert!(!Trainable::first_fit_ready(&s), "nothing re-dues: the loaded file is not refitted on its own");
+    assert!(!notes.iter().any(|n| n.contains("refit on") || n.contains("did not land")), "nothing of the old pass judged against the loaded model: {notes:?}");
+    assert_eq!(s.samples(), m.samples(), "the file's samples");
+}
+
+/// … and Forget model while a pass's fit waits says the pass's tail goes with the samples (review
+/// Minor 6: it was dropped silently).
+#[test]
+fn forgetting_the_model_says_a_waiting_pass_tail_goes() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    pass_with_fit_waiting(&mut s, 11);
+    let _ = Trainable::take_notes(&mut s);
+    Trainable::forget(&mut s);
+    let notes = Trainable::take_notes(&mut s);
+    assert!(notes.iter().any(|n| n.starts_with("sampling pass finished: its refit will not land (the model was forgotten)")), "{notes:?}");
+    assert!(s.pass_tail.is_none() && !Trainable::first_fit_ready(&s));
+}
+
+/// Quiet refits round 3 (missing tests): a pass's fit discarded once is due again and its retry
+/// completes the pass at its install; discarded twice, the tail completes as not landed (shell
+/// checks unjudged, said) and nothing more is due on its account. The conflict here: a threshold
+/// the judgement reads, changed while it ran.
+#[test]
+fn a_pass_fit_discarded_is_due_once_more_then_dropped() {
+    let conflict = |s: &mut SurrogateKs, f: f64| s.set_policy(FallbackPolicy { force_std_abs: f, ..*s.policy() });
+    // once: retried, installed, the pass completed
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    pass_with_fit_waiting(&mut s, 9);
+    let _ = Trainable::take_notes(&mut s);
+    assert!(s.begin_background_refit());
+    conflict(&mut s, 3e-3);
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Discarded(_)));
+    let notes = Trainable::take_notes(&mut s);
+    assert!(Trainable::first_fit_ready(&s) && s.pass_tail.is_some(), "due once more: {notes:?}");
+    assert!(!notes.iter().any(|n| n.starts_with("sampling pass finished")), "not completed yet: {notes:?}");
+    assert!(s.begin_background_refit());
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Installed(Ok(_))));
+    let notes = Trainable::take_notes(&mut s);
+    assert!(notes.iter().any(|n| n.starts_with("sampling pass finished") && n.contains("refit on")), "{notes:?}");
+    assert!(s.pass_tail.is_none() && !Trainable::first_fit_ready(&s));
+    // twice: dropped
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    pass_with_fit_waiting(&mut s, 9);
+    let _ = Trainable::take_notes(&mut s);
+    for f in [3e-3, 4e-3] {
+        assert!(s.begin_background_refit());
+        conflict(&mut s, f);
+        assert!(matches!(s.finish_background_refit(), BackgroundPoll::Discarded(_)));
+    }
+    let notes = Trainable::take_notes(&mut s);
+    assert!(notes.iter().any(|n| n.starts_with("sampling pass finished: the refit of its") && n.contains("did not land (discarded twice: ")), "{notes:?}");
+    assert!(s.pass_tail.is_none() && !s.pass_fit_due && !Trainable::first_fit_ready(&s), "nothing more on its account");
+}
+
+/// … and a background refit carrying a pass's fit that **fails** (an H–He sample kept meanwhile,
+/// no He reference: `MissingReference`) completes the pass at once with the failure, its shell
+/// checks unjudged — the tail does not wait for another fit.
+#[test]
+fn a_failed_background_pass_fit_completes_the_pass() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    pass_with_fit_waiting(&mut s, 10);
+    let _ = Trainable::take_notes(&mut s);
+    let h_he = in_big_cell(dimer(1.6, [0.0, 1.0, 0.0], [0.1, -0.1, 0.0], 1, 2));
+    s.add_sample(morse_sample(&MorseDimer::h2(), &h_he), &h_he).unwrap();
+    assert!(s.begin_background_refit());
+    match s.finish_background_refit() {
+        BackgroundPoll::Installed(Err(FitError::MissingReference(2))) => {}
+        BackgroundPoll::Installed(r) => panic!("the fit should fail on the missing He reference: {r:?}"),
+        BackgroundPoll::Discarded(why) => panic!("discarded: {why}"),
+        _ => panic!("no background refit"),
+    }
+    let notes = Trainable::take_notes(&mut s);
+    assert!(notes.iter().any(|n| n.starts_with("sampling pass finished") && n.contains("the refit failed (no reference energy for Z = 2)")), "{notes:?}");
+    assert!(s.pass_tail.is_none() && !s.pass_fit_due, "completed, not waiting");
+}
+
 /// R3-2: a round over two blockers where one had no check judged near it is not accepted, and the
 /// outcome names it.
 #[test]
@@ -9673,6 +9890,139 @@ fn collection_mode_learns_across_scenes() {
     for want in ["70 samples", "He (Z 2)", "H–He", "H2He: 30 samples, grid 41³", "H2: 40 samples, grid 33³"] {
         assert!(readme.contains(want), "README lacks '{want}':\n{readme}");
     }
+}
+
+/// Quiet refits (2026-11-17; the app worker's "Refits"): with `set_fits_in_background` an attach
+/// whose samples can be fitted leaves that first fit to the caller — no model, a refit due,
+/// `first_fit_ready` — and `begin_background_refit` runs it on a copy while the provider answers as
+/// with no model (a fallback, kept: one more change counted, `fit_inputs_gen`). The install counts
+/// no change of its own, and the appended sample is the next refit's. Without the switch the attach
+/// fits in place, as before. No Retry is offered while the first fit runs (it would fit in place).
+#[test]
+fn a_deferred_first_fit_runs_in_the_background_and_counts_no_change_of_its_own() {
+    let dir = collection_root("deferred_first_fit");
+    let mut rng = StdRng::seed_from_u64(11);
+    {
+        let (mut q, _) = pair_student();
+        q.attach_collection(&dir, &h2(1.4)).unwrap();
+        q.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));
+        for i in 0..60 {
+            q.evaluate(&h2_at(1.1 + 0.02 * i as f64, &mut rng), &mut never()).unwrap();
+        }
+        assert_eq!(q.collection().unwrap().samples.len(), 60);
+    }
+    let (mut s, _) = pair_student();
+    Trainable::set_fits_in_background(&mut s, true);
+    s.attach_collection(&dir, &h2(1.4)).unwrap();
+    assert!(!s.fitted() && s.pending_refit() && Trainable::first_fit_ready(&s), "the attach fits nothing: {:?}", s.no_model().map(|n| n.words));
+    assert!(Trainable::status(&s, &h2(1.4), &[[0.0; 3]; 2]).retry_fit, "the Retry, before it starts");
+    let (g, n) = (s.fit_inputs_gen(), s.samples());
+    assert!(s.begin_background_refit(), "the first fit starts in the background");
+    assert!(!Trainable::first_fit_ready(&s) && !Trainable::status(&s, &h2(1.4), &[[0.0; 3]; 2]).retry_fit, "running: neither again nor a Retry");
+    assert!(s.no_model().is_some_and(|n| n.words.contains("first fit") && n.words.contains("is running") && !n.retry), "{:?}", s.no_model().map(|n| n.words));
+    let mut refs = sim::AtomReferences::default();
+    assert!(s.retry_fit(&h2(1.4), &mut refs).is_err_and(|e| e.contains("running in the background")), "an explicit Retry never fits in place meanwhile");
+    let r = s.evaluate(&h2_at(1.45, &mut rng), &mut never()).unwrap();
+    assert_eq!(r.stats.source, Source::Fallback, "no model yet: the teacher answers");
+    assert_eq!((s.samples(), s.fit_inputs_gen()), (n + 1, g + 1), "kept: one change of what a refit fits");
+    match s.finish_background_refit() {
+        BackgroundPoll::Installed(Ok(_)) => {}
+        BackgroundPoll::Installed(Err(e)) => panic!("the first fit failed: {e}"),
+        BackgroundPoll::Discarded(why) => panic!("discarded: {why}"),
+        _ => panic!("no background refit"),
+    }
+    assert!(s.fitted() && s.pending_refit(), "installed; the sample kept meanwhile is the next refit's");
+    assert_eq!(s.fit_inputs_gen(), g + 1, "the install is no change of what a refit fits");
+    assert!(!Trainable::first_fit_ready(&s));
+    // the Retry route (`request_first_fit`): only with no model and a fit that can form
+    assert!(!Trainable::request_first_fit(&mut s), "a model stands: nothing to request");
+    // without the switch: fitted in place by the attach, as before
+    let (mut t, _) = pair_student();
+    t.attach_collection(&dir, &h2(1.4)).unwrap();
+    assert!(t.fitted() && !Trainable::first_fit_ready(&t), "{:?}", t.no_model().map(|n| n.words));
+    // a provider that attached without fitting and was not left the first fit (no switch, a fit
+    // that failed): the Retry hands it to the caller, in the background
+    let (mut u, _) = pair_student();
+    Trainable::set_fits_in_background(&mut u, true);
+    u.attach_collection(&dir, &h2(1.4)).unwrap();
+    u.first_fit_due = false;
+    assert!(!Trainable::first_fit_ready(&u));
+    assert!(Trainable::request_first_fit(&mut u) && Trainable::first_fit_ready(&u) && u.pending_refit());
+    assert!(u.begin_background_refit());
+    assert!(matches!(u.finish_background_refit(), BackgroundPoll::Installed(Ok(_))) && u.fitted());
+}
+
+/// Quiet refits round 2: ⚠ Model only toggles draft mode and the audit cadence, which no verdict
+/// reads — `set_policy` re-judges nothing then (0.8 s of class-wise leave-one-out per change on a
+/// 1 630-sample collection, `policy_cost`), and every verdict is what a re-judge would give; a
+/// threshold change still re-judges.
+#[test]
+fn a_draft_or_audit_change_re_judges_nothing() {
+    let (mut s, _h) = trained(1.2, 2.2, 40, FallbackPolicy::default());
+    let before = (s.training_residuals, s.misfit.clone(), s.class_loo.clone(), s.trusted(), s.untrusted_reason());
+    let runs = s.class_loo_refreshes;
+    let gen = s.model_gen;
+    let suspects = s.sample_suspects();
+    assert!(!suspects.is_empty(), "premise: the fit's leave-one-out ratios rank its samples");
+    Trainable::set_draft(&mut s, true);
+    Trainable::set_audit_every(&mut s, 0);
+    assert_eq!(s.class_loo_refreshes, runs, "no leave-one-out for draft mode or the audit cadence");
+    // round 3 (review I3, I4): no new generation either — no view reads draft mode or the audit
+    // cadence, and a new one left the fit's leave-one-out ratios stale (Worst-fitting blank until
+    // the next refit, which Model only holds) and discarded a running background refit
+    assert_eq!(s.sample_suspects(), suspects, "Worst-fitting still reads the fit's own ratios");
+    assert_eq!(s.model_gen, gen, "the model generation stands");
+    assert_eq!((s.training_residuals, s.misfit.clone(), s.class_loo.clone(), s.trusted(), s.untrusted_reason()), before);
+    // what a re-judge would give: the same
+    (s.training_residuals, s.misfit) = s.compute_residuals().unzip();
+    s.refresh_class_loo();
+    assert_eq!((s.training_residuals, s.misfit.clone(), s.class_loo.clone(), s.trusted(), s.untrusted_reason()), before);
+    // a threshold the judgement reads: re-judged
+    let runs = s.class_loo_refreshes;
+    s.set_policy(FallbackPolicy { force_std_abs: 3e-3, ..*s.policy() });
+    assert_eq!(s.class_loo_refreshes, runs + 1);
+}
+
+/// Quiet refits round 3 (review I4, the user's original complaint): ⚠ Model only toggled while a
+/// background refit runs — a pass's end fit, here — does not discard it: draft mode and the audit
+/// cadence move no fit input and no verdict, and the install books its jump under the live policy.
+/// It installs, the pass's outcome follows, and nothing more is due. A threshold change while one
+/// runs still discards it (the copy judged under the old thresholds).
+#[test]
+fn a_model_only_toggle_during_a_background_refit_keeps_it() {
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    Trainable::set_fits_in_background(&mut s, true);
+    let scene = in_big_cell(h2(1.6));
+    let prov = s.provenance_for(&scene);
+    let mut refs = sim::AtomReferences::default();
+    refs.seed_energy(crate::sampling::atom_key(&prov, 1), MorseDimer::h2().e_atom, None, prov.tol, &prov.teacher);
+    let plan = SamplingPlan { perturbations: 4, hot_burst_steps: 0, scan_points_per_pair: 0, seed: 7, ..SamplingPlan::default() };
+    Trainable::start_pass(&mut s, &scene, &plan, &mut refs).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    let _ = Trainable::take_notes(&mut s);
+    assert!(Trainable::first_fit_ready(&s), "the pass's fit is due");
+    assert!(s.begin_background_refit());
+    // ⚠ Model only on, then off again, while it runs
+    for on in [true, false] {
+        Trainable::set_draft(&mut s, on);
+        Trainable::set_audit_every(&mut s, if on { 0 } else { 2000 });
+    }
+    match s.finish_background_refit() {
+        BackgroundPoll::Installed(Ok(_)) => {}
+        BackgroundPoll::Installed(Err(e)) => panic!("the fit failed: {e}"),
+        BackgroundPoll::Discarded(why) => panic!("a Model only toggle discarded the pass's fit: {why}"),
+        _ => panic!("no background refit"),
+    }
+    let notes = Trainable::take_notes(&mut s);
+    assert!(notes.iter().any(|n| n.starts_with("sampling pass finished") && n.contains("refit on")), "the pass's outcome at the install: {notes:?}");
+    assert!(!s.pending_refit() && !Trainable::first_fit_ready(&s), "nothing more is due");
+    assert!(!s.sample_suspects().is_empty(), "the installed fit's ratios are fresh");
+    // the control: a threshold the judgement reads, changed while one runs, discards it
+    let sc = in_big_cell(h2(1.5));
+    s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    assert!(s.begin_background_refit());
+    s.set_policy(FallbackPolicy { force_std_abs: 3e-3, ..*s.policy() });
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Discarded(_)), "a threshold change is a conflict");
 }
 
 // ---- the body-4 degree grown with the store (spec 2026-11-13 §4.1) ----
@@ -11368,8 +11718,12 @@ fn a_pass_bringing_a_new_species_into_a_large_store_refits() {
 
 /// M8a Task 9: the knowledge map's builder (`knowledge.rs`), on this module's fixtures.
 mod knowledge;
+/// The three-atom coverage map's builder (`triples.rs`), on the knowledge fixtures.
+mod triples;
 mod refit_cost;
 mod refit_profile;
+/// The triple map's build cost on a collection copy (`#[ignore]`d measurement).
+mod triple_cost;
 mod refit_golden;
 mod residual_diag;
 
@@ -11379,8 +11733,16 @@ mod lone;
 /// Stray atoms (spec 2026-11-18): the split, the floor, the composition check's verdict, the cleared region (`stray.rs`).
 mod stray;
 
+/// Isolated atoms are no training atoms: a fitted stray atom leaves the envelope and rule 5b
+/// alone, and an installed file's envelope is rebuilt without them (`envelope_isolated.rs`).
+mod envelope_isolated;
+
 /// Spec 2026-11-12 R1: the recovery ranks offenders by their leave-one-out ratio (`recovery_loo.rs`).
 mod recovery_loo;
+
+/// Spec 2026-11-17 (option B): warm-started recovery trials, every standing fit a cold search
+/// (`recovery_warm.rs`).
+mod recovery_warm;
 
 /// Spec 2026-11-12 R2: forget and restore one sample, the Model tab's worst-fitting list (`forget.rs`).
 mod forget;
@@ -11401,6 +11763,19 @@ mod scope_measure;
 
 /// Live-orbitals Task 5: the background auditor's Harris display job (`harris.rs`).
 mod harris;
+
+/// 2026-11-17: the status's teach offer reads its richer-basis words from a cache, and the
+/// worker's `audits_background` read builds no status (`status_cache.rs`).
+mod status_cache;
+
+/// 2026-11-17: the estimated step's cost on a collection, the variance step's pieces (`step_cost.rs`).
+mod step_cost;
+
+/// A policy change's cost on a collection (quiet refits round 2; a measurement).
+mod policy_cost;
+
+/// 2026-11-20: decisions on the variance's support path equal the full path's (review I3a).
+mod support_decisions;
 
 // ---- M8a Task 10: masked scenes (a capped segment teaches only its interior atoms) ----
 

@@ -653,7 +653,9 @@ fn appends_during_a_background_refit_survive_the_install() {
     assert_same_state(&without_epoch(&sync), &without_epoch(&bg));
 }
 
-/// More than appends while a background refit runs — a policy change (the model generation moves),
+/// More than appends while a background refit runs — a change of a policy threshold the verdicts
+/// read (the model generation moves; draft mode and the audit cadence read none and conflict with
+/// nothing since quiet refits round 3, `a_model_only_toggle_during_a_background_refit_keeps_it`),
 /// a stored sample's quarantine code — discards its result: the model that stood still stands, and
 /// the refit is due again.
 #[test]
@@ -662,7 +664,8 @@ fn a_conflict_discards_a_background_refit() {
     let mut s = stuck_live("bg-conflict-policy", false);
     let model = format!("{:?}", s.model);
     assert!(s.begin_background_refit());
-    let p = s.policy.clone();
+    // (before round 3 the same policy set again moved the generation; it changes nothing now)
+    let p = FallbackPolicy { force_std_abs: s.policy.force_std_abs * 1.5, ..s.policy.clone() };
     s.set_policy(p);
     match s.finish_background_refit() {
         BackgroundPoll::Discarded(why) => assert!(why.contains("the model, its samples or the policy"), "{why}"),

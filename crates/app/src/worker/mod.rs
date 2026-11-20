@@ -50,35 +50,87 @@
 //!   16 ms budget on the pass); edits are accepted.
 //! - **Refits.** After every tick in which the surrogate kept a sample (`pending_refit`: a
 //!   fallback step — active learning), a model exists (the first fit is the sampling pass's,
-//!   which also solves the reference energies a fit needs) and no pass is running, the worker
-//!   refits it (through `sim::Trainable`, the only way past the boundary — nothing downcasts the
-//!   provider), between ticks as `providers::surrogate` requires — while playing at most once per
-//!   [`REFIT_INTERVAL`] unless [`REFIT_SAMPLES`] new samples arrived first (a fallback burst does
-//!   not refit every step); paused, at once. While playing the refit runs **in the background**
-//!   (`Trainable::begin_refit_background`; `providers::surrogate` "background"): the model that
-//!   stands keeps answering, judged by its own verdicts, and each tick polls it; the new model is
-//!   installed between ticks once done (or discarded when more than appended data changed meanwhile —
-//!   it is due again, after the throttle; after [`REFIT_DISCARDS_BEFORE_SYNC`] discards in a row the
-//!   next one runs in the tick, so the model still moves). Paused, an active-learning refit runs in
-//!   the tick, as before (nothing steps meanwhile, and the order of a paused session's notes stays
-//!   deterministic); a refit for the user's Forget / Restore runs in the background paused too
-//!   (below, and after any number of discards: a paused worker must never block on one). The driver notices the new surface epoch and books
-//!   the jump on its next tick. Every outcome goes to the snapshot notes ("refit #k: rmse …,
-//!   trusted: yes/no — reason", the recovery's quarantine note, or "refit failed: …") and to
-//!   [`ModelStatus::last_refit`]; a failed refit is retried at the next opportunity, never fatal.
-//!   An untrusted refit triggers the surrogate's trust recovery (ruling S15: a degree-cap retry,
-//!   then quarantine rounds — `providers::surrogate` module doc). The Model tab's Forget / Restore
-//!   (`Command::ForgetSample`, spec 2026-11-12 R2, and the batches `Command::ForgetSamples` /
-//!   `RestoreSamples`, 2026-11-14) is applied at once — the samples fence at once — and asks for a
-//!   **debounced** refit ([`UserRefit`]): due [`FORGET_REFIT_DELAY`] after the last change (each one
-//!   restarts the wait), or at once on `Command::RefitNow`; until then no refit starts, then one
-//!   starts unthrottled and **in the background, paused too** (a refit with a non-empty misfit set
-//!   can take minutes: the Model tab stays usable). A change while a refit runs is applied at once
-//!   (the provider re-applies it at the install, `providers::surrogate` "background") and makes one
-//!   more refit due after it — coalesced, not cancelled: the running one may be nearly done, and a
-//!   cancel at every click could starve the model of any refit. While the pending refit waits and
-//!   nothing else runs, the idle worker sleeps until its due time (or the next command), like a
-//!   deferred training-view build.
+//!   which also solves the reference energies a fit needs — or an attached collection's, below)
+//!   and no pass is running, the worker refits it (through `sim::Trainable`, the only way past
+//!   the boundary — nothing downcasts the provider), between ticks as `providers::surrogate`
+//!   requires — while playing at most once per [`REFIT_INTERVAL`] unless [`REFIT_SAMPLES`] new
+//!   samples arrived first (a fallback burst does not refit every step); paused, it starts at once. The
+//!   decision is [`refit_start`]'s. **Quiet refits** (2026-11-17, the user: "Can we PLEASE stop
+//!   refitting all the samples on repeat whilst in model only mode", and the freezes):
+//!   - **⚠ Model only ⇒ no automatic refit** ([`Command::SetModelOnly`]): a kept sample (a
+//!     no-model fallback, a relax check, a scene the model cannot be asked about) waits as
+//!     pending — the knowledge graph shows it "new (waiting for refit)" — and turning Model only
+//!     off makes it due through the throttle. The user's own refits still run: **Refit now** and
+//!     Forget / Restore's debounced refit (below), and the first fit of an attached collection.
+//!   - **No refit without new data, in any mode.** An automatic refit starts only when what a
+//!     refit fits changed (`Trainable::fit_inputs_gen`: samples appended, the user's Forget /
+//!     Restore, a reference that moved the labels, samples loaded, imported or attached) since the
+//!     start of the last refit that ran to completion — installed, failed, or discarded twice. A
+//!     refit's own outcome never re-arms it: before, a discarded background refit
+//!     (`providers::surrogate` "background": a conflict leaves `pending_refit` set, "it is due
+//!     again") was started again on the same samples at once, a failed one at every tick, and after
+//!     two discards in a row the next ran **in the tick**, blocking the worker for a whole trust
+//!     recovery (30–160 s at 1 600 samples) — the pattern of refit_times.csv's repeated 1622 /
+//!     1629-sample recoveries. A failed refit's samples wait for the next change, or Refit now (the
+//!     user's refit is not gated). A **discard** earns **one** more attempt on the same data (fix
+//!     round 1): its conflict may move nothing a refit fits — Model only or the audit cadence
+//!     toggled while it ran (`set_policy`), a class verdict moving a teach-around count — and
+//!     without the retry its samples would be stranded (Model only on → Refit now → Model only
+//!     off). The retry is automatic: in the background only, held by Model only and the throttle;
+//!     a second discard at the same data waits for new data.
+//!   - **Never in the tick.** A refit runs **in the background**, paused or playing
+//!     (`Trainable::begin_refit_background`; `providers::surrogate` "background"): the model that
+//!     stands keeps answering, judged by its own verdicts, and each round polls it — a paused
+//!     worker once a budget — and installs it between ticks once done (or discards it when more
+//!     than appended data changed meanwhile). `working` holds while one runs, so a paused session
+//!     still reads as busy until it lands. A refit that lands after a round's tick is followed by
+//!     one more round at once (round 2: `retick`), so the driver sees the new surface epoch and
+//!     re-evaluates on it — paused and idle it would otherwise show the old surface's answer until
+//!     the next command; `working` holds until that round too. Before fix round 1 a paused automatic refit ran in the
+//!     tick (for a deterministic note order), blocking the worker for its wall — 30–160 s on a
+//!     1 600-sample collection: the window drew but every command waited. Only a provider that
+//!     cannot (the default `Trainable`) refits in the tick, and never a first fit or a retry.
+//!   - **The first fit of an attached collection** (no model yet) is the worker's too: the attach
+//!     leaves it (`Trainable::set_fits_in_background`, set on every driver the worker builds and
+//!     before every attach) and it starts
+//!     here in the background — paused or playing, in Model only too — once
+//!     `Trainable::first_fit_ready` (every reference in, enough samples); before, the attach ran it
+//!     on the worker thread (113 s for 1 627 samples: the "freeze" on opening). `EnsureModel`
+//!     starts no automatic pass for it. While it runs there is no model: the viewer refuses Play
+//!     with [`FIRST_FIT_PLAY`] ([`ModelStatus::first_fit_running`]; a Step is answered as with no
+//!     model) and the provider's "No model yet" words say it runs, with no Retry offered. It is
+//!     never run in the tick; one that failed waits for new data or the Model tab's **Retry**,
+//!     which — every reference in — the worker turns into the same background first fit
+//!     (`Trainable::request_first_fit`) instead of the provider's fit in place. A no-model
+//!     session's kept fallbacks still wait for a sampling pass.
+//!   - **A pass's end fit** (round 2: a sampling pass, Sample more, a teach-around round, a
+//!     reference retry) is the worker's the same way: the provider ends the pass without fitting
+//!     in place (on a large collection a refit with its trust recovery, 30–160 s of frozen app
+//!     after every pass), makes the fit due (`Trainable::first_fit_ready`, with or without a
+//!     model) and keeps the pass's tail — its outcome note, its shell checks, a teach round's
+//!     judgement — for the install of the background refit that carries it
+//!     (`providers::surrogate` "background", "A pass's fit"); the worker drains the provider's
+//!     notes at that install, so they arrive with the refit's own. It is the result of the user's
+//!     own pass, so it starts at once — in Model only too, not throttled, not held by a Forget's
+//!     wait — once per pass (a discard makes it due once more). With a model the old one answers
+//!     meanwhile; without one Play waits as for the first fit.
+//!
+//!   The driver notices the new surface epoch and books the jump on its next tick. Every outcome
+//!   goes to the snapshot notes ("refit #k: rmse …, trusted: yes/no — reason", the recovery's
+//!   quarantine note, "background refit discarded: …", or "refit failed: …") and to
+//!   [`ModelStatus::last_refit`]; a failed refit is never fatal. An untrusted refit triggers the
+//!   surrogate's trust recovery (ruling S15: a degree-cap retry, then quarantine rounds —
+//!   `providers::surrogate` module doc). The Model tab's Forget / Restore (`Command::ForgetSample`,
+//!   spec 2026-11-12 R2, and the batches `Command::ForgetSamples` / `RestoreSamples`, 2026-11-14)
+//!   is applied at once — the samples fence at once — and asks for a **debounced** refit
+//!   ([`UserRefit`]): due [`FORGET_REFIT_DELAY`] after the last change (each one restarts the
+//!   wait), or at once on `Command::RefitNow`; until then no refit starts, then one starts
+//!   unthrottled (a refit with a non-empty misfit set can take minutes: the Model tab stays usable).
+//!   A change while a refit runs is applied at once (the provider re-applies it at the install,
+//!   `providers::surrogate` "background") and makes one more refit due after it — coalesced, not
+//!   cancelled: the running one may be nearly done, and a cancel at every click could starve the
+//!   model of any refit. While the pending refit waits and nothing else runs, the idle worker
+//!   sleeps until its due time (or the next command), like a deferred training-view build.
 //!   A pass that ends — finished or cancelled — with fewer usable samples than its basis's Q′
 //!   is not fitted (M6 Task 3 fix round 2: below Q′ no fit can earn trust) and leaves **no
 //!   model**: its samples are kept, and since this refit needs a fitted model they are not
@@ -459,6 +511,16 @@ impl SimWorker {
         self.rx.recv_timeout(d).ok()
     }
 
+    /// [`Self::recv_timeout`] that tells a timeout (`Ok(None)`) from a worker that has exited
+    /// (`Err`, at once: its channel is closed), so a waiting loop does not spin on it.
+    pub fn recv_or_gone(&self, d: Duration) -> Result<Option<Event>, String> {
+        match self.rx.recv_timeout(d) {
+            Ok(ev) => Ok(Some(ev)),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => Err("the worker exited".into()),
+        }
+    }
+
     /// Stops the worker without waiting for it (switching backends): it exits at its next
     /// command check — at once when idle, at the next SCF step on the GPU, after the solve in
     /// flight on the CPU or in the driver's construction. Its remaining events are dropped with
@@ -637,9 +699,20 @@ struct Worker {
     last_refit_at: Option<Instant>,
     /// When the running background refit started (playing: `refit_if_pending`), if one runs.
     refit_started: Option<Instant>,
-    /// Background refits discarded in a row (a conflict each time): from
-    /// [`REFIT_DISCARDS_BEFORE_SYNC`] on, the next refit runs in the tick, so the model still moves.
-    refit_discards: u32,
+    /// The provider's `Trainable::fit_inputs_gen` when the running background refit started.
+    refit_started_gen: Option<u64>,
+    /// … and at the start of the last refit that ran to completion — installed, failed or
+    /// discarded (module doc, "Refits"): no automatic refit until what a refit fits moves past it.
+    refit_done_gen: Option<u64>,
+    /// … and of the last discarded one: a discard earns one retry at that data, a second one
+    /// there sets `refit_done_gen` (module doc, "Refits").
+    refit_discarded_gen: Option<u64>,
+    /// A background refit landed (installed or discarded) in this round, after the tick: one more
+    /// round follows at once (`retick`), so the driver sees the new surface epoch and re-evaluates
+    /// on it — paused and idle it would otherwise wait for the next command.
+    refit_landed: bool,
+    /// One more round is wanted without a command (`refit_landed`).
+    retick: bool,
     /// The refit the user's Forget / Restore asked for, debounced (`user_samples`, [`UserRefit`];
     /// 2026-11-14, the batched forget).
     user_refit: UserRefit,
@@ -725,8 +798,9 @@ struct Worker {
     harris_seen_seq: u64,
     harris_atoms: Option<(Arc<Vec<AtomProfile>>, Vec<u8>, Arc<sim::HarrisAtoms>)>,
     harris_note: Option<&'static str>,
-    /// The provider audits on a background teacher (`TrainableStatus::audits_background`: the
-    /// estimated solver on the GPU teacher) — Harris display solves need it.
+    /// The provider audits on a background teacher (`Trainable::audits_background`, the status's
+    /// field without building the status: the estimated solver on the GPU teacher) — Harris
+    /// display solves need it.
     background_auditor: bool,
 }
 
@@ -882,7 +956,11 @@ fn worker(
         last_refit: None,
         last_refit_at: None,
         refit_started: None,
-        refit_discards: 0,
+        refit_started_gen: None,
+        refit_done_gen: None,
+        refit_discarded_gen: None,
+        refit_landed: false,
+        retick: false,
         user_refit: UserRefit::default(),
         samples_at_refit: 0,
         refits: 0,
@@ -931,8 +1009,13 @@ fn worker(
     for c in settings {
         w.dy.apply(c);
     }
+    // the fits the provider would run in place (an attach's first fit, a pass's end fit) are the
+    // worker's, in the background (module doc, "Refits")
+    if let Some(t) = trainable(&mut w.dy) {
+        t.set_fits_in_background(true);
+    }
     let first = w.dy.snapshot();
-    w.background_auditor = trainable(&mut w.dy).is_some_and(|t| t.status(&first.scene, &first.forces).audits_background);
+    w.background_auditor = trainable(&mut w.dy).is_some_and(|t| t.audits_background());
     w.publish(first);
     let mut inbox = Inbox {
         rx,
@@ -947,13 +1030,19 @@ fn worker(
         let refit_wake = w.user_refit.due().filter(|_| w.refit_started.is_none());
         let wake = [w.views_wake(), w.harris.wake(), refit_wake].into_iter().flatten().min();
         if let Some(d) = w.pace_until {
+            // (before the retick: a round before the deadline is the early branch below, which
+            // publishes without a round and so never clears `retick` — the loop spun, publishing a
+            // snapshot without a tick each time, until the deadline; quiet refits round 3, review
+            // Minor 5. The paced round at the deadline is the one more round it asks for)
             inbox.wait_until(d);
+        } else if w.retick {
+            // a refit landed after the last tick: the next round now (`refit_landed`)
         } else if let Some(d) = wake {
             inbox.wait_until(d);
         }
         // (idle with a bond reference or a background job to poll, or a view build due: the
         // round's pacing or the wait above was the round's, the take must not block)
-        let Some(cmds) = inbox.take(!has_work(&w.last) && w.last.bonds_pending.is_empty() && !w.side_pending && w.refit_started.is_none() && wake.is_none()) else {
+        let Some(cmds) = inbox.take(!has_work(&w.last) && w.last.bonds_pending.is_empty() && !w.side_pending && w.refit_started.is_none() && !w.retick && wake.is_none()) else {
             w.retire();
             return;
         };
@@ -1004,6 +1093,7 @@ impl Worker {
 
     /// Applies a batch, ticks once, refits the surrogate if it kept a sample, publishes.
     fn round(&mut self, cmds: Vec<Command>, inbox: &mut Inbox) {
+        self.retick = false;
         let applied = self.apply_batch(cmds);
         let fresh = applied.then(|| self.dy.snapshot());
         let pre = fresh.as_ref().unwrap_or(&self.last);
@@ -1045,6 +1135,9 @@ impl Worker {
             polls_references_only(&snap).then_some(t0 + budget)
         };
         let refitted = self.refit_if_pending(&snap);
+        // a refit landed after this round's tick: the next round's tick sees its surface epoch
+        // (forces stale, re-evaluated on the new model) — at once, not at the next command
+        self.retick = std::mem::take(&mut self.refit_landed);
         if refitted {
             // the refit's note is in the driver now: publish it with this snapshot
             let d = self.dy.snapshot();
@@ -1121,7 +1214,7 @@ impl Worker {
             self.background_auditor = false;
             return;
         };
-        self.background_auditor = s.status(&snap.scene, &snap.forces).audits_background;
+        self.background_auditor = s.audits_background();
         if !self.background_auditor {
             return;
         }
@@ -1217,7 +1310,7 @@ impl Worker {
 
     fn publish(&mut self, snap: DynSnapshot) {
         self.track_cost(&snap);
-        let working = has_work(&snap) || self.refit_started.is_some();
+        let working = has_work(&snap) || self.refit_started.is_some() || self.retick;
         if let Some(g) = snap.teacher_gap {
             self.last_gap = Some((g, snap.step));
         }
@@ -1328,6 +1421,11 @@ impl Worker {
         })) {
             Ok(d) => {
                 self.dy = d;
+                // a new provider: its changes are counted afresh, and the old one's refit is gone
+                (self.refit_started, self.refit_started_gen, self.refit_done_gen, self.refit_discarded_gen) = (None, None, None, None);
+                if let Some(t) = trainable(&mut self.dy) {
+                    t.set_fits_in_background(true);
+                }
                 self.apply_audit();
                 // a collection-mode model is not carried by the autosave: the collection holds it
                 self.sync_collection();

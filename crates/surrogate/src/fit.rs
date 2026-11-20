@@ -244,7 +244,13 @@
 //! when the accumulator is rebuilt. Every search starts from the data's own levels (never from an
 //! earlier search's), so it is a function of the accumulated statistics alone: the warm refit is
 //! where the evidence is "warm", and a reopened collection's first fit equals the session's last
-//! search bit for bit. The report of a warm refit carries the search's
+//! search bit for bit. **The one exception is a trust recovery's trial** (spec 2026-11-17,
+//! [`Accumulator::refit_from`]): it is searched from the previous fit's (s_E, s_F) — the λ search
+//! runs its whole grid at every round, so λ needs no start — and meets the same 1e-3 stopping test
+//! (`a_started_search_reaches_the_cold_stopping_point`: within 6.6e-4 of the cold optimum in 2
+//! rounds instead of 8 on a DFT-like scatter, 9.2e-4 in 6 instead of 10 near noise-free); it
+//! leaves no warm state, and the recovery re-searches from the data any trial that would stand, so
+//! every fit that stands is still a function of the statistics alone. The report of a warm refit carries the search's
 //! `condition_estimate` and `converged` and 0 `hyper_iterations`. At Q′ 2 688 and 10 000 samples a
 //! sample's add + warm refit takes 0.17 s. The warm refit also declines (searches) once the ridge
 //! floor 4Q′ε·max diag A of the grown data passes the standing λ_eff: the frozen ridge would no
@@ -292,7 +298,8 @@
 //!   row, so n_scale = n_E and every earlier fit is unchanged bit for bit.
 //! * the **envelope** (`Envelope::add_atom`) of the interior atoms only: a cap or an edge atom
 //!   describes no knowledge of the source (the conservative ruling — the provider's active set
-//!   and key counts follow it).
+//!   and key counts follow it). Nor, masked or not, an isolated atom (no neighbour within r_cut,
+//!   [`crate::envelope::isolated_atom`]): it is no training atom (`envelope` module doc).
 //!
 //! **A fit without energy rows** (a collection taught only by segments): G_E = b_E = yᵀWy_E = 0,
 //! so s_E enters neither A, m, γ nor the evidence (every energy term is 0 · something finite). It
@@ -597,6 +604,26 @@ impl FitReport {
     pub fn sigma_e_text(&self) -> String {
         self.measured_sigma_e().map_or_else(|| NO_ENERGY_ROWS.to_string(), |s| format!("{s:.2e}"))
     }
+
+    /// This fit's hyperparameters (λ, s_E, s_F) as the start of another search
+    /// ([`Accumulator::refit_from`]: a trust recovery's next trial).
+    pub fn search_start(&self) -> SearchStart {
+        SearchStart { lambda: self.lambda, sigma_e: self.sigma_e, sigma_f: self.sigma_f }
+    }
+}
+
+/// Where a spectral hyperparameter search starts instead of the data's own levels
+/// ([`Accumulator::refit_from`]; module doc, "The large-basis path"): λ, s_E (Hartree per atom
+/// when the energy is fitted per atom) and s_F (Hartree/Bohr), as a [`FitReport`] states them. The
+/// search starts its noise levels at (s_E², s_F²); λ is searched over its whole grid at every round
+/// whatever the start, so the start's λ only has to be valid. A start with a non-finite or
+/// non-positive entry is ignored (the search starts from the data); a pinned level
+/// (`FitOptions::sigma_e`, `sigma_f`, a fit without energy rows) overrides the start's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SearchStart {
+    pub lambda: f64,
+    pub sigma_e: f64,
+    pub sigma_f: f64,
 }
 
 /// What a readout shows for the energy numbers of a fit without energy rows (s_E, the energy
@@ -1245,6 +1272,7 @@ impl Accumulator {
             n_samples: self.n_samples,
             provenance: provenance.clone(),
             representatives: OnceLock::new(),
+            variance_support: crate::model::SupportCache::new(),
         };
         let report = FitReport {
             rmse_energy_per_atom: if n_e > 0.0 { (sol.rss_e / n_e).sqrt() } else { 0.0 },
@@ -1279,8 +1307,10 @@ pub enum RefitKind {
     /// A body-4 basis: the hyperparameters searched spectrally, `rounds` outer rounds (one
     /// factorisation and ≥ 1 tridiagonalisations each); `stalled` when the ρ step found no ascent
     /// before the 1e-3 test was met (the search stopped at the profile's maximum to the evidence's
-    /// resolution; the report says `converged: false` then).
-    Spectral { rounds: usize, stalled: bool },
+    /// resolution; the report says `converged: false` then); `from_start` when it was searched
+    /// from a [`SearchStart`] ([`Accumulator::refit_from`]: a recovery trial's, which never stands
+    /// as it is) rather than from the data's own levels.
+    Spectral { rounds: usize, stalled: bool, from_start: bool },
     /// A body-4 basis: the samples added since the last refit folded into the posterior at the
     /// standing hyperparameters and standardisation by rank-one updates of its factor.
     Warm { samples: usize },
@@ -1334,6 +1364,17 @@ impl Accumulator {
     /// valid (the same options, the store grown by less than [`WARM_GROWTH`] since the last search,
     /// at most [`WARM_MAX_PENDING`] samples since the last refit), else the spectral search.
     pub fn refit(&mut self, opts: &FitOptions, provenance: &Provenance, ref_energy: &[f64]) -> Result<(Model, FitReport), FitError> {
+        self.refit_from(opts, provenance, ref_energy, None)
+    }
+
+    /// [`refit`](Self::refit) with the spectral search started from `start` instead of the data's
+    /// own levels (spec 2026-11-17, warm-started recovery trials; module doc, "The large-basis
+    /// path"). `None` is `refit`, bit for bit. With a start a body-4 basis always searches (no
+    /// warm refit), the search meets the same stopping test as one from the data, and it leaves
+    /// no warm state, so the next refit searches from the data again: a started fit is a trust
+    /// recovery's trial, which stands only once a search from the data confirms it. A basis
+    /// without body-4 (`solve`, the dense search) has no start: there the refit is the plain one.
+    pub fn refit_from(&mut self, opts: &FitOptions, provenance: &Provenance, ref_energy: &[f64], start: Option<SearchStart>) -> Result<(Model, FitReport), FitError> {
         let _prof = crate::prof::span("fit: Accumulator::refit");
         let opts = &self.effective_options(opts);
         if !self.basis.body4 {
@@ -1343,16 +1384,17 @@ impl Accumulator {
             return self.solve(opts, provenance, ref_energy);
         }
         let pending = self.pending.len();
-        let warm_ok = self.warm.as_ref().is_some_and(|w| {
-            w.opts == *opts && (self.n_samples as f64) < WARM_GROWTH * w.n_search as f64 && pending <= WARM_MAX_PENDING
-        });
+        let warm_ok = start.is_none()
+            && self.warm.as_ref().is_some_and(|w| {
+                w.opts == *opts && (self.n_samples as f64) < WARM_GROWTH * w.n_search as f64 && pending <= WARM_MAX_PENDING
+            });
         if warm_ok {
             if let Ok(out) = self.solve_warm(opts, provenance, ref_energy) {
                 self.last_refit = RefitKind::Warm { samples: pending };
                 return Ok(out);
             }
         }
-        match self.solve_spectral(opts, provenance, ref_energy) {
+        match self.solve_spectral(opts, provenance, ref_energy, start) {
             Ok(out) => Ok(out),
             // the reference search as the fallback (slow at a large Q′, never wrong): a spectral
             // failure is numerical, not the data's verdict
@@ -1369,21 +1411,28 @@ impl Accumulator {
         self.last_refit
     }
 
-    /// The spectral search (module doc), from the data's own starting levels — never from an
-    /// earlier search's, so a search is a function of the accumulated statistics alone (a
-    /// reopened collection's first fit equals the session's last search, bit for bit); leaves a
-    /// warm state for the next refit.
-    fn solve_spectral(&mut self, opts: &FitOptions, provenance: &Provenance, ref_energy: &[f64]) -> Result<(Model, FitReport), FitError> {
+    /// The spectral search (module doc). Without a start, from the data's own starting levels —
+    /// never from an earlier search's, so a search is a function of the accumulated statistics
+    /// alone (a reopened collection's first fit equals the session's last search, bit for bit);
+    /// leaves a warm state for the next refit. With a start (λ, s_E, s_F), from those: a trust
+    /// recovery's trial ([`Accumulator::refit_from`]), which never stands as it is — it leaves
+    /// **no** warm state, so the next refit searches from the data, and the standing fit, its
+    /// warm state and every refit continuing from it are the cold search's.
+    fn solve_spectral(&mut self, opts: &FitOptions, provenance: &Provenance, ref_energy: &[f64], start: Option<SearchStart>) -> Result<(Model, FitReport), FitError> {
         let _prof = crate::prof::span("fit:   solve_spectral (search)");
-        let start = None;
         self.warm = None;
         self.pending.clear();
         let (scale, d, problem) = self.prepare(ref_energy, None)?;
-        let (hyper, sol, extra) = problem.estimate_spectral(opts, start)?;
+        let (hyper, sol, extra) = problem.estimate_spectral(opts, start.map(|s| (s.lambda, s.sigma_e, s.sigma_f)))?;
         let log_evidence = problem.evidence(hyper.lambda, hyper.s_e2, hyper.s_f2, &sol);
         let q = self.q_prime;
         let condition = condition_estimate(&sol.a, &sol.chol, q);
         let out = self.assemble(opts, provenance, ref_energy, &scale, &d, &hyper, &sol, log_evidence, condition)?;
+        self.last_refit = RefitKind::Spectral { rounds: hyper.iterations, stalled: extra.stalled, from_start: start.is_some() };
+        if start.is_some() {
+            // a trial's search: nothing continues from it (doc above)
+            return Ok(out);
+        }
         let mut r = vec![0.0; q * q];
         for i in 0..q {
             for j in 0..=i {
@@ -1405,7 +1454,6 @@ impl Accumulator {
             converged: hyper.converged,
             condition,
         }));
-        self.last_refit = RefitKind::Spectral { rounds: hyper.iterations, stalled: extra.stalled };
         Ok(out)
     }
 
@@ -2559,6 +2607,7 @@ mod tests {
             n_samples: 0,
             provenance: provenance(),
             representatives: OnceLock::new(),
+            variance_support: crate::model::SupportCache::new(),
         }
     }
 
@@ -3257,11 +3306,6 @@ mod tests {
             .collect()
     }
 
-    /// Stray-atoms Task 4 fix round 1 (C1, controller ruling 7): an isolated atom (no neighbour within r_cut) is no
-    /// training atom. A sample of H₂ plus an H ≥ 9.9 Bohr from both atoms leaves the envelope bit for bit what H₂ alone leaves — on
-    /// the per-sample path (`add`) and the batched body-4 path (`add_many`) — so its species keeps a positive
-    /// coordination minimum and the ratio rule stays on; a species seen only isolated has no training atom (count 0,
-    /// infinitely far). A sparse but non-empty neighbourhood (a pair at 5.125 Bohr, f_c ≈ 0.05) still enters.
     #[test]
     fn a_stray_samples_energy_row_is_its_bonded_parts() {
         // Controller ruling 9a: a sample with a stray atom (B = 0) has the energy row of its bonded part —
@@ -3300,10 +3344,16 @@ mod tests {
         }
     }
 
+    /// An isolated atom (no neighbour within r_cut; `envelope` module doc, "Isolated atoms are not
+    /// training atoms") is no training atom. A sample of H₂ plus an H ≥ 12.9 Bohr from both atoms
+    /// leaves the envelope bit for bit what H₂ alone leaves — on the per-sample path (`add`) and the
+    /// batched path (`add_many`, body-4 threaded; a loop of `add` otherwise), on body-2, body-3 and
+    /// body-4 bases — so its species keeps a positive coordination minimum and rule 5b stays on; a
+    /// species seen only isolated has no training atom (count 0, infinitely far). A sparse but
+    /// non-empty neighbourhood (a pair at 5.125 Bohr, f_c ≈ 0.05) still enters.
     #[test]
     fn an_isolated_atom_is_no_envelope_atom() {
         let mut rng = StdRng::seed_from_u64(77);
-        let refs = [E_ATOM_H];
         let opts = FitOptions::default();
         let train: Vec<Sample> = (0..12).map(|i| dimer_sample(1.0 + 0.1 * i as f64, unit_vector(&mut rng), [0.0, -3.0, 0.0], None)).collect();
         let with_stray = |s: &Sample| {
@@ -3313,8 +3363,9 @@ mod tests {
             t.forces.push([0.0; 3]);
             t
         };
+        let bits = |e: &Envelope| [&e.min, &e.max, &e.sum, &e.sumsq].iter().flat_map(|v| v.iter().map(|x| x.to_bits())).chain(e.count.iter().map(|&c| c as u64)).collect::<Vec<u64>>();
         for basis in [h2_basis(6), Basis::new(&[H]), small_body4_basis()] {
-            let refs: Vec<f64> = basis.species.iter().map(|&z| if z == H { refs[0] } else { -74.8 }).collect();
+            let refs: Vec<f64> = basis.species.iter().map(|&z| if z == H { E_ATOM_H } else { -74.8 }).collect();
             let (mut plain, mut stray, mut batched) = (Accumulator::new(&basis), Accumulator::new(&basis), Accumulator::new(&basis));
             for s in &train {
                 plain.add(s, &basis, &refs, &opts).unwrap();
@@ -3322,9 +3373,8 @@ mod tests {
             }
             let strays: Vec<Sample> = train.iter().map(with_stray).collect();
             batched.add_many(&strays.iter().collect::<Vec<_>>(), &basis, &refs, &opts).unwrap();
-            let bits = |e: &Envelope| [&e.min, &e.max, &e.sum, &e.sumsq].iter().flat_map(|v| v.iter().map(|x| x.to_bits())).chain(e.count.iter().map(|&c| c as u64)).collect::<Vec<u64>>();
-            assert_eq!(bits(&stray.envelope), bits(&plain.envelope), "add: the isolated H adds nothing to the envelope");
-            assert_eq!(bits(&batched.envelope), bits(&plain.envelope), "add_many: the isolated H adds nothing to the envelope");
+            assert_eq!(bits(&stray.envelope), bits(&plain.envelope), "add: the isolated H adds nothing to the envelope (body-3 {}, body-4 {})", basis.body3, basis.body4);
+            assert_eq!(bits(&batched.envelope), bits(&plain.envelope), "add_many: the isolated H adds nothing to the envelope (body-3 {}, body-4 {})", basis.body3, basis.body4);
             let h = basis.species_index(H).unwrap();
             let k = basis.body2_index(h, 0) + h * basis.n_features();
             assert!(stray.envelope.min[k] > 0.5, "the coordination minimum stays the bonded atoms' ({})", stray.envelope.min[k]);
@@ -3342,7 +3392,7 @@ mod tests {
         let mut acc = Accumulator::new(&basis);
         acc.add(&dimer_sample(5.125, [1.0, 0.0, 0.0], [0.0; 3], None), &basis, &[E_ATOM_H], &opts).unwrap();
         assert_eq!(acc.envelope.count, vec![2]);
-        assert!(acc.envelope.min[basis.body2_index(0, 0)] > 0.0);
+        assert!(acc.envelope.min[basis.body2_index(0, 0)] > 0.0, "the tail sample's f_c ≈ 0.05 enters the envelope");
     }
 
     /// The statistics of every public field and the compensated totals, as bits.
@@ -3698,6 +3748,161 @@ mod tests {
         let (b, _) = plain.solve(&opts, &provenance(), &[E_ATOM_H]).unwrap();
         assert_eq!(plain.last_refit(), RefitKind::Full);
         assert_eq!(a.coeffs, b.coeffs);
+    }
+
+    /// A search started from given hyperparameters (spec 2026-11-17, a recovery trial's) meets the
+    /// same stopping test as the search from the data's own levels: λ, s_E² and s_F² each within
+    /// 3e-3 relative of the cold search's (both stop at 1e-3 per round), in no more rounds. The
+    /// start is the cold optimum perturbed (λ × 1.5, σ_E and σ_F × 0.8), as a trial's start is the
+    /// previous fit's on slightly different data. Two fixtures: a DFT-like scatter (1e-4 Ha,
+    /// 2e-3 Ha/Bohr) and the near-noise-free one of `large_basis_search_finds_the_reference_search_optimum`.
+    #[test]
+    fn a_started_search_reaches_the_cold_stopping_point() {
+        let basis = small_body4_basis();
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        for (label, samples) in [("noisy", morse_bend_noisy(&mut StdRng::seed_from_u64(81), 200, 1e-4, 2e-3)), ("near noise-free", morse_bend_samples(&mut StdRng::seed_from_u64(77), 150))] {
+            let mut acc = Accumulator::new(&basis);
+            for s in &samples {
+                acc.add(s, &basis, &refs, &opts).unwrap();
+            }
+            let (m_cold, r_cold) = acc.refit(&opts, &provenance(), &refs).unwrap();
+            let cold_rounds = match acc.last_refit() {
+                RefitKind::Spectral { rounds, from_start: false, .. } => rounds,
+                k => panic!("expected a cold spectral search, got {k:?}"),
+            };
+            let s0 = r_cold.search_start();
+            assert_eq!((s0.lambda, s0.sigma_e, s0.sigma_f), (r_cold.lambda, r_cold.sigma_e, r_cold.sigma_f));
+            let start = SearchStart { lambda: 1.5 * s0.lambda, sigma_e: 0.8 * s0.sigma_e, sigma_f: 0.8 * s0.sigma_f };
+            // the accumulator holds the cold search's warm state: a started refit searches anyway
+            let (_, r_st) = acc.refit_from(&opts, &provenance(), &refs, Some(start)).unwrap();
+            let started_rounds = match acc.last_refit() {
+                RefitKind::Spectral { rounds, from_start: true, .. } => rounds,
+                k => panic!("expected a started spectral search, got {k:?}"),
+            };
+            eprintln!(
+                "{label}: cold λ {:.6e} σ_E {:.6e} σ_F {:.6e} ({cold_rounds} rounds, converged {}); started λ {:.6e} σ_E {:.6e} σ_F {:.6e} ({started_rounds} rounds, converged {}); rel λ {:.1e} s_E² {:.1e} s_F² {:.1e}",
+                r_cold.lambda, r_cold.sigma_e, r_cold.sigma_f, r_cold.converged, r_st.lambda, r_st.sigma_e, r_st.sigma_f, r_st.converged,
+                rel_change(r_cold.lambda, r_st.lambda), rel_change(r_cold.sigma_e.powi(2), r_st.sigma_e.powi(2)), rel_change(r_cold.sigma_f.powi(2), r_st.sigma_f.powi(2))
+            );
+            assert!(r_cold.converged && r_st.converged, "{label}: both meet the stopping test");
+            for (what, a, b) in [("λ", r_cold.lambda, r_st.lambda), ("s_E²", r_cold.sigma_e.powi(2), r_st.sigma_e.powi(2)), ("s_F²", r_cold.sigma_f.powi(2), r_st.sigma_f.powi(2))] {
+                assert!(rel_change(a, b) < 3e-3, "{label} {what}: cold {a:e} vs started {b:e}");
+            }
+            assert!(started_rounds <= cold_rounds, "{label}: started {started_rounds} rounds vs cold {cold_rounds}");
+            // a started search leaves no warm state: the next refit searches from the data again,
+            // and is the cold search bit for bit (a recovery's cold confirmation)
+            let (m_again, r_again) = acc.refit(&opts, &provenance(), &refs).unwrap();
+            assert!(matches!(acc.last_refit(), RefitKind::Spectral { from_start: false, .. }), "{:?}", acc.last_refit());
+            assert_eq!(r_again, r_cold, "{label}: the report");
+            assert_eq!(m_again.coeffs, m_cold.coeffs, "{label}: the coefficients");
+        }
+    }
+
+    /// Review M3: a start far from the optimum (λ × 1e3, σ_E × 10, σ_F × 0.1), a start taken from a
+    /// fit on another basis (the degree cap toggled, as a recovery's step 3 passes one), and a start
+    /// on a fit without energy rows (s_E pinned at `SIGMA_E_WITHOUT_ENERGY_ROWS`, which overrides the
+    /// start's): each search meets the cold search's stopping test, within 3e-3 of its optimum.
+    #[test]
+    fn a_start_far_off_or_from_another_basis_still_reaches_the_cold_optimum() {
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        let samples = morse_bend_noisy(&mut StdRng::seed_from_u64(83), 200, 1e-4, 2e-3);
+        let fit_on = |basis: &Basis, samples: &[Sample], start: Option<SearchStart>| {
+            let mut acc = Accumulator::new(basis);
+            for s in samples {
+                acc.add(s, basis, &refs, &opts).unwrap();
+            }
+            let (_, r) = acc.refit_from(&opts, &provenance(), &refs, start).unwrap();
+            let rounds = match acc.last_refit() {
+                RefitKind::Spectral { rounds, from_start, .. } => {
+                    assert_eq!(from_start, start.is_some());
+                    rounds
+                }
+                k => panic!("expected a spectral search, got {k:?}"),
+            };
+            (r, rounds)
+        };
+        let close = |label: &str, a: &FitReport, b: &FitReport| {
+            eprintln!("{label}: λ {:.1e} s_E² {:.1e} s_F² {:.1e}", rel_change(a.lambda, b.lambda), rel_change(a.sigma_e.powi(2), b.sigma_e.powi(2)), rel_change(a.sigma_f.powi(2), b.sigma_f.powi(2)));
+            assert!(a.converged && b.converged, "{label}");
+            for (what, x, y) in [("λ", a.lambda, b.lambda), ("s_E²", a.sigma_e.powi(2), b.sigma_e.powi(2)), ("s_F²", a.sigma_f.powi(2), b.sigma_f.powi(2))] {
+                assert!(rel_change(x, y) < 3e-3, "{label} {what}: cold {x:e} vs started {y:e}");
+            }
+        };
+        // far from the optimum
+        let basis = small_body4_basis();
+        let (cold, cold_rounds) = fit_on(&basis, &samples, None);
+        let s0 = cold.search_start();
+        let far = SearchStart { lambda: 1e3 * s0.lambda, sigma_e: 10.0 * s0.sigma_e, sigma_f: 0.1 * s0.sigma_f };
+        let (r, rounds) = fit_on(&basis, &samples, Some(far));
+        eprintln!("far start: {rounds} rounds (cold {cold_rounds})");
+        close("far start", &cold, &r);
+        // from another basis's fit: the degree cap toggled
+        let mut capped = small_body4_basis();
+        capped.degree_cap = 2;
+        assert_ne!(capped, basis);
+        let (other, _) = fit_on(&capped, &samples, None);
+        let (r, rounds) = fit_on(&basis, &samples, Some(other.search_start()));
+        eprintln!("start from the degree-cap-2 fit (λ {:.3e} σ_E {:.3e} σ_F {:.3e}): {rounds} rounds", other.lambda, other.sigma_e, other.sigma_f);
+        close("another basis", &cold, &r);
+        // no energy rows: s_E is the pin whatever the start says
+        let force_only: Vec<Sample> = samples.iter().cloned().map(masked).collect();
+        let (cold_f, _) = fit_on(&basis, &force_only, None);
+        let (r, _) = fit_on(&basis, &force_only, Some(SearchStart { sigma_e: 0.37 * s0.sigma_e, ..s0 }));
+        assert_eq!((cold_f.sigma_e, r.sigma_e), (SIGMA_E_WITHOUT_ENERGY_ROWS, SIGMA_E_WITHOUT_ENERGY_ROWS));
+        close("no energy rows", &cold_f, &r);
+    }
+
+    /// `refit_from(.., None)` is `refit`, bit for bit: on a body-4 basis (the spectral search, then
+    /// a warm refit) and on a basis without body-4 (`solve`), where a start has no hook and a
+    /// started refit is the plain one. `refit` is defined as `refit_from(.., None)`, so on this
+    /// branch the first comparison guards the delegation only; the evidence that a refit with no
+    /// start is main's, bit for bit, is the `refit_golden` compare against a main record
+    /// (`references.md` "Warm-started recovery trials": 0 differences in three cases, every search's
+    /// round count included) and the unchanged pinned tests of this module (review M2).
+    #[test]
+    fn no_start_is_todays_refit() {
+        let mut rng = StdRng::seed_from_u64(82);
+        let basis = small_body4_basis();
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        let first = morse_bend_noisy(&mut rng, 120, 1e-4, 2e-3);
+        let more = morse_bend_noisy(&mut rng, 5, 1e-4, 2e-3);
+        let (mut a, mut b) = (Accumulator::new(&basis), Accumulator::new(&basis));
+        for s in &first {
+            a.add(s, &basis, &refs, &opts).unwrap();
+            b.add(s, &basis, &refs, &opts).unwrap();
+        }
+        let (ma, ra) = a.refit(&opts, &provenance(), &refs).unwrap();
+        let (mb, rb) = b.refit_from(&opts, &provenance(), &refs, None).unwrap();
+        assert_eq!(a.last_refit(), b.last_refit());
+        assert!(matches!(b.last_refit(), RefitKind::Spectral { from_start: false, .. }));
+        assert_eq!(ra, rb);
+        assert_eq!(ma.coeffs, mb.coeffs);
+        assert_eq!(ma.sigma_inv_chol, mb.sigma_inv_chol);
+        for s in &more {
+            a.add(s, &basis, &refs, &opts).unwrap();
+            b.add(s, &basis, &refs, &opts).unwrap();
+        }
+        let (ma, ra) = a.refit(&opts, &provenance(), &refs).unwrap();
+        let (mb, rb) = b.refit_from(&opts, &provenance(), &refs, None).unwrap();
+        assert_eq!(b.last_refit(), RefitKind::Warm { samples: 5 });
+        assert_eq!(a.last_refit(), b.last_refit());
+        assert_eq!(ra, rb);
+        assert_eq!(ma.coeffs, mb.coeffs);
+        assert_eq!(ma.sigma_inv_chol, mb.sigma_inv_chol);
+        // a basis without body-4: `solve`, with or without a start
+        let mut plain = Accumulator::new(&h2_basis(4));
+        for s in morse_store(&mut StdRng::seed_from_u64(3), 1.0, 3.0, 40, Some((1e-5, 1e-4))).samples {
+            plain.add(&s, &h2_basis(4), &[E_ATOM_H], &opts).unwrap();
+        }
+        let (p0, q0) = plain.refit(&opts, &provenance(), &[E_ATOM_H]).unwrap();
+        let (p1, q1) = plain.refit_from(&opts, &provenance(), &[E_ATOM_H], None).unwrap();
+        let (p2, q2) = plain.refit_from(&opts, &provenance(), &[E_ATOM_H], Some(q0.search_start())).unwrap();
+        assert_eq!(plain.last_refit(), RefitKind::Full);
+        assert_eq!((&p0.coeffs, &q0), (&p1.coeffs, &q1));
+        assert_eq!((&p0.coeffs, &q0), (&p2.coeffs, &q2));
     }
 
     /// The spectral truncation of the posterior covariance Σ ≈ Σ_{k<K} s_k u_k u_kᵀ + s_min I

@@ -136,6 +136,11 @@ pub enum Command {
     /// `sim::TrainingViews` only while they are (`worker::activity`, "The training views'
     /// schedule"). A view setting: not an edit, never aborts, never reaches the driver.
     SetActivityViews(bool),
+    /// The Activity view's three-atom arrangements are shown (true) or not: the worker builds
+    /// `sim::knowledge::TripleMap` only while they are, on the knowledge map's schedule
+    /// (`worker::activity`, "The three-atom map"). A display-visibility command derived from what is
+    /// shown, as `SetActivityViews`: not an edit, never pauses, never aborts, never reaches the driver.
+    SetTripleView(bool),
     /// Estimated solver: ⚠ Model only is on (true) or off (`ui::Action::ModelOnly`, which also
     /// sends its draft mode and audit cadence): a changed orbital view then asks for a Harris
     /// display solve instead of a DFT refresh (`worker::harris`, spec §4.2). A worker setting: not
@@ -226,6 +231,7 @@ impl Command {
             | Command::SetDraft(_)
             | Command::SetCloud { .. }
             | Command::SetActivityViews(_)
+            | Command::SetTripleView(_)
             | Command::SetModelOnly(_)
             | Command::SetOrbitalRefresh(_)
             | Command::OrbitalView(_)
@@ -268,6 +274,7 @@ impl Command {
             | Command::SetDraft(_)
             | Command::SetCloud { .. }
             | Command::SetActivityViews(_)
+            | Command::SetTripleView(_)
             | Command::SetModelOnly(_)
             | Command::SetOrbitalRefresh(_)
             | Command::DisplayPartialCore(_)
@@ -295,7 +302,7 @@ impl Command {
 
     /// Whether the command is handed to the driver (which may refuse it: `last_rejection`); the
     /// worker's own settings (audit cadence, draft mode, the cloud, the model's first teaching, the
-    /// Activity view's training views) and Shutdown are not.
+    /// Activity view's training views, the three-atom view) and Shutdown are not.
     pub(super) fn reaches_driver(&self) -> bool {
         !matches!(
             self,
@@ -317,6 +324,7 @@ impl Command {
                 | Command::SetDraft(_)
                 | Command::SetCloud { .. }
                 | Command::SetActivityViews(_)
+                | Command::SetTripleView(_)
                 | Command::SetModelOnly(_)
                 | Command::SetOrbitalRefresh(_)
                 | Command::Shutdown
@@ -352,6 +360,7 @@ impl Command {
             | Command::SetDraft(_)
             | Command::SetCloud { .. }
             | Command::SetActivityViews(_)
+            | Command::SetTripleView(_)
             | Command::SetModelOnly(_)
             | Command::SetOrbitalRefresh(_)
             | Command::TrainingCheckpoints(_)
@@ -496,8 +505,16 @@ impl Worker {
                     // the automatic pass's sizing is for that pass only
                     self.sizing = None;
                 }
-                self.dy.apply(c);
-                if takes_over && self.dy.snapshot().last_rejection.is_none() && trainable(&mut self.dy).is_some() {
+                // the Retry of a fit whose references are all in: the first fit, in the background
+                // (`refit_if_pending`), never in place on this thread (quiet refits, fix round 1)
+                let background_retry = matches!(c, DynCommand::RetryFit) && trainable(&mut self.dy).is_some_and(|t| t.request_first_fit());
+                if background_retry {
+                    (self.refit_done_gen, self.refit_discarded_gen) = (None, None);
+                    self.dy.add_note("retry: the fit runs in the background — Play once it lands".into());
+                } else {
+                    self.dy.apply(c);
+                }
+                if takes_over && (background_retry || self.dy.snapshot().last_rejection.is_none()) && trainable(&mut self.dy).is_some() {
                     if leaves_collection {
                         self.use_collection = false;
                     }
@@ -525,6 +542,7 @@ impl Worker {
                 self.cloud_refresh = refresh_s.filter(|x| x.is_finite() && *x > 0.0).map(Duration::from_secs_f64);
             }
             Command::SetActivityViews(on) => self.activity.set_views(on),
+            Command::SetTripleView(on) => self.activity.set_triples(on),
             Command::SetModelOnly(on) => self.model_only = on,
             Command::SetOrbitalRefresh(d) => self.harris.set_every(d),
             Command::OrbitalView(req) => self.orbital_view(req),

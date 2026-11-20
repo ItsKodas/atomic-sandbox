@@ -30,6 +30,18 @@
 
 use super::*;
 
+/// Play refused while the first fit of an attached collection runs in the background (quiet
+/// refits, fix round 1; [`ModelStatus::first_fit_running`]): there is no model to play on yet.
+pub const FIRST_FIT_PLAY: &str = "the model's first fit is running — Play once it lands";
+
+impl ModelStatus {
+    /// The first fit runs in the background (an attached collection's, or a Retry's): no model yet,
+    /// one is coming (`worker` module doc, "Refits").
+    pub fn first_fit_running(&self) -> bool {
+        self.refit_running && !self.fitted
+    }
+}
+
 /// The last refit the worker ran (`worker` module doc, "Refits").
 #[derive(Clone, Debug, PartialEq)]
 pub struct RefitLog {
@@ -495,11 +507,6 @@ pub(super) const REFIT_INTERVAL: Duration = Duration::from_millis(500);
 /// … or until this many samples arrived since it, whichever comes first.
 pub(super) const REFIT_SAMPLES: usize = 25;
 
-/// Background refits discarded in a row after which the next refit runs in the tick (a conflict
-/// that recurs during every background refit — fence votes releasing stored samples while each one
-/// runs — must not keep the model from moving).
-pub(super) const REFIT_DISCARDS_BEFORE_SYNC: u32 = 2;
-
 /// The pending refit after the user's Forget / Restore waits this long after the **last** one
 /// (2026-11-14, the batched forget; `worker` module doc, "Refits"): a refit with a non-empty misfit
 /// set can take minutes, so a run of Forgets is applied at once and refitted once.
@@ -526,17 +533,23 @@ pub(crate) enum RefitGate {
     Start,
 }
 
-/// What [`refit_start`] reads (`Worker::refit_if_pending`): the snapshot's play state, the
-/// provider's `pending_refit` / `fitted` / `user_changes_pending`, the playing throttle
-/// ([`REFIT_INTERVAL`], [`REFIT_SAMPLES`]) and the background discards in a row.
+/// What [`refit_start`] reads (`Worker::refit_if_pending`): the provider's `pending_refit` /
+/// `fitted`, the playing throttle
+/// ([`REFIT_INTERVAL`], [`REFIT_SAMPLES`]), ⚠ Model only, whether what a refit fits changed since
+/// the last refit that ran to completion, and whether an attach left its first fit to the worker.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RefitInputs {
-    pub paused: bool,
     pub pending: bool,
     pub fitted: bool,
-    pub user_changes: usize,
     pub throttled: bool,
-    pub discards: u32,
+    /// ⚠ Model only is on ([`Command::SetModelOnly`]): no automatic refit.
+    pub model_only: bool,
+    /// What a refit fits changed (`Trainable::fit_inputs_gen`) since the start of the last refit
+    /// that ran to completion — installed, failed or discarded.
+    pub new_data: bool,
+    /// A fit the provider left to the worker is due (`Trainable::first_fit_ready`): an attach's
+    /// first fit (no model yet), or a pass's end fit (quiet refits round 2).
+    pub provider_due: bool,
 }
 
 /// What [`refit_start`] decided.
@@ -544,44 +557,51 @@ pub(crate) struct RefitInputs {
 pub(crate) enum RefitStart {
     /// No refit now.
     Wait,
-    /// Start one in the background (`Trainable::begin_refit_background`; in the tick if the
-    /// provider cannot).
+    /// Start one in the background (`Trainable::begin_refit_background`; in the tick only if the
+    /// provider cannot, and never a first fit or a retry after a discard).
     Background,
-    /// Run one in the tick.
-    InTick,
 }
 
 /// Whether a refit starts now, none running (`worker` module doc, "Refits"; `Worker::refit_if_pending`
-/// once its background poll and the pass check are past). Nothing due, or nothing fitted yet (the
-/// pass makes the first fit): no refit, and the user's request is dropped. The user's Forget /
-/// Restore holds every refit until its moment ([`UserRefit`]); then it starts, not throttled. A
-/// refit for the user's changes, or one they asked for, runs **in the background, paused too**
-/// (2026-11-14: it can take minutes, and the Model tab must stay usable); any other runs in the
-/// background while playing and in the tick while paused, as before. After
-/// [`REFIT_DISCARDS_BEFORE_SYNC`] discards in a row a playing refit runs in the tick (so the model
-/// still moves), but a paused one for the user's changes stays in the background (review M2: it
-/// would block the paused worker for minutes; paused, nothing steps, so a discard needs a change
-/// the user made — each discard's note says what).
+/// once its background poll and the pass check are past). Nothing due: no refit, and the user's
+/// request is dropped. No model yet: only the first fit an attach left to the worker
+/// (`first_fit`), **in the background, paused or playing, in Model only too** (quiet refits
+/// 2026-11-17: a collection's first fit took 2 min on the worker thread; without it Model only has
+/// nothing to answer with) — once per change of what it fits (`new_data`): a first fit that failed
+/// waits for new data or the Model tab's Retry. Otherwise the user's Forget / Restore holds every
+/// refit until its moment ([`UserRefit`]); then it starts, not throttled, in Model only too. A
+/// refit nobody asked for — **automatic** — starts only with `new_data` (a finished refit,
+/// installed, failed or discarded, is never repeated on the same data), never under ⚠ Model only
+/// (the kept samples wait, shown pending, until it is turned off), and while playing at most as the
+/// throttle allows. Every refit runs **in the background**, paused or playing (quiet refits
+/// 2026-11-17, fix round 1: one in the tick blocked the worker for a whole trust recovery, 30–160 s
+/// at 1 600 samples; before, a paused automatic refit ran in the tick, and while playing one did
+/// after two discards in a row); the caller runs it in the tick only when the provider cannot.
 pub(crate) fn refit_start(u: &mut UserRefit, at: Instant, i: RefitInputs) -> RefitStart {
-    if !i.pending || !i.fitted {
+    if !i.pending {
         u.clear();
         return RefitStart::Wait;
+    }
+    if !i.fitted {
+        u.clear();
+        return if i.provider_due && i.new_data { RefitStart::Background } else { RefitStart::Wait };
+    }
+    // a pass's end fit: the result of the user's own pass — at once, in Model only too, not
+    // throttled and not held by a Forget's wait (the fit holds those changes too)
+    if i.provider_due {
+        u.clear();
+        return RefitStart::Background;
     }
     let asked = match u.gate(at) {
         RefitGate::Hold(_) => return RefitStart::Wait,
         RefitGate::Start => true,
         RefitGate::Free => false,
     };
-    if i.throttled && !asked {
+    if !asked && (i.model_only || !i.new_data || i.throttled) {
         return RefitStart::Wait;
     }
     u.clear();
-    let user = asked || i.user_changes > 0;
-    if (user && i.paused) || ((!i.paused || user) && i.discards < REFIT_DISCARDS_BEFORE_SYNC) {
-        RefitStart::Background
-    } else {
-        RefitStart::InTick
-    }
+    RefitStart::Background
 }
 
 impl UserRefit {
@@ -657,7 +677,9 @@ impl Worker {
             return;
         }
         let fitted = trainable(&mut self.dy).is_some_and(|s| s.fitted());
-        if auto_pass && !fitted && !sampling_active(&self.dy.snapshot()) {
+        // (an attached collection whose first fit is the worker's to start: it fits, no pass)
+        let first_fit = trainable(&mut self.dy).is_some_and(|s| s.first_fit_ready());
+        if auto_pass && !fitted && !first_fit && !sampling_active(&self.dy.snapshot()) {
             // an interrupted (or paused) pass on disk is the user's to resume or discard: a new
             // pass would replace its files at its first checkpoint (review of 750bc82, item 1)
             if self.checkpoints.as_ref().is_some_and(|ck| super::checkpoint::interrupted_pass(ck.dir()).is_some()) {
@@ -689,6 +711,9 @@ impl Worker {
                 format!("this scene ({why}) cannot learn into the shared collection {slug} — collections are neutral until M9 — so it learns per-scene; the collection stays on disk and comes back when the scene is neutral again")
             })
         } else {
+            // its first fit is the worker's, in the background (`refit_if_pending`; module doc,
+            // "Refits"): a large collection's took minutes on this thread
+            t.set_fits_in_background(true);
             match t.attach_collection(&root, &scene) {
                 Err(e) => Some(format!("shared collection not attached: {e}")),
                 Ok(()) => {
@@ -874,67 +899,115 @@ impl Worker {
     }
 
     /// Active learning (`worker` module doc, "Refits"): the surrogate kept a fallback sample, or the
-    /// user forgot or restored samples, and no pass is running (a pass refits at its end); when a
-    /// refit starts is [`refit_start`]'s.
+    /// user forgot or restored samples, or an attach left its first fit to the worker, and no pass
+    /// is running (a pass refits at its end); when a refit starts is [`refit_start`]'s.
     /// Whether the model's state moved: a refit ran, landed, was discarded or started.
     pub(super) fn refit_if_pending(&mut self, snap: &DynSnapshot) -> bool {
-        // a background refit (playing, or the user's): installed or discarded between ticks
+        // a background refit (playing, or the user's, or a first fit): installed or discarded
+        // between ticks — and then, in the same round, whether the next one starts (a paused idle
+        // worker would otherwise wait for a command: a discard's retry, samples kept meanwhile)
+        let mut landed = false;
         if let Some(started) = self.refit_started {
+            // (whatever it was: a discard re-arms nothing in the driver, but a retick is cheap)
+            self.refit_landed = false;
             let Some(s) = trainable(&mut self.dy) else {
                 self.refit_started = None;
                 return false;
             };
-            match s.poll_refit_background() {
+            let poll = s.poll_refit_background();
+            // what the install said — a pass's outcome, its shell checks, a teach round's verdict
+            // (`complete_pass_tail`) — now, before the refit's own note, not at the next step
+            if matches!(poll, sim::RefitPoll::Done(_) | sim::RefitPoll::Discarded(_)) {
+                let notes = s.take_notes();
+                for n in notes {
+                    self.dy.add_note(n);
+                }
+            }
+            match poll {
                 sim::RefitPoll::Running => return false,
                 // the provider that ran it is gone (a backend switch, a forget's new provider)
-                sim::RefitPoll::Idle => self.refit_started = None,
-                sim::RefitPoll::Discarded(why) => {
+                sim::RefitPoll::Idle => {
                     self.refit_started = None;
-                    self.refit_discards += 1;
+                    (self.refit_done_gen, self.refit_discarded_gen) = (None, None);
+                }
+                sim::RefitPoll::Discarded(why) => {
+                    // it ran to completion. A conflict that moved what a refit fits makes it due
+                    // anyway; one that did not (a policy threshold changed while it ran — since
+                    // quiet refits round 3 not Model only or the audit cadence, which conflict with
+                    // nothing —, a class verdict moving a teach-around count) earns
+                    // **one** more attempt on the same data, in the background; a second discard
+                    // there waits for new data (fix round 1: no loop, no stranded samples)
+                    self.refit_started = None;
+                    let gen = self.refit_started_gen.take();
+                    if gen.is_some() && self.refit_discarded_gen == gen {
+                        self.refit_done_gen = gen;
+                    } else {
+                        // (due once more even if nothing new came before it: Refit now's)
+                        (self.refit_discarded_gen, self.refit_done_gen) = (gen, None);
+                    }
                     // the throttle restarts: a discard is a refit's worth of work
                     self.last_refit_at = Some(Instant::now());
                     self.dy.add_note(why);
-                    return true;
+                    landed = true;
+                    self.refit_landed = true;
                 }
                 sim::RefitPoll::Done(fit) => {
                     self.refit_started = None;
-                    self.refit_discards = 0;
+                    self.refit_done_gen = self.refit_started_gen.take();
                     self.log_refit(snap, fit, started.elapsed().as_secs_f64() * 1e3, " (background)");
-                    return true;
+                    landed = true;
+                    self.refit_landed = true;
                 }
             }
         }
         if sampling_active(snap) {
             // the pass's own fit at its end holds the user's changes; the debounce waits meanwhile
-            return false;
+            return landed;
         }
         let at = Instant::now();
         let Some(s) = trainable(&mut self.dy) else {
             self.user_refit.clear();
-            return false;
+            return landed;
         };
         let throttled = !snap.paused && self.last_refit_at.is_some_and(|t| t.elapsed() < REFIT_INTERVAL) && s.samples() < self.samples_at_refit + REFIT_SAMPLES;
+        // what a refit fits, as the provider counts its changes (`None`: not counted — always new)
+        let gen = s.fit_inputs_gen();
+        let new_data = gen.is_none() || gen != self.refit_done_gen;
+        // the one retry after a discard at this data (it never runs in the tick)
+        let retry = gen.is_some() && gen == self.refit_discarded_gen;
+        let (pending, fitted) = (s.pending_refit(), s.fitted());
+        // a fit the provider left to the worker: an attach's first fit (once per data: asked only
+        // then — `first_fit_ready` reads the samples' fit floor), or a pass's end fit
+        let provider_due = pending && (fitted || new_data) && s.first_fit_ready();
         let inputs = RefitInputs {
-            paused: snap.paused,
-            pending: s.pending_refit(),
-            fitted: s.fitted(),
-            user_changes: s.user_changes_pending(),
+            pending,
+            fitted,
             throttled,
-            discards: self.refit_discards,
+            model_only: self.model_only,
+            new_data,
+            provider_due,
         };
         match refit_start(&mut self.user_refit, at, inputs) {
-            RefitStart::Wait => return false,
+            RefitStart::Wait => return landed,
             // off the step path; a provider that cannot runs it in the tick
             // (published at once: the banner and the busy state follow it)
             RefitStart::Background if s.begin_refit_background() => {
                 self.refit_started = Some(at);
+                self.refit_started_gen = gen;
                 return true;
             }
-            RefitStart::Background | RefitStart::InTick => {}
+            // a first fit, a pass's end fit or a retry never runs in the tick (minutes): this data
+            // is not tried again
+            RefitStart::Background if !fitted || retry || provider_due => {
+                self.refit_done_gen = gen;
+                return landed;
+            }
+            // a provider that cannot refit in the background: in the tick
+            RefitStart::Background => {}
         }
         let t = Instant::now();
         let fit = s.refit();
-        self.refit_discards = 0;
+        self.refit_done_gen = gen;
         self.log_refit(snap, fit, t.elapsed().as_secs_f64() * 1e3, "");
         true
     }
@@ -1020,7 +1093,7 @@ impl Worker {
                 },
                 st.recovery.as_ref().map_or(String::new(), |n| format!("; {n}"))
             ),
-            Err(e) => format!("refit #{k} failed: {e} (retried at the next opportunity)"),
+            Err(e) => format!("refit #{k} failed: {e} (retried when new samples or changes arrive, or at Refit now)"),
         };
         let samples = st.samples;
         // the fit's sample count: the report the refit just made
@@ -1226,7 +1299,7 @@ pub fn purge_line(r: &Result<sim::PurgeReport, String>) -> String {
 /// pending, as `providers::surrogate`'s install leaves them), then `refit_start` decides.
 #[cfg(test)]
 mod debounce_tests {
-    use super::{refit_start, RefitGate, RefitInputs, RefitStart, UserRefit, FORGET_REFIT_DELAY, REFIT_DISCARDS_BEFORE_SYNC};
+    use super::{refit_start, RefitGate, RefitInputs, RefitStart, UserRefit, FORGET_REFIT_DELAY};
     use std::time::{Duration, Instant};
 
     /// The provider's side: a refit due, the user's changes no fit holds, a background refit
@@ -1251,7 +1324,7 @@ mod debounce_tests {
             self.user.changed(at);
         }
         /// One worker tick at `at`.
-        fn tick(&mut self, at: Instant, paused: bool) {
+        fn tick(&mut self, at: Instant) {
             if let Some(end) = self.running_until {
                 if at < end {
                     return;
@@ -1260,7 +1333,7 @@ mod debounce_tests {
                 self.running_until = None;
                 self.pending = self.changes > 0;
             }
-            let i = RefitInputs { paused, pending: self.pending, fitted: true, user_changes: self.changes, throttled: false, discards: 0 };
+            let i = RefitInputs { pending: self.pending, fitted: true, throttled: false, model_only: false, new_data: true, provider_due: false };
             match refit_start(&mut self.user, at, i) {
                 RefitStart::Wait => {}
                 RefitStart::Background => {
@@ -1269,15 +1342,10 @@ mod debounce_tests {
                     self.changes = 0;
                     self.pending = false;
                 }
-                RefitStart::InTick => {
-                    self.started.push((at, RefitStart::InTick));
-                    self.changes = 0;
-                    self.pending = false;
-                }
             }
         }
         /// Ticks every 16 ms from `from` for `secs` s, with `events` (offset s, n changes) on the way.
-        fn run(&mut self, from: Instant, secs: f64, paused: bool, events: &[(f64, usize)]) {
+        fn run(&mut self, from: Instant, secs: f64, events: &[(f64, usize)]) {
             let mut ev = events.iter().peekable();
             let mut t = 0.0;
             while t <= secs {
@@ -1289,7 +1357,7 @@ mod debounce_tests {
                     self.change(from + Duration::from_secs_f64(e), n);
                     ev.next();
                 }
-                self.tick(at, paused);
+                self.tick(at);
                 t += 0.016;
             }
         }
@@ -1305,7 +1373,7 @@ mod debounce_tests {
     fn three_quick_forgets_refit_once_after_the_delay() {
         let t0 = Instant::now();
         let mut f = Fake::new(Duration::from_secs(3));
-        f.run(t0, 40.0, true, &[(0.0, 1), (1.0, 1), (2.0, 1)]);
+        f.run(t0, 40.0, &[(0.0, 1), (1.0, 1), (2.0, 1)]);
         assert_eq!(f.started.len(), 1, "{:?}", f.started.iter().map(|(t, k)| (secs(t0, *t), *k)).collect::<Vec<_>>());
         let (at, how) = f.started[0];
         let d = FORGET_REFIT_DELAY.as_secs_f64();
@@ -1322,7 +1390,7 @@ mod debounce_tests {
         let t0 = Instant::now();
         let mut f = Fake::new(Duration::from_secs(60));
         // the first refit starts at 10 s and runs to 70 s; changes at 15, 20 and 25 s
-        f.run(t0, 300.0, true, &[(0.0, 1), (15.0, 1), (20.0, 2), (25.0, 1)]);
+        f.run(t0, 300.0, &[(0.0, 1), (15.0, 1), (20.0, 2), (25.0, 1)]);
         let at: Vec<f64> = f.started.iter().map(|(t, _)| secs(t0, *t)).collect();
         assert_eq!(at.len(), 2, "{at:?}");
         assert!((at[0] - 10.0).abs() < 0.05, "{at:?}");
@@ -1338,7 +1406,7 @@ mod debounce_tests {
         let t0 = Instant::now();
         let mut f = Fake::new(Duration::from_secs(5));
         // first refit 10 → 15 s; a change at 14 s: due at 24 s
-        f.run(t0, 60.0, true, &[(0.0, 1), (14.0, 1)]);
+        f.run(t0, 60.0, &[(0.0, 1), (14.0, 1)]);
         let at: Vec<f64> = f.started.iter().map(|(t, _)| secs(t0, *t)).collect();
         assert_eq!(at.len(), 2, "{at:?}");
         assert!((at[1] - 24.0).abs() < 0.05, "{at:?}");
@@ -1351,17 +1419,17 @@ mod debounce_tests {
         let t0 = Instant::now();
         let mut f = Fake::new(Duration::from_secs(30));
         f.change(t0, 2);
-        f.tick(t0 + Duration::from_millis(500), true);
+        f.tick(t0 + Duration::from_millis(500));
         assert!(f.started.is_empty(), "waiting");
         assert!(matches!(f.user.gate(t0 + Duration::from_millis(500)), RefitGate::Hold(_)));
         f.user.refit_now(t0 + Duration::from_secs(1));
-        f.tick(t0 + Duration::from_secs(1), true);
+        f.tick(t0 + Duration::from_secs(1));
         assert_eq!(f.started.len(), 1);
         assert_eq!(f.started[0], (t0 + Duration::from_secs(1), RefitStart::Background));
         // a change while it runs, then Refit now: the queued one starts as the running one lands (31 s)
         f.change(t0 + Duration::from_secs(2), 1);
         f.user.refit_now(t0 + Duration::from_secs(3));
-        f.run(t0 + Duration::from_secs(3), 40.0, true, &[]);
+        f.run(t0 + Duration::from_secs(3), 40.0, &[]);
         let at: Vec<f64> = f.started.iter().map(|(t, _)| secs(t0, *t)).collect();
         assert_eq!(at.len(), 2, "{at:?}");
         assert!((at[1] - 31.0).abs() < 0.05, "{at:?}");
@@ -1369,34 +1437,23 @@ mod debounce_tests {
 
     /// The rest of `refit_start`: while the user's refit waits, no refit starts (a fallback's
     /// either: the model keeps its last fit); once due it is not throttled; nothing due or nothing
-    /// fitted drops the request; a paused refit for a fallback sample alone runs in the tick as
-    /// before, a playing one in the background; repeated discards run it in the tick.
+    /// fitted drops the request; every refit starts in the background, paused or playing (quiet
+    /// refits 2026-11-17, fix round 1).
     #[test]
     fn the_gate_and_the_mode() {
         let t0 = Instant::now();
-        let base = RefitInputs { paused: true, pending: true, fitted: true, user_changes: 0, throttled: false, discards: 0 };
-        // nothing asked: a paused fallback refit in the tick, a playing one in the background, a
-        // throttled one waits
-        assert_eq!(refit_start(&mut UserRefit::default(), t0, base), RefitStart::InTick);
-        assert_eq!(refit_start(&mut UserRefit::default(), t0, RefitInputs { paused: false, ..base }), RefitStart::Background);
-        assert_eq!(refit_start(&mut UserRefit::default(), t0, RefitInputs { paused: false, throttled: true, ..base }), RefitStart::Wait);
-        // pending user changes without a wait (a discarded refit gave them back): background, paused too
-        assert_eq!(refit_start(&mut UserRefit::default(), t0, RefitInputs { user_changes: 2, ..base }), RefitStart::Background);
+        let base = RefitInputs { pending: true, fitted: true, throttled: false, model_only: false, new_data: true, provider_due: false };
+        // nothing asked: a fallback refit in the background, a throttled one waits
+        assert_eq!(refit_start(&mut UserRefit::default(), t0, base), RefitStart::Background);
+        assert_eq!(refit_start(&mut UserRefit::default(), t0, RefitInputs { throttled: true, ..base }), RefitStart::Wait);
         // waiting: nothing starts, not even a playing fallback refit
         let mut u = UserRefit::default();
         u.changed(t0);
-        assert_eq!(refit_start(&mut u, t0 + Duration::from_secs(1), RefitInputs { paused: false, user_changes: 1, ..base }), RefitStart::Wait);
+        assert_eq!(refit_start(&mut u, t0 + Duration::from_secs(1), RefitInputs { ..base }), RefitStart::Wait);
         assert!(u.due().is_some(), "still waiting");
         // due: not throttled, in the background
-        assert_eq!(refit_start(&mut u, t0 + FORGET_REFIT_DELAY, RefitInputs { paused: false, throttled: true, user_changes: 1, ..base }), RefitStart::Background);
+        assert_eq!(refit_start(&mut u, t0 + FORGET_REFIT_DELAY, RefitInputs { throttled: true, ..base }), RefitStart::Background);
         assert!(u.due().is_none(), "started");
-        // repeated discards: a playing refit in the tick (the model must move); a paused one for
-        // the user's changes stays in the background (review M2)
-        u.changed(t0);
-        assert_eq!(refit_start(&mut u, t0 + FORGET_REFIT_DELAY, RefitInputs { paused: false, user_changes: 1, discards: REFIT_DISCARDS_BEFORE_SYNC, ..base }), RefitStart::InTick);
-        u.changed(t0);
-        assert_eq!(refit_start(&mut u, t0 + FORGET_REFIT_DELAY, RefitInputs { user_changes: 1, discards: REFIT_DISCARDS_BEFORE_SYNC, ..base }), RefitStart::Background);
-        assert_eq!(refit_start(&mut UserRefit::default(), t0, RefitInputs { discards: REFIT_DISCARDS_BEFORE_SYNC, ..base }), RefitStart::InTick, "a paused fallback refit, as before");
         // nothing due (a pass's fit took the changes) or nothing fitted: the request is dropped
         u.changed(t0);
         assert_eq!(refit_start(&mut u, t0, RefitInputs { pending: false, ..base }), RefitStart::Wait);
@@ -1404,5 +1461,50 @@ mod debounce_tests {
         u.changed(t0);
         assert_eq!(refit_start(&mut u, t0, RefitInputs { fitted: false, ..base }), RefitStart::Wait);
         assert!(u.due().is_none());
+    }
+
+    /// Quiet refits (2026-11-17, the user: "stop refitting all the samples on repeat whilst in model
+    /// only mode"): an automatic refit needs new data and Model only off; the user's (asked) one
+    /// runs regardless; the first fit an attach left to the worker runs in the background, paused
+    /// or playing, in Model only too, once per change of its data.
+    #[test]
+    fn model_only_and_new_data_gate_the_automatic_refit() {
+        let t0 = Instant::now();
+        let base = RefitInputs { pending: true, fitted: true, throttled: false, model_only: false, new_data: true, provider_due: false };
+        // Model only: a kept sample waits, playing or paused
+        assert_eq!(refit_start(&mut UserRefit::default(), t0, RefitInputs { model_only: true, ..base }), RefitStart::Wait);
+        assert_eq!(refit_start(&mut UserRefit::default(), t0, RefitInputs { model_only: true, ..base }), RefitStart::Wait);
+        // … also with user changes no fit holds, until the user's refit is due
+        assert_eq!(refit_start(&mut UserRefit::default(), t0, RefitInputs { model_only: true, ..base }), RefitStart::Wait);
+        // the user's refit (Refit now, or Forget / Restore's debounce) runs in Model only, in the background
+        let mut u = UserRefit::default();
+        u.refit_now(t0);
+        assert_eq!(refit_start(&mut u, t0, RefitInputs { model_only: true, ..base }), RefitStart::Background);
+        assert!(u.due().is_none());
+        u.changed(t0);
+        assert_eq!(refit_start(&mut u, t0 + FORGET_REFIT_DELAY, RefitInputs { model_only: true, ..base }), RefitStart::Background);
+        // no new data since the last refit that ran to completion: nothing automatic, in any mode
+        assert_eq!(refit_start(&mut UserRefit::default(), t0, RefitInputs { new_data: false, ..base }), RefitStart::Wait);
+        assert_eq!(refit_start(&mut UserRefit::default(), t0, RefitInputs { new_data: false, ..base }), RefitStart::Wait);
+        // … but the user's Refit now still runs it
+        let mut u = UserRefit::default();
+        u.refit_now(t0);
+        assert_eq!(refit_start(&mut u, t0, RefitInputs { new_data: false, ..base }), RefitStart::Background);
+        // the first fit: background, paused or playing, Model only or not; never in the tick
+        let first = RefitInputs { fitted: false, provider_due: true, ..base };
+        for model_only in [false, true] {
+            assert_eq!(refit_start(&mut UserRefit::default(), t0, RefitInputs { model_only, ..first }), RefitStart::Background, "model only {model_only}");
+        }
+        // … once per data: a first fit that failed is not tried again on the same samples
+        assert_eq!(refit_start(&mut UserRefit::default(), t0, RefitInputs { new_data: false, ..first }), RefitStart::Wait);
+        // no model and no first fit left to the worker (a no-model session's kept fallbacks): none
+        assert_eq!(refit_start(&mut UserRefit::default(), t0, RefitInputs { provider_due: false, ..first }), RefitStart::Wait);
+        // a pass's end fit (round 2): the user's own pass — at once, in Model only, throttled, held
+        // by a Forget's wait, or on data a refit already saw
+        let pass_end = RefitInputs { provider_due: true, model_only: true, throttled: true, new_data: false, ..base };
+        let mut u = UserRefit::default();
+        u.changed(t0);
+        assert_eq!(refit_start(&mut u, t0, pass_end), RefitStart::Background);
+        assert!(u.due().is_none(), "the pass's fit holds the user's changes too");
     }
 }

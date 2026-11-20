@@ -37,9 +37,9 @@ pub mod prof;
 pub use descriptor::{describe, describe_values, energy_row_atoms, energy_row_atoms_at, no_neighbours, touched_columns, AtomDescriptor, Basis, Body3Term, Body4Term, DescribeError, BODY4_DEGREE_CAP, BODY4_DEGREE_START, COLLECTION_R_CUT};
 pub use envelope::Envelope;
 pub use fit::{
-    fit, Accumulator, FitError, FitOptions, FitReport, RefitKind, Sample, SampleStore, SampleTag, StoreError, Sums,
+    fit, Accumulator, FitError, FitOptions, FitReport, RefitKind, Sample, SampleStore, SampleTag, SearchStart, StoreError, Sums,
 };
-pub use model::{energy_and_forces, Model, Prediction, Provenance, SurfaceKey};
+pub use model::{energy_and_forces, Model, Prediction, Provenance, SupportCache, SurfaceKey};
 pub use collection::{Collection, CollectionReference, REFIT_TIMES_FILE, CollectionSample, ImportReport, OpenReport, PurgeOutcome, ReadOnlyCollection, ReadOnlyError, ReferenceOutcome};
 pub use migration::{read_migration, summary_text, write_migration, MigrationLog, MigrationState, NotMigrated, PendingStatus};
 pub use grade::ActiveSet;

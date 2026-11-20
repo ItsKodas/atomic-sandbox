@@ -132,6 +132,9 @@ impl SurrogateKs {
     /// teacher surface without a jump and the driver restarts its conserved-energy history
     /// (the honest outcome: the surface the invariant lived on is gone).
     pub fn forget(&mut self) {
+        // a pass's tail waiting for its fit goes with the samples, said (quiet refits round 3,
+        // review Minor 6; a load or an attach said why first)
+        self.discard_pass_tail("the model was forgotten");
         // a shared collection is let go (written and released), never cleared: it is on disk for
         // every scene of its surface (`shared` module doc)
         self.detach_collection();
@@ -180,6 +183,9 @@ impl SurrogateKs {
         self.failed_audits.clear();
         self.audit_fences.clear();
         self.pending_refit = false;
+        self.first_fit_due = false;
+        self.pass_fit_due = false;
+        self.pass_tail = None;
         self.pending_jump = None;
         self.consults = 0;
         self.last_variance = None;
@@ -307,6 +313,7 @@ impl SurrogateKs {
             }
         }
         // a clean slate (what `forget` leaves), the epoch moved if a model was answering
+        self.discard_pass_tail("a samples file was loaded");
         self.forget();
         let n = store.len();
         self.face = if face_density.is_empty() { vec![f64::NAN; n] } else { face_density };
@@ -330,7 +337,7 @@ impl SurrogateKs {
             self.user_notes.push("samples file: its reference energies predate ruling S9 (lowest-energy multiplicity) — not used; Retry or a sampling pass re-solves them".into());
         }
         self.refs_dirty = true;
-        self.pending_refit = true;
+        self.arm_refit();
         self.ledger.counts = match teacher_solves {
             Some(t) => SolveCounts { pass: t.pass, fallback: t.fallback, audit: t.audit, verification: t.verification, kept: t.kept, unrecorded_before: !t.complete, reference: self.ledger.counts.reference },
             None => SolveCounts { unrecorded_before: true, reference: self.ledger.counts.reference, ..SolveCounts::default() },
@@ -414,6 +421,7 @@ impl SurrogateKs {
                 .count();
             if usable == 0 {
                 let set = lone_fallback.expect("checked");
+                self.discard_pass_tail("a model file was loaded");
                 self.install_samples(set)?;
                 self.user_notes.push("model file: besides its lone atoms and its samples with stray atoms it holds no sample a fit could use — its samples are installed with no model yet".into());
                 return Ok(());
@@ -433,6 +441,11 @@ impl SurrogateKs {
         for (i, smp) in samples.into_iter().enumerate() {
             store.push(smp).map_err(|e| format!("sample {i}: {e}"))?;
         }
+        // a pass's tail waiting for its fit goes with the samples this file replaces (quiet refits
+        // round 3, review I2: kept, a discard of the refit carrying it re-dued it — an automatic
+        // refit of the loaded file, Model only or not — and the old pass's outcome, shell checks
+        // and teach checks were judged against the loaded model)
+        self.discard_pass_tail("a model file was loaded");
         let was_trusted = self.trusted();
         let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
         self.refs = model.basis.species.iter().copied().zip(model.ref_energy.iter().copied()).collect();
@@ -454,7 +467,11 @@ impl SurrogateKs {
             prefix += 1;
         }
         self.accumulated = prefix;
-        self.pending_refit = store.len() > self.accumulated;
+        if store.len() > self.accumulated {
+            self.arm_refit();
+        } else {
+            self.pending_refit = false;
+        }
         self.envelope = Some(accumulator.envelope.clone());
         self.null_space = Some(NullSpace::of(&accumulator, &model.scale));
         self.null_space_pending = false;
@@ -581,6 +598,19 @@ impl SurrogateKs {
                 "surrogate: the file's fit membership ({members} samples, {rows} rows) did not match its report ({want_n}, {want_rows}) or its label sums{} — the fit was rebuilt from its stored samples (no DFT)",
                 if forgot { " (it was saved with a sample forgotten before its refit)" } else { "" }
             ));
+        } else {
+            // the file's fit stands: an envelope that admitted isolated atoms among the fit's
+            // samples (written before they were no training atoms) is rebuilt from the fit's
+            // members (no refit, no DFT). Above, both full rebuilds build it without them. Nothing
+            // before this reads the envelope (it is read per query: the fences, thinning, the
+            // audits re-judged below)
+            let isolated = self.rebuild_envelope_without_isolated();
+            if isolated > 0 {
+                self.user_notes.push(format!(
+                    "model file: its envelope held {isolated} isolated atom{} among the fit's samples (no neighbour within {lone_cut} Bohr) — the envelope was rebuilt from its stored samples without them (no refit, no DFT)",
+                    if isolated == 1 { "" } else { "s" }
+                ));
+            }
         }
         if lone_in_fit == 0 {
             // held out already (quarantined, box-excluded) or not fitted yet: the fit stands
@@ -622,6 +652,48 @@ impl SurrogateKs {
             self.user_notes.push(format!("surrogate: {n}"));
         }
         Ok(())
+    }
+
+    /// An installed fit's envelope without the isolated atoms of its members (`surrogate::envelope`
+    /// module doc, "Isolated atoms are not training atoms"): a file written before that rule holds
+    /// an envelope into which its fitted samples' isolated atoms (the stray atom of a kept rule-5a
+    /// fallback) were added — every coordination minimum of their species 0, rule 5b off for it —
+    /// and the samples themselves are not held out, so that envelope would stand until the next
+    /// rebuild of the fit. It is rebuilt here from the members' descriptors (the descriptor cache,
+    /// values only, which the install filled for the active set already; no refit, no DFT), each
+    /// member's trained atoms in store order as `Accumulator::add` adds them, so it is bit for bit the
+    /// envelope a fit of the same members builds today; the accumulator's copy (what a save writes
+    /// and a refit extends) is replaced with it. Returns the isolated atoms found among the members'
+    /// trained atoms when the stored envelope differed from the rebuilt one, else 0 and the stored
+    /// envelope stands. The members are the fit's (`accumulated`, not excluded): called only once
+    /// `install_sidecar` has accepted the file's member set (neither full rebuild fired).
+    pub(super) fn rebuild_envelope_without_isolated(&mut self) -> usize {
+        self.ensure_desc_cache();
+        let (Some(basis), Some(store), Some(stored)) = (self.desc_basis.as_ref(), self.store.as_ref(), self.accumulator.as_ref().map(|a| &a.envelope)) else { return 0 };
+        let n = self.accumulated.min(self.desc_cache.len()).min(store.len());
+        let mut env = Envelope::new(basis);
+        let mut isolated = 0usize;
+        for i in (0..n).filter(|&i| !self.excluded(i)) {
+            let smp = &store.samples[i];
+            for (j, (s, b)) in self.desc_cache[i].iter().enumerate() {
+                if !smp.trains_atom(j) {
+                    continue;
+                }
+                if surrogate::envelope::isolated_atom(basis, b) {
+                    isolated += 1;
+                } else {
+                    env.add_atom(*s, b);
+                }
+            }
+        }
+        if isolated == 0 || env == *stored {
+            return 0;
+        }
+        self.envelope = Some(env.clone());
+        if let Some(acc) = self.accumulator.as_mut() {
+            acc.envelope = env;
+        }
+        isolated
     }
 
     /// Provenance of a sample produced at this scene's settings by this teacher; `masses` is the
@@ -746,7 +818,7 @@ impl SurrogateKs {
                     self.quarantine[n - 1] = Q_DRAFT;
                     notes.push("surrogate: kept, held out of the strict fit — a draft-mode audit at a geometry strict mode refuses (it would otherwise judge the strict model by the guess's own excursions)".into());
                 }
-                self.pending_refit = true;
+                self.arm_refit();
                 true
             }
             Err(e) => {

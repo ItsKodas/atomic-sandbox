@@ -677,6 +677,9 @@ impl Viewer {
         self.ui.activity.views = None;
         self.ui.activity.views_at = None;
         self.ui.activity.knowledge = None; // the new worker ships its own model's map
+        // ... and was told nothing of the three-atom view (Review Focus 5: the next frame resends it)
+        self.ui.activity.triples_sent = false;
+        self.ui.activity.triples = None;
         let mut settings = self.ui.run_settings();
         // a resumed session's clock goes to its first driver only (a later solver switch restarts it)
         if let Some(t) = self.resume_clock.take() {
@@ -1479,7 +1482,8 @@ impl Viewer {
     /// Play ↔ Pause (the panel button and the Space key).
     pub fn toggle_play(&mut self) {
         if !self.playing && self.estimated_without_model() {
-            self.ui.set_status(NO_MODEL_PLAY.to_string());
+            let first_fit = self.snapshot.as_ref().and_then(|s| s.model.as_ref()).is_some_and(|m| m.first_fit_running());
+            self.ui.set_status(if first_fit { crate::sim::FIRST_FIT_PLAY } else { NO_MODEL_PLAY }.to_string());
             return;
         }
         let c = if self.playing {
@@ -1535,7 +1539,10 @@ impl Viewer {
             return;
         }
         let held = self.snapshot.as_ref().and_then(|s| s.model.as_ref()).is_some_and(|m| m.no_model.is_some());
-        let why = if self.estimated_without_model() && held {
+        let first_fit = self.snapshot.as_ref().and_then(|s| s.model.as_ref()).is_some_and(|m| m.first_fit_running());
+        let why = if self.estimated_without_model() && first_fit {
+            Some("paused: the model's first fit is running — Play once it lands")
+        } else if self.estimated_without_model() && held {
             // samples held, the fit did not form (a reference that did not solve): the tab says why
             Some("paused: the estimated solver has no model yet — the Model tab says why and offers Retry (the samples are kept)")
         } else if self.estimated_without_model() {
@@ -4160,7 +4167,8 @@ nucleus 1 {a} {} {}
         until(&mut v, &hl, &mut painter, "a running pass", |s| crate::sim::sampling_active(&s.dynamics));
         assert!(!v.playing);
         let deadline = Instant::now() + Duration::from_secs(120);
-        while !v.snapshot.as_ref().is_some_and(|s| s.dynamics.sampling.as_ref().is_some_and(|p| p.finished)) {
+        // (and its fit landed: it runs in the background, quiet refits round 2)
+        while !v.snapshot.as_ref().is_some_and(|s| s.dynamics.sampling.as_ref().is_some_and(|p| p.finished) && !s.working) {
             assert!(Instant::now() < deadline, "the pass did not end");
             if let Some(ev) = v.sim.as_ref().unwrap().recv_timeout(Duration::from_secs(1)) {
                 v.on_event(ev, &hl.ctx, &mut painter, &hl.depth);

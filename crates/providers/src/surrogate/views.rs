@@ -138,10 +138,11 @@ impl SurrogateKs {
     /// `evaluate` computes 3–6 and takes the first refusal (`envelope.or(novel).or(class)
     /// .or(variance)`, then the fence); returning at the first refusal in the same order gives the
     /// same rule and atom. Read-only by type (plan review S1): no variance cadence, audit counter,
-    /// streak, store, quarantine, RNG or cache moves; the teacher is never called. (The one
-    /// interior write on the path is `Model::representatives`, a `OnceLock` `predict` fills
-    /// lazily with a pure function of the basis — `evaluate`'s own prediction fills it with the
-    /// same.) The fence reads the descriptor cache (`ensure_desc_cache`) and describes any held
+    /// streak, store, quarantine, RNG or cache moves; the teacher is never called. (The interior
+    /// writes on the path are the model's derived caches `predict` fills lazily:
+    /// `Model::representatives`, a pure function of the basis, and `Model::variance_support`, one
+    /// factor per species composition, a pure function of the posterior and the composition — the
+    /// stds are the same bits whichever call builds it.) The fence reads the descriptor cache (`ensure_desc_cache`) and describes any held
     /// sample it does not cover.
     ///
     /// Not part of this verdict: rule 0 (the cell) and the empty scene, draft mode (it answers
@@ -239,7 +240,8 @@ impl SurrogateKs {
     }
 
     /// The model generation (`model_gen`): changes at every installed, restored or forgotten
-    /// model and every policy change, an untrusted → untrusted refit included. A readout.
+    /// model and every change of a policy threshold the verdicts read (not draft mode or the audit
+    /// cadence, `set_policy`), an untrusted → untrusted refit included. A readout.
     pub fn model_generation(&self) -> u64 {
         self.model_gen
     }

@@ -465,24 +465,55 @@ impl SurrogateKs {
     /// may still take it, the sample floor the richer basis would set and the environment keys it
     /// would leave short — each key's own floor in that basis (M8a user-fix 3,
     /// `trust::key_column_counts`), counted over the fitted samples, no estimate.
-    fn richer_basis_floor(&self) -> Option<String> {
+    ///
+    /// Cached (`richer_floor_cache`, 2026-11-17): the status asks every snapshot, and the count is
+    /// a descriptor pass over every fitted sample in the degree-6 basis. The key is a fingerprint
+    /// of everything the count and the words read — the fitted prefix's length, each sample's
+    /// held-out flag and (when fitted) its species, positions and force mask, the richer basis and
+    /// the standing degree — so a changed input recounts and nothing else has to clear it.
+    pub(super) fn richer_basis_floor(&self) -> Option<String> {
+        use std::hash::{Hash, Hasher};
         let rich = self.richer_basis()?;
-        let b = &self.model.as_ref()?.basis;
+        let degree = self.model.as_ref()?.basis.degree_cap;
         let store = self.store.as_ref()?;
-        let fitted = store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s);
+        let end = self.accumulated.min(store.len());
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        end.hash(&mut h);
+        for (i, s) in store.samples[..end].iter().enumerate() {
+            let out = self.excluded(i);
+            out.hash(&mut h);
+            if out {
+                continue;
+            }
+            (&s.z, &s.force_mask, s.pos.len()).hash(&mut h);
+            for x in s.pos.iter().flatten() {
+                x.to_bits().hash(&mut h);
+            }
+        }
+        (&rich.species, rich.n_max, rich.l_max, rich.degree_cap, rich.body3, rich.body4, rich.body4_degree, rich.r_cut.to_bits(), degree).hash(&mut h);
+        let key = h.finish();
+        if let Some((k, words)) = self.richer_floor_cache.lock().unwrap().as_ref() {
+            if *k == key {
+                return words.clone();
+            }
+        }
+        let fitted = store.samples[..end].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s);
+        #[cfg(test)]
+        self.richer_floor_counts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let short: Vec<String> = super::trust::key_column_counts(&rich, fitted)
             .per_key
             .into_iter()
             .filter(|(_, (n, q))| n < q)
             .map(|(k, (n, q))| format!("{} {} has {n} of {q}", ENV_CLASSES[(k.class - 1) as usize], sim::key_words(k.z, &k.neighbours)))
             .collect();
-        (!short.is_empty()).then(|| {
+        let words = (!short.is_empty()).then(|| {
             format!(
-                "if the new samples need the richer basis (degree {} → {RECOVERY_DEGREE_CAP}), each kind of environment needs as many samples as the model columns its atoms touch: {} — a sampling pass would then be needed as well",
-                b.degree_cap,
+                "if the new samples need the richer basis (degree {degree} → {RECOVERY_DEGREE_CAP}), each kind of environment needs as many samples as the model columns its atoms touch: {} — a sampling pass would then be needed as well",
                 short.join(", ")
             )
-        })
+        });
+        *self.richer_floor_cache.lock().unwrap() = Some((key, words.clone()));
+        words
     }
 
     /// A pair blocker's defining pair against the cutoff (SHOULD-T5; informational, decides
@@ -699,6 +730,11 @@ impl SurrogateKs {
         if self.model.is_none() {
             return Err("no model yet — run a sampling pass first".into());
         }
+        // a previous pass's tail first, before this round reads or sets the teaching state (quiet
+        // refits round 3, review I1: `drop_pass_tail`) — the offer below reads the round counts a
+        // dropped round returns. A start refused below leaves it completed as not landed: its
+        // samples are kept, pending, and the next refit fits them
+        self.drop_pass_tail(super::NEW_PASS_FIRST);
         let Some(offer) = self.teach_offer() else {
             return Err("no environment class is blocked by samples the rest of the data cannot predict".into());
         };
@@ -747,14 +783,11 @@ impl SurrogateKs {
     /// (SHOULD-T5; `user_notes`). A failed check is a failed audit with its sample's index.
     pub(super) fn finish_teach(&mut self, targets: &[usize], holdouts: Vec<Holdout>, progress: &SamplingProgress) {
         let cancelled = progress.cancelled;
-        let classes_counted = std::mem::take(&mut self.teach_classes);
         if cancelled {
             // a cancelled round is not a round spent
-            for c in classes_counted {
-                if let Some(r) = self.teach_rounds.get_mut(&c) {
-                    *r = r.saturating_sub(1);
-                }
-            }
+            self.uncount_teach_round();
+        } else {
+            self.teach_classes.clear();
         }
         let start = self.teach_start.take();
         let secs = start.as_ref().map_or(0.0, |s| s.started.elapsed().as_secs_f64());
@@ -954,6 +987,67 @@ impl SurrogateKs {
             self.reset_teach_rounds();
         }
         self.user_notes.push(lines.join("\n"));
+    }
+
+    /// The round's classes (`teach_classes`) returned: a round that is not spent (cancelled, or
+    /// its refit never landed).
+    pub(super) fn uncount_teach_round(&mut self) {
+        for c in std::mem::take(&mut self.teach_classes) {
+            if let Some(r) = self.teach_rounds.get_mut(&c) {
+                *r = r.saturating_sub(1);
+            }
+        }
+    }
+
+    /// A teach-around round whose refit never landed (`PassFit::Dropped`: discarded twice, or a new
+    /// pass started first; quiet refits round 3, review I1): **nothing is judged** — the model that
+    /// stands is not the round's fit, so a check judged against it would measure the wrong model
+    /// (a failed check would untrust it as a teach check it never was) — and the round is not
+    /// counted, as a cancelled one. Its checks are kept as samples, unjudged: in strict mode's
+    /// domain as teaching samples the next refit fits, outside it held out until strict mode
+    /// reaches them (`judge_held_out`), as after a judged round. The solves count for the session.
+    pub(super) fn drop_teach(&mut self, targets: &[usize], holdouts: Vec<Holdout>, progress: &SamplingProgress, why: &str) {
+        self.uncount_teach_round();
+        let start = self.teach_start.take();
+        self.teach_session.solves += progress.done.saturating_sub(progress.skipped);
+        self.teach_session.secs += start.as_ref().map_or(0.0, |s| s.started.elapsed().as_secs_f64());
+        let (mut kept, mut deferred) = (0usize, 0usize);
+        if self.store.is_some() {
+            // `geometry_refusal` reads M's descriptors from the cache (the misfit fence)
+            if self.misfit_fence_stands() {
+                self.ensure_desc_cache();
+            }
+            for h in holdouts.into_iter().filter(|h| !h.unfit) {
+                let pos: Vec<[f64; 3]> = h.scene.nuclei.iter().map(|n| n.pos).collect();
+                let z: Vec<u8> = h.scene.nuclei.iter().map(|n| n.z).collect();
+                let prov = &self.scene_provenance(&h.scene);
+                let outside = self.geometry_refusal(&pos, &z, prov).is_some();
+                let tag = if outside { SampleTag::DraftAudit } else { SampleTag::Targeted };
+                let mut sink = Vec::new();
+                if self.keep_sample(&pos, &z, h.energy, &h.forces, h.face, h.multiplicity, prov, tag, &mut sink) {
+                    if outside {
+                        deferred += 1;
+                    } else {
+                        kept += 1;
+                    }
+                }
+            }
+        }
+        let targets_s: Vec<String> = targets.iter().map(|i| format!("#{i}")).collect();
+        let n = kept + deferred;
+        self.user_notes.push(format!(
+            "teaching around {}: the round's refit did not land ({why}) — not judged, and not counted as a round; {}",
+            targets_s.join(", "),
+            if n == 0 {
+                "no check geometry to keep".to_string()
+            } else {
+                format!(
+                    "its {n} check geometr{} kept as samples, unjudged ({kept} fitted at the next refit{})",
+                    if n == 1 { "y is" } else { "ies are" },
+                    if deferred > 0 { format!(", {deferred} held until strict mode reaches them") } else { String::new() }
+                )
+            }
+        ));
     }
 
     /// A check's verdict against the model that stands (the audit criterion: |ΔE|/N over the energy
