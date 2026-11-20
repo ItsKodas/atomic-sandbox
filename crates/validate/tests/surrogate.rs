@@ -1115,12 +1115,119 @@ fn stuck_escape_repro_with(runs: &[bool], audit_every: usize, mut baseline: Opti
     let mut first = Some(p);
     for &hot in runs {
         let provider = first.take().unwrap_or_else(|| SharedTrainable::from_handle(hs.clone()));
+        let (l0, t0) = (snapshot(&log), Instant::now());
         repro_run(&ctx, Box::new(provider), &hs, hot, n_steps, &mut out, baseline.as_deref_mut());
+        // trust tightening Task 9 Step 1 (a printout): the run's own teacher solves and wall time
+        let l1 = snapshot(&log);
+        let _ = writeln!(out, "  {} run: {} teacher solves of the provider (GPU {:.1} s; in-step ticks included, the test's own checker not), run wall {:.1} s", if hot { "hot" } else { "NVE" }, l1.calls - l0.calls, (l1.gpu - l0.gpu).as_secs_f64(), t0.elapsed().as_secs_f64());
     }
     let l = snapshot(&log);
     let _ = writeln!(out, "  teacher: {} solves, GPU {:.1} s; pass wall {:.1} s; test wall {:.1} s", l.calls, l.gpu.as_secs_f64(), pass_wall.as_secs_f64(), t_test.elapsed().as_secs_f64());
     println!("{out}");
     record(&ctx, timing_row("stuck_escape_repro", "H₂ + H", N_H2, TOL_H2, &l, t_test.elapsed(), &format!("runs (hot) {runs:?}: see the log")));
+}
+
+/// The trust-tightening readouts of the standing judgement, per environment key (plan 2026-11-19
+/// Task 9 Step 1; a printout, never an assertion): the verdict, the evidence floor's n_fit and n_pts,
+/// the evidence, λ_sum as rules 6/7 read it (floored), λ_T and λ_E, the measured error and worst atom.
+fn trust_key_lines(s: &SurrogateKs) -> String {
+    use providers::surrogate::{FLOOR_FITS, FLOOR_POINTS};
+    let opt = |x: Option<f64>| x.map_or("—".to_string(), |v| format!("{v:.3}"));
+    s.class_loo()
+        .iter()
+        .flat_map(|c| {
+            c.species.iter().map(move |k| {
+                format!(
+                    "{} {}: {}{}, n_fit {}/{FLOOR_FITS} n_pts {}/{FLOOR_POINTS}, evidence {}, λ_sum {:.3} λ_T {:.3} λ_E {:.3}, measured {} worst atom {}",
+                    c.class, k.words(), if k.trusted { "trusted" } else { "untrusted" },
+                    k.refusal.as_ref().map_or(String::new(), |r| format!(" ({:?} {:.3} > {:.3})", r.0, r.1, r.2)),
+                    k.fits, k.floor_points, k.evidence, k.rule_inflation, k.tail_inflation, k.energy_inflation, opt(k.measured), opt(k.worst_atom)
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The history points a step left (plan 2026-11-19 Task 9 Step 1): tallied by what the trust
+/// tightening reads — code-24 refusals, calibration ticks at answers (audits) and at fallbacks, and
+/// the answer sample P_A (`calibrate::in_answer_sample`'s predicate on the flags and kind, restated
+/// here: the provider's own is crate-private). A printout.
+#[derive(Default, Clone, Copy)]
+struct PointTally {
+    points: usize,
+    code_24: usize,
+    tick_audits: usize,
+    tick_fallbacks: usize,
+    p_a: usize,
+}
+
+impl PointTally {
+    fn add(&mut self, h: &surrogate::AuditHistory, recorded_before: u64) {
+        use providers::surrogate::{history_rule_code, HISTORY_RULE_CLASS_AND_VARIANCE, HISTORY_RULE_TAIL_INFLATION};
+        use sim::activity::{EnvClass, TeachRule};
+        use surrogate::history::{PointFlags, PointKind};
+        let new = (h.recorded().saturating_sub(recorded_before) as usize).min(h.len());
+        let class_codes = [history_rule_code(TeachRule::Class(EnvClass::Pair)), history_rule_code(TeachRule::Class(EnvClass::ManyBody)), HISTORY_RULE_CLASS_AND_VARIANCE];
+        for p in h.iter().rev().take(new) {
+            self.points += 1;
+            let tick = p.flags.has(PointFlags::TICK);
+            match p.kind {
+                PointKind::Audit => self.tick_audits += tick as usize,
+                PointKind::Fallback { rule } => {
+                    self.tick_fallbacks += tick as usize;
+                    self.code_24 += (rule == HISTORY_RULE_TAIL_INFLATION) as usize;
+                }
+            }
+            let class_refused = matches!(p.kind, PointKind::Fallback { rule } if class_codes.contains(&rule));
+            let in_pa = !p.flags.has(PointFlags::FENCED) && !p.flags.has(PointFlags::NOVEL) && (tick || (p.flags.has(PointFlags::CADENCE_FRESH) && class_refused));
+            self.p_a += in_pa as usize;
+        }
+    }
+
+    fn line(&self) -> String {
+        format!("{} history points: {} code-24 refusals (rule 6/7 at λ_T/λ_E, passing at λ_sum), ticks recorded {} at answers + {} at fallbacks, {} in P_A", self.points, self.code_24, self.tick_audits, self.tick_fallbacks, self.p_a)
+    }
+}
+
+/// The calibration ticks of one phase (`SurrogateKs::tick_counts`, `now` − `then`) and the plan's
+/// Step 3b diagnostic (Task 7 review I1/R1): the population's answered share against the due ticks'
+/// and the taken ticks', and the take rates at answered and at refused steps. The harness has no
+/// auditor, so D (the dead time) is 0 and every taken tick is served in the step. A printout.
+fn tick_line(now: providers::surrogate::TickCounts, then: providers::surrogate::TickCounts, tally: &PointTally) -> String {
+    let d = |a: u64, b: u64| a.saturating_sub(b);
+    let (due, ans_due, ans_busy) = (d(now.due, then.due), d(now.answered_due, then.answered_due), d(now.answered_skipped_busy, then.answered_skipped_busy));
+    let (busy, pop, pop_ans) = (d(now.skipped_busy, then.skipped_busy), d(now.population, then.population), d(now.population_answered, then.population_answered));
+    let share = |a: u64, b: u64| if b == 0 { f64::NAN } else { a as f64 / b as f64 };
+    let taken_rec = tally.tick_audits + tally.tick_fallbacks;
+    format!(
+        "ticks: due {due} (at answers {ans_due}), recorded {}, unrecorded {}, skipped busy {busy} (at answers {ans_busy}), lost {}, in-step {}; D 0 (no auditor); \
+         answered share — population {:.3} ({pop_ans}/{pop}), due {:.3}, recorded ticks {:.3} ({}/{taken_rec}); take rate at answered {:.3}, at refused {:.3}",
+        d(now.recorded, then.recorded), d(now.unrecorded, then.unrecorded), d(now.lost, then.lost), d(now.in_step, then.in_step),
+        share(pop_ans, pop), share(ans_due, due), share(tally.tick_audits as u64, taken_rec as u64), tally.tick_audits,
+        1.0 - share(ans_busy, ans_due), 1.0 - share(busy - ans_busy.min(busy), due - ans_due.min(due))
+    )
+}
+
+/// The class of atom `a` (0 pair, 1 many-body; `None` isolated) and its key's rule-6 factor
+/// λ_F = max(λ_sum, λ_T) from the standing judgement — the key: Z and the neighbours' distinct
+/// species within `r_cut`, ascending; NaN when the judgement does not list it. For the inflated z of
+/// Task 9 Step 1.
+fn atom_force_factor(s: &SurrogateKs, pos: &[[f64; 3]], z: &[u8], a: usize, r_cut: f64) -> Option<(usize, f64)> {
+    let nb: Vec<usize> = (0..pos.len()).filter(|&b| b != a && (0..3).map(|k| (pos[a][k] - pos[b][k]).powi(2)).sum::<f64>() < r_cut * r_cut).collect();
+    let class = providers::surrogate::atom_class(nb.len())?;
+    let mut species: Vec<u8> = nb.iter().map(|&b| z[b]).collect();
+    species.sort_unstable();
+    species.dedup();
+    let name = providers::surrogate::ENV_CLASSES[class];
+    let k = s.class_loo().iter().find(|c| c.class == name).and_then(|c| c.species.iter().find(|k| k.z == z[a] && k.neighbours == species));
+    // NaN stays NaN (never through f64::max)
+    Some((class, k.map_or(f64::NAN, |k| if k.rule_inflation.is_nan() || k.tail_inflation.is_nan() { f64::NAN } else { k.rule_inflation.max(k.tail_inflation) })))
+}
+
+/// The larger of two, NaN propagating (a NaN is never dropped by the max).
+fn max_nan(m: f64, x: f64) -> f64 {
+    if m.is_nan() || x.is_nan() { f64::NAN } else { m.max(x) }
 }
 
 /// One run of the repro (the test's doc) on the shared model: heat, the edit, `n_steps` steps
@@ -1157,10 +1264,18 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
     }
     d.apply(DynCommand::SetThermostat(Some((4000.0, 20.0))));
     let mut heat_fb = 0;
+    // trust tightening Task 9 Step 1 (printouts): the ticks and the points each phase left
+    let tick_counts = |hs: &Arc<Mutex<SurrogateKs>>| hs.lock().unwrap_or_else(|e| e.into_inner()).tick_counts();
+    let recorded = |hs: &Arc<Mutex<SurrogateKs>>| hs.lock().unwrap_or_else(|e| e.into_inner()).audit_history().recorded();
+    let tally = |hs: &Arc<Mutex<SurrogateKs>>, t: &mut PointTally, before: u64| t.add(hs.lock().unwrap_or_else(|e| e.into_inner()).audit_history(), before);
+    let ticks_start = tick_counts(hs);
+    let mut heat_tally = PointTally::default();
     for i in 0..1600 {
         d.apply(DynCommand::Step(1));
         let tb = !gate && trusted_now(hs);
+        let before = recorded(hs);
         let snap = d.tick(f64::INFINITY, &mut never());
+        tally(hs, &mut heat_tally, before);
         observe(&mut baseline, tb);
         heat_fb += (snap.source == Source::Fallback) as usize;
         check!(gate, soft, snap.last_error.is_none(), "{what} heating, step {i}: {:?}", snap.last_error);
@@ -1171,6 +1286,14 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
     }
     let pre = d.snapshot();
     let _ = writeln!(out, "  {what} run — heated: {heat_fb} fallbacks in 1600 steps, bond {:.3} Bohr, T {:.0} K, samples {}", bond(&pre.scene), pre.temperature, hs.lock().unwrap().samples());
+    let ticks_heated = tick_counts(hs);
+    let _ = writeln!(out, "    trust (heating): {}; {}", heat_tally.line(), tick_line(ticks_heated, ticks_start, &heat_tally));
+    let _ = writeln!(out, "    keys after heating: {}", trust_key_lines(&hs.lock().unwrap_or_else(|e| e.into_inner())));
+    let mut edit_tally = PointTally::default();
+    // judged answers' z per atom, raw ‖ΔF‖/σ_epi and inflated ‖ΔF‖/(λ_F σ_epi) (max over atoms), and
+    // the worst force residual / bound per class (pair, many-body)
+    let (mut z_raw, mut z_inflated) = (Vec::new(), Vec::new());
+    let mut worst_class = [0.0f64; 2];
     let c = centroid(&pre.scene);
     d.apply(DynCommand::AddNucleus(Nucleus::new(1, [c[0], c[1] + 3.0, c[2]])));
     let mut checker = Locked::new(ctx.clone(), TOL_H2).0;
@@ -1200,6 +1323,7 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
         let tb = !gate && trusted_now(hs);
         let recorded_before = hs.lock().unwrap_or_else(|e| e.into_inner()).audit_history().recorded();
         let snap = d.tick(f64::INFINITY, &mut never());
+        tally(hs, &mut edit_tally, recorded_before);
         observe(&mut baseline, tb);
         if snap.source == Source::Fallback && which_rule(&snap.eval.notes) == "rule 4b (class LOO)" {
             // before the refit below: the model that refused is the one judged
@@ -1280,6 +1404,24 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
                 let zs = snap.forces.iter().zip(&t.forces).zip(pr.force_std.as_ref().expect("variance")).map(|((fm, ft), sd)| ((0..3).map(|k| (fm[k] - ft[k]).powi(2)).sum::<f64>()).sqrt() / sd).fold(0.0f64, f64::max);
                 worst_z = worst_z.max(zs);
                 zscores.push(zs);
+                // Task 9 Step 1: z on the epistemic std alone, raw and at the key's λ_F (a printout)
+                {
+                    let s = hs.lock().unwrap_or_else(|e| e.into_inner());
+                    let epi = pr.force_std_epistemic.as_ref().expect("variance");
+                    let (mut zr, mut zi) = (0.0f64, 0.0f64);
+                    for (j, ((fm, ft), e)) in snap.forces.iter().zip(&t.forces).zip(epi).enumerate() {
+                        let dd = ((0..3).map(|k| (fm[k] - ft[k]).powi(2)).sum::<f64>()).sqrt();
+                        let (class, lf) = atom_force_factor(&s, &pos, &z, j, r_cut).unwrap_or((usize::MAX, f64::NAN));
+                        zr = max_nan(zr, dd / e);
+                        zi = max_nan(zi, dd / (lf * e));
+                        if class < 2 {
+                            let (dr, b) = pol.force_residual(fm, ft);
+                            worst_class[class] = max_nan(worst_class[class], dr / b);
+                        }
+                    }
+                    z_raw.push(zr);
+                    z_inflated.push(zi);
+                }
                 let gamma = hs.lock().unwrap_or_else(|e| e.into_inner()).extrapolation_grade(&pos, &z).unwrap_or(f64::NAN);
                 graded.push((gamma, f_ratio, de));
                 worst_e = worst_e.max(de);
@@ -1333,6 +1475,11 @@ fn repro_run(ctx: &GpuContext, provider: Box<dyn ForceProvider>, hs: &Arc<Mutex<
     let _ = writeln!(out, "    class-refused steps' would-be answers against the teacher — the verdict's jurisdiction (rule-4b points, codes 5/6, over the refusing class's atoms): {} steps, per-step rms ‖ΔF‖/√3 / bound {} — rms over them {refused_rms:.3} (ENTER {:.3}: the refusal is warranted beyond it)",
                      refused_ratio.len(), quantiles(&refused_ratio), providers::surrogate::ENTER);
     let _ = writeln!(out, "      every step with the class's note (code 21 and box-affected steps included, over every atom): {} steps, {} — rms {noted_rms:.3}", noted_ratio.len(), quantiles(&noted_ratio));
+    // trust tightening Task 9 Step 1 (printouts, no assertion)
+    let _ = writeln!(out, "    trust (after the edit): {}; {}", edit_tally.line(), tick_line(tick_counts(hs), ticks_heated, &edit_tally));
+    let _ = writeln!(out, "    keys at the end: {}", trust_key_lines(&hs.lock().unwrap_or_else(|e| e.into_inner())));
+    let _ = writeln!(out, "    judged answers' z on the epistemic std, max_j ‖ΔF_j‖/σ_epi,j — raw: {}; inflated by the key's λ_F = max(λ_sum, λ_T): {}", quantiles(&z_raw), quantiles(&z_inflated));
+    let _ = writeln!(out, "    judged answers' worst force residual / bound per class: pair {:.2}, many-body {:.2}", worst_class[0], worst_class[1]);
     println!("{out}");
     out.clear();
     check!(gate, soft, bad.is_empty(), "{what}: model answers beyond the energy tier or {REPRO_FORCE_RATIO}× the force bound: {bad:#?}");
