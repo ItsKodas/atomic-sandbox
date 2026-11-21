@@ -1836,7 +1836,7 @@ pub(crate) mod tests {
     #[test]
     fn a_witness_failure_at_the_budgets_cap_names_the_way_out() {
         let witness = |cap: usize| {
-            solver_error(QmError::Numerical(format!(
+            solver_error(qm::QmError::Numerical(format!(
                 "no gap witness within {cap} extra levels of spin 0 (WITNESS_GAP = 0.01 Ha above ε_N and 3 kT above μ, on the lower bound θ − r); \
                  {cap} is the most the 2.1 GB budget (the teacher's half of the 4.2 GB budget: 50 % of this GPU's 8.4 GB, set in Scene ▸ Quality; \
                  ATOMIC_SANDBOX_VRAM_GB overrides it) fits (at most 32)"
@@ -1852,7 +1852,7 @@ pub(crate) mod tests {
         // no budget: the cap is the hard one
         assert!(!with_witness_hint(witness(3), 3, false).to_string().contains(WITNESS_BUDGET_HINT));
         // another numerical failure, another error kind
-        let other = with_witness_hint(solver_error(QmError::Numerical("non-finite density".into())), 3, true).to_string();
+        let other = with_witness_hint(solver_error(qm::QmError::Numerical("non-finite density".into())), 3, true).to_string();
         assert!(!other.contains(WITNESS_BUDGET_HINT), "{other}");
         assert!(matches!(with_witness_hint(ProviderError::Cancelled, 3, true), ProviderError::Cancelled));
     }
