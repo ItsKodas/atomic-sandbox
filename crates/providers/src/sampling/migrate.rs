@@ -557,6 +557,12 @@ impl Migrator {
         let r = match r {
             Err(ProviderError::Cancelled) => return Err(ProviderError::Cancelled),
             Err(e @ ProviderError::Solver(sim::SolverError::Device(_))) => return Err(e),
+            // the session's GPU failure ends the migration (resumable): marking every later sample "not migrated" on
+            // a dead device would be a fast loop through the collection (the gpu-fault fix)
+            Err(e @ ProviderError::Solver(sim::SolverError::GpuFailed(_))) => {
+                surrogate.note_teacher_error(&e);
+                return Err(e);
+            }
             Err(e) => {
                 let code = match &e {
                     ProviderError::Solver(sim::SolverError::ScfStalled { .. }) => NotMigrated::Stalled,
@@ -654,6 +660,10 @@ fn check_solve(r: &ForceResult, n: usize, h: f64, recorded: Option<u32>) -> Resu
     }
     if !r.energy.is_finite() || !r.stats.energy.internal.is_finite() || r.forces.iter().flatten().any(|x| !x.is_finite()) {
         return Err((NotMigrated::SolveFailed, "the solve returned a non-finite energy or force".into()));
+    }
+    // converged, at least one SCF step, the scene's electrons (the gpu-fault fix: `sim::answer_refusal`)
+    if let Some(why) = sim::answer_refusal(r) {
+        return Err((NotMigrated::SolveFailed, format!("the solve's answer was refused ({why})")));
     }
     if let Some(why) = r.stats.untrainable() {
         return Err((NotMigrated::Untrainable, format!("the solve is not trained on ({why})")));

@@ -20,3 +20,5 @@ profile = ["surrogate/profile"]
 [dev-dependencies]
 gpu = { path = "../gpu", features = ["fault-injection"] }
 surrogate = { path = "../surrogate", features = ["test-hooks"] }
+# the gpu-fault tests create an oversize buffer (an uncaptured error) on the solver's device
+wgpu = { workspace = true }

@@ -192,9 +192,27 @@
 //! An empty scene (no nuclei) is answered without a solve, by both adapters, through
 //! `sim::provider::nothing_to_solve` (its module doc, "Nothing to solve").
 //!
+//! # A failed GPU (the gpu-fault fix, 2026-11-21)
+//! The device records its own failure (`gpu::GpuHealth`, installed by `gpu::GpuContext`): an uncaptured error — an
+//! out-of-memory on a creation, or any error no scope caught — or a lost device (an out-of-memory inside a submit or
+//! a map, a driver reset). [`GpuKs`] reads the record (`GpuContext::failure`, one non-blocking poll) before every
+//! evaluation, Harris solve and orbital refresh, and again after it: a device that failed before is refused at once,
+//! one that failed during the solve makes the evaluation `SolverError::GpuFailed` and nothing it computed is returned;
+//! the solver, its warm state and its display state are dropped (plain drops, no GPU work). A panic inside the solve
+//! while the device has failed (wgpu still panics on an invalid buffer's mapping, `wgpu::util::DeviceExt::create_buffer_init`)
+//! is that failure; any other panic is passed on. `GpuFailed` is never retried as "GPU busy" (the retries are for a
+//! readback that a healthy, shared device did not deliver). `ForceProvider::device_failure` reports the record, which
+//! the driver checks every tick (`sim::dynamics`, "A failed GPU"). Measured before the fix (the experiment behind
+//! `a_lost_device_refuses_every_solve_without_a_panic`): on a destroyed device every evaluation, warm or fresh, panicked
+//! within 0.1–10 ms ("Buffer with 'nuclei' label is invalid"), also when the device went in the middle of a solve.
+//!
+//! Every Kohn-Sham answer also carries its own account (`EvalStats::scf_check`: converged, ∫ρ of the density it was
+//! evaluated from — `qm::ScfStats::electrons` — and the scene's N), which `sim::answer_refusal` reads before any
+//! teacher answer becomes a sample or a reference.
+//!
 //! # GPU memory (main's fix round 1, review I2; moved here from `sim::provider` with the providers)
-//! A wgpu allocation that does not fit panics through the device's uncaptured-error handler, so
-//! [`GpuKs`] can be given a budget (`with_vram_budget`) and then refuses a scene whose estimated
+//! A wgpu allocation that does not fit fails the device (module section above; before the gpu-fault fix it panicked
+//! through wgpu's default uncaptured-error handler), so [`GpuKs`] can be given a budget (`with_vram_budget`) and then refuses a scene whose estimated
 //! footprint ([`gpu_footprint_bytes`]) exceeds it — `ProviderError::Invalid`, before the solver is
 //! built — and one whose single field would exceed the device's storage-binding or buffer limit.
 //! The estimate follows `qm_gpu::scf`'s "Fields and VRAM": per solve K = N orbitals and K kinetic
@@ -581,7 +599,7 @@ fn elapsed_ms(t0: Instant) -> u64 {
 /// core overlaps — and the per-spin `frontier` levels of the converged state ([`frontier`]).
 fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec<String>, eig_tol_used: f64, system: &System, frontier: [sim::Frontier; 2]) -> EvalStats {
     let setup = system.ionic.as_deref();
-    let ScfStats { iterations, energy, boundary_density, max_eigen_residual, poisson_residual, warnings, core_overlaps, partial, tol_used, mu, .. } = stats;
+    let ScfStats { iterations, energy, boundary_density, max_eigen_residual, poisson_residual, warnings, core_overlaps, partial, tol_used, mu, electrons, .. } = stats;
     // each channel's μ_σ beside its frontier levels (stray-atoms Task 7, controller ruling 10a)
     let mut frontier = frontier;
     for (f, m) in frontier.iter_mut().zip(mu) {
@@ -623,6 +641,9 @@ fn eval_stats(stats: ScfStats, readbacks: Option<usize>, t0: Instant, notes: Vec
         frontier,
         branch_jump: None,
         spin_change: None,
+        // the answer's own account (gpu-fault: `sim::answer_refusal`): an `Ok` from either solver is a converged SCF;
+        // its density's electrons against the scene's as solved (n↑ + n↓ — the valence count under a pseudo setup)
+        scf_check: Some(sim::ScfCheck { converged: true, electrons: electrons[0] + electrons[1], expected: (system.n_up + system.n_dn) as f64 }),
     }
 }
 
@@ -1307,6 +1328,48 @@ impl GpuKs {
         self.orb.rebuilt();
     }
 
+    /// The session's GPU failure as this solver's error (module doc, "A failed GPU"): the device's record
+    /// (`gpu::GpuContext::failure`, which polls it once without waiting), or `None` while it is trusted.
+    fn gpu_failed(&self) -> Option<ProviderError> {
+        self.ctx.failure().map(|why| ProviderError::Solver(SolverError::GpuFailed(why)))
+    }
+
+    /// After a GPU failure nothing this solver holds is trusted (module doc, "A failed GPU"): the solver, its warm
+    /// state, the orbital view and the Harris state are dropped — plain drops, no GPU work — and the textures with them.
+    fn drop_after_gpu_failure(&mut self) {
+        self.density_current = false;
+        self.orbital = None;
+        self.orb.rebuilt();
+        self.unocc.dropped();
+        self.harris.clear();
+        self.guard.reset();
+        self.textures.clear();
+        self.orb_scalar.clear();
+        self.orb_colour.clear();
+        self.share_gpu = None;
+        self.solver = None;
+        self.last = None;
+    }
+
+    /// `f` on this solver unless its device failed, and its outcome only while the device is still trusted after it
+    /// (module doc, "A failed GPU"): a failure before, during or after `f` is `SolverError::GpuFailed` and nothing `f`
+    /// computed is returned. A panic inside `f` while the device has failed is that failure (an invalid object's
+    /// mapping panics inside wgpu); any other panic is passed on unchanged.
+    fn unless_gpu_failed<T>(&mut self, f: impl FnOnce(&mut GpuKs) -> Result<T, ProviderError>) -> Result<T, ProviderError> {
+        if let Some(e) = self.gpu_failed() {
+            self.drop_after_gpu_failure();
+            return Err(e);
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut *self)));
+        match self.gpu_failed() {
+            Some(e) => {
+                self.drop_after_gpu_failure();
+                Err(e)
+            }
+            None => outcome.unwrap_or_else(|p| std::panic::resume_unwind(p)),
+        }
+    }
+
     /// Off, then back on: drops the parked ρ_{t−1} so the next warm start is not extrapolated.
     fn drop_extrapolation(&mut self) {
         if let Some(s) = self.solver.as_mut() {
@@ -1600,11 +1663,20 @@ impl ForceProvider for GpuKs {
     fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         // both closures below need the one `should_abort`, never at the same time
         let abort = std::cell::RefCell::new(should_abort);
-        let this = &mut *self;
-        let (mut result, failed) = retry_on_device_fault(
-            || this.evaluate_once(scene, &mut || (*abort.borrow_mut())()),
-            |ms| pause_unless_aborted(ms, &mut || (*abort.borrow_mut())()),
-        )?;
+        // a failed device (module doc, "A failed GPU"): refused before any GPU work, and an attempt during which it
+        // failed is `GpuFailed` — never retried as "GPU busy", never an answer
+        let (mut result, failed) = self.unless_gpu_failed(|this| {
+            retry_on_device_fault(
+                || {
+                    let r = this.evaluate_once(scene, &mut || (*abort.borrow_mut())());
+                    match this.gpu_failed() {
+                        Some(e) => Err(e),
+                        None => r,
+                    }
+                },
+                |ms| pause_unless_aborted(ms, &mut || (*abort.borrow_mut())()),
+            )
+        })?;
         if failed > 0 {
             result.stats.notes.push(format!("GPU busy: a device readback failed {failed} time(s); the evaluation was repeated"));
         }
@@ -1640,7 +1712,7 @@ impl ForceProvider for GpuKs {
     /// `GpuSolver::sample_density` on the converged state, f32 widened to f64 (module doc,
     /// "Density samples"): one dispatch, one readback.
     fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
-        if !self.density_current {
+        if !self.density_current || self.gpu_failed().is_some() {
             return None;
         }
         let solver = self.solver.as_ref()?;
@@ -1693,15 +1765,24 @@ impl ForceProvider for GpuKs {
         if !self.orb.on() || !self.density_current {
             return None;
         }
-        self.orb.now(Instant::now());
-        qm_gpu::grid::clear_readback_fault();
-        let payload = self.orbital_payload(should_abort);
-        if device_fault().is_ok() {
-            payload
-        } else {
-            self.drop_view_after_fault();
-            None
-        }
+        // display only, but never from a failed device (module doc, "A failed GPU")
+        self.unless_gpu_failed(|this| {
+            this.orb.now(Instant::now());
+            qm_gpu::grid::clear_readback_fault();
+            let payload = this.orbital_payload(should_abort);
+            if device_fault().is_ok() {
+                Ok(payload)
+            } else {
+                this.drop_view_after_fault();
+                Ok(None)
+            }
+        })
+        .ok()
+        .flatten()
+    }
+
+    fn device_failure(&self) -> Option<String> {
+        self.ctx.failure()
     }
 
     fn set_display_interrupt(&mut self, interrupt: DisplayInterrupt) {
@@ -1714,7 +1795,8 @@ impl ForceProvider for GpuKs {
 
     /// A Harris display solve now (module doc, "Harris display"): always `Solved`.
     fn harris_display(&mut self, scene: &Scene, atoms: &Arc<HarrisAtoms>, should_abort: &mut dyn FnMut() -> bool) -> Option<HarrisAnswer> {
-        Some(HarrisAnswer::Solved(self.harris_once(scene, atoms, should_abort)))
+        // never from a failed device (module doc, "A failed GPU")
+        Some(HarrisAnswer::Solved(self.unless_gpu_failed(|this| this.harris_once(scene, atoms, should_abort))))
     }
 }
 
@@ -1927,6 +2009,136 @@ pub(crate) mod tests {
             assert_eq!((a.spin, a.index, a.occupation), (b.spin, b.index, b.occupation));
             assert!((a.energy - b.energy).abs() < 1e-5, "{} vs {}", a.energy, b.energy);
         }
+    }
+
+    /// The gpu-fault fix's electron-count check (`sim::answer_refusal`) against real answers: every converged answer of
+    /// either solver carries ∫ρ = N to well inside `sim::ELECTRON_COUNT_REL_TOL`, over the cases that strain the f32
+    /// GPU sums most — the largest preset grid (Precise H₂O, 141³ all-electron), a pseudised scene (Accurate H₂O under
+    /// `Accepted`), Fermi–Dirac partial occupations (H₂ stretched to 3.2 Bohr) and an open shell (Li). The printed
+    /// relative misses are the measurement `ELECTRON_COUNT_REL_TOL`'s doc cites.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn real_answers_hold_their_electrons() {
+        let check = |what: &str, r: &ForceResult| {
+            let c = r.stats.scf_check.expect("a Kohn-Sham answer carries its SCF check");
+            let miss = (c.electrons - c.expected) / c.expected.max(1.0);
+            println!("{what}: ∫ρ = {:.9} of N = {} — relative miss {miss:+.2e} ({} SCF steps)", c.electrons, c.expected, r.stats.scf_steps);
+            assert_eq!(sim::answer_refusal(r), None, "{what}");
+            miss.abs()
+        };
+        let mut worst: f64 = 0.0;
+        worst = worst.max(check("CPU H₂ 33³ × 0.25", &CpuKs::new(1e-6).evaluate(&h2(33, 1.4), &mut never()).expect("CPU H₂")));
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let li = scene(49, vec![Nucleus::new(3, [0.0; 3])]);
+        let accurate = Scene { cell: Cell { n: 95, h: 0.15 }, ionic: sim::IonicPolicy::Accepted, ..h2o(95) };
+        let precise = Scene { cell: Cell { n: 141, h: 0.10 }, ..h2o(141) };
+        for (what, s) in [("GPU H₂ 49³ × 0.25", h2(49, 1.4)), ("GPU H₂ stretched 3.2 Bohr 49³ (FD partial)", h2(49, 3.2)), ("GPU Li 49³ × 0.25", li),
+                          ("GPU H₂O Accurate 95³ × 0.15, Accepted", accurate), ("GPU H₂O Precise 141³ × 0.10, all-electron", precise)] {
+            let r = GpuKs::new(ctx.clone(), 1e-6).evaluate(&s, &mut never()).unwrap_or_else(|e| panic!("{what}: {e}"));
+            worst = worst.max(check(what, &r));
+        }
+        println!("worst relative miss {worst:.2e} (tolerance {:.0e})", sim::ELECTRON_COUNT_REL_TOL);
+    }
+
+    /// gpu-fault (module doc, "A failed GPU"): on a lost device (`destroy`: the `valid = false` wgpu-core's `lose` sets)
+    /// every evaluation — the warm solver's and a fresh one's — is `GpuFailed` at once, never a panic (before the fix:
+    /// a panic within 0.1–10 ms, "Buffer with 'nuclei' label is invalid") and never an answer; the density and the
+    /// display paths have nothing to offer either, and `device_failure` says why.
+    #[test]
+    fn a_lost_device_refuses_every_solve_without_a_panic() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let s = h2(33, 1.4);
+        let mut g = GpuKs::new(ctx.clone(), 1e-6);
+        g.evaluate(&s, &mut never()).expect("a clean solve");
+        assert!(g.sample_density(&[[0.0; 3]]).is_some());
+        ctx.device.destroy();
+        for (what, p) in [("warm", &mut g), ("fresh", &mut GpuKs::new(ctx.clone(), 1e-6))] {
+            for _ in 0..2 {
+                let t = Instant::now();
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.evaluate(&s, &mut never())));
+                let e = r.unwrap_or_else(|_| panic!("{what}: a lost device panicked")).err().unwrap_or_else(|| panic!("{what}: an answer from a lost device"));
+                assert!(e.gpu_failure().is_some_and(|w| w.contains("destroyed")), "{what}: {e:?}");
+                assert!(e.to_string().starts_with(sim::GPU_FAILED_MESSAGE), "{e}");
+                assert!(t.elapsed().as_secs_f64() < 1.0, "{what}: refused without the busy retries");
+            }
+            assert!(p.sample_density(&[[0.0; 3]]).is_none());
+            assert!(p.device_failure().is_some());
+        }
+    }
+
+    /// gpu-fault: a device lost in the middle of a solve (destroyed from the abort poll before SCF step 3) ends the
+    /// evaluation with `GpuFailed` — no panic, no "GPU busy" retries on a dead device, no answer.
+    #[test]
+    fn a_device_lost_mid_solve_keeps_nothing() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = GpuKs::new(ctx.clone(), 1e-6);
+        let mut polls = 0;
+        let dev = ctx.device.clone();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            g.evaluate(&h2(33, 1.4), &mut || {
+                polls += 1;
+                if polls == 3 {
+                    dev.destroy();
+                }
+                false
+            })
+        }));
+        let e = r.expect("no panic").err().expect("no answer from a solve whose device was lost");
+        assert!(e.gpu_failure().is_some(), "{e:?}");
+        assert!(g.solver.is_none() && !g.density_current, "nothing of the failed solve is kept");
+    }
+
+    /// gpu-fault: an uncaptured GPU error during a solve (here a buffer over the device's size limit created from the
+    /// abort poll — the same uncaptured-error path an out-of-memory on a creation takes) no longer panics on the
+    /// solver's thread: the device is recorded failed, the evaluation is `GpuFailed` and nothing it computed is
+    /// returned; every later one is refused before any GPU work.
+    #[test]
+    fn an_uncaptured_gpu_error_mid_solve_keeps_nothing() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = GpuKs::new(ctx.clone(), 1e-6);
+        let mut polls = 0;
+        let dev = ctx.device.clone();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            g.evaluate(&h2(33, 1.4), &mut || {
+                polls += 1;
+                if polls == 3 {
+                    let _ = dev.create_buffer(&wgpu::BufferDescriptor { label: Some("injected"), size: dev.limits().max_buffer_size + 4, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
+                }
+                false
+            })
+        }));
+        let e = r.expect("an uncaptured error no longer panics").err().expect("no answer from a solve the device failed under");
+        assert!(e.gpu_failure().is_some_and(|w| w.contains("no scope caught")), "{e:?}");
+        let calls_before = polls;
+        let e = g.evaluate(&h2(33, 1.4), &mut || { polls += 1; false }).err().expect("refused");
+        assert!(e.gpu_failure().is_some());
+        assert_eq!(polls, calls_before, "refused before the solve polled even once");
+    }
+
+    /// gpu-fault: a context marked failed (`GpuHealth::fail`, the test hook) is refused by evaluate, Harris and the
+    /// orbital view alike; the CPU provider is untouched by any of it.
+    #[test]
+    fn a_context_marked_failed_is_refused_everywhere() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let s = h2(33, 1.4);
+        let mut g = GpuKs::new(ctx.clone(), 1e-6);
+        g.set_orbital_view(OrbitalViewRequest::new(sim::OrbitalRequest::List));
+        g.evaluate(&s, &mut never()).expect("a clean solve");
+        ctx.health.fail("injected: marked lost");
+        assert!(g.evaluate(&s, &mut never()).err().is_some_and(|e| e.gpu_failure() == Some("injected: marked lost")));
+        assert!(g.orbital_display_now(&mut never()).is_none());
+        let atoms = Arc::new(HarrisAtoms { profiles: Vec::new() });
+        match g.harris_display(&s, &atoms, &mut never()) {
+            Some(HarrisAnswer::Solved(Err(e))) => assert!(e.gpu_failure().is_some(), "{e:?}"),
+            other => panic!("expected a refused Harris solve, got {}", other.is_some()),
+        }
+        assert_eq!(g.device_failure().as_deref(), Some("injected: marked lost"));
+        assert!(CpuKs::new(1e-6).device_failure().is_none());
     }
 
     /// The empty scene (module doc, "Nothing to solve"): both adapters answer E = 0, no forces,

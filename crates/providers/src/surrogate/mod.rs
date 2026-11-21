@@ -450,6 +450,26 @@
 //!   every tick — with an auditor D ≈ t_solve/t_step, so 36–48 at 12 ms/step and 51–79 at 5 ms/step
 //!   for 130–270 ms solves; without one D = 0, one teacher solve in the step per 25 answered steps.
 //!
+//! # A failed GPU (the gpu-fault fix, 2026-11-21)
+//! The user's report (v0.2.0, an 8 GB card, estimated mode near the VRAM limit): "a super fast loop where it takes
+//! hundreds of samples that seemingly contain no data". Two rules, whatever the device did:
+//! - **The session's GPU failure is fatal for this provider.** The first `SolverError::GpuFailed` from any teacher —
+//!   the stepping teacher's fallback, a pass's solve or reference, a migration's, the background auditor's job (its
+//!   answer carries it, `AuditAnswer::gpu_failed`) — or the stepping teacher's own `device_failure` is latched
+//!   ([`SurrogateKs::gpu_failure`]). From then on every `evaluate` is that error — the model answers no step either
+//!   (the run is to be saved and the app restarted) — a running pass ends at its next step with it (one job, not the
+//!   rest of the queue failing in microseconds), and nothing more is sent to the auditor. `device_failure` reports it,
+//!   so the driver stops playing (`sim::dynamics`, "A failed GPU"). The auditor's thread catches a panic inside a job
+//!   (the teacher is reset) and answers the job with an error, so a panic no longer ends the thread silently.
+//! - **No physically empty answer is kept.** Before a teacher answer becomes a sample or a reference — a fallback or
+//!   an in-step audit (`teach`), a background audit or a composition check's part (the auditor), a pass's sample,
+//!   scan, burst step, teach-around solve or reference (`crate::sampling`, `sim::references`), a migrated sample —
+//!   `sim::answer_refusal` checks it: finite, and for a Kohn-Sham answer at least one SCF iteration, converged, and
+//!   ∫ρ within `sim::ELECTRON_COUNT_REL_TOL` (1e-5 relative; derived from the GPU's f32 sums, measured 8.7e-8) of the
+//!   scene's electrons. A refused answer is counted ([`SurrogateKs::refused_answers`]), leaves a `Failed` activity
+//!   event with the reason, and is never kept; a refused fallback is not used for the step either (the step fails, the
+//!   driver pauses with the reason).
+//!
 //! # Draft mode (user request 2026-10-14: `FallbackPolicy::never_fallback`)
 //!
 //! "Guess instead of falling back (unsafe)": with a model present whose provenance, species and
@@ -1862,6 +1882,12 @@ pub struct SurrogateKs {
     /// Consecutive pass steps that failed with "GPU busy" and were kept for a retry
     /// ([`pass_step_is_transient`]); reset by a step that solved.
     pass_busy: u32,
+    /// The session's GPU failure (module doc, "A failed GPU"): latched from the first `SolverError::GpuFailed` a
+    /// teacher or the auditor returned, or from the stepping teacher's `device_failure`. Never cleared.
+    gpu_failed: Option<String>,
+    /// Teacher answers `sim::answer_refusal` refused (module doc, "A failed GPU"): each one also left an activity
+    /// event with its reason; none was kept.
+    refused_answers: u64,
     /// Side jobs (audits and refreshes) dispatched so far, the newest side density, and the
     /// isolated-atom densities that arrived (module doc, "Side densities").
     side_jobs: u64,
@@ -2222,6 +2248,8 @@ impl SurrogateKs {
             force_teacher: false,
             last_fallback: false,
             pass_busy: 0,
+            gpu_failed: None,
+            refused_answers: 0,
             last_audit: None,
             audit_history: surrogate::AuditHistory::default(),
             fits: 0,
@@ -2563,6 +2591,56 @@ impl SurrogateKs {
         self.teacher.as_mut()
     }
 
+    /// The session's GPU failure (module doc, "A failed GPU"), latched from the stepping teacher's device when it
+    /// was not yet: `Some(cause)` once any teacher of this provider reported it.
+    pub fn gpu_failure(&mut self) -> Option<String> {
+        if self.gpu_failed.is_none() {
+            if let Some(why) = self.teacher.device_failure() {
+                self.latch_gpu_failure(why);
+            }
+        }
+        self.gpu_failed.clone()
+    }
+
+    /// [`gpu_failure`](Self::gpu_failure) as the error every evaluation and pass step returns from then on.
+    pub(crate) fn gpu_failure_error(&mut self) -> Option<ProviderError> {
+        self.gpu_failure().map(|why| ProviderError::Solver(sim::SolverError::GpuFailed(why)))
+    }
+
+    /// Records the session's GPU failure (module doc, "A failed GPU"), once: a note, and nothing queued for the
+    /// auditor is sent any more (a job in flight comes back failing and is handled as a failed job).
+    pub(crate) fn latch_gpu_failure(&mut self, why: String) {
+        if self.gpu_failed.is_some() {
+            return;
+        }
+        self.user_notes.push(format!(
+            "surrogate: the GPU failed ({why}) — every teacher solve is refused and the model answers no more steps; nothing from the failed solve was kept"
+        ));
+        self.audit_due = false;
+        self.side_queue.clear();
+        self.harris_queued = None;
+        self.gpu_failed = Some(why);
+    }
+
+    /// A teacher error: latched when it is the session's GPU failure ([`latch_gpu_failure`](Self::latch_gpu_failure)).
+    pub(crate) fn note_teacher_error(&mut self, e: &ProviderError) {
+        if let Some(why) = e.gpu_failure() {
+            self.latch_gpu_failure(why.to_string());
+        }
+    }
+
+    /// One teacher answer `sim::answer_refusal` refused (module doc, "A failed GPU"): counted and noted; the caller
+    /// leaves the activity event with the reason and keeps nothing.
+    pub(crate) fn count_refused_answer(&mut self, why: &str) {
+        self.refused_answers += 1;
+        self.user_notes.push(format!("surrogate: a teacher answer was refused ({why}) — not kept ({} refused this session)", self.refused_answers));
+    }
+
+    /// Teacher answers refused by `sim::answer_refusal` so far (module doc, "A failed GPU").
+    pub fn refused_answers(&self) -> u64 {
+        self.refused_answers
+    }
+
     /// The teacher's step: evaluate, keep the sample, build the result on the right surface
     /// (module doc, "One-surface accounting" and "Audit"), and leave one activity event (`ledger`):
     /// the rule that sent the step here, what `admit` did with the answer, or `Failed` when the
@@ -2572,6 +2650,7 @@ impl SurrogateKs {
         let r = match self.teacher.evaluate(scene, should_abort) {
             Ok(r) => r,
             Err(e) => {
+                self.note_teacher_error(&e);
                 if !matches!(e, ProviderError::Cancelled) {
                     let mut ev = TeachEvent::new(origin_of(h.audit, h.reason.rule), h.reason.rule, TeachOutcome::Failed);
                     ev.atom = h.reason.atom;
@@ -2584,6 +2663,19 @@ impl SurrogateKs {
                 return Err(e);
             }
         };
+        // the gpu-fault fix (module doc, "A failed GPU"): a physically empty answer — not converged, no iteration, a
+        // density without the scene's electrons, a non-finite number — is neither kept nor used for the step
+        if let Some(why) = sim::answer_refusal(&r) {
+            self.count_refused_answer(&why);
+            let mut ev = TeachEvent::new(origin_of(h.audit, h.reason.rule), h.reason.rule, TeachOutcome::Failed);
+            ev.atom = h.reason.atom;
+            ev.detail = format!("{} — the teacher's answer was refused ({why}): not kept, not used", h.reason.text);
+            ev.n_atoms = h.pos.len();
+            ev.solve_ms = solve_started.elapsed().as_secs_f64() * 1e3;
+            ev.scf_steps = Some(r.stats.scf_steps);
+            self.push_event(ev);
+            return Err(ProviderError::Solver(sim::SolverError::Numerical(format!("the teacher's answer was refused ({why}); nothing was kept"))));
+        }
         // a rule-5a fallback of a bonded part plus stray atoms the floor lets through: its answer is a composition
         // check's scene answer (`stray` module doc, "The checks on the auditor"), raw — before the canonical surface
         let stray_check = (h.reason.rule == TeachRule::IsolatedAtom && !h.audit && h.model.is_some() && scene.train_mask().is_none())
@@ -2923,6 +3015,10 @@ impl ForceProvider for SurrogateKs {
         self.last_fallback = false;
         // a note of a step that failed is not carried to the next (review M5)
         self.step_notes.clear();
+        // a failed GPU (module doc, "A failed GPU"): no answer at all — neither the teacher's nor the model's
+        if let Some(e) = self.gpu_failure_error() {
+            return Err(e);
+        }
         // the empty scene (`sim::provider`, "Nothing to solve"): no species, so no model, no
         // fallback, no sample, no audit — the known answer, before any rule runs
         if let Some(r) = sim::nothing_to_solve(scene) {
@@ -2952,6 +3048,10 @@ impl ForceProvider for SurrogateKs {
         self.request_box_references(scene);
         // a background audit's verdict, if it arrived (module doc, "Audit")
         self.poll_audit();
+        // ...whose job may have found the GPU failed (module doc, "A failed GPU")
+        if let Some(e) = self.gpu_failure_error() {
+            return Err(e);
+        }
         // a failed audit of a composition this scene does not hold turns into a local fence, and back
         // when the composition returns (round 1, SHOULD-3; R1-4)
         if !self.failed_audits.is_empty() || !self.audit_fences.is_empty() {
@@ -3507,6 +3607,12 @@ impl ForceProvider for SurrogateKs {
     /// (`request_atom_reference`, module doc "Side densities").
     fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
         self.teacher.side_solver()
+    }
+
+    /// The session's GPU failure (module doc, "A failed GPU"): the one latched from any teacher's answer (the
+    /// auditor's included), else the stepping teacher's device's.
+    fn device_failure(&self) -> Option<String> {
+        self.gpu_failed.clone().or_else(|| self.teacher.device_failure())
     }
 
     /// The teacher's ionic surface (M7): the references and the model's provenance are its.
@@ -4070,7 +4176,15 @@ impl Trainable for SurrogateKs {
     fn pass_step(&mut self, should_abort: &mut dyn FnMut() -> bool) -> Result<Option<SamplingProgress>, ProviderError> {
         let Some(mut sampler) = self.pass.take() else { return Ok(None) };
         self.last_fallback = false; // the teacher solves a pass geometry
-        let r = sampler.step_own_teacher(self, should_abort);
+        // a failed GPU ends the pass (module doc, "A failed GPU"): before its next job, and after the job that found it
+        let r = match self.gpu_failure_error() {
+            Some(e) => Err(e),
+            None => sampler.step_own_teacher(self, should_abort),
+        };
+        let r = match (r, self.gpu_failure_error()) {
+            (Ok(_), Some(e)) => Err(e),
+            (r, _) => r,
+        };
         self.user_notes.extend(sampler.take_notes());
         match r {
             Ok(Some(p)) => {

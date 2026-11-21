@@ -4654,7 +4654,7 @@ fn scripted_session_with(views: bool) -> String {
     let answer = |s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result<(f64, Vec<[f64; 3]>, Option<f64>, Option<Display>), String>| {
         let generation = s.auditor.as_ref().expect("an auditor").generation.load(Ordering::Relaxed);
         let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: Default::default(), tick_only: false };
-        AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps: None, ts: None }
+        AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps: None, ts: None, gpu_failed: None, refused: None }
     };
     let mut teacher = MorseDimer::h2();
     for (i, (r, de, face, fail, charged)) in
@@ -5061,7 +5061,7 @@ fn audit_answer(s: &SurrogateKs, scene: &Scene, prov: Provenance, result: Result
     let generation = s.auditor.as_ref().expect("an auditor").generation();
     let job = AuditJob { scene: scene.clone(), prov, generation, answered: s.answered, kind: JobKind::Audit, id: 0, view: Default::default(), interrupt: None, core: false, draft_guess: false, shares: None, harris: None, flags: Default::default(), tick_only: false };
     let scf_steps = result.is_ok().then_some(5);
-    AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps, ts: None }
+    AuditAnswer { job, result: solved(result), reference: None, ms: 7.0, scf_steps, ts: None, gpu_failed: None, refused: None }
 }
 
 /// Plan review S11: the background auditor's failed solve and its discarded answer are solves
@@ -14544,3 +14544,7 @@ fn a_box_affected_tick_is_taken_without_a_point() {
     assert_eq!(s.tick_counts(), TickCounts { unrecorded: 1, due: 1, answered_due: 1, population: 2, population_answered: 2, ..TickCounts::default() });
     assert_eq!((s.ticks_taken(), s.ticks_skipped(), s.audit_due), (0, 0, false));
 }
+
+/// The gpu-fault fix (2026-11-21): failed-GPU teachers (a panic, `GpuFailed`, an empty answer) through the
+/// surrogate, the pass, the auditor and the driver (`gpu_fault.rs`).
+mod gpu_fault;

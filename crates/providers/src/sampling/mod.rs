@@ -1276,6 +1276,10 @@ impl Sampler {
                     let started = Instant::now();
                     let retry = scan.retrying();
                     let outcome = scan.step(t, should_abort);
+                    if let Err(e) = &outcome {
+                        // the session's GPU failure ends the pass at this step's end (`SurrogateKs::pass_step`)
+                        surrogate.note_teacher_error(e);
+                    }
                     let solve_ms = started.elapsed().as_secs_f64() * 1e3;
                     let again = if retry { " (retry, cold)" } else { "" };
                     if let Err(ProviderError::Cancelled) = outcome {
@@ -1605,13 +1609,22 @@ impl Sampler {
                     self.time_limit_floor_s
                 )));
             }
-            r => r?,
+            Err(e) => {
+                // the session's GPU failure ends the pass at its next step (`SurrogateKs::pass_step`)
+                surrogate.note_teacher_error(&e);
+                return Err(e);
+            }
+            Ok(r) => r,
         };
         if r.forces.len() != n {
             return Err(ProviderError::Invalid(format!("teacher '{}' returned {} forces for {n} nuclei", t.name(), r.forces.len())));
         }
-        if !r.energy.is_finite() || r.forces.iter().flatten().any(|x| !x.is_finite()) {
-            return Err(ProviderError::Invalid(format!("teacher '{}' returned a non-finite energy or force", t.name())));
+        // finite, and for a Kohn-Sham answer converged with the scene's electrons (the gpu-fault fix: a physically empty
+        // answer is a failed solve — counted, its event says why — never a sample)
+        if let Some(why) = sim::answer_refusal(&r) {
+            let name = t.name();
+            surrogate.count_refused_answer(&why);
+            return Err(ProviderError::Invalid(format!("teacher '{name}' answer refused: {why}")));
         }
         self.progress.last_energy = r.energy;
         if limited {

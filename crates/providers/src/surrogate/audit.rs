@@ -297,6 +297,17 @@ pub(super) struct AuditAnswer {
     pub(super) ms: f64,
     pub(super) scf_steps: Option<usize>,
     pub(super) ts: Option<f64>,
+    /// The auditor's device failed (`ForceProvider::device_failure` after the job, or a `GpuFailed` error): the
+    /// surrogate latches it (module doc, "A failed GPU"). `None` otherwise.
+    pub(super) gpu_failed: Option<String>,
+    /// The teacher answered, and `sim::answer_refusal` refused the answer (the reason; `result` is then that `Err`):
+    /// counted and logged, never judged or kept.
+    pub(super) refused: Option<String>,
+}
+
+/// A caught panic's message (`std::panic::catch_unwind`'s payload).
+fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "panic".into())
 }
 
 /// The background auditor (ruling S14, module doc "Audit"): a second teacher instance on its own
@@ -381,7 +392,10 @@ impl Auditor {
                     let t = Instant::now();
                     let g = job.generation;
                     let (mut scf_steps, mut ts) = (None, None);
-                    let (result, reference) = match job.kind {
+                    let (mut gpu_failed, mut refused): (Option<String>, Option<String>) = (None, None);
+                    // a panic inside the job (a GPU failure mid-solve, before the gpu-fault fix the out-of-memory
+                    // handler's own) answers the job with an error instead of ending the thread, the teacher reset
+                    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match job.kind {
                         // the multiplicity scan (each solve cold, the teacher reset after it)
                         JobKind::Reference(z) => {
                             let mass = job.scene.nuclei.first().map_or(0.0, |n| n.mass);
@@ -408,6 +422,19 @@ impl Auditor {
                         _ => (
                             teacher
                                 .evaluate(&job.scene, &mut || current.load(Ordering::Relaxed) != g)
+                                .map_err(|e| {
+                                    gpu_failed = e.gpu_failure().map(str::to_string);
+                                    e
+                                })
+                                // an answer that is physically empty is no audit, no part answer, no density (the
+                                // gpu-fault fix: `sim::answer_refusal`)
+                                .and_then(|r| match sim::answer_refusal(&r) {
+                                    Some(why) => {
+                                        refused = Some(why.clone());
+                                        Err(ProviderError::Invalid(format!("the background teacher's answer was refused ({why})")))
+                                    }
+                                    None => Ok(r),
+                                })
                                 .map(|r| {
                                     (scf_steps, ts) = (Some(r.stats.scf_steps), Some(r.stats.energy.ts));
                                     let frontier = if part { super::stray::with_unoccupied(r.stats.frontier, r.orbitals.as_ref()) } else { r.stats.frontier };
@@ -427,9 +454,20 @@ impl Auditor {
                                 .map_err(|e| e.to_string()),
                             None,
                         ),
+                    }));
+                    let (result, reference) = match ran {
+                        Ok(x) => x,
+                        Err(p) => {
+                            teacher.reset();
+                            let why = format!("the background teacher panicked ({})", panic_text(p.as_ref()));
+                            let reference = matches!(job.kind, JobKind::Reference(_)).then(|| Err(ProviderError::Invalid(why.clone())));
+                            (Err(why), reference)
+                        }
                     };
+                    // the device's own record too: a failure the job's error did not carry (a panic, a display job)
+                    let gpu_failed = gpu_failed.or_else(|| teacher.device_failure());
                     let ms = t.elapsed().as_secs_f64() * 1e3;
-                    if atx.send(AuditAnswer { job, result, reference, ms, scf_steps, ts }).is_err() {
+                    if atx.send(AuditAnswer { job, result, reference, ms, scf_steps, ts, gpu_failed, refused }).is_err() {
                         break;
                     }
                 }
@@ -443,7 +481,7 @@ impl Auditor {
     }
 
     /// Abandons the job in flight (its answer is discarded on arrival).
-    fn new_generation(&mut self) {
+    pub(super) fn new_generation(&mut self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -917,6 +955,14 @@ impl SurrogateKs {
     /// activity event, not counted); a failed audit solve leaves a `Failed` event (plan review
     /// S11).
     pub(super) fn handle_answer(&mut self, mut ans: AuditAnswer) {
+        // the gpu-fault fix (module doc, "A failed GPU"): the auditor's device failed — every solver of the session
+        // refuses from now on; a refused answer is counted (its event, below, carries the reason)
+        if let Some(why) = ans.gpu_failed.take() {
+            self.latch_gpu_failure(why);
+        }
+        if let Some(why) = ans.refused.take() {
+            self.count_refused_answer(&why);
+        }
         // a reference is answered whatever the generation (its requester waits for it); one
         // abandoned by a Forget or an installed model comes back `Cancelled`
         if let (JobKind::Reference(z), Some(r)) = (ans.job.kind, ans.reference.take()) {
