@@ -652,8 +652,8 @@ impl Viewer {
     /// discarded. `start` never waits, but a new worker that builds GPU solvers builds them only
     /// once every stopped worker that held GPU solvers has ended (`SimWorker::spawn_after`, at most
     /// `worker::OLD_WORKER_WAIT`; gpu-fault review B-I1): a rebuild — the GPU memory slider, a
-    /// backend switch — never holds the old solvers and the new ones on the card at once. An estimated one is retired on a reaper thread (fix round 1, I2: `start` never
-    /// waits): it writes its model to the autosave path, if it owns it (`sim` module doc). A new
+    /// backend switch — never holds the old solvers and the new ones on the card at once. An
+    /// estimated one is retired on a reaper thread (fix round 1, I2: `start` never waits): it writes its model to the autosave path, if it owns it (`sim` module doc). A new
     /// estimated worker is sent [`Command::EnsureModel`] — the autosaved model if there is one,
     /// else a sampling pass with the panel's plan — once every retiring worker has finished
     /// ([`Viewer::poll_retiring`], called from the event and frame paths). The displayed density

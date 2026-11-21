@@ -6527,3 +6527,5 @@ The confirmation repeats the standing trial's cold search (6 rounds in the recov
 | GPU H₂O Precise 141³ × 0.10, all-electron | 10.000000003 | 10 | +3.11e-10 |
 
 Worst 8.65e-8 (≈ 1.5 u): the tolerance is ≈ 115× it. Also `qm-gpu` `h2_matches_cpu_at_fixed_sigma`: H₂ 33³ per spin −8.12e-8, −1.98e-8 (CPU 0, 2e-16). An answer a failed device leaves misses by O(1) (an empty density: ∫ρ = 0).
+
+**Refused answers in a row** (the gpu-fault review A-I2, controller ruling 2026-11-21): a sampling pass, and a collection re-solve, ends after `providers::sampling::PASS_REFUSALS_IN_A_ROW` = 3 answers in a row refused by this check (only an accepted answer resets the count). A stopping rule, not a tolerance: no bound above moves, and ending early is the conservative direction (a refused answer is never kept either way). Tests `a_pass_refuses_empty_answers_and_ends_after_three_in_a_row` (6 teacher solves, 2 samples kept, 3 refused), `an_accepted_answer_resets_the_refusal_count`, `three_refused_resolves_in_a_row_end_the_migration`.
