@@ -4529,7 +4529,11 @@ fn fnv1a(text: &str) -> u64 {
 /// `mu` (each channel's μ_σ; the analytic teacher reports none). Removing exactly the 682 occurrences of ", mu: None" from
 /// the 907-line trace (and from the views trace) gives traces byte-identical to the ones at bb8e17b5, whose digest is the
 /// previous pin — no decision, answer, note, sample or draw moved.
-const SCRIPTED_SESSION_DIGEST: u64 = 0x2043_2825_e75d_6a93;
+/// Re-pinned 2026-11-21 (the gpu-fault fix; 0x2043_2825_e75d_6a93 → below): `EvalStats` gained `scf_check` (the analytic
+/// teacher reports none). Removing exactly the 341 occurrences of ", scf_check: None" from the 907-line trace reproduces the
+/// previous digest 0x2043_2825_e75d_6a93 (checked by script on the trace `GOLDEN_TRACE` wrote) — no decision, answer, note,
+/// sample or draw moved.
+const SCRIPTED_SESSION_DIGEST: u64 = 0x6fcc_b5b3_2c5e_24a2;
 
 /// A fixed session through every decision path the providers' tests reach without a thread:
 /// rule 1 before a model, a full sampling pass (its seeded perturbations, the burst's

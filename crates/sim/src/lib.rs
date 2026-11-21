@@ -31,7 +31,7 @@ pub use relax::{Fire, FireOutcome, FireParams, FireStep, RelaxProgress, F_TOL};
 pub use provider::{
     AuditRecord, AuditVerdict, CalibrationTicks, ClassKey, ClassLoo, SpeciesVerdict, key_words, ImportSummary, MigrationPhase, MigrationStatus, ModelSource, PurgeReport, Readiness, TeachOffer, Display, DisplayInterrupt, EnergyBreakdown, EvalStats, Extrapolation, ForceProvider, ForceResult,
     ColourLook, ExperienceUse, HarrisAnswer, HarrisAtoms, LoneAtomLabels, OrbitalDisplay, OrbitalKind, OrbitalField, OrbitalInfo, OrbitalLabel, OrbitalRequest, OrbitalViewRequest, CORE_GAP, ProviderError, SideDisplay, SideKind,
-    RefitPoll, SampleId, SampleSuspect, ShareTables, SolverError, Source, Spin, SpinSummary, Surface, Trainable, TrainableStatus, UnoccupiedStatus, nothing_to_solve, PseudoSummary, PartialLevel, Frontier, CORE_OVERLAP_WARNING, BRANCH_JUMP_WARNING, branch_jump_warning, untrainable_citation, answer_refusal, ScfCheck, ELECTRON_COUNT_REL_TOL, GPU_FAILED_MESSAGE, ORBITAL_MIN_INTERVAL, TRACK_HOMO,
+    RefitPoll, SampleId, SampleSuspect, ShareTables, SolverError, Source, Spin, SpinSummary, Surface, Trainable, TrainableStatus, UnoccupiedStatus, nothing_to_solve, PseudoSummary, PartialLevel, Frontier, CORE_OVERLAP_WARNING, BRANCH_JUMP_WARNING, branch_jump_warning, untrainable_citation, answer_refusal, scf_refusal, ScfCheck, ELECTRON_COUNT_REL_TOL, GPU_FAILED_MESSAGE, ORBITAL_MIN_INTERVAL, TRACK_HOMO,
 };
 pub use charges::{orbital_shares, orbital_shares_many, set_average, share_sum, ChargeSource, PartialCharges, Weights};
 pub use bonds::{components, Bond, BondGraph, BondKind, Detector, MarchStop, PairReport, Promolecule, Route, Verdict};

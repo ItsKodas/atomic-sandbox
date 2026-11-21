@@ -2011,32 +2011,48 @@ pub(crate) mod tests {
         }
     }
 
+    /// The electron count of one real answer (`EvalStats::scf_check`): printed, refused by nothing, the relative miss.
+    fn electron_miss(what: &str, r: &ForceResult) -> f64 {
+        let c = r.stats.scf_check.expect("a Kohn-Sham answer carries its SCF check");
+        let miss = (c.electrons - c.expected) / c.expected.max(1.0);
+        println!("{what}: ∫ρ = {:.9} of N = {} — relative miss {miss:+.2e} ({} SCF steps)", c.electrons, c.expected, r.stats.scf_steps);
+        assert_eq!(sim::answer_refusal(r), None, "{what}");
+        miss.abs()
+    }
+
     /// The gpu-fault fix's electron-count check (`sim::answer_refusal`) against real answers: every converged answer of
-    /// either solver carries ∫ρ = N to well inside `sim::ELECTRON_COUNT_REL_TOL`, over the cases that strain the f32
-    /// GPU sums most — the largest preset grid (Precise H₂O, 141³ all-electron), a pseudised scene (Accurate H₂O under
-    /// `Accepted`), Fermi–Dirac partial occupations (H₂ stretched to 3.2 Bohr) and an open shell (Li). The printed
-    /// relative misses are the measurement `ELECTRON_COUNT_REL_TOL`'s doc cites.
+    /// either solver carries ∫ρ = N to well inside `sim::ELECTRON_COUNT_REL_TOL` — closed and open shells, Fermi–Dirac
+    /// partial occupations (H₂ stretched to 3.2 Bohr). The large grids are [`real_answers_hold_their_electrons_at_the_large_grids`]'s.
     #[test]
     #[cfg_attr(debug_assertions, ignore)]
     fn real_answers_hold_their_electrons() {
-        let check = |what: &str, r: &ForceResult| {
-            let c = r.stats.scf_check.expect("a Kohn-Sham answer carries its SCF check");
-            let miss = (c.electrons - c.expected) / c.expected.max(1.0);
-            println!("{what}: ∫ρ = {:.9} of N = {} — relative miss {miss:+.2e} ({} SCF steps)", c.electrons, c.expected, r.stats.scf_steps);
-            assert_eq!(sim::answer_refusal(r), None, "{what}");
-            miss.abs()
-        };
-        let mut worst: f64 = 0.0;
-        worst = worst.max(check("CPU H₂ 33³ × 0.25", &CpuKs::new(1e-6).evaluate(&h2(33, 1.4), &mut never()).expect("CPU H₂")));
+        let mut worst = electron_miss("CPU H₂ 33³ × 0.25", &CpuKs::new(1e-6).evaluate(&h2(33, 1.4), &mut never()).expect("CPU H₂"));
         let Some(ctx) = gpu() else { return };
         let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
         let li = scene(49, vec![Nucleus::new(3, [0.0; 3])]);
+        for (what, s) in [("GPU H₂ 49³ × 0.25", h2(49, 1.4)), ("GPU H₂ stretched 3.2 Bohr 49³ (FD partial)", h2(49, 3.2)), ("GPU Li 49³ × 0.25", li)] {
+            let r = GpuKs::new(ctx.clone(), 1e-6).evaluate(&s, &mut never()).unwrap_or_else(|e| panic!("{what}: {e}"));
+            worst = worst.max(electron_miss(what, &r));
+        }
+        println!("worst relative miss {worst:.2e} (tolerance {:.0e})", sim::ELECTRON_COUNT_REL_TOL);
+    }
+
+    /// The measurement behind `sim::ELECTRON_COUNT_REL_TOL` at the grids that strain the f32 sums most: a pseudised
+    /// scene (Accurate H₂O under `Accepted`, 95³) and the largest preset grid (Precise H₂O, 141³ all-electron, ≈ 6 GB of
+    /// GPU memory — `#[ignore]`d so the suite's parallel GPU tests never share the card with it; run it alone:
+    /// `cargo test -p providers --release --lib real_answers_hold_their_electrons_at_the_large_grids -- --ignored --nocapture`).
+    /// Recorded in `references.md` "Electron-count check".
+    #[test]
+    #[ignore = "measurement, ≈ 6 GB of GPU memory: run alone"]
+    fn real_answers_hold_their_electrons_at_the_large_grids() {
+        let Some(ctx) = gpu() else { return };
+        let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
         let accurate = Scene { cell: Cell { n: 95, h: 0.15 }, ionic: sim::IonicPolicy::Accepted, ..h2o(95) };
         let precise = Scene { cell: Cell { n: 141, h: 0.10 }, ..h2o(141) };
-        for (what, s) in [("GPU H₂ 49³ × 0.25", h2(49, 1.4)), ("GPU H₂ stretched 3.2 Bohr 49³ (FD partial)", h2(49, 3.2)), ("GPU Li 49³ × 0.25", li),
-                          ("GPU H₂O Accurate 95³ × 0.15, Accepted", accurate), ("GPU H₂O Precise 141³ × 0.10, all-electron", precise)] {
+        let mut worst: f64 = 0.0;
+        for (what, s) in [("GPU H₂O Accurate 95³ × 0.15, Accepted", accurate), ("GPU H₂O Precise 141³ × 0.10, all-electron", precise)] {
             let r = GpuKs::new(ctx.clone(), 1e-6).evaluate(&s, &mut never()).unwrap_or_else(|e| panic!("{what}: {e}"));
-            worst = worst.max(check(what, &r));
+            worst = worst.max(electron_miss(what, &r));
         }
         println!("worst relative miss {worst:.2e} (tolerance {:.0e})", sim::ELECTRON_COUNT_REL_TOL);
     }

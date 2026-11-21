@@ -428,7 +428,7 @@ impl Auditor {
                                 })
                                 // an answer that is physically empty is no audit, no part answer, no density (the
                                 // gpu-fault fix: `sim::answer_refusal`)
-                                .and_then(|r| match sim::answer_refusal(&r) {
+                                .and_then(|r| match sim::scf_refusal(&r.stats) {
                                     Some(why) => {
                                         refused = Some(why.clone());
                                         Err(ProviderError::Invalid(format!("the background teacher's answer was refused ({why})")))

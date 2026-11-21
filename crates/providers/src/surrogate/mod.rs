@@ -2664,8 +2664,9 @@ impl SurrogateKs {
             }
         };
         // the gpu-fault fix (module doc, "A failed GPU"): a physically empty answer — not converged, no iteration, a
-        // density without the scene's electrons, a non-finite number — is neither kept nor used for the step
-        if let Some(why) = sim::answer_refusal(&r) {
+        // density without the scene's electrons — is neither kept nor used for the step (a non-finite one keeps its own
+        // handling: the store never keeps it, and as an audit it fails: activity Task 3b)
+        if let Some(why) = sim::scf_refusal(&r.stats) {
             self.count_refused_answer(&why);
             let mut ev = TeachEvent::new(origin_of(h.audit, h.reason.rule), h.reason.rule, TeachOutcome::Failed);
             ev.atom = h.reason.atom;

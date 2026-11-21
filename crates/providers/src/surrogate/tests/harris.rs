@@ -234,7 +234,9 @@ fn a_polled_harris_payload_is_in_flight_until_taken() {
     assert!(!Trainable::side_job_in_flight(&s), "taken");
 }
 
-/// A gated auditor teacher whose thread dies (it panics) once the gate opens.
+/// A gated auditor teacher whose thread dies once the gate opens: its job then fails, and the next job's preparation
+/// (`discontinuity`, outside the job) panics. (A panic *inside* a job no longer ends the thread: the auditor catches it
+/// and answers the job with an error — the gpu-fault fix.)
 struct Dies {
     open: Arc<AtomicBool>,
 }
@@ -247,12 +249,17 @@ impl ForceProvider for Dies {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        panic!("the test's auditor teacher dies (expected)");
+        Err(ProviderError::Invalid("the test's auditor teacher is dying".into()))
     }
     fn name(&self) -> &'static str {
         "morse dimer"
     }
     fn reset(&mut self) {}
+    fn discontinuity(&mut self) {
+        if self.open.load(SeqCst) {
+            panic!("the test's auditor teacher dies (expected)");
+        }
+    }
 }
 
 /// Review fix round 1, minor 4: when the auditor's thread is gone, the queued Harris job (and the

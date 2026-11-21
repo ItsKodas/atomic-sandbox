@@ -685,7 +685,7 @@ pub struct ScfCheck {
 /// and the partials are finished in f64. The worst-case relative error of one such sum is (m + 8)·u with
 /// u = 2⁻²⁴ ≈ 5.96e-8, i.e. 2.3e-6 at the largest grid (201³, m = 31); a normalisation error and the ∫ρ sum's own
 /// add, so |∫ρ − N|/N ≤ 4.7e-6 at 201³ in the worst case. 1e-5 is that bound with a factor ≈ 2 to spare.
-/// **Measured** (`providers::ks` test `real_answers_hold_their_electrons`, 2026-11-21, RX 7900 XTX): the worst
+/// **Measured** (`providers::ks` tests `real_answers_hold_their_electrons` and the `#[ignore]`d `…_at_the_large_grids`, 2026-11-21, RX 7900 XTX): the worst
 /// relative miss over H₂ 49³, stretched H₂ (Fermi–Dirac partial levels), Li 49³, H₂O Accurate 95³ under `Accepted`
 /// and H₂O Precise 141³ all-electron is 8.7e-8 (≈ 1.5 u; the CPU's 0) — the tolerance is ≈ 115× that. What the check
 /// is for misses by O(1): a density a failed device left empty integrates to 0, one half written to a fraction of N.
@@ -700,8 +700,16 @@ pub fn answer_refusal(r: &ForceResult) -> Option<String> {
     if !r.energy.is_finite() || r.forces.iter().flatten().any(|x| !x.is_finite()) {
         return Some("a non-finite energy or force".into());
     }
-    let c = r.stats.scf_check?;
-    if r.stats.scf_steps == 0 {
+    scf_refusal(&r.stats)
+}
+
+/// The Kohn-Sham part of [`answer_refusal`] alone: an SCF that ran no iteration or did not converge, or a density whose
+/// electrons miss the scene's — `None` for an answer without [`EvalStats::scf_check`]. The surrogate's in-step and
+/// background audits use it where a non-finite answer already has its own handling (never kept by the store's check, and
+/// a NaN gap fails the audit: activity Task 3b).
+pub fn scf_refusal(stats: &EvalStats) -> Option<String> {
+    let c = stats.scf_check?;
+    if stats.scf_steps == 0 {
         return Some("the SCF ran no iteration".into());
     }
     if !c.converged {
