@@ -6512,3 +6512,18 @@ A trust recovery's quarantine trials (each round of both rankings, on the standi
 The confirmation repeats the standing trial's cold search (6 rounds in the recovery, the same 6 main's last trial took), so a recovery saves the warm rounds of the quarantine trials that do not stand and pays the warm rounds of the one that does on top of its cold search. Where a single quarantine round stands (append-20) that is a net cost — here 2 rounds, ≈ 0.5 s; the golden compare after fix round 1, and again after fix round 2 (the rounds' stop test confirmed cold), is 0 differences of any kind in all three cases, with the same rounds per fit (on this collection every round that passed warm passed cold).
 
 **Wall** (the whole case: attach, cold refit and recovery; measured before fix round 1, not re-measured — the machine was not quiet): main 91.3 / 64.4 s, this branch 42.5 / 61.1 s, alternated back to back under other agents' CPU and GPU jobs (main's first record run took 218.7 s under heavier load) — too noisy to quote a ratio. At the quiet refit-speed-up measurement's per-round cost (one spectrum ≈ 0.145 s and one `solve_large` ≈ 0.091 s at Q′ 2 460: 10.0 s / 69 and 7.29 s / 80, "Refit speed-up" above) the 16 rounds saved are ≈ 4 s of the recovery's 31.3 s, ≈ 12 % — below the spec's 20–40 % estimate, which assumed the warm trials would converge in one or two rounds; on this collection a quarantine round moves the noise levels enough that a trial still takes 2–5.
+
+## Electron-count check (2026-11-21; the gpu-fault fix, `sim::ELECTRON_COUNT_REL_TOL`; `providers` `ks::tests::real_answers_hold_their_electrons` and `real_answers_hold_their_electrons_at_the_large_grids` (the H₂O rows; `#[ignore]`d, ≈ 6 GB: run alone), release, RX 7900 XTX, tol 1e-6, Fermi–Dirac kT 5 mHa, another agent's builds running)
+
+`sim::answer_refusal` refuses a Kohn-Sham answer whose density's ∫ρ misses the scene's electron count N by more than 1e-5 × max(N, 1). The bound: the GPU's ∫ρ and its orbitals' normalisation are `qm_gpu::reduce` sums (1 024 × 256 threads, each adding m = ⌈n³/262 144⌉ points serially in f32, a 256-wide tree, an f64 finish): worst case (m + 8)·2⁻²⁴ per sum, 2.3e-6 at 201³, so |∫ρ − N|/N ≤ 4.7e-6 there; 1e-5 is that with a factor ≈ 2 to spare. Measured (`ScfStats::electrons`, the final step's ∫ρ_out):
+
+| answer | ∫ρ | N | relative miss |
+|---|---|---|---|
+| CPU H₂ 33³ × 0.25 | 2.000000000 | 2 | 0 |
+| GPU H₂ 49³ × 0.25 | 1.999999827 | 2 | −8.65e-8 |
+| GPU H₂ at 3.2 Bohr, 49³ (partial levels) | 1.999999848 | 2 | −7.60e-8 |
+| GPU Li 49³ × 0.25 | 2.999999800 | 3 | −6.68e-8 |
+| GPU H₂O Accurate 95³ × 0.15, `Accepted` | 7.999999708 | 8 | −3.65e-8 |
+| GPU H₂O Precise 141³ × 0.10, all-electron | 10.000000003 | 10 | +3.11e-10 |
+
+Worst 8.65e-8 (≈ 1.5 u): the tolerance is ≈ 115× it. Also `qm-gpu` `h2_matches_cpu_at_fixed_sigma`: H₂ 33³ per spin −8.12e-8, −1.98e-8 (CPU 0, 2e-16). An answer a failed device leaves misses by O(1) (an empty density: ∫ρ = 0).

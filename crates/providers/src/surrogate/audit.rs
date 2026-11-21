@@ -300,7 +300,7 @@ pub(super) struct AuditAnswer {
     /// The auditor's device failed (`ForceProvider::device_failure` after the job, or a `GpuFailed` error): the
     /// surrogate latches it (module doc, "A failed GPU"). `None` otherwise.
     pub(super) gpu_failed: Option<String>,
-    /// The teacher answered, and `sim::answer_refusal` refused the answer (the reason; `result` is then that `Err`):
+    /// The teacher answered, and `sim::scf_refusal` refused the answer (the reason; `result` is then that `Err`):
     /// counted and logged, never judged or kept.
     pub(super) refused: Option<String>,
 }

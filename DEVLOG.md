@@ -1297,6 +1297,15 @@ review: 0 Critical, 0 Important, 8 Minor, all fixed. The app gate passes 795 tes
 - **Reviews:** physics review, then two re-review rounds. The composition key replaced a growing support whose bits depended on call order.
 - **Gates:** surrogate 161, providers 461, sim 180, validate surrogate 7/0.
 
+### A failed GPU stops the run instead of looping (2026-11-21, branch gpu-fault)
+
+- **Found by:** a user on v0.2.0 with an 8 GB card, Estimated mode near the VRAM limit: "a super fast loop where it takes hundreds of samples that seemingly contain no data and will completely break the model".
+- **Root cause:** a GPU failure was not a state anywhere. wgpu's default handler panics on whichever thread hits an out-of-memory, and a lost device makes every later solve fail; measured on a destroyed device, every `GpuKs` evaluation (warm or fresh, or one whose device went mid-solve) panicked within 0.1–11 ms. Nothing recorded it, and the sampling pass (hot burst included), the audit cadence and the auditor thread each treated a failed solve as one geometry's event and took the next job at once. Between a teacher answer and the store there was only a finiteness check. Not reproduced on the real 8 GB machine (by instruction); fault injection instead.
+- **Fix:** the device records its own failure (`gpu::GpuHealth`: an uncaptured-error handler and a device-lost callback, no panic). `GpuKs` refuses every solve once it is set (`SolverError::GpuFailed`, never retried, nothing from the failed solve returned), the surrogate latches it from any teacher, and the driver pauses with "The GPU ran out of memory (or its driver reset) during a solve. Nothing from that solve was kept. Save your work and restart the app…", ending any pass. Separately, no teacher answer becomes a sample or a reference unless it ran an SCF iteration, converged, and its density holds the scene's electrons to 1e-5 (derived from the GPU's f32 sums; measured worst 8.7e-8).
+- **Tests:** RED before the fix: a pass on a failing teacher ran through every job; 18 empty pass answers were kept; play went on keeping empty answers; an auditor's failure never reached the surrogate.
+- **An unintended real out-of-memory:** the first full providers run included a 141³ all-electron measurement (≈ 6 GB) beside the suite's parallel GPU tests; 7 test devices ran out of memory for real, and the new handler turned each into `GpuFailed` instead of a panic. The measurement is now `#[ignore]`d (run alone). Later runs shared the card with the user's own app at ≈ 87 % GPU use, which stretched the gates' times.
+- **Gates:** gpu 15, units/qm/sim/surrogate 633, qm-gpu 146, sim 185, providers 666 (29 ignored), app 842 + the drag-flood tripwire alone (it missed its 10 steps in 3 s while the user's app held the GPU: 7 steps at 430 ms; alone 33 steps), validate surrogate 12/0, gpu_vs_cpu 12/0.
+
 ### Process wins
 
 - An input-replay harness (M6 Task 8) that found a real app bug on its first scripts: a running relax

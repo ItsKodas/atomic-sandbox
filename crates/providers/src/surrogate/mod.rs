@@ -466,7 +466,8 @@
 //!   scan, burst step, teach-around solve or reference (`crate::sampling`, `sim::references`), a migrated sample —
 //!   `sim::answer_refusal` checks it: finite, and for a Kohn-Sham answer at least one SCF iteration, converged, and
 //!   ∫ρ within `sim::ELECTRON_COUNT_REL_TOL` (1e-5 relative; derived from the GPU's f32 sums, measured 8.7e-8) of the
-//!   scene's electrons. A refused answer is counted ([`SurrogateKs::refused_answers`]), leaves a `Failed` activity
+//!   scene's electrons. The fallback, the in-step audit and the auditor apply its Kohn-Sham part (`sim::scf_refusal`):
+//!   a non-finite answer keeps its pinned handling there (the store never keeps it; a NaN gap fails the audit). A refused answer is counted ([`SurrogateKs::refused_answers`]), leaves a `Failed` activity
 //!   event with the reason, and is never kept; a refused fallback is not used for the step either (the step fails, the
 //!   driver pauses with the reason).
 //!
