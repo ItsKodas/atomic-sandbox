@@ -9,9 +9,13 @@
 //! panel's folds (`model_sections = teach,health`) and of the Activity panel's
 //! (`activity_sections = trust,training`) and of the Orbitals panel's (`orbital_sections = spin`) and the Knowledge panel's (`knowledge_sections = why,triples`) and the Readouts panel's (`readouts_sections = work,breakdown,compare`) and the Selection panel's (`selection_sections = details,molecules,charges`), the units, the Version
 //! panel's channel and Check automatically (`update_channel = Stable`, `update_auto_check = true`;
-//! installer Task 4) — as a small
-//! text file of `key = value` lines. Display state only: nothing here is an `Action`
-//! or reaches the worker, so a profile never changes the physics or a recording.
+//! installer Task 4), and this machine's GPU memory share (`gpu_memory = 60`, %, Scene ▸ Quality ▸
+//! GPU memory, design 2026-11-21) — as a small text file of `key = value` lines. Display state
+//! only, except `gpu_memory`: nothing else here is an `Action` or reaches the worker. That one is
+//! a machine setting, not physics — the solvers' memory budget (the witness levels it leaves, a
+//! scene refused over it) — and a loaded profile's value is put in force as `Action::GpuMemory`
+//! (`UiState::gpu_memory_pending`), so a recording sees it; at launch `main` sets it before the
+//! first worker starts.
 //!
 //! The window keeps the state in force in `%LOCALAPPDATA%\atomic-sandbox\current.profile`
 //! (written a moment after each change, read at launch: the app opens as it was left); named
@@ -93,6 +97,8 @@ pub fn capture(st: &UiState) -> String {
     // the Version panel's display settings (installer Task 4)
     out += &format!("update_channel = {:?}\n", st.update.channel);
     out += &format!("update_auto_check = {}\n", st.update.auto_check);
+    // Scene ▸ Quality ▸ GPU memory (design 2026-11-21): this machine's share of its card, %
+    out += &format!("gpu_memory = {}\n", st.gpu_memory_pct);
     out
 }
 
@@ -146,6 +152,15 @@ pub fn apply(st: &mut UiState, text: &str) {
     }
     if let Some(v) = kv.get("update_auto_check").and_then(|v| v.parse().ok()) {
         st.update.auto_check = v;
+    }
+    // the GPU memory share (added 2026-11-21; absent: unchanged), clamped to the slider's range; put
+    // in force by the viewer as `Action::GpuMemory` (`UiState::gpu_memory_pending`), at launch by
+    // `main` before the first worker
+    if let Some(v) = kv.get("gpu_memory").and_then(|v| v.trim_end_matches('%').trim().parse::<f64>().ok()) {
+        let pct = crate::quality::clamp_share(v);
+        st.gpu_memory_pct = pct;
+        st.gpu_memory_slider = pct;
+        st.gpu_memory_pending = Some(pct);
     }
     // the View panel's open sections (docking Task 4); a profile from before it opens the default two
     st.view_sections = kv.get("view_sections").map_or_else(Default::default, |v| super::dock::view::Sections::parse(v));

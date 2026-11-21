@@ -3129,6 +3129,8 @@ fn superscripts_are_drawn_raised() {
 #[test]
 fn a_change_over_the_vram_budget_is_refused() {
     use crate::quality::{gpu_solvers, vram_check, VramBudget, VRAM_BUDGET_GB};
+    // its expectation reads the process-wide budget: not while a test moves it
+    let _budget = crate::quality::budget_test_lock();
     let budget = VramBudget::fixed((VRAM_BUDGET_GB * 1e9) as u64);
     let cam = camera();
     let mut big = Scene::preset("empty").unwrap();
@@ -3193,6 +3195,95 @@ fn a_change_over_the_vram_budget_is_refused() {
     let on_card = crate::quality::estimated_box(&w8, 14.0, 0.08, &[], fits(card));
     eprintln!("estimated box: 12 GB default {:?}, 12.88 GB card {:?}", default, on_card);
     assert_eq!((on_card.want_n, on_card.n, on_card.capped), (201, 179, true), "under this card's 12.88 GB");
+}
+
+// ---- Scene ▸ Quality ▸ GPU memory (design 2026-11-21) ----
+
+/// The action keeps the share (clamped to 25–90 %) in the panel and hands it to the viewer, which
+/// puts it in force and rebuilds the solvers (`Viewer::act_on`); nothing goes to the worker from
+/// the panel itself, and it is a script line both ways.
+#[test]
+fn the_gpu_memory_action_clamps_and_hands_the_share_to_the_viewer() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let mut st = UiState::new("h2", &scene);
+    assert_eq!((st.gpu_memory_pct, st.gpu_memory_slider, st.gpu_memory_pending), (50, 50, None), "the default share");
+    for (asked, kept) in [(60, 60), (10, 25), (25, 25), (90, 90), (95, 90)] {
+        let out = act(&mut st, &inp, Action::GpuMemory(asked));
+        assert_eq!(out.gpu_memory, Some(kept), "{asked} %");
+        assert_eq!((st.gpu_memory_pct, st.gpu_memory_slider), (kept, kept), "{asked} %");
+        assert!(out.commands.is_empty() && out.error.is_none(), "{:?} {:?}", out.commands, out.error);
+    }
+    assert_eq!(Action::GpuMemory(60).describe().as_deref(), Some("gpu-memory 60"));
+    assert_eq!(Action::parse(&["gpu-memory", "75"]).unwrap(), Action::GpuMemory(75));
+    assert_eq!(Action::parse(&["gpu-memory", "75%"]).unwrap(), Action::GpuMemory(75));
+    assert!(Action::parse(&["gpu-memory"]).unwrap_err().contains("1 argument"));
+    assert!(search::ENTRIES.iter().any(|e| e.anchor == "m-gpu-memory" && e.also.contains("gpu memory")), "a Ctrl K entry");
+}
+
+/// The share is kept in the profile as `gpu_memory` (a new key: `PROFILE_FORMAT` stays 1); a loaded
+/// one is clamped and left pending for the viewer to put in force; a profile without the key (from
+/// before it) leaves the share as it is; Reset's defaults say 50 %.
+#[test]
+fn the_gpu_memory_share_is_kept_in_the_profile() {
+    let scene = Scene::preset("h2").unwrap();
+    let mut st = UiState::new("h2", &scene);
+    assert!(profile::capture(&st).contains("\ngpu_memory = 50\n"));
+    assert!(profile::defaults(&st).contains("\ngpu_memory = 50\n"));
+    st.gpu_memory_pct = 70;
+    let text = profile::capture(&st);
+    assert!(text.contains("\ngpu_memory = 70\n"), "{text}");
+    let mut back = UiState::new("h2", &scene);
+    profile::apply(&mut back, &text);
+    assert_eq!((back.gpu_memory_pct, back.gpu_memory_slider, back.gpu_memory_pending), (70, 70, Some(70)));
+    let old: String = text.lines().filter(|l| !l.starts_with("gpu_memory")).map(|l| format!("{l}\n")).collect();
+    let mut kept = UiState::new("h2", &scene);
+    kept.gpu_memory_pct = 60;
+    profile::apply(&mut kept, &old);
+    assert_eq!((kept.gpu_memory_pct, kept.gpu_memory_pending), (60, None), "an old profile: unchanged");
+    profile::apply(&mut kept, "gpu_memory = 200\n");
+    assert_eq!((kept.gpu_memory_pct, kept.gpu_memory_pending), (90, Some(90)), "clamped");
+    profile::apply(&mut kept, "gpu_memory = lots\n");
+    assert_eq!(kept.gpu_memory_pct, 90, "unreadable: unchanged");
+    assert_eq!(profile::PROFILE_FORMAT, 1, "a new key alone does not bump the format");
+}
+
+/// Scene ▸ Quality ▸ GPU memory on screen: the slider under the levels with the budget it gives
+/// (here the estimated solver's split on an 8.4 GB card), the warning above 70 %, and a drag past
+/// its end sends the share clamped to 90 %. Without a reported card it is disabled and says why.
+#[test]
+fn the_gpu_memory_slider_shows_the_split_and_clamps_to_its_range() {
+    // the line reads the process-wide card: a test card, put back after
+    let _gpu = crate::sim::tests::gpu_lock();
+    let mut budget = crate::quality::budget_test_lock();
+    if crate::quality::env_budget_gb().is_some() {
+        return;
+    }
+    budget.set_card(8_400_000_000);
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    (st.backend, st.gpu_available) = (Backend::Estimated, true);
+    st.gpu_memory_slider = 80;
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Scene));
+    let texts: Vec<String> = (0..3).map(|i| frame_texts_sized(&ctx, &mut st, &inp, egui::vec2(1400.0, 1400.0), vec![], i as f64)).last().unwrap().into_iter().map(|(t, _)| t).collect();
+    assert!(texts.iter().any(|t| t == "GPU memory"), "{texts:?}");
+    assert!(texts.iter().any(|t| t == "GPU memory: 80 % of this GPU's 8.4 GB = 6.7 GB (teacher 3.4 GB + auditor 3.4 GB)"), "{texts:?}");
+    assert!(texts.iter().any(|t| t.starts_with("above 70 %: the screen, the driver and other applications share this card")), "{texts:?}");
+    st.gpu_memory_slider = 60;
+    let outs = press_widget(&ctx, &mut st, &inp, "gpu-memory", 2000.0);
+    let sent: Vec<u32> = outs.iter().flat_map(|o| &o.actions).filter_map(|a| if let Action::GpuMemory(p) = a { Some(*p) } else { None }).collect();
+    assert_eq!(sent.last(), Some(&90), "dragged past the end: the range's top, {sent:?}");
+    assert!(outs.iter().any(|o| o.gpu_memory == Some(90)));
+    // no reported card: disabled, the reason said
+    budget.set_card(0);
+    let texts: Vec<String> = frame_texts_sized(&ctx, &mut st, &inp, egui::vec2(1400.0, 1400.0), vec![], 10.0).into_iter().map(|(t, _)| t).collect();
+    assert!(texts.iter().any(|t| t.starts_with("this GPU did not report its memory, so the 12 GB default applies")), "{texts:?}");
+    egui::Popup::close_all(&ctx);
 }
 
 // ---- temperature units (user request 2026-10-14: K / °C / °F, display only) ----

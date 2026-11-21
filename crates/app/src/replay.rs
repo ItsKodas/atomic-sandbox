@@ -50,7 +50,9 @@
 //! lines near its start: `action ionic none` (the ionic policy, M7 — the app itself starts its presets under
 //! `cores`), `action quality <level>` and `action walls <on|off> <half-width>`; `replays_pass` refuses a script
 //! without them, `--record` writes the start's policy, quality and walls, so a change of the app's defaults never
-//! moves a replay.
+//! moves a replay. A GPU memory share other than the default 50 % (Scene ▸ Quality ▸ GPU memory, the profile's
+//! `gpu_memory`) is recorded first as `action gpu-memory <pct>`: it is a machine setting, not physics, but it decides
+//! which scenes the GPU solvers accept. A script without the line runs at 50 %.
 //!
 //! **Actions a script cannot carry.** Apply grid, save / load scene or model, Sample, the offered
 //! pass and "sample after refusal" mean panel state a script does not hold (the pending grid

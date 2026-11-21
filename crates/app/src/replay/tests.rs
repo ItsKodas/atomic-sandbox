@@ -214,6 +214,7 @@ fn actions_parse_and_describe_symmetrically() {
         Action::IncludeAllOccupied,
         Action::ColourBlend { additive: false },
         Action::ColourScale { physical: true },
+        Action::GpuMemory(60),
     ];
     for a in all {
         let text = a.describe().unwrap_or_else(|| panic!("{a:?} has no script form"));

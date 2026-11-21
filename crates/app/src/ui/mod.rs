@@ -566,6 +566,16 @@ pub struct UiState {
     /// The Custom slider's value while it is dragged: sent as `Action::Quality` on release, and
     /// set back to [`quality_h`](Self::quality_h) when that is refused (the GPU memory guard).
     pub quality_slider: f64,
+    /// Scene ▸ Quality ▸ GPU memory: the share of the card's memory the GPU solvers' budget takes
+    /// (%, 25–90; `crate::quality::memory_share`, which the viewer sets from
+    /// `Action::GpuMemory`). Kept in the profile as `gpu_memory`.
+    pub gpu_memory_pct: u32,
+    /// The GPU memory slider's value while it is dragged: sent as `Action::GpuMemory` on release.
+    pub gpu_memory_slider: u32,
+    /// A share a loaded profile asks for (`ui::profile::apply`), not yet in force: the viewer
+    /// applies it as `Action::GpuMemory` on its next frame, so a recording sees it and the solvers
+    /// are rebuilt for it.
+    pub gpu_memory_pending: Option<u32>,
     /// The box length a quality change keeps (Bohr): the preset's or the loaded file's, not the
     /// rounded-up box of the current grid (so repeated changes never let it creep).
     pub box_len: f64,
@@ -972,6 +982,9 @@ impl UiState {
             grid_h: scene.grid_h,
             quality_h: crate::quality::DEFAULT_H,
             quality_slider: crate::quality::DEFAULT_H,
+            gpu_memory_pct: crate::quality::DEFAULT_SHARE_PCT,
+            gpu_memory_slider: crate::quality::DEFAULT_SHARE_PCT,
+            gpu_memory_pending: None,
             box_len: crate::quality::box_len(scene),
             last_solve: None,
             cloud_profiles: Vec::new(),
@@ -1395,6 +1408,10 @@ pub struct PanelOutput {
     /// Restart now went past its guard (`version::restart`): the viewer saves the session, hands
     /// the verified installer off and closes the app (`Viewer::restart_for_update`).
     pub restart_for_update: bool,
+    /// Scene ▸ Quality ▸ GPU memory changed to this share (%): the viewer sets the process-wide
+    /// budget (`crate::quality::set_memory_share`) and, when the budget of a running GPU solver
+    /// changed, rebuilds the solvers as a backend switch does (`Viewer::act_on`).
+    pub gpu_memory: Option<u32>,
 }
 
 /// An interrupted sampling pass kept on disk (`crate::sim::interrupted_pass`; user report

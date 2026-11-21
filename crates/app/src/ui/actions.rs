@@ -72,6 +72,11 @@ pub enum Action {
     /// Scene ▸ Quality: a level's or the Custom slider's h (snapped; the box is kept, σ follows h
     /// unless set — `crate::quality`).
     Quality(f64),
+    /// Scene ▸ Quality ▸ GPU memory (design 2026-11-21): the share of the card's memory (%,
+    /// clamped to 25–90) the GPU solvers' budget takes. The viewer sets the process-wide budget and
+    /// rebuilds the GPU solvers (teacher and auditor, or the GPU backend's) as a backend switch
+    /// does: the scene kept, paused, re-solved. `ATOMIC_SANDBOX_VRAM_GB` still wins.
+    GpuMemory(u32),
     /// Write the scene to `UiState::scene_path`.
     SaveScene,
     /// Read the scene at `UiState::scene_path` (and, with `sidecar`, its `.model` sidecar in
@@ -470,6 +475,13 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
                     super::estimated_box::walls_after_grid(st, input.scene, &s, out);
                 }
             }
+        }
+        Action::GpuMemory(pct) => {
+            // the viewer moves the process-wide budget and rebuilds the solvers (`Viewer::act_on`)
+            let pct = crate::quality::clamp_share(pct as f64);
+            st.gpu_memory_pct = pct;
+            st.gpu_memory_slider = pct;
+            out.gpu_memory = Some(pct);
         }
         Action::Thermostat { on, t, tau } => {
             let toggled = on != st.thermostat_on;
@@ -1291,6 +1303,7 @@ impl Action {
                 if l.hide_core { "valence" } else { "all" }
             ),
             Quality(h) => format!("quality {h}"),
+            GpuMemory(p) => format!("gpu-memory {p}"),
             TempUnits(u) => format!(
                 "temp-units {}",
                 match u {
@@ -1489,6 +1502,11 @@ impl Action {
                     Some(h) => h,
                     None => num(head, args[0])?,
                 })
+            }
+            "gpu-memory" => {
+                // the share of the card's memory, % (clamped to 25–90 when applied)
+                want(1)?;
+                GpuMemory(num(head, args[0].trim_end_matches('%'))?)
             }
             "colour-preset" => {
                 want(1)?;
