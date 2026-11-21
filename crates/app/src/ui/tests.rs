@@ -3129,6 +3129,8 @@ fn superscripts_are_drawn_raised() {
 #[test]
 fn a_change_over_the_vram_budget_is_refused() {
     use crate::quality::{gpu_solvers, vram_check, VramBudget, VRAM_BUDGET_GB};
+    // its expectation reads the process-wide budget: not while a test moves it
+    let _budget = crate::quality::budget_test_lock();
     let budget = VramBudget::fixed((VRAM_BUDGET_GB * 1e9) as u64);
     let cam = camera();
     let mut big = Scene::preset("empty").unwrap();
@@ -3193,6 +3195,139 @@ fn a_change_over_the_vram_budget_is_refused() {
     let on_card = crate::quality::estimated_box(&w8, 14.0, 0.08, &[], fits(card));
     eprintln!("estimated box: 12 GB default {:?}, 12.88 GB card {:?}", default, on_card);
     assert_eq!((on_card.want_n, on_card.n, on_card.capped), (201, 179, true), "under this card's 12.88 GB");
+}
+
+// ---- Scene ▸ Quality ▸ GPU memory (design 2026-11-21) ----
+
+/// The action keeps the share (clamped to 25–90 %) in the panel and hands it to the viewer, which
+/// puts it in force and rebuilds the solvers (`Viewer::act_on`); nothing goes to the worker from
+/// the panel itself, and it is a script line both ways.
+#[test]
+fn the_gpu_memory_action_clamps_and_hands_the_share_to_the_viewer() {
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let mut st = UiState::new("h2", &scene);
+    assert_eq!((st.gpu_memory_pct, st.gpu_memory_slider, st.gpu_memory_pending), (50, 50, None), "the default share");
+    for (asked, kept) in [(60, 60), (10, 25), (25, 25), (90, 90), (95, 90)] {
+        let out = act(&mut st, &inp, Action::GpuMemory(asked));
+        assert_eq!(out.gpu_memory, Some(kept), "{asked} %");
+        assert_eq!((st.gpu_memory_pct, st.gpu_memory_slider), (kept, kept), "{asked} %");
+        assert!(out.commands.is_empty() && out.error.is_none(), "{:?} {:?}", out.commands, out.error);
+    }
+    assert_eq!(Action::GpuMemory(60).describe().as_deref(), Some("gpu-memory 60"));
+    assert_eq!(Action::parse(&["gpu-memory", "75"]).unwrap(), Action::GpuMemory(75));
+    assert_eq!(Action::parse(&["gpu-memory", "75%"]).unwrap(), Action::GpuMemory(75));
+    assert!(Action::parse(&["gpu-memory"]).unwrap_err().contains("1 argument"));
+    assert!(search::ENTRIES.iter().any(|e| e.anchor == "m-gpu-memory" && e.also.contains("gpu memory")), "a Ctrl K entry");
+}
+
+/// The share is this computer's (user report 2026-11-21: it reset between runs): kept in
+/// `machine.settings`, never in a profile — a named profile's Load, Reset, or an older build's
+/// rewrite of `current.profile` leaves it alone. A share read there is clamped and left pending
+/// for `main` / the viewer to put in force.
+#[test]
+fn the_gpu_memory_share_is_a_machine_setting_not_a_profile_key() {
+    let scene = Scene::preset("h2").unwrap();
+    let mut st = UiState::new("h2", &scene);
+    st.gpu_memory_pct = 70;
+    assert!(!profile::capture(&st).contains("gpu_memory"), "not in a profile");
+    assert!(!profile::defaults(&st).contains("gpu_memory"), "not in Reset's defaults");
+    let text = profile::machine_text(&st);
+    assert!(text.contains("\ngpu_memory = 70\n"), "{text}");
+    let mut back = UiState::new("h2", &scene);
+    assert!(profile::apply_machine(&mut back, &text));
+    assert_eq!((back.gpu_memory_pct, back.gpu_memory_slider, back.gpu_memory_pending), (70, 70, Some(70)));
+    // a profile (named, Reset's, or 0.2.1-beta.1's with the key) never moves it
+    let mut kept = UiState::new("h2", &scene);
+    kept.gpu_memory_pct = 60;
+    profile::apply(&mut kept, "gpu_memory = 50\n");
+    let defaults = profile::defaults(&kept);
+    profile::apply(&mut kept, &defaults);
+    assert_eq!((kept.gpu_memory_pct, kept.gpu_memory_pending), (60, None), "a profile leaves it");
+    assert!(profile::apply_machine(&mut kept, "gpu_memory = 200\n"));
+    assert_eq!((kept.gpu_memory_pct, kept.gpu_memory_pending), (90, Some(90)), "clamped");
+    assert!(!profile::apply_machine(&mut kept, "gpu_memory = lots\n"));
+    assert_eq!(kept.gpu_memory_pct, 90, "unreadable: unchanged");
+    assert_eq!(profile::PROFILE_FORMAT, 1, "a key dropped from the profile does not bump the format");
+}
+
+/// The launch path, on files: the share saved in `machine.settings` comes back at the next start,
+/// whatever an older build left in `current.profile`; a 0.2.1-beta.1 profile's `gpu_memory` is
+/// taken once, when there is no `machine.settings` yet, and moved there at the next save.
+#[test]
+fn the_gpu_memory_share_survives_a_restart_and_an_older_builds_profile() {
+    let scene = Scene::preset("h2").unwrap();
+    let dir = std::env::temp_dir().join(format!("atomic-ui-machine-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let launch = || {
+        let mut st = UiState::new("h2", &scene);
+        st.profiles.current_file = Some(dir.join("current.profile"));
+        st.profiles.machine_file = Some(dir.join("machine.settings"));
+        profile::load_current(&mut st);
+        st
+    };
+    // 0.2.1-beta.1's profile, no machine.settings: its share is taken, and written there on save
+    let beta1 = format!("{}gpu_memory = 80\n", profile::capture(&UiState::new("h2", &scene)));
+    std::fs::write(dir.join("current.profile"), &beta1).unwrap();
+    let mut st = launch();
+    assert_eq!((st.gpu_memory_pct, st.gpu_memory_slider, st.gpu_memory_pending), (80, 80, Some(80)), "moved from 0.2.1-beta.1");
+    profile::flush(&mut st);
+    assert!(std::fs::read_to_string(dir.join("machine.settings")).unwrap().contains("\ngpu_memory = 80\n"));
+    // the slider moved to 70: saved, and back after a restart
+    let inp_scene = scene.clone();
+    let cam = camera();
+    let inp = input(&inp_scene, None, &cam);
+    act(&mut st, &inp, Action::GpuMemory(70));
+    profile::flush(&mut st);
+    assert_eq!(launch().gpu_memory_pct, 70, "a restart keeps it");
+    // an older build (or 0.2.1-beta.1) rewrites current.profile, with or without the key: no matter
+    std::fs::write(dir.join("current.profile"), profile::capture(&UiState::new("h2", &scene))).unwrap();
+    assert_eq!(launch().gpu_memory_pct, 70, "an older build's profile");
+    std::fs::write(dir.join("current.profile"), &beta1).unwrap();
+    assert_eq!(launch().gpu_memory_pct, 70, "0.2.1-beta.1's profile, once machine.settings exists");
+    // nothing saved at all: the default, and nothing pending
+    let _ = std::fs::remove_dir_all(&dir);
+    let fresh = launch();
+    assert_eq!((fresh.gpu_memory_pct, fresh.gpu_memory_pending), (50, None), "a first start");
+}
+
+/// Scene ▸ Quality ▸ GPU memory on screen: the slider under the levels with the budget it gives
+/// (here the estimated solver's split on an 8.4 GB card), the warning above 70 %, and a drag past
+/// its end sends the share clamped to 90 %. Without a reported card it is disabled and says why.
+#[test]
+fn the_gpu_memory_slider_shows_the_split_and_clamps_to_its_range() {
+    // the line reads the process-wide card: a test card, put back after
+    let _gpu = crate::sim::tests::gpu_lock();
+    let mut budget = crate::quality::budget_test_lock();
+    if crate::quality::env_budget_gb().is_some() {
+        return;
+    }
+    budget.set_card(8_400_000_000);
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let inp = input(&scene, None, &cam);
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let mut st = UiState::new("h2", &scene);
+    (st.backend, st.gpu_available) = (Backend::Estimated, true);
+    st.gpu_memory_slider = 80;
+    egui::Popup::open_id(&ctx, menus::popup_id(menus::MenuId::Scene));
+    let texts: Vec<String> = (0..3).map(|i| frame_texts_sized(&ctx, &mut st, &inp, egui::vec2(1400.0, 1400.0), vec![], i as f64)).last().unwrap().into_iter().map(|(t, _)| t).collect();
+    assert!(texts.iter().any(|t| t == "GPU memory"), "{texts:?}");
+    assert!(texts.iter().any(|t| t == "GPU memory: 80 % of this GPU's 8.4 GB = 6.7 GB (teacher 3.4 GB + auditor 3.4 GB)"), "{texts:?}");
+    assert!(texts.iter().any(|t| t.starts_with("above 70 %: the screen, the driver and other applications share this card")), "{texts:?}");
+    st.gpu_memory_slider = 60;
+    let outs = press_widget(&ctx, &mut st, &inp, "gpu-memory", 2000.0);
+    let sent: Vec<u32> = outs.iter().flat_map(|o| &o.actions).filter_map(|a| if let Action::GpuMemory(p) = a { Some(*p) } else { None }).collect();
+    assert_eq!(sent.last(), Some(&90), "dragged past the end: the range's top, {sent:?}");
+    assert!(outs.iter().any(|o| o.gpu_memory == Some(90)));
+    // no reported card: disabled, the reason said
+    budget.set_card(0);
+    let texts: Vec<String> = frame_texts_sized(&ctx, &mut st, &inp, egui::vec2(1400.0, 1400.0), vec![], 10.0).into_iter().map(|(t, _)| t).collect();
+    assert!(texts.iter().any(|t| t.starts_with("this GPU did not report its memory, so the 12 GB default applies")), "{texts:?}");
+    egui::Popup::close_all(&ctx);
 }
 
 // ---- temperature units (user request 2026-10-14: K / °C / °F, display only) ----

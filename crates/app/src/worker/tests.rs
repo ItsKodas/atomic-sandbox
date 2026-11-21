@@ -4584,3 +4584,18 @@ fn legacy_tag_model_refused_with_reason() {
     assert!(!sim::Trainable::fitted(&s) && s.store().is_none(), "nothing loaded");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Scene ▸ Quality ▸ GPU memory (design 2026-11-21) as the worker's solvers get it: the GPU
+/// backend's one takes the whole budget, the estimated solver's teacher and auditor half each,
+/// and each note names the share it came from (the 8.4 GB card that refused at step 2 in v0.2.0,
+/// at 60 %); the variable's budget says so instead.
+#[test]
+fn the_solvers_get_the_budget_of_the_share() {
+    let b = crate::quality::budget_from(None, 8_400_000_000, 60);
+    let why = "60 % of this GPU's 8.4 GB, set in Scene ▸ Quality; ATOMIC_SANDBOX_VRAM_GB overrides it";
+    assert_eq!(solver_budget(b, 1), (5_040_000_000, why.to_string()));
+    assert_eq!(solver_budget(b, 2), (2_520_000_000, format!("the teacher's half of the 5.0 GB budget: {why}")));
+    assert_eq!(auditor_budget(b), (2_520_000_000, format!("the auditor's half of the 5.0 GB budget: {why}")));
+    let env = crate::quality::budget_from(Some(3.0), 8_400_000_000, 60);
+    assert_eq!(solver_budget(env, 2), (1_500_000_000, "the teacher's half of the 3.0 GB budget: set by ATOMIC_SANDBOX_VRAM_GB".to_string()));
+}

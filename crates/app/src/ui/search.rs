@@ -84,6 +84,7 @@ pub const ENTRIES: &[Entry] = &[
     e("Multiplicity", "spin auto", Menu(M::Scene), "m-electrons"),
     e("σ nuclear smearing", "sigma auto = h", Menu(M::Scene), "m-electrons"),
     e("Quality (Fast / Balanced / Accurate / Precise / Custom)", "accuracy speed precision grid spacing h resolution slow fast", Menu(M::Scene), "m-quality"),
+    e("GPU memory (share of the card)", "gpu memory vram video budget card share percent out of memory witness levels ATOMIC_SANDBOX_VRAM_GB", Menu(M::Scene), "m-gpu-memory"),
     e("Grid n", "points size resolution", Menu(M::Scene), "m-grid"),
     e("Grid spacing h", "Bohr resolution", Menu(M::Scene), "m-grid"),
     e("Apply grid", "cost box", Menu(M::Scene), "m-grid"),

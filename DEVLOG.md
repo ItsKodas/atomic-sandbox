@@ -1297,6 +1297,18 @@ review: 0 Critical, 0 Important, 8 Minor, all fixed. The app gate passes 795 tes
 - **Reviews:** physics review, then two re-review rounds. The composition key replaced a growing support whose bits depended on call order.
 - **Gates:** surrogate 161, providers 461, sim 180, validate surrogate 7/0.
 
+### A GPU memory setting for smaller cards (2026-11-21, branch gpu-budget)
+
+- **Found by:** a user on an 8 GB GPU. v0.2.0 paused Estimated mode at step 2 with "no gap witness within 3 extra levels … 3 is the most the 2.1 GB budget (the teacher's half of the 4.2 GB budget: 50 % of this GPU's 8.4 GB) fits".
+- **Cause:** the budget was fixed at 50 % of the card, split between the teacher and the auditor; at the Accurate grid that left the Fermi–Dirac witness search 3 levels. The only way to change it was `ATOMIC_SANDBOX_VRAM_GB`, which users do not find.
+- **Change (spec `2026-11-21-gpu-budget-setting-design.md`):**
+  - a **GPU memory** slider in Scene ▸ Quality (25–90 %, default 50 %), with the budget it gives per solver and a warning above 70 %; Ctrl K "gpu memory";
+  - a change is `ui::Action::GpuMemory` (script word `gpu-memory`), and the viewer rebuilds the GPU solvers through the backend-switch path (scene kept, paused, re-solved; the estimated model kept through the autosave);
+  - kept in the profile (`gpu_memory`, no format bump); the environment variable still wins and locks the slider;
+  - the refusal says where the share is set, and a witness failure at the budget's cap ends with "raise GPU memory in Scene ▸ Quality, or use a coarser quality (Balanced)".
+- **No physics changed:** the budget only decides how many witness levels fit and which scenes are refused.
+- **Gates:** app 849/2 in the full run (two timing tests, 120 s and 60 s waits, failed in a 33 min run and passed alone), providers 654/0.
+
 ### A failed GPU stops the run instead of looping (2026-11-21, branch gpu-fault)
 
 - **Found by:** a user on v0.2.0 with an 8 GB card, Estimated mode near the VRAM limit: "a super fast loop where it takes hundreds of samples that seemingly contain no data and will completely break the model".

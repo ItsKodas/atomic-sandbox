@@ -617,6 +617,45 @@ fn quality_controls(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts:
             None => "costs appear after the first solve (estimated from it × (new n / n)³)".into(),
         },
     );
+    ui.add_space(4.0);
+    anchored(ui, st, "m-gpu-memory", |ui, st| gpu_memory_controls(ui, st, acts));
+}
+
+/// Scene ▸ Quality ▸ GPU memory (design 2026-11-21): the share of the card's memory the GPU
+/// solvers' budget takes, 25–90 % (`crate::quality::memory_share`); applied when let go
+/// (`Action::GpuMemory`: the solvers are rebuilt, the scene re-solved). Locked when
+/// `ATOMIC_SANDBOX_VRAM_GB` sets the budget, disabled when the card did not report its memory.
+fn gpu_memory_controls(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
+    use crate::quality::{adapter_memory, env_budget_gb, gpu_solvers, memory_line, SHARE_MAX_PCT, SHARE_MIN_PCT, SHARE_WARN_PCT};
+    let (env, card) = (env_budget_gb(), adapter_memory());
+    let usable = env.is_none() && card > 0;
+    let why_not = match env {
+        Some(gb) => format!("set by ATOMIC_SANDBOX_VRAM_GB = {gb} GB: unset the variable to choose a share here"),
+        None => "this GPU did not report its memory, so the 12 GB default applies: set ATOMIC_SANDBOX_VRAM_GB (in GB) to change it".into(),
+    };
+    ui.horizontal(|ui| {
+        ui.label("GPU memory");
+        let r = probed(
+            "gpu-memory",
+            keyed(ui, "gpu-memory", |ui| ui.add_enabled(usable, egui::Slider::new(&mut st.gpu_memory_slider, SHARE_MIN_PCT..=SHARE_MAX_PCT).suffix(" %").update_while_editing(false))),
+        )
+        .on_hover_text("the share of this GPU's memory the solvers may use (25–90 %, default 50 %): in Estimated mode the teacher and the auditor each take half of it. More lets a fine grid keep more witness levels; the rest is the screen's, the driver's and other applications'. Applied when you let go: the GPU solvers are rebuilt and the scene re-solved, paused")
+        .on_disabled_hover_text(why_not.clone());
+        // applied when let go, and whenever the slider shows a share not in force while it is not
+        // held (a release the menu missed, a typed value): the saved share is the one in force
+        if r.drag_stopped() || (!r.dragged() && st.gpu_memory_slider != st.gpu_memory_pct) {
+            acts.push(Action::GpuMemory(st.gpu_memory_slider));
+        }
+    });
+    let line = if usable { memory_line(None, card, st.gpu_memory_slider, gpu_solvers(st.backend, st.gpu_available)) } else { why_not };
+    ui.label(RichText::new(line).monospace().size(10.5).color(theme::INK_DIM));
+    if usable && st.gpu_memory_slider > SHARE_WARN_PCT {
+        ui.label(
+            RichText::new(format!("above {SHARE_WARN_PCT} %: the screen, the driver and other applications share this card — if they run short the app or the display can fail"))
+                .size(10.5)
+                .color(super::AMBER),
+        );
+    }
 }
 
 /// Container walls (`sim::dynamics` module doc, "Container walls"): the checkbox and the

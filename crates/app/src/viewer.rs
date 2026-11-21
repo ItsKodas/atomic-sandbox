@@ -1353,6 +1353,10 @@ impl Viewer {
     /// What a frame's (or one action's) chrome output implies: the error line, the selection, the
     /// camera focus, play / pause, the commands, and a worker re-spawn when the solver changed.
     fn act_on(&mut self, mut out: ui::PanelOutput) {
+        // Scene ▸ Quality ▸ GPU memory: the process-wide budget first (the commands below and the
+        // solvers built next read it); the solvers are rebuilt below when a running GPU solver's
+        // budget changed
+        let rebuild = out.gpu_memory.is_some_and(|p| self.set_gpu_memory(p));
         self.window_requests.append(&mut out.windows);
         if let Some(e) = out.error {
             self.last_error = Some(e);
@@ -1413,7 +1417,29 @@ impl Viewer {
                 "solver switched to {}: the run restarts paused at t = 0 with the panel's settings",
                 self.backend.label()
             ));
+        } else if rebuild {
+            // the backend-switch path on the same backend: the scene kept, paused, re-solved; an
+            // estimated worker retires through the autosave and the new one restores its model
+            // (`start`), the shared collection re-attached
+            self.start(self.backend, self.gpu.clone());
+            let line = crate::quality::memory_line(crate::quality::env_budget_gb(), crate::quality::adapter_memory(), crate::quality::memory_share(), self.gpu_solvers());
+            self.ui.set_status(format!("{line}: the GPU solvers were rebuilt with it; the run restarts paused at t = 0"));
         }
+    }
+
+    /// GPU solvers the running worker has (`quality::gpu_solvers`: 1 on the GPU backend, 2 for the
+    /// estimated solver's GPU teacher and auditor, 0 on the CPU).
+    fn gpu_solvers(&self) -> u64 {
+        crate::quality::gpu_solvers(self.backend, self.gpu.is_some())
+    }
+
+    /// Puts Scene ▸ Quality ▸ GPU memory's share (%) in force (`quality::set_memory_share`, read by
+    /// every `quality::vram_budget`); true when a running worker's GPU solvers now have another
+    /// budget, so they must be rebuilt (the variable set, an unknown card or the CPU solver: false).
+    fn set_gpu_memory(&mut self, pct: u32) -> bool {
+        let before = crate::quality::vram_budget();
+        crate::quality::set_memory_share(pct);
+        crate::quality::vram_budget() != before && self.gpu_solvers() > 0 && self.sim.is_some()
     }
 
     /// Restart now, past its guard (`ui::version`; installer Task 4): refused while another copy of
@@ -2933,6 +2959,16 @@ impl Viewer {
             self.chrome_actions.append(&mut out.actions);
             self.act_on(out);
         }
+        // `machine.settings` asks for another GPU memory share (`ui::profile::apply_machine`; at
+        // launch `main` has already put it in force, so this is a no-op then): put in force as the
+        // slider's action, so a recording sees it and the solvers are rebuilt
+        if let Some(pct) = self.ui.gpu_memory_pending.take() {
+            if pct != crate::quality::memory_share() {
+                let a = ui::Action::GpuMemory(pct);
+                self.chrome_actions.push(a.clone());
+                self.apply(a);
+            }
+        }
         (full, fulls)
     }
 }
@@ -4270,6 +4306,95 @@ nucleus 1 {a} {} {}
         assert!(worst < Duration::from_millis(50), "a backend switch blocked the render thread for {worst:?}");
         assert_eq!(std::fs::read(&v.autosave).unwrap(), b"the session's model", "the autosave was rewritten or removed");
         let _ = std::fs::remove_file(&v.autosave);
+    }
+
+    /// Scene ▸ Quality ▸ GPU memory through the viewer (design 2026-11-21): the action puts the share in force for
+    /// every `quality::vram_budget` reader and replaces the running GPU worker the way a backend switch does — the
+    /// scene kept, paused — and the rebuilt solver has the new budget: an all-electron neon scene that the 50 % budget
+    /// would take is refused by it at 25 %, before any allocation, the refusal naming the share. On the CPU backend the
+    /// share changes and nothing is rebuilt.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "release-only: runs real SCF solves; cargo test -p app --release"
+    )]
+    fn the_gpu_memory_action_rebuilds_the_solvers_with_the_new_budget() {
+        use crate::quality::{adapter_memory, budget_test_lock, env_budget_gb, memory_share, vram_budget, BudgetSource};
+        let _gpu = crate::sim::tests::gpu_lock();
+        let _budget = budget_test_lock();
+        if env_budget_gb().is_some() {
+            eprintln!("ATOMIC_SANDBOX_VRAM_GB is set: the share does not apply");
+            return;
+        }
+        let Some(hl) = Headless::new(64, 64) else {
+            return;
+        };
+        let mut painter = Painter::new(&hl.ctx, HEADLESS_FORMAT);
+        // the CPU backend: no GPU solver to rebuild
+        let mut cpu = pinned("h2");
+        cpu.scene.grid_n = 33;
+        cpu.start(Backend::Cpu, None);
+        cpu.send(Command::Dyn(DynCommand::Pause));
+        cpu.apply(ui::Action::GpuMemory(60));
+        assert_eq!((memory_share(), cpu.ui.gpu_memory_pct), (60, 60));
+        assert!(cpu.commands_sent() > 0, "the CPU worker was rebuilt");
+        cpu.apply(ui::Action::GpuMemory(50));
+        // the GPU backend
+        let mut v = pinned("h2");
+        v.scene.grid_n = 33;
+        v.start(Backend::Gpu, Some(hl.ctx.clone()));
+        let card = adapter_memory();
+        if card == 0 {
+            eprintln!("this adapter does not report its memory: the share does not apply");
+            return;
+        }
+        settle(&mut v, &hl, &mut painter, Backend::Gpu);
+        v.send(Command::Dyn(DynCommand::Pause));
+        assert!(v.commands_sent() > 0);
+        let scene = v.scene.clone();
+        v.apply(ui::Action::GpuMemory(25));
+        assert_eq!(vram_budget().source, BudgetSource::Adapter { card_bytes: card, share_pct: 25 });
+        assert_eq!(v.commands_sent(), 0, "a new worker");
+        assert_eq!((v.backend, v.playing, &v.scene), (Backend::Gpu, false, &scene), "the scene kept, paused");
+        assert!(v.ui.status.contains("25 %") && v.ui.status.contains("the GPU solvers were rebuilt"), "{}", v.ui.status);
+        settle(&mut v, &hl, &mut painter, Backend::Gpu);
+        // the same share again: nothing to rebuild
+        v.send(Command::Dyn(DynCommand::Pause));
+        v.apply(ui::Action::GpuMemory(25));
+        assert!(v.commands_sent() > 0, "an unchanged budget rebuilt the worker");
+        // a scene between 25 % and 50 % of the card: k all-electron Ne in a 16 Bohr box at 0.08 Bohr (201³)
+        let (lo, hi) = (card / 4, card / 2);
+        let big = (1..=12).find_map(|k| {
+            let mut s = Scene::preset("empty").unwrap();
+            s.ionic = sim::IonicPolicy::None;
+            for i in 0..k {
+                let a = i as f64 * std::f64::consts::TAU / k as f64;
+                s.nuclei.push(crate::scene::SceneNucleus { z: 10, pos: [3.0 * a.cos(), 3.0 * a.sin(), 0.0], vel: [0.0; 3], a: None });
+            }
+            let s = crate::quality::regrid(&s, 16.0, 0.08);
+            let need = providers::gpu_footprint_bytes(&s.to_sim().unwrap());
+            (lo < need && need < hi).then_some((s, need))
+        });
+        let Some((big, need)) = big else {
+            eprintln!("no Ne scene between {lo} and {hi} bytes: skipping the refusal");
+            return;
+        };
+        v.send(Command::SetScene(big));
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let refusal = loop {
+            assert!(Instant::now() < deadline, "no refusal from the rebuilt solver");
+            match v.sim.as_ref().unwrap().recv_timeout(Duration::from_secs(1)) {
+                Some(SimEvent::Snapshot(s)) => {
+                    if let Some(e) = s.dynamics.last_error.clone() {
+                        break e;
+                    }
+                }
+                Some(SimEvent::Error(e)) => break e,
+                _ => {}
+            }
+        };
+        eprintln!("GPU memory 25 % of {:.1} GB: a {:.1} GB scene refused: {refusal}", card as f64 / 1e9, need as f64 / 1e9);
+        assert!(refusal.contains("over the") && refusal.contains("(25 % of this GPU's") && refusal.contains("set in Scene ▸ Quality"), "{refusal}");
     }
 
     /// `drive_orbital_view` (no worker needed): the orbital the producer resolved the placeholder

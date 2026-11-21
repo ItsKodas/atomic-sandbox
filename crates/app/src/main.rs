@@ -621,7 +621,14 @@ fn main() {
     // (`%LOCALAPPDATA%\atomic-sandbox`, `paths::user_root`: the same in every mode)
     if let Some(root) = paths::user_root() {
         viewer.ui.profiles.current_file = Some(root.join("current.profile"));
+        // this computer's settings (the GPU memory share): never in a profile (`ui::profile` module doc)
+        viewer.ui.profiles.machine_file = Some(root.join("machine.settings"));
         ui::profile::load_current(&mut viewer.ui);
+        // the GPU memory share is in force before anything reads the budget (the first worker, the
+        // estimated box below): no rebuild at the first frame
+        if let Some(pct) = viewer.ui.gpu_memory_pending.take() {
+            quality::set_memory_share(pct);
+        }
         viewer.ui.timings = timings::Timings::load(Some(root.join("timings.txt")));
         // a running sampling pass is kept resumable there (`worker::checkpoint`), and offered at the next start
         viewer.training_dir = Some(root.join("training"));
@@ -681,6 +688,10 @@ fn main() {
         // the ionic policy first (M7): a preset loads under the policy in force, so the pin precedes it — and
         // a replay never depends on the app's default policy
         start.insert(0, ui::Action::Ionic(u.ionic));
+        // a GPU memory share other than the default (the profile's), before anything reads the budget
+        if u.gpu_memory_pct != quality::DEFAULT_SHARE_PCT {
+            start.insert(0, ui::Action::GpuMemory(u.gpu_memory_pct));
+        }
         if backend != sim::Backend::Gpu {
             start.push(ui::Action::Backend(backend));
         }
