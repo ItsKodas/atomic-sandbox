@@ -660,6 +660,57 @@ pub struct EvalStats {
     /// With a judged step at N↑ = N↓: |Δ∫|ρ↑ − ρ↓|| (electrons) since the previous evaluation, where a
     /// restricted ↔ broken-symmetry switch shows (spec §6.3, "Spin measure"); reported, never decided on.
     pub spin_change: Option<f64>,
+    /// A Kohn-Sham answer's account of its own SCF (the gpu-fault fix): whether it converged, the electrons its density
+    /// integrates to and the electrons the scene has. `None` from a provider without electrons (analytic, a model
+    /// answer). [`answer_refusal`] reads it before any teacher answer becomes a sample or a reference.
+    pub scf_check: Option<ScfCheck>,
+}
+
+/// [`EvalStats::scf_check`]: `electrons` = ∫(ρ↑ + ρ↓) d³r of the density the answer was evaluated from
+/// (`qm::ScfStats::electrons`), `expected` = the scene's electron count as solved (n↑ + n↓: the valence electrons when
+/// pseudised), `converged` = the SCF met its stop.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScfCheck {
+    pub converged: bool,
+    pub electrons: f64,
+    pub expected: f64,
+}
+
+/// The largest relative miss |∫ρ − N| / max(N, 1) of a Kohn-Sham answer's electron count that [`answer_refusal`]
+/// accepts.
+///
+/// **Derived from the GPU solver's f32 sums** (the CPU's f64 sums sit at ~1e-15): ∫ρ = Σ_i f_i ∫|ψ_i|², and both the
+/// orbitals' normalisation (their Gram) and ∫ρ itself are `qm_gpu::reduce` sums — each of the 1 024 × 256 threads adds
+/// m = ⌈n³ / 262 144⌉ grid points serially in f32, a workgroup combines 256 partials in a tree (log₂ 256 = 8 levels),
+/// and the partials are finished in f64. The worst-case relative error of one such sum is (m + 8)·u with
+/// u = 2⁻²⁴ ≈ 5.96e-8, i.e. 2.3e-6 at the largest grid (201³, m = 31); a normalisation error and the ∫ρ sum's own
+/// add, so |∫ρ − N|/N ≤ 4.7e-6 at 201³ in the worst case. 1e-5 is that bound with a factor ≈ 2 to spare.
+/// **Measured** (`providers::ks` test `real_answers_hold_their_electrons`, 2026-11-21, RX 7900 XTX): the worst
+/// relative miss over H₂ 49³, stretched H₂ (Fermi–Dirac partial levels), Li 49³, H₂O Accurate 95³ under `Accepted`
+/// and H₂O Precise 141³ all-electron is 8.7e-8 (≈ 1.5 u; the CPU's 0) — the tolerance is ≈ 115× that. What the check
+/// is for misses by O(1): a density a failed device left empty integrates to 0, one half written to a fraction of N.
+pub const ELECTRON_COUNT_REL_TOL: f64 = 1e-5;
+
+/// Why a teacher answer must not become a sample or a reference (the gpu-fault fix, 2026-11-21), or `None`: a
+/// non-finite energy or force; and for a Kohn-Sham answer ([`EvalStats::scf_check`]) an SCF that ran no iteration or
+/// did not converge, or a density whose electrons miss the scene's by more than [`ELECTRON_COUNT_REL_TOL`] — what a
+/// failed device leaves (an empty density integrates to 0). An answer without `scf_check` (analytic) is judged on
+/// finiteness only.
+pub fn answer_refusal(r: &ForceResult) -> Option<String> {
+    if !r.energy.is_finite() || r.forces.iter().flatten().any(|x| !x.is_finite()) {
+        return Some("a non-finite energy or force".into());
+    }
+    let c = r.stats.scf_check?;
+    if r.stats.scf_steps == 0 {
+        return Some("the SCF ran no iteration".into());
+    }
+    if !c.converged {
+        return Some("the SCF did not report convergence".into());
+    }
+    if !((c.electrons - c.expected).abs() <= ELECTRON_COUNT_REL_TOL * c.expected.max(1.0)) {
+        return Some(format!("its density holds {:.6} electrons where the scene has {} (more than {ELECTRON_COUNT_REL_TOL:.0e} relative off)", c.electrons, c.expected));
+    }
+    None
 }
 
 /// The prefix of the per-step core-overlap warning (spec §5.6): "cores overlap: I–J at R = … Bohr".
@@ -771,6 +822,7 @@ impl Default for EvalStats {
             frontier: [Frontier::default(); 2],
             branch_jump: None,
             spin_change: None,
+            scf_check: None,
         }
     }
 }
@@ -827,7 +879,16 @@ pub enum SolverError {
     /// cause and the attempts. Nothing is wrong with the scene — Play or any edit tries again.
     #[error("GPU busy, a readback from the device failed ({0})")]
     Device(String),
+    /// The session's GPU failed (the gpu-fault fix, 2026-11-21: `gpu::GpuHealth` — an out-of-memory or another error
+    /// no scope caught, or a lost device): the solver refuses every solve from now on and nothing from the solve that
+    /// hit it was kept. Unlike [`Device`](SolverError::Device) it is never retried and Play does not clear it: the
+    /// device is not recovered, the app is restarted. The field is the cause in wgpu's words.
+    #[error("{GPU_FAILED_MESSAGE} (cause: {0})")]
+    GpuFailed(String),
 }
+
+/// What the user reads when the GPU failed ([`SolverError::GpuFailed`]): the paused message.
+pub const GPU_FAILED_MESSAGE: &str = "The GPU ran out of memory (or its driver reset) during a solve. Nothing from that solve was kept. Save your work and restart the app; lower GPU memory or the quality to avoid it.";
 
 impl SolverError {
     /// How a failed SCF ended and after how many iterations (the solve log's iteration cell):
@@ -848,6 +909,15 @@ impl ProviderError {
     pub fn scf_end(&self) -> Option<(crate::activity::ScfEnd, usize)> {
         match self {
             ProviderError::Solver(e) => e.scf_end(),
+            _ => None,
+        }
+    }
+
+    /// The cause when this is the session's GPU failure ([`SolverError::GpuFailed`]): fatal for every solver of the
+    /// session, never one geometry's failure.
+    pub fn gpu_failure(&self) -> Option<&str> {
+        match self {
+            ProviderError::Solver(SolverError::GpuFailed(why)) => Some(why),
             _ => None,
         }
     }
@@ -910,6 +980,14 @@ pub trait ForceProvider: Send {
     /// doc). `None` by default: a provider that cannot be taught. This is the only way past the
     /// boundary; nothing downcasts a provider.
     fn as_trainable(&mut self) -> Option<&mut dyn Trainable> {
+        None
+    }
+    /// The session's GPU failure, if the device this provider solves on failed (the gpu-fault fix: an out-of-memory,
+    /// another error no scope caught, or a lost device — `gpu::GpuHealth`): every later evaluation is then
+    /// [`SolverError::GpuFailed`], and the driver stops playing and any pass (`crate::dynamics`, "A failed GPU"). A
+    /// surrogate answers for its teacher (and for an auditor's failure it has seen). `None` by default: a provider
+    /// without a device.
+    fn device_failure(&self) -> Option<String> {
         None
     }
     /// Side jobs (densities solved off the stepping path: the surrogate's background audits and
@@ -1994,6 +2072,34 @@ mod ionic_tests {
     /// M7 Task 9 (spec §5.6): an answer with overlapping cores or a flagged branch jump is untrainable and says why;
     /// an ordinary one is not. (Re-pinned in plan 2026-11-13 Task 9: the shared-shell occupation watch this test
     /// exercised is gone; the `branch_jump` guard took its role, spec 2026-11-13 §6.3.)
+    /// The gpu-fault fix: `answer_refusal` passes a finite analytic answer and a plausible Kohn-Sham one, and refuses
+    /// a non-finite one, an SCF without an iteration or without convergence, and a density without its electrons —
+    /// at the tolerance's edge on both sides.
+    #[test]
+    fn answer_refusal_refuses_physically_empty_answers() {
+        let answer = |e: f64, steps: usize, check: Option<ScfCheck>| ForceResult {
+            energy: e,
+            forces: vec![[0.1, 0.0, 0.0]; 2],
+            stats: EvalStats { scf_steps: steps, scf_check: check, ..EvalStats::default() },
+            display: None,
+            orbitals: None,
+        };
+        let ks = |electrons: f64, converged: bool| Some(ScfCheck { converged, electrons, expected: 8.0 });
+        assert_eq!(answer_refusal(&answer(-1.0, 0, None)), None, "an analytic answer: finiteness only");
+        assert_eq!(answer_refusal(&answer(-17.0, 12, ks(8.0, true))), None);
+        assert!(answer_refusal(&answer(f64::NAN, 12, ks(8.0, true))).is_some_and(|w| w.contains("non-finite")));
+        assert!(answer_refusal(&answer(-17.0, 0, ks(8.0, true))).is_some_and(|w| w.contains("no iteration")));
+        assert!(answer_refusal(&answer(-17.0, 12, ks(8.0, false))).is_some_and(|w| w.contains("convergence")));
+        assert!(answer_refusal(&answer(0.0, 1, ks(0.0, true))).is_some_and(|w| w.contains("0.000000 electrons")), "the empty density");
+        assert!(answer_refusal(&answer(-17.0, 12, ks(f64::NAN, true))).is_some(), "a NaN count is refused");
+        let edge = ELECTRON_COUNT_REL_TOL * 8.0;
+        assert_eq!(answer_refusal(&answer(-17.0, 12, ks(8.0 - 0.99 * edge, true))), None);
+        assert!(answer_refusal(&answer(-17.0, 12, ks(8.0 + 1.01 * edge, true))).is_some());
+        // no electrons at all (a bare proton): the absolute floor of one electron's tolerance
+        let bare = Some(ScfCheck { converged: true, electrons: 1e-7, expected: 0.0 });
+        assert_eq!(answer_refusal(&answer(0.0, 3, bare)), None);
+    }
+
     #[test]
     fn untrainable_answers_say_why() {
         let mut s = EvalStats::default();

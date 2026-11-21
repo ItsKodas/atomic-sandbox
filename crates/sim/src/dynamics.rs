@@ -223,6 +223,15 @@
 //! `Play`, `Step` and an accepted edit (the "try again" actions). A rejected command sets
 //! `last_rejection` instead, which the next accepted command clears.
 //!
+//! # A failed GPU (the gpu-fault fix, 2026-11-21)
+//! When the provider reports that the device it solves on failed (`ForceProvider::device_failure`: an out-of-memory,
+//! another GPU error no scope caught, or a lost device — `gpu::GpuHealth`), every solver of the session refuses from
+//! then on. Each tick checks first and, failed, does nothing else: the run is paused, the queued steps dropped, a pass
+//! or a relax ends (a pass keeps what it sampled before), and `last_error` says [`crate::GPU_FAILED_MESSAGE`] with the
+//! cause. Play and Step do not clear it — the next tick sets it again; only a new app session does. A provider that
+//! returns [`SolverError::GpuFailed`](crate::SolverError::GpuFailed) from an evaluation lands in the same state
+//! through the ordinary failure path above.
+//!
 //! # Edits (ruling R8)
 //! `AddNucleus` and `RemoveNucleus` are accepted at any time; `MoveNucleusDiscontinuous`,
 //! `MoveNuclei` and `ReplaceScene` only while paused (else rejected). Move zeroes that nucleus's
@@ -1722,6 +1731,11 @@ impl Dynamics {
         // pausing into a state whose newest payload is an earlier step's re-reads it (M1)
         if self.forward_orbital_view() {
             self.show_current_orbitals();
+        }
+        // a failed GPU (module doc, "A failed GPU"): nothing else this tick, and nothing more until the app restarts
+        if let Some(why) = self.provider.device_failure() {
+            self.stop_for_gpu_failure(why, should_abort);
+            return self.snapshot();
         }
         // a side job asked for between ticks is at the current positions (module doc)
         self.stamp_side_jobs(self.sim_time);
@@ -3238,6 +3252,28 @@ impl Dynamics {
         }));
         self.seq += 1;
         Ok(())
+    }
+
+    /// The provider's device failed (module doc, "A failed GPU"): paused, nothing queued, a pass or a relax ended, and
+    /// the user's message in `last_error` (set once; the next ticks find it there).
+    fn stop_for_gpu_failure(&mut self, why: String, should_abort: &mut dyn FnMut() -> bool) {
+        self.paused = true;
+        self.pending_steps = 0;
+        if self.pass_active() {
+            if let Some(t) = self.provider.as_trainable() {
+                t.cancel_pass();
+            }
+            self.take_provider_notes();
+            self.pass_ended();
+        }
+        if self.fire.is_some() {
+            self.finish_relax(None, should_abort);
+        }
+        let msg = format!("{}: {}", self.provider.name(), ProviderError::Solver(crate::SolverError::GpuFailed(why)));
+        if self.last_error.as_deref() != Some(msg.as_str()) {
+            self.last_error = Some(msg);
+            self.seq += 1;
+        }
     }
 
     fn fail(&mut self, e: ProviderError) {

@@ -3,7 +3,7 @@
 use super::*;
 use crate::provider::{EvalStats, ForceResult};
 use crate::scene::{Cell, Nucleus};
-use crate::test_providers::{FailKind, Failing, Harmonic, Zero};
+use crate::test_providers::{FailKind, Failing, Fault, Faulty, Harmonic, Zero};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -255,6 +255,32 @@ fn provider_error_pauses_and_keeps_last_good_state() {
         let r2 = step_n(&mut reference, 10);
         assert!(t2.scene == r2.scene && t2.step == 14);
     }
+}
+
+/// The gpu-fault fix (module doc, "A failed GPU"): once the provider reports its device failed, a tick takes no step
+/// and no solve — paused, nothing queued, the user's message in `last_error` — and Play does not get past it.
+#[test]
+fn a_failed_gpu_stops_the_run_and_play_does_not_resume_it() {
+    let (s, h) = harmonic_three();
+    // call 1 is new()'s evaluation, calls 2–4 steps 1–3; from call 5 the device has failed
+    let p = Faulty::new(h, 5, Fault::GpuFailed);
+    let calls = p.calls.clone();
+    let mut d = Dynamics::new(s, Box::new(p), DT_FS, 1);
+    d.apply(DynCommand::SetSpeed(10));
+    d.apply(DynCommand::Play);
+    let t = d.tick(f64::INFINITY, &mut never());
+    assert!(t.paused, "the failed solve pauses");
+    assert_eq!(t.step, 3);
+    let e = t.last_error.clone().expect("an error");
+    assert!(e.contains(crate::GPU_FAILED_MESSAGE) && e.contains("injected"), "{e}");
+    let before = calls.load(Ordering::SeqCst);
+    for _ in 0..3 {
+        d.apply(DynCommand::Play);
+        let t = d.tick(f64::INFINITY, &mut never());
+        assert!(t.paused && t.step == 3, "play after a GPU failure: step {}", t.step);
+        assert!(t.last_error.as_deref().is_some_and(|e| e.contains(crate::GPU_FAILED_MESSAGE)), "{:?}", t.last_error);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), before, "no solve was asked of a failed device");
 }
 
 #[test]

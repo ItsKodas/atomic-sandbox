@@ -436,8 +436,10 @@ impl AtomScan {
             if r.forces.len() != 1 {
                 return Err(ProviderError::Invalid(format!("provider '{}' returned {} forces for 1 nucleus", provider.name(), r.forces.len())));
             }
-            if !r.energy.is_finite() || r.forces.iter().flatten().any(|x| !x.is_finite()) {
-                return Err(ProviderError::Invalid(format!("provider '{}' returned a non-finite energy or force", provider.name())));
+            // finite, and for a Kohn-Sham answer converged with its electrons (the gpu-fault fix: no physically empty
+            // answer becomes a reference)
+            if let Some(why) = crate::provider::answer_refusal(&r) {
+                return Err(ProviderError::Invalid(format!("provider '{}' answer refused: {why}", provider.name())));
             }
             Ok((r.energy, r.stats.face_density, !r.stats.partial.is_empty()))
         });
@@ -521,6 +523,8 @@ pub fn solve_atom_reporting(provider: &mut dyn ForceProvider, cell: &Cell, sigma
                 provider.reset();
                 return Err(ProviderError::Cancelled);
             }
+            // a failed GPU ends the scan: every later multiplicity would be refused the same way
+            Err(e) if e.gpu_failure().is_some() => return Err(e),
             Err(e) => last_err = Some(e),
         }
     }

@@ -125,6 +125,101 @@ impl ForceProvider for Failing {
     }
 }
 
+/// What [`Faulty`] does once it faults — the ways a failed GPU teacher has been seen or can be made to answer
+/// (the gpu-fault fix, 2026-11-21).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// Panics inside `evaluate` (what wgpu's default error handler did on an out-of-memory, and what an invalid
+    /// buffer's mapping still does on a lost device).
+    Panic,
+    /// `SolverError::GpuFailed` from every evaluation, and `device_failure` reports it (a lost or failed device).
+    GpuFailed,
+    /// An answer with no data: E = 0, F = 0, a converged one-step SCF whose density holds 0 electrons.
+    EmptyDensity,
+    /// The inner answer, its SCF check saying it ran no iteration.
+    NoIterations,
+    /// The inner answer, its SCF check saying it did not converge.
+    NotConverged,
+}
+
+/// Wraps a provider and, from evaluation number `from_call` on (1-based, counted in `calls`), injects `fault`
+/// on every call. Before that it forwards the inner answer with a plausible Kohn-Sham SCF check attached
+/// (`EvalStats::scf_check`: converged, ∫ρ = the scene's electrons, ≥ 1 step), so the answers a test compares go
+/// through the same check as a solver's. `name` is the inner provider's (an auditor must carry its teacher's
+/// name); `side_solver` is a fresh `Faulty` around the inner one's, faulting from its first call when this one
+/// faults already.
+pub struct Faulty {
+    pub inner: Box<dyn ForceProvider>,
+    pub from_call: usize,
+    pub calls: Arc<std::sync::atomic::AtomicUsize>,
+    pub fault: Fault,
+}
+
+impl Faulty {
+    pub fn new(inner: impl ForceProvider + 'static, from_call: usize, fault: Fault) -> Faulty {
+        Faulty { inner: Box::new(inner), from_call, calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)), fault }
+    }
+
+    fn faulting(&self) -> bool {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst) >= self.from_call
+    }
+
+    /// The scene's electrons (Σ Z − charge): what a plausible answer's density holds.
+    fn electrons(scene: &Scene) -> f64 {
+        scene.nuclei.iter().map(|n| n.z as f64).sum::<f64>() - scene.charge as f64
+    }
+}
+
+impl ForceProvider for Faulty {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let n = Self::electrons(scene);
+        let plausible = crate::provider::ScfCheck { converged: true, electrons: n, expected: n };
+        if !self.faulting() {
+            let mut r = self.inner.evaluate(scene, should_abort)?;
+            r.stats.scf_steps = r.stats.scf_steps.max(1);
+            r.stats.scf_check = Some(plausible);
+            return Ok(r);
+        }
+        match self.fault {
+            Fault::Panic => panic!("injected panic inside a solve (a GPU failure)"),
+            Fault::GpuFailed => Err(ProviderError::Solver(SolverError::GpuFailed("injected: the GPU device was lost".into()))),
+            Fault::EmptyDensity => {
+                let mut stats = EvalStats { scf_steps: 1, ..EvalStats::default() };
+                stats.scf_check = Some(crate::provider::ScfCheck { converged: true, electrons: 0.0, expected: n });
+                Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; scene.nuclei.len()], stats, display: None, orbitals: None })
+            }
+            Fault::NoIterations | Fault::NotConverged => {
+                let mut r = self.inner.evaluate(scene, should_abort)?;
+                r.stats.scf_steps = if self.fault == Fault::NoIterations { 0 } else { 7 };
+                r.stats.scf_check = Some(crate::provider::ScfCheck { converged: self.fault == Fault::NoIterations, ..plausible });
+                Ok(r)
+            }
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    fn scf_tol(&self) -> Option<f64> {
+        self.inner.scf_tol()
+    }
+
+    fn device_failure(&self) -> Option<String> {
+        (self.fault == Fault::GpuFailed && self.faulting()).then(|| "injected: the GPU device was lost".to_string())
+    }
+
+    fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+        let inner = self.inner.side_solver()?;
+        Some(Box::new(Faulty { inner, from_call: if self.faulting() { 0 } else { usize::MAX }, calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)), fault: self.fault }))
+    }
+}
+
 /// Morse dimer: E = 2 e_atom + D[(1 − e^{−a(r − r_e)})² − 1] for exactly two nuclei (any Z;
 /// `ProviderError::Invalid` otherwise), with the analytic forces F₁ = +(dE/dr) û, F₂ = −(dE/dr) û,
 /// û from nucleus 0 to nucleus 1 — translation and rotation invariant, so the surrogate can
@@ -226,6 +321,10 @@ impl<P: ForceProvider> ForceProvider for Shared<P> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).scf_tol()
     }
 
+    fn device_failure(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).device_failure()
+    }
+
     fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).side_solver()
     }
@@ -307,6 +406,10 @@ impl<P: ForceProvider + Trainable> ForceProvider for SharedTrainable<P> {
 
     fn scf_tol(&self) -> Option<f64> {
         self.lock().scf_tol()
+    }
+
+    fn device_failure(&self) -> Option<String> {
+        self.lock().device_failure()
     }
 
     fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
@@ -594,6 +697,10 @@ impl<P: ForceProvider + Trainable> ForceProvider for TeacherOf<P> {
 
     fn scf_tol(&self) -> Option<f64> {
         self.with(|t| t.scf_tol())
+    }
+
+    fn device_failure(&self) -> Option<String> {
+        self.with(|t| t.device_failure())
     }
 
     fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
