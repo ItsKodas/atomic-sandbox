@@ -1,9 +1,12 @@
 //! wgpu plumbing shared by the renderer and (later) the GPU solver. Nothing here knows about physics.
 pub mod volume;
 pub mod readback;
+pub mod health;
+pub use health::GpuHealth;
 pub use readback::{read_buffer, wait_idle, ReadbackError};
 pub use volume::{ColourVolume3D, Volume3D};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -17,6 +20,10 @@ pub struct GpuContext {
     /// offers it): `R32Float` textures such as `Volume3D` can then be sampled through a linear
     /// sampler. Without it they are read with `textureLoad` only.
     pub float32_filterable: bool,
+    /// The device's failure record (`health` module doc): set by its uncaptured-error handler and its device-lost
+    /// callback, both installed in [`GpuContext::request`]; shared by every clone. Read it through
+    /// [`failure`](GpuContext::failure).
+    pub health: Arc<GpuHealth>,
 }
 
 /// A wgpu instance on `backends` — never the GL backend that `wgpu::Instance::default()`
@@ -81,7 +88,25 @@ impl GpuContext {
             ..Default::default()
         })).map_err(|e| eprintln!("gpu: request_device failed: {e}")).ok()?;
         let float32_filterable = device.features().contains(wgpu::Features::FLOAT32_FILTERABLE);
-        Some(GpuContext { instance, adapter, device, queue, float32_filterable })
+        // the failure record (`health` module doc): record, never panic (wgpu's default handler panics on the thread
+        // that made the call); the solvers refuse every solve once it is set
+        let health = Arc::new(GpuHealth::default());
+        let h = health.clone();
+        device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| h.fail(GpuHealth::describe_error(&e))));
+        let h = health.clone();
+        device.set_device_lost_callback(move |reason, message| h.fail(GpuHealth::describe_loss(reason, &message)));
+        Some(GpuContext { instance, adapter, device, queue, float32_filterable, health })
+    }
+
+    /// The device's first failure (`health` module doc) — an uncaptured error or a lost device — or `None` while it is
+    /// trusted. Polls the device first without waiting (`PollType::Poll`), which is when wgpu delivers the device-lost
+    /// callback of a device destroyed meanwhile; a lost device's own `lose` calls it at once.
+    pub fn failure(&self) -> Option<String> {
+        if let Some(f) = self.health.failure() {
+            return Some(f);
+        }
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        self.health.failure()
     }
     /// Headless (no surface). Returns None when no adapter is available. Vulkan first, then the
     /// primary backends ([`preferred_instance`]) — also when a Vulkan adapter exists but its
