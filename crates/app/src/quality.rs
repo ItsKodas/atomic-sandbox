@@ -12,7 +12,7 @@
 //!   σ = h (`crates/validate/references.md`, "Quality presets") against 0.741 Å (experiment).
 use crate::scene::Scene;
 
-//// The GPU memory budget (GB) when neither `ATOMIC_SANDBOX_VRAM_GB` is set nor the adapter
+/// The GPU memory budget (GB) when neither `ATOMIC_SANDBOX_VRAM_GB` is set nor the adapter
 /// reports its memory ([`set_adapter_memory`]): half the project's 24 GB RX 7900 XTX
 /// (`providers::ks`, "GPU memory"). Set the variable on such a card.
 pub const VRAM_BUDGET_GB: f64 = 12.0;
@@ -159,7 +159,7 @@ pub fn memory_line(env_gb: Option<f64>, card_bytes: u64, pct: u32, solvers: u64)
     }
 }
 
-//// Serialises the tests that move the process-wide budget ([`set_memory_share`],
+/// Serialises the tests that move the process-wide budget ([`set_memory_share`],
 /// [`BudgetTestGuard::set_card`]) with the ones whose expectation reads it; the guard puts the
 /// share back to the default, and a card memory it set back to what it was, when it drops. A test
 /// that moves the budget also holds the GPU tests' lock (`sim::tests::gpu_lock`, taken first),
@@ -196,7 +196,7 @@ impl Drop for BudgetTestGuard {
     }
 }
 
-// GPU solvers a backend runs: 1 for the GPU backend, 2 for the estimated solver with a GPU
+/// GPU solvers a backend runs: 1 for the GPU backend, 2 for the estimated solver with a GPU
 /// teacher (the teacher and its background auditor, each a full `GpuKs`), 0 on the CPU.
 pub fn gpu_solvers(backend: crate::sim::Backend, gpu_available: bool) -> u64 {
     match backend {

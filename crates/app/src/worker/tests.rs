@@ -1330,6 +1330,142 @@ fn a_failed_gpu_pauses_the_worker_with_the_restart_message() {
     assert_eq!(calls.lock().unwrap().as_ref().unwrap().load(std::sync::atomic::Ordering::SeqCst), n, "no solve was asked of the failed device");
 }
 
+/// A provider whose device has failed from the start (`device_failure` says so) while its evaluations still answer,
+/// with a density (so bond references are queued) — and a count of the driver's `device_failure` checks, one per tick.
+struct FailedWithDensity {
+    inner: sim::Gaussians,
+    checks: Arc<AtomicUsize>,
+}
+
+impl ForceProvider for FailedWithDensity {
+    fn evaluate(&mut self, scene: &sim::Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<sim::ForceResult, sim::ProviderError> {
+        self.inner.evaluate(scene, should_abort)
+    }
+    fn name(&self) -> &'static str {
+        "failed-with-density"
+    }
+    fn reset(&mut self) {}
+    fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        self.inner.sample_density(points)
+    }
+    fn scf_tol(&self) -> Option<f64> {
+        self.inner.scf_tol()
+    }
+    fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+        self.inner.side_solver()
+    }
+    fn device_failure(&self) -> Option<String> {
+        self.checks.fetch_add(1, Ordering::SeqCst);
+        Some("injected: the GPU device was lost".into())
+    }
+}
+
+/// Review A-I1: a GPU failure with a bond reference pending used to leave the worker ticking every 16 ms forever
+/// (`bonds_pending` never cleared, so it polled; each tick one `device_failure` check and a device poll). Now the
+/// failure drops what was pending and the worker sleeps until a command: no tick in 600 ms.
+#[test]
+fn a_failed_gpu_leaves_the_worker_idle() {
+    let checks = Arc::new(AtomicUsize::new(0));
+    let c = checks.clone();
+    let w = SimWorker::spawn_test(h2_33(), Box::new(move || {
+        Box::new(FailedWithDensity { inner: sim::Gaussians::per_atom(0.3, 0.5).with_pair_bump(0.15, 0.5, 3.0), checks: c.clone() })
+    }));
+    // the first tick (a command wakes the worker) finds the failure
+    w.send(Command::Dyn(DynCommand::Pause));
+    let s = snapshot_until(&w, "the GPU failure", |s| s.dynamics.gpu_failed);
+    assert!(s.dynamics.paused && s.dynamics.bonds_pending.is_empty() && s.dynamics.bond_reference.is_none(), "{:?}", s.dynamics.bonds_pending);
+    assert!(!s.working);
+    std::thread::sleep(Duration::from_millis(200));
+    let before = checks.load(Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(600));
+    let after = checks.load(Ordering::SeqCst);
+    assert!(after - before <= 1, "the worker kept ticking after the failure: {} checks in 600 ms", after - before);
+    // a command still lands (one round), and the worker sleeps again
+    w.send(Command::Dyn(DynCommand::Play));
+    let s = snapshot_until(&w, "the paused failure again", |s| s.commands >= 2 && s.dynamics.paused);
+    assert!(s.dynamics.last_error.as_deref().is_some_and(|e| e.contains(sim::GPU_FAILED_MESSAGE)), "{:?}", s.dynamics.last_error);
+    std::thread::sleep(Duration::from_millis(200));
+    let before = checks.load(Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(checks.load(Ordering::SeqCst) - before <= 1, "the worker kept ticking after the command");
+}
+
+/// A provider that takes `delay` to drop and says when it has (an old worker's GPU solvers being freed).
+struct SlowDrop {
+    inner: sim::MorseDimer,
+    delay: Duration,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ForceProvider for SlowDrop {
+    fn evaluate(&mut self, scene: &sim::Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<sim::ForceResult, sim::ProviderError> {
+        self.inner.evaluate(scene, should_abort)
+    }
+    fn name(&self) -> &'static str {
+        "slow-drop"
+    }
+    fn reset(&mut self) {}
+}
+
+impl Drop for SlowDrop {
+    fn drop(&mut self) {
+        std::thread::sleep(self.delay);
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Review B-I1: a rebuild (the GPU memory slider, a backend switch) used to build the new worker's solvers while the
+/// stopped worker still held its own. A worker spawned after a stopped one (`SimWorker::spawn_after`, what
+/// `Viewer::start` uses) builds its provider only once the old worker's thread has ended and its provider has
+/// dropped — here 300 ms after the stop.
+#[test]
+fn a_new_worker_builds_its_solvers_after_the_old_one_dropped_its_own() {
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let d = dropped.clone();
+    let old = SimWorker::spawn_test(h2_33(), Box::new(move || Box::new(SlowDrop { inner: sim::MorseDimer::h2(), delay: Duration::from_millis(300), dropped: d.clone() })));
+    idle(&old);
+    let exit = old.exit_signal();
+    assert!(!exit.done());
+    old.detach();
+    let seen = Arc::new(std::sync::Mutex::new(None::<bool>));
+    let (d, s) = (dropped.clone(), seen.clone());
+    let new = SimWorker::spawn_test_after(h2_33(), sim::ActivityProbe::new(), Box::new(move || {
+        *s.lock().unwrap() = Some(d.load(Ordering::SeqCst));
+        Box::new(sim::MorseDimer::h2())
+    }), None, vec![exit.clone()], Duration::from_secs(30));
+    idle(&new);
+    assert!(exit.done(), "the old worker's thread ended");
+    assert_eq!(*seen.lock().unwrap(), Some(true), "the new provider was built before the old one had dropped");
+}
+
+/// The wait is bounded: an old worker that has not ended within it (here a provider that takes 2 s to drop, against a
+/// 100 ms wait) is reported (a worker error) and the new worker builds anyway.
+#[test]
+fn a_new_worker_does_not_wait_past_its_bound() {
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let d = dropped.clone();
+    let old = SimWorker::spawn_test(h2_33(), Box::new(move || Box::new(SlowDrop { inner: sim::MorseDimer::h2(), delay: Duration::from_secs(2), dropped: d.clone() })));
+    idle(&old);
+    let exit = old.exit_signal();
+    old.detach();
+    let new = SimWorker::spawn_test_after(h2_33(), sim::ActivityProbe::new(), Box::new(|| Box::new(sim::MorseDimer::h2())), None, vec![exit], Duration::from_millis(100));
+    let deadline = Instant::now() + WAIT;
+    let mut said = false;
+    loop {
+        assert!(Instant::now() < deadline, "no snapshot from the new worker");
+        match new.recv_timeout(Duration::from_secs(1)) {
+            Some(Event::Error(e)) => {
+                assert!(e.contains("had not shut down"), "{e}");
+                said = true;
+            }
+            Some(Event::Snapshot(_)) => break,
+            _ => {}
+        }
+    }
+    assert!(said, "the timeout was not reported");
+    assert!(!dropped.load(Ordering::SeqCst), "the new worker waited for the old provider's drop");
+}
+
 /// M6 Task 9 (M5 handoff: "the automatic first pass is sized from one cold solve × 1.6 and
 /// varies under GPU sharing (72–115 solves seen)"): the pass is sized from the median of its
 /// first three solves. A surrogate over a scripted teacher whose pass solves take 0.9 s, 0.1 s,

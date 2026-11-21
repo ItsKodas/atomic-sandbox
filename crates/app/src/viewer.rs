@@ -44,6 +44,12 @@ const SUPERPOSITION_EVERY: Duration = Duration::from_millis(33);
 /// interrupted).
 const RETIRE_WAIT: Duration = Duration::from_secs(60);
 
+/// The error line for a GPU failure while the solves run on the CPU (`Viewer::watch_gpu`): the solver carries on, the
+/// display may stop updating.
+fn cpu_backend_gpu_failure(why: &str) -> String {
+    format!("The GPU failed: the solves run on the CPU and carry on, but the display may stop updating. Save your work and restart the app. (cause: {why})")
+}
+
 /// Who solved the real density on screen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DensitySource {
@@ -492,6 +498,11 @@ pub struct Viewer {
     /// Estimated workers shutting down on reaper threads: each sends whether it retired (wrote
     /// its autosave) within [`RETIRE_WAIT`].
     retiring: Vec<std::sync::mpsc::Receiver<bool>>,
+    /// Stopped workers (detached or retiring) that held GPU solvers and whose threads may not have ended yet: a new
+    /// worker that builds GPU solvers waits for them first (`start`; gpu-fault review B-I1).
+    stopped_gpu_workers: Vec<crate::sim::WorkerExit>,
+    /// The device's failure has been put on the error line (`watch_gpu`): once per session.
+    gpu_failure_shown: bool,
     /// The current estimated worker's `EnsureModel` (and audit cadence), held until every
     /// retiring worker has written the autosave it is to load.
     pending_teach: Option<Vec<Command>>,
@@ -583,6 +594,8 @@ impl Viewer {
             auto_pass: true,
             rate: Default::default(),
             retiring: Vec::new(),
+            stopped_gpu_workers: Vec::new(),
+            gpu_failure_shown: false,
             pending_teach: None,
             motion: [None, None],
             density_at: [None, None],
@@ -636,7 +649,10 @@ impl Viewer {
     /// the time and the drift history start afresh. `Gpu` without a context falls back to `Cpu`
     /// (`Estimated` then teaches with the CPU). A previous worker is detached, not joined: a GPU
     /// solve stops at its next SCF step, a CPU solve in flight finishes in the background and is
-    /// discarded. An estimated one is retired on a reaper thread (fix round 1, I2: `start` never
+    /// discarded. `start` never waits, but a new worker that builds GPU solvers builds them only
+    /// once every stopped worker that held GPU solvers has ended (`SimWorker::spawn_after`, at most
+    /// `worker::OLD_WORKER_WAIT`; gpu-fault review B-I1): a rebuild — the GPU memory slider, a
+    /// backend switch — never holds the old solvers and the new ones on the card at once. An estimated one is retired on a reaper thread (fix round 1, I2: `start` never
     /// waits): it writes its model to the autosave path, if it owns it (`sim` module doc). A new
     /// estimated worker is sent [`Command::EnsureModel`] — the autosaved model if there is one,
     /// else a sampling pass with the panel's plan — once every retiring worker has finished
@@ -653,6 +669,11 @@ impl Viewer {
         }
         self.pending_teach = None; // a worker that never got its EnsureModel owns nothing
         if let Some(old) = self.sim.take() {
+            // its GPU solvers are freed only when its thread ends (gpu-fault review B-I1): the next worker that builds
+            // GPU solvers waits for that (`SimWorker::spawn_after`), so the two never hold the card's memory at once
+            if crate::quality::gpu_solvers(self.backend, self.gpu.is_some()) > 0 {
+                self.stopped_gpu_workers.push(old.exit_signal());
+            }
             if self.backend == Backend::Estimated {
                 let (tx, rx) = std::sync::mpsc::channel();
                 std::thread::Builder::new()
@@ -668,6 +689,8 @@ impl Viewer {
         }
         let backend = if gpu.is_none() && backend == Backend::Gpu { Backend::Cpu } else { backend };
         let estimated = backend == Backend::Estimated;
+        self.stopped_gpu_workers.retain(|e| !e.done());
+        let after = if crate::quality::gpu_solvers(backend, gpu.is_some()) > 0 { self.stopped_gpu_workers.clone() } else { Vec::new() };
         self.reset_orbital_session();
         self.trails.clear(); // a new run: its clock restarts, and a trail never crosses a solver switch
         // the new worker has built no training views and was told nothing (activity Task 5 review
@@ -685,12 +708,13 @@ impl Viewer {
         if let Some(t) = self.resume_clock.take() {
             settings.push(DynCommand::SetClock(t));
         }
-        self.sim = Some(SimWorker::spawn_with(
+        self.sim = Some(SimWorker::spawn_after(
             self.scene.clone(),
             backend,
             gpu.clone(),
             settings,
             estimated.then(|| self.autosave.clone()),
+            after,
         ));
         self.gpu = gpu;
         self.backend = backend;
@@ -1418,12 +1442,18 @@ impl Viewer {
                 self.backend.label()
             ));
         } else if rebuild {
-            // the backend-switch path on the same backend: the scene kept, paused, re-solved; an
-            // estimated worker retires through the autosave and the new one restores its model
-            // (`start`), the shared collection re-attached
-            self.start(self.backend, self.gpu.clone());
             let line = crate::quality::memory_line(crate::quality::env_budget_gb(), crate::quality::adapter_memory(), crate::quality::memory_share(), self.gpu_solvers());
-            self.ui.set_status(format!("{line}: the GPU solvers were rebuilt with it; the run restarts paused at t = 0"));
+            if self.gpu.as_ref().is_some_and(|c| c.failure().is_some()) {
+                // the GPU failed this session (`sim::dynamics`, "A failed GPU"): rebuilt solvers on the same device
+                // would refuse at once — the share is kept for this computer and takes effect at the next start
+                self.ui.set_status(format!("{line}: kept for the next start — the GPU failed this session, so restart the app for it to apply"));
+            } else {
+                // the backend-switch path on the same backend: the scene kept, paused, re-solved; an
+                // estimated worker retires through the autosave and the new one restores its model
+                // (`start`), the shared collection re-attached
+                self.start(self.backend, self.gpu.clone());
+                self.ui.set_status(format!("{line}: the GPU solvers were rebuilt with it; the run restarts paused at t = 0"));
+            }
         }
     }
 
@@ -1609,12 +1639,29 @@ impl Viewer {
         depth: &wgpu::TextureView,
     ) -> bool {
         self.poll_retiring();
+        self.watch_gpu(ctx);
         let mut any = false;
         while let Some(ev) = self.sim.as_ref().and_then(SimWorker::try_recv) {
             self.on_event(ev, ctx, painter, depth);
             any = true;
         }
         any
+    }
+
+    /// A GPU failure no solver reports (gpu-fault review A-M1: on the CPU backend nothing reads the device's record, so
+    /// a lost device froze the window without a word): once per session, the error line — and stderr, since a lost
+    /// device may draw nothing more — says so. With GPU solvers the worker's paused message says it already.
+    fn watch_gpu(&mut self, ctx: &GpuContext) {
+        if self.gpu_failure_shown {
+            return;
+        }
+        let Some(why) = ctx.failure() else { return };
+        self.gpu_failure_shown = true;
+        if self.gpu_solvers() == 0 {
+            let line = cpu_backend_gpu_failure(&why);
+            eprintln!("{line}");
+            self.last_error = Some(line);
+        }
     }
 
     pub fn on_event(

@@ -392,10 +392,74 @@ pub enum Event {
     Retired,
 }
 
+/// How long a new worker waits for the previous workers' threads to end — their GPU solvers dropped — before it builds
+/// its own ([`SimWorker::spawn_after`]): a GPU solve stops at its next SCF step, a retiring estimated worker writes its
+/// autosave first (the viewer's `RETIRE_WAIT`, the same 60 s).
+pub const OLD_WORKER_WAIT: Duration = Duration::from_secs(60);
+
+/// Set when a worker's thread has ended: its driver, its providers and every GPU solver they held (the teacher, the
+/// auditor — joined by the surrogate's drop — and the GPU backend's solver) dropped. A clone is cheap; any thread may
+/// wait on it (gpu-fault review B-I1: a rebuild's new solvers must not be allocated beside the old ones).
+#[derive(Clone, Default)]
+pub struct WorkerExit(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+impl WorkerExit {
+    fn mark(&self) {
+        let (done, cv) = &*self.0;
+        *done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        cv.notify_all();
+    }
+
+    /// The thread has ended.
+    pub fn done(&self) -> bool {
+        *self.0 .0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Waits until the thread has ended or `until` passes; whether it ended.
+    pub fn wait_until(&self, until: Instant) -> bool {
+        let (done, cv) = &*self.0;
+        let mut d = done.lock().unwrap_or_else(|e| e.into_inner());
+        while !*d {
+            let Some(left) = until.checked_duration_since(Instant::now()) else { return false };
+            d = cv.wait_timeout(d, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        true
+    }
+}
+
+/// Marks its [`WorkerExit`] when dropped: the worker thread's first local, so the last thing dropped — after the driver
+/// and its solvers — also when the thread unwinds.
+struct ExitGuard(WorkerExit);
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        self.0.mark();
+    }
+}
+
+/// Before a worker builds its solvers: waits (up to `wait` in all) for every earlier worker in `after` to end, so
+/// their GPU buffers are freed first; false when one had not ended by then.
+fn wait_for_old_workers(after: &[WorkerExit], wait: Duration) -> bool {
+    let until = Instant::now() + wait;
+    after.iter().all(|e| e.wait_until(until))
+}
+
+/// [`wait_for_old_workers`], and a worker error when one had not ended in time (the new solvers are then built beside
+/// its: on a card near its memory limit the GPU may fail).
+fn waited(after: &[WorkerExit], wait: Duration, tx: &Sender<Event>) {
+    if !wait_for_old_workers(after, wait) {
+        let _ = tx.send(Event::Error(format!(
+            "the previous solver had not shut down within {wait:?}: the new one starts beside it, and on a card near its memory limit the GPU may fail"
+        )));
+    }
+}
+
 pub struct SimWorker {
     tx: Sender<Command>,
     rx: Receiver<Event>,
     handle: Option<JoinHandle<()>>,
+    /// Set when this worker's thread has ended ([`WorkerExit`]).
+    exit: WorkerExit,
     /// The live solve state of this worker's solvers (activity spec A1, [`SimWorker::probe`]).
     probe: Arc<sim::ActivityProbe>,
     /// Commands sent and not yet taken by the worker (`Inbox::take`): half of the display
@@ -417,12 +481,28 @@ impl SimWorker {
     /// correction) applied to the driver before its first snapshot is published, and (estimated
     /// solver) the `autosave` path its model is written to when it shuts down (module doc).
     /// `Backend::Estimated` without a context teaches with the CPU solver.
+    #[cfg(test)]
     pub fn spawn_with(
         initial: Scene,
         backend: Backend,
         gpu: Option<GpuContext>,
         settings: Vec<DynCommand>,
         autosave: Option<PathBuf>,
+    ) -> SimWorker {
+        SimWorker::spawn_after(initial, backend, gpu, settings, autosave, Vec::new())
+    }
+
+    /// [`SimWorker::spawn_with`], building its solvers only once every worker in `after` has ended (their GPU solvers
+    /// dropped; [`WorkerExit`], gpu-fault review B-I1) or [`OLD_WORKER_WAIT`] has passed — then it says so
+    /// ([`Event::Error`]) and builds anyway. The viewer passes the stopped workers that held GPU solvers when the new
+    /// one will build some (`Viewer::start`).
+    pub fn spawn_after(
+        initial: Scene,
+        backend: Backend,
+        gpu: Option<GpuContext>,
+        settings: Vec<DynCommand>,
+        autosave: Option<PathBuf>,
+        after: Vec<WorkerExit>,
     ) -> SimWorker {
         assert!(
             backend != Backend::Gpu || gpu.is_some(),
@@ -433,14 +513,21 @@ impl SimWorker {
         let probe = sim::ActivityProbe::new();
         let pending = Arc::new(AtomicUsize::new(0));
         let (p, q) = (probe.clone(), pending.clone());
+        let exit = WorkerExit::default();
+        let guard = ExitGuard(exit.clone());
         let handle = std::thread::Builder::new()
             .name("sim".into())
-            .spawn(move || worker(initial, settings, crx, etx, backend, gpu, autosave, None, p, q))
+            .spawn(move || {
+                let _guard = guard;
+                waited(&after, OLD_WORKER_WAIT, &etx);
+                worker(initial, settings, crx, etx, backend, gpu, autosave, None, p, q)
+            })
             .expect("spawn sim thread");
         SimWorker {
             tx: ctx,
             rx: erx,
             handle: Some(handle),
+            exit,
             probe,
             pending,
         }
@@ -468,21 +555,40 @@ impl SimWorker {
 
     #[cfg(test)]
     fn spawn_test_full(initial: Scene, probe: Arc<sim::ActivityProbe>, make: MakeProvider, autosave: Option<PathBuf>) -> SimWorker {
+        SimWorker::spawn_test_after(initial, probe, make, autosave, Vec::new(), OLD_WORKER_WAIT)
+    }
+
+    /// [`SimWorker::spawn_test_full`] after the workers in `after` ([`SimWorker::spawn_after`]), waiting at most `wait`.
+    #[cfg(test)]
+    pub fn spawn_test_after(initial: Scene, probe: Arc<sim::ActivityProbe>, make: MakeProvider, autosave: Option<PathBuf>, after: Vec<WorkerExit>, wait: Duration) -> SimWorker {
         let (ctx, crx) = channel::<Command>();
         let (etx, erx) = channel::<Event>();
         let pending = Arc::new(AtomicUsize::new(0));
         let (p, q) = (probe.clone(), pending.clone());
+        let exit = WorkerExit::default();
+        let guard = ExitGuard(exit.clone());
         let handle = std::thread::Builder::new()
             .name("sim".into())
-            .spawn(move || worker(initial, Vec::new(), crx, etx, Backend::Cpu, None, autosave, Some(make), p, q))
+            .spawn(move || {
+                let _guard = guard;
+                waited(&after, wait, &etx);
+                worker(initial, Vec::new(), crx, etx, Backend::Cpu, None, autosave, Some(make), p, q)
+            })
             .expect("spawn sim thread");
         SimWorker {
             tx: ctx,
             rx: erx,
             handle: Some(handle),
+            exit,
             probe,
             pending,
         }
+    }
+
+    /// Set when this worker's thread has ended, its solvers dropped ([`WorkerExit`]); still valid after
+    /// [`detach`](Self::detach) or [`retire`](Self::retire) (take it before).
+    pub fn exit_signal(&self) -> WorkerExit {
+        self.exit.clone()
     }
 
     /// The live solve state of this worker's solvers (activity spec A1): the stepping teacher (or
@@ -1156,15 +1262,22 @@ impl Worker {
             (snap.notes, snap.notes_total) = (d.notes, d.notes_total);
         }
         self.checkpoint_round(&snap);
-        self.cloud_jobs(&snap);
-        self.side_charges(&mut snap);
-        self.orbital_retry(&snap);
-        // after the retry: under Model only it asks for a Harris job
-        self.harris_jobs(&snap);
-        // paused with a background job in flight (an orbital refresh asked for by a changed view or
-        // the retry above): poll it once a budget, like a bond reference — else its answer waits in
-        // the auditor's channel for the next command (final review I1)
-        self.side_pending = trainable(&mut self.dy).is_some_and(|t| t.side_job_in_flight());
+        if snap.gpu_failed {
+            // the session's GPU failed (`sim::dynamics`, "A failed GPU"; review A-I1): no display, atom or Harris job
+            // is asked for any more, none is waited for, and nothing is due — the worker sleeps until a command
+            self.harris.reset();
+            self.side_pending = false;
+        } else {
+            self.cloud_jobs(&snap);
+            self.side_charges(&mut snap);
+            self.orbital_retry(&snap);
+            // after the retry: under Model only it asks for a Harris job
+            self.harris_jobs(&snap);
+            // paused with a background job in flight (an orbital refresh asked for by a changed view or
+            // the retry above): poll it once a budget, like a bond reference — else its answer waits in
+            // the auditor's channel for the next command (final review I1)
+            self.side_pending = trainable(&mut self.dy).is_some_and(|t| t.side_job_in_flight());
+        }
         // (a background refit in flight is polled once a budget too: paused, nothing else would
         // wake the worker to install it. The user's pending refit is not polled: the idle worker
         // sleeps until its due time — the loop's `wake` — and a command still lands at once)
