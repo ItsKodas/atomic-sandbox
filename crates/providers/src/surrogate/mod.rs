@@ -458,7 +458,9 @@
 //!   answer carries it, `AuditAnswer::gpu_failed`) — or the stepping teacher's own `device_failure` is latched
 //!   ([`SurrogateKs::gpu_failure`]). From then on every `evaluate` is that error — the model answers no step either
 //!   (the run is to be saved and the app restarted) — a running pass ends at its next step with it (one job, not the
-//!   rest of the queue failing in microseconds), and nothing more is sent to the auditor. `device_failure` reports it,
+//!   rest of the queue failing in microseconds), and nothing more is sent to the auditor: the display, Harris, atom
+//!   and reference requests refuse, the side queue is dropped (the references asked for answered once with the
+//!   failure) and no side job is reported in flight, so the app's worker goes idle (review A-I1). `device_failure` reports it,
 //!   so the driver stops playing (`sim::dynamics`, "A failed GPU"). The auditor's thread catches a panic inside a job
 //!   (the teacher is reset) and answers the job with an error, so a panic no longer ends the thread silently.
 //! - **No physically empty answer is kept.** Before a teacher answer becomes a sample or a reference — a fallback or
@@ -2618,8 +2620,8 @@ impl SurrogateKs {
             "surrogate: the GPU failed ({why}) — every teacher solve is refused and the model answers no more steps; nothing from the failed solve was kept"
         ));
         self.audit_due = false;
-        self.side_queue.clear();
-        self.harris_queued = None;
+        // nothing left to send or to wait for (review A-I1)
+        self.drop_side_queue(&format!("the GPU failed ({why})"));
         self.gpu_failed = Some(why);
     }
 
@@ -4654,7 +4656,12 @@ impl Trainable for SurrogateKs {
     /// A Harris payload polled in (`poll_side_jobs`, e.g. by the worker's per-round
     /// `take_atom_densities`) but not yet taken by the driver is still in flight: else the worker's
     /// lost-job check would read the job as lost and re-send it (final review M2).
+    /// Never after a GPU failure (module doc, "A failed GPU"; review A-I1): a job sent before it ends on the dead device
+    /// and its answer is not waited for, so the worker goes idle instead of polling for it.
     fn side_job_in_flight(&self) -> bool {
+        if self.gpu_down() {
+            return false;
+        }
         self.auditor.as_ref().is_some_and(|a| a.busy.is_some()) || !self.side_queue.is_empty() || self.harris_queued.is_some() || self.side_harris.is_some()
     }
 

@@ -413,6 +413,8 @@ fn parse(text: &str) -> Result<(Sampler, CheckpointInfo), String> {
         timed_out: None,
         time_limit_floor_s: floor,
         timeouts_in_a_row: 0,
+        refused_in_a_row: 0,
+        last_refusal: None,
         migration: None,
     };
     Ok((sampler, info))

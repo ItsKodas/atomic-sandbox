@@ -2684,6 +2684,11 @@ mod migration {
         atom_shift: f64,
         /// Isolated-atom solves (Z, multiplicity) that stall, once each.
         fail_atom: Vec<(u8, u32)>,
+        /// The answer is physically empty: E = 0, F = 0, a one-step SCF whose density holds no electrons (the
+        /// gpu-fault fix's `sim::answer_refusal` refuses it).
+        empty: Vec<f64>,
+        /// The session's GPU fails (`SolverError::GpuFailed`).
+        gpu_fail: Vec<f64>,
     }
 
     /// A pair-Morse teacher with the Fermi–Dirac breakdown (`EvalStats::energy`: internal E, TS, F) and scripted
@@ -2725,6 +2730,16 @@ mod migration {
             let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
             if self.tw.stall.iter().any(|x| (x - r).abs() < 1e-9) {
                 return Err(ProviderError::Solver(sim::SolverError::ScfStalled { iterations: 63, best_delta_rho: 0.2, tol: 1e-6, window: 50, level: 5e-3 }));
+            }
+            if self.tw.gpu_fail.iter().any(|x| (x - r).abs() < 1e-9) {
+                return Err(ProviderError::Solver(sim::SolverError::GpuFailed("injected: the GPU device was lost".into())));
+            }
+            if self.tw.empty.iter().any(|x| (x - r).abs() < 1e-9) {
+                let electrons = scene.nuclei.iter().map(|n| n.z as f64).sum::<f64>();
+                stats.scf_steps = 1;
+                stats.scf_check = Some(sim::ScfCheck { converged: true, electrons: 0.0, expected: electrons });
+                stats.multiplicity = Some(1);
+                return Ok(ForceResult { energy: 0.0, forces: vec![[0.0; 3]; pos.len()], stats, display: None, orbitals: None });
             }
             let internal = e + at(&self.tw.shift, r).unwrap_or(0.0);
             let ts = at(&self.tw.ts, r).unwrap_or(0.0);
@@ -3124,6 +3139,95 @@ mod migration {
         }
         let st = s.migration().unwrap();
         assert_eq!((st.counts, st.state), ([1, 0, 0, 4], sim::MigrationPhase::Complete));
+    }
+
+    /// The gpu-fault fix (review A-M5): a cold solve whose answer is physically empty is refused by `check_solve` —
+    /// listed not migrated with the reason, never appended — and the pass goes on to the next sample.
+    #[test]
+    fn a_refused_resolve_is_listed_not_migrated() {
+        let root = root("refused");
+        let rs = [1.30, 1.50, 1.60];
+        let tw = Tweaks { empty: vec![1.50], ..Tweaks::default() };
+        let samples: Vec<(CollectionSample, u8)> = rs.iter().map(|&r| (old_sample(r), Q_NONE)).collect();
+        old_folder(&root, &samples, &[]);
+        let (mut s, _) = student(tw);
+        s.attach_collection(&root, &h2_at(1.4)).unwrap();
+        s.start_migration().unwrap();
+        run(&mut s);
+        let log = log_of(&s);
+        assert_eq!((log.cursor, log.state), (3, MigrationState::Complete));
+        assert_eq!(log.not_migrated.len(), 1, "{:?}", log.not_migrated);
+        let (i, code, why) = &log.not_migrated[0];
+        assert_eq!((*i, *code), (1, ::surrogate::NotMigrated::SolveFailed));
+        assert!(why.contains("refused") && why.contains("electrons"), "{why}");
+        assert_eq!(s.collection().unwrap().samples.len(), 2, "the two good samples are appended, the refused one is not");
+    }
+
+    /// Review A-I2 for the migration: three refused cold solves in a row end the pass with the reason, before the third
+    /// is marked — the first two are listed not migrated, the third is where a resume starts — and no sample after it
+    /// is solved.
+    #[test]
+    fn three_refused_resolves_in_a_row_end_the_migration() {
+        let root = root("refused3");
+        let rs = [1.30, 1.40, 1.50, 1.60, 1.70];
+        let tw = Tweaks { empty: vec![1.40, 1.50, 1.60], ..Tweaks::default() };
+        let samples: Vec<(CollectionSample, u8)> = rs.iter().map(|&r| (old_sample(r), Q_NONE)).collect();
+        old_folder(&root, &samples, &[]);
+        let (mut s, solves) = student(tw);
+        s.attach_collection(&root, &h2_at(1.4)).unwrap();
+        s.start_migration().unwrap();
+        let mut steps = 0;
+        let e = loop {
+            match Trainable::pass_step(&mut s, &mut never()) {
+                Ok(Some(_)) => steps += 1,
+                Ok(None) => panic!("the migration ran to its end"),
+                Err(e) => break e,
+            }
+            assert!(steps < 100);
+        };
+        let m = e.to_string();
+        assert!(m.contains("3 cold solves in a row failed the answer check") && m.contains("resumes from sample 3"), "{m}");
+        assert!(e.gpu_failure().is_none());
+        let at_end = solves.load(Ordering::SeqCst);
+        assert!(Trainable::pass_step(&mut s, &mut never()).map_or(true, |p| p.is_none()), "the pass is over");
+        assert_eq!(solves.load(Ordering::SeqCst), at_end, "no sample after the third refusal is solved");
+        assert_eq!(s.collection().unwrap().samples.len(), 1, "only sample 0 is appended");
+        let log = log_of(&s);
+        assert_eq!(log.cursor, 3, "the resume starts at the third refused sample");
+        assert_ne!(log.state, MigrationState::Complete);
+        assert_eq!(log.not_migrated.iter().map(|x| x.0).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    /// The gpu-fault fix (review A-M5): the session's GPU failing during a cold solve ends the migration at once with
+    /// the failure — resumable from that sample, which is not marked — and latches it on the surrogate.
+    #[test]
+    fn a_gpu_failure_ends_the_migration_resumably() {
+        let root = root("gpufail");
+        let rs = [1.30, 1.50, 1.60];
+        let tw = Tweaks { gpu_fail: vec![1.50], ..Tweaks::default() };
+        let samples: Vec<(CollectionSample, u8)> = rs.iter().map(|&r| (old_sample(r), Q_NONE)).collect();
+        old_folder(&root, &samples, &[]);
+        let (mut s, solves) = student(tw);
+        s.attach_collection(&root, &h2_at(1.4)).unwrap();
+        s.start_migration().unwrap();
+        let mut steps = 0;
+        let e = loop {
+            match Trainable::pass_step(&mut s, &mut never()) {
+                Ok(Some(_)) => steps += 1,
+                Ok(None) => panic!("the migration ran to its end"),
+                Err(e) => break e,
+            }
+            assert!(steps < 100);
+        };
+        assert!(e.gpu_failure().is_some(), "{e}");
+        assert_eq!(s.collection().unwrap().samples.len(), 1, "only sample 0 is appended");
+        let at_end = solves.load(Ordering::SeqCst);
+        let log = log_of(&s);
+        assert_eq!(log.cursor, 1);
+        assert!(log.not_migrated.is_empty(), "the failed sample is not marked: {:?}", log.not_migrated);
+        assert!(ForceProvider::device_failure(&s).is_some(), "the failure is latched");
+        assert!(Trainable::pass_step(&mut s, &mut never()).map_or(true, |p| p.is_none()), "nothing more runs");
+        assert_eq!(solves.load(Ordering::SeqCst), at_end, "sample 2 is never solved");
     }
 
     /// Spec §7.4: a masked sample (a capped segment) is compared on all atoms — a force moved on its masked-out atom makes

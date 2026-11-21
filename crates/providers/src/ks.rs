@@ -221,8 +221,9 @@
 //! plus the display texture pool and the extrapolation history (4); each field padded with
 //! `qm_gpu::grid::GHOST` = 4 ghost layers per side, (n + 2·GHOST)³ f32;
 //! × 1.2 for what the list misses (uniforms, readback buffers, allocator slack). wgpu reports no
-//! total VRAM, so the caller picks the budget (the app: `quality::vram_budget` — half the card's
-//! memory when the adapter reports it, `gpu::GpuContext::device_local_memory_bytes`) and may say
+//! total VRAM, so the caller picks the budget (the app: `quality::vram_budget` — the user's share of
+//! the card's memory, Scene ▸ Quality ▸ GPU memory, 25–90 %, default 50 %, when the adapter reports
+//! it, `gpu::GpuContext::device_local_memory_bytes`; `ATOMIC_SANDBOX_VRAM_GB` wins) and may say
 //! where it came from (`with_vram_budget_note`, printed with the budget in a refusal).
 //! **The orbital view** (orbital-viewer plan Task 4, Task 3 review ruling 4) is not charged to the
 //! scene — that would refuse scenes that fit without it. It is checked when a payload is made:
@@ -274,8 +275,10 @@ fn solver_error(e: qm::QmError) -> ProviderError {
 }
 
 /// What a witness search that failed at the memory cap adds to its message (design 2026-11-21, "GPU memory budget
-/// setting"): the app's two ways out.
-pub const WITNESS_BUDGET_HINT: &str = "raise GPU memory in Scene ▸ Quality, or use a coarser quality (Balanced)";
+/// setting"): the app's two ways out. Nothing failed here — the solve needs more memory than its share allows — so
+/// it says raise the share; a GPU that actually failed (`sim::gpu_failed_text`) says restart, and lower it only if the
+/// failure recurs. Each names its situation so the two do not read as contradicting each other.
+pub const WITNESS_BUDGET_HINT: &str = "the GPU did not fail, but this solve needs more levels than the GPU memory share allows: raise GPU memory in Scene ▸ Quality, or use a coarser quality (Balanced)";
 
 /// `e` with [`WITNESS_BUDGET_HINT`] added when it is the solver's "no gap witness" failure at a cap the budget set:
 /// the solver had a budget and its witness cap (`witness_cap_for`) is below the hard cap
@@ -1740,6 +1743,12 @@ impl ForceProvider for GpuKs {
         let samples = solver.sample_density(state, points);
         // a failed readback is zeros: no samples rather than a density that is zero (the caller asks again)
         device_fault().ok()?;
+        // a device that failed during the dispatch can map zeros or stale data "successfully" (module doc, "A failed
+        // GPU"): checked again after the readback (review A-M2)
+        if self.gpu_failed().is_some() {
+            self.drop_after_gpu_failure();
+            return None;
+        }
         Some(samples.into_iter().map(f64::from).collect())
     }
 
@@ -1926,8 +1935,10 @@ pub(crate) mod tests {
         };
         let e = with_witness_hint(witness(3), 3, true).to_string();
         assert!(e.starts_with("numerical failure in the solver: no gap witness within 3 extra levels"), "{e}");
-        assert!(e.ends_with("fits (at most 32) — raise GPU memory in Scene ▸ Quality, or use a coarser quality (Balanced)"), "{e}");
-        assert_eq!(WITNESS_BUDGET_HINT, "raise GPU memory in Scene ▸ Quality, or use a coarser quality (Balanced)");
+        assert!(e.ends_with("fits (at most 32) — the GPU did not fail, but this solve needs more levels than the GPU memory share allows: raise GPU memory in Scene ▸ Quality, or use a coarser quality (Balanced)"), "{e}");
+        assert_eq!(WITNESS_BUDGET_HINT, "the GPU did not fail, but this solve needs more levels than the GPU memory share allows: raise GPU memory in Scene ▸ Quality, or use a coarser quality (Balanced)");
+        // it names its situation, apart from a GPU failure's message (which says restart, then lower the share)
+        assert!(e.contains("the GPU did not fail") && !e.contains(sim::GPU_FAILED_MESSAGE), "{e}");
         // the hard cap: more memory would not have helped
         let max = qm::scf::MAX_WITNESS_GROWTH;
         assert!(!with_witness_hint(witness(max), max, true).to_string().contains(WITNESS_BUDGET_HINT));

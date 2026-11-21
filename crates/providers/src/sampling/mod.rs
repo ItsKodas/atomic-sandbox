@@ -91,6 +91,14 @@
 //! pass goes on; a failed reference solve ends the pass with the error (no fit is possible
 //! without it).
 //!
+//! **Refused answers** (the gpu-fault review, A-I2): a teacher answer that `sim::answer_refusal` refuses (no SCF
+//! iteration, not converged, or a density without the scene's electrons) is a failed solve like any other — counted,
+//! a `Failed` event with the reason, never kept. But [`PASS_REFUSALS_IN_A_ROW`] of them in a row (only an accepted
+//! answer resets the count; another kind of failure between them does not) end the pass with an error that says so:
+//! a device that silently returns bad data (memory pressure has been seen to produce a NaN on a device that recorded
+//! no error) would otherwise walk the whole queue, one refused row after another. The pass keeps what it sampled
+//! before. A recorded GPU failure ends the pass at once instead (`SurrogateKs::pass_step`).
+//!
 //! **The time limit** (user report 2026-10-20): once the pass has [`TIME_LIMIT_MIN_SOLVES`]
 //! successful sample solves, a sample solve that runs past [`TIME_LIMIT_FACTOR`] × their median
 //! wall time — never below [`TIME_LIMIT_FLOOR_S`] — is given up (the teacher's `should_abort` says
@@ -224,6 +232,9 @@ pub const HOT_BURST_DT_FS: f64 = 0.25;
 pub const SCAN_CUTOFF_FRACTION: f64 = 5.0 / 6.0;
 /// Hot-burst failures in a row after which the burst ends instead of restarting (module doc, 4.).
 pub const BURST_RESTARTS_IN_A_ROW: usize = 3;
+/// Teacher answers refused in a row (`sim::answer_refusal`) after which the pass ends (module doc, "Refused answers";
+/// gpu-fault review A-I2, the controller's ruling K = 3: ending early is the conservative direction).
+pub const PASS_REFUSALS_IN_A_ROW: usize = 3;
 /// The pass's per-sample time limit (module doc, "The time limit"): this many times the median wall
 /// time of its successful sample solves…
 pub const TIME_LIMIT_FACTOR: f64 = 5.0;
@@ -496,6 +507,10 @@ pub struct Sampler {
     time_limit_floor_s: f64,
     /// Sample solves given up in a row: each doubles the limit (module doc, "The time limit").
     timeouts_in_a_row: usize,
+    /// Teacher answers refused since the last accepted one (module doc, "Refused answers").
+    refused_in_a_row: usize,
+    /// The last refusal's reason, for the pass's end.
+    last_refusal: Option<String>,
     /// A collection migration's re-solve pass (`Sampler::migration`; the `migrate` module): every step is its step.
     migration: Option<Box<migrate::Migrator>>,
 }
@@ -691,6 +706,8 @@ impl Sampler {
             timed_out: None,
             time_limit_floor_s: TIME_LIMIT_FLOOR_S,
             timeouts_in_a_row: 0,
+            refused_in_a_row: 0,
+            last_refusal: None,
             migration: None,
         })
     }
@@ -746,6 +763,8 @@ impl Sampler {
             timed_out: None,
             time_limit_floor_s: TIME_LIMIT_FLOOR_S,
             timeouts_in_a_row: 0,
+            refused_in_a_row: 0,
+            last_refusal: None,
             migration: None,
         }
     }
@@ -1205,6 +1224,10 @@ impl Sampler {
             if self.progress.finished {
                 return Ok(None);
             }
+            // refused answers in a row end the pass (module doc, "Refused answers"): no further job is solved
+            if self.refused_in_a_row >= PASS_REFUSALS_IN_A_ROW {
+                return Err(ProviderError::Invalid(self.refusals_end()));
+            }
             let Some(job) = self.queue.pop_front() else {
                 if self.burst.left == 0 {
                     self.finish();
@@ -1624,14 +1647,27 @@ impl Sampler {
         if let Some(why) = sim::answer_refusal(&r) {
             let name = t.name();
             surrogate.count_refused_answer(&why);
+            // counted toward the pass's end (module doc, "Refused answers")
+            self.refused_in_a_row += 1;
+            self.last_refusal = Some(why.clone());
             return Err(ProviderError::Invalid(format!("teacher '{name}' answer refused: {why}")));
         }
+        self.refused_in_a_row = 0;
         self.progress.last_energy = r.energy;
         if limited {
             self.solve_walls.push(started.elapsed().as_secs_f64());
             self.timeouts_in_a_row = 0;
         }
         Ok(r)
+    }
+
+    /// The pass's end after [`PASS_REFUSALS_IN_A_ROW`] refused answers (module doc, "Refused answers"), in the pass's
+    /// own words: what happened, why it may have, and what to do.
+    fn refusals_end(&self) -> String {
+        let why = self.last_refusal.as_deref().unwrap_or("no reason recorded");
+        format!(
+            "the pass stopped after {PASS_REFUSALS_IN_A_ROW} teacher answers in a row failed the answer check (the last: {why}) — nothing from them was kept, and what the pass sampled before is kept. The GPU may be near its memory limit: lower the quality or GPU memory (Scene ▸ Quality) and start the pass again; if it happens again, restart the app"
+        )
     }
 
     /// A sample job: solve, keep. `Ok(true)` solved and kept (or refused by the store),

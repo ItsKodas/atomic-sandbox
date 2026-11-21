@@ -530,8 +530,8 @@ impl SurrogateKs {
     /// replaces a queued one). False without an auditor. Never judged, never a sample.
     pub fn request_display(&mut self, scene: &Scene) -> bool {
         self.poll_side_jobs();
-        // an empty scene has no density to show (`sim::provider`, "Nothing to solve")
-        if self.auditor.is_none() || scene.nuclei.is_empty() {
+        // an empty scene has no density to show (`sim::provider`, "Nothing to solve"); nothing is sent to a failed GPU
+        if self.auditor.is_none() || scene.nuclei.is_empty() || self.gpu_down() {
             return false;
         }
         let prov = self.scene_provenance(scene);
@@ -550,7 +550,7 @@ impl SurrogateKs {
     /// pass's solves come first, and starting one drops the queued job; the caller asks again).
     pub(super) fn queue_harris(&mut self, scene: &Scene, atoms: &Arc<sim::HarrisAtoms>) -> Option<u64> {
         self.poll_side_jobs();
-        if self.auditor.is_none() || scene.nuclei.is_empty() || self.pass.is_some() {
+        if self.auditor.is_none() || scene.nuclei.is_empty() || self.pass.is_some() || self.gpu_down() {
             return None;
         }
         self.side_jobs += 1;
@@ -564,7 +564,7 @@ impl SurrogateKs {
     /// [`take_atom_densities`](Self::take_atom_densities). False without an auditor.
     pub fn request_atom_density(&mut self, z: u8, scene: &Scene) -> bool {
         self.poll_side_jobs();
-        if self.auditor.is_none() {
+        if self.auditor.is_none() || self.gpu_down() {
             return false;
         }
         let atom = isolated_atom(z, None, scene);
@@ -591,7 +591,7 @@ impl SurrogateKs {
     /// a job of the same Z in another box is another job).
     pub(super) fn request_atom_reference_job(&mut self, z: u8, mass: f64, scene: &Scene, driver: bool) -> bool {
         self.poll_side_jobs();
-        if self.auditor.is_none() {
+        if self.auditor.is_none() || self.gpu_down() {
             return false;
         }
         let n = scene.cell.n;
@@ -642,6 +642,11 @@ impl SurrogateKs {
     /// audit: only an answered step dispatches that, and paused there may be none for a long time
     /// (spec G1: a paused change is shown) — the audit goes at the next evaluate.
     pub(super) fn pump_side_queue(&mut self) {
+        // a failed GPU (module doc, "A failed GPU"; review A-I1): nothing queued is sent, and the queue is dropped
+        if self.gpu_down() {
+            self.drop_side_queue("the GPU failed");
+            return;
+        }
         if !self.auditor_idle() {
             return;
         }
@@ -661,6 +666,24 @@ impl SurrogateKs {
             self.side_queue.clear();
             self.harris_queued = None;
         }
+    }
+
+    /// The session's GPU failed (module doc, "A failed GPU"): latched from a teacher's answer, or the stepping
+    /// teacher's device says so (one non-blocking poll). No job is sent to the auditor from then on (review A-I1: the
+    /// worker's display, Harris and atom requests kept feeding a dead device).
+    pub(super) fn gpu_down(&self) -> bool {
+        self.gpu_failed.is_some() || self.teacher.device_failure().is_some()
+    }
+
+    /// Drops every side job not yet sent — the queue and the queued Harris job — and the arrived Harris payload; the
+    /// references asked for are answered with `why` (each accepted request exactly once).
+    pub(super) fn drop_side_queue(&mut self, why: &str) {
+        if !self.ref_jobs.is_empty() {
+            self.fail_references(None, why);
+        }
+        self.side_queue.clear();
+        self.harris_queued = None;
+        self.side_harris = None;
     }
 
     /// The isolated-atom densities that arrived since the last call: (Z, its display).
@@ -970,6 +993,10 @@ impl SurrogateKs {
             // answer without one (it cannot happen) is handed on and offered nowhere
             let n = ans.job.scene.cell.n;
             let job = self.ref_jobs.iter().position(|j| j.z == z && j.n == n).map(|k| self.ref_jobs.remove(k));
+            // already answered when the GPU failure dropped the queue (`drop_side_queue`): not answered twice
+            if job.is_none() && self.gpu_failed.is_some() {
+                return;
+            }
             let (driver, collection) = job.map_or((true, None), |j| (j.driver, j.collection));
             // offered to the collection only when the requesting scene shared it — and it is still
             // the one attached (`shared` module doc, "References per box"; review 1: never another

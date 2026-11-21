@@ -275,6 +275,9 @@ pub struct Migrator {
     walls: Vec<f64>,
     progress: SamplingProgress,
     notes: Vec<String>,
+    /// Cold solves refused (`sim::answer_refusal`) since the last accepted one: the pass ends at
+    /// `super::PASS_REFUSALS_IN_A_ROW` (gpu-fault review A-I2), before marking that sample.
+    refused_in_a_row: usize,
     /// Test hook (Review Focus 4, fix round 1 I1): sample `k`'s append stops with an error right after its sample
     /// record, before its status record and the cursor are written — a crash in the status window.
     #[cfg(test)]
@@ -359,6 +362,7 @@ impl Migrator {
             walls: Vec::new(),
             progress,
             notes,
+            refused_in_a_row: 0,
             #[cfg(test)]
             crash_in_window: None,
             #[cfg(test)]
@@ -576,7 +580,21 @@ impl Migrator {
         // per grid unit: a measured solve of a 123³ box predicts a 109³ one by the same (n/57)³ as the prior (`eta_s`)
         self.walls.push(started.elapsed().as_secs_f64() * MIGRATION_PRIOR_SOLVE_S / prior_solve_s(old.grid_n));
         self.progress.last_energy = r.energy;
-        // 3. the checks
+        // 3. the checks; refused answers in a row end the pass before the last is marked (module doc of `sampling`,
+        // "Refused answers"): a device returning bad data would otherwise mark the rest of the collection not migrated,
+        // and the resume re-solves the sample at the cursor
+        if let Some(why) = sim::answer_refusal(&r) {
+            self.refused_in_a_row += 1;
+            if self.refused_in_a_row >= super::PASS_REFUSALS_IN_A_ROW {
+                self.refused_in_a_row = 0;
+                return Err(ProviderError::Invalid(format!(
+                    "re-solving stopped after {} cold solves in a row failed the answer check (the last: {why}) — it resumes from sample {i}. The GPU may be near its memory limit: lower the quality or GPU memory (Scene ▸ Quality) before resuming; if it happens again, restart the app",
+                    super::PASS_REFUSALS_IN_A_ROW
+                )));
+            }
+        } else {
+            self.refused_in_a_row = 0;
+        }
         if let Err((code, why)) = check_solve(&r, old.sample.z.len(), self.h, old.multiplicity) {
             return self.not_migrated(i, code, why);
         }
