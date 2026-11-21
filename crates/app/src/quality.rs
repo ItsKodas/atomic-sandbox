@@ -12,23 +12,62 @@
 //!   σ = h (`crates/validate/references.md`, "Quality presets") against 0.741 Å (experiment).
 use crate::scene::Scene;
 
-/// The GPU memory budget (GB) when neither `ATOMIC_SANDBOX_VRAM_GB` is set nor the adapter
+//// The GPU memory budget (GB) when neither `ATOMIC_SANDBOX_VRAM_GB` is set nor the adapter
 /// reports its memory ([`set_adapter_memory`]): half the project's 24 GB RX 7900 XTX
 /// (`providers::ks`, "GPU memory"). Set the variable on such a card.
 pub const VRAM_BUDGET_GB: f64 = 12.0;
 
-/// The share of the card's memory the budget takes when the adapter reports it (user request
-/// 2026-10-19): half, as [`VRAM_BUDGET_GB`] is of the project's card — the rest is the
-/// renderer's, the driver's and other applications'.
-pub const ADAPTER_SHARE: f64 = 0.5;
+/// The share of the card's memory (%) the budget takes when the adapter reports it and the user
+/// has not moved Scene ▸ Quality ▸ GPU memory (user request 2026-10-19): half, as
+/// [`VRAM_BUDGET_GB`] is of the project's card — the rest is the renderer's, the driver's and
+/// other applications'.
+pub const DEFAULT_SHARE_PCT: u32 = 50;
+
+/// The GPU memory slider's range (%; design 2026-11-21, "GPU memory budget setting").
+pub const SHARE_MIN_PCT: u32 = 25;
+pub const SHARE_MAX_PCT: u32 = 90;
+
+/// Above this share (%) the slider warns: the screen, the driver and other applications share
+/// the card.
+pub const SHARE_WARN_PCT: u32 = 70;
 
 /// The card's device-local memory (bytes; 0 = not reported), set once a device exists
 /// (`Viewer::start`, from `GpuContext::device_local_memory_bytes`).
 static ADAPTER_MEMORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The share of the card the budget takes (%), set from the UI (`ui::Action::GpuMemory`, applied
+/// by the viewer; the profile's `gpu_memory`), kept apart from `ATOMIC_SANDBOX_VRAM_GB`.
+static MEMORY_SHARE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(DEFAULT_SHARE_PCT);
+
 /// Records the card's memory for [`vram_budget`] (`None`: the backend did not report it).
 pub fn set_adapter_memory(bytes: Option<u64>) {
     ADAPTER_MEMORY.store(bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The card's memory as recorded (bytes; 0 = not reported).
+pub fn adapter_memory() -> u64 {
+    ADAPTER_MEMORY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `pct` (%) rounded and clamped to the slider's range [`SHARE_MIN_PCT`, `SHARE_MAX_PCT`] (a
+/// non-finite value is the default).
+pub fn clamp_share(pct: f64) -> u32 {
+    if !pct.is_finite() {
+        return DEFAULT_SHARE_PCT;
+    }
+    pct.round().clamp(SHARE_MIN_PCT as f64, SHARE_MAX_PCT as f64) as u32
+}
+
+/// Sets the share of the card the budget takes (%; clamped by [`clamp_share`]) for every later
+/// [`vram_budget`] — the quality refusal, the box advice, the builder, segments and the solvers
+/// the worker builds next.
+pub fn set_memory_share(pct: u32) {
+    MEMORY_SHARE.store(clamp_share(pct as f64), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The share of the card the budget takes (%).
+pub fn memory_share() -> u32 {
+    MEMORY_SHARE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Where the GPU memory budget came from.
@@ -36,8 +75,8 @@ pub fn set_adapter_memory(bytes: Option<u64>) {
 pub enum BudgetSource {
     /// `ATOMIC_SANDBOX_VRAM_GB`.
     Env,
-    /// [`ADAPTER_SHARE`] of the card's reported memory (bytes).
-    Adapter { card_bytes: u64 },
+    /// `share_pct` % (Scene ▸ Quality ▸ GPU memory) of the card's reported memory (bytes).
+    Adapter { card_bytes: u64, share_pct: u32 },
     /// [`VRAM_BUDGET_GB`]: the card's memory is not known.
     Default,
 }
@@ -61,36 +100,103 @@ impl VramBudget {
         format!("{:.1} GB", self.bytes as f64 / 1e9)
     }
 
-    /// Where it came from, for a refusal: "half of this GPU's 25.8 GB; ATOMIC_SANDBOX_VRAM_GB
-    /// overrides it".
+    /// Where it came from, for a refusal: "60 % of this GPU's 8.4 GB, set in Scene ▸ Quality;
+    /// ATOMIC_SANDBOX_VRAM_GB overrides it".
     pub fn why(&self) -> String {
         match self.source {
             BudgetSource::Env => "set by ATOMIC_SANDBOX_VRAM_GB".into(),
-            BudgetSource::Adapter { card_bytes } => {
-                format!("{:.0} % of this GPU's {:.1} GB; ATOMIC_SANDBOX_VRAM_GB overrides it", 100.0 * ADAPTER_SHARE, card_bytes as f64 / 1e9)
+            BudgetSource::Adapter { card_bytes, share_pct } => {
+                format!("{share_pct} % of this GPU's {:.1} GB, set in Scene ▸ Quality; ATOMIC_SANDBOX_VRAM_GB overrides it", card_bytes as f64 / 1e9)
             }
             BudgetSource::Default => "the default: this GPU did not report its memory; set ATOMIC_SANDBOX_VRAM_GB".into(),
         }
     }
 }
 
-/// The GPU memory budget: `ATOMIC_SANDBOX_VRAM_GB` (a positive number of GB), else
-/// [`ADAPTER_SHARE`] of the card's memory when the adapter reported it, else [`VRAM_BUDGET_GB`].
-pub fn vram_budget() -> VramBudget {
-    let env = std::env::var("ATOMIC_SANDBOX_VRAM_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|x| x.is_finite() && *x > 0.0);
-    budget_from(env, ADAPTER_MEMORY.load(std::sync::atomic::Ordering::Relaxed))
+/// `ATOMIC_SANDBOX_VRAM_GB` when it is a positive number of GB.
+pub fn env_budget_gb() -> Option<f64> {
+    std::env::var("ATOMIC_SANDBOX_VRAM_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|x| x.is_finite() && *x > 0.0)
 }
 
-/// [`vram_budget`] from its inputs: the variable's GB and the card's bytes (0 = unknown).
-pub fn budget_from(env_gb: Option<f64>, card_bytes: u64) -> VramBudget {
+/// The GPU memory budget: `ATOMIC_SANDBOX_VRAM_GB` (a positive number of GB), else the share set
+/// in Scene ▸ Quality ([`memory_share`]; [`DEFAULT_SHARE_PCT`] until it is moved) of the card's
+/// memory when the adapter reported it, else [`VRAM_BUDGET_GB`].
+pub fn vram_budget() -> VramBudget {
+    budget_from(env_budget_gb(), adapter_memory(), memory_share())
+}
+
+/// [`vram_budget`] from its inputs: the variable's GB, the card's bytes (0 = unknown) and the
+/// share (%, clamped to the slider's range).
+pub fn budget_from(env_gb: Option<f64>, card_bytes: u64, share_pct: u32) -> VramBudget {
     match env_gb {
         Some(gb) => VramBudget { bytes: (gb * 1e9) as u64, source: BudgetSource::Env },
-        None if card_bytes > 0 => VramBudget { bytes: (card_bytes as f64 * ADAPTER_SHARE) as u64, source: BudgetSource::Adapter { card_bytes } },
+        None if card_bytes > 0 => {
+            let share_pct = clamp_share(share_pct as f64);
+            VramBudget { bytes: (card_bytes as f64 * share_pct as f64 / 100.0) as u64, source: BudgetSource::Adapter { card_bytes, share_pct } }
+        }
         None => VramBudget { bytes: (VRAM_BUDGET_GB * 1e9) as u64, source: BudgetSource::Default },
     }
 }
 
-/// GPU solvers a backend runs: 1 for the GPU backend, 2 for the estimated solver with a GPU
+/// Scene ▸ Quality ▸ GPU memory's line for a share of `pct` % on `solvers` GPU solvers
+/// ([`gpu_solvers`]): "GPU memory: 60 % of this GPU's 8.4 GB = 5.0 GB (teacher 2.5 GB + auditor
+/// 2.5 GB)", "(one solver)" on the GPU backend, "not used by the CPU solver" without one; the
+/// variable's or the default's budget when the slider does not apply.
+pub fn memory_line(env_gb: Option<f64>, card_bytes: u64, pct: u32, solvers: u64) -> String {
+    let b = budget_from(env_gb, card_bytes, pct);
+    let head = match b.source {
+        BudgetSource::Env => format!("GPU memory: set by ATOMIC_SANDBOX_VRAM_GB = {}", b.gb()),
+        BudgetSource::Adapter { card_bytes, share_pct } => format!("GPU memory: {share_pct} % of this GPU's {:.1} GB = {}", card_bytes as f64 / 1e9, b.gb()),
+        BudgetSource::Default => format!("GPU memory: this GPU did not report its memory, so the {} default applies (set ATOMIC_SANDBOX_VRAM_GB)", b.gb()),
+    };
+    match solvers {
+        0 => format!("{head} — not used by the CPU solver"),
+        1 => format!("{head} (one solver)"),
+        _ => {
+            let half = VramBudget { bytes: b.bytes / 2, ..b };
+            format!("{head} (teacher {} + auditor {})", half.gb(), half.gb())
+        }
+    }
+}
+
+//// Serialises the tests that move the process-wide budget ([`set_memory_share`],
+/// [`BudgetTestGuard::set_card`]) with the ones whose expectation reads it; the guard puts the
+/// share back to the default, and a card memory it set back to what it was, when it drops. A test
+/// that moves the budget also holds the GPU tests' lock (`sim::tests::gpu_lock`, taken first),
+/// since the GPU tests build their solvers from it.
+#[cfg(test)]
+pub(crate) fn budget_test_lock() -> BudgetTestGuard {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    BudgetTestGuard { _g: g, card: None }
+}
+
+#[cfg(test)]
+pub(crate) struct BudgetTestGuard {
+    _g: std::sync::MutexGuard<'static, ()>,
+    card: Option<u64>,
+}
+
+#[cfg(test)]
+impl BudgetTestGuard {
+    /// Records a card of `bytes` for the guard's lifetime.
+    pub(crate) fn set_card(&mut self, bytes: u64) {
+        self.card.get_or_insert(adapter_memory());
+        set_adapter_memory(Some(bytes));
+    }
+}
+
+#[cfg(test)]
+impl Drop for BudgetTestGuard {
+    fn drop(&mut self) {
+        set_memory_share(DEFAULT_SHARE_PCT);
+        if let Some(c) = self.card {
+            set_adapter_memory(Some(c));
+        }
+    }
+}
+
+// GPU solvers a backend runs: 1 for the GPU backend, 2 for the estimated solver with a GPU
 /// teacher (the teacher and its background auditor, each a full `GpuKs`), 0 on the CPU.
 pub fn gpu_solvers(backend: crate::sim::Backend, gpu_available: bool) -> u64 {
     match backend {
@@ -386,22 +492,92 @@ const H2_PRECISE: &str = "H₂ bond 0.807 Å (1.524 Bohr) at σ = h = 0.10; exac
 mod tests {
     use super::*;
 
-    /// The budget's order (user request 2026-10-19): the variable, else half the card's reported
-    /// memory, else 12 GB; the refusal names the budget and its source.
+    /// The budget's order (user request 2026-10-19): the variable, else the share set in Scene ▸
+    /// Quality (half by default) of the card's reported memory, else 12 GB; the refusal names the
+    /// budget and its source.
     #[test]
     fn the_vram_budget_follows_the_variable_then_the_card_then_the_default() {
         let card = 25_753_026_560; // 24 GiB, as the RX 7900 XTX's Vulkan heap reports it
-        assert_eq!(budget_from(Some(8.0), card), VramBudget { bytes: 8_000_000_000, source: BudgetSource::Env });
-        let b = budget_from(None, card);
-        assert_eq!(b, VramBudget { bytes: card / 2, source: BudgetSource::Adapter { card_bytes: card } });
-        assert_eq!((b.gb(), b.why()), ("12.9 GB".into(), "50 % of this GPU's 25.8 GB; ATOMIC_SANDBOX_VRAM_GB overrides it".into()));
-        let d = budget_from(None, 0);
+        assert_eq!(budget_from(Some(8.0), card, DEFAULT_SHARE_PCT), VramBudget { bytes: 8_000_000_000, source: BudgetSource::Env });
+        let b = budget_from(None, card, DEFAULT_SHARE_PCT);
+        assert_eq!(b, VramBudget { bytes: card / 2, source: BudgetSource::Adapter { card_bytes: card, share_pct: 50 } });
+        assert_eq!((b.gb(), b.why()), ("12.9 GB".into(), "50 % of this GPU's 25.8 GB, set in Scene ▸ Quality; ATOMIC_SANDBOX_VRAM_GB overrides it".into()));
+        let d = budget_from(None, 0, DEFAULT_SHARE_PCT);
         assert_eq!((d.bytes, d.source), (12_000_000_000, BudgetSource::Default));
         assert!(d.why().contains("did not report"));
         let mut big = Scene::preset("h2").unwrap();
         big.grid_n = 201;
-        let e = vram_check(&big, 2, budget_from(None, 4_000_000_000)).unwrap_err();
-        assert!(e.contains("over the 2.0 GB budget (50 % of this GPU's 4.0 GB; ATOMIC_SANDBOX_VRAM_GB overrides it)"), "{e}");
+        let e = vram_check(&big, 2, budget_from(None, 4_000_000_000, DEFAULT_SHARE_PCT)).unwrap_err();
+        assert!(e.contains("over the 2.0 GB budget (50 % of this GPU's 4.0 GB, set in Scene ▸ Quality; ATOMIC_SANDBOX_VRAM_GB overrides it)"), "{e}");
+    }
+
+    /// The GPU memory setting (design 2026-11-21): the share moves the card's budget — 25, 50 and
+    /// 90 % of the 8.4 GB card that refused at step 2 in v0.2.0 — the variable still wins over any
+    /// share, and a card that did not report its memory keeps the 12 GB default whatever the share.
+    #[test]
+    fn the_share_sets_the_cards_budget_and_the_variable_still_wins() {
+        let card = 8_400_000_000;
+        for (pct, bytes, gb) in [(25, 2_100_000_000, "2.1 GB"), (50, 4_200_000_000, "4.2 GB"), (90, 7_560_000_000, "7.6 GB")] {
+            let b = budget_from(None, card, pct);
+            assert_eq!(b, VramBudget { bytes, source: BudgetSource::Adapter { card_bytes: card, share_pct: pct } }, "{pct} %");
+            assert_eq!(b.gb(), gb);
+        }
+        let b = budget_from(None, card, 60);
+        assert_eq!(b.why(), "60 % of this GPU's 8.4 GB, set in Scene ▸ Quality; ATOMIC_SANDBOX_VRAM_GB overrides it");
+        // the variable wins over every share
+        for pct in [25, 50, 90] {
+            assert_eq!(budget_from(Some(3.0), card, pct), VramBudget { bytes: 3_000_000_000, source: BudgetSource::Env });
+        }
+        assert_eq!(budget_from(Some(3.0), card, 60).why(), "set by ATOMIC_SANDBOX_VRAM_GB");
+        // an unknown card: the default, the share unused
+        for pct in [25, 90] {
+            assert_eq!(budget_from(None, 0, pct), VramBudget { bytes: 12_000_000_000, source: BudgetSource::Default });
+        }
+        // a share outside the slider's range is clamped to it
+        assert_eq!(budget_from(None, card, 5).source, BudgetSource::Adapter { card_bytes: card, share_pct: 25 });
+        assert_eq!(budget_from(None, card, 100).bytes, 7_560_000_000);
+    }
+
+    /// The slider's range: 25–90 %, rounded to whole percent; a non-finite value is the default.
+    #[test]
+    fn the_share_clamps_to_25_to_90() {
+        assert_eq!(clamp_share(10.0), SHARE_MIN_PCT);
+        assert_eq!(clamp_share(25.0), 25);
+        assert_eq!(clamp_share(59.6), 60);
+        assert_eq!(clamp_share(90.0), 90);
+        assert_eq!(clamp_share(95.0), SHARE_MAX_PCT);
+        assert_eq!(clamp_share(f64::NAN), DEFAULT_SHARE_PCT);
+        assert_eq!((SHARE_MIN_PCT, SHARE_MAX_PCT, DEFAULT_SHARE_PCT), (25, 90, 50));
+    }
+
+    /// The setting moves the process-wide budget every caller reads ([`vram_budget`]), the variable
+    /// aside (unset in the tests).
+    #[test]
+    fn set_memory_share_moves_vram_budget() {
+        // the GPU tests build solvers from this budget (and a viewer's start records the card):
+        // not beside them; the GPU lock first, as every test that holds both
+        let _gpu = crate::sim::tests::gpu_lock();
+        let mut b = budget_test_lock();
+        if env_budget_gb().is_some() {
+            return;
+        }
+        b.set_card(8_400_000_000);
+        set_memory_share(60);
+        assert_eq!(memory_share(), 60);
+        assert_eq!(vram_budget(), VramBudget { bytes: 5_040_000_000, source: BudgetSource::Adapter { card_bytes: 8_400_000_000, share_pct: 60 } });
+        set_memory_share(99);
+        assert_eq!(memory_share(), 90, "clamped");
+    }
+
+    /// Scene ▸ Quality ▸ GPU memory's line: the share, the card and the budget, split per solver.
+    #[test]
+    fn the_memory_line_names_the_share_and_the_split() {
+        let card = 8_400_000_000;
+        assert_eq!(memory_line(None, card, 60, 2), "GPU memory: 60 % of this GPU's 8.4 GB = 5.0 GB (teacher 2.5 GB + auditor 2.5 GB)");
+        assert_eq!(memory_line(None, card, 60, 1), "GPU memory: 60 % of this GPU's 8.4 GB = 5.0 GB (one solver)");
+        assert_eq!(memory_line(None, card, 60, 0), "GPU memory: 60 % of this GPU's 8.4 GB = 5.0 GB — not used by the CPU solver");
+        assert_eq!(memory_line(Some(6.0), card, 60, 1), "GPU memory: set by ATOMIC_SANDBOX_VRAM_GB = 6.0 GB (one solver)");
+        assert!(memory_line(None, 0, 60, 2).starts_with("GPU memory: this GPU did not report its memory, so the 12.0 GB default applies"));
     }
 
     /// The presets' 12 Bohr box at every level: 41³, 49³, 81³, 121³ — never smaller than 12;
