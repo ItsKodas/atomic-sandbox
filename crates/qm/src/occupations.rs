@@ -107,9 +107,26 @@
 //!   weight ≲ 3e-5 at g = 1e-3 against the window's D ≈ 0.18 Ha), which is why an untested column (the GPU's buffer)
 //!   is a witness only at r ≤ g. Both solvers let the top tested level decide a (tight) step only at
 //!   r ≤ 1.5 g and otherwise grow the block by one vector (`qm-gpu` `solve_fd`; the CPU's `scf::solve_fd` since plan
-//!   2026-11-13 Task 11 fix round 1, solver-half review M5, `WITNESS_RESIDUAL_FACTOR`). The GPU solver checks the rest the way it can: a Rayleigh–Ritz step whose formed
+//!   2026-11-13 Task 11 fix round 1, solver-half review M5, `WITNESS_RESIDUAL_FACTOR`) — on the GPU after the lowest
+//!   converged witness below (the next bullet) found none. The GPU solver checks the rest the way it can: a Rayleigh–Ritz step whose formed
 //!   vectors do not reproduce their Ritz values (a lost column, `qm_gpu::eigen` "Ritz vectors that do not match their
 //!   Ritz values") is undone; one it cannot undo is an error on the SCF path.
+//! - **The lowest converged witness** (GPU, `witness_keep_within`; branch `eig-floor`, 2026-11-21). The bound above is per
+//!   level: λ_t ≥ θ_t − r_t needs only column t at r_t ≲ g and the columns below it holding the lowest t − 1 levels
+//!   (premise M2); every level above t is then ≥ λ_t, whatever its own column's residual. So when the top tested level
+//!   passes both arms at r > 1.5 g, the GPU first looks for the lowest tested rank t ≥ n that clears both arms on
+//!   θ_t − r_t **at r_t ≤ 1.5 g**; if there is one it decides the step and the block is trimmed above it exactly as
+//!   `witness_keep` would (t + 1, or t + 2 with a passing spare) — the level the old rule's eventual trim kept anyway —
+//!   and only if there is none does the block grow by one. Why the GPU needs it: the top column of a block converges
+//!   slowest (its rate is set by the gap to the first level outside the block), and `qm_gpu::eigen`'s floor diagnosis
+//!   reads the split residual scaled by tol/g, whose band, 10·floor·g/tol = 3.3 g at the floor-limited tight tol
+//!   3·floor, lets a loose top leave on a `Floor` exit anywhere up to 3.3 g. Each growth then made a fresh vector the
+//!   new top, in the box continuum, and the chain ran on: measured on a warm water step at 119³ × 0.15 (17.7 Bohr, the
+//!   app's Estimated-mode box), a block of 7 grown one vector at a time to 20 per spin, 3281 LOBPCG iterations and
+//!   68.6 s, while the first level that clears both arms (θ = 0.0389 Ha against a 0.009 Ha window) was at r = 4.3e-5
+//!   from the second call on and ~1e-5 after; with the rule that level decides at the second call (1054 iterations,
+//!   peak block 8; `qm_gpu::scf` module doc). The CPU keeps the top-level rule: its f64 eigensolver meets g except at
+//!   its cap.
 //! - **Growth** (`grown_extras`): when the witness fails the block grows by its current extra count (the extra block
 //!   doubles: 1, 2, 4, 8, 16, 32), clamped to the cap, instead of one vector per re-solve; each grown vector keeps
 //!   its index-seeded guess. Reaching e extras costs ⌈log₂ e⌉ re-solves instead of e − 1.
@@ -374,6 +391,31 @@ pub fn witness_keep_tail(evals: &[f64], residuals: &[f64], n: usize, mu: f64, kt
         Some(t) => t + 1,
         None => evals.len(),
     }
+}
+
+/// The witness of a tight GPU step whose top level left its eigensolve above `r_max` (module doc, "The lowest converged
+/// witness"): `witness_keep_tail`'s keep count, but read at the lowest rank t ≥ n whose lower bound θ_t − r_t clears both
+/// arms **and** whose residual r_t ≤ `r_max` (premise M2: a lower bound only at r ≲ g) — t + 1, or t + 2 when the level
+/// above t clears both arms on its lower bound too (the spare, as in `witness_keep`). `None` when no level qualifies (the
+/// block must grow); `Some(evals.len())` for an empty channel (n = 0), which needs no witness.
+pub fn witness_keep_within(evals: &[f64], residuals: &[f64], n: usize, mu: f64, kt: f64, tail_kt: f64, r_max: f64) -> Option<usize> {
+    assert_eq!(evals.len(), residuals.len(), "witness_keep_within: one residual per level");
+    if n == 0 {
+        return Some(evals.len());
+    }
+    if evals.len() <= n {
+        return None;
+    }
+    let order = ascending(evals);
+    let eps_n = evals[order[n - 1]];
+    let passes = |rank: usize| {
+        let i = order[rank];
+        let lower = evals[i] - residuals[i];
+        lower >= eps_n + WITNESS_GAP && lower - mu >= tail_kt * kt
+    };
+    // (a non-finite residual fails `≤ r_max` and, through the lower bound, both arms)
+    let t = (n..order.len()).find(|&t| passes(t) && residuals[order[t]] <= r_max)?;
+    Some(if t + 1 < order.len() && passes(t + 1) { t + 2 } else { t + 1 })
 }
 
 /// The extra-vector count after one growth of a block holding `extras` vectors beyond its n (module doc, "Growth"):
@@ -659,6 +701,48 @@ mod tests {
             assert!(witness_bound_reached(&evals[..k], &res[..k], 1, mu, kt));
         }
         assert_eq!(witness_keep(&evals, &zero, 0, mu, kt), 7, "an empty channel keeps its block");
+    }
+
+    /// `witness_keep_within`: the lowest tested level that clears both arms on its lower bound **at a residual within
+    /// `r_max`** decides, with `witness_keep`'s spare rule above it; a passing level above `r_max` is skipped (it is not
+    /// yet a lower bound, premise M2), and none at all is `None` (the block must grow).
+    #[test]
+    fn witness_keep_within_reads_the_lowest_converged_witness() {
+        let kt = ELECTRON_KT;
+        let mu = -0.4; // the arms: lower bound ≥ μ + 0.18 = −0.22 and ≥ ε_(1) + 0.1 = −0.4
+        let evals = [-0.5, -0.3, -0.25, -0.1, -0.05, 0.0, 0.3];
+        let r_max = 1.5e-3;
+        // everything converged: `witness_keep`'s answer (−0.1 at rank 3 and its spare −0.05)
+        let zero = [0.0; 7];
+        assert_eq!(witness_keep_within(&evals, &zero, 1, mu, kt, WITNESS_TAIL_KT, r_max), Some(witness_keep(&evals, &zero, 1, mu, kt)));
+        // the top (rank 6) above r_max, as a floor exit leaves it: rank 3 still decides, the same keep
+        let top_loose = [0.0, 0.0, 0.0, 1e-4, 0.0, 0.0, 3e-3];
+        assert_eq!(witness_keep_within(&evals, &top_loose, 1, mu, kt, WITNESS_TAIL_KT, r_max), Some(5));
+        // the first passing level (rank 3) above r_max: rank 4 decides; its spare rank 5 passes on its lower bound
+        let first_loose = [0.0, 0.0, 0.0, 2e-3, 1e-3, 3e-3, 3e-3];
+        assert_eq!(witness_keep_within(&evals, &first_loose, 1, mu, kt, WITNESS_TAIL_KT, r_max), Some(6));
+        // … and with only the top within r_max, the top decides alone
+        let only_top = [0.0, 0.0, 0.0, 2e-3, 2e-3, 2e-3, 1e-3];
+        assert_eq!(witness_keep_within(&evals, &only_top, 1, mu, kt, WITNESS_TAIL_KT, r_max), Some(7));
+        // no passing level within r_max: no witness
+        let none = [0.0, 0.0, 0.0, 2e-3, 2e-3, 2e-3, 2e-3];
+        assert_eq!(witness_keep_within(&evals, &none, 1, mu, kt, WITNESS_TAIL_KT, r_max), None);
+        // a level within r_max whose lower bound misses the tail arm is no witness (rank 2, −0.25 < −0.22)
+        assert_eq!(witness_keep_within(&evals[..3], &zero[..3], 1, mu, kt, WITNESS_TAIL_KT, r_max), None);
+        // the tail arm is the caller's (a loosened step's 6 kT window lets rank 1 decide, rank 2 its spare)
+        assert_eq!(witness_keep_within(&evals[..3], &zero[..3], 1, mu, kt, 6.0, r_max), Some(3));
+        // whatever is kept passes the witness with its top level's residual within r_max, or its top is the spare
+        for res in [zero, top_loose, first_loose, only_top] {
+            let k = witness_keep_within(&evals, &res, 1, mu, kt, WITNESS_TAIL_KT, r_max).expect("a witness");
+            assert!(witness_bound_reached(&evals[..k], &res[..k], 1, mu, kt));
+            assert!(res[k - 1] <= r_max || res[k - 2] <= r_max, "the witness is the kept top or the one below the spare");
+        }
+        // an empty channel keeps its block, a block without a level above n has none
+        assert_eq!(witness_keep_within(&evals, &zero, 0, mu, kt, WITNESS_TAIL_KT, r_max), Some(7));
+        assert_eq!(witness_keep_within(&evals[..1], &zero[..1], 1, mu, kt, WITNESS_TAIL_KT, r_max), None);
+        // order-independent: the same block shuffled keeps the same count
+        let (e2, r2) = ([0.0, -0.5, 0.3, -0.1, -0.3, -0.05, -0.25], [0.0, 0.0, 3e-3, 2e-3, 0.0, 1e-3, 0.0]);
+        assert_eq!(witness_keep_within(&e2, &r2, 1, mu, kt, WITNESS_TAIL_KT, r_max), Some(6));
     }
 
     #[test]

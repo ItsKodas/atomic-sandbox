@@ -210,6 +210,18 @@
 //!   density bound, was measured and not adopted (`qm::occupations` "No loose stop"). Measured: 11 steps, 11 s, peak
 //!   block 14 (9 extra vectors per spin, the buffer included; the step-1 36 kT window); the app's 177³ × 0.08 VRAM case
 //!   (14 Bohr): 13 steps, 37 s, peak block 8 (3 extra vectors per spin), no growth — `providers::ks::WITNESS_GROWTH_COUNTED`.
+//! - **The lowest converged witness** (branch `eig-floor`, 2026-11-21; `qm::occupations` "The lowest converged witness" is the
+//!   bound). On a tight step whose top tested level passes both witness arms at r > `EIG_GUESS_FACTOR`·g, the lowest
+//!   tested level that passes them at r ≤ `EIG_GUESS_FACTOR`·g decides (`qm::witness_keep_within`; the block is trimmed
+//!   above it as by the witness trim) before the block grows by one vector (`SolveProfile::lower_witnesses` counts
+//!   them). Without it a warm step at the app's Estimated-mode box (119³ × 0.15) grew one vector per call, each new
+//!   top a fresh box state that left LOBPCG on a floor exit at 2–3.3 g while the level below it sat at r ≈ 1e-5
+//!   (`providers` `eig_floor::h2o_estimated_box_warm_chain`, pseudised water, the pass's warm path from the preset
+//!   through five σ = 0.1 Bohr displacements): its first warm solve took 3 281 LOBPCG iterations, 23 one-vector growths
+//!   and a peak block of 20 per spin (68.6 s), its fourth was stopped after 3 719 iterations and 570 s of eigensolves
+//!   still in SCF step 1 at a block of 29; with the rule 1 054 and 1 091 iterations, peak block 8. The sampling pass's
+//!   "hang" between samples was this (`eig_floor::quick_look_pass_wall_per_sample`). The answers stay within the
+//!   warm/cold path noise: chain − cold |ΔF| ≤ 6.0e-7 Ha and max |ΔF_I| ≤ 4.0e-5 Ha/Bohr (3.9e-7 and 4.1e-5 before).
 //! - **Pause and cancel inside an eigensolve** (Task 9c): `solve_polled`'s second poll reaches the FD channels' LOBPCG
 //!   (once per iteration; `solve_with`/`solve_observed` keep their one poll per step, which callers count as steps —
 //!   the Activity probe); an aborted eigensolve abandons the solve like an abort before a step, parking the iterate as
@@ -324,7 +336,7 @@ use nalgebra::{DMatrix, DVector};
 use qm::ionic::{core_overlaps, IonicSetup, CORE_OVERLAP_WARNING};
 use qm::nuclear::{cold_guess, ionic_repulsion, nuclear_repulsion};
 use qm::scf::{ascending, initial_orbitals, MAX_WITNESS_GROWTH};
-use qm::{fermi_dirac, grown_extras, partial_levels, step_tail_kt, tight_columns, tight_start, witness_bound_reached_tail, witness_keep_tail, FdOccupations, PartialLevel, WITNESS_GAP,
+use qm::{fermi_dirac, grown_extras, partial_levels, step_tail_kt, tight_columns, tight_start, witness_bound_reached_tail, witness_keep_tail, witness_keep_within, FdOccupations, PartialLevel, WITNESS_GAP,
          WITNESS_GUARD_TOL, WITNESS_TAIL_KT};
 use qm::{Energy, Occupations, QmError, ScfProgress, ScfSettings, ScfStats, StallWatch, System};
 
@@ -483,6 +495,10 @@ pub struct SolveProfile {
     /// `FermiDirac`: the tight steps whose tested witness passed both arms at r > `EIG_GUESS_FACTOR`·g and grew the
     /// block by one instead (task 9d review m3).
     pub witness_residual_growths: usize,
+    /// `FermiDirac`: the tight steps whose top tested level passed both arms at r > `EIG_GUESS_FACTOR`·g and a lower
+    /// tested level, at r ≤ `EIG_GUESS_FACTOR`·g, decided the witness instead of a growth (module doc, "The lowest
+    /// converged witness").
+    pub lower_witnesses: usize,
     /// `FermiDirac`: the frozen steps that stalled and dropped the DIIS entries older than the freeze (Task 9d).
     pub diis_freeze_trims: usize,
     /// The LOBPCG steps redone without P after a failed Ritz-vector formation (`EigenStats::restores`, summed over the
@@ -907,6 +923,8 @@ impl Channel<'_> {
                           self.spin, orbs.len(), es.iterations, es.stop, es.head_kept, es.readbacks, es.fallbacks,
                           es.alpha_worst, t_call.elapsed().as_secs_f64(), es.split_residual,
                           evals[..checked].iter().copied().fold(f64::NEG_INFINITY, f64::max));
+                let srt: Vec<String> = ascending(&evals[..checked]).iter().skip(self.n).map(|&i| format!("{:.4}/{:.1e}", evals[i], residuals[i])).collect();
+                eprintln!("    tested levels above n, θ/r: {}", srt.join(" "));
             }
             kept &= es.head_kept;
             if es.head_kept && es.iterations > 0 { inner.profile.locked_calls += 1; }
@@ -924,17 +942,30 @@ impl Channel<'_> {
             // is a lower bound under premise M2 only at r ≲ g, and the top tested column can exit above g (a guess
             // accepted inside its 1.5× band, a Floor or MaxIter exit, a swapped-in column after its two retries) — so
             // it decides a tight step only at r ≤ EIG_GUESS_FACTOR·g; above that the block grows by one vector (as the
-            // buffer's rule does) and is re-solved; at the cap no vector fits and the bound is θ − r as read
+            // buffer's rule does) and is re-solved; at the cap no vector fits and the bound is θ − r as read. Before it
+            // grows, a lower tested level that clears both arms at r ≤ EIG_GUESS_FACTOR·g decides instead (module doc, "The
+            // lowest converged witness"): the top of a block converges slowest, and growing made each new top a fresh
+            // vector in the box continuum — the chain measured on the 119³ water pass (a block of 7 grown to 23 per spin)
             let top_r = ascending(&evals[..checked]).last().map_or(0.0, |&i| residuals[i]);
-            if witness && self.loosened_delta.is_none() && top_r > EIG_GUESS_FACTOR * WITNESS_GUARD_TOL && orbs.len() - self.n < self.cap {
-                inner.profile.witness_residual_growths += 1;
-                self.grow(orbs, evals, pool);
-                continue;
-            }
-            if witness {
+            let r_witness = EIG_GUESS_FACTOR * WITNESS_GUARD_TOL;
+            let keep = if witness && self.loosened_delta.is_none() && top_r > r_witness && orbs.len() - self.n < self.cap {
+                match witness_keep_within(&evals[..checked], &residuals[..checked], self.n, mu, kt, tail_kt, r_witness) {
+                    Some(keep) => {
+                        inner.profile.lower_witnesses += 1;
+                        Some(keep)
+                    }
+                    None => {
+                        inner.profile.witness_residual_growths += 1;
+                        self.grow(orbs, evals, pool);
+                        continue;
+                    }
+                }
+            } else if witness {
+                Some(witness_keep_tail(&evals[..checked], &residuals[..checked], self.n, mu, kt, tail_kt))
+            } else { None };
+            if let Some(keep) = keep {
                 // the trim (`qm::occupations` "Trim"): drop a doubled block's overshoot above the lowest witness, keeping
                 // the next level up as the buffer when one fits
-                let keep = witness_keep_tail(&evals[..checked], &residuals[..checked], self.n, mu, kt, tail_kt);
                 let len = if buffered(keep + 1) { keep + 1 } else { keep };
                 let (mut occ, checked) = if len < orbs.len() {
                     let order = ascending(evals);
@@ -2014,6 +2045,43 @@ mod tests {
                    "cold solves are bitwise reproducible");
     }
 
+    /// Branch `eig-floor`, 2026-11-21 (module doc, "The lowest converged witness"): the pass's warm path in a large box —
+    /// all-electron H₂ at 81³ × 0.25 (20 Bohr), FD at tol 1e-6, cold at R = 1.4, then three displaced geometries each warm
+    /// from the one before (as a sampling pass's perturbations). The warm steps' tight-step witness left LOBPCG at
+    /// 2–3.3 g on the top column while a lower tested level was at r ≈ 1e-5; growing one vector per call made each new
+    /// top a fresh box state. Measured before the rule: 8 one-vector growths over the chain (3 at geometry 1, 5 at
+    /// geometry 3), peak block 10, 2 758 LOBPCG iterations over the four solves; with it: 0 growths, 3 lower witnesses,
+    /// peak block 7, 2 219 iterations (the chain energies moved by ≤ 1.3e-7 Ha, the warm path's own noise: geometry 2,
+    /// which grew in neither run, moved as much). Every solve converges, and the last geometry's chain energy agrees with
+    /// its own cold solve (measured 3.8e-8 Ha; bound 1e-6, the SCF tol).
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release-only; run: cargo test -p qm-gpu --release")]
+    fn warm_displaced_steps_take_the_lowest_converged_witness() {
+        let Some(ctx) = GpuContext::new_headless() else { return };
+        let grid = Grid::cube(81, 0.25);
+        let settings = ScfSettings::for_grid(&grid);
+        let mut s = GpuSolver::new(ctx.clone(), &grid);
+        let geo = |r: f64, d: [f64; 3]| System::new(vec![Nucleus { pos: [0.5 * r + d[0], d[1], d[2]], z: 1 }, Nucleus { pos: [-0.5 * r, -d[1], 0.3 * d[2]], z: 1 }], 0, None);
+        let path = [(1.4, [0.0; 3]), (1.5, [0.1, -0.08, 0.05]), (1.35, [-0.05, 0.1, -0.1]), (1.45, [0.12, 0.03, 0.08])];
+        let (mut growths, mut lower, mut peak, mut iterations, mut last) = (0, 0, 0, 0, 0.0);
+        for (i, &(r, d)) in path.iter().enumerate() {
+            let (_, st) = s.solve(&geo(r, d), &settings, i > 0).unwrap_or_else(|e| panic!("geometry {i}: {e}"));
+            let p = s.profile();
+            println!("81³ geometry {i}: {} steps, E {:+.9}, residual growths {}, lower witnesses {}, witness growths {}, peak block {}, eigen it {}",
+                     st.iterations, st.energy.total, p.witness_residual_growths, p.lower_witnesses, p.witness_growths, p.peak_block, p.eigen_iterations);
+            (growths, lower, peak, iterations, last) = (growths + p.witness_residual_growths, lower + p.lower_witnesses, peak.max(p.peak_block), iterations + p.eigen_iterations, st.energy.total);
+        }
+        let mut fresh = GpuSolver::new(ctx, &grid);
+        let (r, d) = path[3];
+        let (_, cold) = fresh.solve(&geo(r, d), &settings, false).unwrap();
+        println!("chain: {growths} residual growths, {lower} lower witnesses, peak block {peak}, {iterations} LOBPCG iterations; last geometry chain − cold {:+.2e} Ha",
+                 last - cold.energy.total);
+        assert!(lower >= 1, "the warm path no longer reaches a top above 1.5 g with a converged level below it: the test lost its case");
+        assert!(growths <= 1, "{growths} one-vector growths on the warm path (8 before the rule)");
+        assert!(peak <= 8, "peak block {peak} (10 before the rule, 7 with it)");
+        assert!((last - cold.energy.total).abs() < 1e-6, "chain {last:+.9} vs cold {:+.9}", cold.energy.total);
+    }
+
     /// As the CPU test: a warm start on the displaced geometry is cheaper than a cold solve of
     /// the same geometry and lands on the same energy. "Cheaper" is measured in readbacks (the
     /// deterministic cost), not SCF steps (change of measure, M4 review/controller ruling): near
@@ -2737,9 +2805,12 @@ mod tests {
     const GPU_FD_H2_E: u64 = 0xbfee7a76841de0c9; // -0.952449090996 (Aufbau −0.952449164522: +7.4e-8; TS 4.3e-20)
     const GPU_FD_H2_FX: u64 = 0x3fc07b1d3d73bcd8; // +0.128757147795 (Aufbau +0.128753746201: +3.4e-6)
     // LiH re-pinned again in Task 9d fix round 3 (a tight step's tested witness needs r ≤ 1.5 g, review m3: the block
-    // grows to 8 / 8 stored; −5.219910925573 / −0.022680600374 before it)
-    const GPU_FD_LIH_E: u64 = 0xc014e1305be477a6; // -5.219911037273 (Aufbau −5.219911953896: +9.2e-7, inside the f32 path scatter; TS 1.59e-7)
-    const GPU_FD_LIH_FX: u64 = 0xbf9739901b3ea440; // -0.022680522597 (Aufbau −0.022675900853: −4.6e-6)
+    // grows to 8 / 8 stored; −5.219910925573 / −0.022680600374 before it), and again in branch `eig-floor`, 2026-11-21 (module
+    // doc, "The lowest converged witness": the tested level below the top, converged, decides where the m3 rule grew the
+    // block): back to exactly the digits before fix round 3 (13 steps, 8 / 8 stored); fix round 3's pins were
+    // −5.219911037273 / −0.022680522597 (this one +1.1e-7 Ha, −7.8e-8 Ha/Bohr from them)
+    const GPU_FD_LIH_E: u64 = 0xc014e13054657be9; // -5.219910925573 (Aufbau −5.219911953896: +1.0e-6, inside the f32 path scatter; TS 1.59e-7)
+    const GPU_FD_LIH_FX: u64 = 0xbf97399553722c40; // -0.022680600374 (Aufbau −0.022675900853: −4.7e-6)
 
     /// M7 Task 8a: `IonicPolicy::None` (no setup, `Aufbau`) is today's GPU solver bit for bit — the energy and F_x of
     /// nucleus 0 of H₂ and LiH equal the bits measured on the code before the pseudopotential path (driver-specific:

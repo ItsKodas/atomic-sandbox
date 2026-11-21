@@ -9,6 +9,8 @@
 //! (live orbitals, Phase A), which `GpuKs::harris_display` runs.
 pub mod branch_jump;
 #[cfg(test)]
+mod eig_floor;
+#[cfg(test)]
 mod fd_regression;
 pub mod harris;
 pub mod ks;

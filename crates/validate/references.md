@@ -6529,3 +6529,42 @@ The confirmation repeats the standing trial's cold search (6 rounds in the recov
 Worst 8.65e-8 (≈ 1.5 u): the tolerance is ≈ 115× it. Also `qm-gpu` `h2_matches_cpu_at_fixed_sigma`: H₂ 33³ per spin −8.12e-8, −1.98e-8 (CPU 0, 2e-16). An answer a failed device leaves misses by O(1) (an empty density: ∫ρ = 0).
 
 **Refused answers in a row** (the gpu-fault review A-I2, controller ruling 2026-11-21): a sampling pass, and a collection re-solve, ends after `providers::sampling::PASS_REFUSALS_IN_A_ROW` = 3 answers in a row refused by this check (only an accepted answer resets the count). A stopping rule, not a tolerance: no bound above moves, and ending early is the conservative direction (a refused answer is never kept either way). Tests `a_pass_refuses_empty_answers_and_ends_after_three_in_a_row` (6 teacher solves, 2 samples kept, 3 refused), `an_accepted_answer_resets_the_refusal_count`, `three_refused_resolves_in_a_row_end_the_migration`.
+
+## The lowest converged witness (2026-11-22; branch `eig-floor`; `providers` `eig_floor::{h2o_estimated_box_cold_solve_profile, h2o_estimated_box_warm_chain, quick_look_pass_wall_per_sample}` (`#[ignore]`d measurements) and `qm-gpu` `warm_displaced_steps_take_the_lowest_converged_witness`; release, RX 7900 XTX, BelowNormal; the user's game shared the GPU during parts of the runs, so LOBPCG iterations and column-iterations (Σ iterations × block size) are the deterministic measure and walls are noted where contended)
+
+**The report.** A "Quick look" sampling pass (30 perturbations σ 0.10, 3 pair scans × 8, a 100-step 800 K burst; 158 solves) on water in Estimated mode — 119³ × 0.15 (17.7 Bohr), `Accepted` (O and H pseudised), kT 5 mHa, teacher tol 1e-6 — "hangs a minute or two" between samples.
+
+**Not the tight confirmation step.** A cold solve of that scene is 6.7 s, 15 SCF steps, 898 LOBPCG iterations; its two floor exits (the note "accepted at the f32 floor in 2 of 30 calls, worst 1.70e-5, tightest tol 1.51e-5") cost 12 iterations each. The three geometries measured cold gave the same profile.
+
+**The cause (measured).** The pass's perturbations are warm starts (`discontinuity`: the previous geometry's orbitals, no extrapolation). Their SCF step 1 runs at the tight eigen tol (Δρ_prev = ∞), so the tested witness decides only at r ≤ 1.5 g (g = `WITNESS_GUARD_TOL` = 1e-3 Ha). LOBPCG's floor diagnosis reads the split residual scaled by tol/g, whose band 10·floor·g/tol is 3.3 g at the floor-limited tight tol 3·floor, so the top loose column (the slowest of a block: its rate is set by the gap to the first level outside) leaves on a `Floor` exit at 2–3.3 g. The SCF then grew the block by one vector and re-solved; the new top was a fresh vector in the box continuum and floor-exited the same way, call after call — while the first level that clears both arms sat at r = 4.3e-5 from the second call on. Measured on the warm chain (preset → five σ = 0.1 Bohr displacements, one solver): the first warm solve 23 one-vector growths, peak block 20 per spin, 3 281 LOBPCG iterations, 68.6 s; the fourth stopped by hand after 3 719 iterations and 570 s of eigensolves, still in SCF step 1, at a block of 29.
+
+**The rule** (`qm::occupations` "The lowest converged witness", `qm::witness_keep_within`): before that growth, the lowest tested level that clears both arms at r ≤ 1.5 g decides and the block is trimmed above it (as the witness trim would). λ_t ≥ θ_t − r_t needs only column t at r_t ≲ g and the columns below it holding the lowest levels (premise M2); every level above t is ≥ λ_t. GPU only; no tolerance moves.
+
+| warm chain, 119³ water | before: LOBPCG it / peak block / wall | after |
+|---|---|---|
+| geometry 1 | 3 281 / 20 / 68.6 s | 1 054 / 8 / 40.0 s (contended) |
+| geometry 2 | 3 086 / 20 / 128.7 s | 1 444 / 10 / 58.5 s (contended) |
+| geometry 3 | 1 317 / 8 / 46.6 s | 1 335 / 8 / 16.6 s |
+| geometry 4 | > 3 719 / > 29 / stopped at 570 s | 1 091 / 8 / 14.0 s |
+| geometry 5 | not reached | 1 395 / 8 / 17.2 s |
+
+**The answers** (each chain geometry against its own cold solve on a fresh solver — two converged answers from different starts, the noise level at tol 1e-6; the cold solves never take the new branch and are bitwise the old ones): before |ΔF| 3.4e-7, 2.2e-7, 3.9e-7 Ha and max |ΔF_I| 2.5e-5, 4.1e-5, 7.4e-6 Ha/Bohr (geometries 1–3); after |ΔF| 1.7e-7, 6.0e-7, 4.3e-7, 3.8e-7, 8e-9 Ha and max |ΔF_I| 2.5e-5, 4.0e-5, 1.8e-5, 3.2e-5, 1.8e-5 Ha/Bohr (geometries 1–5). After − before on the same chain: |ΔF| ≤ 8.2e-7 Ha, max |ΔF_I| ≤ 2.4e-5 Ha/Bohr. The `qm-gpu` test (all-electron H₂, 81³ × 0.25, cold then three displaced warm geometries): 8 growths, peak block 10, 2 758 iterations before; 0 growths, 3 lower witnesses, peak block 7, 2 219 after; energies moved ≤ 1.3e-7 Ha (a geometry that took the new branch in neither run moved as much); chain − cold 3.8e-8 Ha.
+
+**Pins moved.** `qm-gpu` `gpu_none_policy_is_bitwise_today`'s all-electron LiH FD cold solve (33³) takes the new branch where Task 9d fix round 3's m3 rule grew its block: E −5.219911037273 → −5.219910925573 Ha (+1.1e-7), F_x0 −0.022680522597 → −0.022680600374 Ha/Bohr (−7.8e-8) — exactly the digits pinned before fix round 3 (13 steps, 8 / 8 stored). Its Aufbau bits and the H₂ FD bits are unchanged. Other GPU FD pins where the m3 growth fired can move the same way (the f32 path scatter); none of `qm-gpu`'s other 146 tests did.
+
+**The pass** (the whole Quick look pass, seed 1, the app's estimated-mode teacher; stage: wall / LOBPCG iterations / column-iterations / peak block / samples lost to the pass's time limit):
+
+| stage (samples) | before | after |
+|---|---|---|
+| references (4) | 208.8 s / 74 699 / 289 990 / 25 / 0 | 652.8 s (contended ≈ 4×) / 72 629 / 274 188 / 22 / 0 |
+| perturbations (30) | 1 045.3 s / 57 825 / 685 700 / 27 / **8** | 522.7 s (its first 10 contended) / 34 515 / 263 298 / 11 / **0** |
+| perturbations 14–33 (20, both uncontended) | 567.9 s, median 20.0 s, slowest 79.0 s / 33 868 / 382 027 / 26 / 6 | 215.1 s, median 10.2 s, slowest 18.6 s / 23 435 / 179 379 / 11 / 0 |
+| scans (24) | 302.2 s / 23 786 / 209 357 / 28 / 3 | 272.4 s / 21 951 / 184 679 / 28 / 2 |
+| hot burst (100) | 334.3 s / 31 243 / 233 712 / 28 / 1 | 333.0 s / 31 616 / 238 629 / 28 / 1 |
+| the pass | 1 891 s (31.5 min), 12 of 158 lost | 1 781 s measured with steps 0–13 contended (the same-behaviour steps there took 4.2× their uncontended wall); ≈ 1 050–1 120 s (18 min) with those steps at their uncontended rate; 3 of 158 lost |
+
+A lost sample is one the pass gave up at its time limit (5× the median solve): before, 8 of the 30 perturbations; after, none. The steps whose behaviour the rule does not touch have identical iteration counts on both sides (28 of them; their walls agree within 6 % where both ran uncontended).
+
+**Not fixed here** (pre-existing, measured on both sides): two scan points and the burst's start geometry (steps 43, 51, 59) end on the pass's time limit in both runs. Each is SCF step 1 of a discontinuous start whose first potential puts μ above zero (+0.09…+0.14 Ha: the fourth level unbound), so the 36 kT witness window (μ + 0.18 Ha) lies deep in the 17.7 Bohr box's continuum and the "no witness yet" doubling runs past 28 columns; the lowest-witness rule does not apply there (no tested level passes).
+
+**The dimer gate** solves on the GPU through the same code: its H₂ trace moved at the noise level in a few of its tight steps (the O and H acceptances unchanged in every run here); the pseudo suites re-check it.
