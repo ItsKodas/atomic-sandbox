@@ -1304,6 +1304,32 @@ fn a_recovered_panic_keeps_the_walls() {
     assert_eq!(s.dynamics.walls, Some(walls), "the rebuilt run lost its walls");
 }
 
+/// The gpu-fault fix (`sim::dynamics`, "A failed GPU"): a provider whose device fails while playing leaves the worker
+/// paused with the restart message, and Play (or Step) does not get past it — no step, no further solve.
+#[test]
+fn a_failed_gpu_pauses_the_worker_with_the_restart_message() {
+    let calls = Arc::new(std::sync::Mutex::new(None::<Arc<std::sync::atomic::AtomicUsize>>));
+    let c = calls.clone();
+    let w = SimWorker::spawn_test(h2_33(), Box::new(move || {
+        let p = sim::Faulty::new(sim::MorseDimer::h2(), 6, sim::Fault::GpuFailed);
+        *c.lock().unwrap() = Some(p.calls.clone());
+        Box::new(p)
+    }));
+    idle(&w);
+    w.send(Command::Dyn(DynCommand::Play));
+    let s = snapshot_until(&w, "the GPU failure", |s| s.dynamics.paused && s.dynamics.last_error.as_deref().is_some_and(|e| e.contains(sim::GPU_FAILED_MESSAGE)));
+    let step = s.dynamics.step;
+    let n = calls.lock().unwrap().as_ref().expect("the provider was built").load(std::sync::atomic::Ordering::SeqCst);
+    for c in [Command::Dyn(DynCommand::Play), Command::Dyn(DynCommand::Step(3))] {
+        w.send(c);
+        let s = idle(&w);
+        assert!(s.dynamics.paused, "the run must stay paused");
+        assert_eq!(s.dynamics.step, step, "no step after the GPU failed");
+        assert!(s.dynamics.last_error.as_deref().is_some_and(|e| e.contains(sim::GPU_FAILED_MESSAGE)), "{:?}", s.dynamics.last_error);
+    }
+    assert_eq!(calls.lock().unwrap().as_ref().unwrap().load(std::sync::atomic::Ordering::SeqCst), n, "no solve was asked of the failed device");
+}
+
 /// M6 Task 9 (M5 handoff: "the automatic first pass is sized from one cold solve × 1.6 and
 /// varies under GPU sharing (72–115 solves seen)"): the pass is sized from the median of its
 /// first three solves. A surrogate over a scripted teacher whose pass solves take 0.9 s, 0.1 s,
