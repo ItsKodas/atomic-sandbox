@@ -255,6 +255,22 @@ fn solver_error(e: qm::QmError) -> ProviderError {
     })
 }
 
+/// What a witness search that failed at the memory cap adds to its message (design 2026-11-21, "GPU memory budget
+/// setting"): the app's two ways out.
+pub const WITNESS_BUDGET_HINT: &str = "raise GPU memory in Scene ▸ Quality, or use a coarser quality (Balanced)";
+
+/// `e` with [`WITNESS_BUDGET_HINT`] added when it is the solver's "no gap witness" failure at a cap the budget set:
+/// the solver had a budget and its witness cap (`witness_cap_for`) is below the hard cap
+/// `qm::scf::MAX_WITNESS_GROWTH` (32). Any other error, or a failure at the hard cap, is unchanged.
+fn with_witness_hint(e: ProviderError, cap: usize, budgeted: bool) -> ProviderError {
+    match e {
+        ProviderError::Solver(SolverError::Numerical(m)) if budgeted && cap < qm::scf::MAX_WITNESS_GROWTH && m.starts_with("no gap witness within") => {
+            ProviderError::Solver(SolverError::Numerical(format!("{m} — {WITNESS_BUDGET_HINT}")))
+        }
+        e => e,
+    }
+}
+
 /// A failed GPU readback latched on this thread since the last check, as the boundary's error
 /// (`qm_gpu::grid::take_readback_fault`). `GpuSolver`'s display-side calls (`density_max`,
 /// `sample_density`, the orbital view) return numbers rather than `Result`s; zeros stand in for
@@ -1415,6 +1431,7 @@ impl GpuKs {
         // the probe's display slot (never its solve slots: this is not a teacher solve)
         let busy = self.probe.as_ref().map(|(p, _)| p.display_solve(DisplayJob::Harris));
         qm_gpu::grid::clear_readback_fault();
+        let (cap, budgeted) = (self.witness_cap, self.vram_budget.is_some());
         let GpuKs { solver, ctx, orb, orbital, orb_scalar, orb_colour, unocc, harris, share_tables, share_gpu, .. } = self;
         let solver = solver.as_mut().expect("built above");
         let input = HarrisInput { system: &system, settings: &settings, rho_in: [&rho.up, &rho.dn], unoccupied: m };
@@ -1426,7 +1443,7 @@ impl GpuKs {
                 }
                 return Err(ProviderError::Cancelled);
             }
-            Err(e) => return Err(solver_error(e)), // the guard's drop records it as stopped
+            Err(e) => return Err(with_witness_hint(solver_error(e), cap, budgeted)), // the guard's drop records it as stopped
         };
         let view = orbital.get_or_insert_with(|| {
             let mut v = OrbitalView::new(solver);
@@ -1535,7 +1552,9 @@ impl GpuKs {
         if result.is_err() {
             self.cold |= !warm;
         }
-        let (stats, stall) = result.map_err(solver_error)?;
+        // a witness search stopped by the budget's cap names the way out (`with_witness_hint`)
+        let (cap, budgeted) = (self.witness_cap, self.vram_budget.is_some());
+        let (stats, stall) = result.map_err(|e| with_witness_hint(solver_error(e), cap, budgeted))?;
         let Some(mut stats) = stats else {
             return Err(ProviderError::Cancelled);
         };
@@ -1809,6 +1828,33 @@ pub(crate) mod tests {
         let (r, calls) = run(true, vec![Err(QmError::Numerical("test".into()))]);
         assert_eq!(calls, [true]);
         assert!(matches!(r, Err(QmError::Numerical(_))), "{r:?}");
+    }
+
+    /// Design 2026-11-21 (the 8 GB card that refused at step 2 in v0.2.0): a witness search that stopped at a cap the
+    /// budget set (below the hard cap of 32) names the way out after the solver's own words; at the hard cap, without a
+    /// budget, or for any other error the message is unchanged.
+    #[test]
+    fn a_witness_failure_at_the_budgets_cap_names_the_way_out() {
+        let witness = |cap: usize| {
+            solver_error(QmError::Numerical(format!(
+                "no gap witness within {cap} extra levels of spin 0 (WITNESS_GAP = 0.01 Ha above ε_N and 3 kT above μ, on the lower bound θ − r); \
+                 {cap} is the most the 2.1 GB budget (the teacher's half of the 4.2 GB budget: 50 % of this GPU's 8.4 GB, set in Scene ▸ Quality; \
+                 ATOMIC_SANDBOX_VRAM_GB overrides it) fits (at most 32)"
+            )))
+        };
+        let e = with_witness_hint(witness(3), 3, true).to_string();
+        assert!(e.starts_with("numerical failure in the solver: no gap witness within 3 extra levels"), "{e}");
+        assert!(e.ends_with("fits (at most 32) — raise GPU memory in Scene ▸ Quality, or use a coarser quality (Balanced)"), "{e}");
+        assert_eq!(WITNESS_BUDGET_HINT, "raise GPU memory in Scene ▸ Quality, or use a coarser quality (Balanced)");
+        // the hard cap: more memory would not have helped
+        let max = qm::scf::MAX_WITNESS_GROWTH;
+        assert!(!with_witness_hint(witness(max), max, true).to_string().contains(WITNESS_BUDGET_HINT));
+        // no budget: the cap is the hard one
+        assert!(!with_witness_hint(witness(3), 3, false).to_string().contains(WITNESS_BUDGET_HINT));
+        // another numerical failure, another error kind
+        let other = with_witness_hint(solver_error(QmError::Numerical("non-finite density".into())), 3, true).to_string();
+        assert!(!other.contains(WITNESS_BUDGET_HINT), "{other}");
+        assert!(matches!(with_witness_hint(ProviderError::Cancelled, 3, true), ProviderError::Cancelled));
     }
 
     /// The "GPU busy" policy without a solver: only a `Device` error is retried, after the
