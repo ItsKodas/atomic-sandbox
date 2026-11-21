@@ -3222,31 +3222,75 @@ fn the_gpu_memory_action_clamps_and_hands_the_share_to_the_viewer() {
     assert!(search::ENTRIES.iter().any(|e| e.anchor == "m-gpu-memory" && e.also.contains("gpu memory")), "a Ctrl K entry");
 }
 
-/// The share is kept in the profile as `gpu_memory` (a new key: `PROFILE_FORMAT` stays 1); a loaded
-/// one is clamped and left pending for the viewer to put in force; a profile without the key (from
-/// before it) leaves the share as it is; Reset's defaults say 50 %.
+/// The share is this computer's (user report 2026-11-21: it reset between runs): kept in
+/// `machine.settings`, never in a profile — a named profile's Load, Reset, or an older build's
+/// rewrite of `current.profile` leaves it alone. A share read there is clamped and left pending
+/// for `main` / the viewer to put in force.
 #[test]
-fn the_gpu_memory_share_is_kept_in_the_profile() {
+fn the_gpu_memory_share_is_a_machine_setting_not_a_profile_key() {
     let scene = Scene::preset("h2").unwrap();
     let mut st = UiState::new("h2", &scene);
-    assert!(profile::capture(&st).contains("\ngpu_memory = 50\n"));
-    assert!(profile::defaults(&st).contains("\ngpu_memory = 50\n"));
     st.gpu_memory_pct = 70;
-    let text = profile::capture(&st);
+    assert!(!profile::capture(&st).contains("gpu_memory"), "not in a profile");
+    assert!(!profile::defaults(&st).contains("gpu_memory"), "not in Reset's defaults");
+    let text = profile::machine_text(&st);
     assert!(text.contains("\ngpu_memory = 70\n"), "{text}");
     let mut back = UiState::new("h2", &scene);
-    profile::apply(&mut back, &text);
+    assert!(profile::apply_machine(&mut back, &text));
     assert_eq!((back.gpu_memory_pct, back.gpu_memory_slider, back.gpu_memory_pending), (70, 70, Some(70)));
-    let old: String = text.lines().filter(|l| !l.starts_with("gpu_memory")).map(|l| format!("{l}\n")).collect();
+    // a profile (named, Reset's, or 0.2.1-beta.1's with the key) never moves it
     let mut kept = UiState::new("h2", &scene);
     kept.gpu_memory_pct = 60;
-    profile::apply(&mut kept, &old);
-    assert_eq!((kept.gpu_memory_pct, kept.gpu_memory_pending), (60, None), "an old profile: unchanged");
-    profile::apply(&mut kept, "gpu_memory = 200\n");
+    profile::apply(&mut kept, "gpu_memory = 50\n");
+    let defaults = profile::defaults(&kept);
+    profile::apply(&mut kept, &defaults);
+    assert_eq!((kept.gpu_memory_pct, kept.gpu_memory_pending), (60, None), "a profile leaves it");
+    assert!(profile::apply_machine(&mut kept, "gpu_memory = 200\n"));
     assert_eq!((kept.gpu_memory_pct, kept.gpu_memory_pending), (90, Some(90)), "clamped");
-    profile::apply(&mut kept, "gpu_memory = lots\n");
+    assert!(!profile::apply_machine(&mut kept, "gpu_memory = lots\n"));
     assert_eq!(kept.gpu_memory_pct, 90, "unreadable: unchanged");
-    assert_eq!(profile::PROFILE_FORMAT, 1, "a new key alone does not bump the format");
+    assert_eq!(profile::PROFILE_FORMAT, 1, "a key dropped from the profile does not bump the format");
+}
+
+/// The launch path, on files: the share saved in `machine.settings` comes back at the next start,
+/// whatever an older build left in `current.profile`; a 0.2.1-beta.1 profile's `gpu_memory` is
+/// taken once, when there is no `machine.settings` yet, and moved there at the next save.
+#[test]
+fn the_gpu_memory_share_survives_a_restart_and_an_older_builds_profile() {
+    let scene = Scene::preset("h2").unwrap();
+    let dir = std::env::temp_dir().join(format!("atomic-ui-machine-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let launch = || {
+        let mut st = UiState::new("h2", &scene);
+        st.profiles.current_file = Some(dir.join("current.profile"));
+        st.profiles.machine_file = Some(dir.join("machine.settings"));
+        profile::load_current(&mut st);
+        st
+    };
+    // 0.2.1-beta.1's profile, no machine.settings: its share is taken, and written there on save
+    let beta1 = format!("{}gpu_memory = 80\n", profile::capture(&UiState::new("h2", &scene)));
+    std::fs::write(dir.join("current.profile"), &beta1).unwrap();
+    let mut st = launch();
+    assert_eq!((st.gpu_memory_pct, st.gpu_memory_slider, st.gpu_memory_pending), (80, 80, Some(80)), "moved from 0.2.1-beta.1");
+    profile::flush(&mut st);
+    assert!(std::fs::read_to_string(dir.join("machine.settings")).unwrap().contains("\ngpu_memory = 80\n"));
+    // the slider moved to 70: saved, and back after a restart
+    let inp_scene = scene.clone();
+    let cam = camera();
+    let inp = input(&inp_scene, None, &cam);
+    act(&mut st, &inp, Action::GpuMemory(70));
+    profile::flush(&mut st);
+    assert_eq!(launch().gpu_memory_pct, 70, "a restart keeps it");
+    // an older build (or 0.2.1-beta.1) rewrites current.profile, with or without the key: no matter
+    std::fs::write(dir.join("current.profile"), profile::capture(&UiState::new("h2", &scene))).unwrap();
+    assert_eq!(launch().gpu_memory_pct, 70, "an older build's profile");
+    std::fs::write(dir.join("current.profile"), &beta1).unwrap();
+    assert_eq!(launch().gpu_memory_pct, 70, "0.2.1-beta.1's profile, once machine.settings exists");
+    // nothing saved at all: the default, and nothing pending
+    let _ = std::fs::remove_dir_all(&dir);
+    let fresh = launch();
+    assert_eq!((fresh.gpu_memory_pct, fresh.gpu_memory_pending), (50, None), "a first start");
 }
 
 /// Scene ▸ Quality ▸ GPU memory on screen: the slider under the levels with the budget it gives

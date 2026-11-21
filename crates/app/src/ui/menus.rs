@@ -637,11 +637,13 @@ fn gpu_memory_controls(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
         ui.label("GPU memory");
         let r = probed(
             "gpu-memory",
-            keyed(ui, "gpu-memory", |ui| ui.add_enabled(usable, egui::Slider::new(&mut st.gpu_memory_slider, SHARE_MIN_PCT..=SHARE_MAX_PCT).suffix(" %"))),
+            keyed(ui, "gpu-memory", |ui| ui.add_enabled(usable, egui::Slider::new(&mut st.gpu_memory_slider, SHARE_MIN_PCT..=SHARE_MAX_PCT).suffix(" %").update_while_editing(false))),
         )
         .on_hover_text("the share of this GPU's memory the solvers may use (25–90 %, default 50 %): in Estimated mode the teacher and the auditor each take half of it. More lets a fine grid keep more witness levels; the rest is the screen's, the driver's and other applications'. Applied when you let go: the GPU solvers are rebuilt and the scene re-solved, paused")
         .on_disabled_hover_text(why_not.clone());
-        if r.drag_stopped() || (r.changed() && !r.dragged()) {
+        // applied when let go, and whenever the slider shows a share not in force while it is not
+        // held (a release the menu missed, a typed value): the saved share is the one in force
+        if r.drag_stopped() || (!r.dragged() && st.gpu_memory_slider != st.gpu_memory_pct) {
             acts.push(Action::GpuMemory(st.gpu_memory_slider));
         }
     });

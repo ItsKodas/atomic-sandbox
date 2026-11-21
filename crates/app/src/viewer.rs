@@ -2959,8 +2959,9 @@ impl Viewer {
             self.chrome_actions.append(&mut out.actions);
             self.act_on(out);
         }
-        // a profile loaded this frame (Profiles… ▸ Load or Reset) asks for another GPU memory share:
-        // put in force as the slider's action, so a recording sees it and the solvers are rebuilt
+        // `machine.settings` asks for another GPU memory share (`ui::profile::apply_machine`; at
+        // launch `main` has already put it in force, so this is a no-op then): put in force as the
+        // slider's action, so a recording sees it and the solvers are rebuilt
         if let Some(pct) = self.ui.gpu_memory_pending.take() {
             if pct != crate::quality::memory_share() {
                 let a = ui::Action::GpuMemory(pct);

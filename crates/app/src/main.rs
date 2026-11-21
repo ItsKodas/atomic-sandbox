@@ -621,8 +621,10 @@ fn main() {
     // (`%LOCALAPPDATA%\atomic-sandbox`, `paths::user_root`: the same in every mode)
     if let Some(root) = paths::user_root() {
         viewer.ui.profiles.current_file = Some(root.join("current.profile"));
+        // this computer's settings (the GPU memory share): never in a profile (`ui::profile` module doc)
+        viewer.ui.profiles.machine_file = Some(root.join("machine.settings"));
         ui::profile::load_current(&mut viewer.ui);
-        // its GPU memory share is in force before anything reads the budget (the first worker, the
+        // the GPU memory share is in force before anything reads the budget (the first worker, the
         // estimated box below): no rebuild at the first frame
         if let Some(pct) = viewer.ui.gpu_memory_pending.take() {
             quality::set_memory_share(pct);

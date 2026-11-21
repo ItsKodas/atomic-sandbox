@@ -9,13 +9,18 @@
 //! panel's folds (`model_sections = teach,health`) and of the Activity panel's
 //! (`activity_sections = trust,training`) and of the Orbitals panel's (`orbital_sections = spin`) and the Knowledge panel's (`knowledge_sections = why,triples`) and the Readouts panel's (`readouts_sections = work,breakdown,compare`) and the Selection panel's (`selection_sections = details,molecules,charges`), the units, the Version
 //! panel's channel and Check automatically (`update_channel = Stable`, `update_auto_check = true`;
-//! installer Task 4), and this machine's GPU memory share (`gpu_memory = 60`, %, Scene ▸ Quality ▸
-//! GPU memory, design 2026-11-21) — as a small text file of `key = value` lines. Display state
-//! only, except `gpu_memory`: nothing else here is an `Action` or reaches the worker. That one is
-//! a machine setting, not physics — the solvers' memory budget (the witness levels it leaves, a
-//! scene refused over it) — and a loaded profile's value is put in force as `Action::GpuMemory`
-//! (`UiState::gpu_memory_pending`), so a recording sees it; at launch `main` sets it before the
-//! first worker starts.
+//! installer Task 4) — as a small text file of `key = value` lines. Display state only: nothing
+//! here is an `Action` or reaches the worker.
+//!
+//! This computer's GPU memory share (Scene ▸ Quality ▸ GPU memory, design 2026-11-21) is kept
+//! beside it in `%LOCALAPPDATA%\atomic-sandbox\machine.settings` (`gpu_memory = 60`, %), not in a
+//! profile (user report 2026-11-21: the slider reset between runs). A profile is shared between
+//! machines and between builds, so a named profile's Load, Reset, or an older build rewriting
+//! `current.profile` without the key must not move a setting that belongs to this card. It is a
+//! machine setting, not physics — the solvers' memory budget (the witness levels it leaves, a
+//! scene refused over it); at launch `main` puts it in force before the first worker starts.
+//! 0.2.1-beta.1 kept it in `current.profile`: with no `machine.settings` yet, that value is read
+//! once and moved there.
 //!
 //! The window keeps the state in force in `%LOCALAPPDATA%\atomic-sandbox\current.profile`
 //! (written a moment after each change, read at launch: the app opens as it was left); named
@@ -97,9 +102,32 @@ pub fn capture(st: &UiState) -> String {
     // the Version panel's display settings (installer Task 4)
     out += &format!("update_channel = {:?}\n", st.update.channel);
     out += &format!("update_auto_check = {}\n", st.update.auto_check);
-    // Scene ▸ Quality ▸ GPU memory (design 2026-11-21): this machine's share of its card, %
-    out += &format!("gpu_memory = {}\n", st.gpu_memory_pct);
     out
+}
+
+/// This computer's settings (`machine.settings`): the GPU memory share, % (Scene ▸ Quality ▸ GPU
+/// memory). Kept apart from the profile: see the module doc.
+pub fn machine_text(st: &UiState) -> String {
+    format!("# Atomic Sandbox: this computer's settings\ngpu_memory = {}\n", st.gpu_memory_pct)
+}
+
+/// Applies `machine.settings`' text (or, once, a 0.2.1-beta.1 profile's `gpu_memory` line): the
+/// share is clamped to the slider's range and left pending (`UiState::gpu_memory_pending`) for
+/// `main` (at launch) or the viewer to put in force; absent or unreadable, unchanged. Whether the
+/// text had a readable share.
+pub fn apply_machine(st: &mut UiState, text: &str) -> bool {
+    let value = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter_map(|l| l.split_once('='))
+        .find(|(k, _)| k.trim() == "gpu_memory")
+        .and_then(|(_, v)| v.trim().trim_end_matches('%').trim().parse::<f64>().ok());
+    let Some(v) = value else { return false };
+    let pct = crate::quality::clamp_share(v);
+    st.gpu_memory_pct = pct;
+    st.gpu_memory_slider = pct;
+    st.gpu_memory_pending = Some(pct);
+    true
 }
 
 /// Applies a profile's text to `st`: unknown keys and unreadable values are skipped. `layout` sets
@@ -153,15 +181,8 @@ pub fn apply(st: &mut UiState, text: &str) {
     if let Some(v) = kv.get("update_auto_check").and_then(|v| v.parse().ok()) {
         st.update.auto_check = v;
     }
-    // the GPU memory share (added 2026-11-21; absent: unchanged), clamped to the slider's range; put
-    // in force by the viewer as `Action::GpuMemory` (`UiState::gpu_memory_pending`), at launch by
-    // `main` before the first worker
-    if let Some(v) = kv.get("gpu_memory").and_then(|v| v.trim_end_matches('%').trim().parse::<f64>().ok()) {
-        let pct = crate::quality::clamp_share(v);
-        st.gpu_memory_pct = pct;
-        st.gpu_memory_slider = pct;
-        st.gpu_memory_pending = Some(pct);
-    }
+    // (a `gpu_memory` line, written by 0.2.1-beta.1, is not applied here: the share is this
+    // computer's, kept in `machine.settings` — `load_current` moves it there once)
     // the View panel's open sections (docking Task 4); a profile from before it opens the default two
     st.view_sections = kv.get("view_sections").map_or_else(Default::default, |v| super::dock::view::Sections::parse(v));
     // the Model panel's open folds (2026-11-14); a profile from before them opens Teach next and Health
@@ -213,7 +234,11 @@ pub fn defaults(st: &UiState) -> String {
 pub struct Profiles {
     /// `%LOCALAPPDATA%\atomic-sandbox\current.profile` in the window; `None` headless (never saved).
     pub current_file: Option<PathBuf>,
+    /// `%LOCALAPPDATA%\atomic-sandbox\machine.settings` in the window (`machine_text`); `None`
+    /// headless (never saved).
+    pub machine_file: Option<PathBuf>,
     written: String,
+    machine_written: String,
     changed_at: Option<Instant>,
     pub open: bool,
     name: String,
@@ -222,22 +247,54 @@ pub struct Profiles {
     note: String,
 }
 
-/// Reads the state in force at launch (the window).
+/// Reads the state in force at launch (the window): the profile, then this computer's settings.
+/// Without `machine.settings`, a 0.2.1-beta.1 profile's `gpu_memory` line is taken instead and
+/// written there at the next save.
 pub fn load_current(st: &mut UiState) {
-    let Some(text) = st.profiles.current_file.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) else { return };
-    apply(st, &text);
-    st.profiles.written = capture(st);
+    let read = |p: &Option<PathBuf>| p.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
+    let profile = read(&st.profiles.current_file);
+    if let Some(text) = &profile {
+        apply(st, text);
+        st.profiles.written = capture(st);
+    }
+    match read(&st.profiles.machine_file) {
+        Some(text) => {
+            apply_machine(st, &text);
+            st.profiles.machine_written = machine_text(st);
+        }
+        // nothing written yet (`machine_written` stays empty, so the next save writes the file)
+        None => {
+            if let Some(text) = &profile {
+                apply_machine(st, text);
+            }
+        }
+    }
+}
+
+fn write(path: &std::path::Path, text: &str) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, text);
+}
+
+/// Writes this computer's settings if they changed (at once: a change is rare and deliberate).
+fn save_machine(st: &mut UiState) {
+    let Some(path) = st.profiles.machine_file.clone() else { return };
+    let now = machine_text(st);
+    if now != st.profiles.machine_written {
+        write(&path, &now);
+        st.profiles.machine_written = now;
+    }
 }
 
 /// Writes the state in force now if it changed (the window's close).
 pub fn flush(st: &mut UiState) {
+    save_machine(st);
     let Some(path) = st.profiles.current_file.clone() else { return };
     let now = capture(st);
     if now != st.profiles.written {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(&path, &now);
+        write(&path, &now);
         st.profiles.written = now;
     }
 }
@@ -245,6 +302,7 @@ pub fn flush(st: &mut UiState) {
 /// Writes the state in force a moment after it last changed (once per frame: a cheap compare);
 /// asks for the frame that writes it, so an idle window still saves.
 pub fn autosave(ctx: &egui::Context, st: &mut UiState) {
+    save_machine(st);
     let Some(path) = st.profiles.current_file.clone() else { return };
     let now = capture(st);
     if now == st.profiles.written {
@@ -254,10 +312,7 @@ pub fn autosave(ctx: &egui::Context, st: &mut UiState) {
     let since = *st.profiles.changed_at.get_or_insert_with(Instant::now);
     ctx.request_repaint_after(Duration::from_millis(750));
     if since.elapsed() >= Duration::from_millis(700) {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(&path, &now);
+        write(&path, &now);
         st.profiles.written = now;
         st.profiles.changed_at = None;
     }

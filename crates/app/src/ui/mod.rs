@@ -568,11 +568,12 @@ pub struct UiState {
     pub quality_slider: f64,
     /// Scene ▸ Quality ▸ GPU memory: the share of the card's memory the GPU solvers' budget takes
     /// (%, 25–90; `crate::quality::memory_share`, which the viewer sets from
-    /// `Action::GpuMemory`). Kept in the profile as `gpu_memory`.
+    /// `Action::GpuMemory`). Kept per computer in `machine.settings` (`ui::profile::machine_text`),
+    /// never in a profile.
     pub gpu_memory_pct: u32,
     /// The GPU memory slider's value while it is dragged: sent as `Action::GpuMemory` on release.
     pub gpu_memory_slider: u32,
-    /// A share a loaded profile asks for (`ui::profile::apply`), not yet in force: the viewer
+    /// A share `machine.settings` asks for (`ui::profile::apply_machine`), not yet in force: the viewer
     /// applies it as `Action::GpuMemory` on its next frame, so a recording sees it and the solvers
     /// are rebuilt for it.
     pub gpu_memory_pending: Option<u32>,

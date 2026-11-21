@@ -36,7 +36,7 @@ pub const SHARE_WARN_PCT: u32 = 70;
 static ADAPTER_MEMORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The share of the card the budget takes (%), set from the UI (`ui::Action::GpuMemory`, applied
-/// by the viewer; the profile's `gpu_memory`), kept apart from `ATOMIC_SANDBOX_VRAM_GB`.
+/// by the viewer; `machine.settings`' `gpu_memory`, `ui::profile::apply_machine`), kept apart from `ATOMIC_SANDBOX_VRAM_GB`.
 static MEMORY_SHARE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(DEFAULT_SHARE_PCT);
 
 /// Records the card's memory for [`vram_budget`] (`None`: the backend did not report it).
