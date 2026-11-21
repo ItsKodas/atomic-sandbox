@@ -226,9 +226,12 @@
 //! # A failed GPU (the gpu-fault fix, 2026-11-21)
 //! When the provider reports that the device it solves on failed (`ForceProvider::device_failure`: an out-of-memory,
 //! another GPU error no scope caught, or a lost device — `gpu::GpuHealth`), every solver of the session refuses from
-//! then on. Each tick checks first and, failed, does nothing else: the run is paused, the queued steps dropped, a pass
-//! or a relax ends (a pass keeps what it sampled before), and `last_error` says [`crate::GPU_FAILED_MESSAGE`] with the
-//! cause. Play and Step do not clear it — the next tick sets it again; only a new app session does. A provider that
+//! then on. Each tick checks first — before anything else it does — and, failed, does nothing else: the run is paused,
+//! the queued steps dropped, a pass or a relax ends (a pass keeps what it sampled before), the bond references are
+//! dropped (the queue, a running side-solver job told to stop, the side solver; none is queued again), and
+//! `last_error` says [`crate::GPU_FAILED_MESSAGE`] with the cause (`crate::gpu_failed_text`). Play and Step do not
+//! clear it — the next tick sets it again; only a new app session does. `DynSnapshot::gpu_failed` says so, and with
+//! nothing pending (`bonds_pending` empty) the worker goes idle instead of polling (review A-I1). A provider that
 //! returns [`SolverError::GpuFailed`](crate::SolverError::GpuFailed) from an evaluation lands in the same state
 //! through the ordinary failure path above.
 //!
@@ -589,6 +592,9 @@ pub const F_DRAG_LO: f64 = 0.01;
 pub const F_DRAG_HI: f64 = 1.0;
 /// Notes kept for the snapshot (newest last).
 const NOTES_KEPT: usize = 8;
+/// How long a dropped driver waits for a reference job's side solver to stop and come back (`Drop for Dynamics`): a
+/// GPU solve stops at its next SCF step.
+const SIDE_SOLVER_DROP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// K below this fraction of K̄ counts as "at rest" when the thermostat is switched on (R7).
 const AT_REST_FRACTION: f64 = 0.01;
 /// Steps the fallback fraction is computed over.
@@ -953,6 +959,9 @@ pub struct DynSnapshot {
     /// `None` before the first density with the references in, and after a nucleus count change.
     /// Measured at `charges.positions` — compare with the scene (`PartialCharges::is_current`).
     pub charges: Option<Arc<PartialCharges>>,
+    /// The session's GPU failed (module doc, "A failed GPU"): nothing runs from now on — no step, no pass, no bond
+    /// reference, no side job — so the worker has nothing to poll and waits for a command.
+    pub gpu_failed: bool,
 }
 
 impl DynSnapshot {
@@ -1031,6 +1040,7 @@ impl Default for DynSnapshot {
             bond_reference: None,
             pair_reports: Vec::new(),
             charges: None,
+            gpu_failed: false,
         }
     }
 }
@@ -1188,6 +1198,9 @@ pub struct Dynamics {
     /// (user request 2026-10-19): for a loaded scene, or by `RefreshBonds` — never because an atom
     /// was added or a first density arrived mid-play. Cleared once the queue is done.
     refs_wanted: bool,
+    /// The session's GPU failed (module doc, "A failed GPU"; `stop_for_gpu_failure`): no reference is queued or
+    /// started from now on.
+    gpu_failed: bool,
     /// The references' solver as (its SCF tolerance, its name) — the key's provenance — read
     /// once from the provider (`reference_solver`).
     ref_solver: (Option<f64>, &'static str),
@@ -1289,6 +1302,7 @@ impl Dynamics {
             density_refresh: false,
             bonds_requested: false,
             refs_wanted: true,
+            gpu_failed: false,
             ref_solver: (None, ""),
             bonds: None,
             bonds_stale: false,
@@ -1725,17 +1739,18 @@ impl Dynamics {
         let t0 = Instant::now();
         self.steps_last_tick = 0;
         self.wall_ratio = 0.0;
+        // a failed GPU (module doc, "A failed GPU"): nothing else this tick — the first thing it does, before any work
+        // that could touch the device (review A-M3) — and nothing more until the app restarts
+        if let Some(why) = self.provider.device_failure() {
+            self.stop_for_gpu_failure(why, should_abort);
+            return self.snapshot();
+        }
         // the commands just applied may have changed the species (module doc, "Orbital share tables")
         self.sync_share_tables();
         // the orbital view's rate flag follows the play state (module doc, "Orbital display");
         // pausing into a state whose newest payload is an earlier step's re-reads it (M1)
         if self.forward_orbital_view() {
             self.show_current_orbitals();
-        }
-        // a failed GPU (module doc, "A failed GPU"): nothing else this tick, and nothing more until the app restarts
-        if let Some(why) = self.provider.device_failure() {
-            self.stop_for_gpu_failure(why, should_abort);
-            return self.snapshot();
         }
         // a side job asked for between ticks is at the current positions (module doc)
         self.stamp_side_jobs(self.sim_time);
@@ -1990,6 +2005,7 @@ impl Dynamics {
             bond_reference: self.ref_job.as_ref().map(|j| ReferenceProgress { z: j.z, done: j.done, total: j.total, elapsed_s: j.started.elapsed().as_secs_f64() }),
             pair_reports: self.pair_reports.clone(),
             charges: self.charges.clone(),
+            gpu_failed: self.gpu_failed,
         }
     }
 
@@ -2841,7 +2857,8 @@ impl Dynamics {
     /// A failed key is not queued again (module doc); a side-solver job whose key is no longer
     /// wanted is told to stop.
     fn queue_missing_references(&mut self) {
-        if !self.density_seen {
+        // nothing is solved on a failed GPU (module doc, "A failed GPU")
+        if !self.density_seen || self.gpu_failed {
             return;
         }
         // the estimated solver: only when asked (`refs_wanted`)
@@ -3017,6 +3034,10 @@ impl Dynamics {
     /// else on the side solver (lent to a thread; it comes back with the answer). With neither,
     /// the queued keys are given up with a note: no references, no bonds.
     fn start_reference(&mut self, z: u8) {
+        if self.gpu_failed {
+            self.ref_queue.clear();
+            return;
+        }
         let Some(mass) = self.scene.nuclei.iter().find(|n| n.z == z).map(|n| n.mass) else {
             self.ref_queue.retain(|&q| q != z);
             return;
@@ -3269,6 +3290,21 @@ impl Dynamics {
         if self.fire.is_some() {
             self.finish_relax(None, should_abort);
         }
+        // nothing left in flight for the worker to poll (review A-I1: a pending bond reference kept it ticking every
+        // 16 ms forever): the queued references dropped, a running side-solver job told to stop and forgotten (its
+        // answer is discarded with the channel), the side solver freed, no density re-solve or "Bonds now" pending
+        if !self.gpu_failed {
+            self.gpu_failed = true;
+            self.ref_queue.clear();
+            if let Some(ReferenceJob { place: JobPlace::Thread { abort, .. }, .. }) = &self.ref_job {
+                abort.store(true, Ordering::Relaxed);
+            }
+            self.ref_job = None;
+            self.side = None;
+            self.density_refresh = false;
+            self.bonds_requested = false;
+            self.seq += 1;
+        }
         let msg = format!("{}: {}", self.provider.name(), ProviderError::Solver(crate::SolverError::GpuFailed(why)));
         if self.last_error.as_deref() != Some(msg.as_str()) {
             self.last_error = Some(msg);
@@ -3297,11 +3333,16 @@ impl Dynamics {
 
 impl Drop for Dynamics {
     /// A side-solver reference job still solving is told to stop (a GPU solve polls the flag at
-    /// SCF-step granularity, the scan between multiplicities); its answer is discarded with the
-    /// channel. A background teacher's job ends with its provider.
+    /// SCF-step granularity, the scan between multiplicities) and waited for up to
+    /// [`SIDE_SOLVER_DROP_WAIT`]: its side solver comes back with the answer and is dropped here, so
+    /// a GPU side solver's buffers are freed before the driver is gone (gpu-fault review B-I1: the
+    /// app builds the next worker's solvers once the old driver has dropped). A CPU solve that does
+    /// not stop in time is left to finish on its thread (it holds no GPU memory); its answer is
+    /// discarded with the channel. A background teacher's job ends with its provider.
     fn drop(&mut self) {
-        if let Some(ReferenceJob { place: JobPlace::Thread { abort, .. }, .. }) = &self.ref_job {
+        if let Some(ReferenceJob { place: JobPlace::Thread { abort, rx, .. }, .. }) = &self.ref_job {
             abort.store(true, Ordering::Relaxed);
+            let _ = rx.recv_timeout(SIDE_SOLVER_DROP_WAIT);
         }
     }
 }

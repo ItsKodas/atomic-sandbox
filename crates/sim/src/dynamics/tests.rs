@@ -283,6 +283,63 @@ fn a_failed_gpu_stops_the_run_and_play_does_not_resume_it() {
     assert_eq!(calls.load(Ordering::SeqCst), before, "no solve was asked of a failed device");
 }
 
+/// A provider whose device fails when the test says so (`failed`): until then the inner provider's answers, its
+/// density and its side solver.
+struct FailSwitch {
+    inner: Box<dyn ForceProvider>,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ForceProvider for FailSwitch {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        self.inner.evaluate(scene, should_abort)
+    }
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+    fn sample_density(&mut self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
+        self.inner.sample_density(points)
+    }
+    fn scf_tol(&self) -> Option<f64> {
+        self.inner.scf_tol()
+    }
+    fn side_solver(&self) -> Option<Box<dyn ForceProvider>> {
+        self.inner.side_solver()
+    }
+    fn device_failure(&self) -> Option<String> {
+        self.failed.load(Ordering::SeqCst).then(|| "injected: the GPU device was lost".to_string())
+    }
+}
+
+/// Review A-I1 (the gpu-fault fix): a GPU failure with a bond reference queued leaves nothing pending — the queue
+/// dropped, no reference running, `gpu_failed` set — so the worker has nothing to poll; and nothing queues one again
+/// (`RefreshBonds`, a new species through `ReplaceScene`).
+#[test]
+fn a_failed_gpu_leaves_no_bond_reference_pending() {
+    use crate::test_providers::Gaussians;
+    let s = scene(vec![Nucleus::new(1, [-0.8, 0.0, 0.0]), Nucleus::new(1, [0.8, 0.0, 0.0])]);
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let p = FailSwitch { inner: Box::new(Gaussians::per_atom(0.3, 0.5).with_pair_bump(0.15, 0.5, 3.0)), failed: failed.clone() };
+    let mut d = Dynamics::new(s, Box::new(p), DT_FS, 1);
+    assert_eq!(d.snapshot().bonds_pending, vec![1], "the H reference is queued");
+    assert!(!d.snapshot().gpu_failed);
+    failed.store(true, Ordering::SeqCst);
+    let t = d.tick(f64::INFINITY, &mut never());
+    assert!(t.paused && t.gpu_failed);
+    assert!(t.last_error.as_deref().is_some_and(|e| e.contains(crate::GPU_FAILED_MESSAGE)), "{:?}", t.last_error);
+    assert!(t.bonds_pending.is_empty() && t.bond_reference.is_none(), "{:?} {:?}", t.bonds_pending, t.bond_reference);
+    d.apply(DynCommand::RefreshBonds);
+    let water = scene(vec![Nucleus::new(8, [0.0; 3]), Nucleus::new(1, [1.43, 1.11, 0.0]), Nucleus::new(1, [-1.43, 1.11, 0.0])]);
+    d.apply(DynCommand::ReplaceScene(water));
+    for _ in 0..3 {
+        let t = d.tick(f64::INFINITY, &mut never());
+        assert!(t.gpu_failed && t.bonds_pending.is_empty() && t.bond_reference.is_none(), "{:?}", t.bonds_pending);
+    }
+}
+
 #[test]
 fn cancelled_evaluation_ends_the_tick_without_error() {
     let (s, h) = harmonic_three();

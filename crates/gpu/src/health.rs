@@ -59,19 +59,60 @@ impl GpuHealth {
     /// The words for an uncaptured wgpu error.
     pub fn describe_error(e: &wgpu::Error) -> String {
         match e {
-            wgpu::Error::OutOfMemory { .. } => format!("out of GPU memory ({e})"),
-            wgpu::Error::Validation { description, .. } => format!("a GPU error no scope caught ({})", first_line(description)),
-            wgpu::Error::Internal { description, .. } => format!("an internal GPU error ({})", first_line(description)),
+            wgpu::Error::OutOfMemory { .. } => format!("{OUT_OF_MEMORY_WORDS} ({e})"),
+            wgpu::Error::Validation { description, .. } => format!("{UNCAUGHT_ERROR_WORDS} ({})", first_line(description)),
+            wgpu::Error::Internal { description, .. } => format!("{INTERNAL_ERROR_WORDS} ({})", first_line(description)),
         }
     }
 
     /// The words for a lost device.
     pub fn describe_loss(reason: wgpu::DeviceLostReason, message: &str) -> String {
         match (reason, message.trim()) {
-            (wgpu::DeviceLostReason::Destroyed, "") => "the GPU device was destroyed".into(),
-            (wgpu::DeviceLostReason::Destroyed, m) => format!("the GPU device was destroyed ({m})"),
-            (_, "") => "the GPU device was lost (a driver reset or out of memory)".into(),
-            (_, m) => format!("the GPU device was lost ({m})"),
+            (wgpu::DeviceLostReason::Destroyed, "") => DESTROYED_WORDS.into(),
+            (wgpu::DeviceLostReason::Destroyed, m) => format!("{DESTROYED_WORDS} ({m})"),
+            (_, "") => format!("{LOST_WORDS} (a driver reset or out of memory)"),
+            (_, m) => format!("{LOST_WORDS} ({m})"),
+        }
+    }
+}
+
+/// How a recorded failure began ([`GpuHealth::describe_error`] / [`GpuHealth::describe_loss`] start their words
+/// with these), so the user's message can say what is known and no more ([`FailureKind::of`]).
+pub const OUT_OF_MEMORY_WORDS: &str = "out of GPU memory";
+/// A validation error no error scope caught: a bug in the app's GPU use, or a limit the device enforces.
+pub const UNCAUGHT_ERROR_WORDS: &str = "a GPU error no scope caught";
+/// wgpu's internal error.
+pub const INTERNAL_ERROR_WORDS: &str = "an internal GPU error";
+/// The device was lost (an out-of-memory inside a submit or a map, or a driver reset: wgpu does not say which).
+pub const LOST_WORDS: &str = "the GPU device was lost";
+/// The device was destroyed (`Device::destroy`: the app's own shutdown, or a test).
+pub const DESTROYED_WORDS: &str = "the GPU device was destroyed";
+
+/// What a recorded failure is known to be, read from its words (the gpu-fault review, 2026-11-21: the message must
+/// not say "out of memory" for a validation error).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureKind {
+    /// wgpu reported an out-of-memory.
+    OutOfMemory,
+    /// The device was lost: a driver reset or an out-of-memory, not told apart.
+    Lost,
+    /// The device was destroyed.
+    Destroyed,
+    /// Another error (validation, internal) or words this module did not write: the cause is not known to be memory.
+    Other,
+}
+
+impl FailureKind {
+    /// The kind of a failure recorded with these words.
+    pub fn of(why: &str) -> FailureKind {
+        if why.starts_with(OUT_OF_MEMORY_WORDS) {
+            FailureKind::OutOfMemory
+        } else if why.starts_with(LOST_WORDS) {
+            FailureKind::Lost
+        } else if why.starts_with(DESTROYED_WORDS) {
+            FailureKind::Destroyed
+        } else {
+            FailureKind::Other
         }
     }
 }
@@ -86,6 +127,18 @@ fn first_line(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::GpuContext;
+
+    /// Each description is read back as its own kind; anything else is `Other`.
+    #[test]
+    fn a_failure_is_read_back_as_its_kind() {
+        assert_eq!(FailureKind::of(&GpuHealth::describe_loss(wgpu::DeviceLostReason::Destroyed, "")), FailureKind::Destroyed);
+        assert_eq!(FailureKind::of(&GpuHealth::describe_loss(wgpu::DeviceLostReason::Unknown, "")), FailureKind::Lost);
+        assert_eq!(FailureKind::of(&GpuHealth::describe_loss(wgpu::DeviceLostReason::Unknown, "reset")), FailureKind::Lost);
+        assert_eq!(FailureKind::of(&format!("{OUT_OF_MEMORY_WORDS} (Out of Memory)")), FailureKind::OutOfMemory);
+        assert_eq!(FailureKind::of(&format!("{UNCAUGHT_ERROR_WORDS} (Buffer size exceeds the limit)")), FailureKind::Other);
+        assert_eq!(FailureKind::of(&format!("{INTERNAL_ERROR_WORDS} (x)")), FailureKind::Other);
+        assert_eq!(FailureKind::of("injected: something"), FailureKind::Other);
+    }
 
     #[test]
     fn the_first_failure_is_kept() {

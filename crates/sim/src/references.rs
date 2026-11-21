@@ -596,6 +596,29 @@ mod tests {
         assert!(*t.r.last().unwrap() <= shell_radius(&cell) && *t.r.last().unwrap() > shell_radius(&cell) - 0.25);
     }
 
+    /// The gpu-fault fix (review A-M5): a physically empty atom answer (no electrons in its density) is refused by the
+    /// scan — the multiplicity recorded as failed with the reason, no reference made of it — and a GPU failure ends
+    /// the scan at its first multiplicity (O has three: one solve, not three).
+    #[test]
+    fn a_refused_or_failed_atom_solve_makes_no_reference() {
+        use crate::test_providers::{Fault, Faulty};
+        let cell = Cell { n: 33, h: 0.25 };
+        let mut empty = Faulty::new(Gaussians::per_atom(0.3, 0.8), 1, Fault::EmptyDensity);
+        let mut scan = AtomScan::new(&cell, None, IonicPolicy::None, 1, 1, 1837.15);
+        let e = scan.step(&mut empty, &mut || false).err().expect("refused");
+        assert!(e.to_string().contains("refused") && e.to_string().contains("electrons"), "{e}");
+        assert_eq!(scan.failed().len(), 1, "{:?}", scan.failed());
+        let r = solve_atom(&mut Faulty::new(Gaussians::per_atom(0.3, 0.8), 1, Fault::EmptyDensity), &cell, None, IonicPolicy::None, 1, 1837.15, &mut || false);
+        assert!(r.as_ref().err().is_some_and(|e| e.to_string().contains("refused")), "{:?}", r.map(|r| r.energy));
+        let failed = Faulty::new(Gaussians::per_atom(0.3, 0.8), 1, Fault::GpuFailed);
+        let calls = failed.calls.clone();
+        let mut failed = failed;
+        assert!(multiplicities(8) > 1);
+        let r = solve_atom(&mut failed, &cell, None, IonicPolicy::None, 8, 15.995 * 1822.888, &mut || false);
+        assert!(r.as_ref().err().is_some_and(|e| e.gpu_failure().is_some()), "{:?}", r.map(|r| r.energy));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "the scan ended at the failure");
+    }
+
     /// A scripted provider whose energy depends on the multiplicity (m = 1 → −1.0, m = 3 →
     /// −1.2; Z = 2): the triplet wins; every multiplicity cold (a reset before each, one after:
     /// 3 for helium — the brief's "twice" is a one-multiplicity species); tol and the name are

@@ -891,12 +891,32 @@ pub enum SolverError {
     /// no scope caught, or a lost device): the solver refuses every solve from now on and nothing from the solve that
     /// hit it was kept. Unlike [`Device`](SolverError::Device) it is never retried and Play does not clear it: the
     /// device is not recovered, the app is restarted. The field is the cause in wgpu's words.
-    #[error("{GPU_FAILED_MESSAGE} (cause: {0})")]
+    #[error("{}", gpu_failed_text(.0))]
     GpuFailed(String),
 }
 
-/// What the user reads when the GPU failed ([`SolverError::GpuFailed`]): the paused message.
-pub const GPU_FAILED_MESSAGE: &str = "The GPU ran out of memory (or its driver reset) during a solve. Nothing from that solve was kept. Save your work and restart the app; lower GPU memory or the quality to avoid it.";
+/// The first sentence of what the user reads when the GPU failed ([`SolverError::GpuFailed`], [`gpu_failed_text`]),
+/// whatever the cause.
+pub const GPU_FAILED_MESSAGE: &str = "The GPU failed during a solve, and nothing from that solve was kept.";
+
+/// The paused message for a GPU failure recorded as `cause` (`gpu::GpuHealth`'s words): [`GPU_FAILED_MESSAGE`], then
+/// what the cause is known to be (`gpu::FailureKind`: an out-of-memory, a lost device — a driver reset or an
+/// out-of-memory, wgpu does not say which — or another error, which is not called a memory problem), then what to
+/// do: restart first (the device is not recovered in-process), and only if it happens again lower GPU memory or the
+/// quality. A different situation from the witness-cap refusal (`providers::ks::WITNESS_BUDGET_HINT`), where nothing
+/// failed and the solve needs more memory than its budget: that one says raise GPU memory.
+pub fn gpu_failed_text(cause: &str) -> String {
+    const RESTART: &str = "Save your work and restart the app: no solve runs on this GPU again in this session.";
+    const MEMORY: &str = "If it happens again after the restart, lower GPU memory in Scene ▸ Quality or choose the Balanced quality.";
+    let (what, then) = match gpu::FailureKind::of(cause) {
+        gpu::FailureKind::OutOfMemory => ("The GPU ran out of memory.", MEMORY),
+        gpu::FailureKind::Lost => ("The GPU device was lost (a driver reset, or the GPU ran out of memory).", MEMORY),
+        gpu::FailureKind::Destroyed => ("The GPU device was shut down.", ""),
+        gpu::FailureKind::Other => ("The GPU reported an error that is not known to be a memory problem.", "If it happens again after the restart, please report it with the cause below."),
+    };
+    let then = if then.is_empty() { String::new() } else { format!(" {then}") };
+    format!("{GPU_FAILED_MESSAGE} {what} {RESTART}{then} (cause: {cause})")
+}
 
 impl SolverError {
     /// How a failed SCF ended and after how many iterations (the solve log's iteration cell):
@@ -2077,9 +2097,6 @@ pub struct AuditRecord {
 mod ionic_tests {
     use super::*;
 
-    /// M7 Task 9 (spec §5.6): an answer with overlapping cores or a flagged branch jump is untrainable and says why;
-    /// an ordinary one is not. (Re-pinned in plan 2026-11-13 Task 9: the shared-shell occupation watch this test
-    /// exercised is gone; the `branch_jump` guard took its role, spec 2026-11-13 §6.3.)
     /// The gpu-fault fix: `answer_refusal` passes a finite analytic answer and a plausible Kohn-Sham one, and refuses
     /// a non-finite one, an SCF without an iteration or without convergence, and a density without its electrons —
     /// at the tolerance's edge on both sides.
@@ -2108,6 +2125,32 @@ mod ionic_tests {
         assert_eq!(answer_refusal(&answer(0.0, 3, bare)), None);
     }
 
+    /// The GPU failure's message (the gpu-fault review): the common first sentence always; "ran out of memory" only
+    /// when wgpu said so (an out-of-memory) or could have (a lost device); a validation or internal error, or words
+    /// the gpu crate did not write, is not called a memory problem and does not send the user to the memory setting;
+    /// every kind says restart, and the memory advice is for a failure that recurs after the restart.
+    #[test]
+    fn the_gpu_failure_message_says_what_the_cause_is_known_to_be() {
+        let oom = gpu_failed_text(&format!("{} (Out of Memory)", gpu::health::OUT_OF_MEMORY_WORDS));
+        let lost = gpu_failed_text(&format!("{} (a driver reset or out of memory)", gpu::health::LOST_WORDS));
+        let bug = gpu_failed_text(&format!("{} (Buffer size 42 exceeds the limit)", gpu::health::UNCAUGHT_ERROR_WORDS));
+        let gone = gpu_failed_text(gpu::health::DESTROYED_WORDS);
+        for m in [&oom, &lost, &bug, &gone] {
+            assert!(m.starts_with(GPU_FAILED_MESSAGE), "{m}");
+            assert!(m.contains("restart the app"), "{m}");
+            assert!(m.ends_with(')') && m.contains("(cause: "), "{m}");
+            assert!(!m.contains("raise GPU memory"), "{m}");
+        }
+        assert!(oom.contains("ran out of memory") && oom.contains("If it happens again after the restart, lower GPU memory"), "{oom}");
+        assert!(lost.contains("driver reset") && lost.contains("lower GPU memory"), "{lost}");
+        assert!(!bug.contains("ran out of memory") && !bug.contains("lower GPU memory") && bug.contains("not known to be a memory problem"), "{bug}");
+        assert!(!gone.contains("lower GPU memory"), "{gone}");
+        assert_eq!(SolverError::GpuFailed("x".into()).to_string(), gpu_failed_text("x"));
+    }
+
+    /// M7 Task 9 (spec §5.6): an answer with overlapping cores or a flagged branch jump is untrainable and says why;
+    /// an ordinary one is not. (Re-pinned in plan 2026-11-13 Task 9: the shared-shell occupation watch this test
+    /// exercised is gone; the `branch_jump` guard took its role, spec 2026-11-13 §6.3.)
     #[test]
     fn untrainable_answers_say_why() {
         let mut s = EvalStats::default();

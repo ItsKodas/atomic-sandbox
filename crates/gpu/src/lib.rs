@@ -2,7 +2,7 @@
 pub mod volume;
 pub mod readback;
 pub mod health;
-pub use health::GpuHealth;
+pub use health::{FailureKind, GpuHealth};
 pub use readback::{read_buffer, wait_idle, ReadbackError};
 pub use volume::{ColourVolume3D, Volume3D};
 use std::marker::PhantomData;
