@@ -1352,6 +1352,8 @@ impl GpuSolver {
         // --- the loop ---
         let mut iterations = 0;
         let mut delta_rho = f64::INFINITY;
+        // ∫ρ_out,σ of the latest step (read back with its Δρ): the converged answer's electron count (`ScfStats::electrons`)
+        let mut electrons = [0.0f64; 2];
         let mut abandoned = false;
         let mut aborted_in_step = false; // `inner_abort` stopped an FD channel's eigensolve (Task 9c)
         // the stall stop (`qm::scf` module doc, "The stall stop"): the same rule as the CPU's
@@ -1482,6 +1484,7 @@ impl GpuSolver {
                 (vals[4..row_end].chunks(2).map(|c| c[0] + c[1]).collect::<Vec<f64>>(), [vals[2], vals[3]], hf_dc)
             };
             device_fault!(); // before Δρ = 0 from a failed readback reads as convergence
+            electrons = q_out;
             // spec §5.1: the tolerance this step is tested against — max(tol, GPU_PARTIAL_TOL) when its occupations
             // have a partial level, else tol (bitwise today's comparison)
             test_tol = if fd_kt.is_some() && !partial.is_empty() { settings.tol.max(partial_tol) } else { settings.tol };
@@ -1670,7 +1673,7 @@ impl GpuSolver {
                                 ionic: system.ionic.clone(), occ_up, occ_dn, occupations: settings.occupations });
         *converged = true;
         Ok(Some(ScfStats { iterations, delta_rho, energy, boundary_density, max_eigen_residual, max_guard_residual, poisson_residual, poisson_iterations, warnings,
-                           core_overlaps: overlaps, entropy, mu, partial, tol_used: test_tol }))
+                           core_overlaps: overlaps, entropy, mu, partial, tol_used: test_tol, electrons }))
     }
 
     /// The LOBPCG tol the SCF converges its final step to (module doc, "Display access"); a Harris
@@ -1923,6 +1926,12 @@ mod tests {
         let d = compare("H₂ 33³", &stats, &cpu_stats, 1e-5, 2e-5); // brief 1e-4 / 2e-4; achieved 9.1e-8 / ≤ 2.4e-6
         println!("H₂ 33³: |ΔE| = {d:.2e}");
         assert!((q - 2.0).abs() < 1e-5, "∫ρ = {q}");
+        // the stats carry the final step's ∫ρ_out per spin (gpu-fault: an answer must have its electrons), measured
+        // N_σ(1 + ε) with |ε| ~ 1e-7 (module doc, "Charge renormalisation"); the CPU's is f64-exact
+        println!("H₂ 33³: ScfStats::electrons GPU {:?} (−1: {:+.2e} {:+.2e}), CPU {:?}", stats.electrons, stats.electrons[0] - 1.0, stats.electrons[1] - 1.0, cpu_stats.electrons);
+        for (spin, e) in stats.electrons.iter().enumerate() {
+            assert!((e - 1.0).abs() < 1e-6, "spin {spin}: ∫ρ_out = {e}");
+        }
         assert!((stats.iterations as i64 - cpu_stats.iterations as i64).abs() <= 3, "DIIS steps: gpu {} cpu {}", stats.iterations, cpu_stats.iterations);
         let s_readbacks_1e6 = s.profile().readbacks;
         println!("H₂ 33³: Δρ_final = {:.2e} (tol {:.0e}), final-step eigen residual {:.2e}", stats.delta_rho, settings.tol, s.profile().eigen_last_step_residual);

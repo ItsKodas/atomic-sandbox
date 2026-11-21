@@ -566,6 +566,11 @@ pub struct ScfStats {
     pub mu: [Option<f64>; 2],
     pub partial: Vec<PartialLevel>,
     pub tol_used: f64,
+    /// ∫ρ_σ d³r of the density the answer was evaluated from, per spin [↑, ↓] (electrons; on the GPU the final step's
+    /// ∫ρ_out,σ, read back with its Δρ). Equal to the system's (n_up, n_dn) to the solver's rounding: the providers check
+    /// it before an answer may become training data (`sim::answer_refusal`, the gpu-fault fix) — a density that a failed
+    /// device left empty integrates to 0.
+    pub electrons: [f64; 2],
 }
 
 /// Density on a box face above this (e/Bohr³) triggers the box-size warning.
@@ -1075,6 +1080,7 @@ fn scf_tiered(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option
         Energy { kinetic: kinetic_e, external, hartree, xc: xc_e, nuclear: e_nn, internal, ts, total: internal - ts }
     };
     let boundary_density = max_on_faces(grid, &rho);
+    let electrons = [grid.integrate(&rho_out_up), grid.integrate(&rho_out_dn)];
     let mut warnings = Vec::new();
     if boundary_density > BOUNDARY_DENSITY_WARN { warnings.push(format!("density on box faces is {boundary_density:.2e}: box too small")); }
     warnings.append(&mut inner.warnings);
@@ -1088,7 +1094,7 @@ fn scf_tiered(grid: &Grid, system: &System, settings: &ScfSettings, warm: Option
         ScfStats { iterations, delta_rho, energy, boundary_density,
                    max_eigen_residual: inner.eigen_residual, max_guard_residual: inner.guard_residual, poisson_residual: inner.poisson_residual,
                    poisson_iterations: inner.poisson_iterations, warnings, core_overlaps: overlaps,
-                   entropy, mu, partial, tol_used: settings.tol }))
+                   entropy, mu, partial, tol_used: settings.tol, electrons }))
 }
 
 /// kT of a scheme (Ha): the `FermiDirac` temperature, 0 for `Aufbau` (whose S is 0).
@@ -1164,6 +1170,9 @@ mod tests {
         assert!(stats.delta_rho < 1e-6, "{stats:?}");
         assert_relative_eq!(g.integrate(&state.rho_up), 1.0, epsilon = 1e-8);
         assert_eq!(g.integrate(&state.rho_dn), 0.0);
+        // the electron count the stats carry is the final density's integral per spin (gpu-fault: the providers'
+        // check that an answer has its electrons)
+        assert_eq!(stats.electrons, [g.integrate(&state.rho_up), g.integrate(&state.rho_dn)]);
         assert!(stats.energy.total < -0.40 && stats.energy.total > -0.50, "E = {}", stats.energy.total);
         assert!(stats.warnings.is_empty(), "{:?}", stats.warnings);
     }
