@@ -91,6 +91,48 @@ The FD migration (`surrogate/migration.rs`, `providers/sampling/migrate.rs`, the
   - providers (surrogate and sampling) and app (`ui::` and the worker model tests) at the end of day 2;
   - validate surrogate (the key trust tests), one full app run and one full providers run before merging.
 
+## Physics review, 2026-11-22: binding changes
+
+Full review: `docs/superpowers/research/2026-11-22-chemical-channels-physics-review.md`. Column counts: `…-counts.py`. Verdict: **sound after changes.** Where this section and the text above disagree, this section wins.
+
+- **C1. The W uncertainty is propagated, not taken from a residual.** W = M·V_K·Σ_K⁻¹ is linear in the low-order fit's coefficients, so Σ_W = R·Σ_low·Rᵀ, taken from that fit's exact posterior.
+  - Freeze Σ_W with W.
+  - The energy gradient ∂E/∂W comes from the hot path's adjoint. The force gradient comes from a 5-point stencil in W, which is exact because E is cubic in W.
+  - Add gᵀΣ_W g to σ_epi before calibration, and record it in the history stds.
+  - With λ floored at 1 it can only widen error bars. For a barely seen element it falls back to the prior's width.
+  - **N_W:** an element gets a W row once one of its many-body neighbour keys meets today's sample floor in the low-order fit. **N_trust is dropped** (redundant with C2).
+- **C2. Trust floors per key.** A dense W would make `touched_columns` mark a centre's whole block: H{H} would go from 74 to 1 652 samples, and the model floor to 8 340, so the model would answer nothing. Instead each key's floor is q_k = n_max·|T| + P₃(min(|T|, K)) + P₄(min(|T|, K)), with T the key's neighbour-species set. This is exactly today's floor when |T| ≤ K. Apply the same bound to `fit_floor`, `min_samples_for_trust_basis` and `richer_basis`.
+- **I1. Tests beyond the identity:**
+  - an algebraic oracle with a random dense non-symmetric W (B^ch = W⊗W contracted with B^sp);
+  - permutation and species-relabel tests;
+  - a finite-difference force test at K < S.
+- **I2. The W recipe:**
+  - halve the off-diagonal terms when unpacking the c₁ ≤ c₂ storage;
+  - weight the SVD by energy relevance (a per-species density scale);
+  - store W with orthonormal columns (column scale is an exact gauge under per-feature standardisation);
+  - fix the sign by the entry of largest absolute value;
+  - use a deterministic S×S Jacobi eigensolve;
+  - set W = I whenever the effective K reaches S;
+  - report a per-species truncation residual and the singular-value gap.
+- **I3. Choosing K:** bound K by cost, choose it by **held-out RMSE** (evidence degenerates to the largest K on thousands of rows), and run K = S as a control.
+- **I4. A reduced basis for the low-order fit:** n_max 4, l_max 2, D 2 gives Q′ ≈ 5 640 at S = 10. The collection basis would grow as S⁹. **The scaling claim corrected:** at K = 4, Q′ is 8 340 at 5 elements and 16 880 at 10, so ten elements cost about what five cost today (14 670).
+- **I5. The new-element lifecycle:**
+  - leave samples of an element with no W row out of the fit;
+  - relearn W at N_W, and again each time that element's informative count doubles;
+  - key the rows in `channels.txt` by Z, and refuse a mismatched species set;
+  - reset class hysteresis on a relearn (keys re-enter at ENTER).
+- **I6.** The closed-form LOO is W-leaky (W was learnt with the left-out sample). Guard it by N_W, and measure it with a fold relearn.
+- **I7. The day-1 gate is extended:**
+  - held out by scene group, with W relearnt per fold;
+  - an **energy** criterion beside the force one;
+  - results per element and per key;
+  - trust outcome: key verdicts and `would_answer` at the `refit_golden` probes;
+  - calibration z and the count of admitted-but-wrong atoms;
+  - the rarest element at 5 % / 20 % of its samples;
+  - a relearn timed end to end;
+  - the K = S control.
+- **Rules 5a/5b are unaffected:** `isolated_atom` and `coordination_ratio` read only the per-species body-2 features, which stay. No geometric replacement is needed. Keep `n_species()` = S and add a separate `n_channels()`.
+
 ## Approaches considered
 
 1. **Neighbour channels with per-centre blocks and W from an SVD of a low-order fit (chosen).** It is supported by the literature, linear-algebra only, and keeps the exact posterior.

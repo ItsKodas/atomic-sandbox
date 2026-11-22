@@ -14,6 +14,15 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-22-chemical-channels-design.md` (with `docs/superpowers/research/2026-11-22-chemical-channels-literature.md`).
 
+## Physics review changes (2026-11-22, binding)
+
+The spec's section "Physics review, 2026-11-22: binding changes" (C1, C2, I1–I7) overrides the task text below where they differ. In particular:
+- Task 1 adds I1's oracle, permutation, relabel and finite-difference tests.
+- Task 2 follows I2/I3/I4 (the W recipe, K by held-out RMSE, the reduced low-order basis) and the extended gate I7.
+- Task 4 keeps the envelope and the 5a/5b logic (no geometric replacement).
+- Task 5 implements C1 (Σ_W = R·Σ_low·Rᵀ) and N_W, with no N_trust.
+- Task 6 implements C2's per-key floor q_k and the I5 lifecycle.
+
 ## Global constraints
 
 - Rule 1 exception (CLAUDE.md): W is learnt only from our DFT samples, never from tabulated properties.
