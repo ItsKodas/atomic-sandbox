@@ -9,9 +9,10 @@
 //! (`overlay.rs`).
 use super::dock;
 use super::activity;
+use super::icons::Icon;
 use super::{keyed, source_colour, source_label, theme, Action, PanelInput, UiState, GREEN, RED, SPARK_E};
 use crate::sim::Backend;
-use egui::{pos2, Align2, Color32, Id, Order, Pos2, Rect, RichText, Stroke, Vec2};
+use egui::{pos2, Align2, Color32, Id, Order, Pos2, Rect, RichText, Stroke, Ui, Vec2};
 
 pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) {
     if let Some(s) = input.snapshot {
@@ -921,19 +922,41 @@ fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInp
                     .on_hover_text("one DFT solve at the current positions, then the bonds and angles");
                 return;
             }
-            let word = if stale { "Solve Bonds" } else { "Bonds solved" };
-            let b = egui::Button::new(egui::RichText::new(word).strong().size(14.0).color(egui::Color32::WHITE))
-                .fill(if stale { theme::GLOW } else { theme::PANEL_3 })
-                .stroke(egui::Stroke::new(1.0, theme::ACCENT))
-                .corner_radius(8)
-                .min_size(Vec2::new(172.0, 36.0));
-            let r = ui.add_enabled(!input.sampling(), b).on_hover_text(
-                "the model's steps carry no density, so the bonds and angles shown are from the last DFT step: this solves the density once at the current positions (between two steps; a running simulation carries on) and shows the bonds, their lengths and the angles",
-            );
-            super::probe("bonds-now", &r);
-            if r.clicked() {
-                acts.push(Action::RefreshBonds);
-            }
+            // two connected icon buttons (user 2026-11-22): Solve bonds | Solve orbitals
+            let enabled = !input.sampling();
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.horizontal(|ui| {
+                let half = |ui: &mut Ui, icon: Icon, lit: bool, left: bool| {
+                    let cr = if left { egui::CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 } } else { egui::CornerRadius { nw: 0, sw: 0, ne: 8, se: 8 } };
+                    let b = egui::Button::new("").fill(if lit { theme::GLOW } else { theme::PANEL_3 }).stroke(egui::Stroke::new(1.0, theme::ACCENT)).corner_radius(cr).min_size(Vec2::new(52.0, 36.0));
+                    let r = ui.add_enabled(enabled, b);
+                    let inner = egui::Rect::from_center_size(r.rect.center(), Vec2::splat(22.0));
+                    let colour = if !enabled { theme::INK_FAINT } else { egui::Color32::WHITE };
+                    if enabled {
+                        super::icons::paint(ui.painter(), inner, icon, colour);
+                    } else {
+                        super::icons::paint_disabled(ui.painter(), inner, icon, colour);
+                    }
+                    r
+                };
+                let bonds_tip = if stale {
+                    "Solve bonds: the model's steps carry no density, so the bonds and angles shown are from the last DFT step. This solves the density once at the current positions (between two steps; a running simulation carries on) and shows the bonds, their lengths and the angles"
+                } else {
+                    "Bonds solved at these positions. Solve bonds solves the density again at the current positions and shows the bonds, their lengths and the angles"
+                };
+                let r = half(ui, Icon::Bonds, stale, true).on_hover_text(bonds_tip);
+                super::probe("bonds-now", &r);
+                if r.clicked() {
+                    acts.push(Action::RefreshBonds);
+                }
+                let r = half(ui, Icon::Orbitals, false, false).on_hover_text(
+                    "Solve orbitals: one display-only DFT solve on the background solver at the current positions, for the density cloud and the orbitals shown (Orbitals tab), even under Model only. It teaches nothing and never delays a step",
+                );
+                super::probe("orbitals-now", &r);
+                if r.clicked() {
+                    acts.push(Action::SolveOrbitals);
+                }
+            });
         });
     let mut top = button.response.rect.top();
     if let Some(text) = &line {

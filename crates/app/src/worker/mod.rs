@@ -803,6 +803,9 @@ struct Worker {
     samples_at_refit: usize,
     /// When the last refit ended (the refit throttle, [`REFIT_INTERVAL`]).
     last_refit_at: Option<Instant>,
+    /// The last refit's wall and Model tab ▸ Refit (`model::RefitCadence`).
+    last_refit_wall: Duration,
+    refit_cadence: model::RefitCadence,
     /// When the running background refit started (playing: `refit_if_pending`), if one runs.
     refit_started: Option<Instant>,
     /// The provider's `Trainable::fit_inputs_gen` when the running background refit started.
@@ -1073,6 +1076,8 @@ fn worker(
         autosave,
         last_refit: None,
         last_refit_at: None,
+        last_refit_wall: Duration::ZERO,
+        refit_cadence: model::RefitCadence::default(),
         refit_started: None,
         refit_started_gen: None,
         refit_done_gen: None,

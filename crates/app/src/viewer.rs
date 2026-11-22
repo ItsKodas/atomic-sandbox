@@ -758,6 +758,10 @@ impl Viewer {
             if self.ui.draft {
                 teach.push(Command::SetDraft(true));
             }
+            // Model tab ▸ Refit (machine.settings)
+            if self.ui.refit_cadence != crate::worker::RefitCadence::default() {
+                teach.push(Command::SetRefitCadence(self.ui.refit_cadence));
+            }
             self.pending_teach = Some(teach);
             self.poll_retiring();
         }

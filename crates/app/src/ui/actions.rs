@@ -164,6 +164,9 @@ pub enum Action {
     /// user's Forget / Restore starts at once instead of after its delay (`Command::RefitNow`).
     /// Recorded, not replayable (it only exists after a Forget or Restore, which a replay refuses).
     RefitNow,
+    /// Model tab ▸ Refit (`worker::RefitCadence`, `Command::SetRefitCadence`; user 2026-11-22): how
+    /// soon an automatic refit may follow the last one. Script word `refit-cadence auto|<min>|manual`.
+    RefitCadence(crate::worker::RefitCadence),
     /// The forgotten list's "Purge forgotten (N)…" › **Purge** (after the inline confirmation):
     /// every forgotten sample deleted for good (`Command::PurgeForgotten`), with the count the user
     /// confirmed (the worker refuses when the forgotten list changed since). Recorded, not
@@ -219,6 +222,11 @@ pub enum Action {
     /// The estimated view's "Bonds now" (`DynCommand::RefreshBonds`): a teacher solve between
     /// steps for the bond graph, and the bonds, lengths and angles shown.
     RefreshBonds,
+    /// The estimated view's Solve orbitals (user 2026-11-22, beside Solve bonds): one display-only
+    /// Kohn-Sham solve on the background teacher at the current positions (`Command::SolveOrbitals`,
+    /// `Trainable::request_display`) for the density and the shown orbitals — under ⚠ Model only too:
+    /// the user's own press, like Solve bonds. Never judged, never a sample.
+    SolveOrbitals,
     /// End the relax now: `DynCommand::StopRelax`.
     StopRelax,
     /// View ▸ Density ▸ smooth motion: draw the nuclei between the last two snapshots (display
@@ -778,6 +786,10 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             st.set_status(format!("purging {n} forgotten sample{}…", if n == 1 { "" } else { "s" }));
             out.commands.push(Command::PurgeForgotten(n));
         }
+        Action::RefitCadence(c) => {
+            st.refit_cadence = c;
+            out.commands.push(Command::SetRefitCadence(c));
+        }
         Action::SetAudit(n) => {
             model_only_by_hand(st, "the audit cadence", out);
             st.audit_every = n;
@@ -827,6 +839,9 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
         Action::ShowBadge(on) => st.show_badge = on,
         Action::ShowAngles(on) => st.show_angles = on,
         Action::NameStyle(s) => st.name_style = s,
+        Action::SolveOrbitals => {
+            out.commands.push(Command::SolveOrbitals);
+        }
         Action::RefreshBonds => {
             out.commands.push(dyn_(DynCommand::RefreshBonds));
             // the button shows everything it solved for
@@ -1263,6 +1278,7 @@ impl Action {
             PauseSampling => "pause-sampling".into(),
             ContinueSampling => "continue-sampling".into(),
             SetAudit(n) => format!("audit {n}"),
+            RefitCadence(c) => format!("refit-cadence {}", c.word()),
             VolumeMode(m) => format!("volume-mode {m}"),
             Walls { on: o, half_width } => format!("walls {} {half_width}", on(*o)),
             Cloud { superposition, refresh, refresh_s } => format!("cloud {superposition} {refresh} {refresh_s}"),
@@ -1278,6 +1294,7 @@ impl Action {
             NameStyle(s) => format!("names {}", style_word(*s)),
             Relax => "relax".into(),
             RefreshBonds => "refresh-bonds".into(),
+            SolveOrbitals => "solve-orbitals".into(),
             StopRelax => "stop-relax".into(),
             SmoothMotion(b) => format!("smooth-motion {b}"),
             Show(m) => format!("show {}", m.word()),
@@ -1352,6 +1369,7 @@ impl Action {
                     "continue-sampling" => ContinueSampling,
                     "relax" => Relax,
                     "refresh-bonds" => RefreshBonds,
+                    "solve-orbitals" => SolveOrbitals,
                     "orbital-include-reset" => IncludeAllOccupied,
                     "cancel-compare" => CancelCompare,
                     "migration-later" => MigrationLater,
@@ -1459,6 +1477,10 @@ impl Action {
             "audit" => {
                 want(1)?;
                 SetAudit(num(head, args[0])?)
+            }
+            "refit-cadence" => {
+                want(1)?;
+                RefitCadence(crate::worker::RefitCadence::parse(args[0]).ok_or_else(|| format!("{head}: auto, the minutes or manual, not {:?}", args[0]))?)
             }
             "volume-mode" => {
                 want(1)?;

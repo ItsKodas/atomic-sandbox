@@ -33,6 +33,8 @@ pub enum Icon {
     Activity,
     /// A p orbital: two lobes, both filled, about the nucleus (the Orbitals tab).
     Orbitals,
+    /// Two atoms, filled, joined by a double bond (the view's Solve bonds button, 2026-11-22).
+    Bonds,
     /// A filled circle in a dashed ring (the Selection tab).
     Selection,
     /// A page with a folded corner, the page filled, and its lines (the Log tab).
@@ -81,7 +83,7 @@ pub enum Icon {
 impl Icon {
     /// Every icon (the painter's tests draw each).
     #[cfg(test)]
-    pub const ALL: [Icon; 31] = [
+    pub const ALL: [Icon; 32] = [
         Icon::Play,
         Icon::Pause,
         Icon::Step,
@@ -94,6 +96,7 @@ impl Icon {
         Icon::Model,
         Icon::Activity,
         Icon::Orbitals,
+        Icon::Bonds,
         Icon::Selection,
         Icon::Log,
         Icon::ChevronLeft,
@@ -255,6 +258,15 @@ fn draw(p: &Painter, rect: Rect, icon: Icon, colour: Color32, fill: Color32) {
             p.circle_stroke(at(7.0, 12.0), 4.4 * s, stroke);
             p.circle_stroke(at(17.0, 12.0), 4.4 * s, stroke);
             p.circle_filled(at(12.0, 12.0), 1.4 * s, colour);
+        }
+        Icon::Bonds => {
+            // two atoms joined by a double bond
+            fill_circle(6.0, 12.0, 3.8);
+            fill_circle(18.0, 12.0, 3.8);
+            p.circle_stroke(at(6.0, 12.0), 3.8 * s, stroke);
+            p.circle_stroke(at(18.0, 12.0), 3.8 * s, stroke);
+            p.line_segment([at(9.8, 10.4), at(14.2, 10.4)], stroke);
+            p.line_segment([at(9.8, 13.6), at(14.2, 13.6)], stroke);
         }
         Icon::Selection => {
             fill_circle(12.0, 12.0, 4.0);
@@ -434,8 +446,9 @@ mod tests {
     use egui::epaint::Shape;
 
     /// The icons with a duotone fill on their main shape (the user's set, 2026-11-03).
-    const DUOTONE: [Icon; 14] = [
+    const DUOTONE: [Icon; 15] = [
         Icon::Model,
+        Icon::Bonds,
         Icon::Knowledge,
         Icon::Selection,
         Icon::Readouts,

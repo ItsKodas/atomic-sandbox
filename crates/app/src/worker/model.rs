@@ -134,6 +134,12 @@ pub struct ModelStatus {
     /// waiting) and whether a background refit runs now: the Model tab's banner.
     pub refit_due: Option<Instant>,
     pub refit_running: bool,
+    /// Model tab ▸ Refit ([`RefitCadence`]), the samples kept since the last refit that wait for
+    /// one (0 without a pending refit), and when the cadence lets the next automatic one start
+    /// (`None`: Manual, or no refit yet).
+    pub refit_cadence: RefitCadence,
+    pub samples_waiting: usize,
+    pub auto_refit_at: Option<Instant>,
     /// Superseded quarantined samples, box-affected samples excluded from the fit, and samples
     /// kept since the last refit: with `quarantined`, what the store holds beyond the fit
     /// (`samples` = fit + quarantined + superseded + box_excluded + unfitted right after a refit;
@@ -509,6 +515,89 @@ pub(super) const REFIT_INTERVAL: Duration = Duration::from_millis(500);
 
 /// … or until this many samples arrived since it, whichever comes first.
 pub(super) const REFIT_SAMPLES: usize = 25;
+
+/// Model tab ▸ Refit (user 2026-11-22: "It runs refits back to back, slowing everything down" —
+/// a four-element collection's refit takes 1–2 min, and fallbacks keep adding samples, so with
+/// [`REFIT_INTERVAL`] the next refit started as soon as one landed): how soon an **automatic**
+/// refit may follow the last one while playing. **Refit now** is never held. Kept per computer in
+/// `machine.settings` (`ui::profile::machine_text`: refit cost is this CPU's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RefitCadence {
+    /// Wait [`AUTO_REFIT_FACTOR`] × the last refit's wall (at least [`REFIT_INTERVAL`]), so
+    /// automatic refits take at most about a third of the time; the 25-sample bypass only while
+    /// refits are quick.
+    #[default]
+    Auto,
+    /// At most one automatic refit per this many minutes (no sample bypass).
+    Every(u32),
+    /// Never automatic, playing or paused: only **Refit now** (and a sampling pass's own fit).
+    Manual,
+}
+
+/// The minutes Model tab ▸ Refit offers.
+pub const REFIT_CADENCE_MINUTES: [u32; 4] = [1, 2, 5, 10];
+
+/// [`RefitCadence::Auto`]'s wait, × the last refit's wall.
+pub const AUTO_REFIT_FACTOR: f64 = 2.0;
+
+impl RefitCadence {
+    /// The script / settings word: `auto`, the minutes, or `manual`.
+    pub fn word(self) -> String {
+        match self {
+            RefitCadence::Auto => "auto".into(),
+            RefitCadence::Every(m) => m.to_string(),
+            RefitCadence::Manual => "manual".into(),
+        }
+    }
+
+    /// The inverse of [`word`](Self::word) (minutes clamped to 1–60).
+    pub fn parse(w: &str) -> Option<RefitCadence> {
+        match w.trim() {
+            "auto" => Some(RefitCadence::Auto),
+            "manual" => Some(RefitCadence::Manual),
+            m => m.trim_end_matches("min").trim().parse::<u32>().ok().map(|m| RefitCadence::Every(m.clamp(1, 60))),
+        }
+    }
+
+    /// The menu's words.
+    pub fn label(self) -> String {
+        match self {
+            RefitCadence::Auto => "Auto".into(),
+            RefitCadence::Every(1) => "Every minute".into(),
+            RefitCadence::Every(m) => format!("Every {m} minutes"),
+            RefitCadence::Manual => "Only when I press Refit now".into(),
+        }
+    }
+
+    /// The wait after the last refit before an automatic one while playing (`None`: never
+    /// automatic), given the last refit's wall.
+    pub fn wait(self, last_wall: Duration) -> Option<Duration> {
+        match self {
+            RefitCadence::Auto => Some(REFIT_INTERVAL.max(last_wall.mul_f64(AUTO_REFIT_FACTOR))),
+            RefitCadence::Every(m) => Some(Duration::from_secs(60 * m as u64)),
+            RefitCadence::Manual => None,
+        }
+    }
+}
+
+/// Whether the cadence holds an automatic refit now: `paused`, the time since the last refit
+/// (`None`: none yet this session), its wall, and whether [`REFIT_SAMPLES`] new samples arrived.
+/// Paused, only [`RefitCadence::Manual`] holds (a paused change is shown at once, as before).
+pub(crate) fn cadence_holds(c: RefitCadence, paused: bool, since: Option<Duration>, last_wall: Duration, many_new: bool) -> bool {
+    match c.wait(last_wall) {
+        None => true,
+        Some(_) if paused => false,
+        // the old rule while refits are quick: 0.5 s, or 25 new samples first
+        Some(w) if w <= REFIT_INTERVAL => since.is_some_and(|t| t < w) && !many_new,
+        Some(w) => since.is_some_and(|t| t < w),
+    }
+}
+
+/// When the cadence lets the next automatic refit start (`None`: not held by time — Manual, or
+/// no refit yet).
+pub(crate) fn cadence_next(c: RefitCadence, last_at: Option<Instant>, last_wall: Duration) -> Option<Instant> {
+    Some(last_at? + c.wait(last_wall)?)
+}
 
 /// The pending refit after the user's Forget / Restore waits this long after the **last** one
 /// (2026-11-14, the batched forget; `worker` module doc, "Refits"): a refit with a non-empty misfit
@@ -972,7 +1061,9 @@ impl Worker {
             self.user_refit.clear();
             return landed;
         };
-        let throttled = !snap.paused && self.last_refit_at.is_some_and(|t| t.elapsed() < REFIT_INTERVAL) && s.samples() < self.samples_at_refit + REFIT_SAMPLES;
+        // the cadence (Model tab ▸ Refit; `RefitCadence`): Refit now is never held (`refit_start`'s `asked`)
+        let many_new = s.samples() >= self.samples_at_refit + REFIT_SAMPLES;
+        let throttled = cadence_holds(self.refit_cadence, snap.paused, self.last_refit_at.map(|t| t.elapsed()), self.last_refit_wall, many_new);
         // what a refit fits, as the provider counts its changes (`None`: not counted — always new)
         let gen = s.fit_inputs_gen();
         let new_data = gen.is_none() || gen != self.refit_done_gen;
@@ -1104,6 +1195,7 @@ impl Worker {
         self.samples_at_refit = samples;
         self.last_refit = Some(RefitLog { ms, at_step: snap.step, result });
         self.last_refit_at = Some(Instant::now());
+        self.last_refit_wall = Duration::from_secs_f64((ms * 1e-3).max(0.0));
         self.dy.add_note(note);
     }
 
@@ -1118,6 +1210,8 @@ impl Worker {
         let last_purge = self.last_purge.clone();
         let autosave = self.autosave.clone();
         let (refit_due, refit_running) = (self.user_refit.due(), self.refit_started.is_some());
+        let (cadence, samples_at_refit) = (self.refit_cadence, self.samples_at_refit);
+        let auto_refit_at = cadence_next(cadence, self.last_refit_at, self.last_refit_wall);
         let s = trainable(&mut self.dy)?;
         let st = s.status(scene, forces);
         let source_is_autosave = matches!((&st.model_source, &autosave), (sim::ModelSource::File(p), Some(a)) if p == a);
@@ -1155,6 +1249,9 @@ impl Worker {
             forgotten_samples: s.forgotten_samples(),
             user_changes_pending: s.user_changes_pending(),
             refit_due,
+            refit_cadence: cadence,
+            samples_waiting: if st.pending_refit { st.samples.saturating_sub(samples_at_refit) } else { 0 },
+            auto_refit_at,
             refit_running,
             superseded: st.superseded,
             box_excluded: st.box_excluded,
@@ -1303,7 +1400,7 @@ pub fn purge_line(r: &Result<sim::PurgeReport, String>) -> String {
 /// pending, as `providers::surrogate`'s install leaves them), then `refit_start` decides.
 #[cfg(test)]
 mod debounce_tests {
-    use super::{refit_start, RefitGate, RefitInputs, RefitStart, UserRefit, FORGET_REFIT_DELAY};
+    use super::{cadence_holds, cadence_next, refit_start, RefitCadence, RefitGate, RefitInputs, RefitStart, UserRefit, FORGET_REFIT_DELAY};
     use std::time::{Duration, Instant};
 
     /// The provider's side: a refit due, the user's changes no fit holds, a background refit
@@ -1510,5 +1607,31 @@ mod debounce_tests {
         u.changed(t0);
         assert_eq!(refit_start(&mut u, t0, pass_end), RefitStart::Background);
         assert!(u.due().is_none(), "the pass's fit holds the user's changes too");
+    }
+
+    /// Model tab ▸ Refit (user 2026-11-22): Auto waits 2x the last refit (the old 0.5 s / 25-sample
+    /// rule while refits are quick), Every N waits N minutes with no sample bypass, Manual holds
+    /// every automatic refit (paused too); paused, the timed ones do not hold; the words round-trip.
+    #[test]
+    fn the_refit_cadence_holds_automatic_refits() {
+        let (s, ms) = (Duration::from_secs, Duration::from_millis);
+        let auto = RefitCadence::Auto;
+        assert!(cadence_holds(auto, false, Some(s(60)), s(90), true), "Auto after a 90 s refit: 180 s, samples do not bypass");
+        assert!(!cadence_holds(auto, false, Some(s(181)), s(90), true));
+        assert!(cadence_holds(auto, false, Some(ms(100)), ms(50), false), "quick refits: the old 0.5 s");
+        assert!(!cadence_holds(auto, false, Some(ms(100)), ms(50), true), "quick refits: 25 new samples go first");
+        assert!(!cadence_holds(auto, true, Some(s(1)), s(90), false), "paused: not held");
+        assert!(!cadence_holds(auto, false, None, s(90), false), "no refit yet: not held");
+        let five = RefitCadence::Every(5);
+        assert!(cadence_holds(five, false, Some(s(299)), ms(10), true) && !cadence_holds(five, false, Some(s(300)), ms(10), false));
+        assert!(cadence_holds(RefitCadence::Manual, true, None, s(0), true), "Manual holds paused too");
+        for c in [auto, RefitCadence::Every(1), five, RefitCadence::Manual] {
+            assert_eq!(RefitCadence::parse(&c.word()), Some(c));
+        }
+        assert_eq!(RefitCadence::parse("90"), Some(RefitCadence::Every(60)));
+        assert_eq!(RefitCadence::parse("soon"), None);
+        let t0 = Instant::now();
+        assert_eq!(cadence_next(auto, Some(t0), s(90)), Some(t0 + s(180)));
+        assert_eq!(cadence_next(RefitCadence::Manual, Some(t0), s(90)), None);
     }
 }

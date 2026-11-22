@@ -103,6 +103,10 @@ pub enum Command {
     /// Restore starts at once instead of after its delay (after a running refit lands). Never an
     /// edit, never aborts.
     RefitNow,
+    /// The view's Solve orbitals (`ui::Action::SolveOrbitals`): a display refresh on the background teacher at the current positions.
+    SolveOrbitals,
+    /// Model tab ▸ Refit (`model::RefitCadence`): how soon an automatic refit may follow the last one.
+    SetRefitCadence(super::model::RefitCadence),
     /// Estimated solver: the Model tab's "Purge forgotten (N)…" after its confirmation
     /// (`Trainable::purge_forgotten`): every forgotten sample deleted for good — from the shared
     /// collection's samples file too, its old file kept as `samples.bin.bak`. No refit (the fit
@@ -224,6 +228,8 @@ impl Command {
             | Command::RestoreSamples(_)
             | Command::ForgetByRule { .. }
             | Command::RefitNow
+            | Command::SolveOrbitals
+            | Command::SetRefitCadence(_)
             | Command::PurgeForgotten(_)
             | Command::SaveSpecialised { .. }
             | Command::ResumeTraining(_)
@@ -268,6 +274,8 @@ impl Command {
             | Command::RestoreSamples(_)
             | Command::ForgetByRule { .. }
             | Command::RefitNow
+            | Command::SolveOrbitals
+            | Command::SetRefitCadence(_)
             | Command::PurgeForgotten(_)
             | Command::SaveSpecialised { .. }
             | Command::SetAudit(_)
@@ -317,6 +325,8 @@ impl Command {
                 | Command::RestoreSamples(_)
                 | Command::ForgetByRule { .. }
                 | Command::RefitNow
+            | Command::SolveOrbitals
+            | Command::SetRefitCadence(_)
                 | Command::PurgeForgotten(_)
                 | Command::SaveSpecialised { .. }
                 | Command::ResumeTraining(_)
@@ -372,6 +382,8 @@ impl Command {
             | Command::RestoreSamples(_)
             | Command::ForgetByRule { .. }
             | Command::RefitNow
+            | Command::SolveOrbitals
+            | Command::SetRefitCadence(_)
             | Command::PurgeForgotten(_)
             | Command::SaveSpecialised { .. }
             | Command::DisplayPartialCore(_)
@@ -487,6 +499,19 @@ impl Worker {
             Command::RestoreSamples(ids) => self.user_samples(&ids, false),
             Command::ForgetByRule { rule, expected } => self.forget_by_rule(&rule, expected),
             Command::RefitNow => self.refit_now(),
+            Command::SolveOrbitals => {
+                let snap = self.dy.snapshot();
+                if !snap.scene.nuclei.is_empty() {
+                    if let Some(t) = trainable(&mut self.dy) {
+                        if t.request_display(&snap.scene) {
+                            // the refresh covers this geometry: no Harris job for it
+                            let here: Vec<[f64; 3]> = snap.scene.nuclei.iter().map(|n| n.pos).collect();
+                            self.harris.covered(&here);
+                        }
+                    }
+                }
+            }
+            Command::SetRefitCadence(c) => self.refit_cadence = c,
             Command::PurgeForgotten(n) => self.purge_forgotten(n),
             Command::SaveSpecialised { path, species } => self.save_specialised(&path, &species),
             Command::DisplayPartialCore(on) => self.dy.apply(DynCommand::SetDisplayPartialCore(on)),

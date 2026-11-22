@@ -797,6 +797,9 @@ pub struct UiState {
     pub audit_every: usize,
     /// Draft mode (`Command::SetDraft`): per session, off by default.
     pub draft: bool,
+    /// Model tab ▸ Refit (`worker::RefitCadence`, `Command::SetRefitCadence`): kept per computer in
+    /// `machine.settings`.
+    pub refit_cadence: crate::worker::RefitCadence,
     /// The toolbar's ⚠ Model only (user request 2026-11-12; `Action::ModelOnly`): on, it holds the
     /// draft mode and audit cadence it replaced (draft on, audits 0 while it lasts), restored
     /// exactly when it is turned off or the solver leaves Estimated; a hand change of either turns
@@ -1077,6 +1080,7 @@ impl UiState {
             start_armed: None,
             audit_every: providers::FallbackPolicy::default().audit_every,
             draft: false,
+            refit_cadence: crate::worker::RefitCadence::default(),
             model_only: None,
             drag_force: F_DRAG_MAX,
             queued: Vec::new(),

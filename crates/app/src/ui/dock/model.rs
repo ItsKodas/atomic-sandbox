@@ -700,6 +700,7 @@ fn verdict_card(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, m: Option
         // the user's Forget / Restore waiting for their refit (2026-11-14, the batched forget)
         if let Some(m) = m.filter(|_| st.backend == Backend::Estimated) {
             refit_banner_row(ui, m, input.sampling(), input.probe.as_ref().and_then(|p| p.refit.as_ref()), acts);
+            refit_cadence_row(ui, st, acts);
             // the stray-atom signatures of this session and the samples they hold out (spec 2026-11-18 §5)
             for (k, (line, warn)) in stray_lines(m).into_iter().enumerate() {
                 let text = RichText::new(line).size(11.5).color(if warn { AMBER } else { theme::INK_DIM });
@@ -1280,7 +1281,22 @@ pub fn refit_banner(m: &ModelStatus, sampling: bool, now: std::time::Instant, re
     let n = m.user_changes_pending;
     let left = refit.map(|r| format!(" · {}", crate::ui::activity::words::refit_eta_words(r, false))).unwrap_or_default();
     if n == 0 {
-        return refit.filter(|r| r.elapsed_s >= REFIT_BANNER_AFTER_S).map(|_| format!("refitting{left}"));
+        let running = refit.filter(|r| r.elapsed_s >= REFIT_BANNER_AFTER_S).map(|_| format!("refitting{left}"));
+        // new samples held by Model tab ▸ Refit (user 2026-11-22), with Refit now beside it
+        if running.is_some() || m.refit_running || sampling || m.samples_waiting == 0 {
+            return running;
+        }
+        let w = m.samples_waiting;
+        let waiting = if w == 1 { "1 new sample waiting".to_string() } else { format!("{w} new samples waiting") };
+        return Some(match (m.refit_cadence, m.auto_refit_at) {
+            (crate::worker::RefitCadence::Manual, _) => format!("{waiting} · refit when you press Refit now"),
+            (_, Some(at)) => match at.saturating_duration_since(now).as_secs() {
+                0 => format!("{waiting} · refit due"),
+                s if s < 60 => format!("{waiting} · next automatic refit in {s} s"),
+                s => format!("{waiting} · next automatic refit in {}:{:02}", s / 60, s % 60),
+            },
+            (_, None) => format!("{waiting} · refit due"),
+        });
     }
     if m.refit_running || refit.is_some() {
         return Some(format!("refitting{left} · {n} more pending after this one"));
@@ -1315,6 +1331,31 @@ fn refit_banner_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, refit: Option<
         }
     });
 }
+
+/// Model tab ▸ Refit (user 2026-11-22): how soon an automatic refit may follow the last one
+/// (`worker::RefitCadence`, `Action::RefitCadence`); Refit now is never held.
+fn refit_cadence_row(ui: &mut Ui, st: &mut UiState, acts: &mut Vec<Action>) {
+    use crate::worker::{RefitCadence, REFIT_CADENCE_MINUTES};
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Refit").size(11.5).color(theme::INK_DIM));
+        let mut pick = st.refit_cadence;
+        let choices: Vec<RefitCadence> = std::iter::once(RefitCadence::Auto)
+            .chain(REFIT_CADENCE_MINUTES.iter().map(|&m| RefitCadence::Every(m)))
+            .chain(std::iter::once(RefitCadence::Manual))
+            .collect();
+        let r = egui::ComboBox::from_id_salt("refit-cadence").selected_text(pick.label()).show_ui(ui, |ui| {
+            for c in choices {
+                ui.selectable_value(&mut pick, c, c.label());
+            }
+        });
+        super::super::probed("refit-cadence", r.response).on_hover_text(REFIT_CADENCE_TIP);
+        if pick != st.refit_cadence {
+            acts.push(Action::RefitCadence(pick));
+        }
+    });
+}
+
+const REFIT_CADENCE_TIP: &str = "how soon an automatic refit may follow the last one while the run plays. Auto waits twice as long as the last refit took, so refits take at most about a third of the time; Every N minutes waits that long; Only when I press Refit now never refits by itself (paused too). New samples are saved at once, but the model uses them only after a refit: until then geometries near them still fall back to DFT. Refit now is never held. A sampling pass still fits at its end. Kept for this computer";
 
 /// The hover of a row's Forget.
 const FORGET_SAMPLE_TIP: &str = "hold this sample out of the fit until you restore it: geometries near it fall back to DFT, and the trust recovery never releases it (it counts with the quarantined samples against the 10 % the recovery may hold out). Written at once — to the shared collection when it holds the sample — then the model refits without it, 10 s after your last Forget or Restore (Refit now starts it at once). Check several rows to forget them together";

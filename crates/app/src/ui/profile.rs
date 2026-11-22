@@ -108,7 +108,7 @@ pub fn capture(st: &UiState) -> String {
 /// This computer's settings (`machine.settings`): the GPU memory share, % (Scene ▸ Quality ▸ GPU
 /// memory). Kept apart from the profile: see the module doc.
 pub fn machine_text(st: &UiState) -> String {
-    format!("# Atomic Sandbox: this computer's settings\ngpu_memory = {}\n", st.gpu_memory_pct)
+    format!("# Atomic Sandbox: this computer's settings\ngpu_memory = {}\nrefit = {}\n", st.gpu_memory_pct, st.refit_cadence.word())
 }
 
 /// Applies `machine.settings`' text (or, once, a 0.2.1-beta.1 profile's `gpu_memory` line): the
@@ -116,12 +116,12 @@ pub fn machine_text(st: &UiState) -> String {
 /// `main` (at launch) or the viewer to put in force; absent or unreadable, unchanged. Whether the
 /// text had a readable share.
 pub fn apply_machine(st: &mut UiState, text: &str) -> bool {
-    let value = text
-        .lines()
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .filter_map(|l| l.split_once('='))
-        .find(|(k, _)| k.trim() == "gpu_memory")
-        .and_then(|(_, v)| v.trim().trim_end_matches('%').trim().parse::<f64>().ok());
+    let get = |key: &str| text.lines().filter(|l| !l.trim_start().starts_with('#')).filter_map(|l| l.split_once('=')).find(|(k, _)| k.trim() == key).map(|(_, v)| v.trim().to_string());
+    // Model tab ▸ Refit (2026-11-22; absent or unreadable: unchanged); the worker gets it at its start
+    if let Some(c) = get("refit").and_then(|v| crate::worker::RefitCadence::parse(&v)) {
+        st.refit_cadence = c;
+    }
+    let value = get("gpu_memory").and_then(|v| v.trim_end_matches('%').trim().parse::<f64>().ok());
     let Some(v) = value else { return false };
     let pct = crate::quality::clamp_share(v);
     st.gpu_memory_pct = pct;
