@@ -244,9 +244,6 @@ pub struct ModelStatus {
     /// The species the model in use knows (`Trainable::model_species`): the specialised-model
     /// picker offers them beside the scene's.
     pub model_species: Vec<u8>,
-    /// The attached collection's migration from its predecessor folder (`Trainable::migration`; Fermi–Dirac spec
-    /// §7.8): the Model tab's offer, progress line and summary, and the Activity tab's progress line.
-    pub migration: Option<sim::MigrationStatus>,
 }
 
 /// The Model tab's source line (M8a Task 4b): "model: shared — <slug> · N samples" (with
@@ -808,22 +805,7 @@ impl Worker {
             t.set_fits_in_background(true);
             match t.attach_collection(&root, &scene) {
                 Err(e) => Some(format!("shared collection not attached: {e}")),
-                Ok(()) => {
-                    // a re-solve pass started and not finished goes on at the next attach (Fermi–Dirac spec §7.3,
-                    // "Resume"): a collection newly attached — at app start, a worker re-spawn, another surface —
-                    // never the one already attached (a Cancel keeps it stopped until then)
-                    let now = match t.model_source() {
-                        sim::ModelSource::Collection { slug, .. } => Some(slug),
-                        _ => None,
-                    };
-                    let paused = t.migration().is_some_and(|m| m.state == sim::MigrationPhase::Paused) && !t.pass_active();
-                    if now.is_some() && now != attached && paused {
-                        // through the command path, so its bookkeeping (the first-pass offer, the pass sizing,
-                        // the autosave's owner) is the button's (review M6)
-                        self.apply(Command::Dyn(DynCommand::StartMigration));
-                    }
-                    None
-                }
+                Ok(()) => None,
             }
         };
         if let Some(n) = note {
@@ -1291,7 +1273,6 @@ impl Worker {
             source_is_autosave,
             specialised: s.specialised(),
             model_species: s.model_species(),
-            migration: s.migration(),
         })
     }
 

@@ -715,14 +715,14 @@ fn outcomes(s: &mut SurrogateKs) -> Vec<TeachOutcome> {
 /// Ruling D: `Q_STRAY` is no other in-memory code and no code a collection status record (or a file) can hold.
 #[test]
 fn stray_code_is_no_other_code() {
-    let others = [Q_NONE, Q_HELD, Q_SUPERSEDED, Q_BOX, Q_DRAFT, Q_REF_WAIT, Q_LONE, Q_FORGOTTEN, Q_FORGOTTEN_UNFENCED, surrogate::quarantine::Q_RESOLVED];
+    let others = [Q_NONE, Q_HELD, Q_SUPERSEDED, Q_BOX, Q_DRAFT, Q_REF_WAIT, Q_LONE, Q_FORGOTTEN, Q_FORGOTTEN_UNFENCED, 9];
     assert!(!others.contains(&Q_STRAY), "{Q_STRAY} is taken");
     for c in 0..=u8::MAX {
-        if surrogate::quarantine::is_collection_code(c) || surrogate::quarantine::is_persisted_code(c) {
+        if surrogate::quarantine::is_persisted_code(c) {
             assert_ne!(c, Q_STRAY, "a collection or a file can hold {c}");
         }
     }
-    assert_eq!(Q_STRAY, 10, "the next free value after the migration's 9");
+    assert_eq!(Q_STRAY, 10, "the next free value after the retired 9");
 }
 
 /// Plan Task 3 step 1: one strict step at H₂ + a stray H 8 Bohr away falls back (rule 5a), keeps its sample held out

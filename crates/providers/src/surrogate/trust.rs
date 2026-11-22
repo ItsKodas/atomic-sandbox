@@ -1433,9 +1433,6 @@ impl SurrogateKs {
         // provider does after the install (`background` module doc)
         if !self.refit_fork {
             self.sync_collection_status();
-            // the review's verdicts after the status records they name (`flush_migration_log`), and before the README,
-            // which carries the migration summary of the log on disk (Task 16 re-review R2)
-            self.flush_migration_log();
             self.flush_collection();
         }
         r
@@ -1466,19 +1463,12 @@ impl SurrogateKs {
         Ok(report)
     }
 
-    /// The fits of a refit ([`refit_inner`](Self::refit_inner)): the fit, the review of the re-solved
-    /// samples (`review_resolved`), the fence votes, the release, the trust recovery, the held-out guesses
-    /// — each fit deferred (`fit_store_deferred`).
+    /// The fits of a refit ([`refit_inner`](Self::refit_inner)): the fit, the fence votes, the release, the trust
+    /// recovery, the held-out guesses — each fit deferred (`fit_store_deferred`).
     fn refit_fits(&mut self) -> Result<FitReport, FitError> {
         let _prof = surrogate::prof::span("P1 refit_fits (fits, votes, release, recovery, held-out)");
         let mut report = self.fit_store_deferred()?;
         self.recovery = None;
-        // the re-solved samples' review (Fermi–Dirac spec §7.6; `review_resolved`): before the trust judgement, so a
-        // released sample is judged by the votes, the release and the recovery as any fitted sample; the refit goes on
-        // from the fit above (the candidate is undone), rebuilt with the released ones
-        if self.review_resolved().is_some_and(|o| !o.released.is_empty()) {
-            report = self.fit_store_deferred()?;
-        }
         // fence votes (`surrogate` module doc, "Fence voting"): a voted sample the new model cannot
         // reproduce is quarantined itself and its region takes no further vote
         let rejected = self.judge_votes();

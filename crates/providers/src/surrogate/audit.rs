@@ -350,7 +350,7 @@ impl Auditor {
                         // isolated atom's density is no warm start for a molecule, nor the reverse. A
                         // composition check's parts start cold too (review M1): one failing check refuses
                         // its signature for the session, so its solves must not depend on the job before
-                        // (a reproducible cold solve, as the migration's)
+                        // (a reproducible cold solve)
                         let cold = atom || job.kind == JobKind::Fragment;
                         if cold || last_atom {
                             teacher.reset();

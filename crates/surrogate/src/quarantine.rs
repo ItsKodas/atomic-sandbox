@@ -1,15 +1,14 @@
 //! The quarantine codes of a stored sample — one source of truth for the sidecar's
 //! `sample_quarantine` array ([`crate::sidecar`]), the provider's per-sample flags
 //! (`providers::surrogate`, whose `Q_*` are aliases of these) and a collection's status records
-//! ([`crate::collection`]). Codes 1–4 and 7–9 are kept but excluded from the fit; what each means, and when
+//! ([`crate::collection`]). Codes 1–4, 7 and 8 are kept but excluded from the fit; what each means, and when
 //! the provider sets it, is the provider's (`providers::surrogate` module doc, "Trust recovery and
 //! quarantine"). M8a Task 3 moved them here from `providers::surrogate::quarantine` (controller
 //! ruling P4), values unchanged.
 //!
-//! Two predicates say where a code may be written: [`is_persisted_code`] for a sidecar's
-//! `sample_quarantine` array (and a collection), [`is_collection_code`] for a collection's status
-//! records — the same set plus [`Q_RESOLVED`], which only a collection holds (Fermi–Dirac spec
-//! §7.7, ruling R12).
+//! [`is_persisted_code`] says which codes a sidecar's `sample_quarantine` array and a collection's
+//! status records may hold. Code 9 (the Fermi–Dirac migration's "re-solved") was retired with the
+//! migration (2026-11-22): no build writes it.
 
 /// Trained on (the default; a sidecar without a `sample_quarantine` array reads as all zero).
 pub const Q_NONE: u8 = 0;
@@ -88,51 +87,9 @@ pub fn is_forgotten_code(code: u8) -> bool {
     code == Q_FORGOTTEN || code == Q_FORGOTTEN_UNFENCED
 }
 
-/// **Re-solved for the new solver, awaiting review** (Fermi–Dirac smearing, spec
-/// `2026-11-13-fermi-smearing-design.md` §7.5–7.6; F1: 9 everywhere, 8 being `purge-forgotten`'s
-/// [`Q_FORGOTTEN_UNFENCED`]): a sample the collection migration re-solved whose label changed
-/// state (class S), appended to the new collection at this code. It is out of the fit, the
-/// envelope, the grade, the leave-one-out and the class statistics like a held sample, but it is
-/// not a misfit hold (the recovery's 10 % cap does not count it) and not the user's (Forget and
-/// Restore do not apply). Before its review it does not fence; the review (a candidate fit with
-/// every code-9 sibling, by the leave-one-out ratio, once the migration pass is complete) releases
-/// it to [`Q_NONE`] or keeps it here, fencing from then on (preflight F4: in the quarantine fence,
-/// not in the provider's `fencing()` count or the held cap, never in the misfit set, never lifted by
-/// the fence's lift votes, never converted to [`Q_HELD`]). A kept one moves like a held sample when
-/// a fresh teacher answer next to it agrees with the model — released, or [`Q_SUPERSEDED`] — and a
-/// later review can still release it. Which samples were kept is not in the code (9 either way):
-/// it is the review log of the folder's `migration.txt` ([`crate::migration`]). What reads and acts
-/// on it is the provider's (`providers::surrogate`, "Re-solved samples").
-///
-/// **A collection code only** ([`is_collection_code`]; ruling R12): written as a collection status
-/// record, never into a sidecar — a sidecar writer leaves code-9 samples out (ruling R11: the
-/// collection is the store of record), so [`is_persisted_code`] does not admit it.
-///
-/// **An older build meeting code 9** (checked against the code before the Fermi–Dirac switch, the
-/// merged `main` of this plan's Task 2): it never does.
-/// - **a shared collection**: code 9 is written only by this build, only as a status record of
-///   record version 2 ([`crate::collection::RECORD_VERSION`], the Fermi–Dirac bump), and only into a
-///   collection of the new solver surface. A released older build never computes that folder's key;
-///   a preview build of the Fermi–Dirac branch (its plan's Tasks 9–12) does, and may have written
-///   version-1 records there itself. Either, pointed at it, refuses the first version-2 record
-///   with `Collection::open` ("written by a newer build") and leaves the file untouched; a code 9
-///   only ever sits in a version-2 status record, which comes after that first one, so it is
-///   never read.
-/// - **a model file**: none holds a 9 (the writers leave such samples out). Were one to, every
-///   earlier build refuses it whole: its `sample_quarantine` reader takes 0–3, 7 and 8 at most, and the
-///   file is version 9 ([`crate::sidecar::MAGIC_V9`]), which those builds refuse as "newer than this
-///   build" first.
-pub const Q_RESOLVED: u8 = 9;
-
 /// Whether `code` is one a file or a collection may hold ([`Q_NONE`]…[`Q_BOX`], [`Q_FORGOTTEN`] and
 /// [`Q_FORGOTTEN_UNFENCED`]; [`Q_DRAFT`] is carried by the sample's tag, 5, 6 and 10 are the provider's
-/// own — `providers::surrogate`'s `Q_REF_WAIT`, `Q_LONE` and `Q_STRAY`, never written): the sidecar's predicate. [`Q_RESOLVED`] is a collection's only ([`is_collection_code`]).
+/// own — `providers::surrogate`'s `Q_REF_WAIT`, `Q_LONE` and `Q_STRAY`, never written): the sidecar's and the collection's predicate.
 pub fn is_persisted_code(code: u8) -> bool {
     matches!(code, Q_NONE | Q_HELD | Q_SUPERSEDED | Q_BOX | Q_FORGOTTEN | Q_FORGOTTEN_UNFENCED)
-}
-
-/// Whether `code` is one a collection's status record may hold: [`is_persisted_code`]'s codes and
-/// [`Q_RESOLVED`] (ruling R12).
-pub fn is_collection_code(code: u8) -> bool {
-    is_persisted_code(code) || code == Q_RESOLVED
 }

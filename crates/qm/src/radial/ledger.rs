@@ -29,9 +29,7 @@
 //! integer aufbau on the all-electron one); they now run Fermi–Dirac at kT = `ELECTRON_KT`, and on the GPU stop a
 //! partly occupied step at `GPU_PARTIAL_TOL`. Both are fields of [`DIMER_PROCEDURE`] (read from those constants, never
 //! literals, preflight F11), so `recipe_hash` — and the gated species' identity — moved, and H and He regenerate once on
-//! first use; [`core_recipe_hash`] did not move. [`ds_era::DIMER_PROCEDURE_DS`] is the procedure as it was before the
-//! switch, frozen: [`legacy_recipe_hash`] hashes it exactly as `recipe_hash` did then (0x30a74d9bda495668), for
-//! `providers::pseudo::legacy_tag_of` alone (finding a predecessor collection).
+//! first use; [`core_recipe_hash`] did not move.
 
 use crate::occupations::{ELECTRON_KT, GPU_PARTIAL_TOL};
 use crate::scf::Occupations;
@@ -190,7 +188,7 @@ pub struct DimerProcedure {
     /// agrees with the all-electron one at the outer bracket end, |F_PP/F_AE − 1| ≤ this (Task 11 review Minor-2).
     pub wall_rel: f64,
     /// The occupation rule of every gate solve, the pseudised and the all-electron dimer alike (plan 2026-11-13 Task 10:
-    /// Fermi–Dirac at `ELECTRON_KT`; before it the shared-shell rule and aufbau, [`ds_era`]).
+    /// Fermi–Dirac at `ELECTRON_KT`; before it the shared-shell rule and aufbau).
     pub occupations: Occupations,
     /// The GPU's stop on a step with a partly occupied level, max(tol, this) (spec 2026-11-13 §5.1; `GPU_PARTIAL_TOL`,
     /// set on the gate's GPU solver). The CPU backend never reaches it.
@@ -209,37 +207,6 @@ pub const DIMER_PROCEDURE: DimerProcedure = DimerProcedure {
     occupations: Occupations::FermiDirac { kt: ELECTRON_KT },
     gpu_partial_tol: GPU_PARTIAL_TOL,
 };
-
-/// The dimer procedure as it was before the Fermi–Dirac switch (plan 2026-11-13 Task 10), frozen. A struct of its own,
-/// named `DimerProcedure` like the live one, so its derived `Debug` rendering — the hashed text — is byte for byte the
-/// pre-change one (the shared-shell rule and aufbau were code, not fields, then: the `version` named them). Used only by
-/// [`legacy_recipe_hash`].
-pub mod ds_era {
-    /// The pre-switch `DimerProcedure`, field for field.
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    pub struct DimerProcedure {
-        pub version: &'static str,
-        pub h_ladder_index: usize,
-        pub box_bohr: f64,
-        pub sigma_ladder_over_h: [f64; 4],
-        pub fd_step_over_h: f64,
-        pub bisection_over_dimer_re: f64,
-        pub scf_tol: f64, pub eig_tol: f64,
-        pub wall_rel: f64,
-    }
-
-    /// The values of 1d816c4 (the last tree with the shared-shell rule), frozen.
-    pub const DIMER_PROCEDURE_DS: DimerProcedure = DimerProcedure {
-        version: "dimer-gate-1",
-        h_ladder_index: 4,
-        box_bohr: 12.0,
-        sigma_ladder_over_h: [1.0, 1.2, 1.4, 1.6],
-        fd_step_over_h: 1.0,
-        bisection_over_dimer_re: 0.1,
-        scf_tol: 1e-6, eig_tol: 1e-7,
-        wall_rel: 0.05,
-    };
-}
 
 /// FNV-1a 64 over the table's `Debug` rendering (f64 `Debug` is the shortest round-trip decimal, so
 /// the rendering — and the hash — is stable across builds and platforms). Every field, `version` and
@@ -261,11 +228,6 @@ pub fn recipe_hash() -> u64 { hash_recipe(&LEDGER, &DIMER_PROCEDURE) }
 
 /// `recipe_hash` of a given ledger and gate procedure (the tests change one field and check the hash moves).
 pub fn hash_recipe(l: &Ledger, d: &DimerProcedure) -> u64 { fnv(hash_ledger(l), format!("|{d:?}").as_bytes()) }
-
-/// The recipe hash the last shared-shell build computed (0x30a74d9bda495668): [`LEDGER`] and the frozen
-/// [`ds_era::DIMER_PROCEDURE_DS`], the same expression as [`hash_recipe`]. For `providers::pseudo::legacy_tag_of` only
-/// (module doc, "The Fermi–Dirac switch"); nothing generates or checks a table with it.
-pub fn legacy_recipe_hash() -> u64 { fnv(hash_ledger(&LEDGER), format!("|{:?}", ds_era::DIMER_PROCEDURE_DS).as_bytes()) }
 
 /// The identity of the tables of every Z above `LEDGER.dimer_z_max` (the dimer gate never runs for them): the ledger
 /// alone. At `m7-tm-kb-nlcc-4` it equals the -4 recipe hash 0xeef0a918057a9fbe, so a surface that pseudises only such
@@ -350,19 +312,6 @@ mod tests {
             assert_ne!(hash_recipe(&LEDGER, &v), recipe_hash(), "{v:?} must move recipe_hash");
         }
         assert_eq!(core_recipe_hash(), hash_ledger(&LEDGER), "the procedure is not in the core tables' identity");
-    }
-
-    /// Plan 2026-11-13 Task 10: the frozen pre-switch procedure renders exactly as the live struct did before it gained
-    /// `occupations` and `gpu_partial_tol` (the same leading fields, the same type name), so `legacy_recipe_hash` is the
-    /// recipe hash pinned on that tree (the `all/30a74d9bda495668/…` legacy tag), and the live hash moved away from it.
-    #[test]
-    fn the_ds_era_procedure_keeps_its_hash() {
-        let live = format!("{DIMER_PROCEDURE:?}");
-        let frozen = format!("{:?}", ds_era::DIMER_PROCEDURE_DS);
-        let head = live.split(", occupations:").next().expect("the live text names its occupations");
-        assert_eq!(format!("{head} }}"), frozen, "the frozen text is the live one without the two new fields");
-        assert_eq!(legacy_recipe_hash(), 0x30a7_4d9b_da49_5668);
-        assert_ne!(recipe_hash(), legacy_recipe_hash());
     }
 
     /// Task 11 (the controller's requirement): switching the dimer gate on did not change the identity of any table above

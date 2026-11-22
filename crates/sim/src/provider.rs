@@ -1486,19 +1486,6 @@ pub trait Trainable {
     fn forgotten_in_collection(&self) -> usize {
         0
     }
-    /// The attached shared collection's migration from its predecessor folder (Fermi–Dirac spec §7.3): offered, running,
-    /// paused, complete or reviewed, with the counts and the time estimate. `None` without an attached collection, when
-    /// it has no predecessor with samples and no `migration.txt`, and by default.
-    fn migration(&self) -> Option<MigrationStatus> {
-        None
-    }
-    /// Starts — or resumes from its cursor — the re-solve pass that migrates the predecessor's samples into the attached
-    /// collection (`providers::sampling::migrate`): a pass like any other, driven by `pass_step`, paused and cancelled
-    /// like one. `Err` with the reason, nothing started: no collection or no predecessor, a pass running, the migration
-    /// complete, the predecessor held by a live writer. The default refuses.
-    fn start_migration(&mut self) -> Result<(), String> {
-        Err("this provider does not learn".into())
-    }
     /// Draft mode: the model answers every step it can be asked at all, extrapolating (the
     /// surrogate's `FallbackPolicy::never_fallback`). A provider without one ignores it.
     fn set_draft(&mut self, _on: bool) {}
@@ -1770,48 +1757,6 @@ pub struct ImportSummary {
     pub imported: usize,
     pub refused: Vec<(Option<usize>, String)>,
     pub notes: Vec<String>,
-}
-
-/// Where a shared collection's migration from its predecessor stands ([`MigrationStatus::state`];
-/// Fermi–Dirac spec `docs/superpowers/specs/2026-11-13-fermi-smearing-design.md` §7.3, §7.6).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MigrationPhase {
-    /// The attached collection has a predecessor (the same surface under the previous solver's tag)
-    /// with samples, and no pass has started: [`Trainable::start_migration`] starts one.
-    Offered,
-    /// The re-solve pass is running (driven by `Trainable::pass_step` like any pass).
-    Running,
-    /// A pass was started and is not complete, and none runs now (cancelled, or the app was closed):
-    /// [`Trainable::start_migration`] resumes it from its cursor.
-    Paused,
-    /// Every source sample was re-solved or listed as not migrated; the code-9 review is pending.
-    Complete,
-    /// Complete, and the code-9 samples were reviewed by a refit.
-    Reviewed,
-}
-
-/// A shared collection's migration (plain data of the provider's `migration.txt` and its offer;
-/// [`Trainable::migration`]).
-#[derive(Clone, Debug, PartialEq)]
-pub struct MigrationStatus {
-    /// The predecessor folder's name (under `models/collections`).
-    pub source: String,
-    /// The predecessor's samples (whole records read).
-    pub samples: usize,
-    /// Source samples re-solved or listed as not migrated so far (the pass's cursor).
-    pub done: usize,
-    /// Unchanged (U), entropy only (T), state changed (S), not migrated.
-    pub counts: [usize; 4],
-    /// The GPU time left, s: before the start a count-based estimate, from the median of the pass's own solves
-    /// once it has made 20 (`None` when complete).
-    pub eta_s: Option<f64>,
-    pub state: MigrationPhase,
-    /// The predecessor's species (Z ascending; the offer's words), as read of it before the pass ends; empty once the
-    /// migration is complete (the source is no longer read).
-    pub species: Vec<u8>,
-    /// The summary once the pass is complete (spec §7.8; `surrogate::migration::summary_text` of `migration.txt`, the
-    /// text the collection's `README.txt` carries too); `None` before.
-    pub summary: Option<String>,
 }
 
 /// What [`Trainable::purge_forgotten`] did (plain data of the provider's purge).

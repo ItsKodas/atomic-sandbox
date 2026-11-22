@@ -20,7 +20,6 @@
 //! | `.lock` | the owning process id while a writer has it open |
 //! | `samples.bin.dropped-<n>` | the bytes a damaged tail held, set aside when it was cut (never deleted) |
 //! | `samples.bin.bak` | the samples file as it was before the last purge ([`Collection::purge`]; replaced by the next purge) |
-//! | `migration.txt` | a collection made by migrating a predecessor folder to a new solver surface (the Fermi–Dirac switch, spec `2026-11-13-fermi-smearing-design.md` §7): its source folder and that folder's `key.txt`, the source `samples.bin`'s length and hash when the pass started, the pass's cursor and state, its counts, what was not migrated and why, the references re-solved, and the review log ([`crate::migration`]; rewritten whole through a temporary file) |
 //!
 //! `references.txt`, `history.bin` and `refit_times.csv` are rewritten whole through a temporary file renamed into
 //! place; `samples.bin` is only ever appended to (or cut back to its last whole record after a
@@ -51,24 +50,14 @@
 //!   reader keeps any code, so a build before it reads such a record and holds the sample out of
 //!   its fit (its doc says what else that build does with it). Code 8
 //!   ([`crate::quarantine::Q_FORGOTTEN_UNFENCED`], 2026-11-14: forgotten, its fence lifted) the same way.
-//!   Code 9 ([`crate::quarantine::Q_RESOLVED`], the Fermi–Dirac migration: re-solved, awaiting
-//!   review) is a collection's only ([`crate::quarantine::is_collection_code`]) and is written in
-//!   version-2 records only, which no older build reads (below).
 //!   A sample enters with [`Q_NONE`] (the admission rules refuse every other code).
 //!
 //! # Record versions
 //!
-//! Every record this build writes carries [`RECORD_VERSION`], **2** since the Fermi–Dirac switch
-//! (plan 2026-11-13 Task 13; spec §7.7). The byte layout of every kind is version 1's; the meaning
-//! moved: a sample's `energy` is the Mermin free energy F on a Fermi–Dirac surface, and a status
-//! record may carry code 9. The reader takes every version from 1 to [`RECORD_VERSION`], record by
-//! record. A version-2 record is only ever written into a folder of a new solver surface (the
-//! ionic tag of the key changed with the switch, so every folder of a released older build is a
-//! migration's predecessor, opened read-only, below). The preview builds of the Fermi–Dirac branch
-//! (its plan's Tasks 9–12) did compute the new key and wrote **version-1** records into such
-//! folders: this build appends version-2 records after them, so those files mix versions, and the
-//! reader takes the mix. An older build — such a preview included — refuses the first version-2
-//! record (next paragraph), the file untouched.
+//! Every record carries [`RECORD_VERSION`] (**2**, the Fermi–Dirac surface). The reader takes that
+//! version only: a record of an older version (1, before the Fermi–Dirac switch) refuses the open
+//! as made by an older version of the app (old collections are not read: user ruling 2026-11-22), the
+//! file untouched.
 //!
 //! A record whose checksum holds but whose kind, version or flags
 //! this build does not know was written by a newer build: the open is refused with that reason and
@@ -184,18 +173,6 @@
 //! References carry no box record in a `.model` file, so [`Collection::import_sidecar`] takes none
 //! (a note per species says so); the next sampling pass solves them.
 //!
-//! # The read-only open (Fermi–Dirac spec §7.1)
-//!
-//! [`Collection::open_read_only`] reads a folder without writing anything to it: a migration reads
-//! its predecessor this way, and the folder stays exactly as it was for the older builds that keep
-//! using it. It takes no lock (and does not take over a stale one: the file is left as it is); it
-//! refuses — [`ReadOnlyError::LiveWriter`] — while a live process holds `.lock`, checked before and
-//! after the read, because that process may still be appending; it reads `samples.bin` up to its
-//! last whole record and reports a damaged tail instead of cutting or setting it aside; it never
-//! touches a purge's `samples.bin.new` or `samples.bin.bak.new` (F3: they are the purge's, which
-//! overwrites them when it next runs); it reads `references.txt` and not the history. A record of a newer build is
-//! [`ReadOnlyError::NewerFormat`], with its version.
-//!
 //! # The lock
 //!
 //! `.lock` holds the process id of the writer. An open finds it absent (creates it, atomically),
@@ -303,9 +280,8 @@ pub const REFIT_TIMES_FILE: &str = "refit_times.csv";
 const REC_HEADER: u8 = 0;
 const REC_SAMPLE: u8 = 1;
 const REC_STATUS: u8 = 2;
-/// The version every record this build writes carries (module doc, "Record versions"): 2 since
-/// the Fermi–Dirac switch (plan 2026-11-13 Task 13, F1: the merged `main`'s 1, plus one). The
-/// reader takes every version from 1 to this one.
+/// The version every record carries (module doc, "Record versions"): 2 since the Fermi–Dirac
+/// switch. The reader takes this version only.
 pub const RECORD_VERSION: u8 = 2;
 /// Sample flag bit 0: a force mask follows (module doc, M8a Task 10).
 const FLAG_FORCE_MASK: u16 = 1;
@@ -382,73 +358,6 @@ pub struct OpenReport {
     /// Anything else worth saying (a stale lock taken over, a damaged tail set aside, an
     /// unreadable history or reference line ignored).
     pub notes: Vec<String>,
-}
-
-/// What [`Collection::open_read_only`] read (module doc, "The read-only open"): the folder's key
-/// (from `key.txt`), every whole sample in file order with its current quarantine code, and its
-/// references as (Z, grid points per side, the reference), sorted by (Z, n).
-#[derive(Clone, Debug, PartialEq)]
-pub struct ReadOnlyCollection {
-    pub key: SurfaceKey,
-    pub samples: Vec<CollectionSample>,
-    /// Per sample, its quarantine code (the latest status record), as [`Collection::quarantine`].
-    pub codes: Vec<u8>,
-    pub references: Vec<(u8, usize, CollectionReference)>,
-    /// A damaged tail (a crash mid-append) that was not read, said for people; `None` when every
-    /// byte was a whole record. The file is never cut.
-    pub damaged_tail: Option<String>,
-    /// The length and the hash of the `samples.bin` bytes that were parsed
-    /// ([`crate::migration::fingerprint_bytes`]; F3: what `migration.txt` records at a pass's start,
-    /// taken from the very bytes read — no second read of a file that might change in between).
-    /// `(0, the hash of no bytes)` when there is no `samples.bin`.
-    pub source_len: u64,
-    pub source_hash: u64,
-}
-
-/// Why [`Collection::open_read_only`] read nothing.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ReadOnlyError {
-    /// A live process holds the folder's `.lock` (a writer — an older build, or this one): its
-    /// store may still be appended to.
-    LiveWriter { pid: u32 },
-    /// The folder is not a readable collection (no or a bad `key.txt`, a `samples.bin` that is not
-    /// a collection or of another surface, an I/O error), with the reason.
-    Unreadable(String),
-    /// A record of `samples.bin` was written by a newer build: its version byte (a newer version,
-    /// or a version this build reads holding a kind, flag or tag code it does not know).
-    NewerFormat(u8),
-}
-
-impl std::fmt::Display for ReadOnlyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ReadOnlyError::LiveWriter { pid } => write!(f, "another copy of the app (process {pid}) has this collection open: reading it now would be reading a store that is still being appended to — close it first"),
-            ReadOnlyError::Unreadable(why) => write!(f, "the collection can't be read: {why}"),
-            ReadOnlyError::NewerFormat(v) => write!(f, "the collection holds a record written by a newer build (record version {v}; this build reads versions 1 to {RECORD_VERSION} and only the record kinds and fields they define)"),
-        }
-    }
-}
-
-impl std::error::Error for ReadOnlyError {}
-
-/// The read-only open's lock check (module doc, "The read-only open"): `Err` when `.lock` names a
-/// live process; an absent, stale or unreadable lock is read past and never touched.
-fn live_writer(dir: &Path) -> Result<(), ReadOnlyError> {
-    let path = dir.join(".lock");
-    let mut text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(ReadOnlyError::Unreadable(format!("{}: {e}", path.display()))),
-    };
-    if text.trim().is_empty() {
-        // a writer between its create and its write (as `acquire` waits for it)
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        text = std::fs::read_to_string(&path).unwrap_or_default();
-    }
-    match text.trim().parse::<u32>() {
-        Ok(pid) if pid_alive(pid) => Err(ReadOnlyError::LiveWriter { pid }),
-        _ => Ok(()),
-    }
 }
 
 /// What [`Collection::import_sidecar`] did. Nothing is imported silently: every sample of the
@@ -747,12 +656,10 @@ fn decode_sample(c: &mut Cursor) -> Result<CollectionSample, String> {
     Ok(CollectionSample { sample, grid_n, multiplicity_forced: forced, multiplicity, scene })
 }
 
-/// Why `samples.bin` was not read ([`parse`]): the message, and — when a newer build wrote the
-/// record that stopped it — that record's version byte.
+/// Why `samples.bin` was not read ([`parse`]).
 #[derive(Debug)]
 struct ParseError {
     message: String,
-    newer: Option<u8>,
 }
 
 impl std::fmt::Display for ParseError {
@@ -763,13 +670,13 @@ impl std::fmt::Display for ParseError {
 
 impl From<String> for ParseError {
     fn from(message: String) -> ParseError {
-        ParseError { message, newer: None }
+        ParseError { message }
     }
 }
 
 impl From<&str> for ParseError {
     fn from(message: &str) -> ParseError {
-        ParseError { message: message.to_string(), newer: None }
+        ParseError { message: message.to_string() }
     }
 }
 
@@ -785,7 +692,7 @@ struct Parsed {
 }
 
 /// Reads `samples.bin` (module doc): `Err` only for a file that is not a collection, of another
-/// surface, or written by a newer build (then with that record's version).
+/// surface, or written by an older or a newer build.
 fn parse(bytes: &[u8], key: &SurfaceKey) -> Result<Parsed, ParseError> {
     let mut out = Parsed { samples: Vec::new(), quarantine: Vec::new(), good_len: 0, has_header: false, dropped: 0 };
     if bytes.len() < MAGIC.len() {
@@ -832,13 +739,16 @@ fn parse(bytes: &[u8], key: &SurfaceKey) -> Result<Parsed, ParseError> {
         let kind = c.u8("kind").map_err(at_record)?;
         let version = c.u8("version").map_err(at_record)?;
         let what = |e: String| match e.strip_prefix("newer build: ") {
-            Some(rest) => ParseError { message: format!("samples.bin record {index} was written by a newer build ({rest}); this build does not read it"), newer: Some(version) },
+            Some(rest) => ParseError { message: format!("samples.bin record {index} was written by a newer build ({rest}); this build does not read it") },
             None => at_record(e),
         };
         if version == 0 {
             return Err(what("record version 0, which no build writes".into()));
         }
-        // every version up to this build's (module doc, "Record versions")
+        // this build's version only (module doc, "Record versions")
+        if version < RECORD_VERSION {
+            return Err(at_record(format!("made by an older version of the app (record version {version}; this version reads {RECORD_VERSION} only)")));
+        }
         if kind > REC_STATUS || version > RECORD_VERSION {
             return Err(what(format!("newer build: record kind {kind} version {version}")));
         }
@@ -989,7 +899,7 @@ fn check_shape(s: &Sample) -> Result<(), String> {
 
 /// Renames `from` over `to` (the purge's final step): on Windows `MoveFileExW` with
 /// `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`, so the call returns once the rename is on
-/// disk; elsewhere `rename(2)` (atomic replace). `crate::migration` renames `migration.txt` with it.
+/// disk; elsewhere `rename(2)` (atomic replace).
 #[cfg(windows)]
 pub(crate) fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
@@ -1210,66 +1120,6 @@ impl Collection {
         Ok((c, report))
     }
 
-    /// Opens the collection in folder `dir` **strictly read-only** (module doc, "The read-only
-    /// open"; Fermi–Dirac spec §7.1): the migration's view of a predecessor folder. Nothing is
-    /// created, taken, cut, cleaned or rewritten — no `.lock` (a stale one is left as it is), no tail
-    /// cut or set aside (a damaged tail is reported in [`ReadOnlyCollection::damaged_tail`]), no
-    /// history or references rewrite, and a purge's `samples.bin.new` / `samples.bin.bak.new` are
-    /// left byte for byte (F3). `Err` when a live process holds the lock (checked before and after
-    /// the read, so a writer that opened meanwhile is caught too), the folder is not a readable
-    /// collection, or a record was written by a newer build. The audit history is not read (a
-    /// migration never carries it); a `references.txt` line that does not parse is skipped, as
-    /// [`open`](Self::open) skips it (that reference is not read, so it is not re-solved).
-    pub fn open_read_only(dir: &Path) -> Result<ReadOnlyCollection, ReadOnlyError> {
-        let unreadable = |p: &Path, e: &dyn std::fmt::Display| ReadOnlyError::Unreadable(format!("{}: {e}", p.display()));
-        live_writer(dir)?;
-        let key_path = dir.join("key.txt");
-        let text = std::fs::read_to_string(&key_path).map_err(|e| unreadable(&key_path, &e))?;
-        let key = SurfaceKey::from_text(&text).map_err(|e| unreadable(&key_path, &e))?;
-        let path = dir.join("samples.bin");
-        let bytes = match std::fs::read(&path) {
-            Ok(b) => b,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(unreadable(&path, &e)),
-        };
-        let parsed = parse(&bytes, &key).map_err(|e| match e.newer {
-            Some(v) => ReadOnlyError::NewerFormat(v),
-            None => unreadable(&path, &e),
-        })?;
-        let damaged_tail = (parsed.good_len < bytes.len()).then(|| {
-            format!(
-                "{} bytes ({} records) of a damaged tail were not read (a crash mid-append); {} is left as it is",
-                bytes.len() - parsed.good_len,
-                parsed.dropped,
-                path.display()
-            )
-        });
-        let mut references = BTreeMap::new();
-        let ref_path = dir.join("references.txt");
-        match std::fs::read_to_string(&ref_path) {
-            Ok(text) => {
-                for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
-                    if let Some((zn, r)) = parse_reference_line(line) {
-                        references.insert(zn, r);
-                    }
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(unreadable(&ref_path, &e)),
-        }
-        live_writer(dir)?;
-        let (source_len, source_hash) = crate::migration::fingerprint_bytes(&bytes);
-        Ok(ReadOnlyCollection {
-            key,
-            samples: parsed.samples,
-            codes: parsed.quarantine,
-            references: references.into_iter().map(|((z, n), r)| (z, n, r)).collect(),
-            damaged_tail,
-            source_len,
-            source_hash,
-        })
-    }
-
     /// The collection's folder (`root/<slug>`).
     pub fn folder(&self) -> &Path {
         &self.folder
@@ -1430,12 +1280,11 @@ impl Collection {
     }
 
     /// Records a later quarantine change of sample `index` (a status record; module doc). Only a code a collection
-    /// may hold ([`crate::quarantine::is_collection_code`]: 0–3, 7, 8 and 9) is written; any other — the provider's own
-    /// 5, 6 and 10, the draft code 4 that a sample's tag carries — is refused, nothing written (plan 2026-11-13 Task 14,
-    /// with the first code-9 writer).
+    /// may hold ([`crate::quarantine::is_persisted_code`]: 0–3, 7 and 8) is written; any other — the provider's own
+    /// 5, 6 and 10, the draft code 4 that a sample's tag carries — is refused, nothing written.
     pub fn set_status(&mut self, index: usize, code: u8) -> Result<(), String> {
-        if !crate::quarantine::is_collection_code(code) {
-            return Err(format!("status code {code} is not one a collection holds (0–3, 7, 8 or 9)"));
+        if !crate::quarantine::is_persisted_code(code) {
+            return Err(format!("status code {code} is not one a collection holds (0–3, 7 or 8)"));
         }
         self.writable()?;
         if index >= self.samples.len() {
@@ -1824,10 +1673,6 @@ impl Collection {
             count(Q_DRAFT),
             count(crate::quarantine::Q_FORGOTTEN) + count(crate::quarantine::Q_FORGOTTEN_UNFENCED)
         ));
-        // re-solved and not back in the fit: kept out by the review, or awaiting it (code 9; spec §7.6; re-review R2)
-        if count(crate::quarantine::Q_RESOLVED) > 0 {
-            t.push_str(&format!("{} of them re-solved for the new solver and not yet back in the fit (kept out, or awaiting their review)\n", count(crate::quarantine::Q_RESOLVED)));
-        }
         let mut tags: BTreeMap<String, usize> = BTreeMap::new();
         for s in &self.samples {
             *tags.entry(format!("{:?}", s.sample.tag)).or_default() += 1;
@@ -1911,13 +1756,6 @@ impl Collection {
             t.push_str(&format!("  {name}: {k} samples, grid {grids}\n"));
         }
         t.push_str(&format!("\naudit history: {} points ({} recorded)\n", self.history.len(), self.history.recorded()));
-        // a collection a migration made (Fermi–Dirac spec §7.5, §7.8): once its re-solve pass is complete, its summary
-        // — the Model tab's text (`crate::migration::summary_text`)
-        if let Some(summary) = crate::migration::read_migration(&self.folder).ok().flatten().as_ref().and_then(crate::migration::summary_text) {
-            t.push_str("\nmigration (re-solved for the Fermi–Dirac solver; the old folder is kept unchanged):\n");
-            t.push_str(&summary);
-            t.push('\n');
-        }
         t
     }
 }
@@ -2087,9 +1925,8 @@ mod tests {
         assert_eq!(c.read_refit_times().as_deref(), Some("c\n"));
     }
 
-    /// Plan 2026-11-13 Task 14 (with the first code-9 writer; Task 13 review concern 6): `set_status` writes only a
-    /// code a collection holds (`is_collection_code`: 0–3, 7, 8, 9) — the draft code 4 and the provider's own 5 and 6 are
-    /// refused with nothing written, and code 9 is written and read back.
+    /// `set_status` writes only a code a collection holds (`is_persisted_code`: 0–3, 7, 8) — the draft code 4, the
+    /// provider's own 5, 6 and 10 and the retired 9 are refused with nothing written.
     #[test]
     fn set_status_writes_collection_codes_only() {
         let dir = root("status-guard");
@@ -2100,16 +1937,16 @@ mod tests {
                 c.append(cs(i)).unwrap();
             }
             let before = std::fs::read(dir.join(key.slug()).join("samples.bin")).unwrap();
-            for code in [Q_DRAFT, 5, 6, 10, 255] {
+            for code in [Q_DRAFT, 5, 6, 9, 10, 255] {
                 let e = c.set_status(1, code).expect_err("not a collection code");
                 assert!(e.contains(&format!("status code {code} is not one a collection holds")), "{e}");
             }
             assert_eq!(std::fs::read(dir.join(key.slug()).join("samples.bin")).unwrap(), before, "nothing written");
             assert_eq!(c.quarantine, vec![Q_NONE, Q_NONE]);
-            c.set_status(1, crate::quarantine::Q_RESOLVED).unwrap();
+            c.set_status(1, crate::quarantine::Q_FORGOTTEN_UNFENCED).unwrap();
         }
         let (c, _) = Collection::open(&dir, &key).unwrap();
-        assert_eq!(c.quarantine, vec![Q_NONE, crate::quarantine::Q_RESOLVED]);
+        assert_eq!(c.quarantine, vec![Q_NONE, crate::quarantine::Q_FORGOTTEN_UNFENCED]);
     }
 
     /// Appends, status updates, references and the history survive a reopen bit-exactly.
@@ -2315,7 +2152,7 @@ mod tests {
         }
         let path = samples_path(&dir, &key);
         let mut bytes = std::fs::read(&path).unwrap();
-        let payload = [9u8, 1, 0, 0];
+        let payload = [9u8, RECORD_VERSION, 0, 0];
         bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&crc32(&payload).to_le_bytes());
         bytes.extend_from_slice(&payload);
@@ -2548,22 +2385,12 @@ mod tests {
         let dir = root("import");
         let key = prov().surface_key();
         let (mut c, _) = Collection::open(&dir, &key).unwrap();
-        // a fitted version-5 model of a charged scene (this build's output in its body form —
-        // version 7's bytes —, header surgery)
+        // a fitted model of a charged scene
         let mut fitted = crate::sidecar::tests::random_sidecar(41, false);
         fitted.model.provenance = prov();
         fitted.model.provenance.charge = 1;
-        let v7 = dir.join("nh4+.v7.model");
-        sidecar::write(&v7, &fitted.model, &fitted.accumulator, fitted.report.as_ref(), &fitted.samples, None).unwrap();
-        let bytes = crate::sidecar::tests::body_form(&std::fs::read(&v7).unwrap());
-        let hl = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
-        let header = std::str::from_utf8(&bytes[16..16 + hl]).unwrap().replacen("ASMODEL7", "ASMODEL5", 1);
-        let mut v5 = sidecar::MAGIC_V5.to_vec();
-        v5.extend_from_slice(&(header.len() as u64).to_le_bytes());
-        v5.extend_from_slice(header.as_bytes());
-        v5.extend_from_slice(&bytes[16 + hl..]);
         let charged = dir.join("nh4+.model");
-        std::fs::write(&charged, v5).unwrap();
+        sidecar::write(&charged, &fitted.model, &fitted.accumulator, fitted.report.as_ref(), &fitted.samples, None).unwrap();
         assert!(matches!(sidecar::read_any(&charged).unwrap(), sidecar::Contents::Fitted(_)));
         let r = c.import_sidecar(&charged, 1e-4, 6.0).unwrap();
         assert_eq!(r.imported, 0);
@@ -2663,54 +2490,6 @@ mod tests {
         for want in ["lsda", "h 0.25", "4 samples", "H (Z 1)", "O (Z 8)", "H–H", "H–O", "h2o", "1 held"] {
             assert!(text.contains(want), "README lacks '{want}':\n{text}");
         }
-    }
-
-    /// Fermi–Dirac spec §7.5, §7.8 (plan Task 16 fix round 1): a collection a migration made carries, once the pass is
-    /// complete, the summary as its README paragraph — the very text of `migration::summary_text`, the Model tab's —
-    /// and counts its code-9 samples; while the pass runs, or without a `migration.txt`, there is no paragraph.
-    #[test]
-    fn the_readme_carries_the_migration_summary() {
-        use crate::migration::{summary_text, write_migration, MigrationLog, MigrationState, NotMigrated};
-        let dir = root("readme-migration");
-        let key = prov().surface_key();
-        let (mut c, _) = Collection::open(&dir, &key).unwrap();
-        for i in 0..3 {
-            c.append(cs(i)).unwrap();
-        }
-        c.set_status(1, crate::quarantine::Q_RESOLVED).unwrap();
-        let folder = dir.join(key.slug());
-        c.write_readme().unwrap();
-        let before = std::fs::read_to_string(folder.join("README.txt")).unwrap();
-        assert!(!before.contains("migration (") , "no migration.txt, no paragraph:\n{before}");
-        assert!(before.contains("1 of them re-solved for the new solver and not yet back in the fit (kept out, or awaiting their review)"), "{before}");
-        let mut log = MigrationLog {
-            source_slug: "lsda-old".into(),
-            source_key: String::new(),
-            build: "0.2.0".into(),
-            date: "2026-11-20".into(),
-            source_len: 0,
-            source_hash: 0,
-            cursor: 4,
-            state: MigrationState::Running,
-            counts: [2, 0, 1, 1],
-            not_migrated: vec![(3, NotMigrated::Stalled, "the cold solve failed: SCF stalled".into())],
-            references: vec![(1, 49, Some(-0.478), Some(-0.478))],
-            class_u_max: (0.0, 0.0),
-            review: Vec::new(),
-            waiting: Vec::new(),
-            pending: None,
-            orphaned: Vec::new(),
-        };
-        write_migration(&folder, &log).unwrap();
-        c.write_readme().unwrap();
-        assert!(!std::fs::read_to_string(folder.join("README.txt")).unwrap().contains("Migrated from"), "running: no summary yet");
-        log.state = MigrationState::Complete;
-        write_migration(&folder, &log).unwrap();
-        c.write_readme().unwrap();
-        let text = std::fs::read_to_string(folder.join("README.txt")).unwrap();
-        let summary = summary_text(&log).unwrap();
-        assert!(summary.starts_with("Migrated from lsda-old on 2026-11-20:") && summary.contains("- 1 not migrated (1 stalled; it remains in the old collection)."), "{summary}");
-        assert!(text.contains(&summary), "README lacks the summary:\n{text}");
     }
 
     fn solved(energy: f64, n: usize, face: f64) -> CollectionReference {
@@ -2827,46 +2606,7 @@ mod tests {
         assert_eq!(crc32(b""), 0);
     }
 
-    // ---- the read-only open and record versions (Fermi–Dirac plan Task 13; spec §7.1, §7.7) ----
-
-    /// What a fixture folder holds, as a writer saw it before it closed.
-    struct Fixture {
-        folder: PathBuf,
-        samples: Vec<CollectionSample>,
-        codes: Vec<u8>,
-        references: Vec<(u8, usize, CollectionReference)>,
-    }
-
-    /// A closed collection with every file a writer leaves: samples (one held, one forgotten, one
-    /// released again), two references of H in two boxes and one of O, a history, the README and
-    /// the refit times.
-    fn ro_fixture(dir: &Path, key: &SurfaceKey) -> Fixture {
-        let (mut c, _) = Collection::open(dir, key).unwrap();
-        for i in 0..6 {
-            c.append(cs(i)).unwrap();
-        }
-        c.set_status(2, Q_HELD).unwrap();
-        c.set_status(4, crate::quarantine::Q_FORGOTTEN).unwrap();
-        c.set_status(1, Q_HELD).unwrap();
-        c.set_status(1, Q_NONE).unwrap();
-        c.set_reference(1, solved(-0.478, 49, 1e-9)).unwrap();
-        c.set_reference(1, solved(-0.4785, 57, 2e-10)).unwrap();
-        c.set_reference(8, CollectionReference { energy: -15.8, grid_n: Some(57), face_density: None }).unwrap();
-        c.history.push(AuditPoint { kind: PointKind::Audit, classes: vec![1, 1], pred_force_std: vec![1e-3; 2], pred_force_std_epistemic: vec![5e-4; 2], pred_energy_std: 1e-4, err_force: vec![2e-4; 2], teacher_force: vec![0.01; 2], err_energy: -3e-5, n_atoms: 2, model_gen: 7, species: vec![(1, vec![1]); 2], fit_id: None, flags: Default::default(), energy_std_epistemic: None, model_force: Vec::new() });
-        c.save_history().unwrap();
-        c.write_readme().unwrap();
-        c.save_refit_times("refit\n").unwrap();
-        let references = c.references.iter().map(|(&(z, n), &r)| (z, n, r)).collect();
-        let f = Fixture { folder: c.folder().to_path_buf(), samples: c.samples.clone(), codes: c.quarantine.clone(), references };
-        drop(c);
-        f
-    }
-
-    /// Every file of a folder and its bytes (the "hash" of the folder, kept whole: an exact
-    /// comparison).
-    fn snapshot(folder: &Path) -> BTreeMap<String, Vec<u8>> {
-        std::fs::read_dir(folder).unwrap().map(|e| e.unwrap().path()).filter(|p| p.is_file()).map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read(&p).unwrap())).collect()
-    }
+    // ---- record versions ----
 
     /// `samples.bin`'s bytes with the version byte of every record from `first` on set to
     /// `version` (each checksum recomputed, so the records are whole).
@@ -2886,144 +2626,11 @@ mod tests {
         out
     }
 
-    /// A process id that ran and has exited (a stale lock's).
-    fn dead_pid() -> u32 {
-        #[cfg(windows)]
-        let mut child = std::process::Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap();
-        #[cfg(not(windows))]
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        let dead = child.id();
-        child.wait().unwrap();
-        dead
-    }
-
-    /// Spec §7.1: the read-only open reads the samples, their codes and the references, and
-    /// writes nothing: every file of the folder is byte-identical afterwards and no `.lock` is
-    /// created.
+    /// Every record this build appends carries [`RECORD_VERSION`]; a record of an older version (1, before the
+    /// Fermi–Dirac switch) refuses the open as made by an older version, and a record of a newer version or kind as a
+    /// newer build's — the file untouched either way. Version 0 was never written.
     #[test]
-    fn read_only_open_leaves_every_byte() {
-        let dir = root("ro-bytes");
-        let key = prov().surface_key();
-        let f = ro_fixture(&dir, &key);
-        assert!(!f.folder.join(".lock").exists(), "the writer released its lock");
-        let before = snapshot(&f.folder);
-        for name in ["key.txt", "samples.bin", "references.txt", "history.bin", "README.txt", REFIT_TIMES_FILE] {
-            assert!(before.contains_key(name), "the fixture has {name}");
-        }
-        let r = Collection::open_read_only(&f.folder).unwrap();
-        assert_eq!(snapshot(&f.folder), before, "every file byte for byte, and no new one");
-        assert!(!f.folder.join(".lock").exists(), "no lock is taken");
-        assert_eq!(r.key, key);
-        assert_eq!(r.samples, f.samples);
-        assert_eq!(r.codes, f.codes);
-        assert_eq!(r.codes, vec![Q_NONE, Q_NONE, Q_HELD, Q_NONE, crate::quarantine::Q_FORGOTTEN, Q_NONE]);
-        assert_eq!(r.references, f.references);
-        assert_eq!(r.references.len(), 3);
-        assert_eq!(r.damaged_tail, None);
-        // F3: the fingerprint of the bytes parsed, the same as the file's
-        let samples = f.folder.join("samples.bin");
-        assert_eq!((r.source_len, r.source_hash), crate::migration::source_fingerprint(&samples).unwrap());
-        assert_eq!(r.source_len, std::fs::metadata(&samples).unwrap().len());
-        // twice: still nothing written
-        let again = Collection::open_read_only(&f.folder).unwrap();
-        assert_eq!((again.samples, again.codes), (r.samples, r.codes));
-        assert_eq!(snapshot(&f.folder), before);
-        // a folder that is not a collection is unreadable, and nothing is created in it
-        let empty = dir.join("not-a-collection");
-        std::fs::create_dir_all(&empty).unwrap();
-        assert!(matches!(Collection::open_read_only(&empty), Err(ReadOnlyError::Unreadable(_))));
-        assert!(snapshot(&empty).is_empty(), "nothing created");
-        assert!(matches!(Collection::open_read_only(&dir.join("absent")), Err(ReadOnlyError::Unreadable(_))));
-        assert!(!dir.join("absent").exists(), "no folder created");
-    }
-
-    /// Review Focus 5: a last record cut mid-payload (a crash mid-append) is reported, every whole
-    /// record before it is read, and nothing is cut, set aside or written.
-    #[test]
-    fn read_only_open_damaged_tail() {
-        let dir = root("ro-tail");
-        let key = prov().surface_key();
-        let f = ro_fixture(&dir, &key);
-        // the last record is a status (sample 1 released): append one more sample and cut it
-        {
-            let (mut c, _) = Collection::open(&dir, &key).unwrap();
-            c.append(cs(6)).unwrap();
-        }
-        let path = f.folder.join("samples.bin");
-        let len = std::fs::metadata(&path).unwrap().len();
-        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(len - 30).unwrap();
-        let before = snapshot(&f.folder);
-        let r = Collection::open_read_only(&f.folder).unwrap();
-        assert_eq!(r.samples, f.samples, "every whole record read");
-        assert_eq!(r.codes, f.codes);
-        let note = r.damaged_tail.as_deref().expect("the damaged tail is reported");
-        assert!(note.contains("damaged tail"), "{note}");
-        assert_eq!((r.source_len, r.source_hash), crate::migration::source_fingerprint(&path).unwrap(), "the whole file, its damaged tail included");
-        assert_eq!(snapshot(&f.folder), before, "nothing cut, nothing set aside");
-        assert!(!before.keys().any(|k| k.starts_with("samples.bin.dropped")));
-    }
-
-    /// Spec §7.1: a folder held by a live process (an older build running) is refused, naming the
-    /// process; a stale lock (its process has exited) is read past and left exactly as it is.
-    #[test]
-    fn read_only_open_refuses_live_writer() {
-        let dir = root("ro-lock");
-        let key = prov().surface_key();
-        let f = ro_fixture(&dir, &key);
-        let lock = f.folder.join(".lock");
-        let me = std::process::id();
-        std::fs::write(&lock, format!("{me}\n")).unwrap();
-        let before = snapshot(&f.folder);
-        match Collection::open_read_only(&f.folder) {
-            Err(ReadOnlyError::LiveWriter { pid }) => assert_eq!(pid, me),
-            other => panic!("expected LiveWriter, got {other:?}"),
-        }
-        let why = ReadOnlyError::LiveWriter { pid: me }.to_string();
-        assert!(why.contains(&me.to_string()) && why.contains("still being appended to"), "{why}");
-        assert_eq!(snapshot(&f.folder), before, "the lock and every file untouched");
-        std::fs::remove_file(&lock).unwrap();
-        // a writer handle of this process is a live writer too
-        {
-            let (_w, _) = Collection::open(&dir, &key).unwrap();
-            assert!(matches!(Collection::open_read_only(&f.folder), Err(ReadOnlyError::LiveWriter { pid }) if pid == me));
-        }
-        // a stale lock: read, and the lock file untouched
-        let dead = dead_pid();
-        std::fs::write(&lock, format!("{dead}\n")).unwrap();
-        let before = snapshot(&f.folder);
-        let r = Collection::open_read_only(&f.folder).unwrap();
-        assert_eq!(r.samples, f.samples);
-        assert_eq!(snapshot(&f.folder), before, "a stale lock is not taken over or removed");
-    }
-
-    /// F3: a purge's temporaries (`samples.bin.new`, `samples.bin.bak.new`, left by a purge that
-    /// stopped before its rename) are never cleaned by the read-only open: it reads `samples.bin`
-    /// and both stay present, byte for byte.
-    #[test]
-    fn read_only_open_leaves_purge_temporaries() {
-        let dir = root("ro-purge");
-        let key = prov().surface_key();
-        let f = ro_fixture(&dir, &key);
-        let samples = std::fs::read(f.folder.join("samples.bin")).unwrap();
-        // what a purge of sample 4 would have staged: a shorter file, and the backup copy
-        let staged = rewrite_without(&samples, &[Some(0), Some(1), Some(2), Some(3), None, Some(4)]).unwrap();
-        std::fs::write(f.folder.join("samples.bin.new"), &staged).unwrap();
-        std::fs::write(f.folder.join("samples.bin.bak.new"), &samples[..samples.len() / 2]).unwrap();
-        let before = snapshot(&f.folder);
-        let r = Collection::open_read_only(&f.folder).unwrap();
-        assert_eq!(r.samples, f.samples, "samples.bin, not the staged file");
-        assert_eq!(r.samples.len(), 6);
-        assert_eq!(snapshot(&f.folder), before, "both temporaries present and byte-identical");
-        assert!(f.folder.join("samples.bin.new").exists() && f.folder.join("samples.bin.bak.new").exists());
-    }
-
-    /// Spec §7.7 (F1): every record this build appends carries [`RECORD_VERSION`] (R + 1); records
-    /// of version R and of version 1 still read (as whole files, and mixed with R + 1 records);
-    /// a record of version R + 2 is refused as written by a newer build, the file
-    /// untouched — by the writer's open and by the read-only open. Versions are named through the
-    /// constant.
-    #[test]
-    fn records_are_new_version_and_older_read() {
+    fn records_carry_the_current_version_and_others_are_refused() {
         let dir = root("versions");
         let key = prov().surface_key();
         let path = samples_path(&dir, &key);
@@ -3038,44 +2645,31 @@ mod tests {
         let recs = frames(&bytes);
         assert_eq!(recs.len(), 5, "header, three samples, one status");
         assert!(recs.iter().all(|(_, r)| r[9] == RECORD_VERSION), "every record at RECORD_VERSION");
-        assert!(RECORD_VERSION > 1, "the Fermi–Dirac records are a new version");
-        let want: Vec<CollectionSample> = (0..3).map(cs).collect();
-        let r = RECORD_VERSION - 1;
-        for (what, old) in [("R", with_version(&bytes, 0, r)), ("1", with_version(&bytes, 0, 1)), ("mixed R + 1 and R", with_version(&bytes, 3, r))] {
+        let (c, rep) = Collection::open(&dir, &key).unwrap();
+        assert_eq!((c.samples.clone(), c.quarantine.clone(), rep.dropped_tail), ((0..3).map(cs).collect::<Vec<_>>(), vec![Q_NONE, Q_HELD, Q_NONE], 0));
+        drop(c);
+        // an older version's records, whole or after current ones
+        for (what, old) in [("all at 1", with_version(&bytes, 0, 1)), ("the last at R - 1", with_version(&bytes, 4, RECORD_VERSION - 1))] {
             std::fs::write(&path, &old).unwrap();
-            let ro = Collection::open_read_only(&dir.join(key.slug())).unwrap();
-            assert_eq!((ro.samples.clone(), ro.codes.clone()), (want.clone(), vec![Q_NONE, Q_HELD, Q_NONE]), "{what}");
-            let (c, rep) = Collection::open(&dir, &key).unwrap();
-            assert_eq!((c.samples.clone(), c.quarantine.clone(), rep.dropped_tail), (want.clone(), vec![Q_NONE, Q_HELD, Q_NONE], 0), "{what}");
-            drop(c);
-            assert_eq!(std::fs::read(&path).unwrap(), old, "{what}: an open writes nothing");
+            let e = Collection::open(&dir, &key).unwrap_err();
+            assert!(e.contains("made by an older version of the app"), "{what}: {e}");
+            assert_eq!(std::fs::read(&path).unwrap(), old, "{what}: untouched");
         }
-        // a record of a newer build: the last one at R + 2
-        let newer_version = RECORD_VERSION + 1;
-        let newer = with_version(&bytes, 4, newer_version);
+        // a record of a newer build: the last one at R + 1
+        let newer = with_version(&bytes, 4, RECORD_VERSION + 1);
         std::fs::write(&path, &newer).unwrap();
         let e = Collection::open(&dir, &key).unwrap_err();
         assert!(e.contains("written by a newer build"), "{e}");
         assert_eq!(std::fs::read(&path).unwrap(), newer, "untouched");
-        match Collection::open_read_only(&dir.join(key.slug())) {
-            Err(ReadOnlyError::NewerFormat(v)) => assert_eq!(v, newer_version),
-            other => panic!("expected NewerFormat, got {other:?}"),
-        }
-        assert!(ReadOnlyError::NewerFormat(newer_version).to_string().contains("newer build"));
-        assert_eq!(std::fs::read(&path).unwrap(), newer, "untouched");
-        // a kind this build does not know, at a version it reads: refused the same way, by its version
+        // a kind this build does not know, at its version: refused the same way
         let mut unknown_kind = bytes.clone();
         let payload = [9u8, RECORD_VERSION, 0, 0];
         unknown_kind.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         unknown_kind.extend_from_slice(&crc32(&payload).to_le_bytes());
         unknown_kind.extend_from_slice(&payload);
         std::fs::write(&path, &unknown_kind).unwrap();
-        match Collection::open_read_only(&dir.join(key.slug())) {
-            Err(ReadOnlyError::NewerFormat(v)) => assert_eq!(v, RECORD_VERSION),
-            other => panic!("expected NewerFormat, got {other:?}"),
-        }
-        let said = ReadOnlyError::NewerFormat(RECORD_VERSION).to_string();
-        assert!(said.contains("written by a newer build") && said.contains("kinds"), "{said}");
+        let e = Collection::open(&dir, &key).unwrap_err();
+        assert!(e.contains("written by a newer build"), "{e}");
         assert_eq!(std::fs::read(&path).unwrap(), unknown_kind, "untouched");
         // version 0 was never written: not a format, never read
         std::fs::write(&path, with_version(&bytes, 4, 0)).unwrap();
