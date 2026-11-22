@@ -99,33 +99,9 @@
 //! `Trainable::import_model`); readers (a README viewer, the knowledge map) may open a read-only
 //! handle, which never writes and never removes the owner's lock. `attach_collection` on the
 //! collection already attached is a no-op, never a second open.
-//!
-//! # The migration (Fermi–Dirac spec §7; plan 2026-11-13 Task 14)
-//!
-//! The Fermi–Dirac switch changed the ionic tag, so the slug: a collection of the new surface lives in a new folder, and
-//! the folder of the same surface under the previous solver's tag is its **predecessor** ([`predecessor_of`]: the
-//! attached key with its tag replaced by `pseudo::legacy_tag_of` of the tag's policy — `"none"` for the all-electron
-//! surface — matched exactly against `key.txt`; one predecessor, no fuzzy match). At attach the provider looks for it
-//! (`MigrationSlot`): a predecessor with samples and no `migration.txt` in the new folder is **offered**
-//! (`Trainable::migration`, a count and an a-priori estimate); a `migration.txt` says where a started migration stands
-//! (running — paused when no pass runs it —, complete, reviewed). `Trainable::start_migration` starts or resumes the
-//! re-solve pass (`crate::sampling::migrate`), a pass of the machinery's own kind. Every migrated sample enters through
-//! [`SurrogateKs::take_migrated`]: appended to the collection (its status record when its code is not 0) and mirrored
-//! into the store as attach would load it — the collection's code, its box's references, no face density. A duplicate
-//! (the same answer stored — a crash between an append and the cursor write) is counted as done, its status written
-//! when it is missing (the stored code still 0). The predecessor is only ever opened read-only.
-//!
-//! **The source is never read from `migration.txt` as a path** (Task 14 security review): its `source_slug` must equal
-//! the predecessor's slug recomputed from the attached key (`predecessor_slug`) and be one plain folder name; any other
-//! value — a separator, `..`, an absolute, drive or UNC path, another folder — makes the log stale: no migration, a note,
-//! the file left as it is. The path used is the recomputed one under the collections root.
 
 use super::*;
-use crate::sampling::migrate::{prior_solve_s, MigratedAppend, Migrator};
-use sim::IonicPolicy;
-use sim::sampling::allowed_multiplicities;
 use std::path::{Path, PathBuf};
-use surrogate::{MigrationLog, MigrationState};
 use surrogate::collection::{CollectionReference, ImportReport, ReferenceOutcome, REFUSE_BOX_UNKNOWN};
 use surrogate::{Collection, CollectionSample, SurfaceKey};
 
@@ -374,7 +350,6 @@ impl SurrogateKs {
         self.user_notes.push(note);
         self.note_lone_held_out(&format!("shared collection {slug}"), lone, r_cut);
         self.note_stray_held_out(&format!("shared collection {slug}"), stray, r_cut);
-        self.find_migration();
         #[cfg(test)]
         if self.attach_refit_off {
             return Ok(());
@@ -428,13 +403,7 @@ impl SurrogateKs {
     /// Writes the audit history and the README of the attached collection, then lets it go
     /// (its lock released). `None` when none was attached.
     pub(super) fn detach_collection(&mut self) -> Option<Collection> {
-        // the log before the README, which carries its summary (Task 16 re-review R2)
-        self.flush_migration_log();
         self.flush_collection();
-        self.migration = None;
-        self.review_kept.clear();
-        self.review_stamp = None;
-        self.review_log_dirty = false;
         self.shared.take().map(|s| s.coll)
     }
 
@@ -648,10 +617,10 @@ impl SurrogateKs {
             }
             let code = self.quarantine.get(i).copied().filter(|&q| q != Q_REF_WAIT).unwrap_or(Q_NONE);
             match *link {
-                // only a code a collection holds is written (`is_collection_code`: 0–3, 7, 8, 9); the provider's own and
+                // only a code a collection holds is written (`is_persisted_code`: 0–3, 7, 8); the provider's own and
                 // the draft code (its tag carries it) leave the collection's code standing — `set_status` refuses them,
-                // and a refusal is no write failure (Task 13 review, with code 9's writer)
-                Link::In(_) if !surrogate::quarantine::is_collection_code(code) => {}
+                // and a refusal is no write failure
+                Link::In(_) if !surrogate::quarantine::is_persisted_code(code) => {}
                 Link::In(k) => {
                     if sh.coll.quarantine.get(k).is_some_and(|&c| c != code) {
                         if let Err(e) = sh.coll.set_status(k, code) {
@@ -687,7 +656,7 @@ impl SurrogateKs {
         let code = self.quarantine.get(i).copied().filter(|&q| q != Q_REF_WAIT).unwrap_or(Q_NONE);
         let Some(sh) = self.shared.as_mut() else { return Ok(false) };
         let Some(&Link::In(k)) = sh.link.get(i) else { return Ok(false) };
-        if !surrogate::quarantine::is_collection_code(code) {
+        if !surrogate::quarantine::is_persisted_code(code) {
             return Err(format!("status code {code} is the provider's own, not one a collection holds"));
         }
         if sh.coll.read_only {
@@ -805,7 +774,6 @@ impl SurrogateKs {
         let changed = sh.box_refs.insert((z, grid_n), value).is_none_or(|old| old.to_bits() != value.to_bits());
         self.user_notes.extend(note);
         self.failed_refs.remove(&z);
-        self.legacy_refs.remove(&z);
         if changed {
             self.rebase_collection();
             self.book_reference_arrival(before);
@@ -1014,10 +982,6 @@ impl SurrogateKs {
             return Err("import: cancel the running sampling pass first".into());
         }
         let sh = self.shared.as_mut().ok_or("import: no shared collection is attached (the Model tab's shared model)")?;
-        // a model of the previous solver (spec §7.9; plan Task 16 review M7): its reason, never "another surface"
-        if let Some(why) = surrogate::sidecar::read_provenance(path).ok().and_then(|p| legacy_model_refusal(&p.ionic)) {
-            return Err(format!("import {}: refused — {why}", path.display()));
-        }
         let limit = box_affected_face_density(sh.coll.key.h);
         let before = sh.coll.samples.len();
         let r_cut = self.cutoff();
@@ -1222,9 +1186,7 @@ impl SurrogateKs {
     pub(super) fn load_specialised(&mut self, path: &Path, set: surrogate::SampleSet, scene: &Scene) -> Result<(), String> {
         let want = self.provenance_for(scene);
         let refused = |why: String| format!("specialised model {} refused: {why}", path.display());
-        let why = if let Some(why) = legacy_model_refusal(&set.provenance.ionic) {
-            Some(why)
-        } else if want.charge != 0 {
+        let why = if want.charge != 0 {
             Some(format!("the scene has charge {:+} — a specialised model is cut from a neutral collection (collections are neutral until M9)", want.charge))
         } else if let Some(m) = want.multiplicity {
             Some(format!("the scene forces multiplicity {m} — a specialised model is taught at the automatic multiplicity"))
@@ -1271,7 +1233,6 @@ impl SurrogateKs {
         let dropped = set.sample_box.len() - keep.len();
         let pick = |v: &[u8]| if v.is_empty() { Vec::new() } else { keep.iter().map(|&i| v[i]).collect() };
         let pick_f = |v: &[f64]| if v.is_empty() { Vec::new() } else { keep.iter().map(|&i| v[i]).collect() };
-        let s9 = set.reference_rule.as_deref() == Some(surrogate::sidecar::REFERENCE_RULE);
         let per_scene = surrogate::SampleSet {
             provenance: want.clone(),
             samples,
@@ -1299,11 +1260,9 @@ impl SurrogateKs {
         }
         self.set_source_file(Some(path.to_path_buf()));
         self.specialised = set.specialised;
-        if s9 {
-            // the scene's own box: the cache's key (grid n included) is exactly right
-            for (&z, &e) in &frame {
-                self.ref_cache.seed_energy(atom_key(&want, z), e, None, want.tol, &want.teacher);
-            }
+        // the scene's own box: the cache's key (grid n included) is exactly right
+        for (&z, &e) in &frame {
+            self.ref_cache.seed_energy(atom_key(&want, z), e, None, want.tol, &want.teacher);
         }
         self.last_pass = None;
         let state = match self.no_model() {
@@ -1321,513 +1280,9 @@ impl SurrogateKs {
     }
 }
 
-/// The ionic policy whose tag on this build is `tag`: `None` (the policy) for the all-electron tag
-/// (`pseudo::all_electron_tag`), else the first of `Accepted`, `CoresOnly`, `All` whose `pseudo::tag_of` is `tag`
-/// (`Accepted`'s tag is `All`'s or `CoresOnly`'s word, and `Accepted` solves both surfaces' species as they were: a
-/// species `All` refuses was never on an `All` surface). `None` for any other tag — a legacy one, another build's.
-pub(crate) fn policy_of_tag(tag: &str) -> Option<IonicPolicy> {
-    if tag == crate::pseudo::all_electron_tag() {
-        return Some(IonicPolicy::None);
-    }
-    if crate::pseudo::is_all_electron_tag(tag) {
-        return None;
-    }
-    [IonicPolicy::Accepted, IonicPolicy::CoresOnly, IonicPolicy::All].into_iter().find(|&p| crate::pseudo::tag_of(p) == tag)
-}
-
-/// The tag the previous solver (the last shared-shell build) wrote for the surface this build tags `tag`
-/// (`pseudo::legacy_tag_of` of [`policy_of_tag`]: `"none"` for the all-electron surface); `None` when `tag` is not one
-/// this build writes.
-pub(crate) fn legacy_tag_for(tag: &str) -> Option<String> {
-    policy_of_tag(tag).map(crate::pseudo::legacy_tag_of)
-}
-
-/// The **predecessor** of the collection of `key` under `root` (Fermi–Dirac spec §7.2; module doc, "The migration"):
-/// the folder whose `key.txt` is `key` with its ionic tag replaced by the previous solver's ([`legacy_tag_for`]),
-/// matched exactly (every field, as every open matches); `None` when there is none or `key` is not this build's surface.
-pub fn predecessor_of(root: &Path, key: &SurfaceKey) -> Option<PathBuf> {
-    let old = SurfaceKey { ionic: legacy_tag_for(&key.ionic)?, ..key.clone() };
-    let dir = root.join(predecessor_slug(key)?);
-    let text = std::fs::read_to_string(dir.join("key.txt")).ok()?;
-    let theirs = SurfaceKey::from_text(&text).ok()?;
-    old.difference(&theirs).is_none().then_some(dir)
-}
-
-/// The folder name (slug) of `key`'s predecessor ([`predecessor_of`]), computed from the key alone — never read from a
-/// file; `None` when `key` is not this build's surface.
-pub(crate) fn predecessor_slug(key: &SurfaceKey) -> Option<String> {
-    Some(SurfaceKey { ionic: legacy_tag_for(&key.ionic)?, ..key.clone() }.slug())
-}
-
-/// Whether `name` is one plain path component (no separator, no `.`/`..`, no root, drive or UNC prefix).
-fn plain_component(name: &str) -> bool {
-    let mut parts = Path::new(name).components();
-    matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(c)), None) if c == std::ffi::OsStr::new(name)) && !name.contains(['/', '\\', ':'])
-}
-
-/// The attached collection's migration (module doc, "The migration"): its predecessor folder, what was read of it, and
-/// the new folder's `migration.txt` (`None`: not started — the offer). Cloned into a background refit's copy, whose
-/// review of the re-solved samples writes its log (`background` module doc).
-#[derive(Clone)]
-pub(crate) struct MigrationSlot {
-    pub(super) source: PathBuf,
-    /// The predecessor's samples (whole records), as read at attach or at the pass's start.
-    pub(super) samples: usize,
-    /// The boxes (grid points per side) of the predecessor's samples and of its references' solves (one per
-    /// multiplicity), for the a-priori estimate (`migrate::prior_solve_s`); empty once complete.
-    sample_boxes: Vec<usize>,
-    reference_boxes: Vec<usize>,
-    /// The predecessor's species (Z ascending), as read at attach: the offer's words (`sim::MigrationStatus::species`);
-    /// empty once complete.
-    species: Vec<u8>,
-    pub(super) log: Option<MigrationLog>,
-}
-
-impl MigrationSlot {
-    /// The a-priori time (s) of the solves left after `cursor` samples (the references counted until the log lists one).
-    fn prior_s(&self, cursor: usize) -> f64 {
-        let refs = if self.log.as_ref().is_some_and(|l| !l.references.is_empty() || l.cursor > 0) { 0.0 } else { self.reference_boxes.iter().map(|&n| prior_solve_s(n)).sum::<f64>() };
-        self.sample_boxes.iter().skip(cursor).map(|&n| prior_solve_s(n)).sum::<f64>() + refs
-    }
-}
-
-/// Whether two samples are the same teacher answer (atoms, positions, energy and forces, bit for bit): the collection's
-/// duplicate rule.
-fn same_answer(a: &Sample, b: &Sample) -> bool {
-    let bits = |v: &[[f64; 3]]| v.iter().flatten().map(|x| x.to_bits()).collect::<Vec<_>>();
-    a.z == b.z && a.energy.to_bits() == b.energy.to_bits() && bits(&a.pos) == bits(&b.pos) && bits(&a.forces) == bits(&b.forces)
-}
-
-impl SurrogateKs {
-    /// Looks for the attached collection's migration (module doc, "The migration"): its `migration.txt`, else its
-    /// predecessor with samples (the offer). Called at attach; a source that cannot be read is said once.
-    pub(super) fn find_migration(&mut self) {
-        self.migration = None;
-        // the review's state is the attached folder's: read back below (ruling R13), reviewed again at the next refit
-        self.review_kept.clear();
-        self.review_stamp = None;
-        self.review_log_dirty = false;
-        let Some(sh) = self.shared.as_ref() else { return };
-        let dir = sh.coll.folder().to_path_buf();
-        let Some(root) = dir.parent().map(Path::to_path_buf) else { return };
-        let slug = sh.coll.key.slug();
-        let mut log = match surrogate::read_migration(&dir) {
-            Ok(l) => l,
-            Err(e) => {
-                self.user_notes.push(format!("shared collection {slug}: its {} can't be read ({e}) — the re-solve for the new solver is not offered", surrogate::migration::MIGRATION_FILE));
-                return;
-            }
-        };
-        let source = match &log {
-            // the source is never the log's word for a path (security review, Task 14): the predecessor's slug is
-            // recomputed from the attached key and must be the log's, a plain folder name under the same root
-            Some(l) => match predecessor_slug(&sh.coll.key) {
-                Some(want) if want == l.source_slug && plain_component(&l.source_slug) => root.join(want),
-                want => {
-                    self.user_notes.push(format!(
-                        "shared collection {slug}: its {} names the source folder {:?}, not this collection's predecessor ({}) — it is ignored, and the re-solve for the new solver is not offered",
-                        surrogate::migration::MIGRATION_FILE,
-                        l.source_slug,
-                        want.unwrap_or_else(|| "none for this surface".into())
-                    ));
-                    return;
-                }
-            },
-            None => match predecessor_of(&root, &sh.coll.key) {
-                Some(d) => d,
-                None => return,
-            },
-        };
-        // the status window (`crate::sampling::migrate` module doc, 4.; fix round 1 I1): a code recorded before its
-        // sample's append, which a crash kept from its status record, is applied now — before attach's refit
-        if let Some(l) = log.as_mut().filter(|l| l.state == MigrationState::Running && l.pending.is_some()) {
-            let p = l.pending.expect("checked");
-            // the entry goes only once it is resolved: the status on disk, a code set already, or a stale entry that
-            // names no record (fix round 2) — never after a failed write, which the next attach tries again
-            if self.apply_pending_status(p) && !self.shared.as_ref().is_some_and(|sh| sh.coll.read_only) {
-                l.pending = None;
-                if let Err(e) = surrogate::write_migration(&dir, l) {
-                    self.user_notes.push(format!("shared collection {slug}: its {} could not be rewritten ({e})", surrogate::migration::MIGRATION_FILE));
-                }
-            }
-        }
-        let done = log.as_ref().is_some_and(|l| l.state != MigrationState::Running);
-        let (samples, sample_boxes, reference_boxes, species) = if done {
-            (log.as_ref().map_or(0, |l| l.counts.iter().sum()), Vec::new(), Vec::new(), Vec::new())
-        } else {
-            match Collection::open_read_only(&source) {
-                Ok(ro) => {
-                    let refs = ro.references.iter().flat_map(|&(z, n, _)| std::iter::repeat_n(n, allowed_multiplicities(z as u32).len())).collect();
-                    let species: std::collections::BTreeSet<u8> = ro.samples.iter().flat_map(|s| s.sample.z.iter().copied()).collect();
-                    (ro.samples.len(), ro.samples.iter().map(|s| s.grid_n).collect(), refs, species.into_iter().collect())
-                }
-                Err(e) => {
-                    let old = source.file_name().map_or_else(|| source.display().to_string(), |f| f.to_string_lossy().into_owned());
-                    self.user_notes.push(format!("shared collection {slug}: the previous solver's collection {old} can't be read now ({e}) — its re-solve for the new solver waits until it can"));
-                    match &log {
-                        None => return,
-                        Some(l) => (l.cursor, Vec::new(), Vec::new(), Vec::new()),
-                    }
-                }
-            }
-        };
-        if log.is_none() && samples == 0 {
-            return;
-        }
-        self.migration = Some(MigrationSlot { source, samples, sample_boxes, reference_boxes, species, log });
-        self.read_back_review();
-    }
-
-    /// The re-solved samples a review **kept** (ruling R13; Fermi–Dirac spec §7.6 step 4): every "kept" entry of the
-    /// attached migration's review log whose sample is still at code 9 fences again ([`SurrogateKs::fences`]). An entry
-    /// whose sample moved since (released, superseded by a fresh answer — controller ruling B) is history only.
-    fn read_back_review(&mut self) {
-        let Some(log) = self.migration.as_ref().and_then(|m| m.log.as_ref()) else { return };
-        let Some(sh) = self.shared.as_ref() else { return };
-        let kept: Vec<usize> = log
-            .review
-            .iter()
-            .filter(|e| !e.2)
-            .filter_map(|e| sh.link.iter().position(|l| *l == Link::In(e.0)))
-            .filter(|&i| self.quarantine.get(i) == Some(&surrogate::quarantine::Q_RESOLVED))
-            .collect();
-        self.review_kept.extend(kept);
-    }
-
-    /// Writes `migration.txt` when the review changed its log (`review_log_dirty`): at the end of a refit, after the
-    /// status records its verdicts name, after a background refit's install, and after a purge renumbered it (F3). A
-    /// read-only collection writes nothing; a failed write is said and tried again next time.
-    pub(super) fn flush_migration_log(&mut self) {
-        if !self.review_log_dirty || self.refit_fork {
-            return;
-        }
-        let Some(sh) = self.shared.as_ref() else {
-            self.review_log_dirty = false;
-            return;
-        };
-        if sh.coll.read_only {
-            return;
-        }
-        let (dir, slug) = (sh.coll.folder().to_path_buf(), sh.coll.key.slug());
-        let Some(log) = self.migration.as_ref().and_then(|m| m.log.as_ref()) else {
-            self.review_log_dirty = false;
-            return;
-        };
-        match surrogate::write_migration(&dir, log) {
-            Ok(()) => self.review_log_dirty = false,
-            Err(e) => self.user_notes.push(format!("shared collection {slug}: its {} could not be rewritten with the review ({e}) — tried again at the next refit", surrogate::migration::MIGRATION_FILE)),
-        }
-    }
-
-    /// A pending status (`find_migration`): collection sample `index` takes `code` when it exists, **is the sample the
-    /// entry names** (its energy's bits and `answer_print`; fix round 2) and still holds 0 — the status record a crash
-    /// kept from following its sample record —, in the collection and in the store (through its link). Anything else (no
-    /// such sample, another sample at that index, a code set since, a code no collection holds) leaves it as it is.
-    /// `true` when the entry is resolved: the status written, a code there already, or an entry that names no record;
-    /// `false` when the write failed or the collection is read-only (the store still holds the sample out).
-    fn apply_pending_status(&mut self, p: surrogate::PendingStatus) -> bool {
-        let (k, code) = (p.index, p.code);
-        let n = self.samples();
-        let Some(sh) = self.shared.as_mut() else { return false };
-        let slug = sh.coll.key.slug();
-        if k >= sh.coll.samples.len() || !p.names(&sh.coll.samples[k].sample) || !surrogate::quarantine::is_collection_code(code) || code == Q_NONE {
-            return true;
-        }
-        if sh.coll.quarantine[k] != Q_NONE {
-            return true;
-        }
-        let failed = if sh.coll.read_only { None } else { sh.coll.set_status(k, code).err() };
-        let written = !sh.coll.read_only && failed.is_none();
-        let i = sh.link.iter().position(|l| *l == Link::In(k));
-        if let Some(e) = failed {
-            self.user_notes.push(format!("shared collection {slug}: the re-solved sample {k}'s status {code} could not be written ({e}) — it is held out for this session"));
-        }
-        if let Some(i) = i {
-            self.quarantine.resize(n, Q_NONE);
-            self.quarantine[i] = code;
-        }
-        self.user_notes.push(format!("shared collection {slug}: the re-solve pass stopped between sample {k}'s record and its status — its code {code} is applied now"));
-        written
-    }
-
-    /// The migration's state for `Trainable::migration` (module doc, "The migration").
-    pub(super) fn migration_status(&self) -> Option<sim::MigrationStatus> {
-        let slot = self.migration.as_ref()?;
-        let source = slot.source.file_name().map_or_else(|| slot.source.display().to_string(), |f| f.to_string_lossy().into_owned());
-        let running = self.pass.as_ref().and_then(|p| p.migrator());
-        let Some(log) = running.map(|m| m.log()).or(slot.log.as_ref()) else {
-            return Some(sim::MigrationStatus {
-                source,
-                samples: slot.samples,
-                done: 0,
-                counts: [0; 4],
-                eta_s: Some(slot.prior_s(0)),
-                state: sim::MigrationPhase::Offered,
-                species: slot.species.clone(),
-                summary: None,
-            });
-        };
-        let state = match log.state {
-            MigrationState::Running if running.is_some() => sim::MigrationPhase::Running,
-            MigrationState::Running => sim::MigrationPhase::Paused,
-            MigrationState::Complete => sim::MigrationPhase::Complete,
-            MigrationState::Reviewed => sim::MigrationPhase::Reviewed,
-        };
-        let eta_s = match state {
-            sim::MigrationPhase::Running => running.map(|m| m.eta_s()),
-            sim::MigrationPhase::Paused => Some(slot.prior_s(log.cursor)),
-            _ => None,
-        };
-        let samples = running.map_or(slot.samples, |m| m.source_samples());
-        Some(sim::MigrationStatus {
-            source,
-            samples,
-            done: log.cursor,
-            counts: log.counts,
-            eta_s,
-            state,
-            species: slot.species.clone(),
-            summary: surrogate::summary_text(log),
-        })
-    }
-
-    /// Starts or resumes the re-solve pass (`Trainable::start_migration`; module doc, "The migration"). `Err` with the
-    /// reason, nothing started.
-    pub(super) fn start_migration_pass(&mut self) -> Result<(), String> {
-        if self.pass.is_some() {
-            return Err("a pass is already running (cancel it first)".into());
-        }
-        let sh = self.shared.as_ref().ok_or("no shared collection is attached")?;
-        if sh.coll.read_only {
-            return Err(format!("the shared collection {} is read-only (another copy of the app holds its lock)", sh.coll.key.slug()));
-        }
-        let slot = self.migration.as_ref().ok_or_else(|| format!("the shared collection {} has no collection of the previous solver to re-solve", sh.coll.key.slug()))?;
-        let policy = policy_of_tag(&sh.coll.key.ionic).ok_or_else(|| format!("the shared collection's ionic tag {} is not this build's", sh.coll.key.ionic))?;
-        let m = Migrator::start(&slot.source, sh.coll.folder(), &sh.coll.key, policy, self.cutoff(), slot.log.clone())?;
-        // a previous pass's tail first, before this pass touches any state (`drop_pass_tail`)
-        self.drop_pass_tail(super::NEW_PASS_FIRST);
-        let slot = self.migration.as_mut().expect("checked above");
-        slot.log = Some(m.log().clone());
-        slot.samples = m.source_samples();
-        let (resumed, at) = (m.log().cursor > 0 || !m.log().references.is_empty(), m.log().cursor);
-        let (n, old) = (m.source_samples(), m.log().source_slug.clone());
-        let eta = m.eta_s();
-        self.user_notes.push(if resumed {
-            format!("re-solving {old} for the new solver: going on at sample {} of {n} (about {:.0} min of GPU time left); the dynamics are paused until it ends — Pause keeps its place, Cancel stops it and it resumes from there", at + 1, eta / 60.0)
-        } else {
-            format!("re-solving {old} for the new solver: {n} samples (about {:.0} min of GPU time); the dynamics are paused until it ends — Pause keeps its place, Cancel stops it and it resumes from there", eta / 60.0)
-        });
-        self.begin_pass(crate::sampling::Sampler::migration(m));
-        Ok(())
-    }
-
-    /// Takes one migrated sample (module doc, "The migration"; `crate::sampling::migrate`, 4.): appended to the attached
-    /// collection with its status record when `code` is not 0, and mirrored into the store; a duplicate is
-    /// [`MigratedAppend::Duplicate`], its status written only when the stored one is still 0. `Err` when nothing could
-    /// be written (a read-only collection, a failed write).
-    pub fn take_migrated(&mut self, mut cs: CollectionSample, code: u8) -> Result<MigratedAppend, String> {
-        // never a stray mask in a record (plan Task 5, B): the mirror below masks the store's copy in memory
-        cs.sample = super::stray::unmasked_record(&cs.sample, self.cutoff());
-        let sh = self.shared.as_mut().ok_or("no shared collection is attached")?;
-        if sh.coll.read_only {
-            return Err(format!("the shared collection {} is read-only", sh.coll.key.slug()));
-        }
-        let k = sh.coll.samples.len();
-        #[cfg(test)]
-        let crash = std::mem::take(&mut self.status_window_crash);
-        #[cfg(test)]
-        if std::mem::take(&mut self.migrated_append_fails) {
-            return Err("injected append failure (nothing written)".into());
-        }
-        let sh = self.shared.as_mut().expect("checked above");
-        match sh.coll.append(cs.clone()) {
-            Ok(()) => {
-                #[cfg(test)]
-                if crash {
-                    return Err("injected crash between the sample record and its status".into());
-                }
-                if code != Q_NONE {
-                    sh.coll.set_status(k, code)?;
-                }
-                self.mirror_collection_sample(k).map_err(|e| e.to_string())?;
-                Ok(MigratedAppend::Appended(k))
-            }
-            Err(e) if e == surrogate::collection::REFUSE_DUPLICATE => {
-                let k = sh.coll.samples.iter().position(|t| same_answer(&t.sample, &cs.sample)).ok_or("a duplicate the collection does not hold")?;
-                if code != Q_NONE && sh.coll.quarantine[k] == Q_NONE {
-                    sh.coll.set_status(k, code)?;
-                    let i = sh.link.iter().position(|l| *l == Link::In(k));
-                    if let Some(i) = i {
-                        let n = self.samples();
-                        self.quarantine.resize(n, Q_NONE);
-                        self.quarantine[i] = code;
-                        self.pending_refit = true;
-                    }
-                }
-                Ok(MigratedAppend::Duplicate(k))
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Collection sample `k` (just appended) into the store, as attach loads one (`attach_inner`, `push_shared`): its
-    /// code, no face density, its teacher energy and box, its fit energy against its box's references — or waiting
-    /// for them (`Q_REF_WAIT`) when it is in the fit's codes.
-    fn mirror_collection_sample(&mut self, k: usize) -> Result<(), StoreError> {
-        let sh = self.shared.as_ref().expect("collection mode");
-        let (cs, code, prov) = (sh.coll.samples[k].clone(), sh.coll.quarantine[k], sh.prov.clone());
-        let n = self.store.as_ref().map_or(0, |st| st.len());
-        let offset = self.box_offset(&cs.sample.z, cs.grid_n);
-        let mut s = cs.sample.clone();
-        if let Some(o) = offset {
-            s.energy -= o;
-        }
-        // stray atoms are no force rows (fix round 1, I2; in memory, the record is the collection's)
-        super::stray::mask_stray_atoms(&mut s, self.cutoff());
-        let z = s.z.clone();
-        let mut box_prov = prov.clone();
-        box_prov.grid_n = cs.grid_n;
-        self.store.get_or_insert_with(|| SampleStore::new(prov)).push(s)?;
-        self.face.resize(n, f64::NAN);
-        self.face.push(f64::NAN);
-        let q = if offset.is_none() && code == Q_NONE { Q_REF_WAIT } else { code };
-        // a sample with stray atoms is held out until a composition check measures it, as at attach (`Q_STRAY`) —
-        // unless a cleared region of its signature covers it already (review M3)
-        let q = if (q == Q_NONE || q == Q_REF_WAIT) && self.stray_held(&cs.sample.pos, &cs.sample.z, &box_prov) { Q_STRAY } else { q };
-        if !self.quarantine.is_empty() || q != Q_NONE {
-            self.quarantine.resize(n, Q_NONE);
-            self.quarantine.push(q);
-        }
-        let sh = self.shared.as_mut().expect("collection mode");
-        sh.link.resize(n, Link::Out);
-        sh.link.push(Link::In(k));
-        sh.raw.resize(n, f64::NAN);
-        sh.raw.push(cs.sample.energy);
-        sh.box_n.resize(n, 0);
-        sh.box_n.push(cs.grid_n);
-        if let Some(acc) = &self.accumulator {
-            if z.iter().any(|&zi| acc.basis.species_index(zi).is_none()) {
-                self.species_dirty = true;
-            }
-        }
-        self.pending_refit = true;
-        Ok(())
-    }
-
-    /// After the re-solve pass (complete, cancelled, or stopped by an error — `finish_pass`): the slot takes the log,
-    /// the teacher is told its state is a sample's, and the model is refitted as after any pass when a fit can form.
-    pub(super) fn finish_migration(&mut self, mut sampler: crate::sampling::Sampler) {
-        let progress = sampler.progress();
-        self.user_notes.extend(sampler.take_notes());
-        self.last_pass = Some(progress.clone());
-        let Some(m) = sampler.migrator() else { return };
-        let log = m.log().clone();
-        let n = m.source_samples();
-        if let Some(slot) = self.migration.as_mut() {
-            slot.log = Some(log.clone());
-            if log.state != MigrationState::Running {
-                slot.sample_boxes.clear();
-                slot.reference_boxes.clear();
-                slot.species.clear();
-            }
-        }
-        self.teacher.discontinuity();
-        let [u, t, s, x] = log.counts;
-        let head = match log.state {
-            MigrationState::Running => format!(
-                "re-solving {} for the new solver stopped at sample {} of {} (it goes on from there when started again)",
-                log.source_slug,
-                surrogate::migration::spaced(log.cursor as u64 + 1),
-                surrogate::migration::spaced(n as u64)
-            ),
-            _ => format!("re-solving {} for the new solver finished", log.source_slug),
-        };
-        let counts = format!("{u} identical within solver noise, {t} changed only by −TS, {s} changed state (held out until reviewed), {x} not migrated (they stay in the old collection)");
-        let (fittable, floor, _) = self.fittable_and_floor();
-        let fit = if self.samples() == 0 || fittable < floor {
-            None
-        } else {
-            Some(match SurrogateKs::refit(self) {
-                Ok(r) => format!("refit on {} samples, rmse {:.1e} Ha/atom, {:.1e} Ha/Bohr", r.n_samples, r.rmse_energy_per_atom, r.rmse_force),
-                Err(e) => format!("the refit failed ({e})"),
-            })
-        };
-        if fit.is_none() {
-            // the README is regenerated even without a refit (spec §7.5)
-            self.flush_collection();
-        }
-        self.user_notes.push(match fit {
-            Some(f) => format!("{head}: {counts}; {f}"),
-            None => format!("{head}: {counts}"),
-        });
-    }
-
-    /// The legacy-solver check of a pass checkpoint (spec §7.7): `Some(reason)` when its provenance line carries the
-    /// tag the previous solver wrote for `scene`'s surface — an interrupted pass that solved on the old surface, which
-    /// never goes on here.
-    pub(super) fn legacy_checkpoint_refusal(&self, scene: &Scene, line: &str) -> Option<String> {
-        let tag = self.provenance_for(scene).ionic;
-        let legacy = legacy_tag_for(&tag)?;
-        let theirs = line.rsplit_once(", ionic ").map(|(_, t)| t.trim())?;
-        (theirs == legacy).then(|| format!("{PASS_STARTED_WITH_PREVIOUS_SOLVER} (its samples are on that surface, ionic {legacy}; this build solves ionic {tag}) — it cannot go on here; the checkpoint is left as it is"))
-    }
-}
-
-#[cfg(test)]
-impl SurrogateKs {
-    /// Test hook (Review Focus 4, fix round 1 I1): the running re-solve pass stops with an error inside sample `k`'s
-    /// append — after its sample record, before its status record and the cursor — a crash in the status window.
-    pub(crate) fn migration_crash_in_window(&mut self, k: usize) {
-        if let Some(m) = self.pass.as_mut().and_then(|p| p.migrator_mut()) {
-            m.crash_in_window = Some(k);
-        }
-    }
-
-    /// Test hook (fix round 2): the running pass's append of sample `k` fails before anything is written.
-    pub(crate) fn migration_fail_append(&mut self, k: usize) {
-        if let Some(m) = self.pass.as_mut().and_then(|p| p.migrator_mut()) {
-            m.fail_append = Some(k);
-        }
-    }
-
-    /// Test hook: the next `take_migrated` fails before it writes anything (`migration_fail_append`).
-    pub(crate) fn arm_migrated_append_failure(&mut self) {
-        self.migrated_append_fails = true;
-    }
-
-    /// Test hook: the next `take_migrated` stops after its sample record (`migration_crash_in_window`).
-    pub(crate) fn arm_status_window_crash(&mut self) {
-        self.status_window_crash = true;
-    }
-
-    /// Test reader: stored sample `i`'s code in the store (what a fit reads).
-    pub(crate) fn code_of(&self, i: usize) -> u8 {
-        self.quarantine.get(i).copied().unwrap_or(Q_NONE)
-    }
-}
-
-/// Why an interrupted pass of the previous solver never resumes (spec §7.7, the `training/pass.ckpt` row).
-pub const PASS_STARTED_WITH_PREVIOUS_SOLVER: &str = "the interrupted pass was started with the previous solver";
-
-/// The last release whose solver used the integer / shared occupation rules (v0.2.0-beta.1 … beta.5 are all
-/// pre-Fermi–Dirac): the version the legacy-model refusal names in both its slots (plan ruling R17 as revised at Task 16
-/// fix round 1 — a build's own `CARGO_PKG_VERSION` named the wrong boundary).
-pub const LAST_PRE_FD_RELEASE: &str = "0.2.0-beta.5";
-
-/// Why a model file taught before the Fermi–Dirac switch is refused on load (spec §7.9; plan 2026-11-13 Task 16): `Some`
-/// with the reason when its ionic tag is one of the previous solver's (`pseudo::is_pre_fermi_dirac_tag`), naming
-/// [`LAST_PRE_FD_RELEASE`]. Migrating model files in the app is a non-goal (spec §7.9): the reason says to re-teach the
-/// model, or to open it in that version.
-pub fn legacy_model_refusal(tag: &str) -> Option<String> {
-    let v = LAST_PRE_FD_RELEASE;
-    crate::pseudo::is_pre_fermi_dirac_tag(tag).then(|| format!("taught with the solver of {v} or earlier (integer / shared occupations); this version uses Fermi–Dirac smearing: re-teach it, or open it in {v}"))
-}
-
 impl Drop for SurrogateKs {
     /// The attached collection's audit history and README are written before its lock is released.
     fn drop(&mut self) {
-        // the log before the README, which carries its summary (Task 16 re-review R2)
-        self.flush_migration_log();
         self.flush_collection();
     }
 }

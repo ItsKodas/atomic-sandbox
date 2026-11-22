@@ -52,7 +52,6 @@ All heavy tests are release-only (`#[cfg_attr(debug_assertions, ignore)]`); run 
 | dynamics | `cargo test -p validate --release --test dynamics` | ~42–46 min (V5's CO₂⁺ NVE and CPU work integral; the stray-atom NVE re-entry at 101³, ~14 min) |
 | surrogate / provider / policy | `cargo test -p validate --release --test surrogate` | ~20–40 min (with the stray-atom and trust-tightening tests) |
 | shared-model measurements (not gates) | `--test transfer`, `--test capping` (`#[ignore]`d; commands in `references.md`) | hours |
-| collection migration, V11 (measurement, not a gate) | `FD_DRY_RUN_COPY=<copy of a pre-FD collection> cargo test -p validate --release --test migration dry_run -- --ignored --nocapture` (on a copy only, never `models/collections`) | ~17 h GPU for a 1 657-sample Accurate collection (V11, 37 s/sample) |
 | bonds / relax / isotopes | `cargo test -p validate --release --test tools` | ~3–10 min |
 | charges | `cargo test -p validate --release --test charges` (CPU) | ~5.5–11 min |
 | pseudopotentials | `--test pseudo`, `--test pseudo_gen`, `--test pseudo_oracles` | ~39 min–1 h, ~4.5–9 min, ~65 min–2 h |

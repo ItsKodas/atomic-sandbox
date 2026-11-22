@@ -15,8 +15,7 @@
 //!   tag. Since the Fermi–Dirac switch (spec 2026-11-13 §6.2; plan Task 9) the tags name the occupation rule:
 //!   pseudised `<word>/<surface_hash:016x>/fd5e-3/stop2x5e-8/pin1e-5`, all-electron `none/fd5e-3/pin1e-5`
 //!   ([`all_electron_tag`]: `fd{ELECTRON_KT:e}`, `pin{GPU_PARTIAL_TOL:e}`). Every "is this the all-electron
-//!   surface" test goes through [`is_all_electron_tag`], which also answers for the legacy `"none"`;
-//!   [`legacy_tag_of`] gives the tag the last shared-shell build computed, to find a predecessor collection.
+//!   surface" test goes through [`is_all_electron_tag`], which also answers for the bare word `"none"`.
 //! - [`gpu_tol_floor`] / [`effective_gpu_tol`]: the floor-aware GPU stop (spec §7 risk 6).
 //! - `Accepted` (M7 Task 11 fix round, the app's default): every species the recipe accepts, H and He included; a refused
 //!   one runs all-electron with a note (`qm::ionic`). In a run without a GPU dimer backend H and He are not generated at
@@ -310,49 +309,6 @@ pub fn all_electron_tag() -> String {
 /// all-electron surface" goes through here (spec 2026-11-13 §6.2), never a `== "none"`.
 pub fn is_all_electron_tag(tag: &str) -> bool {
     tag == "none" || tag.starts_with("none/")
-}
-
-/// Whether `tag` is a surface tag of a build before the Fermi–Dirac switch (spec 2026-11-13 §7.9): its first word a
-/// policy this build knows and no Fermi–Dirac occupation segment — the legacy all-electron `"none"`, a shared-shell tag
-/// (`…/shared1e-3/1e-1/stop2x5e-8`, [`legacy_tag_of`]) or an older pseudopotential tag with no occupation part. A model
-/// file carrying one is refused on load with its reason (`providers::surrogate::legacy_model_refusal`).
-///
-/// The occupation segment is read by position — the second for `none/…`, the third (after the recipe hash) otherwise —
-/// and is Fermi–Dirac only as `fd<kT>` with a kT that parses, never by a prefix anywhere in the tag (plan Task 16
-/// review M4: a recipe hash may itself begin with "fd").
-pub fn is_pre_fermi_dirac_tag(tag: &str) -> bool {
-    let parts: Vec<&str> = tag.split('/').collect();
-    let Some(policy) = parts.first().and_then(|w| IonicPolicy::parse(w)) else { return false };
-    let occupation = parts.get(if policy == IonicPolicy::None { 1 } else { 2 });
-    !occupation.is_some_and(|w| w.strip_prefix("fd").is_some_and(|kt| kt.parse::<f64>().is_ok_and(|kt| kt > 0.0)))
-}
-
-/// `τ` and `τ_c` of the last shared-shell build's tags (its decision threshold τ = 1e-3 Ha and candidate window
-/// = `qm::WITNESS_GAP` = 0.1 Ha), frozen here: [`legacy_tag_of`] keeps producing the strings that build wrote now the
-/// scheme and its constants are deleted (plan 2026-11-13 Task 10).
-const LEGACY_DS_TAU: f64 = 1e-3;
-const LEGACY_DS_TAU_C: f64 = 0.1;
-
-/// The tag the last shared-shell build computed for a scene that pseudises something under `policy`, with the current
-/// dimer backend (spec 2026-11-13 §6.2, §7.2): `"<word>/<surface_hash:016x>/shared1e-3/1e-1/stop2x5e-8"`, and `"none"`
-/// for `IonicPolicy::None`. Its only use is to find a predecessor collection; the all-electron predecessor is `"none"`,
-/// which a caller picks through [`is_all_electron_tag`] on the current tag. Pinned against the strings recorded from the
-/// last DS commit (62ae478) for every policy and both backends (`legacy_tag_of_matches_recorded_ds_strings`). The hash
-/// is the surface hash with the gated species' identity frozen at the pre-switch dimer procedure
-/// (`qm::radial::ledger::legacy_recipe_hash`, `DIMER_PROCEDURE_DS`; plan Task 10 moved the live one); the core tables'
-/// identity never moved.
-pub fn legacy_tag_of(policy: IonicPolicy) -> String {
-    legacy_tag_gpu(policy, dimer_backend_is_gpu())
-}
-
-/// [`legacy_tag_of`] with the dimer backend given (`gpu`: a GPU dimer backend is set), so the test reads both without
-/// switching the process-wide backend under the other tests.
-fn legacy_tag_gpu(policy: IonicPolicy, gpu: bool) -> String {
-    if policy == IonicPolicy::None {
-        return "none".into();
-    }
-    let hash = if gates_species_gpu(policy, gpu) { qm::radial::ledger::legacy_recipe_hash() } else { qm::radial::ledger::core_recipe_hash() };
-    format!("{}/{:016x}/shared{:e}/{:e}/stop2x{:e}", surface_word_gpu(policy, gpu), hash, LEGACY_DS_TAU, LEGACY_DS_TAU_C, GPU_DRHO_FLOOR_PER_ELECTRON)
 }
 
 /// The charge each nucleus's electrons are counted against under `scene`'s policy (`sim::ForceProvider::valence_charges`,
@@ -1347,9 +1303,7 @@ mod tests {
     /// keeps the table hash it had at `m7-tm-kb-nlcc-4` — the -4 recipe hash 0xeef0a918057a9fbe (references.md's records
     /// block before Task 11) — while an `All` surface's tag moves (it may hold the gated H). The `All` side is checked on
     /// `surface_hash` (no generation: the gated H costs the GPU dimer gate). Re-pinned in plan 2026-11-13 Task 9: the
-    /// Fermi–Dirac switch moved every tag (the occupation rule is part of the surface), so the exact string a -4 sidecar
-    /// holds is now the *legacy* tag, by which the predecessor collection is found ([`legacy_tag_of`]); the hash part is
-    /// unchanged.
+    /// Fermi–Dirac switch moved every tag (the occupation rule is part of the surface); the hash part is unchanged.
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release-only (generates O); cargo test -p providers --release")]
     fn cores_only_provenance_survives_the_dimer_gate_and_all_does_not() {
@@ -1357,9 +1311,6 @@ mod tests {
         let private = Mutex::new(PseudoCache::default());
         let water = scene(&[8, 1, 1], IonicPolicy::CoresOnly, 33, 0.2);
         let tag = tag_in(&private, &water);
-        // The literal a -4 sidecar holds (Task 5 review): built from today's constants it would follow them if they moved.
-        let minus_4 = format!("cores/{RECIPE_HASH_M7_4:016x}/shared1e-3/1e-1/stop2x5e-8");
-        assert_eq!(legacy_tag_of(IonicPolicy::CoresOnly), minus_4, "a CoresOnly water model from -4 is found as the predecessor");
         assert_eq!(tag, format!("cores/{RECIPE_HASH_M7_4:016x}/fd5e-3/stop2x5e-8/pin1e-5"), "the same table hash, the FD rule");
         assert_eq!(tag_in(&private, &scene(&[8], IonicPolicy::CoresOnly, 33, 0.2)), tag, "O alone: the same surface");
         let c = private.lock().unwrap();
@@ -1552,36 +1503,11 @@ mod tests {
         assert!(!pseudised("cores/0123456789abcdef/shared1e-3/1e-1/stop2x5e-8", &["cores"]), "a legacy DS tag is not an FD one");
     }
 
-    /// Plan 2026-11-13 Task 9 step 1 (spec §6.2, R15): `legacy_tag_of` reproduces exactly the tags the last
-    /// shared-shell build (62ae478) computed, for every policy under both dimer backends. The literals were printed
-    /// from `provenance_tag` (and `tag_of`) on that unmodified tree, with `set_dimer_backend(Cpu)` and `Gpu`; they are the
-    /// only source of truth. The backend is passed explicitly here (`legacy_tag_gpu`), so the process-wide backend the
-    /// other tests read is never switched.
-    #[test]
-    fn legacy_tag_of_matches_recorded_ds_strings() {
-        const CORES: &str = "cores/eef0a918057a9fbe/shared1e-3/1e-1/stop2x5e-8";
-        const ALL: &str = "all/30a74d9bda495668/shared1e-3/1e-1/stop2x5e-8";
-        // (policy, CPU dimer backend, GPU dimer backend)
-        let recorded = [
-            (IonicPolicy::None, "none", "none"),
-            (IonicPolicy::CoresOnly, CORES, CORES),
-            (IonicPolicy::Accepted, CORES, ALL),
-            (IonicPolicy::All, ALL, ALL),
-        ];
-        for (policy, cpu, gpu) in recorded {
-            assert_eq!(legacy_tag_gpu(policy, false), cpu, "{policy:?}, CPU dimer backend");
-            assert_eq!(legacy_tag_gpu(policy, true), gpu, "{policy:?}, GPU dimer backend");
-        }
-        assert_eq!(legacy_tag_of(IonicPolicy::All), legacy_tag_gpu(IonicPolicy::All, dimer_backend_is_gpu()), "the current backend");
-        assert!(is_all_electron_tag(&legacy_tag_of(IonicPolicy::None)));
-    }
-
     /// Plan 2026-11-13 Task 10 (spec §6.2, F8, F11): the dimer gate's procedure — every constant of its 3-D computation,
     /// hashed into `recipe_hash` — names the occupation rule its solves now run (Fermi–Dirac at kT = `qm::ELECTRON_KT` =
     /// 5e-3 Ha, `Debug` renders it 0.005) and the GPU's partial-level stop `qm::GPU_PARTIAL_TOL` (1e-5; the gate's 3-D
     /// solves run on the GPU when a GPU backend is set), read from the constants, never a literal. So `recipe_hash` moved
-    /// from the shared-shell build's 0x30a74d9bda495668 (`legacy_tag_of_matches_recorded_ds_strings`), and the frozen
-    /// pre-change procedure (`DIMER_PROCEDURE_DS`) still hashes to it.
+    /// from the shared-shell build's 0x30a74d9bda495668.
     #[test]
     fn dimer_procedure_hashes_fd() {
         let text = format!("{DIMER_PROCEDURE:?}");
@@ -1595,21 +1521,19 @@ mod tests {
         assert_ne!(recipe_hash(), 0x30a7_4d9b_da49_5668, "the gate's procedure moved, so the recipe hash moved");
         // FNV-1a 64 of the ledger and this procedure's `Debug` text, computed independently (references.md records block)
         assert_eq!(recipe_hash(), 0xeaf6_3fe2_13a8_4a26);
-        assert_eq!(qm::radial::ledger::legacy_recipe_hash(), 0x30a7_4d9b_da49_5668, "the frozen pre-change procedure keeps the DS-era hash");
         // the gate's solves read the procedure's rule (F8: no `Aufbau` hold, no shared-shell occupations)
         assert_eq!(BondForce::new(DimerBackend::Cpu).settings().occupations, DIMER_PROCEDURE.occupations);
     }
 
     /// Plan 2026-11-13 Task 10 (spec §6.2): the identity of every table above `dimer_z_max` — the ledger alone — is the
     /// literal recorded on the tree before this task (the -4 recipe hash, 0xeef0a918057a9fbe), so the `CoresOnly`
-    /// surface hash, its current tag and its legacy tag keep it: only the gated species' identity moved.
+    /// surface hash and its current tag keep it: only the gated species' identity moved.
     #[test]
     fn core_recipe_hash_unchanged() {
         const CORE: u64 = 0xeef0_a918_057a_9fbe;
         assert_eq!(qm::radial::ledger::core_recipe_hash(), CORE);
         for gpu in [false, true] {
             assert_eq!(surface_hash_gpu(IonicPolicy::CoresOnly, gpu), CORE, "CoresOnly, GPU backend {gpu}");
-            assert!(legacy_tag_gpu(IonicPolicy::CoresOnly, gpu).starts_with("cores/eef0a918057a9fbe/"));
         }
         assert!(tag_of(IonicPolicy::CoresOnly).starts_with("cores/eef0a918057a9fbe/"), "{}", tag_of(IonicPolicy::CoresOnly));
     }
@@ -1623,24 +1547,5 @@ mod tests {
         assert!(!is_all_electron_tag("cores/0123456789abcdef/fd5e-3/stop2x5e-8/pin1e-5"));
         assert!(!is_all_electron_tag(""));
         assert!(!is_all_electron_tag("nonesuch"), "a prefix of the word is not the word");
-    }
-
-    /// Spec §7.9 (plan Task 16 review M4): the pre-Fermi–Dirac test reads the occupation segment by position, so a
-    /// recipe hash that begins with "fd" (1 in 256) neither hides a legacy tag nor makes one of a current tag.
-    #[test]
-    fn pre_fermi_dirac_tags_are_read_by_position() {
-        for legacy in ["none", "all/0123456789abcdef/shared1e-3/1e-1/stop2x5e-8", "cores/fdab0123456789ab/shared1e-3/1e-1/stop2x5e-8", "cores/fd00000000000000", "all/0123456789abcdef"] {
-            assert!(is_pre_fermi_dirac_tag(legacy), "{legacy}");
-        }
-        for p in [IonicPolicy::None, IonicPolicy::CoresOnly, IonicPolicy::All] {
-            assert!(is_pre_fermi_dirac_tag(&legacy_tag_of(p)), "{p:?}");
-            assert!(!is_pre_fermi_dirac_tag(&tag_of(p)), "{p:?}");
-        }
-        for current in [all_electron_tag().as_str(), "cores/fdab0123456789ab/fd5e-3/stop2x5e-8/pin1e-5", "all/0123456789abcdef/fd5e-3/stop2x5e-8/pin1e-5"] {
-            assert!(!is_pre_fermi_dirac_tag(current), "{current}");
-        }
-        for not_a_tag in ["", "weird/1", "nonesuch"] {
-            assert!(!is_pre_fermi_dirac_tag(not_a_tag), "{not_a_tag}: only a known policy word is a tag at all");
-        }
     }
 }

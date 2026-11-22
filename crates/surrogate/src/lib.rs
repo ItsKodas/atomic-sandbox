@@ -26,7 +26,6 @@ pub mod grade;
 pub mod history;
 pub mod linalg;
 pub mod loo;
-pub mod migration;
 pub mod model;
 pub mod novelty;
 pub mod quarantine;
@@ -40,8 +39,7 @@ pub use fit::{
     fit, Accumulator, FitError, FitOptions, FitReport, RefitKind, Sample, SampleStore, SampleTag, SearchStart, StoreError, Sums,
 };
 pub use model::{energy_and_forces, Model, Prediction, Provenance, SupportCache, SurfaceKey};
-pub use collection::{Collection, CollectionReference, REFIT_TIMES_FILE, CollectionSample, ImportReport, OpenReport, PurgeOutcome, ReadOnlyCollection, ReadOnlyError, ReferenceOutcome};
-pub use migration::{read_migration, summary_text, write_migration, MigrationLog, MigrationState, NotMigrated, PendingStatus};
+pub use collection::{Collection, CollectionReference, REFIT_TIMES_FILE, CollectionSample, ImportReport, OpenReport, PurgeOutcome, ReferenceOutcome};
 pub use grade::ActiveSet;
 pub use history::{AuditHistory, AuditPoint, EnvKey, PointFlags, HISTORY_CAP};
 pub use novelty::NullSpace;

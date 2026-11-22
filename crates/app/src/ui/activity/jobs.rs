@@ -126,46 +126,25 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
         let step = running.map(|s| format!(" · {}", iteration_text(s.live.as_ref(), s.scf_step))).unwrap_or_default();
         // paused (user request 2026-11-16): "paused · sample 40 of 144", no time left (none passes)
         let count = if p.paused { format!("paused · {}", sample_text(p.done, p.total).to_lowercase()) } else { sample_text(p.done, p.total).to_lowercase() };
-        // the collection migration's re-solve pass (Fermi–Dirac spec §7.8): its own title and the progress line's
-        // counts by class, its time left the migration's own estimate (the median of its solves after 20)
-        if let Some(mg) = m.and_then(|m| m.migration.as_ref()).filter(|mg| mg.state == sim::MigrationPhase::Running) {
-            let counts = crate::ui::migration::progress_counts(mg);
-            v.push(JobRow {
-                key: JobKey::Pass,
-                title: crate::ui::migration::RESOLVING.into(),
-                detail: crate::ui::migration::progress_line(mg),
-                progress: JobProgress::Fraction { done: mg.done, total: mg.samples },
-                elapsed_s: None,
-                eta_s: mg.eta_s.filter(|_| !p.paused),
-                control: Some(("Cancel".into(), Action::CancelSampling)),
-                no_control_why: None,
-                scf: probe.and_then(|p| p.main.live).filter(|_| !p.paused),
-                keeps_block: true,
-                stage: (p.stage == "references").then(|| "references".to_string()),
-                count: Some(if p.paused { format!("paused · {counts}") } else { counts }),
-                control2: Some(pause_control(p.paused)),
-            });
-        } else {
-            v.push(JobRow {
-                key: JobKey::Pass,
-                title: "Sampling pass".into(),
-                detail: format!("{} · {count}{step}", super::words::pass_stage_of(p, d.and_then(|d| d.ghost.as_ref()))),
-                progress: JobProgress::Fraction { done: p.done, total: p.total },
-                elapsed_s: None,
-                eta_s: m.and_then(|m| m.pass_eta_s).filter(|_| !p.paused),
-                control: Some(("Cancel".into(), Action::CancelSampling)),
-                no_control_why: None,
-                // kept between samples: the probe keeps the last solve's record until the next one
-                // starts (user request 2026-10-17: the block hid between samples), so it stays on
-                // screen and is replaced, not blanked, as each sample begins; paused, the dropped
-                // solve's record is not shown
-                scf: probe.and_then(|p| p.main.live).filter(|_| !p.paused),
-                keeps_block: true,
-                stage: Some(super::words::pass_stage_of(p, d.and_then(|d| d.ghost.as_ref()))),
-                count: Some(count),
-                control2: Some(pause_control(p.paused)),
-            });
-        }
+        v.push(JobRow {
+            key: JobKey::Pass,
+            title: "Sampling pass".into(),
+            detail: format!("{} · {count}{step}", super::words::pass_stage_of(p, d.and_then(|d| d.ghost.as_ref()))),
+            progress: JobProgress::Fraction { done: p.done, total: p.total },
+            elapsed_s: None,
+            eta_s: m.and_then(|m| m.pass_eta_s).filter(|_| !p.paused),
+            control: Some(("Cancel".into(), Action::CancelSampling)),
+            no_control_why: None,
+            // kept between samples: the probe keeps the last solve's record until the next one
+            // starts (user request 2026-10-17: the block hid between samples), so it stays on
+            // screen and is replaced, not blanked, as each sample begins; paused, the dropped
+            // solve's record is not shown
+            scf: probe.and_then(|p| p.main.live).filter(|_| !p.paused),
+            keeps_block: true,
+            stage: Some(super::words::pass_stage_of(p, d.and_then(|d| d.ghost.as_ref()))),
+            count: Some(count),
+            control2: Some(pause_control(p.paused)),
+        });
     } else if let Some(pv) = probe.filter(|p| p.main.running) {
         let last = d.map(|d| d.eval.scf_steps as u32).filter(|&n| n > 0);
         let estimated = snap.is_some_and(|s| s.backend == crate::sim::Backend::Estimated);

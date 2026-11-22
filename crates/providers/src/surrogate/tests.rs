@@ -11031,7 +11031,8 @@ impl ForceProvider for StubKsGpu {
 
 /// The M8a user-test regression (`references.md` "M8a stuck collection"): the user's H-only
 /// collection (`testdata/stuck-h-collection`, 578 GPU teacher answers: H, H₂ at 81³ and 101³,
-/// H₃) as the live session held it — the collection's 8 held samples and the `degree_cap` 6 an
+/// H₃; its records re-stamped at record version 2 on 2026-11-22, when version 1 stopped being read — the bytes of
+/// every payload otherwise unchanged) as the live session held it — the collection's 8 held samples and the `degree_cap` 6 an
 /// earlier recovery had set. Under the cap one sample (H₂ at 5.585 Bohr in the 101³ box, its
 /// restricted-spin label 40 mHa above two atoms) drives the energy noise to 2e-2 Ha/atom and the
 /// misfit spreads over every H₂ sample (−25 mHa/atom each, the sample itself −6 mHa/atom): the
@@ -11832,10 +11833,6 @@ mod purge;
 
 /// 2026-11-14: a forgotten sample's fence lifts after agreeing answers (`fence_lift.rs`).
 mod fence_lift;
-
-/// Fermi–Dirac spec §7.6 (plan 2026-11-13 Task 15): code 9 in the trust machinery and its leave-one-out review
-/// (`resolved.rs`).
-mod resolved;
 
 /// Scoped-trust study step 3 (2026-11-13): the block downdate by a suspect set and its shift on
 /// the stored scenes, a measurement only (`scope_measure.rs`).

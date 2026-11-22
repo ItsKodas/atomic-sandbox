@@ -333,9 +333,6 @@ impl SurrogateKs {
                 Q_STRAY => SampleState::HeldOut,
                 // waiting for its box's reference (collection mode): not in the fit yet
                 Q_REF_WAIT => SampleState::Unfitted,
-                // re-solved for the new solver (Fermi–Dirac spec §7.6): held out until its review; kept by it, it fences
-                Q_RESOLVED if self.fences(i) => SampleState::Quarantined,
-                Q_RESOLVED => SampleState::HeldOut,
                 Q_NONE if i < *fit_n && fit_q.get(i).copied().unwrap_or(Q_NONE) == Q_NONE => SampleState::Fitted,
                 Q_NONE => SampleState::Unfitted,
                 // a code the sidecar does not write (it validates 0–3): excluded, as `excluded`

@@ -5,6 +5,11 @@
 
 use super::*;
 
+/// Why a model or samples file whose references predate ruling S9 (no `reference_rule`, lowest-energy multiplicity)
+/// is refused on load: no build since the Fermi–Dirac switch writes one, and old files are not read (user ruling
+/// 2026-11-22).
+pub(crate) const PRE_S9_REFUSAL: &str = "made by an older version of the app (its reference energies predate the lowest-energy-multiplicity rule): re-teach it";
+
 /// `s` as the scene teaches it (M8a Task 10, ruling P10): a capped segment's scene
 /// (`Scene::train_mask`, one entry per nucleus — the sample's atoms) masks the sample's forces to
 /// its interior atoms and leaves its energy unfitted; any other scene leaves the sample as it is.
@@ -98,7 +103,6 @@ impl SurrogateKs {
             ));
             return;
         }
-        self.legacy_refs.remove(&z);
         self.failed_refs.remove(&z);
         if self.refs.insert(z, e) != Some(e) {
             self.refs_dirty = true;
@@ -150,7 +154,6 @@ impl SurrogateKs {
         self.accumulator = None;
         self.accumulated = 0;
         self.refs.clear();
-        self.legacy_refs.clear();
         self.refs_dirty = false;
         self.species_dirty = false;
         self.model = None;
@@ -234,7 +237,7 @@ impl SurrogateKs {
         let r_cut = self.cutoff();
         let samples: Vec<Sample> = self.store.as_ref().map_or(&[][..], |s| &s.samples[..]).iter().map(|s| stray::unmasked_record(s, r_cut)).collect();
         let samples = &samples[..];
-        let rule = self.legacy_refs.is_empty().then_some(surrogate::sidecar::REFERENCE_RULE);
+        let rule = Some(surrogate::sidecar::REFERENCE_RULE);
         // `Q_DRAFT` is not a file code: the `DraftAudit` tag carries it (install restores it); a
         // lone sample (`Q_LONE`, provider-only) writes the code it was loaded with
         let flags: Vec<u8> = (0..samples.len()).map(|i| self.persisted_code(i)).collect();
@@ -298,6 +301,9 @@ impl SurrogateKs {
     /// reference. The caller has checked the provenance against the scene.
     pub fn install_samples(&mut self, set: surrogate::SampleSet) -> Result<(), String> {
         let surrogate::SampleSet { provenance, samples, references, reference_rule, quarantine, face_density, teacher_solves, teacher_solves_note, .. } = set;
+        if reference_rule.as_deref() != Some(surrogate::sidecar::REFERENCE_RULE) {
+            return Err(PRE_S9_REFUSAL.into());
+        }
         if !quarantine.is_empty() && quarantine.len() != samples.len() {
             return Err(format!("the file has {} quarantine flags for {} samples", quarantine.len(), samples.len()));
         }
@@ -329,15 +335,8 @@ impl SurrogateKs {
         // and samples with stray atoms, until a composition check measures them (`Q_STRAY`)
         let stray = self.hold_out_stray(r_cut);
         self.note_stray_held_out("model file", stray, r_cut);
-        // references of another rule are not fitted on (a new fit would bake them in — the model has
-        // no intercept, ruling S5): they count as missing, and the Retry or a pass re-solves them
-        let s9 = reference_rule.as_deref() == Some(surrogate::sidecar::REFERENCE_RULE);
-        if s9 {
-            for &(z, e) in &references {
-                self.refs.insert(z, e);
-            }
-        } else if !references.is_empty() {
-            self.user_notes.push("samples file: its reference energies predate ruling S9 (lowest-energy multiplicity) — not used; Retry or a sampling pass re-solves them".into());
+        for &(z, e) in &references {
+            self.refs.insert(z, e);
         }
         self.refs_dirty = true;
         self.arm_refit();
@@ -357,11 +356,6 @@ impl SurrogateKs {
         Ok(())
     }
 
-    /// Species whose reference energy predates ruling S9 (from a sidecar without the rule).
-    pub fn legacy_references(&self) -> Vec<u8> {
-        self.legacy_refs.iter().copied().collect()
-    }
-
     /// Replaces everything learned with a sidecar's contents (the caller has checked its
     /// provenance against the scene — `Dynamics` refuses a mismatch). The file must hold the
     /// fit report and at least the samples its accumulator was built from (a model-only file
@@ -379,6 +373,9 @@ impl SurrogateKs {
         let Some(report) = report else {
             return Err("the file has no fit report (a model-only sidecar): it cannot be judged by the trust rule".into());
         };
+        if reference_rule.as_deref() != Some(surrogate::sidecar::REFERENCE_RULE) {
+            return Err(PRE_S9_REFUSAL.into());
+        }
         // without the posterior factor no answer can be judged by rules 5d, 6 and 7, and
         // `evaluate` would find no variance verdict at its first consultation (activity Task 4
         // review I4: it panicked there)
@@ -452,10 +449,6 @@ impl SurrogateKs {
         let was_trusted = self.trusted();
         let was_model = self.last.as_ref().is_some_and(|l| l.on_model);
         self.refs = model.basis.species.iter().copied().zip(model.ref_energy.iter().copied()).collect();
-        self.legacy_refs = match reference_rule.as_deref() {
-            Some(surrogate::sidecar::REFERENCE_RULE) => Default::default(),
-            _ => model.basis.species.iter().copied().collect(),
-        };
         self.refs_dirty = false;
         self.species_dirty = store.samples.iter().flat_map(|s| s.z.iter()).any(|&z| model.basis.species_index(z).is_none());
         // the accumulated store prefix: the samples the fit used plus the quarantined ones among

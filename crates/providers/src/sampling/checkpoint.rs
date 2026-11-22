@@ -69,7 +69,7 @@ impl Sampler {
     /// count and the pass's first store index, `provenance` the surface's `describe()`. `None` for a
     /// finished, teach-around or references-only pass.
     pub fn checkpoint(&self, provenance: &str, samples: usize, pass_start: usize) -> Option<String> {
-        if self.progress.finished || self.is_targeted() || self.references_only || self.migration.is_some() {
+        if self.progress.finished || self.is_targeted() || self.references_only {
             return None;
         }
         let mut o = String::new();
@@ -415,7 +415,6 @@ fn parse(text: &str) -> Result<(Sampler, CheckpointInfo), String> {
         timeouts_in_a_row: 0,
         refused_in_a_row: 0,
         last_refusal: None,
-        migration: None,
     };
     Ok((sampler, info))
 }

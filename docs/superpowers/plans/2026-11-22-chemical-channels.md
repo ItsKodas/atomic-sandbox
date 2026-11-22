@@ -55,10 +55,10 @@
   - the migration lines in `app/src/update/formats.rs`, `pseudo::legacy_tag_of`, the app's migration offer, action and command, and the worker plumbing.
 - Docs: README (the migration paragraph), `docs/dev-reference.md` (migration), CLAUDE.md's V11 row in the suite table.
 
-- [ ] **Step 1:** delete and trim; `cargo build --workspace` is clean, with no dead-code warnings left by the removal.
-- [ ] **Step 2:** delete the tests that only exercised removed behaviour; keep every test that exercises current behaviour.
-- [ ] **Step 3:** `cargo test -p surrogate --release`, `cargo test -p providers --release`, and `cargo test -p app --release --bin app -- ui:: worker::` pass.
-- [ ] **Step 4:** commit `refactor: remove old-collection migration and legacy formats (no compatibility, user 2026-11-22)`.
+- [x] **Step 1:** delete and trim; `cargo build --workspace` is clean, with no dead-code warnings left by the removal.
+- [x] **Step 2:** delete the tests that only exercised removed behaviour; keep every test that exercises current behaviour.
+- [x] **Step 3:** `cargo test -p surrogate --release`, `cargo test -p providers --release`, and `cargo test -p app --release --bin app -- ui:: worker::` pass.
+- [x] **Step 4:** commit `refactor: remove old-collection migration and legacy formats (no compatibility, user 2026-11-22)`.
 
 ### Task 1: channel-mixed descriptors (day 1)
 

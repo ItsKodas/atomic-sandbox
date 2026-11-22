@@ -454,7 +454,7 @@
 //! The user's report (v0.2.0, an 8 GB card, estimated mode near the VRAM limit): "a super fast loop where it takes
 //! hundreds of samples that seemingly contain no data". Two rules, whatever the device did:
 //! - **The session's GPU failure is fatal for this provider.** The first `SolverError::GpuFailed` from any teacher —
-//!   the stepping teacher's fallback, a pass's solve or reference, a migration's, the background auditor's job (its
+//!   the stepping teacher's fallback, a pass's solve or reference, the background auditor's job (its
 //!   answer carries it, `AuditAnswer::gpu_failed`) — or the stepping teacher's own `device_failure` is latched
 //!   ([`SurrogateKs::gpu_failure`]). From then on every `evaluate` is that error — the model answers no step either
 //!   (the run is to be saved and the app restarted) — a running pass ends at its next step with it (one job, not the
@@ -465,7 +465,7 @@
 //!   (the teacher is reset) and answers the job with an error, so a panic no longer ends the thread silently.
 //! - **No physically empty answer is kept.** Before a teacher answer becomes a sample or a reference — a fallback or
 //!   an in-step audit (`teach`), a background audit or a composition check's part (the auditor), a pass's sample,
-//!   scan, burst step, teach-around solve or reference (`crate::sampling`, `sim::references`), a migrated sample —
+//!   scan, burst step, teach-around solve or reference (`crate::sampling`, `sim::references`) —
 //!   `sim::answer_refusal` checks it: finite, and for a Kohn-Sham answer at least one SCF iteration, converged, and
 //!   ∫ρ within `sim::ELECTRON_COUNT_REL_TOL` (1e-5 relative; derived from the GPU's f32 sums, measured 8.7e-8) of the
 //!   scene's electrons. The fallback, the in-step audit and the auditor apply its Kohn-Sham part (`sim::scf_refusal`):
@@ -1067,29 +1067,6 @@
 //! for good — from the store and the shared collection's file — once the refit after the last
 //! Forget has run; no refit, the fit bitwise unchanged, every index the provider holds remapped.
 //!
-//! **Re-solved samples** (code 9, `Q_RESOLVED`; Fermi–Dirac spec §7.5–7.6 and §8, plan 2026-11-13 Task 15): a sample
-//! the collection migration re-solved for the new solver whose state changed (class S). Out of the fit, the envelope,
-//! the grade, the leave-one-out and the class statistics like a held sample (`excluded` is "code ≠ 0"); **not**
-//! counted by the recovery's 10 % held cap (`quarantined() + forgotten()`) nor by `fencing()` — it is no misfit hold —
-//! and **not the user's**: Forget and Restore refuse it. Before its review it does not fence: the fit simply has no
-//! data there. **The review** (`review_resolved`) runs inside a refit, after its first fit and before the trust
-//! judgement (votes, release, recovery), only once the migration pass is complete (`migration.txt` at "complete" or
-//! "reviewed": every sibling present), while a code-9 sample remains and the store changed since the last review: a
-//! candidate is fitted on the fit's members plus every code-9 sample, each one's leave-one-out ratio in it
-//! (`loo_ratio`, against its own bounds) is read, ≤ 1 releases it (9 → 0; the refit is rebuilt with it and the trust
-//! machinery judges it as any new data), > 1 keeps it at 9. A **kept** one is a stored label the model cannot
-//! reproduce: it fences like a held sample (`fences()`, F4; the fence's on-switch is `any_fences()`, controller ruling
-//! A, since `fencing()` does not count it) — but never joins M (it is not fitted), is never code 1 (no ratchet), and
-//! purge's lift votes never lift it (they take code 7 only). Like a held sample, one fresh teacher answer next to it
-//! that agrees with the model settles it in `admit` — released when the model reproduces it, else superseded
-//! (controller ruling B) — and a later review can still release it. Its verdict is in `migration.txt`'s review log
-//! (collection indices, the latest per sample), read back at attach (ruling R13), renumbered by a purge (F3), and
-//! written at the refit's end after the status records it names. Judged by the review: code-9 samples whose box has
-//! its references and that have no stray atoms. One with stray atoms waits at 9, unreviewed and not fencing (a known
-//! limit, spec §7.6 "Not judged"): the log lists it as `waiting` and stays "complete" while it remains, and the note
-//! counts it. The review repeats when the store, the policy's bounds or the basis (degree cap, body-4 degree) changed;
-//! its note only when the verdicts changed.
-//!
 //! **Box-affected answers** (fix round 4; threshold Task 9, h-scaled by ruling S17): a teacher
 //! answer whose reported face density (`EvalStats::face_density`: max ρ on the outermost grid
 //! plane, one spacing h inside the Dirichlet wall) exceeds [`box_affected_face_density`]`(h)` =
@@ -1423,8 +1400,7 @@ mod policy;
 mod purge;
 mod quarantine;
 mod shared;
-pub use shared::{legacy_model_refusal, predecessor_of, LAST_PRE_FD_RELEASE, COLLECTION_CHECKPOINT_PREFIX, PASS_STARTED_WITH_PREVIOUS_SOLVER};
-pub use purge::PURGE_WAIT_MIGRATION;
+pub use shared::COLLECTION_CHECKPOINT_PREFIX;
 mod store;
 pub(crate) use store::PassKeep;
 // the stray-atom logic (spec 2026-11-18): the composition checks and the hold-out (plan Task 3); answering inside a
@@ -1614,9 +1590,6 @@ pub struct SurrogateKs {
     /// Store samples already in the accumulator (a prefix).
     accumulated: usize,
     refs: BTreeMap<u8, f64>,
-    /// Species whose reference came from a sidecar without the S9 reference rule (re-solved by
-    /// the next sampling pass; `save_sidecar` writes no rule while any remain).
-    legacy_refs: std::collections::BTreeSet<u8>,
     /// A reference changed since the accumulator was built → rebuild at the next refit.
     refs_dirty: bool,
     /// The store holds a species the accumulator's basis lacks → rebuild at the next refit.
@@ -2019,23 +1992,6 @@ pub struct SurrogateKs {
     /// The shared collection this provider learns into (M8a Task 4a; `shared` module doc), if
     /// attached: the process's one writable handle of it.
     shared: Option<shared::SharedCollection>,
-    /// The attached collection's migration from its predecessor (`shared` module doc, "The migration"; plan 2026-11-13
-    /// Task 14): the offer, or the `migration.txt` it keeps. `None` without a collection or anything to migrate.
-    migration: Option<shared::MigrationSlot>,
-    /// The re-solved samples (code 9, `Q_RESOLVED`) whose last review **kept** them (`quarantine` module,
-    /// `review_resolved`; Fermi–Dirac spec §7.6 step 4): store indices. Such a sample fences (`fences`) while its code
-    /// is 9. Read back from `migration.txt`'s review log at attach (`shared::find_migration`, ruling R13), remapped by a
-    /// purge, cleared with the collection.
-    review_kept: std::collections::BTreeSet<usize>,
-    /// The store's stamp (`review_stamp_now`) when the re-solved samples were last reviewed: the review repeats only
-    /// when it moved. `None`: not reviewed in this session (an attach starts here).
-    review_stamp: Option<u64>,
-    /// The migration log's review entries (or its state) changed since `migration.txt` was written
-    /// (`flush_migration_log`).
-    review_log_dirty: bool,
-    /// Tests only: how many reviews of the re-solved samples ran (`review_resolved`).
-    #[cfg(test)]
-    pub(super) reviews_run: usize,
     /// Tests only: an attach runs no refit (`shared::attach_inner`), so what the attach itself installed is seen.
     #[cfg(test)]
     pub(super) attach_refit_off: bool,
@@ -2043,12 +1999,6 @@ pub struct SurrogateKs {
     /// M8a Task 5 — the user's stuck collection's repro is pinned to it).
     #[cfg(test)]
     body4_off: bool,
-    /// Tests only: the next migrated append stops after its sample record (`shared`, the status window).
-    #[cfg(test)]
-    status_window_crash: bool,
-    /// Tests only: the next migrated append fails before it writes anything.
-    #[cfg(test)]
-    migrated_append_fails: bool,
     /// Tests only: the body-4 degree every fit takes instead of the growth rule's
     /// ([`grown_body4_degree`](Self::grown_body4_degree)), in collection mode.
     #[cfg(test)]
@@ -2171,7 +2121,6 @@ impl SurrogateKs {
             accumulator: None,
             accumulated: 0,
             refs: BTreeMap::new(),
-            legacy_refs: std::collections::BTreeSet::new(),
             refs_dirty: false,
             species_dirty: false,
             model: None,
@@ -2321,20 +2270,10 @@ impl SurrogateKs {
             pass_start: None,
             pass_coverage: None,
             shared: None,
-            migration: None,
-            review_kept: std::collections::BTreeSet::new(),
-            review_stamp: None,
-            review_log_dirty: false,
-            #[cfg(test)]
-            reviews_run: 0,
             #[cfg(test)]
             attach_refit_off: false,
             #[cfg(test)]
             body4_off: false,
-            #[cfg(test)]
-            status_window_crash: false,
-            #[cfg(test)]
-            migrated_append_fails: false,
             #[cfg(test)]
             body4_force: None,
             #[cfg(test)]
@@ -3770,9 +3709,6 @@ impl SurrogateKs {
     /// the worker thread inside a Cancel: the samples are kept and the refit waits; M6 Task 3
     /// fix round 2) — and the outcome noted (what `Dynamics` did before M6).
     fn finish_pass(&mut self, mut sampler: Sampler) {
-        if sampler.is_migration() {
-            return self.finish_migration(sampler);
-        }
         let progress = sampler.progress();
         // a teach-around pass is judged after its refit (`teach`)
         let teach = sampler.is_targeted().then(|| (sampler.targets().to_vec(), sampler.take_holdouts()));
@@ -4242,10 +4178,6 @@ impl Trainable for SurrogateKs {
             return Err("a pass is already running (cancel it first)".into());
         }
         let info = crate::sampling::checkpoint_info(checkpoint)?;
-        // a pass the previous solver started never goes on here (Fermi–Dirac spec §7.7)
-        if let Some(why) = self.legacy_checkpoint_refusal(scene, &info.provenance) {
-            return Err(why);
-        }
         let (want, _, _) = self.checkpoint_counts(scene);
         if info.provenance != want {
             return Err(format!("it was taught at {}, the scene is solved at {want}", info.provenance));
@@ -4303,14 +4235,6 @@ impl Trainable for SurrogateKs {
         if let Some(sampler) = &mut self.pass {
             sampler.rescale(plan);
         }
-    }
-
-    fn migration(&self) -> Option<sim::MigrationStatus> {
-        self.migration_status()
-    }
-
-    fn start_migration(&mut self) -> Result<(), String> {
-        self.start_migration_pass()
     }
 
     fn pass_active(&self) -> bool {
@@ -4397,12 +4321,6 @@ impl Trainable for SurrogateKs {
             surrogate::sidecar::Contents::Samples(set) if !set.specialised.is_empty() => return self.load_specialised(path, set, scene),
             surrogate::sidecar::Contents::Samples(set) => return self.load_samples(path, set, scene),
         };
-        // a model of the previous solver (spec §7.9): its reason, never the generic "another surface"
-        if let Some(why) = legacy_model_refusal(&sc.model.provenance.ionic) {
-            let msg = format!("model {} refused: {why}", path.display());
-            self.user_notes.push(msg.clone());
-            return Err(msg);
-        }
         let want = self.provenance_for(scene);
         if sc.model.provenance != want {
             let msg = format!(
@@ -4417,7 +4335,6 @@ impl Trainable for SurrogateKs {
         let prov = sc.model.provenance.clone();
         let refs: Vec<(u8, f64)> = sc.model.basis.species.iter().copied().zip(sc.model.ref_energy.iter().copied()).collect();
         let n = sc.samples.len();
-        let s9 = sc.reference_rule.as_deref() == Some(surrogate::sidecar::REFERENCE_RULE);
         // a model file switches the provider to it (a specialised, per-scene model); the shared
         // collection comes back if the install fails (`shared` module doc)
         let shared = self.detach_collection();
@@ -4431,20 +4348,10 @@ impl Trainable for SurrogateKs {
             Ok(()) => {
                 self.set_source_file(Some(path.to_path_buf()));
                 let trusted = self.trusted();
-                if s9 {
-                    for (z, e) in refs {
-                        // an energy without a table (the sidecar carries none): a solved entry
-                        // under the same key is kept
-                        self.ref_cache.seed_energy(atom_key(&prov, z), e, None, prov.tol, &prov.teacher);
-                    }
-                } else {
-                    // pre-S9 references: kept for the loaded fit (they are consistent with it),
-                    // never cached, so the next pass re-solves them (or takes an S9 value an
-                    // earlier pass cached) and its refit rebuilds on them
-                    self.user_notes.push(format!(
-                        "model {}: its reference energies predate ruling S9 (lowest-energy multiplicity) — the next sampling pass re-solves them and the refit rebuilds the model on them",
-                        path.display()
-                    ));
+                for (z, e) in refs {
+                    // an energy without a table (the sidecar carries none): a solved entry
+                    // under the same key is kept
+                    self.ref_cache.seed_energy(atom_key(&prov, z), e, None, prov.tol, &prov.teacher);
                 }
                 self.last_pass = None;
                 self.user_notes.push(format!("model loaded from {} ({n} samples, {})", path.display(), if trusted { "trusted" } else { "untrusted" }));
@@ -4701,11 +4608,6 @@ impl SurrogateKs {
     /// checked against `scene` as for a model, then `install_samples` — which fits when it can —
     /// and its S9 references seeded into the cache (a later pass skips their scans).
     fn load_samples(&mut self, path: &std::path::Path, set: surrogate::SampleSet, scene: &Scene) -> Result<(), String> {
-        if let Some(why) = legacy_model_refusal(&set.provenance.ionic) {
-            let msg = format!("samples {} refused: {why}", path.display());
-            self.user_notes.push(msg.clone());
-            return Err(msg);
-        }
         let want = self.provenance_for(scene);
         if set.provenance != want {
             let msg = format!(
@@ -4719,7 +4621,6 @@ impl SurrogateKs {
         }
         let prov = set.provenance.clone();
         let refs = set.references.clone();
-        let s9 = set.reference_rule.as_deref() == Some(surrogate::sidecar::REFERENCE_RULE);
         let n = set.samples.len();
         let shared = self.detach_collection();
         if let Err(e) = self.install_samples(set) {
@@ -4729,10 +4630,8 @@ impl SurrogateKs {
             return Err(format!("load model {}: {e}", path.display()));
         }
         self.set_source_file(Some(path.to_path_buf()));
-        if s9 {
-            for (z, e) in refs {
-                self.ref_cache.seed_energy(atom_key(&prov, z), e, None, prov.tol, &prov.teacher);
-            }
+        for (z, e) in refs {
+            self.ref_cache.seed_energy(atom_key(&prov, z), e, None, prov.tol, &prov.teacher);
         }
         self.last_pass = None;
         let state = match self.no_model() {
