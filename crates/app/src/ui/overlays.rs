@@ -952,7 +952,9 @@ fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInp
                 ui.add_space(6.0);
             }
             ui.spacing_mut().item_spacing.x = 0.0;
-            ui.horizontal(|ui| {
+            // left to right whatever the outer layout's alignment (inside Align::Max a plain
+            // `horizontal` runs right to left and swapped the pair)
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 let bonds_tip = match bonds {
                     BtnState::Busy => "Solving bonds: one DFT solve at the current positions, then the bonds and angles",
                     BtnState::Ready => "Solve bonds: the model's steps carry no density, so the bonds and angles shown are from the last DFT step. This solves the density once at the current positions (between two steps; a running simulation carries on) and shows the bonds, their lengths and the angles",
