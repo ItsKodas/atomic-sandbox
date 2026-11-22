@@ -920,8 +920,8 @@ fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInp
             let sampling = input.sampling();
             let bonds = if sampling { BtnState::Off } else if busy { BtnState::Busy } else if stale { BtnState::Ready } else { BtnState::Off };
             let orbitals = if sampling { BtnState::Off } else if orbitals_busy { BtnState::Busy } else if orbitals_done { BtnState::Off } else { BtnState::Ready };
-            // right-aligned: the card above the pair, the pair at the view's corner
-            ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+            // the card above the pair; the pair stays at the view's corner (indented under the card)
+            let mut card_w = 0.0f32;
             if orbitals == BtnState::Busy {
                 let live = input.probe.as_ref().filter(|p| p.side.running).and_then(|p| p.side.live);
                 // Δρ falls from ~1 to the tol on a log scale: the bar's fraction (capped short of full)
@@ -930,7 +930,7 @@ fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInp
                     Some(l) => format!("iteration {}", l.iteration),
                     None => "starting".into(),
                 };
-                egui::Frame::new()
+                card_w = egui::Frame::new()
                     .fill(theme::PANEL_3)
                     .stroke(egui::Stroke::new(1.0, theme::LINE))
                     .corner_radius(8)
@@ -948,13 +948,17 @@ fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInp
                         ui.add(egui::ProgressBar::new(frac).desired_height(6.0).fill(theme::ACCENT));
                     })
                     .response
-                    .on_hover_text("the display-only DFT solve on the background solver: the bar follows its density change down to the tolerance (log scale)");
+                    .on_hover_text("the display-only DFT solve on the background solver: the bar follows its density change down to the tolerance (log scale)")
+                    .rect
+                    .width();
                 ui.add_space(6.0);
             }
             ui.spacing_mut().item_spacing.x = 0.0;
-            // left to right whatever the outer layout's alignment (inside Align::Max a plain
-            // `horizontal` runs right to left and swapped the pair)
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.horizontal(|ui| {
+                // under a wider card, the pair is pushed to its right edge (the view's corner)
+                if card_w > PAIR_W {
+                    ui.add_space(card_w - PAIR_W);
+                }
                 let bonds_tip = match bonds {
                     BtnState::Busy => "Solving bonds: one DFT solve at the current positions, then the bonds and angles",
                     BtnState::Ready => "Solve bonds: the model's steps carry no density, so the bonds and angles shown are from the last DFT step. This solves the density once at the current positions (between two steps; a running simulation carries on) and shows the bonds, their lengths and the angles",
@@ -978,7 +982,6 @@ fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInp
                     st.orbitals_press = Some((std::time::Instant::now(), here.clone()));
                     acts.push(Action::SolveOrbitals);
                 }
-            });
             });
         });
     let mut top = button.response.rect.top();
@@ -1007,6 +1010,9 @@ fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInp
     }
     Corner { top: Some(top), line }
 }
+
+/// The bonds / orbitals pair's width (two 52-point halves).
+const PAIR_W: f32 = 104.0;
 
 /// A view button's state (the bonds / orbitals pair, 2026-11-22).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
