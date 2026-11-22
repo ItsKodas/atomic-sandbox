@@ -904,56 +904,45 @@ fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInp
                     .on_hover_text("the bonds are read against isolated-atom references, one per element, solved in the background first; a press made now runs once they are done");
                 return;
             }
-            if busy {
-                // a spinner beside the word (not over it), in the button's place
-                egui::Frame::new()
-                    .fill(theme::GLOW)
-                    .stroke(egui::Stroke::new(1.0, theme::ACCENT))
-                    .corner_radius(8)
-                    .inner_margin(egui::Margin::symmetric(14, 9))
-                    .show(ui, |ui| {
-                        ui.set_min_width(172.0);
-                        ui.horizontal(|ui| {
-                            ui.add(egui::Spinner::new().size(16.0).color(egui::Color32::WHITE));
-                            ui.label(egui::RichText::new("Solving…").strong().size(14.0).color(egui::Color32::WHITE));
-                        });
-                    })
-                    .response
-                    .on_hover_text("one DFT solve at the current positions, then the bonds and angles");
-                return;
+            // two connected icon buttons (user 2026-11-22): Solve bonds | Solve orbitals, each
+            // raised and lit when a press would do something, flat with a spinner while its solve
+            // runs, flat and greyed when there is nothing to do (or a sampling pass holds the teacher)
+            let here: Vec<[f64; 3]> = input.scene.nuclei.iter().map(|n| n.pos).collect();
+            let side_running = input.probe.as_ref().is_some_and(|p| p.side.running);
+            let orbitals_busy = st.orbitals_press.as_ref().is_some_and(|(t, _)| {
+                let e = t.elapsed().as_secs_f64();
+                e < 0.6 || (side_running && e < 300.0)
+            });
+            let orbitals_done = !orbitals_busy && st.orbitals_press.as_ref().is_some_and(|(_, at)| *at == here);
+            if !orbitals_busy && !orbitals_done {
+                st.orbitals_press = None;
             }
-            // two connected icon buttons (user 2026-11-22): Solve bonds | Solve orbitals
-            let enabled = !input.sampling();
+            let sampling = input.sampling();
+            let bonds = if sampling { BtnState::Off } else if busy { BtnState::Busy } else if stale { BtnState::Ready } else { BtnState::Off };
+            let orbitals = if sampling { BtnState::Off } else if orbitals_busy { BtnState::Busy } else if orbitals_done { BtnState::Off } else { BtnState::Ready };
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.horizontal(|ui| {
-                let half = |ui: &mut Ui, icon: Icon, lit: bool, left: bool| {
-                    let cr = if left { egui::CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 } } else { egui::CornerRadius { nw: 0, sw: 0, ne: 8, se: 8 } };
-                    let b = egui::Button::new("").fill(if lit { theme::GLOW } else { theme::PANEL_3 }).stroke(egui::Stroke::new(1.0, theme::ACCENT)).corner_radius(cr).min_size(Vec2::new(52.0, 36.0));
-                    let r = ui.add_enabled(enabled, b);
-                    let inner = egui::Rect::from_center_size(r.rect.center(), Vec2::splat(22.0));
-                    let colour = if !enabled { theme::INK_FAINT } else { egui::Color32::WHITE };
-                    if enabled {
-                        super::icons::paint(ui.painter(), inner, icon, colour);
-                    } else {
-                        super::icons::paint_disabled(ui.painter(), inner, icon, colour);
-                    }
-                    r
+                let bonds_tip = match bonds {
+                    BtnState::Busy => "Solving bonds: one DFT solve at the current positions, then the bonds and angles",
+                    BtnState::Ready => "Solve bonds: the model's steps carry no density, so the bonds and angles shown are from the last DFT step. This solves the density once at the current positions (between two steps; a running simulation carries on) and shows the bonds, their lengths and the angles",
+                    BtnState::Off if sampling => "Solve bonds: not while a sampling pass uses the teacher",
+                    BtnState::Off => "Bonds solved at these positions: move an atom (or let the run go on) to solve them again",
                 };
-                let bonds_tip = if stale {
-                    "Solve bonds: the model's steps carry no density, so the bonds and angles shown are from the last DFT step. This solves the density once at the current positions (between two steps; a running simulation carries on) and shows the bonds, their lengths and the angles"
-                } else {
-                    "Bonds solved at these positions. Solve bonds solves the density again at the current positions and shows the bonds, their lengths and the angles"
-                };
-                let r = half(ui, Icon::Bonds, stale, true).on_hover_text(bonds_tip);
+                let r = state_button(ui, Icon::Bonds, bonds, true).on_hover_text(bonds_tip).on_disabled_hover_text(bonds_tip);
                 super::probe("bonds-now", &r);
                 if r.clicked() {
                     acts.push(Action::RefreshBonds);
                 }
-                let r = half(ui, Icon::Orbitals, false, false).on_hover_text(
-                    "Solve orbitals: one display-only DFT solve on the background solver at the current positions, for the density cloud and the orbitals shown (Orbitals tab), even under Model only. It teaches nothing and never delays a step",
-                );
+                let orbitals_tip = match orbitals {
+                    BtnState::Busy => "Solving orbitals: a display-only DFT solve on the background solver at these positions",
+                    BtnState::Ready => "Solve orbitals: one display-only DFT solve on the background solver at the current positions, for the density cloud and the orbitals shown (Orbitals tab), even under Model only. It teaches nothing and never delays a step",
+                    BtnState::Off if sampling => "Solve orbitals: not while a sampling pass uses the solvers",
+                    BtnState::Off => "Orbitals solved at these positions: move an atom (or let the run go on) to solve them again",
+                };
+                let r = state_button(ui, Icon::Orbitals, orbitals, false).on_hover_text(orbitals_tip).on_disabled_hover_text(orbitals_tip);
                 super::probe("orbitals-now", &r);
                 if r.clicked() {
+                    st.orbitals_press = Some((std::time::Instant::now(), here.clone()));
                     acts.push(Action::SolveOrbitals);
                 }
             });
@@ -983,4 +972,46 @@ fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInp
         top = r.response.rect.top();
     }
     Corner { top: Some(top), line }
+}
+
+/// A view button's state (the bonds / orbitals pair, 2026-11-22).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BtnState {
+    /// A press would do something: raised and lit.
+    Ready,
+    /// Its solve runs: flat, a spinner in place of the icon, not pressable.
+    Busy,
+    /// Nothing to do now (done at these positions, or held): flat and greyed.
+    Off,
+}
+
+/// One half of the joined pair: `left` rounds the left corners, else the right ones.
+fn state_button(ui: &mut Ui, icon: Icon, state: BtnState, left: bool) -> egui::Response {
+    let cr = if left { egui::CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 } } else { egui::CornerRadius { nw: 0, sw: 0, ne: 8, se: 8 } };
+    let (fill, stroke) = match state {
+        BtnState::Ready => (theme::GLOW, Stroke::new(1.5, theme::ACCENT_INK)),
+        BtnState::Busy => (theme::PANEL_3, Stroke::new(1.0, theme::LINE)),
+        BtnState::Off => (theme::PANEL_2, Stroke::new(1.0, theme::LINE_SOFT)),
+    };
+    let size = Vec2::new(52.0, 36.0);
+    // raised: a darker lip under a ready button
+    if state == BtnState::Ready {
+        let (rect, _) = ui.allocate_exact_size(Vec2::ZERO, egui::Sense::hover());
+        let lip = Rect::from_min_size(rect.min + Vec2::new(0.0, 3.0), size);
+        ui.painter().rect_filled(lip, cr, theme::ACCENT_BG);
+    }
+    let b = egui::Button::new("").fill(fill).stroke(stroke).corner_radius(cr).min_size(size);
+    let r = ui.add_enabled(state == BtnState::Ready, b);
+    let inner = Rect::from_center_size(r.rect.center(), Vec2::splat(22.0));
+    match state {
+        BtnState::Ready => super::icons::paint(ui.painter(), inner, icon, Color32::WHITE),
+        BtnState::Busy => {
+            egui::Spinner::new().size(18.0).color(theme::INK).paint_at(ui, Rect::from_center_size(r.rect.center(), Vec2::splat(18.0)));
+        }
+        BtnState::Off => super::icons::paint_disabled(ui.painter(), inner, icon, theme::INK_FAINT),
+    }
+    if state == BtnState::Busy {
+        ui.ctx().request_repaint();
+    }
+    r.on_hover_cursor(if state == BtnState::Ready { egui::CursorIcon::PointingHand } else { egui::CursorIcon::Default })
 }

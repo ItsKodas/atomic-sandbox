@@ -726,6 +726,8 @@ pub struct UiState {
     pub dots_blur: f32,
     /// When "Bonds now" was pressed (its button spins until the graph is fresh, at most 20 s).
     pub bonds_refresh: Option<Instant>,
+    /// The view's Solve orbitals press and the positions it solved (its busy / done look).
+    pub orbitals_press: Option<(Instant, Vec<[f64; 3]>)>,
     /// A Relax or Stop click the worker has not answered yet: the button shows the new state at
     /// once, with a spinner, until [`RelaxPending::settled`] (display only, never recorded).
     pub relax_pending: Option<RelaxPending>,
@@ -1054,6 +1056,7 @@ impl UiState {
             dots_feather: 0.0,
             dots_blur: 0.5,
             bonds_refresh: None,
+            orbitals_press: None,
             relax_pending: None,
             ref_seen: None,
             trail_fs: crate::trails::LENGTH_DEFAULT_FS,
