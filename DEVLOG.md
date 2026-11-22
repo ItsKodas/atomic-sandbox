@@ -1329,6 +1329,15 @@ review: 0 Critical, 0 Important, 8 Minor, all fixed. The app gate passes 795 tes
 - **Still open:** scan points and the burst's start — solves after a discontinuous jump whose first potential puts μ above zero — still run long or hit the time limit (both before and after); a separate measurement and ruling.
 - **Physics review:** land after the gates; the per-level bound (M2) holds; the LiH none-policy pin moved +1.1e-7 Ha back to its pre-Task-9d-round-3 digits and was re-pinned with that history. Seven doc/test minors are open.
 - **Gates (on the branch):** qm 250, qm-gpu 147, validate gpu_vs_cpu 12, oracles 5, providers 674, dynamics 7, pseudo_gen 6, pseudo 9 — all passed (pseudo_oracles not run).
+- **A gate it missed:** `validate --test surrogate` was not in its gate list. Run the next day, `the_stuck_escape_repro_is_answered_honestly` fails on main (97b7d4e4, so in v0.2.1): in the hot H₂ + H run the many-body class ends untrusted (worst atom 3.389 > 3.0), 999 of 1 000 steps fall back to DFT, and the refused steps' would-be answers sit at rms 0.411 of the bound (below ENTER 0.707), so the refusals are not warranted. The same tree passed it (12/0) before this fix; the chaotic 2 358 K trajectory moves with the solve's f32-level answers. Conservative (DFT instead of the model), not a wrong answer; open, to be investigated — no tolerance loosened.
+
+### Faster refits on a four-element collection (2026-11-22, branch nullspace-faer)
+
+- **Found by:** the user: refits went from ~30 s to 3–5 min once sulfur joined their H/Li/O collection (`refit_times.csv`: 5.6–9.7 s at 2 336–2 352 samples with 3 species; 171–264 s from 2 422 samples with 4). Q′ = 6 656.
+- **Cause (stack snapshot, then the `refit_profile` harness on a copy of the collection):** `NullSpace::of` (the novelty null space) ran the unthreaded `linalg::symmetric_eigen_householder` for a body-4 basis: 167 s of a 304 s append refit.
+- **Fix:** it takes `dense::symmetric_eigen` (faer's blocked, threaded tridiagonalisation, the same implicit QL; the 2026-11-17 refit speed-up's routine), the unthreaded one kept as the fallback. Test: the same null dimension and subspace (projectors to 1e-9) on graded rank-deficient Grams.
+- **Measured** (append refit, +20 samples, harness): 304 s → 79 s; `NullSpace::of` 167 s → 9 s. What is left: the fit's hyperparameter search (5 full eigendecompositions, 37 s, a one-thread QL stretch in each), Cholesky + inverse 11 s, class LOO 11 s, the condition estimate 7 s.
+- **Gates:** surrogate 168 (+ doc/integration binaries), providers 674, validate surrogate 11/1 — the one failure is the pre-existing `the_stuck_escape_repro_is_answered_honestly` above, identical on main without this change.
 
 ### Process wins
 
