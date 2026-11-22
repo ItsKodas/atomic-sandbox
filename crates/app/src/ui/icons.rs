@@ -262,10 +262,11 @@ fn draw(p: &Painter, rect: Rect, icon: Icon, colour: Color32, fill: Color32) {
         Icon::Bonds => {
             // ball and stick on the diagonal: a large atom and a small one joined by one bond
             // (distinct from the Orbitals icon's two level lobes)
-            p.line_segment([at(9.2, 14.8), at(15.6, 8.4)], Stroke::new(stroke.width * 1.6, colour));
+            // the duotone fills first (`the_duotone_set_paints_its_fill_first`), then the bond, then the outlines
             fill_circle(6.5, 17.5, 4.2);
-            p.circle_stroke(at(6.5, 17.5), 4.2 * s, stroke);
             fill_circle(18.0, 6.0, 2.9);
+            p.line_segment([at(9.2, 14.8), at(15.6, 8.4)], Stroke::new(stroke.width * 1.6, colour));
+            p.circle_stroke(at(6.5, 17.5), 4.2 * s, stroke);
             p.circle_stroke(at(18.0, 6.0), 2.9 * s, stroke);
         }
         Icon::Selection => {

@@ -2970,7 +2970,9 @@ fn the_stale_bonds_line_sits_over_bonds_now() {
         for _ in 0..3 {
             view = frame(&ctx, &mut st, &inp, w, vec![]).view;
         }
-        let (line, button) = (probed_rect("bonds-stale-line"), probed_rect("bonds-now"));
+        // since 2026-11-22 the button is a pair (Solve bonds | Solve orbitals): the line sits over the pair,
+        // right-aligned with its right half
+        let (line, button) = (probed_rect("bonds-stale-line"), probed_rect("bonds-now").union(probed_rect("orbitals-now")));
         let view = view.expect("the 3D view");
         assert!(line.bottom() <= button.top() + 0.5 && button.top() - line.bottom() < 12.0, "{w}: just over the button: {line:?} {button:?}");
         assert!((line.right() - button.right()).abs() < 2.0, "{w}: right-aligned: {line:?} {button:?}");
@@ -14835,8 +14837,14 @@ fn forget_by_rule_needs_its_inline_confirmation() {
     assert!(sent(&outs).is_empty() && acted(&outs).is_empty() && st.forget_rule.above_confirm, "the first click only opens the confirmation");
     let t = texts(&ctx, &mut st, &inp);
     assert!(t.contains("Forget 3 samples: 2 PH₃, 1 H₂.") && t.contains("The ratios are recomputed at every refit") && t.contains("hides that gap rather than fixing it"), "{t}");
+    // the open confirmation is taller: back to the list so Cancel is on screen (since the Refit row,
+    // 2026-11-22, it could sit under the panel's edge, where the click met the Model only switch)
+    search::pick(&ctx, &mut st, search::ENTRIES.iter().find(|e| e.anchor == "d-suspects").unwrap());
+    for _ in 0..10 {
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+    }
     let outs = click_widget(&ctx, &mut st, &inp, "forget-above-cancel");
-    assert!(sent(&outs).is_empty() && !st.forget_rule.above_confirm, "Cancel sends nothing");
+    assert!(sent(&outs).is_empty() && !st.forget_rule.above_confirm, "Cancel sends nothing: sent {:?}, actions {:?}, still confirming {}", sent(&outs), acted(&outs), st.forget_rule.above_confirm);
     click_widget(&ctx, &mut st, &inp, "forget-above");
     let outs = click_widget(&ctx, &mut st, &inp, "forget-above-confirm");
     assert!(matches!(sent(&outs).as_slice(), [Command::ForgetByRule { rule: ForgetRule::Above(x), expected: 3 }] if *x == 5.0), "{:?}", sent(&outs));

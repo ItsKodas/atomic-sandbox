@@ -700,7 +700,6 @@ fn verdict_card(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, m: Option
         // the user's Forget / Restore waiting for their refit (2026-11-14, the batched forget)
         if let Some(m) = m.filter(|_| st.backend == Backend::Estimated) {
             refit_banner_row(ui, m, input.sampling(), input.probe.as_ref().and_then(|p| p.refit.as_ref()), acts);
-            refit_cadence_row(ui, st, acts);
             // the stray-atom signatures of this session and the samples they hold out (spec 2026-11-18 §5)
             for (k, (line, warn)) in stray_lines(m).into_iter().enumerate() {
                 let text = RichText::new(line).size(11.5).color(if warn { AMBER } else { theme::INK_DIM });
@@ -857,6 +856,10 @@ fn teach(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, m: Option<&Model
         });
     });
     super::group(ui, st, "d-audits", |ui, st| {
+        // Model tab ▸ Refit (2026-11-22): beside the audits, the model's other cadence
+        if st.backend == Backend::Estimated {
+            refit_cadence_row(ui, st, acts);
+        }
         audits_line(ui, st, m, acts);
         fold(ui, st, Section::Audits, "Audits", None, None, |ui, st| {
             audit_controls(ui, st, acts);

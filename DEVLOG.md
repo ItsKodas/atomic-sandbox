@@ -1339,6 +1339,13 @@ review: 0 Critical, 0 Important, 8 Minor, all fixed. The app gate passes 795 tes
 - **Measured** (append refit, +20 samples, harness): 304 s → 79 s; `NullSpace::of` 167 s → 9 s. What is left: the fit's hyperparameter search (5 full eigendecompositions, 37 s, a one-thread QL stretch in each), Cholesky + inverse 11 s, class LOO 11 s, the condition estimate 7 s.
 - **Gates:** surrogate 168 (+ doc/integration binaries), providers 674, validate surrogate 11/1 — the one failure is the pre-existing `the_stuck_escape_repro_is_answered_honestly` above, identical on main without this change.
 
+### Refit cadence and the bonds / orbitals buttons (2026-11-22, branch refit-cooldown)
+
+- **Found by:** the user: in Estimated mode "it runs refits back to back, slowing everything down". The playing throttle (0.5 s or 25 new samples) dates from sub-second refits; with 1–2 min refits and fallbacks adding samples, the next refit started as one landed.
+- **Change:** Model tab ▸ **Refit** (`worker::RefitCadence`): Auto (default; waits 2× the last refit's wall, the old rule while refits are quick), every 1/2/5/10 min, or only Refit now (paused too); `machine.settings` `refit = …`; script word `refit-cadence`. The banner shows the samples waiting and when the next automatic refit starts, with Refit now. Hand-tested by the user in previews; unit test `the_refit_cadence_holds_automatic_refits`.
+- **The view's Solve Bonds** became two joined icon buttons (a new Bonds icon, the Orbitals icon): Solve bonds, and Solve orbitals (`Action::SolveOrbitals`: a display refresh on the background teacher, under Model only too), each ready / busy (spinner) / done-or-held, with an Orbitals progress card. Three layout slips on the way (a misplaced shadow, a swapped pair, the pair pulled out of the corner), caught by the user; the last fix was checked in a rendered frame before handing over.
+- **Still open:** the "Computing orbitals…" label under Model only can sit with no job running (no Harris job eligible); Solve orbitals is the way round it for now.
+
 ### Process wins
 
 - An input-replay harness (M6 Task 8) that found a real app bug on its first scripts: a running relax
