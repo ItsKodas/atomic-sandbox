@@ -119,8 +119,16 @@ impl NullSpace {
         // a body-4 basis (a shared collection's, Q′ up to 2 688) takes Householder–QL: the same
         // O(ε)‖G̃‖ backward error the threshold rests on (`linalg` tests: null eigenvalues at
         // 8e-17·tr against τ/tr = Q′ε), minutes faster than Jacobi there; every other basis keeps
-        // Jacobi bit for bit
-        let (ev, v) = if basis.body4 { symmetric_eigen_householder(&g, q) } else { symmetric_eigen(&g, q) };
+        // Jacobi bit for bit. Since 2026-11-22 (the user: refits of a four-element collection took
+        // ~171 s, this eigendecomposition on one thread most of it) the body-4 one is faer's blocked,
+        // threaded tridiagonalisation with the same implicit QL (`dense::symmetric_eigen`: the same
+        // algorithm and backward error, eigenvalues sorted); the unthreaded `linalg` one only if its
+        // QL does not converge on a block (never seen)
+        let (ev, v) = if basis.body4 {
+            crate::dense::symmetric_eigen(&g, q).unwrap_or_else(|_| symmetric_eigen_householder(&g, q))
+        } else {
+            symmetric_eigen(&g, q)
+        };
         let kept: Vec<usize> = (0..q).filter(|&i| ev[i] <= tau).collect();
         let (v, kept_ref) = (&v, &kept);
         let columns = (0..q).flat_map(|k| kept_ref.iter().map(move |&i| v[k * q + i])).collect();
@@ -234,6 +242,45 @@ mod tests {
                     assert_eq!(nu.to_bits(), want.to_bits(), "q {q} dim {dim} m {m}: {nu:e} vs {want:e}");
                 }
             }
+        }
+    }
+
+    /// The body-4 null space's eigensolver (2026-11-22: faer's threaded tridiagonalisation,
+    /// `dense::symmetric_eigen`) finds the unthreaded `linalg::symmetric_eigen_householder`'s null
+    /// space: on rank-deficient Grams G = AᵀA (graded columns, as standardised descriptors are),
+    /// the same count of eigenvalues at or below τ = Q′ε·tr(G), none of them near τ, and the same
+    /// subspace (the projectors agree to 1e-9).
+    #[test]
+    fn the_threaded_eigensolver_finds_the_same_null_space() {
+        let mut rng = StdRng::seed_from_u64(7);
+        for (q, rank) in [(40, 25), (180, 120), (400, 330)] {
+            let scale: Vec<f64> = (0..q).map(|j| 10f64.powf(-3.0 * j as f64 / q as f64)).collect();
+            let a: Vec<f64> = (0..rank * q).map(|i| rng.gen_range(-1.0..1.0) * scale[i % q]).collect();
+            let mut g = vec![0.0; q * q];
+            for i in 0..q {
+                for j in 0..q {
+                    g[i * q + j] = (0..rank).map(|r| a[r * q + i] * a[r * q + j]).sum();
+                }
+            }
+            let tau = q as f64 * f64::EPSILON * (0..q).map(|i| g[i * q + i]).sum::<f64>();
+            let null = |ev: &[f64], v: &[f64]| {
+                let kept: Vec<usize> = (0..q).filter(|&i| ev[i] <= tau).collect();
+                // no eigenvalue within a factor 100 of τ: the count does not hinge on rounding
+                assert!(ev.iter().all(|&e| e <= tau / 100.0 || e >= tau * 100.0), "q {q}: an eigenvalue near τ");
+                let mut p = vec![0.0; q * q];
+                for i in 0..q {
+                    for j in 0..q {
+                        p[i * q + j] = kept.iter().map(|&k| v[i * q + k] * v[j * q + k]).sum();
+                    }
+                }
+                (kept.len(), p)
+            };
+            let (ev_new, v_new) = crate::dense::symmetric_eigen(&g, q).expect("QL converges");
+            let (ev_old, v_old) = symmetric_eigen_householder(&g, q);
+            let ((n_new, p_new), (n_old, p_old)) = (null(&ev_new, &v_new), null(&ev_old, &v_old));
+            assert_eq!((n_new, n_old), (q - rank, q - rank), "q {q}: the null dimension");
+            let worst = p_new.iter().zip(&p_old).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+            assert!(worst < 1e-9, "q {q}: projectors differ by {worst:e}");
         }
     }
 }
