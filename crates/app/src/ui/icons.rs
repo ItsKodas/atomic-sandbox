@@ -260,13 +260,13 @@ fn draw(p: &Painter, rect: Rect, icon: Icon, colour: Color32, fill: Color32) {
             p.circle_filled(at(12.0, 12.0), 1.4 * s, colour);
         }
         Icon::Bonds => {
-            // two atoms joined by a double bond
-            fill_circle(6.0, 12.0, 3.8);
-            fill_circle(18.0, 12.0, 3.8);
-            p.circle_stroke(at(6.0, 12.0), 3.8 * s, stroke);
-            p.circle_stroke(at(18.0, 12.0), 3.8 * s, stroke);
-            p.line_segment([at(9.8, 10.4), at(14.2, 10.4)], stroke);
-            p.line_segment([at(9.8, 13.6), at(14.2, 13.6)], stroke);
+            // ball and stick on the diagonal: a large atom and a small one joined by one bond
+            // (distinct from the Orbitals icon's two level lobes)
+            p.line_segment([at(9.2, 14.8), at(15.6, 8.4)], Stroke::new(stroke.width * 1.6, colour));
+            fill_circle(6.5, 17.5, 4.2);
+            p.circle_stroke(at(6.5, 17.5), 4.2 * s, stroke);
+            fill_circle(18.0, 6.0, 2.9);
+            p.circle_stroke(at(18.0, 6.0), 2.9 * s, stroke);
         }
         Icon::Selection => {
             fill_circle(12.0, 12.0, 4.0);
