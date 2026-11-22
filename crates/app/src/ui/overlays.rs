@@ -920,6 +920,37 @@ fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInp
             let sampling = input.sampling();
             let bonds = if sampling { BtnState::Off } else if busy { BtnState::Busy } else if stale { BtnState::Ready } else { BtnState::Off };
             let orbitals = if sampling { BtnState::Off } else if orbitals_busy { BtnState::Busy } else if orbitals_done { BtnState::Off } else { BtnState::Ready };
+            // right-aligned: the card above the pair, the pair at the view's corner
+            ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+            if orbitals == BtnState::Busy {
+                let live = input.probe.as_ref().filter(|p| p.side.running).and_then(|p| p.side.live);
+                // Δρ falls from ~1 to the tol on a log scale: the bar's fraction (capped short of full)
+                let frac = live.filter(|l| l.tol > 0.0 && l.delta_rho > 0.0).map_or(0.0, |l| ((1.0 / l.delta_rho).ln() / (1.0 / l.tol).ln()).clamp(0.0, 0.97) as f32);
+                let words = match live {
+                    Some(l) => format!("iteration {}", l.iteration),
+                    None => "starting".into(),
+                };
+                egui::Frame::new()
+                    .fill(theme::PANEL_3)
+                    .stroke(egui::Stroke::new(1.0, theme::LINE))
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::symmetric(14, 9))
+                    .show(ui, |ui| {
+                        ui.set_width(220.0);
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().size(14.0).color(theme::INK));
+                            ui.label(egui::RichText::new("Orbitals").strong().size(14.0).color(theme::INK));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(egui::RichText::new(words).size(12.0).color(theme::INK_DIM));
+                            });
+                        });
+                        ui.add_space(4.0);
+                        ui.add(egui::ProgressBar::new(frac).desired_height(6.0).fill(theme::ACCENT));
+                    })
+                    .response
+                    .on_hover_text("the display-only DFT solve on the background solver: the bar follows its density change down to the tolerance (log scale)");
+                ui.add_space(6.0);
+            }
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.horizontal(|ui| {
                 let bonds_tip = match bonds {
@@ -945,6 +976,7 @@ fn bonds_now(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInp
                     st.orbitals_press = Some((std::time::Instant::now(), here.clone()));
                     acts.push(Action::SolveOrbitals);
                 }
+            });
             });
         });
     let mut top = button.response.rect.top();
@@ -990,16 +1022,10 @@ fn state_button(ui: &mut Ui, icon: Icon, state: BtnState, left: bool) -> egui::R
     let cr = if left { egui::CornerRadius { nw: 8, sw: 8, ne: 0, se: 0 } } else { egui::CornerRadius { nw: 0, sw: 0, ne: 8, se: 8 } };
     let (fill, stroke) = match state {
         BtnState::Ready => (theme::GLOW, Stroke::new(1.5, theme::ACCENT_INK)),
-        BtnState::Busy => (theme::PANEL_3, Stroke::new(1.0, theme::LINE)),
-        BtnState::Off => (theme::PANEL_2, Stroke::new(1.0, theme::LINE_SOFT)),
+        BtnState::Busy => (theme::PANEL_3, Stroke::new(1.0, theme::ACCENT)),
+        BtnState::Off => (theme::PANEL_3, Stroke::new(1.0, theme::LINE)),
     };
     let size = Vec2::new(52.0, 36.0);
-    // raised: a darker lip under a ready button
-    if state == BtnState::Ready {
-        let (rect, _) = ui.allocate_exact_size(Vec2::ZERO, egui::Sense::hover());
-        let lip = Rect::from_min_size(rect.min + Vec2::new(0.0, 3.0), size);
-        ui.painter().rect_filled(lip, cr, theme::ACCENT_BG);
-    }
     let b = egui::Button::new("").fill(fill).stroke(stroke).corner_radius(cr).min_size(size);
     let r = ui.add_enabled(state == BtnState::Ready, b);
     let inner = Rect::from_center_size(r.rect.center(), Vec2::splat(22.0));
