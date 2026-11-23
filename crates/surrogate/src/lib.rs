@@ -17,6 +17,7 @@
 //! isotope mass; everything element-specific is learned).
 
 pub mod basis;
+pub mod channels;
 pub mod collection;
 pub mod dense;
 pub mod descriptor;
