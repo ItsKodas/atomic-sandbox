@@ -82,6 +82,28 @@
 //!   leaves the fit once the trust floor is met without it). Recorded, not corrected: a point
 //!   measures the model that judged it, and the evidence window ages by model generation.
 //!
+//! # The model basis (chemical-channels plan Task 3; spec `2026-11-22-chemical-channels-design.md`)
+//!
+//! A collection is keyed by its surface **and** its model basis (`surrogate::BasisKind`,
+//! `surrogate::collection` "The model basis"): [`SurrogateKs::set_collection_basis`]
+//! (`Trainable::set_model_basis`, the Model tab's "Model basis") picks which one
+//! [`attach_collection_at`](SurrogateKs::attach_collection_at) opens — the species collection
+//! (the default) or the channel collection of K channels, a new key that starts empty — and the
+//! next attach lets the other go. Nothing is migrated between them.
+//!
+//! **The mix.** An attached channel collection's frozen W is read from its `channels.txt` at
+//! attach (`SharedCollection::mix`) and a fit's basis takes it ([`SurrogateKs::collection_mix_for`],
+//! through `default_basis`) **only when the fit's species set is exactly the mix's rows**; any other
+//! set — an element without a W row, or no W at all — refuses the fit before anything changes
+//! (`channel_refusal`, as `FitError::Describe(UnknownSpecies(z))` naming the first species without a
+//! row: review I5, a missing row is never patched). **What Task 3 does not do:** learn W. A W is
+//! given to the collection from outside ([`SurrogateKs::set_collection_mix`]: written to
+//! `channels.txt`, the accumulator rebuilt at the next refit); the lifecycle of review I5 — learn W
+//! with `surrogate::channels::learn_mix` once the collection has enough samples (N_W), leave the
+//! samples of an element without a row out of the fit, relearn when that element's informative
+//! count doubles, reset class hysteresis on a relearn — is plan Task 6's. Until then a fresh channel
+//! collection gathers samples (it admits and stores them as any collection does) and forms no model.
+//!
 //! **Not in collection mode:** a scene that cannot share the collection (charged, a forced
 //! multiplicity, another surface) is refused by rule 3 — the teacher answers, the sample is not
 //! kept, the note names the reason (spec: charged scenes keep per-scene models — the caller
@@ -102,8 +124,9 @@
 
 use super::*;
 use std::path::{Path, PathBuf};
+use surrogate::channels::LearntMix;
 use surrogate::collection::{CollectionReference, ImportReport, ReferenceOutcome, REFUSE_BOX_UNKNOWN};
-use surrogate::{Collection, CollectionSample, SurfaceKey};
+use surrogate::{BasisKind, ChannelMix, Collection, CollectionSample, DescribeError, FitError, SurfaceKey};
 
 /// How a collection-mode pass checkpoint's provenance line begins ([`SurrogateKs::checkpoint_counts`]):
 /// the app tells a collection checkpoint (no samples file beside it) from a per-scene one by it
@@ -160,6 +183,9 @@ pub(super) struct SharedCollection {
     /// checkpoint's `pass_start` in collection mode (M8a Task 4b, the resume rule —
     /// [`SurrogateKs::checkpoint_counts`]).
     pub(super) pass_start: Option<usize>,
+    /// A channel collection's frozen mix (`channels.txt`, module doc "The model basis"); `None` for
+    /// a species collection or before W is given.
+    pub(super) mix: Option<LearntMix>,
 }
 
 impl SharedCollection {
@@ -180,6 +206,7 @@ impl SharedCollection {
             box_refs: self.box_refs.clone(),
             write_noted: true,
             pass_start: self.pass_start,
+            mix: self.mix.clone(),
         }
     }
 }
@@ -251,22 +278,25 @@ impl SurrogateKs {
     /// [`attach`](Self::attach); `restoring`: a collection taken back after a failed load (its
     /// note says so, and says nothing of the samples held before — they are the failed load's).
     pub(super) fn attach_inner(&mut self, c: Collection, restoring: bool) -> Result<(), String> {
-        if self.shared.as_ref().is_some_and(|s| s.coll.key == c.key) {
+        if self.shared.as_ref().is_some_and(|s| s.coll.key == c.key && s.coll.basis == c.basis) {
             return Ok(());
         }
         if self.pass.is_some() {
             return Err("shared collection: cancel the running sampling pass first".into());
         }
+        // a channel collection's frozen mix (module doc, "The model basis"): read before anything
+        // changes, so an unreadable file refuses the attach
+        let mix = c.read_mix().map_err(|e| format!("shared collection {}: {e}", c.slug()))?;
         if c.key.teacher != self.teacher.name() {
-            return Err(format!("shared collection {}: it was taught by '{}', this provider's teacher is '{}'", c.key.slug(), c.key.teacher, self.teacher.name()));
+            return Err(format!("shared collection {}: it was taught by '{}', this provider's teacher is '{}'", c.slug(), c.key.teacher, self.teacher.name()));
         }
         if c.key.tol != self.teacher_tol {
-            return Err(format!("shared collection {}: it was taught at tol {:e}, this provider's teacher solves at {:e}", c.key.slug(), c.key.tol, self.teacher_tol));
+            return Err(format!("shared collection {}: it was taught at tol {:e}, this provider's teacher solves at {:e}", c.slug(), c.key.tol, self.teacher_tol));
         }
         let prov = shared_provenance(&c.key);
         let mut store = SampleStore::new(prov.clone());
         for cs in &c.samples {
-            store.push(cs.sample.clone()).map_err(|e| format!("shared collection {}: {e}", c.key.slug()))?;
+            store.push(cs.sample.clone()).map_err(|e| format!("shared collection {}: {e}", c.slug()))?;
         }
         let held = self.samples();
         // a clean slate (a previous collection is flushed and released)
@@ -300,7 +330,7 @@ impl SurrogateKs {
         // the conservative side of the floor
         self.fit_id = c.history.max_fit_id().unwrap_or(0);
         self.fit_id_samples = n;
-        let slug = c.key.slug();
+        let slug = c.slug();
         // the collection's refit history for the time estimate (`sim::refit_eta`; none on file:
         // the session's stands, and is written with the next refit)
         if let (Some(p), Some(text)) = (self.probe.as_ref(), c.read_refit_times()) {
@@ -325,6 +355,7 @@ impl SurrogateKs {
             box_refs: c.references.iter().map(|(&k, r)| (k, r.energy)).collect(),
             write_noted: false,
             pass_start: None,
+            mix,
             coll: c,
         });
         // the fit's energies: each sample against its own box's references (module doc)
@@ -346,6 +377,12 @@ impl SurrogateKs {
         }
         if read_only {
             note.push_str(" — read-only: another process holds its lock, so this session's answers are used and not added to it");
+        }
+        if let Some(sh) = self.shared.as_ref().filter(|sh| sh.coll.basis != BasisKind::Species) {
+            note.push_str(&match &sh.mix {
+                Some(m) => format!(" — model basis {}: the frozen mix W of {} (K = {})", sh.coll.basis.describe(), m.species.iter().map(|&z| symbol(z)).collect::<Vec<_>>().join(" "), m.k),
+                None => format!(" — model basis {}: no mix W learnt yet, so it gathers samples and forms no model until W is learnt", sh.coll.basis.describe()),
+            });
         }
         self.user_notes.push(note);
         self.note_lone_held_out(&format!("shared collection {slug}"), lone, r_cut);
@@ -379,22 +416,72 @@ impl SurrogateKs {
             return Err(format!("this scene keeps a per-scene model ({why})"));
         }
         let key = prov.surface_key();
-        if self.shared.as_ref().is_some_and(|s| s.coll.key == key) {
+        let basis = self.collection_basis;
+        if self.shared.as_ref().is_some_and(|s| s.coll.key == key && s.coll.basis == basis) {
             return Ok(());
         }
         if self.pass.is_some() {
             return Err("shared collection: cancel the running sampling pass first".into());
         }
-        // another surface's collection, if one is attached, is released by `attach` once this one
-        // has opened (a different folder, so its lock is no obstacle)
-        let (c, report) = Collection::open(root, &key)?;
-        self.user_notes.extend(report.notes.into_iter().map(|n| format!("shared collection {}: {n}", key.slug())));
+        // another surface's (or basis's) collection, if one is attached, is released by `attach`
+        // once this one has opened (a different folder, so its lock is no obstacle)
+        let (c, report) = Collection::open_basis(root, &key, basis)?;
+        self.user_notes.extend(report.notes.into_iter().map(|n| format!("shared collection {}: {n}", Collection::slug_of(&key, basis))));
         self.attach(c)
+    }
+
+    /// The model basis the next [`attach_collection_at`](Self::attach_collection_at) opens (module
+    /// doc, "The model basis"; `Trainable::set_model_basis`). An attached collection stays until
+    /// then.
+    pub fn set_collection_basis(&mut self, basis: BasisKind) {
+        self.collection_basis = basis;
+    }
+
+    /// The model basis [`attach_collection_at`](Self::attach_collection_at) opens.
+    pub fn collection_basis(&self) -> BasisKind {
+        self.collection_basis
+    }
+
+    /// The attached channel collection's frozen mix for a fit over `species`, when it is exactly
+    /// the mix's species set (module doc, "The model basis"); `None` otherwise — a species
+    /// collection, none attached, no mix, or another species set ([`channel_refusal`](Self::channel_refusal)
+    /// refuses that fit).
+    pub(super) fn collection_mix_for(&self, species: &[u8]) -> Option<ChannelMix> {
+        let mix = self.shared.as_ref().filter(|sh| sh.coll.basis != BasisKind::Species)?.mix.as_ref()?;
+        surrogate::collection::mix_for(mix, species).ok()
+    }
+
+    /// Why a fit over `species` cannot form on the attached channel collection (module doc, "The
+    /// model basis"): no mix yet, or a species set other than the mix's rows — the first species
+    /// without a row (or, when every one has a row, the first row the fit lacks) as
+    /// `FitError::Describe(UnknownSpecies)`. `Ok` for a species collection or without one.
+    pub(super) fn channel_refusal(&self, species: &[u8]) -> Result<(), FitError> {
+        let Some(sh) = self.shared.as_ref().filter(|sh| sh.coll.basis != BasisKind::Species) else { return Ok(()) };
+        let rows: &[u8] = sh.mix.as_ref().map_or(&[], |m| &m.species);
+        if rows == species {
+            return Ok(());
+        }
+        let z = species.iter().find(|z| !rows.contains(z)).or_else(|| rows.iter().find(|z| !species.contains(z))).copied().unwrap_or(0);
+        Err(FitError::Describe(DescribeError::UnknownSpecies(z)))
+    }
+
+    /// Gives the attached channel collection its frozen mix W (module doc, "The model basis": Task 3
+    /// takes a W given from outside; learning it when the collection is ready is plan Task 6's):
+    /// written to `channels.txt` first (`Collection::save_mix`: refused for a species collection, a
+    /// read-only one, or another K than the key's), then used, the accumulator rebuilt at the next
+    /// refit (which is armed). `Err`, nothing changed, without an attached channel collection.
+    pub fn set_collection_mix(&mut self, mix: LearntMix) -> Result<(), String> {
+        let sh = self.shared.as_mut().ok_or("no shared collection is attached")?;
+        sh.coll.save_mix(&mix)?;
+        sh.mix = Some(mix);
+        self.species_dirty = true;
+        self.arm_refit();
+        Ok(())
     }
 
     /// Takes a collection back after a load that failed (review M3): a failure to do so is said.
     pub(super) fn reattach_after_failed_load(&mut self, c: Collection) {
-        let slug = c.key.slug();
+        let slug = c.slug();
         if let Err(e) = self.attach_inner(c, true) {
             self.user_notes.push(format!("shared collection {slug}: could not be attached again after the failed load ({e}) — the provider is per-scene now; attach it again to use it"));
         }
@@ -431,7 +518,7 @@ impl SurrogateKs {
     pub(super) fn checkpoint_counts(&self, scene: &Scene) -> (String, usize, usize) {
         let prov = self.provenance_for(scene).describe();
         match &self.shared {
-            Some(s) => (format!("{COLLECTION_CHECKPOINT_PREFIX}{}: {prov}", s.coll.key.slug()), s.coll.samples.len(), s.pass_start.unwrap_or(0)),
+            Some(s) => (format!("{COLLECTION_CHECKPOINT_PREFIX}{}: {prov}", s.coll.slug()), s.coll.samples.len(), s.pass_start.unwrap_or(0)),
             None => (prov, self.samples(), self.pass_start.unwrap_or(0)),
         }
     }
@@ -442,13 +529,13 @@ impl SurrogateKs {
     pub(super) fn collection_resume_refusal(&self, samples: usize) -> Option<String> {
         let s = self.shared.as_ref()?;
         let held = s.coll.samples.len();
-        (held < samples).then(|| format!("the shared collection {} holds {held} samples, the checkpoint was written when it held {samples} — not the collection the pass learned into", s.coll.key.slug()))
+        (held < samples).then(|| format!("the shared collection {} holds {held} samples, the checkpoint was written when it held {samples} — not the collection the pass learned into", s.coll.slug()))
     }
 
     /// Where the model comes from (`TrainableStatus::model_source`).
     pub(super) fn model_source(&self) -> sim::ModelSource {
         match (&self.shared, &self.source_file) {
-            (Some(s), _) => sim::ModelSource::Collection { slug: s.coll.key.slug(), samples: s.coll.samples.len(), read_only: s.coll.read_only },
+            (Some(s), _) => sim::ModelSource::Collection { slug: s.coll.slug(), samples: s.coll.samples.len(), read_only: s.coll.read_only },
             (None, Some(p)) => sim::ModelSource::File(p.clone()),
             (None, None) => sim::ModelSource::None,
         }
@@ -468,7 +555,7 @@ impl SurrogateKs {
     /// can, or without a collection.
     pub(super) fn collection_refuses(&self, prov: &Provenance) -> Option<String> {
         let s = self.shared.as_ref()?;
-        s.coll.admit_provenance(prov).err().map(|why| format!("the shared collection {} does not take this scene ({why}) — a per-scene model learns it", s.coll.key.slug()))
+        s.coll.admit_provenance(prov).err().map(|why| format!("the shared collection {} does not take this scene ({why}) — a per-scene model learns it", s.coll.slug()))
     }
 
     /// [`push_shared_coded`](Self::push_shared_coded) at [`Q_NONE`] (the tests' entry).
@@ -577,7 +664,7 @@ impl SurrogateKs {
             }
             Err(_) if code == Q_DRAFT => {
                 sh.waiting += 1;
-                let slug = sh.coll.key.slug();
+                let slug = sh.coll.slug();
                 self.collection_note.push(format!(
                     "surrogate: held out of the strict fit, so not in the shared collection {slug} yet — it is added if a refit promotes it into the fit"
                 ));
@@ -587,7 +674,7 @@ impl SurrogateKs {
             // releases it (`sync_collection_status`)
             Err(_) if code == Q_STRAY => {
                 sh.waiting += 1;
-                let slug = sh.coll.key.slug();
+                let slug = sh.coll.slug();
                 self.collection_note.push(format!(
                     "surrogate: held out of the fit, so not in the shared collection {slug} yet — it is added once a composition check measures its stray atoms"
                 ));
@@ -595,7 +682,7 @@ impl SurrogateKs {
             }
             Err(why) => {
                 *sh.refused.entry(why.clone()).or_default() += 1;
-                let slug = sh.coll.key.slug();
+                let slug = sh.coll.slug();
                 self.collection_note.push(format!("surrogate: kept for this session only — the shared collection {slug} did not take it ({why})"));
                 Link::Out
             }
@@ -671,7 +758,7 @@ impl SurrogateKs {
     pub(super) fn note_write_failure(&mut self, e: &str) {
         if let Some(sh) = self.shared.as_mut().filter(|s| !s.write_noted) {
             sh.write_noted = true;
-            let slug = sh.coll.key.slug();
+            let slug = sh.coll.slug();
             self.user_notes.push(format!("shared collection {slug}: {e} — this session's changes are used, not all are written"));
         }
     }
@@ -713,7 +800,7 @@ impl SurrogateKs {
         let why: Vec<String> = std::mem::take(&mut sh.refused).into_iter().map(|(w, n)| format!("{n} {w}")).collect();
         let appended = std::mem::take(&mut sh.appended);
         let waiting = std::mem::take(&mut sh.waiting);
-        let mut text = format!("shared collection {}: {appended} samples added ({} in all)", sh.coll.key.slug(), sh.coll.samples.len());
+        let mut text = format!("shared collection {}: {appended} samples added ({} in all)", sh.coll.slug(), sh.coll.samples.len());
         if held > 0 {
             text.push_str(&format!("; {held} geometries already in it, not solved again"));
         }
@@ -758,7 +845,7 @@ impl SurrogateKs {
         let before = self.last_report_offset();
         let sh = self.shared.as_mut().expect("collection mode");
         let limit = box_affected_face_density(sh.coll.key.h);
-        let slug = sh.coll.key.slug();
+        let slug = sh.coll.slug();
         let name = symbol(z);
         let offered = CollectionReference { energy: e, grid_n: Some(grid_n), face_density: face };
         let (value, note) = match sh.coll.offer_reference(z, offered, limit) {
@@ -1018,7 +1105,7 @@ impl SurrogateKs {
             // each against its own box's references; a box without them waits (module doc)
             self.rebase_collection();
         }
-        let slug = self.shared.as_ref().map_or_else(String::new, |s| s.coll.key.slug());
+        let slug = self.shared.as_ref().map_or_else(String::new, |s| s.coll.slug());
         self.user_notes.push(format!("shared collection {slug}: {} imported from {}, {} refused", report.imported, path.display(), report.refused.len()));
         self.flush_collection();
         Ok(report)
@@ -1083,7 +1170,7 @@ impl SurrogateKs {
             surrogate::sidecar::Contents::Samples(set) => set,
             surrogate::sidecar::Contents::Fitted(_) => return Err(format!("{}: a fitted model, not a collection's session-only samples", path.display())),
         };
-        let slug = sh.coll.key.slug();
+        let slug = sh.coll.slug();
         if set.provenance.grid_n != 0 || set.sample_box.len() != set.samples.len() {
             return Err(format!("{}: not a collection's session-only samples (a per-scene samples file)", path.display()));
         }
@@ -1166,7 +1253,7 @@ impl SurrogateKs {
         let set = sh.coll.specialise(species);
         let names: Vec<&str> = set.specialised.iter().map(|&z| symbol(z)).collect();
         if set.samples.is_empty() {
-            return Err(format!("the shared collection {} holds no sample made only of {} (in the fit, with its box's references)", sh.coll.key.slug(), names.join(", ")));
+            return Err(format!("the shared collection {} holds no sample made only of {} (in the fit, with its box's references)", sh.coll.slug(), names.join(", ")));
         }
         let n = set.samples.len();
         surrogate::sidecar::write_samples(path, &set).map_err(|e| format!("{}: {e}", path.display()))?;

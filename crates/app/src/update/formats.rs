@@ -29,6 +29,11 @@
 //! (`surrogate::history::written_by_newer_build`); a build before it overwrites it, and its warning
 //! says so.
 //!
+//! Chemical channels (plan 2026-11-22 Task 3) moved `sidecar` (10 to 11): a model on a
+//! chemical-channel basis is written as `ASMOD011`, its basis carrying K and W — every species-basis
+//! file keeps its version-9 / version-10 bytes. A channel collection is a new folder (its own key,
+//! `surrogate::collection` "The model basis"), so `collection` keeps its number.
+//!
 //! Choosing a downgrade never changes a file: [`downgrade_warnings`] only reads the headers of the
 //! files under the per-user root to say which of them the older version won't open, and where the
 //! older version itself would overwrite newer data once running (a collection's audit history, an
@@ -342,7 +347,7 @@ mod tests {
             ("pseudo_cache", 1),
             ("replay", 1),
             ("scene", 1),
-            ("sidecar", 10),
+            ("sidecar", 11),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))

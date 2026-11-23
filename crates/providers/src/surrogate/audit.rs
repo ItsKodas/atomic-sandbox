@@ -601,7 +601,7 @@ impl SurrogateKs {
         }
         // the collection the requesting scene shares, if any: only then may its answer become one
         // of the collection's references (fix round 3, review 1)
-        let collection = self.shared.as_ref().filter(|sh| sh.coll.admit_provenance(&self.scene_provenance(scene)).is_ok()).map(|sh| sh.coll.key.slug());
+        let collection = self.shared.as_ref().filter(|sh| sh.coll.admit_provenance(&self.scene_provenance(scene)).is_ok()).map(|sh| sh.coll.slug());
         let atom = isolated_atom(z, Some(mass), scene);
         let prov = self.scene_provenance(&atom);
         self.ref_jobs.push(super::shared::RefJob { z, n, driver, collection });
@@ -1001,7 +1001,7 @@ impl SurrogateKs {
             // offered to the collection only when the requesting scene shared it — and it is still
             // the one attached (`shared` module doc, "References per box"; review 1: never another
             // surface's atom)
-            let ours = collection.is_some() && self.shared.as_ref().map(|s| s.coll.key.slug()) == collection;
+            let ours = collection.is_some() && self.shared.as_ref().map(|s| s.coll.slug()) == collection;
             if let (Ok(a), true) = (&r, ours) {
                 self.set_reference_solved(z, a.energy, n, a.face_density);
             }

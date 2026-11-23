@@ -107,7 +107,7 @@ The spec's section "Physics review, 2026-11-22: binding changes" (C1, C2, I1–I
 - `crates/providers/src/surrogate/shared.rs`: open, create and attach for the channel basis;
 - app: Model tab ▸ **Model basis** (Species / Channels), as `ui::Action::ModelBasis` and a script word, with a new collection for each choice.
 
-- [ ] **Steps:** round-trip tests (`channels_txt_round_trips`, `a_channel_collection_has_its_own_key`), then the implementation, tests, commit.
+- [x] **Steps:** round-trip tests (`channels_txt_round_trips`, `a_channel_collection_has_its_own_key`), then the implementation, tests, commit. (2026-11-24: also `a_mismatched_species_set_is_refused` (review I5: rows keyed by Z), `a_sample_with_extra_targets_reads_as_the_same_sample` (flag bit 2, never written yet), `a_channel_model_sidecar_round_trips_its_mix` (sidecar version 11, `ASMOD011`), providers `a_channel_collection_attaches_as_its_own_and_fits_only_with_its_mix`, app `the_model_basis_switch_sends_its_command_and_has_a_script_word`. W is accepted from outside (`SurrogateKs::set_collection_mix`); learning it when the collection is ready, leaving rowless elements out of the fit and relearning — review I5's lifecycle — is Task 6's. A channel collection without a W gathers samples and forms no model.)
 
 ### Task 4: model hot path, fit, novelty, LOO, envelope (day 2)
 
@@ -139,7 +139,7 @@ The spec's section "Physics review, 2026-11-22: binding changes" (C1, C2, I1–I
 
 ### Task 6: trust floors, new-species handling, sampling (day 2)
 
-**Files:** providers `trust::key_column_counts`, `unseen_key_floor`, `fit_column_union`, `mod.rs` `fit_floor` / `grown_body4_degree`, `calibrate.rs`, `quarantine.rs:2314`, `sampling/mod.rs` `min_samples_for_trust_basis`, `teach.rs` `richer_basis`, `store.rs` / `shared.rs` dirtying on a new species (relearn W: Review focus 4).
+**Files:** providers `trust::key_column_counts`, `unseen_key_floor`, `fit_column_union`, `mod.rs` `fit_floor` / `grown_body4_degree`, `calibrate.rs`, `quarantine.rs:2314`, `sampling/mod.rs` `min_samples_for_trust_basis`, `teach.rs` `richer_basis`, `store.rs` / `shared.rs` dirtying on a new species (relearn W: Review focus 4). From Task 3: a channel collection starts without W and refuses every fit (`shared.rs` `channel_refusal`); this task learns W with `channels::learn_mix` once N_W is met and installs it through `SurrogateKs::set_collection_mix` (which writes `channels.txt`), leaves a rowless element's samples out of the fit instead of refusing it (review I5a), relearns on doubling, and resets class hysteresis on a relearn.
 
 - [ ] **Steps:**
   - check each floor's rationale against channel Q′ and fix the reasoning text;

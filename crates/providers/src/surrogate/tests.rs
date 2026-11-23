@@ -11571,6 +11571,90 @@ fn a_collection_of_only_lone_atoms_attaches_with_no_model() {
     assert!(s.user_notes.iter().any(|n| n.contains("6 samples of lone atoms (no neighbour within 6 Bohr) held out of the fit")), "{:?}", s.user_notes);
 }
 
+/// Chemical-channels plan Task 3 (`shared` module doc, "The model basis"): the model basis picks
+/// the collection — the channel one is its own folder and starts empty, the species one keeps its
+/// samples —, a channel collection without a mix gathers samples and refuses the fit naming a
+/// species without a W row, a mix given to it is written to `channels.txt` and taken by the fit's
+/// basis (exactly its species set), a reattached provider reads it back, and a species the mix has
+/// no row for refuses the fit again.
+#[test]
+fn a_channel_collection_attaches_as_its_own_and_fits_only_with_its_mix() {
+    use surrogate::{BasisKind, FitError};
+    let dir = collection_root("channel-basis");
+    let mut rng = StdRng::seed_from_u64(17);
+    let key = {
+        let (mut sp, _) = pair_student();
+        sp.attach_collection(&dir, &h2(1.4)).unwrap();
+        sp.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));
+        for i in 0..5 {
+            sp.evaluate(&h2_at(1.2 + 0.1 * i as f64, &mut rng), &mut never()).unwrap();
+        }
+        assert_eq!(sp.collection().unwrap().samples.len(), 5);
+        sp.provenance_for(&h2(1.4)).surface_key()
+    };
+    let ch3 = BasisKind::Channels { k: 3 };
+    let (mut s, _) = pair_student();
+    assert_eq!(s.collection_basis(), BasisKind::Species, "the default");
+    Trainable::set_model_basis(&mut s, sim::ModelBasis::Channels(3)).unwrap();
+    assert_eq!(s.collection_basis(), ch3);
+    s.attach_collection(&dir, &h2(1.4)).unwrap();
+    let slug = format!("{}_ch3", key.slug());
+    assert_eq!((s.collection().unwrap().basis, s.collection().unwrap().folder().to_path_buf(), s.samples()), (ch3, dir.join(&slug), 0), "its own folder, empty");
+    assert!(s.user_notes.iter().any(|n| n.contains("model basis channels (K = 3): no mix W learnt yet")), "{:?}", s.user_notes);
+    assert_eq!(Trainable::status(&s, &h2(1.4), &[[0.0; 3]; 2]).model_source, sim::ModelSource::Collection { slug: slug.clone(), samples: 0, read_only: false });
+    s.set_reference_solved(1, SpeciesMorse::atom(1), 33, Some(0.0));
+    for i in 0..40 {
+        s.evaluate(&h2_at(1.1 + 1.2 * i as f64 / 39.0, &mut rng), &mut never()).unwrap();
+    }
+    assert_eq!(s.collection().unwrap().samples.len(), 40, "it gathers samples");
+    assert!(matches!(s.refit(), Err(FitError::Describe(surrogate::DescribeError::UnknownSpecies(1)))), "no W: no fit");
+    assert!(s.model().is_none());
+    // a W given at creation (Task 6 learns it): H alone, K_eff = S = 1, W = I
+    let mix = surrogate::channels::LearntMix {
+        k: 1,
+        k_requested: 3,
+        species: vec![1],
+        w: vec![1.0],
+        sigma_w: vec![0.0],
+        singular_values: vec![2.0],
+        truncation_residual: vec![0.0],
+        nonlinearity: 0.0,
+        weights: vec![1.0],
+        rank: 1,
+        low_order: None,
+    };
+    let mut wrong_k = mix.clone();
+    wrong_k.k_requested = 4;
+    assert!(s.set_collection_mix(wrong_k).unwrap_err().contains("K = 4"));
+    s.set_collection_mix(mix.clone()).unwrap();
+    assert!(dir.join(&slug).join(surrogate::collection::CHANNELS_FILE).exists());
+    assert_eq!(s.fit_basis(&[1]).channels(), Some(&surrogate::ChannelMix { k: 1, w: vec![1.0] }));
+    assert_eq!(s.fit_basis(&[1, 2]).channels(), None, "another species set: not the mix");
+    s.refit().expect("the fit on the mix");
+    assert_eq!(s.basis().unwrap().channels(), Some(&surrogate::ChannelMix { k: 1, w: vec![1.0] }));
+    drop(s);
+    // a reattached provider reads the mix back; the species collection still holds its own
+    let (mut again, _) = pair_student();
+    again.set_collection_basis(ch3);
+    again.attach_collection(&dir, &h2(1.4)).unwrap();
+    assert!(again.user_notes.iter().any(|n| n.contains("the frozen mix W of H (K = 1)")), "{:?}", again.user_notes);
+    assert_eq!(again.samples(), 40);
+    again.set_collection_basis(BasisKind::Species);
+    again.attach_collection(&dir, &h2(1.4)).unwrap();
+    assert_eq!((again.collection().unwrap().basis, again.samples()), (BasisKind::Species, 5), "switched back: the species collection");
+    drop(again);
+    // a species without a W row refuses the fit
+    let (mut he, _) = pair_student();
+    he.set_collection_basis(ch3);
+    he.attach_collection(&dir, &h2(1.4)).unwrap();
+    he.set_reference_solved(1, SpeciesMorse::atom(1), 41, Some(0.0));
+    he.set_reference_solved(2, SpeciesMorse::atom(2), 41, Some(0.0));
+    for i in 0..3 {
+        he.evaluate(&h2_he_at(1.3, 2.4 + 0.2 * i as f64, &mut rng), &mut never()).unwrap();
+    }
+    assert!(matches!(he.refit(), Err(FitError::Describe(surrogate::DescribeError::UnknownSpecies(2)))), "He has no W row");
+}
+
 /// User-fix-4, the per-scene file: a model file whose fit used lone-atom samples (written before
 /// the keep rule) installs with them held out and its fit rebuilt without them (no DFT); release
 /// never takes one back; a save writes the codes they were loaded with. A file with nothing but

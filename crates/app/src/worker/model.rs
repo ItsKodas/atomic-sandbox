@@ -803,7 +803,11 @@ impl Worker {
             // its first fit is the worker's, in the background (`refit_if_pending`; module doc,
             // "Refits"): a large collection's took minutes on this thread
             t.set_fits_in_background(true);
-            match t.attach_collection(&root, &scene) {
+            // the Model tab's basis picks which collection of the surface (`Command::SetModelBasis`)
+            // (a provider without bases — the tests' fakes — has only the species one)
+            let species = self.model_basis == sim::ModelBasis::Species;
+            let basis = t.set_model_basis(self.model_basis).or_else(|e| if species { Ok(()) } else { Err(e) });
+            match basis.and_then(|()| t.attach_collection(&root, &scene)) {
                 Err(e) => Some(format!("shared collection not attached: {e}")),
                 Ok(()) => None,
             }
@@ -825,6 +829,18 @@ impl Worker {
         if let sim::ModelSource::Collection { slug, samples, .. } = t.model_source() {
             self.dy.add_note(format!("forgotten: this session's own samples; the shared collection {slug} keeps its {samples} samples (they are permanent) and stays attached"));
         }
+    }
+
+    /// [`Command::SetModelBasis`]: the Model tab's "Model basis" (chemical-channels plan Task 3).
+    /// Each basis is its own collection of the surface: with the collection in use, the one of the
+    /// new basis is attached at once (`sync_collection`; the other is let go, nothing of it lost);
+    /// otherwise it is the basis of the next attach.
+    pub(super) fn set_model_basis(&mut self, b: sim::ModelBasis) {
+        if self.model_basis == b {
+            return;
+        }
+        self.model_basis = b;
+        self.sync_collection();
     }
 
     /// [`Command::UseModel`]: the Model tab's switch.

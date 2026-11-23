@@ -542,6 +542,10 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         self.lock().attach_collection(root, scene)
     }
 
+    fn set_model_basis(&mut self, basis: crate::provider::ModelBasis) -> Result<(), String> {
+        self.lock().set_model_basis(basis)
+    }
+
     fn import_model(&mut self, path: &std::path::Path) -> Result<crate::provider::ImportSummary, String> {
         self.lock().import_model(path)
     }

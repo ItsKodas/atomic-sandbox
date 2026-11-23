@@ -107,6 +107,11 @@ pub enum Command {
     SolveOrbitals,
     /// Model tab ▸ Refit (`model::RefitCadence`): how soon an automatic refit may follow the last one.
     SetRefitCadence(super::model::RefitCadence),
+    /// Model tab ▸ Model basis (`ui::Action::ModelBasis`; chemical-channels plan Task 3): the basis
+    /// of the shared collection learnt into — species or K chemical channels, each its own
+    /// collection (`Trainable::set_model_basis`); with the collection in use it is attached at once.
+    /// Never an edit, never aborts.
+    SetModelBasis(sim::ModelBasis),
     /// Estimated solver: the Model tab's "Purge forgotten (N)…" after its confirmation
     /// (`Trainable::purge_forgotten`): every forgotten sample deleted for good — from the shared
     /// collection's samples file too, its old file kept as `samples.bin.bak`. No refit (the fit
@@ -230,6 +235,7 @@ impl Command {
             | Command::RefitNow
             | Command::SolveOrbitals
             | Command::SetRefitCadence(_)
+            | Command::SetModelBasis(_)
             | Command::PurgeForgotten(_)
             | Command::SaveSpecialised { .. }
             | Command::ResumeTraining(_)
@@ -275,6 +281,7 @@ impl Command {
             | Command::RefitNow
             | Command::SolveOrbitals
             | Command::SetRefitCadence(_)
+            | Command::SetModelBasis(_)
             | Command::PurgeForgotten(_)
             | Command::SaveSpecialised { .. }
             | Command::SetAudit(_)
@@ -326,6 +333,7 @@ impl Command {
                 | Command::RefitNow
             | Command::SolveOrbitals
             | Command::SetRefitCadence(_)
+            | Command::SetModelBasis(_)
                 | Command::PurgeForgotten(_)
                 | Command::SaveSpecialised { .. }
                 | Command::ResumeTraining(_)
@@ -382,6 +390,7 @@ impl Command {
             | Command::RefitNow
             | Command::SolveOrbitals
             | Command::SetRefitCadence(_)
+            | Command::SetModelBasis(_)
             | Command::PurgeForgotten(_)
             | Command::SaveSpecialised { .. }
             | Command::DisplayPartialCore(_)
@@ -510,6 +519,7 @@ impl Worker {
                 }
             }
             Command::SetRefitCadence(c) => self.refit_cadence = c,
+            Command::SetModelBasis(b) => self.set_model_basis(b),
             Command::PurgeForgotten(n) => self.purge_forgotten(n),
             Command::SaveSpecialised { path, species } => self.save_specialised(&path, &species),
             Command::DisplayPartialCore(on) => self.dy.apply(DynCommand::SetDisplayPartialCore(on)),

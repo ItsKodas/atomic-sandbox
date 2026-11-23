@@ -167,6 +167,11 @@ pub enum Action {
     /// Model tab ▸ Refit (`worker::RefitCadence`, `Command::SetRefitCadence`; user 2026-11-22): how
     /// soon an automatic refit may follow the last one. Script word `refit-cadence auto|<min>|manual`.
     RefitCadence(crate::worker::RefitCadence),
+    /// Model tab ▸ Model basis (chemical-channels plan Task 3): the basis of the shared collection —
+    /// Species, or K learnt chemical channels — each choice its own collection
+    /// (`Command::SetModelBasis`, `Trainable::set_model_basis`). Species stays the default until the
+    /// channel basis is gated (plan Task 7). Script word `model-basis species|channels <K>`.
+    ModelBasis(sim::ModelBasis),
     /// The forgotten list's "Purge forgotten (N)…" › **Purge** (after the inline confirmation):
     /// every forgotten sample deleted for good (`Command::PurgeForgotten`), with the count the user
     /// confirmed (the worker refuses when the forgotten list changed since). Recorded, not
@@ -759,6 +764,11 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             st.set_status(format!("purging {n} forgotten sample{}…", if n == 1 { "" } else { "s" }));
             out.commands.push(Command::PurgeForgotten(n));
         }
+        Action::ModelBasis(b) => {
+            st.model_basis = b;
+            st.set_status(format!("model basis: {} — its own shared collection", b.label()));
+            out.commands.push(Command::SetModelBasis(b));
+        }
         Action::RefitCadence(c) => {
             st.refit_cadence = c;
             out.commands.push(Command::SetRefitCadence(c));
@@ -1252,6 +1262,7 @@ impl Action {
             ContinueSampling => "continue-sampling".into(),
             SetAudit(n) => format!("audit {n}"),
             RefitCadence(c) => format!("refit-cadence {}", c.word()),
+            ModelBasis(b) => format!("model-basis {}", b.words()),
             VolumeMode(m) => format!("volume-mode {m}"),
             Walls { on: o, half_width } => format!("walls {} {half_width}", on(*o)),
             Cloud { superposition, refresh, refresh_s } => format!("cloud {superposition} {refresh} {refresh_s}"),
@@ -1449,6 +1460,7 @@ impl Action {
                 want(1)?;
                 SetAudit(num(head, args[0])?)
             }
+            "model-basis" => ModelBasis(sim::ModelBasis::parse(args).ok_or_else(|| format!("{head}: species, or channels and K ≥ 1, not {:?}", args.join(" ")))?),
             "refit-cadence" => {
                 want(1)?;
                 RefitCadence(crate::worker::RefitCadence::parse(args[0]).ok_or_else(|| format!("{head}: auto, the minutes or manual, not {:?}", args[0]))?)

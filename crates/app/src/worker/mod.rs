@@ -806,6 +806,9 @@ struct Worker {
     /// The last refit's wall and Model tab ▸ Refit (`model::RefitCadence`).
     last_refit_wall: Duration,
     refit_cadence: model::RefitCadence,
+    /// Model tab ▸ Model basis (`Command::SetModelBasis`; chemical-channels plan Task 3): the basis
+    /// of the shared collection `sync_collection` attaches — each its own collection.
+    model_basis: sim::ModelBasis,
     /// When the running background refit started (playing: `refit_if_pending`), if one runs.
     refit_started: Option<Instant>,
     /// The provider's `Trainable::fit_inputs_gen` when the running background refit started.
@@ -1078,6 +1081,7 @@ fn worker(
         last_refit_at: None,
         last_refit_wall: Duration::ZERO,
         refit_cadence: model::RefitCadence::default(),
+        model_basis: sim::ModelBasis::default(),
         refit_started: None,
         refit_started_gen: None,
         refit_done_gen: None,

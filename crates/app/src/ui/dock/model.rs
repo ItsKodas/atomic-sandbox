@@ -1090,6 +1090,9 @@ fn source_row(ui: &mut Ui, st: &mut UiState, m: Option<&ModelStatus>, sampling: 
             }
         }
     });
+    if shared {
+        model_basis_row(ui, st, sampling, acts);
+    }
     if attached {
         specialise_row(ui, st, m, scene_z, acts);
     }
@@ -1254,6 +1257,30 @@ fn refit_banner_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, refit: Option<
         }
     });
 }
+
+/// Model tab ▸ Model basis (chemical-channels plan Task 3): the basis of the shared collection,
+/// Species or K learnt chemical channels — each choice its own collection (`Action::ModelBasis`).
+/// Offered with the shared collection in use; not while a pass runs (the switch re-attaches).
+fn model_basis_row(ui: &mut Ui, st: &UiState, sampling: bool, acts: &mut Vec<Action>) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Model basis").size(11.5).color(theme::INK_DIM));
+        let mut pick = st.model_basis;
+        let choices = [sim::ModelBasis::Species, sim::ModelBasis::Channels(sim::ModelBasis::CHANNELS_K)];
+        let r = ui.add_enabled_ui(!sampling, |ui| {
+            egui::ComboBox::from_id_salt("model-basis").selected_text(pick.label()).show_ui(ui, |ui| {
+                for c in choices {
+                    ui.selectable_value(&mut pick, c, c.label());
+                }
+            })
+        });
+        super::super::probed("model-basis", r.inner.response).on_hover_text(MODEL_BASIS_TIP).on_disabled_hover_text("not while a sampling pass runs");
+        if pick != st.model_basis {
+            acts.push(Action::ModelBasis(pick));
+        }
+    });
+}
+
+const MODEL_BASIS_TIP: &str = "how the model describes three- and four-atom environments. Species: one block per combination of neighbour elements (the cost grows quickly with each element). Channels: the neighbours are mixed into a few learnt chemical channels (learnt only from this collection's own DFT samples), so the cost grows gently with the elements. Each choice is its own shared collection, starting empty: switching never mixes or moves samples, and the other collection stays on disk. A channel collection forms a model once its channel mix is learnt";
 
 /// Model tab ▸ Refit (user 2026-11-22): how soon an automatic refit may follow the last one
 /// (`worker::RefitCadence`, `Action::RefitCadence`); Refit now is never held.
