@@ -244,6 +244,39 @@ impl Envelope {
 mod tests {
     use super::*;
 
+    /// Chemical channels, plan Review focus 2 (physics review 2026-11-22: rules 5a/5b need no
+    /// geometric replacement): isolation and the coordination ratio read the per-species body-2
+    /// features only, so a neighbour whose W row sums to zero, or is zero (its Ā contribution
+    /// vanishes, every body-3/4 feature of the centre is 0), still makes the atom non-isolated, and
+    /// the ratio is the species basis's, bit for bit.
+    #[test]
+    fn a_neighbour_with_zero_channel_sum_is_not_isolated() {
+        use crate::descriptor::{describe_values, ChannelMix};
+        let species = Basis::new(&[1, 8]);
+        let pos = [[0.0, 0.0, 0.0], [0.0, 0.3, 1.8]];
+        let z = [1u8, 8];
+        let sp = describe_values(&species, &pos, &z).unwrap();
+        let mut env = Envelope::new(&species);
+        env.add_atom(0, &sp[0]);
+        // O's row: summing to zero (K = 2), all zero (K = 2), and one channel at 0 (K = 1)
+        for w in [vec![0.6, 0.8, 0.7, -0.7], vec![0.6, 0.8, 0.0, 0.0], vec![1.0, 0.0]] {
+            let k = w.len() / 2;
+            let ch = species.clone().with_channels(ChannelMix { k, w: w.clone() });
+            let b = describe_values(&ch, &pos, &z).unwrap();
+            let p2 = ch.n_body2();
+            assert_eq!(b[0][..p2], sp[0][..p2], "W {w:?}: body 2 is the species basis's");
+            assert!(!isolated_atom(&ch, &b[0]) && !isolated_atom(&ch, &b[1]), "W {w:?}");
+            // O is species index 1: its row is w[k..2k]
+            if w[k..2 * k].iter().all(|&x| x == 0.0) {
+                assert!(b[0][p2..].iter().all(|&x| x == 0.0), "W {w:?}: H's only neighbour feeds no channel");
+            }
+            assert_eq!(crate::descriptor::energy_row_atoms_described(&ch, &crate::descriptor::describe(&ch, &pos, &z).unwrap()), 2);
+            let mut env_ch = Envelope::new(&ch);
+            env_ch.add_atom(0, &b[0]);
+            assert_eq!(env_ch.coordination_ratio(&ch, 0, &b[0]), env.coordination_ratio(&species, 0, &sp[0]), "W {w:?}");
+        }
+    }
+
     #[test]
     fn distance_is_zero_inside_and_in_spread_units_outside() {
         let mut b = Basis::new(&[1]);

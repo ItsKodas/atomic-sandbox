@@ -1442,6 +1442,51 @@ pub(crate) mod tests {
         acc.hi
     }
 
+    /// Σ = A⁻¹ for A = L Lᵀ (L lower, row-major n × n), formed densely in double-double: X = L⁻¹ by
+    /// forward substitution of each unit vector, Σ_ij = Σ_k X_ki X_kj. Returns Σ's (hi, lo), row-major.
+    /// The dense-posterior oracle of `model`'s channel variance test (an explicit f64 inverse loses
+    /// ~κ(A)·ε to the cancellation of vᵀΣv on a fitted, ill-conditioned posterior).
+    pub(crate) fn dense_inverse_dd(l: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
+        use super::dd::{dot2_dd_dd, dot2_f_dd, Dd};
+        // column c of X (zero above row c), hi and lo
+        let mut xh = vec![vec![0.0; n]; n];
+        let mut xl = vec![vec![0.0; n]; n];
+        for c in 0..n {
+            for i in c..n {
+                let s = dot2_f_dd(&l[i * n + c..i * n + i], &xh[c][c..i], &xl[c][c..i]);
+                let y = Dd::from(if i == c { 1.0 } else { 0.0 }).sub(s).div(Dd::from(l[i * n + i]));
+                xh[c][i] = y.hi;
+                xl[c][i] = y.lo;
+            }
+        }
+        let mut sh = vec![0.0; n * n];
+        let mut sl = vec![0.0; n * n];
+        for i in 0..n {
+            for j in 0..=i {
+                let s = dot2_dd_dd(&xh[i], &xl[i], &xh[j], &xl[j]);
+                sh[i * n + j] = s.hi;
+                sl[i * n + j] = s.lo;
+                sh[j * n + i] = s.hi;
+                sl[j * n + i] = s.lo;
+            }
+        }
+        (sh, sl)
+    }
+
+    /// vᵀΣv in double-double for Σ = (hi, lo) of [`dense_inverse_dd`].
+    pub(crate) fn dense_form_dd(sh: &[f64], sl: &[f64], n: usize, v: &[f64]) -> f64 {
+        use super::dd::{dot2_f_dd, Dd};
+        let mut acc = Dd::default();
+        for i in 0..n {
+            if v[i] == 0.0 {
+                continue;
+            }
+            let u = dot2_f_dd(v, &sh[i * n..(i + 1) * n], &sl[i * n..(i + 1) * n]);
+            acc = acc.add(u.mul_f(v[i]));
+        }
+        acc.hi
+    }
+
     /// A random SPD factor L = chol(BBᵀ/n + 0.1 I).
     fn random_factor(rng: &mut StdRng, n: usize) -> Vec<f64> {
         let a: Vec<f64> = (0..n * n).map(|_| rng.gen_range(-1.0..1.0)).collect();

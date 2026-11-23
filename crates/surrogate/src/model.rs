@@ -61,6 +61,26 @@
 //! the rotation invariance of E_i (cancellation between neighbours, to rounding) rather than
 //! pair by pair. The body-2 block keeps its pair sweep above.
 //!
+//! ## With chemical channels (plan 2026-11-22-chemical-channels, Task 4)
+//!
+//! (Here the adjoint above is written w, to keep W for the mix.) A channel basis
+//! (`descriptor` module doc, "Chemical channels") builds bodies 3 and 4 from
+//! Ā_{(k,n),lm}(i) = Σ_{j≠i} W[s_j,k] φ_{n,lm}(r_j − r_i), k ∈ 0..K, so the energy and the adjoint
+//! w_{(k,n),lm}(i) = ∂E_i/∂Ā_{(k,n),lm} are the formulas above with channel rows k·n_max + n in place
+//! of species rows (the term lists index channels). The chain rule through Ā then gives, with
+//! d_ij = r_j − r_i (so ∂d_ij/∂r_j = +1, ∂d_ij/∂r_i = −1),
+//!
+//!   ∂E_i/∂r_j = Σ_{k,n,lm} w_{(k,n),lm}(i) W[s_j,k] ∇φ_{n,lm}(d_ij) = Σ_{n,lm} w̄_{(s_j,n),lm}(i) ∇φ_{n,lm}(d_ij),
+//!   w̄_{(t,n),lm}(i) = Σ_k W[t,k] w_{(k,n),lm}(i)   (the adjoint pulled back to species),
+//!
+//! and ∂E_i/∂r_i = −Σ_j ∂E_i/∂r_j; F = −∇E, so F_j −= ∂E_i/∂r_j and F_i += it as before (ΣF = 0
+//! by construction). The pull-back costs S·K·n_max·(l_max+1)² multiply-adds per centre, against
+//! the term loops' P₃(K)·(2l+1) and P₄(K)·|Gaunt|; the per-neighbour force loop is unchanged. The
+//! species basis (W = I, w̄ = w) reads w directly, so its path is bit for bit what it was. Checked
+//! against a fourth-order finite difference of the same energy
+//! (`channel_model_forces_are_minus_energy_gradient`) and against the fit's own design rows
+//! (`channel_hot_path_matches_the_design_rows`: energy and forces = loo::design_rows · θ).
+//!
 //! # Coincident atoms (policy)
 //!
 //! Two atoms at the same position have r_ij = 0 and no direction. The descriptor keeps the value
@@ -118,6 +138,21 @@
 //! pair 468, all three 1 902.
 //!
 //! The model caches one factor per composition (`Model::variance_support`, a [`SupportCache`]).
+//! **With chemical channels** a body-3/4 column's channels are not species: Ā_k = Σ_t W[t,k] A_t
+//! is non-zero for a scene of composition C as soon as some species t of C has W[t,k] ≠ 0. Let
+//! K(C) be those channels (`reached_channels`). For k ∉ K(C) every neighbour's weight W[s_j,k] is
+//! 0, which `add_neighbour` skips, so Ā_k stays +0.0; every body-3/4 value with that factor is a
+//! sum of ±0 products, and every gradient entry either skips that factor (its weight is 0) or
+//! multiplies by it — ±0, which the layout treats as zero. So S(C) is: centre in C, body-2
+//! neighbour species in C, body-3/4 channels in K(C). For W = I, K(C) = C and this is the species
+//! definition above, column for column; for a dense W, K(C) is every channel and S(C) holds the
+//! centres' whole channel blocks (on a 5-species K = 4 collection basis, |S({H})| = n_max + P₃(4) +
+//! P₄(4) instead of n_max + P₃(1) + P₄(1)). With Q′ ≈ S·(P₃ + P₄) the support of m species is
+//! about m/S of Q′: one species stays under the Q′/2 cut from S = 3, a pair from S = 5; larger
+//! compositions take the full path, a speed loss accepted for exactness (plan Task 4). Pinned by
+//! `the_channel_support_covers_every_scene_of_it` and against the dense
+//! posterior by `channel_variance_matches_the_dense_posterior`.
+//!
 //! A composition with |S(C)| > Q′/2 takes the full factor (the support gains little there), and so
 //! does every call of a model without a posterior (none is asked for) or with a factor the full
 //! substitution cannot use (a non-finite entry or a zero pivot: the full path then reports the
@@ -125,7 +160,8 @@
 //! std is a pure function of (L, geometry, species set): call order, threads and clones do not
 //! move a bit (`stds_do_not_depend_on_the_call_history`).
 //!
-//! Cost: one `describe` (body-3/4 terms of absent channel species skipped, bit for bit), then the
+//! Cost: one `describe` (body-3/4 terms of absent channel species skipped, bit for bit; no skip with
+//! chemical channels), then the
 //! forms: on the support |S|²/2 multiply-adds per vector (1 + 3N of them), and one build per
 //! (model, composition) (double-double, Σ_s (Q′ − s)²/2 + Q′|S|²/2 and O(|S|³): 9.5 ms at |S| = 52,
 //! 57 ms at 282, 0.26 s at 950 for Q′ = 1 902); on the full factor 3N + 1 triangular solves of
@@ -594,6 +630,9 @@ impl Model {
         assert_eq!(self.mean.len(), p, "Model.mean: one entry per feature");
         assert_eq!(self.scale.len(), p, "Model.scale: one entry per feature");
         assert_eq!(self.ref_energy.len(), s, "Model.ref_energy: one entry per species");
+        if let Some(mix) = self.basis.channels() {
+            assert_eq!(mix.w.len(), s * mix.k, "Model.basis: the channel mix is not S × K over the basis's species");
+        }
     }
 }
 
@@ -702,7 +741,8 @@ fn full_quad_forms(l: &[f64], qr: usize, vs: &[Vec<f64>]) -> Vec<f64> {
 }
 
 /// The composition's support S(C) (module doc): every reduced column whose centre species and
-/// channel species all lie in `mask` (bit s = species index s), ascending.
+/// body-2 neighbour species lie in `mask` (bit s = species index s) and whose body-3/4 channels
+/// all lie in the channels C reaches ([`reached_channels`]), ascending.
 fn composition_support(basis: &Basis, rep: &[usize], mask: u32) -> Vec<usize> {
     let p = basis.n_features();
     let p2 = basis.n_body2();
@@ -710,22 +750,42 @@ fn composition_support(basis: &Basis, rep: &[usize], mask: u32) -> Vec<usize> {
     let terms4 = basis.body4_terms();
     let p3 = terms3.len();
     let bit = |t: usize| 1u32 << t;
+    let reached = reached_channels(basis, mask);
     rep.iter()
         .enumerate()
         .filter(|&(_, &c)| {
             let (centre, k) = (c / p, c % p);
-            let channels = if k < p2 {
-                bit(k / basis.n_max)
-            } else if k < p2 + p3 {
+            if bit(centre) & !mask != 0 {
+                return false;
+            }
+            if k < p2 {
+                return bit(k / basis.n_max) & !mask == 0;
+            }
+            let channels = if k < p2 + p3 {
                 let t = &terms3[k - p2];
                 bit(t.t1) | bit(t.t2)
             } else {
                 terms4[k - p2 - p3].t.iter().fold(0, |m, &t| m | bit(t))
             };
-            (bit(centre) | channels) & !mask == 0
+            channels & !reached == 0
         })
         .map(|(r, _)| r)
         .collect()
+}
+
+/// K(C), the body-3/4 channels a composition C (`mask`, bit s = species index s) reaches (module
+/// doc, "On the composition's support"): channel k when some species t of C has W[t, k] ≠ 0 — C
+/// itself for the species basis (W = I), every channel for a dense W. Bit k = channel k (K ≤ S, so
+/// it fits whenever `mask` does).
+fn reached_channels(basis: &Basis, mask: u32) -> u32 {
+    let Some(mix) = basis.channels() else {
+        return mask;
+    };
+    let kk = mix.k;
+    (0..basis.n_species())
+        .filter(|&t| mask & (1 << t) != 0)
+        .flat_map(|t| (0..kk).filter(move |&k| mix.w[t * kk + k] != 0.0))
+        .fold(0u32, |m, k| m | 1 << k)
 }
 
 /// The species bitmask of a scene (bit s = species index s); `None` past 32 species (the full
@@ -1170,7 +1230,12 @@ fn body3_energy_and_forces(
     let terms4: Vec<(Body4Term, &[Gaunt])> = basis.body4_terms().into_iter().map(|t| (t, gaunt(t.l))).collect();
     let mut sc = AtomicBasisScratch::new(basis, n);
     let nlm = sc.nlm;
-    let mut w = vec![0.0; basis.n_body2() * nlm];
+    // the adjoint w = ∂E_i/∂Ā, one row per (channel, n): K·n_max rows (S·n_max without channels)
+    let mut w = vec![0.0; basis.n_channels() * n_max * nlm];
+    // with chemical channels, its pull-back to species w̄_{(t,n),lm} = Σ_k W[t,k] w_{(k,n),lm}
+    // (module doc, "Chemical channels"), S·n_max rows; the species basis reads w itself
+    let mix = basis.channels().map(|m| (m.k, m.w.as_slice()));
+    let mut w_bar = if mix.is_some() { vec![0.0; basis.n_species() * n_max * nlm] } else { Vec::new() };
     for i in 0..n {
         sc.clear();
         for j in 0..n {
@@ -1195,7 +1260,7 @@ fn body3_energy_and_forces(
             if c == 0.0 {
                 continue;
             }
-            let (c1, c2) = (basis.body2_index(t.t1, t.n1), basis.body2_index(t.t2, t.n2));
+            let (c1, c2) = (basis.channel_index(t.t1, t.n1), basis.channel_index(t.t2, t.n2));
             let range = AtomicBasisScratch::l_range(t.l);
             let mut dot = 0.0;
             for lm in range.clone() {
@@ -1226,11 +1291,32 @@ fn body3_energy_and_forces(
             e3.add(c * val);
         }
         energy.add(e3.sum());
-        // Forces: ∂E_i/∂r_j = Σ_{n,lm} W_{(s_j,n),lm} ∇φ_{n,lm}(d_ij).
+        // The adjoint per neighbour species: w itself (species basis, δ_{tk}), else its pull-back
+        // through W (module doc, "Chemical channels"), summed over k in channel order.
+        let adj: &[f64] = match mix {
+            None => &w,
+            Some((kk, wt)) => {
+                let row = n_max * nlm;
+                for t in 0..basis.n_species() {
+                    let dst = &mut w_bar[t * row..(t + 1) * row];
+                    dst.iter_mut().for_each(|v| *v = 0.0);
+                    for (k, &wtk) in wt[t * kk..(t + 1) * kk].iter().enumerate() {
+                        if wtk == 0.0 {
+                            continue;
+                        }
+                        for (d, &a) in dst.iter_mut().zip(&w[k * row..(k + 1) * row]) {
+                            *d += wtk * a;
+                        }
+                    }
+                }
+                &w_bar
+            }
+        };
+        // Forces: ∂E_i/∂r_j = Σ_{n,lm} w̄_{(s_j,n),lm} ∇φ_{n,lm}(d_ij).
         for (slot, &j) in sc.neighbours.iter().enumerate() {
             let mut g = [0.0; 3];
             for nn in 0..n_max {
-                let wrow = &w[(s[j] * n_max + nn) * nlm..(s[j] * n_max + nn + 1) * nlm];
+                let wrow = &adj[(s[j] * n_max + nn) * nlm..(s[j] * n_max + nn + 1) * nlm];
                 let dp = sc.dphi(slot, nn);
                 for lm in 0..nlm {
                     let wv = wrow[lm];
@@ -1892,6 +1978,363 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- chemical channels (plan 2026-11-22-chemical-channels.md, Task 4) ----
+
+    use crate::descriptor::ChannelMix;
+
+    /// A random dense S × K mix, no zero entry and no symmetry: |W| ∈ [0.2, 1.3), random signs (as
+    /// the descriptor tests' `random_mix`).
+    fn dense_mix(rng: &mut StdRng, s: usize, k: usize) -> ChannelMix {
+        ChannelMix { k, w: (0..s * k).map(|_| rng.gen_range(0.2..1.3) * if rng.gen_bool(0.5) { 1.0 } else { -1.0 }).collect() }
+    }
+
+    /// A block mix on three species, K = 3: species 0 feeds channel 0 alone, species 1 and 2 feed
+    /// channels 1 and 2 densely, so a composition reaches only some channels (module doc, "On the
+    /// composition's support": K(C)).
+    fn block_mix(rng: &mut StdRng) -> ChannelMix {
+        let mut v = || rng.gen_range(0.2..1.3) * if rng.gen_bool(0.5) { 1.0 } else { -1.0 };
+        ChannelMix { k: 3, w: vec![v(), 0.0, 0.0, 0.0, v(), v(), 0.0, v(), v()] }
+    }
+
+    /// A basis on `species` (body 3 on, body 4 as given at the starting degree) with channels `mix`
+    /// (`None`: the species basis).
+    fn mixed_basis(species: &[u8], body4: bool, mix: Option<ChannelMix>) -> Basis {
+        let mut b = Basis::new(species);
+        b.body4 = body4;
+        match mix {
+            Some(m) => b.with_channels(m),
+            None => b,
+        }
+    }
+
+    /// [`random_posterior_on`] a channel basis whose mix `mix` draws.
+    fn channel_model(rng: &mut StdRng, species: &[u8], body4: bool, mix: impl FnOnce(&mut StdRng) -> ChannelMix) -> Model {
+        let w = mix(rng);
+        random_posterior_on(rng, mixed_basis(species, body4, Some(w)))
+    }
+
+    /// `n` atoms in a 3 Bohr cube (every pair well inside r_cut = 6, so no cutoff tail), no two
+    /// closer than 1.2 Bohr (a well-conditioned cluster for finite differences), every species of
+    /// `sp` present, shuffled.
+    fn compact_cluster(rng: &mut StdRng, sp: &[u8], n: usize) -> (Vec<[f64; 3]>, Vec<u8>) {
+        assert!(n >= sp.len());
+        let mut pos: Vec<[f64; 3]> = Vec::new();
+        while pos.len() < n {
+            let p: [f64; 3] = std::array::from_fn(|_| rng.gen_range(-1.5..1.5));
+            if pos.iter().all(|q| (0..3).map(|a| (p[a] - q[a]).powi(2)).sum::<f64>() >= 1.44) {
+                pos.push(p);
+            }
+        }
+        let mut z: Vec<u8> = sp.to_vec();
+        z.extend((sp.len()..n).map(|_| sp[rng.gen_range(0..sp.len())]));
+        for i in (1..n).rev() {
+            z.swap(i, rng.gen_range(0..=i));
+        }
+        (pos, z)
+    }
+
+    /// θ, the standardised reduced coefficients the design rows (`loo::design_rows`) multiply: per
+    /// column class, scale′_rep · Σ_{q ∈ class} coeffs[q]/scale′_q — the energy depends on a tied
+    /// class only through the sum of its raw coefficients, and the row holds B/scale′_rep. For a
+    /// fitted model (equal split) this is the fit's own θ.
+    fn theta_of(m: &Model) -> Vec<f64> {
+        let p = m.basis.n_features();
+        let sc = |k: usize| if m.scale[k] == 0.0 { 1.0 } else { m.scale[k] };
+        m.basis.column_classes().iter().map(|c| sc(c[0] % p) * c.iter().map(|&q| m.coeffs[q / p][q % p] / sc(q % p)).sum::<f64>()).collect()
+    }
+
+    /// A compensated dot product (the oracle's sums: CLAUDE.md rule 4).
+    fn dot_compensated(a: &[f64], b: &[f64]) -> f64 {
+        let mut s = Neumaier::default();
+        for (x, y) in a.iter().zip(b) {
+            s.add(x * y);
+        }
+        s.sum()
+    }
+
+    /// The hot path's forces are −∇E of its own energy with a channel basis (module doc, "Body-3
+    /// forces by the adjoint", the W pull-back): a fourth-order central difference (h = 1e-3 Bohr)
+    /// of `energy_and_forces`'s energy, on compact clusters with random dense W at K < S, a dense W
+    /// at K = S, a block W, and the species basis as the control. Bound: 1e-7 of the cluster's
+    /// largest force component, per component. ΣF = 0 to rounding.
+    #[test]
+    fn channel_model_forces_are_minus_energy_gradient() {
+        let mut rng = StdRng::seed_from_u64(2026_11_24);
+        let species: &[u8] = &[1, 6, 8];
+        let cases: Vec<(&str, bool, Option<ChannelMix>)> = vec![
+            ("species basis (control)", true, None),
+            ("dense K = 1", false, Some(dense_mix(&mut rng, 3, 1))),
+            ("dense K = 2, body 4", true, Some(dense_mix(&mut rng, 3, 2))),
+            ("dense K = 3, body 4", true, Some(dense_mix(&mut rng, 3, 3))),
+            ("block K = 3", false, Some(block_mix(&mut rng))),
+        ];
+        let mut overall = 0.0f64;
+        for (what, body4, mix) in cases {
+            let mut m = random_posterior_on(&mut rng, mixed_basis(species, body4, mix));
+            // a constant, irrelevant to the forces, kept out of the difference's rounding
+            m.ref_energy = vec![0.0; 3];
+            for scene in 0..2 {
+                let (pos, z) = compact_cluster(&mut rng, species, 5);
+                let (e0, f) = energy_and_forces(&m, &pos, &z).unwrap();
+                let fmax = f.iter().flat_map(|v| v.iter()).fold(0.0f64, |a, v| a.max(v.abs()));
+                assert!(fmax > 0.0 && e0.is_finite());
+                let h = 1e-3;
+                let e_at = |j: usize, a: usize, d: f64| {
+                    let mut p = pos.clone();
+                    p[j][a] += d;
+                    energy_and_forces(&m, &p, &z).unwrap().0
+                };
+                let mut worst = 0.0f64;
+                for j in 0..pos.len() {
+                    for a in 0..3 {
+                        let d1 = e_at(j, a, h) - e_at(j, a, -h);
+                        let d2 = e_at(j, a, 2.0 * h) - e_at(j, a, -2.0 * h);
+                        let fd = -(8.0 * d1 - d2) / (12.0 * h);
+                        let err = (fd - f[j][a]).abs() / fmax;
+                        worst = worst.max(err);
+                        assert!(err <= 1e-7, "{what} scene {scene}: F[{j}][{a}] {:e} vs −dE/dx {fd:e} (|F|max {fmax:e})", f[j][a]);
+                    }
+                }
+                for a in 0..3 {
+                    let sum: f64 = f.iter().map(|v| v[a]).sum();
+                    assert!(sum.abs() <= 1e-12 * fmax, "{what}: ΣF_{a} = {sum:e}");
+                }
+                println!("{what} scene {scene}: |F − (−∇E)_fd| / |F|max = {worst:.2e} (|F|max {fmax:.2e}, E {e0:.3e})");
+                overall = overall.max(worst);
+            }
+        }
+        println!("channel hot-path forces vs finite differences: worst {overall:.2e}");
+    }
+
+    /// The hot path is the fit's own linear model with a channel basis: `energy_and_forces`' energy
+    /// (minus Σ ref) equals N_e · (energy design row · θ) and every force component its force row ·
+    /// θ (`loo::design_rows`, built from `describe`'s features and gradients, an independent
+    /// evaluation; θ = `theta_of`), to 1e-12 relative — the energy to its own size, each force to
+    /// the scene's largest component. Dense W at K < S and K = S, the identity at K = S, and the
+    /// species basis, with body 4; scenes of every composition (2–5 atoms).
+    #[test]
+    fn channel_hot_path_matches_the_design_rows() {
+        let mut rng = StdRng::seed_from_u64(0x7a5c_4004);
+        let species: &[u8] = &[1, 6, 8];
+        let identity = ChannelMix { k: 3, w: (0..9).map(|q| if q / 3 == q % 3 { 1.0 } else { 0.0 }).collect() };
+        let cases: Vec<(&str, Option<ChannelMix>)> = vec![
+            ("species basis", None),
+            ("dense K = 2", Some(dense_mix(&mut rng, 3, 2))),
+            ("dense K = 3", Some(dense_mix(&mut rng, 3, 3))),
+            ("identity K = 3", Some(identity)),
+        ];
+        let compositions: [&[u8]; 5] = [&[1], &[6], &[1, 8], &[6, 8], &[1, 6, 8]];
+        let (mut worst_e, mut worst_f) = (0.0f64, 0.0f64);
+        for (what, mix) in cases {
+            let m = random_posterior_on(&mut rng, mixed_basis(species, true, mix));
+            let th = theta_of(&m);
+            for (c, comp) in compositions.iter().enumerate() {
+                let n = (comp.len() + 1).max(2) + c % 2;
+                let (pos, z) = compact_cluster(&mut rng, comp, n);
+                let (e, f) = energy_and_forces(&m, &pos, &z).unwrap();
+                let (er, fr) = crate::loo::design_rows(&m, &pos, &z).unwrap();
+                let s = m.basis.species_indices(&z).unwrap();
+                let e_bind = e - s.iter().map(|&t| m.ref_energy[t]).sum::<f64>();
+                let ne = if m.energy_per_atom { crate::energy_row_atoms(&m.basis, &pos) as f64 } else { 1.0 };
+                let e_rows = ne * dot_compensated(&er, &th);
+                let de = (e_bind - e_rows).abs() / e_bind.abs().max(e_rows.abs());
+                assert!(de <= 1e-12, "{what} {comp:?}: hot-path binding energy {e_bind:e} vs rows {e_rows:e}");
+                let fmax = f.iter().flat_map(|v| v.iter()).fold(0.0f64, |a, v| a.max(v.abs()));
+                for j in 0..n {
+                    for a in 0..3 {
+                        let fr_ja = dot_compensated(&fr[3 * j + a], &th);
+                        let df = (f[j][a] - fr_ja).abs() / fmax;
+                        assert!(df <= 1e-12, "{what} {comp:?}: F[{j}][{a}] hot path {:e} vs rows {fr_ja:e}", f[j][a]);
+                        worst_f = worst_f.max(df);
+                    }
+                }
+                worst_e = worst_e.max(de);
+            }
+        }
+        println!("channel hot path vs design rows · θ: energy worst {worst_e:.2e}, forces worst {worst_f:.2e}");
+    }
+
+    /// The predictive stds of a channel model through `predict` (the composition's support factor
+    /// where it applies) equal the dense posterior's quadratic forms on the fit's own rows
+    /// (`loo::design_rows`; energy: (N_e σ_e)² + N_e² φ_Eᵀ Σ φ_E, forces: 3σ_f² + Σ_a φ_{j,a}ᵀ Σ φ_{j,a}) to
+    /// 1e-10 relative, with Σ = (L Lᵀ)⁻¹ formed and contracted densely in double-double
+    /// (`linalg::tests::dense_inverse_dd`: in f64 the explicit inverse itself is off by up to 1e-10 on
+    /// the fitted posterior below, measured 2026-11-24, where `predict` is within 1.4e-14 of a
+    /// double-double ‖L⁻¹v‖²); the support path is taken for the small compositions and never meets a
+    /// non-zero outside S(C). Random posteriors with dense W (K < S), a block W (K(C) a strict
+    /// subset of the channels), and a real fit at S = 2, K = 1.
+    #[test]
+    fn channel_variance_matches_the_dense_posterior() {
+        let mut rng = StdRng::seed_from_u64(0x5167_a110);
+        let species: &[u8] = &[1, 6, 8];
+        let fitted = {
+            let basis = mixed_basis(&[1, 8], false, Some(dense_mix(&mut rng, 2, 1)));
+            fitted_model_on(&mut rng, basis, &[1, 8], 30)
+        };
+        let models: Vec<(&str, Model, Vec<&[u8]>)> = vec![
+            ("dense K = 2", channel_model(&mut rng, species, false, |r| dense_mix(r, 3, 2)), vec![&[1], &[6], &[8], &[1, 8], &[1, 6, 8]]),
+            ("dense K = 2, body 4", channel_model(&mut rng, species, true, |r| dense_mix(r, 3, 2)), vec![&[1], &[8], &[6, 8]]),
+            ("block K = 3", channel_model(&mut rng, species, false, block_mix), vec![&[1], &[6], &[6, 8], &[1, 6]]),
+            ("fitted S = 2, K = 1", fitted, vec![&[1], &[8], &[1, 8]]),
+        ];
+        let mut worst = 0.0f64;
+        for (what, m, comps) in &models {
+            let l = m.sigma_inv_chol.as_ref().unwrap();
+            let q = m.representatives().len();
+            let (sigma_hi, sigma_lo) = crate::linalg::tests::dense_inverse_dd(l, q);
+            let dense_form = |v: &[f64]| crate::linalg::tests::dense_form_dd(&sigma_hi, &sigma_lo, q, v);
+            // (predict, dense) against double-double, the largest relative std difference
+            let mut dd_err = (0.0f64, 0.0f64);
+            for comp in comps {
+                for t in 0..2 {
+                    let (pos, z) = compact_cluster(&mut rng, comp, comp.len().max(2) + t);
+                    let pred = m.predict(&pos, &z, true).unwrap();
+                    let (er, fr) = crate::loo::design_rows(m, &pos, &z).unwrap();
+                    // the energy row is per N_e when the fit was per atom (its floor then (N_e σ_e)²)
+                    let ne = if m.energy_per_atom { crate::energy_row_atoms(&m.basis, &pos) as f64 } else { 1.0 };
+                    let want_e = ((ne * m.sigma_e).powi(2) + ne * ne * dense_form(&er)).sqrt();
+                    let got_e = pred.energy_std.unwrap();
+                    let d = (got_e - want_e).abs() / want_e;
+                    assert!(d <= 1e-10, "{what} {comp:?}: energy std {got_e:e} vs dense {want_e:e}");
+                    worst = worst.max(d);
+                    // diagnostics: each side against a double-double ‖L⁻¹v‖² (which one carries the difference)
+                    let dd_e = ((ne * m.sigma_e).powi(2) + ne * ne * crate::linalg::tests::quad_form_dd(l, q, &er)).sqrt();
+                    dd_err.0 = dd_err.0.max((got_e - dd_e).abs() / dd_e);
+                    dd_err.1 = dd_err.1.max((want_e - dd_e).abs() / dd_e);
+                    for j in 0..pos.len() {
+                        let epi: f64 = (0..3).map(|a| dense_form(&fr[3 * j + a])).sum();
+                        let (got, got_epi) = (pred.force_std.as_ref().unwrap()[j], pred.force_std_epistemic.as_ref().unwrap()[j]);
+                        let (want, want_epi) = ((3.0 * m.sigma_f * m.sigma_f + epi).sqrt(), epi.sqrt());
+                        let dd_epi = (0..3).map(|a| crate::linalg::tests::quad_form_dd(l, q, &fr[3 * j + a])).sum::<f64>().sqrt();
+                        dd_err.0 = dd_err.0.max((got_epi - dd_epi).abs() / dd_epi);
+                        dd_err.1 = dd_err.1.max((want_epi - dd_epi).abs() / dd_epi);
+                        for (g, w, name) in [(got, want, "force_std"), (got_epi, want_epi, "force_std_epistemic")] {
+                            let d = (g - w).abs() / w;
+                            assert!(d <= 1e-10, "{what} {comp:?}: {name}[{j}] {g:e} vs dense {w:e}");
+                            worst = worst.max(d);
+                        }
+                    }
+                }
+            }
+            assert!(m.variance_support.support_entries() >= 1, "{what}: the support path was taken ({:?})", m.variance_support);
+            assert_eq!(m.variance_support.outside_support_calls(), 0, "{what}");
+            assert!(m.variance_support.self_check_max() <= 2e-12, "{what}: self-check {:.2e}", m.variance_support.self_check_max());
+            println!("{what}: Q′ {q}, {:?}; against double-double: predict {:.1e}, dense Σ {:.1e}", m.variance_support, dd_err.0, dd_err.1);
+        }
+        println!("channel stds (support path) vs the dense posterior: worst relative difference {worst:.2e}");
+    }
+
+    /// With channels S(C) is the centre's block on the channels C reaches (K(C), module doc): a
+    /// dense W reaches every channel (S({H}) = n_max + P₃(K)), a block W only its own (S({H}) =
+    /// n_max + P₃(1) when H feeds channel 0 alone); and every query vector of a scene of composition
+    /// C vanishes off S(C). The species basis keeps its sizes.
+    #[test]
+    fn the_channel_support_covers_every_scene_of_it() {
+        let mut rng = StdRng::seed_from_u64(0x5c09);
+        let species: &[u8] = &[1, 6, 8];
+        let nm = Basis::new(species).n_max;
+        let p3 = |k: usize| mixed_basis(&[1, 2, 3, 4, 5][..k], false, None).n_body3();
+        let dense = channel_model(&mut rng, species, false, |r| dense_mix(r, 3, 2));
+        let block = channel_model(&mut rng, species, false, block_mix);
+        let dense4 = channel_model(&mut rng, species, true, |r| dense_mix(r, 3, 2));
+        let size = |m: &Model, mask: u32| composition_support(&m.basis, m.representatives(), mask).len();
+        assert_eq!((size(&dense, 0b001), size(&dense, 0b010), size(&dense, 0b011)), (nm + p3(2), nm + p3(2), 3 * nm + 2 * p3(2)));
+        assert_eq!(size(&dense, 0b111), dense.representatives().len());
+        // block: H → channel 0 only; C, O → channels 1 and 2
+        assert_eq!((size(&block, 0b001), size(&block, 0b010), size(&block, 0b110)), (nm + p3(1), nm + p3(2), 3 * nm + 2 * p3(2)));
+        assert_eq!(size(&block, 0b011), 3 * nm + 2 * p3(3));
+        for m in [&dense, &block, &dense4] {
+            for t in 0..12 {
+                let pick: Vec<u8> = species.iter().copied().filter(|_| rng.gen_bool(0.5)).collect();
+                let pick = if pick.is_empty() { vec![species[t % 3]] } else { pick };
+                let (pos, z) = compact_cluster(&mut rng, &pick, pick.len().max(2) + t % 2);
+                let s = m.basis.species_indices(&z).unwrap();
+                let sc = composition_support(&m.basis, m.representatives(), mask_of(&s).unwrap());
+                for v in m.query_vectors(&pos, &z).unwrap() {
+                    assert!(v.iter().enumerate().all(|(k, &x)| x == 0.0 || sc.binary_search(&k).is_ok()), "{pick:?} scene {t}");
+                }
+            }
+        }
+    }
+
+    /// A model fitted by `fit` on `basis` to a seeded random linear teacher on the same basis, with
+    /// noise (`samples` scenes of 2–4 atoms over `species`).
+    fn fitted_model_on(rng: &mut StdRng, basis: Basis, species: &[u8], samples: usize) -> Model {
+        let teacher = {
+            let mut t = random_posterior_on(rng, basis);
+            t.sigma_inv_chol = None;
+            t.scale = vec![1.0; t.basis.n_features()];
+            t
+        };
+        let store = teacher_store(rng, &teacher, species, samples);
+        let (m, _) = crate::fit::fit(&store, &teacher.basis, &teacher.ref_energy, &crate::fit::FitOptions::default()).unwrap();
+        assert!(m.sigma_inv_chol.is_some());
+        m
+    }
+
+    /// `samples` noisy teacher answers on scenes of 2–4 atoms over `species`.
+    fn teacher_store(rng: &mut StdRng, teacher: &Model, species: &[u8], samples: usize) -> crate::fit::SampleStore {
+        let mut store = crate::fit::SampleStore::new(provenance());
+        for _ in 0..samples {
+            let n = rng.gen_range(2..=4);
+            let (pos, z) = random_scene(rng, species, n);
+            let (e, f) = energy_and_forces(teacher, &pos, &z).unwrap();
+            let e = e + 1e-4 * rng.gen_range(-1.0..1.0);
+            let f = f
+                .iter()
+                .map(|v| [v[0] + 1e-3 * rng.gen_range(-1.0..1.0), v[1] + 1e-3 * rng.gen_range(-1.0..1.0), v[2] + 1e-3 * rng.gen_range(-1.0..1.0)])
+                .collect();
+            store.push(crate::fit::Sample::new(pos, z, e, f, crate::fit::SampleTag::Perturbation, 1.0)).unwrap();
+        }
+        store
+    }
+
+    /// Plan Task 4, the identity-W fit: the same samples fitted on the species basis and on its
+    /// channel basis with W = I (K = S) give the same model — energies, forces and stds on held-out
+    /// scenes to 1e-9 relative (the features agree to rounding: Task 1's identity test).
+    #[test]
+    fn identity_mix_fit_equals_the_species_fit() {
+        let mut rng = StdRng::seed_from_u64(0x1d_f17);
+        let species: &[u8] = &[1, 8];
+        let sp_basis = mixed_basis(species, false, None);
+        let teacher = {
+            let mut t = random_posterior_on(&mut rng, sp_basis.clone());
+            t.sigma_inv_chol = None;
+            t.scale = vec![1.0; t.basis.n_features()];
+            t
+        };
+        let store = teacher_store(&mut rng, &teacher, species, 30);
+        let opts = crate::fit::FitOptions::default();
+        let (m_sp, _) = crate::fit::fit(&store, &sp_basis, &teacher.ref_energy, &opts).unwrap();
+        let ch_basis = sp_basis.clone().with_channels(ChannelMix { k: 2, w: vec![1.0, 0.0, 0.0, 1.0] });
+        let (m_ch, _) = crate::fit::fit(&store, &ch_basis, &teacher.ref_energy, &opts).unwrap();
+        let mut worst = 0.0f64;
+        for t in 0..6 {
+            let (pos, z) = random_scene(&mut rng, species, 2 + t % 3);
+            let (a, b) = (m_sp.predict(&pos, &z, true).unwrap(), m_ch.predict(&pos, &z, true).unwrap());
+            let rel = |x: f64, y: f64, mag: f64| if x == y { 0.0 } else { (x - y).abs() / mag.max(x.abs()).max(y.abs()) };
+            let e_ref: f64 = m_sp.basis.species_indices(&z).unwrap().iter().map(|&s| m_sp.ref_energy[s]).sum();
+            let d = rel(a.energy - e_ref, b.energy - e_ref, 0.0);
+            assert!(d <= 1e-9, "scene {t}: binding energy {:e} vs {:e}", a.energy - e_ref, b.energy - e_ref);
+            worst = worst.max(d);
+            let fmax = a.forces.iter().flat_map(|v| v.iter()).fold(0.0f64, |m, v| m.max(v.abs()));
+            for j in 0..pos.len() {
+                for x in 0..3 {
+                    let d = rel(a.forces[j][x], b.forces[j][x], fmax);
+                    assert!(d <= 1e-9, "scene {t}: F[{j}][{x}]");
+                    worst = worst.max(d);
+                }
+                let d = rel(a.force_std.as_ref().unwrap()[j], b.force_std.as_ref().unwrap()[j], 0.0);
+                assert!(d <= 1e-9, "scene {t}: force std [{j}]");
+                worst = worst.max(d);
+            }
+            let d = rel(a.energy_std.unwrap(), b.energy_std.unwrap(), 0.0);
+            assert!(d <= 1e-9, "scene {t}: energy std");
+            worst = worst.max(d);
+        }
+        println!("identity-W fit vs species fit: worst relative difference {worst:.2e}");
     }
 
     /// The support path against the full one on a real fit (review I3b, round 2): 1 000 seeded H₂
