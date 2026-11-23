@@ -285,6 +285,14 @@ mod tests {
     fn fixture() -> (Basis, Provenance, Vec<Sample>, FitOptions) {
         let mut basis = Basis::new(&[1]);
         basis.n_max = 4;
+        let (prov, samples, opts) = fixture_samples(&|_, _| 1);
+        (basis, prov, samples, opts)
+    }
+
+    /// [`fixture`]'s samples with atom k of sample i of species `z_of(i, k)` (the teacher is the
+    /// same species-blind pair potential; its isolated-atom energy −0.5 per atom whatever the
+    /// species — a fit's references are the caller's).
+    fn fixture_samples(z_of: &dyn Fn(usize, usize) -> u8) -> (Provenance, Vec<Sample>, FitOptions) {
         let prov = Provenance { grid_n: 33, h: 0.25, sigma: 0.25, tol: 1e-6, charge: 0, multiplicity: None, teacher: "pair".into(), masses: vec![], ionic: "none".into() };
         let mut seed = 5u64;
         let mut rnd = || {
@@ -327,21 +335,25 @@ mod tests {
                 _ => None,
             };
             let use_energy = i % 4 != 1;
-            samples.push(Sample { pos, z: vec![1; n], energy: e, forces: f, tag: SampleTag::Scan, weight: 0.5 + rnd(), force_mask, use_energy });
+            samples.push(Sample { pos, z: (0..n).map(|k| z_of(i, k)).collect(), energy: e, forces: f, tag: SampleTag::Scan, weight: 0.5 + rnd(), force_mask, use_energy });
         }
         // pinned hyperparameters with a moderate ridge: the brute-force side (an explicit A₋ and a
         // dense solve) is only as good as A₋'s conditioning, so the comparison runs where that is
         // moderate (printed) — the closed form itself does not depend on the choice
         let opts = FitOptions { sigma_e: Some(1e-2), sigma_f: Some(3e-2), lambda: Some(1e3), ..FitOptions::default() };
-        (basis, prov, samples, opts)
+        (prov, samples, opts)
     }
 
     fn fit(basis: &Basis, prov: &Provenance, samples: &[Sample], opts: &FitOptions) -> (Model, crate::fit::FitReport) {
+        fit_with_refs(basis, prov, samples, opts, &[-0.5])
+    }
+
+    fn fit_with_refs(basis: &Basis, prov: &Provenance, samples: &[Sample], opts: &FitOptions, refs: &[f64]) -> (Model, crate::fit::FitReport) {
         let mut acc = Accumulator::new(basis);
         for s in samples {
-            acc.add(s, basis, &[-0.5], opts).unwrap();
+            acc.add(s, basis, refs, opts).unwrap();
         }
-        acc.solve(opts, prov, &[-0.5]).unwrap()
+        acc.solve(opts, prov, refs).unwrap()
     }
 
     /// The closed form against an explicit downdate of the fit at its own hyperparameters (not an
@@ -408,7 +420,34 @@ mod tests {
         let (basis, prov, samples, opts) = fixture();
         let (model, rep) = fit(&basis, &prov, &samples, &opts);
         println!("fixture: κ(A) {:.2e}", rep.condition_estimate);
+        // S = 1: no tied columns, θ is the stored coefficients
+        downdate_check(&model, &samples, &[-0.5], &model.coeffs[0].clone());
+    }
+
+    /// The same downdate on a two-species fit whose body-3 block is on one chemical channel (plan
+    /// 2026-11-22-chemical-channels Task 4): the closed form is generic in the rows, and its
+    /// in-sample residual comes from `predict` (the hot path's channel adjoint). θ per column class
+    /// is the fit's (the representative's coefficient × the class size, the equal split undone).
+    #[test]
+    fn channel_loo_matches_a_downdate_of_the_fit() {
+        let mut basis = Basis::new(&[1, 8]).with_channels(crate::descriptor::ChannelMix { k: 1, w: vec![0.8, -1.1] });
+        basis.n_max = 4;
+        let (prov, samples, opts) = fixture_samples(&|i, k| if (i + k) % 3 == 0 { 8 } else { 1 });
+        assert!(samples.iter().any(|s| s.z.contains(&8) && s.z.contains(&1)));
+        let refs = [-0.5, -0.5];
+        let (model, rep) = fit_with_refs(&basis, &prov, &samples, &opts, &refs);
+        println!("channel fixture: Q′ {}, κ(A) {:.2e}", rep.q_prime, rep.condition_estimate);
+        let p = basis.n_features();
+        let theta: Vec<f64> = basis.column_classes().iter().map(|c| model.coeffs[c[0] / p][c[0] % p] * c.len() as f64).collect();
+        downdate_check(&model, &samples, &refs, &theta);
+    }
+
+    /// The body of [`loo_matches_a_downdate_of_the_fit`] (its doc) for `model` fitted to `samples`
+    /// with references `refs`, θ its standardised reduced coefficients.
+    fn downdate_check(model: &Model, samples: &[Sample], refs: &[f64], theta: &[f64]) {
+        let basis = &model.basis;
         let q = basis.n_independent_columns();
+        assert_eq!(theta.len(), q);
         let l = model.sigma_inv_chol.as_ref().unwrap();
         let mut a = vec![0.0; q * q];
         for i in 0..q {
@@ -416,12 +455,11 @@ mod tests {
                 a[i * q + j] = (0..q).map(|k| l[i * q + k] * l[j * q + k]).sum();
             }
         }
-        let theta: Vec<f64> = model.coeffs[0].clone();
         let b: Vec<f64> = (0..q).map(|i| (0..q).map(|j| a[i * q + j] * theta[j]).sum()).collect();
         let (mut worst, mut max_h) = (0.0f64, 0.0f64);
         let mut masked = 0;
-        for s in &samples {
-            let loo = leave_one_out(&model, s).expect("loo");
+        for s in samples {
+            let loo = leave_one_out(model, s).expect("loo");
             let ins = model.predict(&s.pos, &s.z, false).unwrap();
             let j0 = (0..s.pos.len()).find(|&j| s.trains_atom(j)).unwrap();
             max_h = max_h.max((loo.forces[j0].unwrap()[0] - (s.forces[j0][0] - ins.forces[j0][0])).abs());
@@ -430,11 +468,12 @@ mod tests {
                 assert_eq!(f.is_some(), s.trains_atom(j), "a force residual exactly for a fitted atom");
             }
             masked += usize::from(!s.is_whole());
-            let (er, fr) = design_rows(&model, &s.pos, &s.z).unwrap();
+            let (er, fr) = design_rows(model, &s.pos, &s.z).unwrap();
             let n = s.pos.len();
             // the rows the sample was fitted with
             let rows: Vec<Vec<f64>> = std::iter::once(er).filter(|_| s.use_energy).chain(fr.into_iter().enumerate().filter(|(r, _)| s.trains_atom(r / 3)).map(|(_, row)| row)).collect();
-            let y: Vec<f64> = std::iter::once((s.energy + 0.5 * n as f64) / n as f64)
+            let e_ref: f64 = basis.species_indices(&s.z).unwrap().iter().map(|&t| refs[t]).sum();
+            let y: Vec<f64> = std::iter::once((s.energy - e_ref) / n as f64)
                 .filter(|_| s.use_energy)
                 .chain(s.forces.iter().enumerate().filter(|(j, _)| s.trains_atom(*j)).flat_map(|(_, f)| f.iter().copied()))
                 .collect();

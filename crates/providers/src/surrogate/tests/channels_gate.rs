@@ -19,9 +19,11 @@
 //!    only (`channels::learn_mix`, review I2/I4 recipe, energy weighting on). **The K = S control is the species
 //!    model itself:** `learn_mix` returns W = I when K_eff = S (review I2f), and W = I reproduces the species
 //!    features (Task 1's identity test; `GATE=tiny` checks the fit end to end on a small basis).
-//! 3. **Predictions from the design rows**, never through `model::energy_and_forces` (whose body-3/4 adjoint is
-//!    not channel-aware until Task 4): the standardised rows the fit itself uses (`loo::design_rows`) dotted with
-//!    the fitted coefficients, and σ_epi² = ‖L⁻¹φ‖² from the fit's posterior factor (no Σ_W term: Task 5).
+//! 3. **Predictions from the design rows**, not through `model::energy_and_forces` (whose body-3/4 adjoint was
+//!    not channel-aware when the gate ran; Task 4 made it so, and the two now agree to 1e-12,
+//!    `channel_hot_path_matches_the_design_rows`): the standardised rows the fit itself uses (`loo::design_rows`)
+//!    dotted with the fitted coefficients, and σ_epi² = ‖L⁻¹φ‖² from the fit's posterior factor (no Σ_W term:
+//!    Task 5).
 //! 4. **Rare-element probe (I7f):** K = 4 with the rarest element that has ≥ 20 training samples and ≥ 20
 //!    held-out atoms (enough to measure) thinned to 20 % (and 5 %) of its training samples, W relearnt on the
 //!    thinned set.

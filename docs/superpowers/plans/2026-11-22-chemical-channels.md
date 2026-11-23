@@ -117,11 +117,12 @@ The spec's section "Physics review, 2026-11-22: binding changes" (C1, C2, I1–I
 - `novelty.rs`, `loo.rs`, `grade.rs`;
 - `envelope.rs` and `providers/src/surrogate/policy.rs`: the isolated-atom test and coordination use geometry or raw per-species counts (Review focus 2).
 
-- [ ] **Step 1, tests:**
+- [x] **Step 1, tests:**
   - `channel_model_forces_are_minus_energy_gradient` (finite differences, 1e-7);
   - `a_neighbour_with_zero_channel_sum_is_not_isolated`;
   - the identity-W fit equals the species fit (energies and forces to 1e-9).
-- [ ] **Step 2:** implement until they pass. Run `cargo test -p surrogate --release`. Commit.
+  - (added) `channel_hot_path_matches_the_design_rows`, `channel_variance_matches_the_dense_posterior`, `the_channel_support_covers_every_scene_of_it`, `channel_loo_matches_a_downdate_of_the_fit`.
+- [x] **Step 2:** implement until they pass. Run `cargo test -p surrogate --release`. Commit. (2026-11-24: the hot path pulls the body-3/4 adjoint back through W; the variance support takes the channels a composition reaches, K(C) — the centres' whole channel blocks for a dense W. fit, novelty, LOO and grade are generic in the column classes and needed no change; the envelope and `policy.rs` none, by the physics review's "Rules 5a/5b are unaffected". Species behaviour bit for bit.)
 
 ### Task 5: uncertainty guards (day 2; physics review before landing)
 
