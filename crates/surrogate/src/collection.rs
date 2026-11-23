@@ -11,7 +11,8 @@
 //!
 //! | file | content |
 //! |---|---|
-//! | `key.txt` | the key, human-readable ([`SurfaceKey::to_text`]); checked on every open, so a slug collision is refused, never mixed |
+//! | `key.txt` | the key, human-readable ([`SurfaceKey::to_text`], plus a `basis channels <K>` line for a channel collection: "The model basis" below); checked on every open, so a slug collision is refused, never mixed |
+//! | `channels.txt` | a channel collection's frozen chemical-channel mix W, its K and diagnostics and Σ_W, rows keyed by Z ("The model basis" below; [`channels_to_text`]); absent until W is learnt |
 //! | `samples.bin` | the samples: magic [`MAGIC`], then append-only records (below) |
 //! | `references.txt` | isolated-atom energies **per box**, one `Z E n ρ` line per (species, box) (Hartree, the solve's grid points per side — the box length (n − 1)·h at the key's h —, its face density in e/Bohr³ or `-`; shortest round-trip decimals; "References" below) |
 //! | `history.bin` | the audit history ([`AuditHistory::encode`]); one written by a newer build (`crate::history::written_by_newer_build`) is never overwritten: the open starts an empty history and says so, and [`Collection::save_history`] leaves the file as it is (trust-tightening plan, Review Focus 1); one that is damaged is replaced at the next save |
@@ -43,7 +44,14 @@
 //!   (1 the atom's forces are fitted, 0 not); bit 1 **energy not fitted** (no field). A sample
 //!   without a mask and with its energy fitted is written with flags 0, byte for byte as before, so
 //!   every older file reads unchanged (as whole samples); a build before Task 10 refuses a record
-//!   with a flag set (below) — it never reads a cap's force as training data.
+//!   with a flag set (below) — it never reads a cap's force as training data. Bit 2 **extra
+//!   targets** (chemical-channels plan Task 3: room for optional further training targets later —
+//!   no bonds or density work yet): after the mask, `version: u8` ([`EXTRA_TARGETS_VERSION`], 1),
+//!   `count: u16`, then `count` × (`kind: u16`, `len: u32`, `len × f64`). **This build writes none**
+//!   (bit 2 is never set) and reads the block by skipping its entries: they are optional targets a
+//!   later build may fit, never a change to the energy and forces this build fits, and the file
+//!   keeps them byte for byte (a purge copies sample records whole). A block of another version
+//!   was written by a newer build and refuses the open.
 //! * kind 2, **status**: `sample index: u64, code: u8` — a later quarantine change of the sample
 //!   with that index ([`crate::quarantine`] codes); the latest record per sample wins on load.
 //!   Code 7 ([`crate::quarantine::Q_FORGOTTEN`], 2026-11-12: forgotten by the user) is new; the
@@ -51,6 +59,30 @@
 //!   its fit (its doc says what else that build does with it). Code 8
 //!   ([`crate::quarantine::Q_FORGOTTEN_UNFENCED`], 2026-11-14: forgotten, its fence lifted) the same way.
 //!   A sample enters with [`Q_NONE`] (the admission rules refuse every other code).
+//!
+//! # The model basis (chemical-channels plan Task 3; spec `2026-11-22-chemical-channels-design.md`)
+//!
+//! A collection is keyed by its solver surface **and** the model basis it is fitted with
+//! ([`BasisKind`]): the species basis (body 3/4 per neighbour species, as before) or the
+//! chemical-channel basis with K requested channels (`crate::descriptor`, "Chemical channels").
+//! Each is its own collection — its own folder, slug suffix `_ch<K>` ([`Collection::slug`]) — so
+//! a channel collection never mixes with a species one; channel collections are new keys and
+//! start empty (no migration: user ruling 2026-11-22). A species collection's `key.txt` and header
+//! are the surface key's text as before; a channel collection's add one line, `basis channels <K>`,
+//! which a build before Task 3 refuses as an unknown field (it never opens a channel collection as
+//! a species one). An open of a folder whose key names another basis is refused.
+//!
+//! **`channels.txt`** holds the frozen mix W of a channel collection ([`channels_to_text`],
+//! [`channels_from_text`]; [`Collection::save_mix`], [`Collection::read_mix`]), versioned
+//! ([`CHANNELS_VERSION`]): the K asked for (the key's) and K_eff, the numerical rank, η, the S
+//! singular values, one `row` line **per species keyed by Z** (its energy weight a_t, its truncation
+//! residual ρ_t and its K weights W[t, ·]), Σ_W as one `sigma_w <Z> <c>` line per row (columns in
+//! the (sorted Z, channel) order of the rows), and the low-order fit's report (`low_order.<field>`
+//! lines; review M7 records Q′, λ and σ with W). Every f64 in Rust's shortest round-trip form, so
+//! the round trip is bit-exact (NaN, a species without a body-3 fibre's ρ, keeps no payload). The
+//! mix is used only for a fit over **exactly** its species ([`mix_for`]): a species set that
+//! differs — an element without a W row, or a row for an element the fit lacks — is refused
+//! (review I5: the provider relearns W instead; the "learn when ready" lifecycle is plan Task 6's).
 //!
 //! # Record versions
 //!
@@ -183,7 +215,9 @@
 //! A pid the OS has since reused for another live process keeps the collection read-only until
 //! that process exits — the safe side. The writer removes the lock when the collection is dropped.
 
-use crate::fit::{Sample, SampleTag};
+use crate::channels::LearntMix;
+use crate::descriptor::ChannelMix;
+use crate::fit::{FitReport, Sample, SampleTag};
 use crate::history::AuditHistory;
 use crate::model::{fnv1a64, Provenance, SurfaceKey};
 use crate::quarantine::{Q_BOX, Q_DRAFT, Q_NONE};
@@ -195,6 +229,337 @@ use std::path::{Path, PathBuf};
 
 /// The magic of `samples.bin` (module doc).
 pub const MAGIC: &[u8; 8] = b"ASCOLL1\0";
+
+/// The model basis a collection is fitted with — half of its key (module doc, "The model basis").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BasisKind {
+    /// Bodies 3 and 4 per neighbour species (`Basis::channels` `None`).
+    #[default]
+    Species,
+    /// Bodies 3 and 4 on `k` learnt chemical channels (the K asked for; the mix may hold fewer,
+    /// [`LearntMix::k`], or W = I when K reaches S).
+    Channels { k: usize },
+}
+
+impl BasisKind {
+    /// The slug's suffix: none for the species basis (its folders are as before), `_ch<K>` else.
+    pub fn slug_suffix(&self) -> String {
+        match self {
+            BasisKind::Species => String::new(),
+            BasisKind::Channels { k } => format!("_ch{k}"),
+        }
+    }
+
+    /// For people: "species" or "channels (K = 3)".
+    pub fn describe(&self) -> String {
+        match self {
+            BasisKind::Species => "species".into(),
+            BasisKind::Channels { k } => format!("channels (K = {k})"),
+        }
+    }
+
+    /// The `key.txt` / header line: none for the species basis, `basis channels <K>` else.
+    fn key_line(&self) -> Option<String> {
+        match self {
+            BasisKind::Species => None,
+            BasisKind::Channels { k } => Some(format!("basis channels {k}\n")),
+        }
+    }
+}
+
+/// A collection's key text (module doc, "The model basis"): the surface key's, plus the basis
+/// line of a channel collection.
+pub fn key_text(key: &SurfaceKey, basis: BasisKind) -> String {
+    let mut t = key.to_text();
+    if let Some(line) = basis.key_line() {
+        t.push_str(&line);
+    }
+    t
+}
+
+/// Reads [`key_text`]'s form: at most one `basis` line (`basis species` or `basis channels <K>`,
+/// K ≥ 1; absent = species), every other line the surface key's.
+pub fn parse_key_text(text: &str) -> Result<(SurfaceKey, BasisKind), String> {
+    let mut basis = None;
+    let mut rest = String::with_capacity(text.len());
+    for line in text.lines() {
+        let l = line.trim_end_matches('\r');
+        match l.strip_prefix("basis ") {
+            Some(v) => {
+                let kind = match v.split_whitespace().collect::<Vec<_>>().as_slice() {
+                    ["species"] => BasisKind::Species,
+                    ["channels", k] => match k.parse::<usize>() {
+                        Ok(k) if k >= 1 => BasisKind::Channels { k },
+                        _ => return Err(format!("basis line '{l}': K must be a whole number ≥ 1")),
+                    },
+                    _ => return Err(format!("basis line '{l}' is not 'basis species' or 'basis channels <K>'")),
+                };
+                if basis.replace(kind).is_some() {
+                    return Err("field 'basis' appears twice".into());
+                }
+            }
+            None => {
+                rest.push_str(l);
+                rest.push('\n');
+            }
+        }
+    }
+    Ok((SurfaceKey::from_text(&rest)?, basis.unwrap_or_default()))
+}
+
+/// The first difference of a stored key (`theirs`) from the one asked for, worded for a refusal.
+fn key_difference(key: &SurfaceKey, basis: BasisKind, theirs: &(SurfaceKey, BasisKind)) -> Option<String> {
+    key.difference(&theirs.0).or_else(|| (basis != theirs.1).then(|| format!("model basis {} (the collection's {})", theirs.1.describe(), basis.describe())))
+}
+
+/// A channel collection's mix file in its folder (module doc, "The model basis").
+pub const CHANNELS_FILE: &str = "channels.txt";
+/// The version of [`CHANNELS_FILE`]'s format this build writes and reads.
+pub const CHANNELS_VERSION: u32 = 1;
+/// The version of a sample record's extra-targets block (module doc, "`samples.bin` records",
+/// flag bit 2).
+pub const EXTRA_TARGETS_VERSION: u8 = 1;
+
+/// The `low_order.<field>` lines of `channels.txt`: every [`FitReport`] field, f64 ones first.
+const LOW_ORDER_F64: [&str; 12] = [
+    "rmse_energy_per_atom",
+    "rmse_force",
+    "sigma_e",
+    "sigma_f",
+    "lambda",
+    "log_evidence",
+    "dof_eff",
+    "gamma_e",
+    "gamma_f",
+    "residual_dof_e",
+    "residual_dof_f",
+    "condition_estimate",
+];
+
+fn low_order_f64(r: &FitReport) -> [f64; 12] {
+    [r.rmse_energy_per_atom, r.rmse_force, r.sigma_e, r.sigma_f, r.lambda, r.log_evidence, r.dof_eff, r.gamma_e, r.gamma_f, r.residual_dof_e, r.residual_dof_f, r.condition_estimate]
+}
+
+fn join_f64(v: &[f64]) -> String {
+    v.iter().map(|x| format!("{x:?}")).collect::<Vec<_>>().join(" ")
+}
+
+/// `channels.txt`'s text for `mix` (module doc, "The model basis"; read back bit-exactly by
+/// [`channels_from_text`]).
+pub fn channels_to_text(mix: &LearntMix) -> String {
+    let (s, k) = (mix.species.len(), mix.k);
+    let mut t = String::new();
+    t.push_str("# Atomic Sandbox chemical-channel mix W of this collection: learnt only from its own DFT samples (CLAUDE.md rule 1's signed-off exception), frozen until relearnt\n");
+    t.push_str("# row <Z> weight <a_t> residual <rho_t> w <W[t,0..K]>; sigma_w <Z> <c> <Sigma_W row t*K+c over (sorted Z, channel)>\n");
+    t.push_str(&format!("version {CHANNELS_VERSION}\n"));
+    t.push_str(&format!("k_requested {}\nk {k}\nrank {}\nnonlinearity {:?}\n", mix.k_requested, mix.rank, mix.nonlinearity));
+    t.push_str(&format!("singular_values {}\n", join_f64(&mix.singular_values)));
+    for (ti, z) in mix.species.iter().enumerate() {
+        t.push_str(&format!("row {z} weight {:?} residual {:?} w {}\n", mix.weights[ti], mix.truncation_residual[ti], join_f64(&mix.w[ti * k..(ti + 1) * k])));
+    }
+    let sk = s * k;
+    if mix.sigma_w.len() == sk * sk {
+        for (ti, z) in mix.species.iter().enumerate() {
+            for c in 0..k {
+                let r = ti * k + c;
+                t.push_str(&format!("sigma_w {z} {c} {}\n", join_f64(&mix.sigma_w[r * sk..(r + 1) * sk])));
+            }
+        }
+    }
+    if let Some(r) = &mix.low_order {
+        for (name, v) in LOW_ORDER_F64.iter().zip(low_order_f64(r)) {
+            t.push_str(&format!("low_order.{name} {v:?}\n"));
+        }
+        t.push_str(&format!("low_order.n_rows {}\nlow_order.n_samples {}\nlow_order.q_prime {}\nlow_order.hyper_iterations {}\nlow_order.converged {}\n", r.n_rows, r.n_samples, r.q_prime, r.hyper_iterations, r.converged));
+    }
+    t
+}
+
+/// Reads [`channels_to_text`]'s form. Strict: the version must be this build's
+/// ([`CHANNELS_VERSION`]; another is "written by another build", the file untouched), every field
+/// once, the rows in strictly ascending Z, each with K finite weights, Σ_W complete or absent, and
+/// the low-order report complete or absent.
+pub fn channels_from_text(text: &str) -> Result<LearntMix, String> {
+    let mut version = None;
+    let (mut k_req, mut k, mut rank, mut eta, mut sv) = (None, None, None, None, None);
+    let mut rows: Vec<(u8, f64, f64, Vec<f64>)> = Vec::new();
+    let mut sigma: Vec<(u8, usize, Vec<f64>)> = Vec::new();
+    let mut low: BTreeMap<String, String> = BTreeMap::new();
+    let nums = |ws: &[&str], what: &str| -> Result<Vec<f64>, String> { ws.iter().map(|w| w.parse::<f64>().map_err(|e| format!("{what}: '{w}': {e}"))).collect() };
+    let one = |slot: &mut Option<String>, name: &str, v: &[&str]| -> Result<(), String> {
+        if v.len() != 1 {
+            return Err(format!("field '{name}' takes one value"));
+        }
+        if slot.replace(v[0].to_string()).is_some() {
+            return Err(format!("field '{name}' appears twice"));
+        }
+        Ok(())
+    };
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let (head, rest) = (w[0], &w[1..]);
+        match head {
+            "version" => one(&mut version, head, rest)?,
+            "k_requested" => one(&mut k_req, head, rest)?,
+            "k" => one(&mut k, head, rest)?,
+            "rank" => one(&mut rank, head, rest)?,
+            "nonlinearity" => one(&mut eta, head, rest)?,
+            "singular_values" => {
+                if sv.replace(nums(rest, head)?).is_some() {
+                    return Err("field 'singular_values' appears twice".into());
+                }
+            }
+            "row" => match rest {
+                [z, "weight", a, "residual", rho, "w", ws @ ..] => {
+                    let z = z.parse::<u8>().ok().filter(|&z| z >= 1).ok_or_else(|| format!("row '{line}': Z must be 1–255"))?;
+                    let a = a.parse::<f64>().map_err(|e| format!("row {z} weight: {e}"))?;
+                    let rho = rho.parse::<f64>().map_err(|e| format!("row {z} residual: {e}"))?;
+                    rows.push((z, a, rho, nums(ws, &format!("row {z} w"))?));
+                }
+                _ => return Err(format!("line '{line}' is not 'row <Z> weight <a> residual <rho> w <K values>'")),
+            },
+            "sigma_w" => match rest {
+                [z, c, vs @ ..] => {
+                    let z = z.parse::<u8>().map_err(|e| format!("sigma_w Z: {e}"))?;
+                    let c = c.parse::<usize>().map_err(|e| format!("sigma_w channel: {e}"))?;
+                    sigma.push((z, c, nums(vs, "sigma_w")?));
+                }
+                _ => return Err(format!("line '{line}' is not 'sigma_w <Z> <c> <values>'")),
+            },
+            h if h.starts_with("low_order.") => {
+                if rest.len() != 1 {
+                    return Err(format!("field '{h}' takes one value"));
+                }
+                if low.insert(h["low_order.".len()..].to_string(), rest[0].to_string()).is_some() {
+                    return Err(format!("field '{h}' appears twice"));
+                }
+            }
+            _ => return Err(format!("unknown field '{head}'")),
+        }
+    }
+    let need = |v: Option<String>, name: &str| v.ok_or_else(|| format!("field '{name}' is missing"));
+    let int = |v: Option<String>, name: &str| -> Result<usize, String> { need(v, name)?.parse::<usize>().map_err(|e| format!("field '{name}': {e}")) };
+    let version: u32 = need(version, "version")?.parse().map_err(|e| format!("field 'version': {e}"))?;
+    if version != CHANNELS_VERSION {
+        return Err(format!("channels.txt version {version} was written by another build (this build reads version {CHANNELS_VERSION})"));
+    }
+    let (k_requested, k, rank) = (int(k_req, "k_requested")?, int(k, "k")?, int(rank, "rank")?);
+    let nonlinearity = need(eta, "nonlinearity")?.parse::<f64>().map_err(|e| format!("field 'nonlinearity': {e}"))?;
+    let singular_values = sv.ok_or("field 'singular_values' is missing")?;
+    let s = rows.len();
+    if s == 0 {
+        return Err("no 'row' lines: a mix has at least one species".into());
+    }
+    if rows.windows(2).any(|p| p[0].0 >= p[1].0) {
+        return Err("the rows must be in strictly ascending Z, each Z once".into());
+    }
+    if k == 0 || k > s || k > k_requested {
+        return Err(format!("K = {k} is not between 1 and min(the {s} species, K asked {k_requested})"));
+    }
+    if singular_values.len() != s {
+        return Err(format!("{} singular values for {s} species", singular_values.len()));
+    }
+    let species: Vec<u8> = rows.iter().map(|r| r.0).collect();
+    let mut w = Vec::with_capacity(s * k);
+    for (z, _, _, ws) in &rows {
+        if ws.len() != k {
+            return Err(format!("row {z} has {} weights for K = {k}", ws.len()));
+        }
+        if let Some(v) = ws.iter().find(|v| !v.is_finite()) {
+            return Err(format!("row {z} has a non-finite weight {v}"));
+        }
+        w.extend_from_slice(ws);
+    }
+    let sk = s * k;
+    let sigma_w = if sigma.is_empty() {
+        Vec::new()
+    } else {
+        if sigma.len() != sk {
+            return Err(format!("{} sigma_w rows for S·K = {sk}", sigma.len()));
+        }
+        let mut out = Vec::with_capacity(sk * sk);
+        for (r, (z, c, vs)) in sigma.iter().enumerate() {
+            if (*z, *c) != (species[r / k], r % k) || vs.len() != sk {
+                return Err(format!("sigma_w row {r} must be Z {} channel {} with {sk} values", species[r / k], r % k));
+            }
+            out.extend_from_slice(vs);
+        }
+        out
+    };
+    let low_order = if low.is_empty() {
+        None
+    } else {
+        let mut take = |name: &str| low.remove(name).ok_or_else(|| format!("field 'low_order.{name}' is missing"));
+        let mut f = [0.0; 12];
+        for (slot, name) in f.iter_mut().zip(LOW_ORDER_F64) {
+            *slot = take(name)?.parse::<f64>().map_err(|e| format!("field 'low_order.{name}': {e}"))?;
+        }
+        let mut u = |name: &str| -> Result<usize, String> { take(name)?.parse::<usize>().map_err(|e| format!("field 'low_order.{name}': {e}")) };
+        let (n_rows, n_samples, q_prime, hyper_iterations) = (u("n_rows")?, u("n_samples")?, u("q_prime")?, u("hyper_iterations")?);
+        let converged = take("converged")?.parse::<bool>().map_err(|e| format!("field 'low_order.converged': {e}"))?;
+        if let Some(extra) = low.keys().next() {
+            return Err(format!("unknown field 'low_order.{extra}'"));
+        }
+        Some(FitReport {
+            rmse_energy_per_atom: f[0],
+            rmse_force: f[1],
+            sigma_e: f[2],
+            sigma_f: f[3],
+            lambda: f[4],
+            log_evidence: f[5],
+            dof_eff: f[6],
+            gamma_e: f[7],
+            gamma_f: f[8],
+            residual_dof_e: f[9],
+            residual_dof_f: f[10],
+            n_rows,
+            n_samples,
+            q_prime,
+            condition_estimate: f[11],
+            hyper_iterations,
+            converged,
+        })
+    };
+    Ok(LearntMix {
+        k,
+        k_requested,
+        weights: rows.iter().map(|r| r.1).collect(),
+        truncation_residual: rows.iter().map(|r| r.2).collect(),
+        species,
+        w,
+        sigma_w,
+        singular_values,
+        nonlinearity,
+        rank,
+        low_order,
+    })
+}
+
+/// The basis mix of `mix` for a fit over `species` (sorted, unique Z): `Ok` only when the species
+/// set is exactly the mix's rows (module doc, "The model basis"; review I5: a mismatched set is
+/// refused, never patched — an element without a W row stays out of the channel model until W is
+/// relearnt with it, and a row the fit lacks would leave W's columns no longer orthonormal over
+/// the fitted species).
+pub fn mix_for(mix: &LearntMix, species: &[u8]) -> Result<ChannelMix, String> {
+    if mix.species != species {
+        let missing: Vec<u8> = species.iter().copied().filter(|z| !mix.species.contains(z)).collect();
+        let extra: Vec<u8> = mix.species.iter().copied().filter(|z| !species.contains(z)).collect();
+        let names = |v: &[u8]| v.iter().map(|&z| element(z)).collect::<Vec<_>>().join(", ");
+        let mut why = Vec::new();
+        if !missing.is_empty() {
+            why.push(format!("no W row for {}", names(&missing)));
+        }
+        if !extra.is_empty() {
+            why.push(format!("W has rows for {} that the fit does not hold", names(&extra)));
+        }
+        return Err(format!("the channel mix was learnt for {} and the fit is over {} ({}): W must be relearnt", names(&mix.species), names(species), why.join("; ")));
+    }
+    Ok(ChannelMix { k: mix.k, w: mix.w.clone() })
+}
 
 /// The refusal of a box-affected sample (by its code, or by its face density on import).
 pub const REFUSE_BOX: &str = "box-affected sample";
@@ -287,8 +652,10 @@ pub const RECORD_VERSION: u8 = 2;
 const FLAG_FORCE_MASK: u16 = 1;
 /// Sample flag bit 1: the energy is not fitted.
 const FLAG_NO_ENERGY: u16 = 2;
+/// Sample flag bit 2: an extra-targets block follows (module doc; never written by this build).
+const FLAG_EXTRA_TARGETS: u16 = 4;
 /// The sample flags this build reads (module doc).
-const SAMPLE_FLAGS_KNOWN: u16 = FLAG_FORCE_MASK | FLAG_NO_ENERGY;
+const SAMPLE_FLAGS_KNOWN: u16 = FLAG_FORCE_MASK | FLAG_NO_ENERGY | FLAG_EXTRA_TARGETS;
 /// The largest record accepted (a hostile or damaged length prefix is not followed past this):
 /// 64 MiB ≈ a 1.3-million-atom sample.
 pub const MAX_RECORD: usize = 1 << 26;
@@ -315,6 +682,8 @@ pub struct CollectionSample {
 #[derive(Debug)]
 pub struct Collection {
     pub key: SurfaceKey,
+    /// The model basis it is fitted with: the other half of its key (module doc, "The model basis").
+    pub basis: BasisKind,
     /// Every stored sample, in the order appended.
     pub samples: Vec<CollectionSample>,
     /// Per sample, its current quarantine code ([`crate::quarantine`]; the latest status record).
@@ -531,8 +900,8 @@ fn frame(payload: &[u8]) -> Vec<u8> {
     rec
 }
 
-fn header_record(key: &SurfaceKey) -> Vec<u8> {
-    let text = key.to_text();
+fn header_record(key: &SurfaceKey, basis: BasisKind) -> Vec<u8> {
+    let text = key_text(key, basis);
     let mut p = vec![REC_HEADER, RECORD_VERSION];
     p.extend_from_slice(&(text.len() as u16).to_le_bytes());
     p.extend_from_slice(text.as_bytes());
@@ -648,12 +1017,32 @@ fn decode_sample(c: &mut Cursor) -> Result<CollectionSample, String> {
     } else {
         None
     };
+    if flags & FLAG_EXTRA_TARGETS != 0 {
+        skip_extra_targets(c)?;
+    }
     c.done()?;
     let sample = Sample { pos, z, energy, forces, tag, weight, force_mask, use_energy: flags & FLAG_NO_ENERGY == 0 };
     if !sample.use_energy && sample.trained_atoms() == 0 {
         return Err("the sample teaches nothing (no energy and no masked-in atom)".into());
     }
     Ok(CollectionSample { sample, grid_n, multiplicity_forced: forced, multiplicity, scene })
+}
+
+/// Reads past a sample's extra-targets block (module doc, flag bit 2): its version must be
+/// [`EXTRA_TARGETS_VERSION`] (another was written by a newer build); its entries are optional
+/// targets this build does not fit, checked for shape and skipped.
+fn skip_extra_targets(c: &mut Cursor) -> Result<(), String> {
+    let v = c.u8("extra-targets version")?;
+    if v != EXTRA_TARGETS_VERSION {
+        return Err(format!("newer build: extra-targets version {v}"));
+    }
+    let count = c.u16("extra-target count")?;
+    for _ in 0..count {
+        let _kind = c.u16("extra-target kind")?;
+        let len = c.u32("extra-target length")? as usize;
+        c.take(len.checked_mul(8).ok_or("an extra target's length overflows")?, "an extra target's values")?;
+    }
+    Ok(())
 }
 
 /// Why `samples.bin` was not read ([`parse`]).
@@ -693,7 +1082,7 @@ struct Parsed {
 
 /// Reads `samples.bin` (module doc): `Err` only for a file that is not a collection, of another
 /// surface, or written by an older or a newer build.
-fn parse(bytes: &[u8], key: &SurfaceKey) -> Result<Parsed, ParseError> {
+fn parse(bytes: &[u8], key: &SurfaceKey, basis: BasisKind) -> Result<Parsed, ParseError> {
     let mut out = Parsed { samples: Vec::new(), quarantine: Vec::new(), good_len: 0, has_header: false, dropped: 0 };
     if bytes.len() < MAGIC.len() {
         // nothing, or a magic torn mid-write
@@ -760,8 +1149,8 @@ fn parse(bytes: &[u8], key: &SurfaceKey) -> Result<Parsed, ParseError> {
                 let n = c.u16("key length").map_err(what)? as usize;
                 let text = std::str::from_utf8(c.take(n, "key").map_err(what)?).map_err(|_| what("the key is not UTF-8".into()))?;
                 c.done().map_err(what)?;
-                let theirs = SurfaceKey::from_text(text).map_err(|e| what(format!("key: {e}")))?;
-                if let Some(d) = key.difference(&theirs) {
+                let theirs = parse_key_text(text).map_err(|e| what(format!("key: {e}")))?;
+                if let Some(d) = key_difference(key, basis, &theirs) {
                     return Err(format!("samples.bin belongs to another surface: {d}").into());
                 }
                 out.has_header = true;
@@ -972,7 +1361,25 @@ impl Collection {
     /// another surface (`key.txt` or the samples' header differ), a `samples.bin` that is not a
     /// collection or holds a record of a newer build; never for a damaged tail.
     pub fn open(root: &Path, key: &SurfaceKey) -> Result<(Collection, OpenReport), String> {
-        let folder = root.join(key.slug());
+        Collection::open_basis(root, key, BasisKind::Species)
+    }
+
+    /// The folder name of the collection of `key` and `basis` under the root (module doc, "The
+    /// model basis"): the surface key's slug, plus `_ch<K>` for a channel collection.
+    pub fn slug_of(key: &SurfaceKey, basis: BasisKind) -> String {
+        format!("{}{}", key.slug(), basis.slug_suffix())
+    }
+
+    /// This collection's folder name ([`slug_of`](Self::slug_of)).
+    pub fn slug(&self) -> String {
+        Collection::slug_of(&self.key, self.basis)
+    }
+
+    /// [`open`](Self::open) for the collection of `key` fitted with `basis` (module doc, "The model
+    /// basis"): its own folder `root/<slug_of(key, basis)>`, its own key; a folder whose `key.txt`
+    /// or header names another basis is refused.
+    pub fn open_basis(root: &Path, key: &SurfaceKey, basis: BasisKind) -> Result<(Collection, OpenReport), String> {
+        let folder = root.join(Collection::slug_of(key, basis));
         let at = |e: io::Error| format!("{}: {e}", folder.display());
         std::fs::create_dir_all(&folder).map_err(at)?;
         let mut report = OpenReport::default();
@@ -993,14 +1400,14 @@ impl Collection {
         let key_path = folder.join("key.txt");
         match std::fs::read_to_string(&key_path) {
             Ok(text) => {
-                let theirs = SurfaceKey::from_text(&text).map_err(|e| format!("{}: {e}", key_path.display()))?;
-                if let Some(d) = key.difference(&theirs) {
+                let theirs = parse_key_text(&text).map_err(|e| format!("{}: {e}", key_path.display()))?;
+                if let Some(d) = key_difference(key, basis, &theirs) {
                     return Err(format!("{} holds another surface: {d}", folder.display()));
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 if !read_only {
-                    write_atomic(&key_path, key.to_text().as_bytes()).map_err(at)?;
+                    write_atomic(&key_path, key_text(key, basis).as_bytes()).map_err(at)?;
                 }
             }
             Err(e) => return Err(at(e)),
@@ -1013,7 +1420,7 @@ impl Collection {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(at(e)),
         };
-        let parsed = parse(&bytes, key).map_err(|e| format!("{}: {e}", path.display()))?;
+        let parsed = parse(&bytes, key, basis).map_err(|e| format!("{}: {e}", path.display()))?;
         report.dropped_tail = parsed.dropped;
         let mut file = None;
         if parsed.good_len < bytes.len() {
@@ -1039,7 +1446,7 @@ impl Collection {
                 // a new file, or one whose magic or header was torn: start it afresh
                 f.set_len(0).map_err(at)?;
                 let mut head = MAGIC.to_vec();
-                head.extend_from_slice(&header_record(key));
+                head.extend_from_slice(&header_record(key, basis));
                 f.write_all(&head).map_err(at)?;
                 f.sync_data().map_err(at)?;
             } else if parsed.good_len < bytes.len() {
@@ -1099,6 +1506,7 @@ impl Collection {
         };
         let c = Collection {
             key: key.clone(),
+            basis,
             samples: parsed.samples,
             quarantine: parsed.quarantine,
             references,
@@ -1123,6 +1531,42 @@ impl Collection {
     /// The collection's folder (`root/<slug>`).
     pub fn folder(&self) -> &Path {
         &self.folder
+    }
+
+    /// Writes `mix` as this channel collection's frozen W (`channels.txt`, module doc "The model
+    /// basis"; replaced whole through a temporary file). Refused for a species collection, a
+    /// read-only handle, or a mix learnt for another K than the key's.
+    pub fn save_mix(&self, mix: &LearntMix) -> Result<(), String> {
+        let BasisKind::Channels { k } = self.basis else {
+            return Err(format!("the collection {} has the species basis: it holds no channel mix", self.slug()));
+        };
+        if mix.k_requested != k {
+            return Err(format!("a mix learnt for K = {} is not this collection's (K = {k})", mix.k_requested));
+        }
+        if self.read_only {
+            return Err(format!("the collection {} is read-only (another process holds it)", self.slug()));
+        }
+        let path = self.folder.join(CHANNELS_FILE);
+        write_atomic(&path, channels_to_text(mix).as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// This channel collection's frozen W (`channels.txt`): `Ok(None)` for a species collection or
+    /// before W is learnt (no file); `Err` for a file this build cannot read or one learnt for
+    /// another K than the key's (the file untouched). Whether it fits a fit's species set is
+    /// [`mix_for`]'s question.
+    pub fn read_mix(&self) -> Result<Option<LearntMix>, String> {
+        let BasisKind::Channels { k } = self.basis else { return Ok(None) };
+        let path = self.folder.join(CHANNELS_FILE);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let mix = channels_from_text(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        if mix.k_requested != k {
+            return Err(format!("{}: learnt for K = {}, the collection's key says K = {k}", path.display(), mix.k_requested));
+        }
+        Ok(Some(mix))
     }
 
     /// Would this sample — produced at `prov`, with the provider's quarantine code `quarantine` —
@@ -1259,6 +1703,7 @@ impl Collection {
     pub fn detached_view(&self) -> Collection {
         Collection {
             key: self.key.clone(),
+            basis: self.basis,
             samples: Vec::new(),
             quarantine: self.quarantine.clone(),
             references: self.references.clone(),
@@ -1353,7 +1798,7 @@ impl Collection {
         let new = rewrite_without(&old[..self.good_len as usize], &map).map_err(|e| format!("{}: {e}; nothing was changed", path.display()))?;
         let kept: Vec<CollectionSample> = self.samples.iter().zip(&map).filter(|(_, m)| m.is_some()).map(|(s, _)| s.clone()).collect();
         let kept_codes: Vec<u8> = self.quarantine.iter().zip(&map).filter(|(_, m)| m.is_some()).map(|(&q, _)| q).collect();
-        let check = parse(&new, &self.key).map_err(|e| format!("the rewritten samples file does not read back ({e}); nothing was changed"))?;
+        let check = parse(&new, &self.key, self.basis).map_err(|e| format!("the rewritten samples file does not read back ({e}); nothing was changed"))?;
         if check.samples != kept || check.quarantine != kept_codes || check.good_len != new.len() {
             return Err("the rewritten samples file does not hold exactly the kept samples and codes; nothing was changed".into());
         }
@@ -1661,7 +2106,7 @@ impl Collection {
         let r_cut = crate::descriptor::COLLECTION_R_CUT;
         let mut t = String::new();
         t.push_str("Atomic Sandbox — shared model collection\n\n");
-        t.push_str(&format!("surface: {}\nfolder:  {}\n\n", self.key.describe(), self.key.slug()));
+        t.push_str(&format!("surface: {}\nbasis:   {}\nfolder:  {}\n\n", self.key.describe(), self.basis.describe(), self.slug()));
         let count = |code: u8| self.quarantine.iter().filter(|&&q| q == code).count();
         let n = self.samples.len();
         t.push_str(&format!(
@@ -2674,5 +3119,220 @@ mod tests {
         // version 0 was never written: not a format, never read
         std::fs::write(&path, with_version(&bytes, 4, 0)).unwrap();
         assert!(Collection::open(&dir, &key).is_err());
+    }
+
+    // ---- the model basis (chemical-channels plan Task 3) ----
+
+    /// A hand-built mix over H, O, S at K = 2 (requested 3): awkward values (−0.0, a subnormal, a
+    /// 17-digit weight), a NaN residual (a species without a body-3 fibre), the full Σ_W and the
+    /// low-order report with its pinned σ_E.
+    fn mix() -> LearntMix {
+        let (s, k) = (3usize, 2usize);
+        let w = vec![0.7071067811865476, -0.0, 0.5, 0.8660254037844386, -0.49999999999999994, 5e-324];
+        let sigma_w = (0..s * k * s * k).map(|q| if q % (s * k + 1) == 0 { 1e-3 * (1 + q) as f64 } else { -1.25e-7 * q as f64 }).collect();
+        let report = FitReport {
+            rmse_energy_per_atom: 1.2e-4,
+            rmse_force: 3.4e-3,
+            sigma_e: crate::fit::SIGMA_E_WITHOUT_ENERGY_ROWS,
+            sigma_f: 2.0e-3,
+            lambda: 0.123_456_789_012_345_67,
+            log_evidence: -1234.5,
+            dof_eff: 345.25,
+            gamma_e: 0.5,
+            gamma_f: 0.25,
+            residual_dof_e: 10.0,
+            residual_dof_f: 1000.0,
+            n_rows: 4321,
+            n_samples: 321,
+            q_prime: 735,
+            condition_estimate: f64::INFINITY,
+            hyper_iterations: 6,
+            converged: true,
+        };
+        LearntMix {
+            k,
+            k_requested: 3,
+            species: vec![1, 8, 16],
+            w,
+            sigma_w,
+            singular_values: vec![3.8, 2.3, 0.0],
+            truncation_residual: vec![0.01, 0.2, f64::NAN],
+            nonlinearity: 0.067,
+            weights: vec![1.5, 0.25, 1.0],
+            rank: 2,
+            low_order: Some(report),
+        }
+    }
+
+    /// Bit-exact equality of two mixes (NaN equals NaN: `PartialEq` would not say so).
+    fn same_mix(a: &LearntMix, b: &LearntMix) -> bool {
+        let bits = |v: &[f64]| v.iter().map(|x| if x.is_nan() { u64::MAX } else { x.to_bits() }).collect::<Vec<_>>();
+        let report = |r: &Option<FitReport>| r.as_ref().map(|r| (bits(&low_order_f64(r)), r.n_rows, r.n_samples, r.q_prime, r.hyper_iterations, r.converged));
+        (a.k, a.k_requested, &a.species, a.rank) == (b.k, b.k_requested, &b.species, b.rank)
+            && [(&a.w, &b.w), (&a.sigma_w, &b.sigma_w), (&a.singular_values, &b.singular_values), (&a.truncation_residual, &b.truncation_residual), (&a.weights, &b.weights)].iter().all(|(x, y)| bits(x) == bits(y))
+            && a.nonlinearity.to_bits() == b.nonlinearity.to_bits()
+            && report(&a.low_order) == report(&b.low_order)
+    }
+
+    /// `channels.txt` reads back bit for bit (rows keyed by Z, Σ_W, the low-order report; without
+    /// the optional parts too), through a channel collection's save and read; its strictness.
+    #[test]
+    fn channels_txt_round_trips() {
+        let m = mix();
+        let text = channels_to_text(&m);
+        assert!(text.contains("\nrow 1 weight 1.5 residual 0.01 w 0.7071067811865476 -0.0\n"), "{text}");
+        assert!(text.contains("\nrow 16 weight 1.0 residual NaN w -0.49999999999999994 5e-324\n"), "{text}");
+        assert!(text.contains("\nversion 1\n") && text.contains("\nsigma_w 8 1 "), "{text}");
+        assert!(same_mix(&channels_from_text(&text).unwrap(), &m));
+        let mut bare = m.clone();
+        bare.sigma_w.clear();
+        bare.low_order = None;
+        assert!(same_mix(&channels_from_text(&channels_to_text(&bare)).unwrap(), &bare));
+
+        // through the collection's file
+        let dir = root("channels-txt");
+        let key = prov().surface_key();
+        let (c, _) = Collection::open_basis(&dir, &key, BasisKind::Channels { k: 3 }).unwrap();
+        assert_eq!(c.read_mix(), Ok(None), "no W before it is learnt");
+        c.save_mix(&m).unwrap();
+        assert!(same_mix(&c.read_mix().unwrap().unwrap(), &m));
+        assert_eq!(std::fs::read_to_string(c.folder().join(CHANNELS_FILE)).unwrap(), text);
+        let mut other_k = m.clone();
+        other_k.k_requested = 4;
+        assert!(c.save_mix(&other_k).unwrap_err().contains("K = 4"));
+        drop(c);
+        let (species, _) = Collection::open(&dir, &key).unwrap();
+        assert!(species.save_mix(&m).unwrap_err().contains("species basis"));
+        assert_eq!(species.read_mix(), Ok(None));
+
+        // refusals: another version, a row out of order, a short row, a missing field, Σ_W cut short
+        let swap = text.replace("row 1 weight", "row 99 weight");
+        let cases: Vec<(&str, String, &str)> = vec![
+            ("version", text.replace("version 1\n", "version 2\n"), "another build"),
+            ("order", swap, "ascending"),
+            ("short row", text.replace("w 0.7071067811865476 -0.0\n", "w 0.7071067811865476\n"), "weights for K"),
+            ("missing k", text.replace("\nk 2\n", "\n"), "'k' is missing"),
+            ("sigma rows", text.lines().filter(|l| !l.starts_with("sigma_w 16 1 ")).map(|l| format!("{l}\n")).collect(), "sigma_w rows"),
+            ("unknown", format!("{text}colour blue\n"), "unknown field"),
+            ("K above S", text.replace("\nk 2\n", "\nk 4\n"), "between 1"),
+        ];
+        for (what, t, want) in cases {
+            let e = channels_from_text(&t).unwrap_err();
+            assert!(e.contains(want), "{what}: {e}");
+        }
+    }
+
+    /// A channel collection is its own key: its own folder (`_ch<K>`), its own `key.txt` and header
+    /// line, never the species collection of the same surface nor another K's; a folder whose key
+    /// names another basis is refused, the files untouched. The species collection's folder and key
+    /// are the surface key's as before.
+    #[test]
+    fn a_channel_collection_has_its_own_key() {
+        let dir = root("channel-key");
+        let key = prov().surface_key();
+        let ch3 = BasisKind::Channels { k: 3 };
+        assert_eq!(Collection::slug_of(&key, BasisKind::Species), key.slug(), "the species folder is as before");
+        assert_eq!(Collection::slug_of(&key, ch3), format!("{}_ch3", key.slug()));
+        assert_ne!(Collection::slug_of(&key, ch3), Collection::slug_of(&key, BasisKind::Channels { k: 4 }));
+        {
+            let (mut sp, _) = Collection::open(&dir, &key).unwrap();
+            sp.append(cs(0)).unwrap();
+            let (mut ch, _) = Collection::open_basis(&dir, &key, ch3).unwrap();
+            assert!(ch.samples.is_empty(), "a channel collection starts empty");
+            ch.append(cs(1)).unwrap();
+            ch.append(cs(2)).unwrap();
+            assert_eq!((sp.basis, ch.basis, sp.slug(), ch.slug()), (BasisKind::Species, ch3, key.slug(), format!("{}_ch3", key.slug())));
+        }
+        let sp_key = std::fs::read_to_string(dir.join(key.slug()).join("key.txt")).unwrap();
+        assert_eq!(sp_key, key.to_text(), "the species key.txt is the surface key's text");
+        let ch_folder = dir.join(Collection::slug_of(&key, ch3));
+        let ch_key = std::fs::read_to_string(ch_folder.join("key.txt")).unwrap();
+        assert_eq!(ch_key, format!("{}basis channels 3\n", key.to_text()));
+        assert_eq!(parse_key_text(&ch_key).unwrap(), (key.clone(), ch3));
+        assert_eq!(parse_key_text(&sp_key).unwrap(), (key.clone(), BasisKind::Species));
+        assert!(SurfaceKey::from_text(&ch_key).is_err(), "a build before Task 3 refuses a channel key (unknown field)");
+        let header = &frames(&std::fs::read(ch_folder.join("samples.bin")).unwrap())[0].1;
+        assert!(String::from_utf8_lossy(header).ends_with("basis channels 3\n"), "the samples' header carries the basis");
+        let (sp, _) = Collection::open(&dir, &key).unwrap();
+        let (ch, _) = Collection::open_basis(&dir, &key, ch3).unwrap();
+        assert_eq!((sp.samples.len(), ch.samples.len()), (1, 2), "never mixed");
+        drop((sp, ch));
+        // a folder whose key.txt (or header) names another basis: refused, untouched
+        let (k4, _) = Collection::open_basis(&dir, &key, BasisKind::Channels { k: 4 }).unwrap();
+        let k4_folder = k4.folder().to_path_buf();
+        drop(k4);
+        std::fs::write(k4_folder.join("key.txt"), &ch_key).unwrap();
+        let e = Collection::open_basis(&dir, &key, BasisKind::Channels { k: 4 }).unwrap_err();
+        assert!(e.contains("model basis channels (K = 3)"), "{e}");
+        assert_eq!(std::fs::read_to_string(k4_folder.join("key.txt")).unwrap(), ch_key);
+        std::fs::write(k4_folder.join("key.txt"), key_text(&key, BasisKind::Channels { k: 4 })).unwrap();
+        let samples = std::fs::read(ch_folder.join("samples.bin")).unwrap();
+        std::fs::write(k4_folder.join("samples.bin"), &samples).unwrap();
+        let e = Collection::open_basis(&dir, &key, BasisKind::Channels { k: 4 }).unwrap_err();
+        assert!(e.contains("another surface") && e.contains("model basis"), "{e}");
+        assert_eq!(std::fs::read(k4_folder.join("samples.bin")).unwrap(), samples, "untouched");
+        // key texts: a bad basis line is refused
+        for bad in ["basis channels 0", "basis channels x", "basis lattice", "basis species\nbasis species"] {
+            assert!(parse_key_text(&format!("{}{bad}\n", key.to_text())).is_err(), "{bad}");
+        }
+    }
+
+    /// A mix is used only for a fit over exactly its species (review I5): an element without a W
+    /// row, or a row the fit does not hold, is refused with the reason; the same set gives W.
+    #[test]
+    fn a_mismatched_species_set_is_refused() {
+        let m = mix();
+        assert_eq!(mix_for(&m, &[1, 8, 16]), Ok(ChannelMix { k: 2, w: m.w.clone() }));
+        let e = mix_for(&m, &[1, 6, 8, 16]).unwrap_err();
+        assert!(e.contains("no W row for C") && e.contains("relearnt"), "{e}");
+        let e = mix_for(&m, &[1, 8]).unwrap_err();
+        assert!(e.contains("rows for S that the fit does not hold"), "{e}");
+        let e = mix_for(&m, &[1, 9, 16]).unwrap_err();
+        assert!(e.contains("no W row for F") && e.contains("rows for O"), "{e}");
+    }
+
+    /// The reserved extra-targets block (flag bit 2): this build writes none, reads a sample that
+    /// carries one as the same sample (its entries skipped), keeps it in the file, and refuses a
+    /// block of another version as a newer build's.
+    #[test]
+    fn a_sample_with_extra_targets_reads_as_the_same_sample() {
+        let dir = root("extra-targets");
+        let key = prov().surface_key();
+        let path = samples_path(&dir, &key);
+        {
+            let (mut c, _) = Collection::open(&dir, &key).unwrap();
+            c.append(cs(1)).unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let recs = frames(&bytes);
+        assert_eq!(u16::from_le_bytes(recs[1].1[10..12].try_into().unwrap()) & FLAG_EXTRA_TARGETS, 0, "never written");
+        let with_block = |version: u8| {
+            let mut payload = recs[1].1[8..].to_vec();
+            let flags = u16::from_le_bytes(payload[2..4].try_into().unwrap()) | FLAG_EXTRA_TARGETS;
+            payload[2..4].copy_from_slice(&flags.to_le_bytes());
+            payload.push(version);
+            payload.extend_from_slice(&2u16.to_le_bytes());
+            for (kind, vals) in [(7u16, vec![1.0, -2.5]), (9, vec![])] {
+                payload.extend_from_slice(&kind.to_le_bytes());
+                payload.extend_from_slice(&(vals.len() as u32).to_le_bytes());
+                for v in vals {
+                    payload.extend_from_slice(&f64::to_le_bytes(v));
+                }
+            }
+            let mut out = bytes[..8].to_vec();
+            out.extend_from_slice(&recs[0].1);
+            out.extend_from_slice(&frame(&payload));
+            out
+        };
+        let file = with_block(EXTRA_TARGETS_VERSION);
+        std::fs::write(&path, &file).unwrap();
+        let (c, rep) = Collection::open(&dir, &key).unwrap();
+        assert_eq!((c.samples.clone(), rep.dropped_tail), (vec![cs(1)], 0));
+        drop(c);
+        assert_eq!(std::fs::read(&path).unwrap(), file, "kept byte for byte");
+        let newer = with_block(EXTRA_TARGETS_VERSION + 1);
+        std::fs::write(&path, &newer).unwrap();
+        let e = Collection::open(&dir, &key).unwrap_err();
+        assert!(e.contains("written by a newer build"), "{e}");
     }
 }

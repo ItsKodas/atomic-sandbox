@@ -3,13 +3,14 @@
 //! envelope and can keep learning), the last [`FitReport`] and, optionally, the training
 //! [`Sample`]s themselves. Hand-written serialisation (no serde): the format is small and fixed.
 //!
-//! # Format (versions 9 and 10; this build writes every file as version 9, which carries the body
+//! # Format (versions 9, 10 and 11; this build writes every file as version 9, which carries the body
 //! of version 7 for a fitted model — a body-2 or a body-3 basis alike —, of version 8 for a body-4
 //! basis, of version 6 for samples without a fit — or as version 10, the same with the audit
-//! history's trust-tightening arrays, when the history carries them; it reads those two only)
+//! history's trust-tightening arrays, when the history carries them — or as version 11, a fitted
+//! model on a chemical-channel basis; it reads those three only)
 //!
 //! ```text
-//! "ASMODEL9" or "ASMOD010"          8 bytes, magic (the version)
+//! "ASMODEL9", "ASMOD010", "ASMOD011" 8 bytes, magic (the version)
 //! header_len                       u64 little-endian
 //! header                           header_len bytes of UTF-8 JSON (below)
 //! array₁ … arrayₖ                  in the order the header's "arrays" lists them, each
@@ -249,6 +250,21 @@
 //! would refuse the three as undeclared — it refuses the file as "format version 10 is newer than
 //! this build" instead, and the app's downgrade warnings name it (`app::update::formats`).
 //!
+//! **Version 11** (chemical channels, plan 2026-11-22 Task 3; magic `ASMOD011`): a fitted model
+//! (body **7** or **8**) whose basis is on learnt chemical channels (`Basis::channels`,
+//! `crate::descriptor` "Chemical channels"). Its basis object carries one more key, `channels`
+//! {k (JSON integer, 1 ≤ K ≤ S), w (S·K numbers, W row-major `w[t·K + c]` over the basis's sorted
+//! species, shortest round-trip decimals — bit-exact)}, required in version 11 and refused under any
+//! other magic; the basis must have body 3. Every array length follows from the channel basis's P
+//! and Q′ (body 3/4 indexed by channel), and the `body3_terms` the reader regenerates are the
+//! channel basis's. Its audit history is version 9's or version 10's: the three trust-tightening
+//! arrays are present exactly when declared right after the history's arrays (the writer adds them
+//! when the history carries them), so a channel model never needs a twelfth version for that.
+//! Written exactly when the basis has channels: every species-basis file is still version 9 or 10,
+//! bit for bit. The bump is real: a version-10 build would read the arrays at the species basis's
+//! lengths — it refuses the file as "format version 11 is newer than this build" instead (so the
+//! loader sets the mix a channel model was fitted with, never the species basis).
+//!
 //! **The fit id** (trust tightening Task 2): a fitted model's file may carry the header key
 //! `fit_id` (a JSON integer below 2⁵³, after `class_memory`), the id of the fit it holds — the id
 //! its history points carry (`crate::history`, "Trust-tightening fields") and the one an install
@@ -289,16 +305,19 @@ pub const MAGIC_V9: &[u8; 8] = b"ASMODEL9";
 /// trust-tightening per-point arrays (module doc, "Version 10"). Written only when the history carries them; its
 /// header names the fitted body it carries (7 or 8).
 pub const MAGIC_V10: &[u8; 8] = b"ASMOD010";
+/// The first eight bytes of a version-11 file: a fitted model on a chemical-channel basis, its basis
+/// carrying K and W (module doc, "Version 11"). Written exactly when the basis has channels.
+pub const MAGIC_V11: &[u8; 8] = b"ASMOD011";
 /// Every magic this build reads, oldest first: versions [`OLDEST_VERSION`] to [`NEWEST_VERSION`]. A file of an
 /// earlier version (1 to 8, before the Fermi–Dirac switch) is refused as made by an older version of the app (module
 /// doc, "Older files").
-pub const MAGICS: [&[u8; 8]; 2] = [MAGIC_V9, MAGIC_V10];
+pub const MAGICS: [&[u8; 8]; 3] = [MAGIC_V9, MAGIC_V10, MAGIC_V11];
 /// The oldest model-file version this build reads ([`MAGIC_V9`]).
 pub const OLDEST_VERSION: u32 = 9;
 /// The newest model-file version this build reads and writes ([`MAGIC_V10`]): the model-file format a release
 /// manifest records (`app::update::formats`). A new version's magic goes into [`MAGICS`] with its reader in
 /// `parse_header`, and this moves on.
-pub const NEWEST_VERSION: u32 = 10;
+pub const NEWEST_VERSION: u32 = 11;
 /// The version an 8-byte sidecar magic names under the magic layout (module doc, "The magic"):
 /// `ASMODEL<d>` is version d (1 to 9), `ASMOD<ddd>` — three decimal digits — version ddd (10 to 999);
 /// `None` for anything else (`ASMOD009`, `ASMODEL0`, another file's magic). Whether this build reads
@@ -321,6 +340,9 @@ const BODIES_V9: [u8; 3] = [6, 7, 8];
 /// The bodies a version-10 file may carry: a fitted model's (7, 8) — only a fitted model has an
 /// audit history (module doc, "Version 10").
 const BODIES_V10: [u8; 2] = [7, 8];
+/// The bodies a version-11 file may carry: a fitted model's (7, 8) on a channel basis (module doc,
+/// "Version 11").
+const BODIES_V11: [u8; 2] = [7, 8];
 /// Species a body-3 file may declare (a hostile-header guard: P₃ grows with (S·n_max)²).
 const MAX_SPECIES_V2: usize = 32;
 /// The `reference_rule` of references solved under ruling S9: each isolated atom at its
@@ -751,7 +773,14 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
             arrays.push((HistoryArrays::MODEL_FORCE, &a.model_force));
         }
     }
-    let magic = if trust.is_some() { MAGIC_V10 } else { MAGIC_V9 };
+    // a channel basis (version 11, module doc) whatever its history; otherwise as before
+    let magic = if basis.channels().is_some() {
+        MAGIC_V11
+    } else if trust.is_some() {
+        MAGIC_V10
+    } else {
+        MAGIC_V9
+    };
 
     let provenance = provenance_json(&model.provenance);
     let species = format!("[{}]", basis.species.iter().map(|z| z.to_string()).collect::<Vec<_>>().join(","));
@@ -768,6 +797,11 @@ fn encode(model: &Model, acc: &Accumulator, report: Option<&FitReport>, samples:
     if basis.body4 {
         basis_pairs.push(("body4", "true".into()));
         basis_pairs.push(("body4_cap", basis.body4_cap().to_string()));
+    }
+    // version 11 only (module doc): the channel mix, K and W row-major S × K
+    if let Some(mix) = basis.channels() {
+        let w = format!("[{}]", mix.w.iter().map(|&x| num(x)).collect::<Vec<_>>().join(","));
+        basis_pairs.push(("channels", obj(&[("k", mix.k.to_string()), ("w", w)])));
     }
     let basis_json = obj(&basis_pairs);
     let model_json = obj(&[
@@ -1186,12 +1220,39 @@ fn parse_header(bytes: &[u8]) -> Result<(u8, Json), String> {
         return Err(format!("header format {format:?} does not match the file's version {version}"));
     }
     // the body it carries (module doc, "Version 9", "Version 10") is read as that layout from here on
-    let bodies: &[u8] = if magic == MAGIC_V10 { &BODIES_V10 } else { &BODIES_V9 };
+    let bodies: &[u8] = if magic == MAGIC_V11 {
+        &BODIES_V11
+    } else if magic == MAGIC_V10 {
+        &BODIES_V10
+    } else {
+        &BODIES_V9
+    };
     let body = h.get("body").map_err(|_| format!("a version-{version} file names the body it carries (its header has no \"body\" key)"))?.u64()?;
     match u8::try_from(body).ok().filter(|b| bodies.contains(b)) {
         Some(b) => Ok((b, h)),
         None => Err(format!("a version-{version} file carries body {} (this one names {body})", bodies.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(", "))),
     }
+}
+
+/// A version-11 basis's `channels` object {k, w} (module doc, "Version 11"): 1 ≤ K ≤ S, W of
+/// S·K finite numbers, and a basis with body 3 (the channels mix bodies 3 and 4 only).
+fn decode_channels(c: &Json, s: usize, body3: bool) -> Result<crate::descriptor::ChannelMix, String> {
+    if !body3 {
+        return Err("a channel basis without body 3 (the channels mix bodies 3 and 4)".into());
+    }
+    let k = c.get("k")?.usize()?;
+    if !(1..=s).contains(&k) {
+        return Err(format!("channel count K = {k} outside 1..={s} (the basis's species)"));
+    }
+    let w = c.get("w")?.arr()?;
+    if w.len() != s * k {
+        return Err(format!("the channel mix has {} entries, not S·K = {}", w.len(), s * k));
+    }
+    let w = w.iter().map(Json::f64).collect::<Result<Vec<f64>, String>>()?;
+    if let Some(i) = w.iter().position(|x| !x.is_finite()) {
+        return Err(format!("the channel mix entry {i} is not finite"));
+    }
+    Ok(crate::descriptor::ChannelMix { k, w })
 }
 
 fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
@@ -1256,7 +1317,15 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     } else {
         BODY4_DEGREE_START
     };
-    let basis = Basis {
+    // version 11 (module doc): the channel mix, required there and nowhere else
+    let channel_file = &bytes[..8] == MAGIC_V11;
+    let channels = match (channel_file, b.get("channels")) {
+        (true, Ok(c)) => Some(decode_channels(c, species.len(), body3)?),
+        (true, Err(_)) => return Err("a version-11 file has a channel basis (its basis has no \"channels\" key)".into()),
+        (false, Ok(_)) => return Err("a channel basis is written as version 11 (this file's magic is not ASMOD011)".into()),
+        (false, Err(_)) => None,
+    };
+    let mut basis = Basis {
         n_max,
         l_max,
         r_cut,
@@ -1265,9 +1334,11 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         body4,
         body4_degree,
         species,
-        // the sidecar does not carry a chemical-channel mix yet (chemical-channels plan, Task 3)
         channels: None,
     };
+    if let Some(mix) = channels {
+        basis = basis.with_channels(mix);
+    }
     if body4 && body4_degree != basis.body4_cap() {
         return Err(format!("body4_cap {body4_degree} differs from this build's layout for the basis ({})", basis.body4_cap()));
     }
@@ -1362,8 +1433,9 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
     if has_species {
         fixed.push((HistoryArrays::SPECIES, None));
     }
-    // version 10 (module doc): the three trust-tightening arrays, required, last
-    let has_trust = &bytes[..8] == MAGIC_V10;
+    // version 10 (module doc): the three trust-tightening arrays, required, last; version 11
+    // (a channel basis): optional, present when declared right after the history's arrays
+    let has_trust = &bytes[..8] == MAGIC_V10 || (channel_file && history_counts.is_some() && declared.get(fixed.len()).is_some_and(|(n, _)| n == HistoryArrays::FIT));
     if has_trust {
         let Some((points, _, _)) = &history_counts else {
             return Err("a version-10 file carries an audit history (its header has no \"audit_history\" key)".into());
@@ -2204,6 +2276,11 @@ pub(crate) mod tests {
 
     /// [`random_sidecar_with`] at a chosen body-4 degree (`Basis::body4_degree`).
     pub(crate) fn random_sidecar_at(seed: u64, body3: bool, body4: bool, body4_degree: usize) -> Sidecar {
+        random_sidecar_mixed(seed, body3, body4, body4_degree, None)
+    }
+
+    /// [`random_sidecar_at`] with its body-3/4 blocks on the chemical channels of `mix` (S = 3).
+    pub(crate) fn random_sidecar_mixed(seed: u64, body3: bool, body4: bool, body4_degree: usize, mix: Option<crate::descriptor::ChannelMix>) -> Sidecar {
         let mut rng = StdRng::seed_from_u64(seed);
         let mut basis = Basis::new(&[1, 6, 8]);
         basis.body3 = body3;
@@ -2215,6 +2292,9 @@ pub(crate) mod tests {
             basis.n_max = 3;
             basis.l_max = 2;
             basis.degree_cap = 10;
+        }
+        if let Some(m) = mix {
+            basis = basis.with_channels(m);
         }
         let p = basis.n_features();
         let s = basis.n_species();
@@ -2829,7 +2909,7 @@ pub(crate) mod tests {
     }
 
     /// Module doc, "The magic": `ASMODEL<d>` names 1 to 9 and `ASMOD<ddd>` 10 to 999; the reader takes exactly
-    /// `MAGICS` (versions 9 and 10), refuses an earlier version as made by an older version of the app ("Older
+    /// `MAGICS` (versions 9 to 11), refuses an earlier version as made by an older version of the app ("Older
     /// files"), a later version as newer by its number, any other `ASMOD…` magic as newer, and anything else as not
     /// a sidecar.
     #[test]
@@ -2837,7 +2917,7 @@ pub(crate) mod tests {
         for (i, m) in MAGICS.iter().enumerate() {
             assert_eq!(magic_version(&m[..]), Some(OLDEST_VERSION + i as u32));
         }
-        assert_eq!((MAGICS, OLDEST_VERSION, NEWEST_VERSION), ([MAGIC_V9, MAGIC_V10], 9, 10));
+        assert_eq!((MAGICS, OLDEST_VERSION, NEWEST_VERSION), ([MAGIC_V9, MAGIC_V10, MAGIC_V11], 9, 11));
         for (m, v) in [(b"ASMODEL1", Some(1)), (b"ASMODEL8", Some(8)), (b"ASMOD010", Some(10)), (b"ASMOD999", Some(999)), (b"ASMOD123", Some(123)), (b"ASMOD009", None), (b"ASMODEL0", None), (b"ASMODELX", None), (b"ASAUDIT1", None), (b"ASMOD01x", None)] {
             assert_eq!(magic_version(&m[..]), v, "{}", String::from_utf8_lossy(m));
         }
@@ -2848,8 +2928,9 @@ pub(crate) mod tests {
             bytes.extend_from_slice(b"{}");
             parse_header(&bytes).expect_err("no such version, or no provenance")
         };
-        // version 10 is this build's own since trust tightening Task 1; 11 is the next
-        assert!(refusal(b"ASMOD011").contains("format version 11 is newer than this build (it reads versions 9 to 10)"), "{}", refusal(b"ASMOD011"));
+        // version 11 is this build's own since chemical channels Task 3; 12 is the next
+        assert!(refusal(b"ASMOD012").contains("format version 12 is newer than this build (it reads versions 9 to 11)"), "{}", refusal(b"ASMOD012"));
+        assert!(!refusal(b"ASMOD011").contains("newer"), "{}", refusal(b"ASMOD011"));
         // every version before the Fermi–Dirac switch: an older version's file, never "newer"
         for d in 1..=8u8 {
             let m: [u8; 8] = *format!("ASMODEL{d}").as_bytes().first_chunk().unwrap();
@@ -3010,6 +3091,72 @@ pub(crate) mod tests {
         let _ = std::fs::remove_file(p);
     }
 
+    /// Chemical channels Task 3 (module doc, "Version 11"): a model on a channel basis is written
+    /// under `ASMOD011` with its K and W in the basis object, bit for bit, at body 7 and body 8, with a
+    /// history that carries the trust-tightening arrays and with one that does not, and reads back
+    /// with the same mix (never the species basis). The same model on the species basis stays
+    /// version 9. A channels key under another magic, a version-11 file without one, a K outside
+    /// 1..=S and a W of the wrong length are refused.
+    #[test]
+    fn a_channel_model_sidecar_round_trips_its_mix() {
+        use crate::descriptor::ChannelMix;
+        use crate::history::AuditHistory;
+        assert_eq!((MAGICS[2], magic_version(MAGIC_V11)), (b"ASMOD011", Some(11)));
+        // S = 3, K = 2: awkward entries (−0.0, a subnormal, a 17-digit value)
+        let mix = ChannelMix { k: 2, w: vec![0.7071067811865476, -0.0, 0.5, 0.8660254037844386, -0.49999999999999994, 5e-324] };
+        let w_json = "[0.7071067811865476,-0.0,0.5,0.8660254037844386,-0.49999999999999994,5e-324]";
+        for (what, body, body4) in [("body 7", 7u8, false), ("body 8", 8, true)] {
+            let orig = random_sidecar_mixed(91 + u64::from(body), true, body4, BODY4_DEGREE_START, Some(mix.clone()));
+            assert_eq!(orig.model.basis.n_channels(), 2);
+            for trust in [false, true] {
+                let mut hist = AuditHistory::default();
+                for i in 0..12u64 {
+                    hist.push(if trust { trust_point(i, 1 + (i % 3) as usize) } else { history_point(i, 1 + (i % 3) as usize) });
+                }
+                let p = tmp(&format!("v11-{body}-{trust}.model"));
+                write_full_with_history(&p, &orig.model, &orig.accumulator, orig.report.as_ref(), &orig.samples, None, &[], &[], None, &[], &hist).unwrap();
+                let bytes = std::fs::read(&p).unwrap();
+                assert_eq!(&bytes[..8], MAGIC_V11, "{what}");
+                let header = header_of(&bytes);
+                assert!(header.starts_with(&format!("{{\"format\":\"ASMOD011\",\"body\":{body},\"created_by\":")), "{what}: {header}");
+                assert!(header.contains(&format!("\"channels\":{{\"k\":2,\"w\":{w_json}}}")), "{what}: {header}");
+                assert_eq!(header.contains("audit_fit"), trust, "{what}");
+                let back = read(&p).unwrap();
+                assert_eq!(back.model.basis.channels(), Some(&mix), "{what}: the mix comes back");
+                assert_eq!(back.model.basis.channels().unwrap().w.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), mix.w.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "{what}: bit for bit");
+                assert_eq!(back.model, orig.model, "{what}");
+                assert_eq!(back.accumulator.basis, orig.accumulator.basis, "{what}");
+                assert_eq!(back.audit_history, hist, "{what}");
+                // refusals, each on this file's own bytes
+                let refused = |bytes: Vec<u8>, want: &str| {
+                    let q = tmp(&format!("v11-bad-{body}-{trust}.model"));
+                    std::fs::write(&q, bytes).unwrap();
+                    let e = read(&q).unwrap_err().to_string();
+                    assert!(e.contains(want), "{what}: {e}");
+                    let _ = std::fs::remove_file(q);
+                };
+                let channels = format!(",\"channels\":{{\"k\":2,\"w\":{w_json}}}");
+                refused(reheader(&bytes, MAGIC_V11, &header.replacen(&channels, "", 1), 0), "no \"channels\" key");
+                if !trust {
+                    let as_v9 = header.replacen("\"format\":\"ASMOD011\"", "\"format\":\"ASMODEL9\"", 1);
+                    refused(reheader(&bytes, MAGIC_V9, &as_v9, 0), "written as version 11");
+                }
+                refused(reheader(&bytes, MAGIC_V11, &header.replacen("\"k\":2,", "\"k\":4,", 1), 0), "outside 1..=3");
+                refused(reheader(&bytes, MAGIC_V11, &header.replacen(",5e-324]", "]", 1), 0), "not S·K = 6");
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        // the species basis of the same shape: version 9, no channels key
+        let plain = random_sidecar(93, true);
+        let p = tmp("v11-species.model");
+        write(&p, &plain.model, &plain.accumulator, plain.report.as_ref(), &plain.samples, None).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        assert_written(&bytes, 7);
+        assert!(!header_of(&bytes).contains("channels"));
+        assert_eq!(read(&p).unwrap().model.basis.channels(), None);
+        let _ = std::fs::remove_file(p);
+    }
+
     /// Trust tightening Task 1: a history whose points carry a fit id, a flags word or an epistemic
     /// energy std is written under the version-10 magic `ASMOD010` — the body named as in version 9
     /// (7, or 8 for a body-4 basis) — with `audit_fit`, `audit_flags` and
@@ -3019,7 +3166,7 @@ pub(crate) mod tests {
     #[test]
     fn the_new_fields_round_trip_in_the_sidecar() {
         use crate::history::{AuditHistory, PointFlags};
-        assert_eq!((MAGICS[1], MAGIC_V10, NEWEST_VERSION), (b"ASMOD010", b"ASMOD010", 10));
+        assert_eq!((MAGICS[1], MAGIC_V10), (b"ASMOD010", b"ASMOD010"));
         assert_eq!(magic_version(MAGIC_V10), Some(10));
         for (what, body, orig) in [("body 7, body-2 basis", 7u8, random_sidecar(81, false)), ("body 7, body-3 basis", 7, random_sidecar(82, true)), ("body 8", 8, random_sidecar_with(83, true, true))] {
             let mut hist = AuditHistory::default();

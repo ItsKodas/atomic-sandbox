@@ -2110,11 +2110,14 @@ impl SurrogateKs {
         let mut species: Vec<u8> = store.samples.iter().flat_map(|s| s.z.iter().copied()).collect();
         species.sort_unstable();
         species.dedup();
+        // a channel collection fits only over its frozen mix's species (`shared` module doc, "The
+        // model basis"): refused before anything changes
+        self.channel_refusal(&species)?;
         let degree = self.grown_body4_degree(&species);
         let rebuild = self.accumulator.is_none()
             || self.species_dirty
             || self.refs_dirty
-            || self.accumulator.as_ref().is_some_and(|a| a.basis.body4 != default.body4 || a.basis.r_cut != default.r_cut || a.basis.body4_degree != degree);
+            || self.accumulator.as_ref().is_some_and(|a| a.basis.body4 != default.body4 || a.basis.r_cut != default.r_cut || a.basis.body4_degree != degree || a.basis.channels() != self.collection_mix_for(&species).as_ref());
         let basis = if rebuild {
             let mut b = self.fit_basis(&species);
             if b.body4 {

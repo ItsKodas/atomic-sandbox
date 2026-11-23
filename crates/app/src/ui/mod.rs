@@ -798,6 +798,9 @@ pub struct UiState {
     /// Model tab ▸ Refit (`worker::RefitCadence`, `Command::SetRefitCadence`): kept per computer in
     /// `machine.settings`.
     pub refit_cadence: crate::worker::RefitCadence,
+    /// Model tab ▸ Model basis (`Action::ModelBasis`, `Command::SetModelBasis`; chemical-channels plan
+    /// Task 3): per session, Species by default until the channel basis is gated (plan Task 7).
+    pub model_basis: sim::ModelBasis,
     /// The toolbar's ⚠ Model only (user request 2026-11-12; `Action::ModelOnly`): on, it holds the
     /// draft mode and audit cadence it replaced (draft on, audits 0 while it lasts), restored
     /// exactly when it is turned off or the solver leaves Estimated; a hand change of either turns
@@ -1079,6 +1082,7 @@ impl UiState {
             audit_every: providers::FallbackPolicy::default().audit_every,
             draft: false,
             refit_cadence: crate::worker::RefitCadence::default(),
+            model_basis: sim::ModelBasis::default(),
             model_only: None,
             drag_force: F_DRAG_MAX,
             queued: Vec::new(),

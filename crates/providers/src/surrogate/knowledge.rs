@@ -216,7 +216,7 @@ impl SurrogateKs {
         Some(KnowledgeMap {
             elements,
             pairs: pair_list,
-            slug: self.shared.as_ref().map_or_else(String::new, |s| s.coll.key.slug()),
+            slug: self.shared.as_ref().map_or_else(String::new, |s| s.coll.slug()),
             samples: fitted.len(),
             r_cut,
             molecules,

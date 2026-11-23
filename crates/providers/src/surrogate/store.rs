@@ -229,7 +229,7 @@ impl SurrogateKs {
         if let Some(sh) = &self.shared {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                format!("the shared collection {} saves itself as it learns ({}); a model file of it is a specialised model", sh.coll.key.slug(), sh.coll.folder().display()),
+                format!("the shared collection {} saves itself as it learns ({}); a model file of it is a specialised model", sh.coll.slug(), sh.coll.folder().display()),
             ));
         }
         // as the teacher solved them: the stray mask is in memory only (plan Task 5, B; `stray::unmasked_record`), applied

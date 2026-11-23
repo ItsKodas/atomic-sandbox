@@ -2010,6 +2010,10 @@ pub struct SurrogateKs {
     /// A shared collection's cutoff (Bohr): [`surrogate::COLLECTION_R_CUT`] unless the reach
     /// measurement set another ([`SurrogateKs::with_collection_r_cut`]).
     collection_r_cut: f64,
+    /// The model basis of the shared collection [`attach_collection_at`](SurrogateKs::attach_collection_at)
+    /// opens (`shared` module doc, "The model basis"; `Trainable::set_model_basis`): each basis is
+    /// its own collection. Species unless set.
+    pub(super) collection_basis: surrogate::BasisKind,
     /// Why the collection refused the sample just stored (taken by `keep_sample` for the step's
     /// note; `shared::SurrogateKs::take_collection_note`).
     collection_note: Vec<String>,
@@ -2279,6 +2283,7 @@ impl SurrogateKs {
             #[cfg(test)]
             training_ranking: false,
             collection_r_cut: surrogate::COLLECTION_R_CUT,
+            collection_basis: surrogate::BasisKind::Species,
             collection_note: Vec::new(),
             source_file: None,
             specialised: Vec::new(),
@@ -3917,6 +3922,8 @@ impl SurrogateKs {
         }
         self.quarantine.hash(&mut h);
         (&basis.species, basis.n_max, basis.l_max, basis.degree_cap, basis.body3, basis.body4, basis.body4_degree, basis.r_cut.to_bits()).hash(&mut h);
+        // a channel basis's mix is part of its shape (chemical-channels Task 3)
+        basis.channels().map(|m| (m.k, m.w.iter().map(|x| x.to_bits()).collect::<Vec<u64>>())).hash(&mut h);
         let key = h.finish();
         if let Some(&(k, f)) = self.fit_floor_cache.lock().unwrap().get(&basis.body4_degree) {
             if k == key {
@@ -4002,7 +4009,12 @@ impl SurrogateKs {
         if b.body4 {
             b.body4_degree = self.body4_degree;
         }
-        b
+        // a channel collection's frozen mix, for a fit over exactly its species (`shared` module
+        // doc, "The model basis"; another species set is refused by `channel_refusal`)
+        match self.collection_mix_for(species) {
+            Some(mix) => b.with_channels(mix),
+            None => b,
+        }
     }
 
     /// The model's provenance against `scene`'s, for the readouts (`TrainableStatus`).
@@ -4299,7 +4311,7 @@ impl Trainable for SurrogateKs {
             self.ref_cache = sampler.take_references();
         }
         let n = self.samples();
-        let shared = self.shared.as_ref().map(|s| (s.coll.key.slug(), s.coll.samples.len()));
+        let shared = self.shared.as_ref().map(|s| (s.coll.slug(), s.coll.samples.len()));
         SurrogateKs::forget(self);
         self.last_pass = None;
         self.user_notes.push(match shared {
@@ -4369,6 +4381,16 @@ impl Trainable for SurrogateKs {
         self.attach_collection_at(root, scene)
     }
 
+    fn set_model_basis(&mut self, basis: sim::ModelBasis) -> Result<(), String> {
+        let kind = match basis {
+            sim::ModelBasis::Species => surrogate::BasisKind::Species,
+            sim::ModelBasis::Channels(k) if k >= 1 => surrogate::BasisKind::Channels { k },
+            sim::ModelBasis::Channels(_) => return Err("a channel basis needs K ≥ 1".into()),
+        };
+        self.set_collection_basis(kind);
+        Ok(())
+    }
+
     fn model_source(&self) -> sim::ModelSource {
         SurrogateKs::model_source(self)
     }
@@ -4419,7 +4441,7 @@ impl Trainable for SurrogateKs {
             force_bound: self.policy.force_bound(if fmin.is_finite() { fmin } else { 0.0 }),
             provenance_mismatch: self.provenance_mismatch(scene),
             provenance: match &self.shared {
-                Some(sh) => self.model.as_ref().map(|_| format!("shared collection {}: {} — any box, neutral, automatic multiplicity", sh.coll.key.slug(), sh.coll.key.describe())),
+                Some(sh) => self.model.as_ref().map(|_| format!("shared collection {}: {} — any box, neutral, automatic multiplicity", sh.coll.slug(), sh.coll.key.describe())),
                 None => self.model.as_ref().map(|m| m.provenance.describe_recorded()),
             },
             audit_every: self.policy.audit_every,

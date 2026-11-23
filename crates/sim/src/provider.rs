@@ -1345,6 +1345,13 @@ pub trait Trainable {
     fn attach_collection(&mut self, _root: &std::path::Path, _scene: &Scene) -> Result<(), String> {
         Err("this provider does not learn".into())
     }
+    /// The model basis the shared collection is fitted with ([`ModelBasis`]; chemical-channels plan
+    /// Task 3): each basis is its own collection, so the next
+    /// [`attach_collection`](Self::attach_collection) opens the one of this basis (an attached
+    /// collection of the other basis is let go then). Nothing else changes here. The default refuses.
+    fn set_model_basis(&mut self, _basis: ModelBasis) -> Result<(), String> {
+        Err("this provider does not learn".into())
+    }
     /// Imports a `.model` file's samples into the attached collection (`surrogate::Collection::
     /// import_sidecar` with the box rule of the collection's h), never silently: what was taken and
     /// what was refused, with the reasons. `Err` without an attached, writable collection. The
@@ -1747,6 +1754,46 @@ pub enum ModelSource {
     File(std::path::PathBuf),
     #[default]
     None,
+}
+
+/// The model basis a shared collection is fitted with (plain data of `surrogate::BasisKind`;
+/// chemical-channels plan Task 3): bodies 3 and 4 per neighbour species, or on K learnt chemical
+/// channels. Each is its own collection ([`Trainable::set_model_basis`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ModelBasis {
+    #[default]
+    Species,
+    Channels(usize),
+}
+
+impl ModelBasis {
+    /// The K the Model tab offers for the channel basis (the day-1 gate's choice, plan Task 2).
+    pub const CHANNELS_K: usize = 3;
+
+    /// The script words: `species` or `channels <K>`.
+    pub fn words(&self) -> String {
+        match self {
+            ModelBasis::Species => "species".into(),
+            ModelBasis::Channels(k) => format!("channels {k}"),
+        }
+    }
+
+    /// Reads [`words`](Self::words)' form (K ≥ 1); `None` for anything else.
+    pub fn parse(words: &[&str]) -> Option<ModelBasis> {
+        match words {
+            ["species"] => Some(ModelBasis::Species),
+            ["channels", k] => k.parse::<usize>().ok().filter(|&k| k >= 1).map(ModelBasis::Channels),
+            _ => None,
+        }
+    }
+
+    /// For the Model tab: "Species" or "Channels (K=3)".
+    pub fn label(&self) -> String {
+        match self {
+            ModelBasis::Species => "Species".into(),
+            ModelBasis::Channels(k) => format!("Channels (K={k})"),
+        }
+    }
 }
 
 /// What [`Trainable::import_model`] did (plain data of `surrogate::ImportReport`): the samples

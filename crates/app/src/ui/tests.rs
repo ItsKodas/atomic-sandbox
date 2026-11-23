@@ -1651,6 +1651,47 @@ fn the_model_tab_says_where_the_model_learns() {
     assert_eq!(source_line(&spec), "file: hc.model (specialised)");
 }
 
+/// Chemical-channels plan Task 3: Model tab ▸ Model basis is an action — the UiState choice and the
+/// worker's `SetModelBasis` (each basis its own collection) — with the script word
+/// `model-basis species|channels <K>`, read back; Species is the default; the row is drawn in the
+/// Model file fold with the shared collection in use, sending nothing by itself.
+#[test]
+fn the_model_basis_switch_sends_its_command_and_has_a_script_word() {
+    for (b, words) in [(sim::ModelBasis::Species, "model-basis species"), (sim::ModelBasis::Channels(3), "model-basis channels 3"), (sim::ModelBasis::Channels(6), "model-basis channels 6")] {
+        let a = Action::ModelBasis(b);
+        assert_eq!(a.describe().as_deref(), Some(words));
+        let w: Vec<&str> = words.split(' ').collect();
+        assert_eq!(Action::parse(&w), Ok(a.clone()));
+        assert_eq!(crate::replay::unreplayable_kind(&a), None, "replayable");
+    }
+    for bad in [&["model-basis"][..], &["model-basis", "channels"], &["model-basis", "channels", "0"], &["model-basis", "lattice"], &["model-basis", "species", "3"]] {
+        assert!(Action::parse(bad).is_err(), "{bad:?}");
+    }
+    assert_eq!((sim::ModelBasis::Channels(sim::ModelBasis::CHANNELS_K).label(), sim::ModelBasis::Species.label()), ("Channels (K=3)".to_string(), "Species".to_string()));
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let m = ModelStatus { source: sim::ModelSource::Collection { slug: "x".into(), samples: 0, read_only: false }, collections: true, use_collection: true, ..model() };
+    let snap = snapshot(&scene, Backend::Estimated, Some(m));
+    let inp = input(&scene, Some(&snap), &cam);
+    let mut st = UiState::new("h2", &scene);
+    assert_eq!(st.model_basis, sim::ModelBasis::Species, "the default until plan Task 7");
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::ModelBasis(sim::ModelBasis::Channels(3)), &mut out);
+    assert_eq!(st.model_basis, sim::ModelBasis::Channels(3));
+    assert!(matches!(out.commands.as_slice(), [Command::SetModelBasis(sim::ModelBasis::Channels(3))]), "{:?}", out.commands);
+    // drawn, sending nothing
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    st.backend = Backend::Estimated;
+    st.open_tab(DockTab::Model);
+    st.model_sections.set(super::dock::model::Section::File, true);
+    super::PROBES.with(|p| p.borrow_mut().clear());
+    for _ in 0..3 {
+        assert!(frame(&ctx, &mut st, &inp, 1400.0, vec![]).commands.is_empty());
+    }
+    assert!(super::PROBES.with(|p| p.borrow().contains_key("model-basis")), "the Model basis row is drawn");
+}
+
 /// The M5b controls in their new homes, clicked: Scene ▸ Container's walls checkbox, the View
 /// panel's cloud refresh, Physics ▸ draft mode (estimated solver).
 #[test]
