@@ -192,6 +192,10 @@ pub(super) struct SharedCollection {
     pub(super) census: Option<super::represent::Census>,
     /// The census at which the last learn of W failed: not retried until it changes.
     pub(super) learn_failed: Option<super::represent::Census>,
+    /// A mix learnt at this refit's start whose first fit has not succeeded yet (review of Tasks
+    /// 5–6, I1): the fit takes it, rule 3b and the evidence floor keep reading `mix` until the fit
+    /// succeeds (`represent`, "The lifecycle"). `None` outside a refit.
+    pub(super) pending_mix: Option<(LearntMix, String)>,
 }
 
 impl SharedCollection {
@@ -214,6 +218,7 @@ impl SharedCollection {
             pass_start: self.pass_start,
             mix: self.mix.clone(),
             census: self.census.clone(),
+            pending_mix: self.pending_mix.clone(),
             learn_failed: self.learn_failed.clone(),
         }
     }
@@ -328,7 +333,10 @@ impl SurrogateKs {
         // provider's generation moves past them (as `install_sidecar` does)
         let newest = c.history.iter().map(|p| p.model_gen).max().unwrap_or(0);
         self.audit_history = c.history.clone();
-        self.model_gen = self.model_gen.max(newest) + 1;
+        // and past a channel mix's first generation (review M3: the new W's points must not fall
+        // below `history_from`)
+        let mix_from = mix.as_ref().map_or(0, |m| m.history_from);
+        self.model_gen = self.model_gen.max(newest).max(mix_from) + 1;
         // the fit id (spec 2026-11-18 §3: an attach adds no fit): the collection history's
         // largest — the newest fit its points name — and the watermark at the collection's length,
         // so a refit of what it holds (the attach's own below, or a later one) keeps that id and
@@ -365,6 +373,7 @@ impl SurrogateKs {
             pass_start: None,
             mix,
             census: None,
+            pending_mix: None,
             learn_failed: None,
             coll: c,
         });
@@ -469,10 +478,15 @@ impl SurrogateKs {
     /// ([`channel_refusal`](Self::channel_refusal) refuses that fit).
     pub(super) fn collection_mix_for(&self, species: &[u8]) -> Option<ChannelMix> {
         let sh = self.shared.as_ref().filter(|sh| sh.coll.basis != BasisKind::Species)?;
-        match sh.mix.as_ref() {
-            Some(mix) => surrogate::collection::mix_for(mix, species).ok(),
-            None => (!species.is_empty()).then(|| ChannelMix { k: 1, w: vec![0.0; species.len()] }),
-        }
+        mix_basis_for(sh.pending_mix.as_ref().map(|(m, _)| m).or(sh.mix.as_ref()), species)
+    }
+
+    /// [`collection_mix_for`](Self::collection_mix_for) of the **committed** mix, a staged one
+    /// ignored: the basis the standing model must have been fitted with for rule 3b to read the
+    /// committed flags (`represent`, "The lifecycle", review I1).
+    pub(super) fn committed_mix_for(&self, species: &[u8]) -> Option<ChannelMix> {
+        let sh = self.shared.as_ref().filter(|sh| sh.coll.basis != BasisKind::Species)?;
+        mix_basis_for(sh.mix.as_ref(), species)
     }
 
     /// Why a fit over `species` cannot form on the attached channel collection (module doc, "The
@@ -495,16 +509,20 @@ impl SurrogateKs {
     /// the key's), then used, the accumulator rebuilt at the next refit (which is armed), the class
     /// memory cleared as on a relearn. `Err`, nothing changed, without an attached channel
     /// collection.
-    pub fn set_collection_mix(&mut self, mix: LearntMix) -> Result<(), String> {
+    pub fn set_collection_mix(&mut self, mut mix: LearntMix) -> Result<(), String> {
+        // another basis: a background refit begun on the old one is a conflict (`background`), and
+        // the points of the models before it leave the evidence (review M2: `history_from`)
+        let gen = self.model_gen + 1;
+        mix.history_from = gen;
         let sh = self.shared.as_mut().ok_or("no shared collection is attached")?;
         sh.coll.save_mix(&mix)?;
         sh.mix = Some(mix);
+        sh.pending_mix = None;
         sh.learn_failed = None;
+        self.model_gen = gen;
         self.species_dirty = true;
         self.class_memory.clear();
         self.fit_floor_cache.lock().unwrap().clear();
-        // another basis: a background refit begun on the old one is a conflict (`background`)
-        self.model_gen += 1;
         self.arm_refit();
         Ok(())
     }
@@ -1402,5 +1420,14 @@ impl Drop for SurrogateKs {
     /// The attached collection's audit history and README are written before its lock is released.
     fn drop(&mut self) {
         self.flush_collection();
+    }
+}
+
+/// A fit's channel basis from `mix` over `species` (`SurrogateKs::collection_mix_for`): W with a zero
+/// row for a species without one, or one all-zero channel before any W.
+fn mix_basis_for(mix: Option<&LearntMix>, species: &[u8]) -> Option<ChannelMix> {
+    match mix {
+        Some(mix) => surrogate::collection::mix_for(mix, species).ok(),
+        None => (!species.is_empty()).then(|| ChannelMix { k: 1, w: vec![0.0; species.len()] }),
     }
 }

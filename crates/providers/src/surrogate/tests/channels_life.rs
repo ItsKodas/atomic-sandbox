@@ -119,7 +119,8 @@ fn gate_mix(li_cl_flagged: bool) -> LearntMix {
         w: vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
         sigma_w: Vec::new(),
         singular_values: vec![2.0, 1.0, 0.0, 0.0],
-        truncation_residual: vec![0.0, 1.0, 0.0, 1.0],
+        // (flagged: ρ 0, a file can hold only a represented row within the rule)
+        truncation_residual: if li_cl_flagged { vec![0.0; 4] } else { vec![0.0, 1.0, 0.0, 1.0] },
         nonlinearity: 0.0,
         weights: vec![1.0; 4],
         rank: 2,
@@ -307,12 +308,16 @@ fn a_rare_element_is_unrepresented_until_n_w_then_relearns() {
     for _ in 0..floor + 4 {
         teach(&mut s, &h2s(&mut r));
     }
-    // the relearn clears the class memory (a planted entry stands for the standing verdicts)
+    // the relearn is staged (nothing changes before its fit stands: review I1), and its commit
+    // clears the class memory (a planted entry stands for the standing verdicts)
     let planted = EnvKey { class: 2, z: O, neighbours: vec![H] };
     s.class_memory.insert(planted.clone(), (true, Some(1)));
     s.channel_lifecycle();
-    assert!(s.class_memory.is_empty(), "every key re-enters at ENTER");
+    assert!(s.shared.as_ref().unwrap().pending_mix.is_some() && s.class_memory.contains_key(&planted), "staged, nothing committed");
+    assert_eq!(s.history_floor(), first_from);
     let gen = s.model_gen;
+    s.commit_pending_mix();
+    assert!(s.class_memory.is_empty(), "every key re-enters at ENTER");
     s.refit().expect("the refit on the relearnt W");
     let mix = s.collection().unwrap().read_mix().unwrap().unwrap();
     assert_eq!(mix.represented, vec![true, true, true], "S represented: {:?}", s.user_notes);
@@ -362,4 +367,97 @@ fn c2_floors_keep_todays_floor_up_to_k_species() {
         assert_eq!(q, ch.per_key[k].1.min(sp.per_key[k].1), "{k:?}");
     }
     assert_eq!(c2.union, ch.union.min(sp.union));
+}
+
+/// Water and a few H₂S, refitted once: the first learn (H, O represented, S not).
+fn first_learn(dir: &std::path::Path, rng: &mut StdRng, r: &mut StdRng) -> SurrogateKs {
+    let mut s = channel_student(dir, true, rng);
+    for _ in 0..90 {
+        teach(&mut s, &water(r));
+    }
+    for _ in 0..3 {
+        teach(&mut s, &h2s(r));
+    }
+    s.refit().expect("the first fit, with the first learn");
+    assert!(s.collection().unwrap().read_mix().unwrap().is_some_and(|m| m.represented == vec![true, true, false]));
+    s
+}
+
+/// The H₂S samples that bring a many-body key with S among its neighbours past its low-order floor.
+fn teach_h2s_to_n_w(s: &mut SurrogateKs, r: &mut StdRng) {
+    let low = surrogate::channels::LowOrder::REVIEW_I4.basis(&[H, O, S], surrogate::COLLECTION_R_CUT);
+    let (pos, z) = geometry(&h2s(r));
+    let one = Sample::new(pos, z, 0.0, vec![[0.0; 3]; 3], SampleTag::Scan, 1.0);
+    let floor = super::super::trust::key_column_counts(&low, [&one]).per_key.iter().filter(|(k, _)| k.class == 2 && k.neighbours.contains(&S)).map(|(_, &(_, q))| q).min().unwrap();
+    for _ in 0..floor + 4 {
+        teach(s, &h2s(r));
+    }
+}
+
+/// Review of Tasks 5–6, I1: a learnt W is committed only with its first fit. A relearn that would
+/// represent S whose fit fails leaves the committed W governing rule 3b (H₂S still refused) and
+/// `channels.txt` untouched; and while the standing model is not fitted on the committed W (a W
+/// given from outside, not yet refitted), every many-body atom is refused — water's O included.
+#[test]
+fn a_learn_whose_fit_fails_leaves_the_old_mix_governing_rule_3b() {
+    let root = collection_root("channels-i1");
+    let (mut rng, mut r) = (StdRng::seed_from_u64(101), StdRng::seed_from_u64(102));
+    let mut s = first_learn(&root.join("life"), &mut rng, &mut r);
+    let file = s.collection().unwrap().folder().join(surrogate::collection::CHANNELS_FILE);
+    let on_disk = std::fs::read_to_string(&file).unwrap();
+    teach_h2s_to_n_w(&mut s, &mut r);
+    // the fit fails right after the lifecycle staged the relearnt W (the cancel seam)
+    s.refit_cancel = Some(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+    assert!(s.refit().is_err());
+    let sh = s.shared.as_ref().unwrap();
+    assert!(sh.pending_mix.is_none() && sh.learn_failed.is_some());
+    assert!(!sh.mix.as_ref().unwrap().represents(S), "the committed W stands");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), on_disk, "channels.txt untouched");
+    assert!(s.user_notes.iter().any(|n| n.contains("but the fit on it failed")), "{:?}", s.user_notes);
+    let probe = h2s(&mut r);
+    let (pos, z) = geometry(&probe);
+    let prov = s.provenance_for(&probe);
+    assert!(matches!(s.would_answer(&pos, &z, &prov), Err((TeachRule::UnrepresentedNeighbour(S), _))), "S still refused");
+    // the learn is retried once allowed, and committed with its fit
+    s.refit_cancel = None;
+    s.shared.as_mut().unwrap().learn_failed = None;
+    s.refit().expect("the refit on the relearnt W");
+    assert!(s.collection().unwrap().read_mix().unwrap().unwrap().represents(S));
+    assert!(!matches!(s.would_answer(&pos, &z, &prov), Err((TeachRule::UnrepresentedNeighbour(_), _))));
+    // belt and braces: a W given from outside before its refit — the model is on another W, so every
+    // many-body atom is refused, a water's O among them
+    let mut other = s.collection().unwrap().read_mix().unwrap().unwrap();
+    other.w = vec![0.0; other.w.len()];
+    other.represented = vec![false; other.species.len()];
+    s.set_collection_mix(other).unwrap();
+    let w = water(&mut r);
+    let (pos, z) = geometry(&w);
+    assert!(matches!(s.would_answer(&pos, &z, &s.provenance_for(&w)), Err((TeachRule::UnrepresentedNeighbour(_), Some(_)))));
+}
+
+/// Review of Tasks 5–6, I2: a relearn that reproduces the same W on the same represented species is
+/// an ordinary refit — the counts move; `history_from`, the class memory and the evidence stand.
+#[test]
+fn an_unchanged_relearn_keeps_the_trust_evidence() {
+    let root = collection_root("channels-i2");
+    let (mut rng, mut r) = (StdRng::seed_from_u64(103), StdRng::seed_from_u64(104));
+    let mut s = first_learn(&root.join("life"), &mut rng, &mut r);
+    let before = s.collection().unwrap().read_mix().unwrap().unwrap();
+    // H's and O's many-body counts double: a relearn is due
+    for _ in 0..100 {
+        teach(&mut s, &water(&mut r));
+    }
+    let planted = EnvKey { class: 2, z: O, neighbours: vec![H] };
+    s.class_memory.insert(planted.clone(), (true, Some(1)));
+    s.channel_lifecycle();
+    assert!(s.user_notes.iter().any(|n| n.contains("came out unchanged")), "{:?}", s.user_notes);
+    assert_eq!(s.class_memory.get(&planted), Some(&(true, Some(1))), "the class memory stands");
+    assert!(s.shared.as_ref().unwrap().pending_mix.is_none(), "nothing staged");
+    let after = s.collection().unwrap().read_mix().unwrap().unwrap();
+    assert_eq!(after.history_from, before.history_from, "the evidence floor stands");
+    assert_eq!((after.w.clone(), after.represented.clone(), after.k), (before.w.clone(), before.represented.clone(), before.k));
+    assert!(after.many_body[0] >= 2 * before.many_body[0], "the counts moved: {:?} → {:?}", before.many_body, after.many_body);
+    assert_eq!(s.history_floor(), before.history_from);
+    s.refit().unwrap();
+    assert_eq!(s.collection().unwrap().read_mix().unwrap().unwrap().history_from, before.history_from, "no relearn at the refit either");
 }

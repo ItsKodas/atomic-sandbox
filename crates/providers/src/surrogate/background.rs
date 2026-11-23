@@ -456,12 +456,21 @@ impl SurrogateKs {
         }
         self.quarantine = q;
         // a chemical-channel mix the copy learnt (`represent` module doc, "The lifecycle"): the copy
-        // wrote nothing, so `channels.txt` is written here; its census and failed learn too
+        // wrote nothing, so `channels.txt` is written here; its census and failed learn too. Taken
+        // only with the fit it was committed by (review I1): the copy's refit succeeded and its
+        // model is fitted on exactly that mix — else the live W stands with the live model
+        let copy_fit_on = |copy: &shared::SharedCollection| -> bool {
+            let (Some(m), Some(mix)) = (f.model.as_ref(), copy.mix.as_ref()) else { return false };
+            m.basis.channels() == surrogate::collection::mix_for(mix, &m.basis.species).ok().as_ref()
+        };
+        let take_mix = ok && f.shared.as_ref().is_some_and(|c| copy_fit_on(c));
         if let (Some(live), Some(copy)) = (self.shared.as_mut(), f.shared.as_mut()) {
             live.census = copy.census.take();
             live.learn_failed = copy.learn_failed.take();
-            let learnt = |m: &Option<surrogate::channels::LearntMix>| m.as_ref().map(|m| (m.history_from, m.species.clone(), m.k, m.w.iter().map(|x| x.to_bits()).collect::<Vec<u64>>()));
-            if learnt(&copy.mix) != learnt(&live.mix) {
+            let learnt = |m: &Option<surrogate::channels::LearntMix>| {
+                m.as_ref().map(|m| (m.history_from, m.species.clone(), m.k, m.w.iter().map(|x| x.to_bits()).collect::<Vec<u64>>(), m.represented.clone(), m.n_w_met.clone(), m.many_body.clone()))
+            };
+            if take_mix && learnt(&copy.mix) != learnt(&live.mix) {
                 if let Some(m) = copy.mix.as_ref() {
                     if let Err(e) = live.coll.save_mix(m) {
                         self.user_notes.push(format!("chemical channels: the learnt W was not written to the collection ({e}): used for this session only"));

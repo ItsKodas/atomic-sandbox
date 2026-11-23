@@ -11657,6 +11657,7 @@ fn a_channel_collection_attaches_as_its_own_and_fits_only_with_its_mix() {
     he.set_collection_basis(ch3);
     he.attach_collection(&dir, &h2(1.4)).unwrap();
     assert!(he.model().is_some(), "the attach's fit on the mix");
+    let from_at_attach = he.collection().unwrap().read_mix().unwrap().unwrap().history_from;
     he.set_reference_solved(1, SpeciesMorse::atom(1), 41, Some(0.0));
     he.set_reference_solved(2, SpeciesMorse::atom(2), 41, Some(0.0));
     for i in 0..3 {
@@ -11668,7 +11669,7 @@ fn a_channel_collection_attaches_as_its_own_and_fits_only_with_its_mix() {
     assert!(he.samples() > 40 && he.quarantine[40..].iter().all(|&q| q == Q_UNREP), "kept, out of the channel fit: {:?}", &he.quarantine[40..]);
     assert_eq!(he.report().unwrap().n_samples, 40);
     let mix_now = he.collection().unwrap().read_mix().unwrap().unwrap();
-    assert_eq!((mix_now.species.clone(), mix_now.history_from), (vec![1], 0), "no relearn");
+    assert_eq!((mix_now.species.clone(), mix_now.history_from), (vec![1], from_at_attach), "no relearn");
     let prov = he.provenance_for(&h2_he_at(1.3, 2.6, &mut rng));
     let sc = h2_he_at(1.3, 2.6, &mut rng);
     let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();

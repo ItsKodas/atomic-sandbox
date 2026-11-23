@@ -1498,7 +1498,17 @@ impl SurrogateKs {
         // a channel collection's W: learnt or relearnt when due (`represent` module doc, "The
         // lifecycle"); a no-op for the species basis
         self.channel_lifecycle();
-        let mut report = self.fit_store_deferred()?;
+        // a W staged by the lifecycle is committed only once its first fit stands (review I1)
+        let mut report = match self.fit_store_deferred() {
+            Ok(r) => {
+                self.commit_pending_mix();
+                r
+            }
+            Err(e) => {
+                self.drop_pending_mix(&e);
+                return Err(e);
+            }
+        };
         self.recovery = None;
         // fence votes (`surrogate` module doc, "Fence voting"): a voted sample the new model cannot
         // reproduce is quarantined itself and its region takes no further vote

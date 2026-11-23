@@ -70,7 +70,13 @@
 //! until it reaches N_W. **Before any W** the fit's mix is one all-zero channel: every species
 //! unrepresented, so the channel model is a body-2 model whose many-body atoms rule 3b hands to the
 //! teacher — a diatomic collection answers from body 2, and its first many-body samples go towards
-//! N_W. A relearn writes `channels.txt` (a background refit's copy writes nothing: the install writes
+//! N_W. **A learnt W is staged** (`pending_mix`; physics review of Tasks 5–6, I1): the refit's fits
+//! and the exclusion use it, while rule 3b and the evidence floor keep reading the committed W; it
+//! is committed only once its first fit succeeds (`commit_pending_mix`), else dropped
+//! (`drop_pending_mix`), and a background copy's W is installed only with a successful fit on it.
+//! While the standing model's channels are not the committed W's, rule 3b refuses every many-body
+//! atom. **A relearn that reproduces the same W** (species, K, W bits, represented flags; review I2)
+//! is an ordinary refit: only its counts are written. A committed relearn writes `channels.txt` (a background refit's copy writes nothing: the install writes
 //! it), rebuilds the fit, **clears the class hysteresis memory** (every key re-enters at ENTER) and
 //! sets the mix's `history_from` to the next model generation, so the audit points measured under an
 //! earlier W **leave the evidence counts, the windows and every λ** (`calibrate::calibrate_from`). A
@@ -161,8 +167,9 @@ impl SurrogateKs {
         }
     }
 
-    /// Whether `z` is represented by the attached channel collection's mix (`true` outside a channel
-    /// collection: the species basis represents every species it has).
+    /// Whether `z` is represented by the attached channel collection's **committed** mix — the one
+    /// the standing model was fitted with (`true` outside a channel collection: the species basis
+    /// represents every species it has). Rule 3b reads this.
     pub(super) fn represents(&self, z: u8) -> bool {
         match self.channel_collection() {
             None => true,
@@ -170,18 +177,33 @@ impl SurrogateKs {
         }
     }
 
-    /// The reach rule 3b and the exclusion judge neighbours within: the standing model's r_cut, else
-    /// the collection's.
+    /// Whether `z` is represented by the mix a fit now uses: a staged one (`pending_mix`) during
+    /// the refit that learnt it, else the committed one. The exclusion (`mark_unrepresented`) reads
+    /// this, so the staged fit leaves out exactly what its W cannot represent.
+    fn represents_for_fit(&self, z: u8) -> bool {
+        match self.channel_collection() {
+            None => true,
+            Some(sh) => sh.pending_mix.as_ref().map(|(m, _)| m).or(sh.mix.as_ref()).is_some_and(|m| m.represents(z)),
+        }
+    }
+
+    /// The reach rule 3b, the exclusion and the census judge neighbours within (review M4: one
+    /// source): the larger of the standing model's r_cut and the collection's, so the exclusion never
+    /// sees fewer neighbours than the query rule.
     fn channel_r_cut(&self) -> f64 {
-        self.model.as_ref().map_or(self.collection_r_cut, |m| m.basis.r_cut)
+        self.model.as_ref().map_or(self.collection_r_cut, |m| m.basis.r_cut.max(self.collection_r_cut))
     }
 
     /// Rule 3b (module doc): the first atom with two or more neighbours and an unrepresented one
     /// among them, as (atom, that neighbour's Z); `None` outside a channel collection or where none.
+    /// **Belt and braces** (review I1): while the standing model's channels are not the committed
+    /// mix's (a W given or learnt whose fit has not stood yet), every species counts as
+    /// unrepresented — every many-body atom is refused until a fit on the committed W stands.
     pub(super) fn unrepresented_neighbour(&self, pos: &[[f64; 3]], z: &[u8]) -> Option<(usize, u8)> {
         self.channel_collection()?;
         let r = self.channel_r_cut();
-        unrepresented_many_body(pos, z, r * r, |t| !self.represents(t))
+        let stale = self.model.as_ref().is_some_and(|m| m.basis.channels() != self.committed_mix_for(&m.basis.species).as_ref());
+        unrepresented_many_body(pos, z, r * r, |t| stale || !self.represents(t))
     }
 
     /// Rule 3b's refusal words: the atom, the species and its N_W progress.
@@ -201,7 +223,7 @@ impl SurrogateKs {
     /// Whether stored sample `s` has an atom of two or more neighbours with an unrepresented
     /// species among them (module doc, item 4).
     fn unrepresentable(&self, s: &Sample, rc2: f64) -> bool {
-        unrepresented_many_body(&s.pos, &s.z, rc2, |t| !self.represents(t)).is_some()
+        unrepresented_many_body(&s.pos, &s.z, rc2, |t| !self.represents_for_fit(t)).is_some()
     }
 
     /// Item 4 of the module doc, at every fit: in a channel collection, every `Q_NONE` sample that
@@ -214,7 +236,7 @@ impl SurrogateKs {
             return false;
         }
         let Some(store) = self.store.as_ref() else { return false };
-        let r = self.collection_r_cut;
+        let r = self.channel_r_cut();
         let rc2 = r * r;
         let mut moves: Vec<(usize, u8)> = Vec::new();
         for (i, s) in store.samples.iter().enumerate() {
@@ -263,7 +285,7 @@ impl SurrogateKs {
         if species.is_empty() {
             return None;
         }
-        let r_cut = self.collection_r_cut;
+        let r_cut = self.channel_r_cut();
         let low = LowOrder::REVIEW_I4.basis(&species, r_cut);
         let counts = trust::key_column_counts(&low, members.iter().map(|&i| &store.samples[i]));
         let s_n = species.len();
@@ -312,7 +334,9 @@ impl SurrogateKs {
         let sh = self.shared.as_mut().expect("a channel collection");
         sh.census = Some(census.clone());
         let Some(why) = mix_due(&census, sh.mix.as_ref()) else { return };
-        if sh.learn_failed.as_ref() == Some(&census) {
+        // a learn that failed is tried again only when its inputs changed in substance (review M6):
+        // the N_W set, or a many-body count doubled since — not at every new sample
+        if sh.learn_failed.as_ref().is_some_and(|f| !retry_due(f, &census)) {
             return;
         }
         let BasisKind::Channels { k } = sh.coll.basis else { return };
@@ -332,8 +356,27 @@ impl SurrogateKs {
         match learn_mix(&samples, &setup, k) {
             Ok(mut mix) => {
                 mix.many_body = census.many_body.clone();
-                mix.history_from = self.model_gen + 1;
-                self.install_mix(mix, &why);
+                let sh = self.shared.as_mut().expect("a channel collection");
+                if let Some(old) = sh.mix.as_ref().filter(|old| same_basis(old, &mix)) {
+                    // the same W on the same represented species (review I2): an ordinary refit —
+                    // only the counts the triggers read move; the evidence and the memory stand
+                    let mut kept = old.clone();
+                    kept.many_body = mix.many_body;
+                    kept.n_w_met = mix.n_w_met;
+                    let mut note = format!("chemical channels: W {why}, and came out unchanged — its counts updated, the trust evidence stands");
+                    if !self.refit_fork {
+                        if let Err(e) = sh.coll.save_mix(&kept) {
+                            note.push_str(&format!(" (not written to the collection: {e})"));
+                        }
+                    }
+                    sh.mix = Some(kept);
+                    sh.learn_failed = None;
+                    self.user_notes.push(note);
+                } else {
+                    mix.history_from = self.model_gen + 1;
+                    sh.pending_mix = Some((mix, why));
+                    self.species_dirty = true;
+                }
             }
             Err(e) => {
                 self.user_notes.push(format!("chemical channels: W could not be learnt ({why}): {e} — the standing mix is kept, and the learn is tried again when the samples change"));
@@ -342,12 +385,17 @@ impl SurrogateKs {
         }
     }
 
-    /// Installs a learnt mix (module doc, "The lifecycle"): written to `channels.txt` (not by a
-    /// background refit's copy: its install writes it), used, the fit rebuilt, the class memory
-    /// cleared. A failed write keeps the mix for this session and says so.
-    pub(super) fn install_mix(&mut self, mix: LearntMix, why: &str) {
+    /// Commits the mix staged by [`channel_lifecycle`](Self::channel_lifecycle) once its first fit
+    /// has succeeded (review I1; module doc, "The lifecycle"): written to `channels.txt` (not by a
+    /// background refit's copy: its install writes it, and only with the fit), rule 3b and the
+    /// evidence floor now read it, the class memory cleared (the trust passes of the fit that stands
+    /// run after this). A failed write keeps the mix for this session and says so. A no-op without a
+    /// staged mix.
+    pub(super) fn commit_pending_mix(&mut self) {
         let fork = self.refit_fork;
-        let sh = self.shared.as_mut().expect("a channel collection");
+        let Some(sh) = self.shared.as_mut() else { return };
+        let Some((mix, why)) = sh.pending_mix.take() else { return };
+        let why = &why;
         let mut note = format!("chemical channels: W {why} (K = {}): {}", mix.k, represented_words(&mix));
         if !fork {
             if let Err(e) = sh.coll.save_mix(&mix) {
@@ -357,12 +405,37 @@ impl SurrogateKs {
         sh.mix = Some(mix);
         sh.learn_failed = None;
         note.push_str(" — every environment's trust verdict starts over, and the checks measured under the earlier W leave the evidence");
+        // (the staged fit was a rebuild already; a later one re-marks with the committed flags)
         self.user_notes.push(note);
         self.species_dirty = true;
         self.class_memory.clear();
         self.fit_floor_cache.lock().unwrap().clear();
         self.last_variance = None;
     }
+
+    /// Drops a staged mix whose first fit failed (review I1): the committed W stands — rule 3b, the
+    /// evidence and `channels.txt` as before — and the learn is not retried until its inputs change
+    /// (`learn_failed`). The codes the staged fit marked are marked again at the next fit.
+    pub(super) fn drop_pending_mix(&mut self, e: &FitError) {
+        let Some(sh) = self.shared.as_mut() else { return };
+        let Some((_, why)) = sh.pending_mix.take() else { return };
+        sh.learn_failed = sh.census.clone();
+        self.species_dirty = true;
+        self.user_notes.push(format!("chemical channels: W {why}, but the fit on it failed ({e}) — the standing W is kept, and the learn is tried again when the samples change in substance"));
+    }
+}
+
+/// Whether two mixes give the same channel basis on the same represented species (review I2): the
+/// species, K, W bit for bit and the represented flags.
+fn same_basis(a: &LearntMix, b: &LearntMix) -> bool {
+    let bits = |m: &LearntMix| m.w.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+    a.species == b.species && a.k == b.k && a.represented == b.represented && bits(a) == bits(b)
+}
+
+/// Whether a failed learn's census `failed` should be retried at `now` (review M6): another species
+/// set or N_W set, or a many-body count doubled since.
+fn retry_due(failed: &Census, now: &Census) -> bool {
+    failed.species != now.species || failed.n_w != now.n_w || failed.many_body.iter().zip(&now.many_body).any(|(&f, &n)| n >= 2 * f.max(1))
 }
 
 /// "represented H, O; not represented: Cl (N_W unmet), S (ρ 0.43 > 0.01)".

@@ -501,6 +501,11 @@ pub fn channels_from_text(text: &str) -> Result<LearntMix, String> {
         if r.represented && !r.n_w {
             return Err(format!("row {z} is represented without N_W met"));
         }
+        // the representation rule (`channels::is_represented`; review of Tasks 5–6, M1): a raw mix's
+        // flags are not a represented mix's, and a hand edit cannot make a ρ = 1 row represented
+        if r.represented && !(r.rho <= crate::channels::RHO_MAX) {
+            return Err(format!("row {z} is represented with a truncation residual {} above {}", r.rho, crate::channels::RHO_MAX));
+        }
         w.extend_from_slice(ws);
     }
     let sk = s * k;
@@ -3206,7 +3211,7 @@ mod tests {
             w,
             sigma_w,
             singular_values: vec![3.8, 2.3, 0.0],
-            truncation_residual: vec![0.01, 0.2, f64::NAN],
+            truncation_residual: vec![0.01, 0.002, f64::NAN],
             nonlinearity: 0.067,
             weights: vec![1.5, 0.25, 1.0],
             rank: 2,
@@ -3273,6 +3278,8 @@ mod tests {
             ("bad flag", text.replace("row 1 represented 1", "row 1 represented yes"), "not 0 or 1"),
             ("unrepresented weight", text.replace("residual NaN w 0.0 0.0", "residual NaN w 0.0 0.5"), "exactly 0"),
             ("represented without N_W", text.replace("represented 1 n_w 1 many_body 812", "represented 1 n_w 0 many_body 812"), "without N_W"),
+            ("represented above rho_max", text.replace("residual 0.01 w", "residual 0.25 w"), "above 0.01"),
+            ("represented with NaN rho", text.replace("residual 0.01 w", "residual NaN w"), "above 0.01"),
             ("sigma rows", text.lines().filter(|l| !l.starts_with("sigma_w 16 1 ")).map(|l| format!("{l}\n")).collect(), "sigma_w rows"),
             ("unknown", format!("{text}colour blue\n"), "unknown field"),
             ("K above S", text.replace("\nk 2\n", "\nk 4\n"), "between 1"),

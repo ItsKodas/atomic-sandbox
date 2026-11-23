@@ -689,7 +689,10 @@ fn represented_mix(model: &Model, k: usize, map: Map, eligible: &[bool], a: &[f6
     // step 7 on the represented rows: B = D_a⁻¹ Ũ_K, unrepresented rows exact 0
     let b: Vec<f64> = (0..s_n).flat_map(|t| (0..kk).map(move |c| (t, c))).map(|(t, c)| if represented[t] { u_mat[t * s_n + c] / a[t] } else { 0.0 }).collect();
     let (mut w, r_qr) = thin_qr(&b, s_n, kk);
-    if (0..kk).any(|c| !(r_qr[c * kk + c] > 0.0) || !r_qr[c * kk + c].is_finite()) {
+    // relative to the largest pivot (review of Tasks 5–6, M5): a near-dependent column of the
+    // represented rows is noise, not a channel
+    let r_max = (0..kk).map(|c| r_qr[c * kk + c].abs()).fold(0.0f64, f64::max);
+    if (0..kk).any(|c| !(r_qr[c * kk + c] > s_n as f64 * f64::EPSILON * r_max) || !r_qr[c * kk + c].is_finite()) {
         // the represented rows alone do not hold K independent directions
         return Err(MixError::DegenerateGap { k: kk });
     }
