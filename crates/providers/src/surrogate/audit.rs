@@ -39,6 +39,7 @@ pub use sim::{AuditRecord, AuditVerdict};
 /// | 20 | `Pass` (a sampling-pass job; never a step) |
 /// | 22 | `Segment` (a capped segment's scene: teacher only, never recorded — no model answer; M8a Task 10) |
 /// | 23 | `NearMisfit` (an atom next to a training sample the model cannot reproduce; spec 2026-11-13 §4.3) |
+/// | 25 | `UnrepresentedNeighbour` (rule 3b, chemical channels: a many-body atom with a neighbour the mix does not represent; a gate rule — no model answer is consulted, so never recorded) |
 /// | 21 | `Class(_)` refused **and** the variance verdict (rule 6/7) refused too — the class's note
 ///       is shown, but the step is not the class verdict's evidence ([`HISTORY_RULE_CLASS_AND_VARIANCE`];
 ///       M8a Task 2: `calibrate` reads codes 5 and 6 only) |
@@ -52,6 +53,7 @@ pub fn history_rule_code(rule: TeachRule) -> u8 {
         TeachRule::NoModel => 1,
         TeachRule::NewSpecies(_) => 2,
         TeachRule::OtherSettings => 3,
+        TeachRule::UnrepresentedNeighbour(_) => 25,
         TeachRule::Untrusted(_) => 4,
         TeachRule::Class(EnvClass::Pair) => 5,
         TeachRule::Class(EnvClass::ManyBody) => 6,
@@ -115,6 +117,7 @@ pub fn history_rule_name(code: u8) -> &'static str {
         22 => "capped segment (teacher only)",
         23 => "near a misfit",
         24 => "rule 6/7 at the tail-aware inflation (passes at λ_sum)",
+        25 => "rule 3b (unrepresented neighbour)",
         _ => "?",
     }
 }

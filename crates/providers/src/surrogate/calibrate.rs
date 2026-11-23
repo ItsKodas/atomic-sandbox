@@ -68,6 +68,16 @@
 //! as the no-model keep cap ([`super::NO_MODEL_SAMPLE_FACTOR`] · Q′, which only bounds how many
 //! answers are kept before a first fit).
 //!
+//! **A channel collection** (chemical channels Tasks 5–6, review C2; `represent` module doc) counts
+//! q_k as the smaller of the channel columns k's atoms touch and the columns they touch in the
+//! shadow species basis (`trust::key_column_counts_c2`): a dense W makes every atom touch its
+//! centre's whole channel block, and without the bound no key would ever be answered; with it a key
+//! over at most K neighbour species keeps exactly the floor above. The whole-model floor takes the
+//! same bound. An unseen key still needs the whole basis's Q′. And **a relearnt W starts the
+//! evidence over**: the points of the models of an earlier W are left out of every count, window
+//! and λ ([`calibrate_from`], the mix's `history_from`), and the hysteresis memory is cleared, so
+//! every key re-enters at ENTER.
+//!
 //! # What the verdict asks
 //!
 //! Rule 4b asks, per environment class c (pair, many-body; [`super::trust::atom_class`]): may the
@@ -799,10 +809,19 @@ impl Lists {
 /// inflation's measured errors, and a calibration for every key in `keys` (the fit's own atoms'
 /// keys) besides the history's attributed ones (module doc, "Per environment species").
 pub fn calibrate_with(history: &AuditHistory, policy: &FallbackPolicy, aleatoric: [f64; 2], keys: &BTreeSet<EnvKey>) -> Calibration {
+    calibrate_from(history, policy, aleatoric, keys, 0)
+}
+
+/// [`calibrate_with`] over the points of model generation `min_gen` and later only: a channel
+/// collection's relearnt W (chemical channels, spec "Physics review 2" item 8) — the points the
+/// models of an earlier W measured leave the evidence counts, the windows and every λ, as if the
+/// ring began at the relearn (`providers::surrogate`, "Chemical channels"). `min_gen` 0 is
+/// [`calibrate_with`] bit for bit.
+pub fn calibrate_from(history: &AuditHistory, policy: &FallbackPolicy, aleatoric: [f64; 2], keys: &BTreeSet<EnvKey>, min_gen: u64) -> Calibration {
     let mut class: [Lists; 2] = Default::default();
     let mut legacy: [Lists; 2] = Default::default();
     let mut by_key: BTreeMap<EnvKey, Lists> = BTreeMap::new();
-    for p in history.iter() {
+    for p in history.iter().filter(|p| p.model_gen >= min_gen) {
         // the posterior's jurisdiction (λ_sum, the verdict) and the answer sample (λ_T, λ_E) are
         // selected apart: a tick may be a point of either kind
         let posterior = in_posterior_jurisdiction(p.kind);

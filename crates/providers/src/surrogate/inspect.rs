@@ -73,6 +73,7 @@ fn state_name(code: Option<u8>, below_prefix: bool) -> &'static str {
         Some(Q_DRAFT) => "held out (draft guess)",
         Some(Q_LONE) => "held out (lone atoms)",
         Some(Q_STRAY) => "held out (stray atoms, until measured)",
+        Some(Q_UNREP) => "held out (a neighbour the chemical channels do not represent)",
         _ if !below_prefix => "unfitted",
         _ => "fitted",
     }
@@ -119,7 +120,7 @@ impl SurrogateKs {
     /// The strict policy's first refusal at (`pos`, `z`) under `prov`, in `evaluate`'s order with a
     /// fresh variance (module doc, "Readiness"); `None` where it would answer. Read-only.
     pub(super) fn first_refusal(&self, pos: &[[f64; 3]], z: &[u8], prov: &Provenance) -> Option<Refusal> {
-        if let Err(g) = self.gate(z, prov) {
+        if let Err(g) = self.gate(pos, z, prov) {
             return Some(g.reason);
         }
         let model = self.model.as_ref()?;
@@ -198,7 +199,7 @@ impl SurrogateKs {
             Some(v) if v.key == key && v.pos == pos && v.z == z => v.refusal.clone(),
             _ => match (self.first_refusal(&pos, &z, &prov), lone) {
                 // the gate passes and rule 5a has not already refused: 0b's refusal (as `evaluate`)
-                (r, Lone::StandAside(why)) if self.gate(&z, &prov).is_ok() && r.as_ref().is_none_or(|r| r.rule != TeachRule::IsolatedAtom) => Some(Self::lone_refusal(&why)),
+                (r, Lone::StandAside(why)) if self.gate(&pos, &z, &prov).is_ok() && r.as_ref().is_none_or(|r| r.rule != TeachRule::IsolatedAtom) => Some(Self::lone_refusal(&why)),
                 (r, _) => r,
             },
         };
@@ -285,7 +286,7 @@ impl SurrogateKs {
         );
         let _ = writeln!(o, "    would_answer: {:?}", self.would_answer(&pos, &z, &prov));
         let _ = writeln!(o, "    lone-atom rule (0b, strict mode): {:?}", self.lone_reference(scene, &prov));
-        if let Err(g) = self.gate(&z, &prov) {
+        if let Err(g) = self.gate(&pos, &z, &prov) {
             let _ = writeln!(o, "    REFUSED by the gate ({:?}): {}", g.reason.rule, g.reason.text);
             return o;
         }

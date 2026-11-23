@@ -131,20 +131,21 @@ The spec's section "Physics review, 2026-11-22: binding changes" (C1, C2, I1–I
 - `crates/surrogate/src/model.rs` and `fit.rs`: the linearised W variance gᵀΣ_W g in the predictive std (the form the physics review approves);
 - constants N_W and N_trust, each with its reason.
 
-- [ ] **Step 1, tests:**
-  - `a_new_element_is_refused_until_it_has_enough_samples`;
-  - `rare_element_error_bars_widen` (σ for an element with few samples ≥ σ for the same geometry type with many);
-  - `well_sampled_error_bars_are_unchanged_within_5_percent`.
-- [ ] **Step 2:** implement; physics-reviewer pass; commit.
+**Replaced** by the spec's "Physics review 2, 2026-11-23: Task 5 replaced" (refuse rather than widen; no gᵀΣ_W g, no N_trust). Tasks 5 and 6 landed as one piece (2026-11-24; `providers/src/surrogate/represent.rs` module doc).
+
+- [x] **Step 1, tests** (the review-2 list): `representation_status_is_a_flag_not_a_value` (surrogate `channels`), `channels_txt_round_trips` and `a_mismatched_species_set_is_refused` (surrogate `collection`, channels.txt version 2), and providers `tests/channels_life.rs`: `a_many_body_atom_with_an_unrepresented_neighbour_is_refused` (HOCl, H₂O·HCl, LiOH refused by rule 3b where 5d/5e pass at a geometry Task 4's fit holds; the excluded samples leave water's coefficients, report, n_k/q_k and prediction bit-identical), `pair_atoms_with_an_unrepresented_neighbour_still_answer` (HCl, LiH, ClO bit-identical), `a_rare_element_is_unrepresented_until_n_w_then_relearns` (S unrepresented with a zero row, refused, kept; relearnt at N_W with class memory cleared and `history_from` moved; then O{H, S} refused by its n_k = 0 floor). The two Σ_W error-bar tests are dropped (no Σ_W term).
+- [x] **Step 2:** implemented: the represented flag (N_W ∧ ρ_t ≤ 0.01, NaN fails, stored by Z), W from represented species only (`MixSetup::eligible`; the raw mix stays for the gate), rule 3b (`TeachRule::UnrepresentedNeighbour`, history code 25, draft mode too, kept and thinned), `Q_UNREP` (out of the channel fit, in the low-order fit and N_W). Physics-reviewer pass: still due (not dispatched from the implementing agent).
+
+**Not done here:** the gate rerun through the full decision list (review T7: admitted-but-wrong ≤ the species model's, no admitted many-body atom with an unrepresented neighbour, z within 1 + 1/√(2n)) — see the Task 5–6 report. K is the collection key's; review I3's choice of K stays the gate's.
 
 ### Task 6: trust floors, new-species handling, sampling (day 2)
 
 **Files:** providers `trust::key_column_counts`, `unseen_key_floor`, `fit_column_union`, `mod.rs` `fit_floor` / `grown_body4_degree`, `calibrate.rs`, `quarantine.rs:2314`, `sampling/mod.rs` `min_samples_for_trust_basis`, `teach.rs` `richer_basis`, `store.rs` / `shared.rs` dirtying on a new species (relearn W: Review focus 4). From Task 3: a channel collection starts without W and refuses every fit (`shared.rs` `channel_refusal`); this task learns W with `channels::learn_mix` once N_W is met and installs it through `SurrogateKs::set_collection_mix` (which writes `channels.txt`), leaves a rowless element's samples out of the fit instead of refusing it (review I5a), relearns on doubling, and resets class hysteresis on a relearn.
 
-- [ ] **Steps:**
-  - check each floor's rationale against channel Q′ and fix the reasoning text;
-  - test `a_new_species_relearns_the_mix_and_refits_from_scratch`;
-  - shortened providers and app runs (end of day 2);
+- [x] **Steps** (2026-11-24, with Task 5):
+  - floors: C2 per key, `trust::key_column_counts_c2` = min(channel columns touched, shadow species basis columns touched) over fitted samples — the class pass (`key_q`), the whole-model floor (`fit_column_union`, `sample_floor`), `fit_floor` (so `grown_body4_degree` and the readiness), `richer_basis` (now keeps the mix) and the pass floor (`sampling::min_samples_for_trust_channels`, `Sampler::with_channel_k`); `unseen_key_floor` stays Q′; the no-model keep cap (quarantine.rs) is the channel basis's own Q′, unchanged in meaning. Test `c2_floors_keep_todays_floor_up_to_k_species`.
+  - lifecycle (`represent` module doc): census of the low-order fit's samples at every refit start; learn at the first N_W, relearn when a species first meets N_W or a species that met it doubles its many-body samples; a new element enters with a zero row (`collection::mix_for`) without a relearn; before any W the fit uses one all-zero channel (a body-2 model; Task 3's "no fit without W" is gone); a relearn clears the class memory and sets `history_from`, and `calibrate::calibrate_from` leaves earlier-W points out. A background refit's copy learns, the install writes `channels.txt`. `a_new_species_relearns_the_mix_and_refits_from_scratch` is `a_rare_element_is_unrepresented_until_n_w_then_relearns`.
+  - runs (2026-11-24): `-p surrogate` all pass; `-p providers` 640 pass, 1 known environmental failure (`ks::tests::the_level_gated_stall_stop_on_the_measured_cases`, also on main); `-p app --bin app -- ui:: worker::` 538 pass. The gate rerun through the decision list (review T7) is not run yet (Task 7).
   - commit.
 
 ### Task 7: preview, suites, merge (day 3)

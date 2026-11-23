@@ -471,8 +471,10 @@ impl SurrogateKs {
         self.settle_recovery_note();
     }
 
-    /// Rules 1–4: whether the model may be consulted for this scene.
-    pub(super) fn gate(&self, z: &[u8], prov: &Provenance) -> Result<(), Gate> {
+    /// Rules 1–4 (with 3b): whether the model may be consulted for this scene. `pos` may be empty
+    /// where only the species and settings are known (the pair curves: a dimer's atoms have one
+    /// neighbour each, so rule 3b never applies there).
+    pub(super) fn gate(&self, pos: &[[f64; 3]], z: &[u8], prov: &Provenance) -> Result<(), Gate> {
         let Some(model) = &self.model else {
             return Err(Gate { reason: Refusal::new("surrogate: no model yet", TeachRule::NoModel, None), keep_sample: true, thin: false, dedup: false, untrusted: false });
         };
@@ -530,6 +532,18 @@ impl SurrogateKs {
                 keep_sample: true,
                 thin: false,
                 dedup: false,
+                untrusted: false,
+            });
+        }
+        // rule 3b (chemical channels, `represent` module doc): an atom of two or more neighbours with
+        // a neighbour the mix does not represent — its many-body energy has no channel; draft mode
+        // too (like rule 2). Kept, thinned like rule 5's fallbacks, never a copy
+        if let Some((atom, zu)) = self.unrepresented_neighbour(pos, z) {
+            return Err(Gate {
+                reason: Refusal::new(self.unrepresented_words(atom, zu), TeachRule::UnrepresentedNeighbour(zu), Some(atom)),
+                keep_sample: true,
+                thin: true,
+                dedup: true,
                 untrusted: false,
             });
         }
@@ -697,7 +711,7 @@ impl SurrogateKs {
         }
         let whole = |rule: TeachRule| Some(AtomVerdicts { geometry: Some(rule), atoms: vec![None; n] });
         let prov = self.scene_provenance(scene);
-        if let Err(g) = self.gate(&z, &prov) {
+        if let Err(g) = self.gate(&pos, &z, &prov) {
             return whole(g.reason.rule);
         }
         // a cleared stray-atom scene (spec §4.4, `evaluate`'s): its stray atoms are exempt, the bonded part judged alone

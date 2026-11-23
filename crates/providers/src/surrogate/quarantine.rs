@@ -91,6 +91,22 @@ pub(super) const Q_LONE: u8 = 6;
 /// 0–8: [`surrogate::quarantine::is_persisted_code`]; 9 was the retired Fermi–Dirac migration's).
 pub(super) const Q_STRAY: u8 = 10;
 
+/// A sample of a **channel collection** holding an atom with two or more neighbours and an
+/// **unrepresented** species among them (chemical channels, spec "Physics review 2" item 5; the
+/// `surrogate` module doc, "Chemical channels: which species are represented"): its many-body
+/// energy has no channel to live in (the neighbour's W row is zero), so fitted it would be absorbed
+/// by the represented channels' coefficients — Cl in HOCl biasing O{H}, i.e. water. **Held out of
+/// the channel fit** like [`Q_REF_WAIT`] (not fitted, not in the envelope, the grade, the
+/// leave-one-out or the per-key counts), while it **still enters the low-order fit W is learnt
+/// from and counts toward N_W** — that is how such a species earns its row. Set and cleared only
+/// by [`SurrogateKs::mark_unrepresented`], at every fit, from [`Q_NONE`] and back to the code a
+/// release gives ([`Q_NONE`], or [`Q_REF_WAIT`] while its box lacks a reference), so its code on
+/// disk is always `Q_NONE`. A provider-only code like [`Q_REF_WAIT`]: **never written** — a saved
+/// file writes `Q_NONE`, a collection gets no status record for it — so a relearn that represents
+/// the species takes the sample back without a trace. Never set outside a channel collection, so the
+/// species basis is bit for bit as before.
+pub(super) const Q_UNREP: u8 = 11;
+
 /// A box-affected sample ([`surrogate::quarantine::Q_BOX`]).
 pub(super) const Q_BOX: u8 = surrogate::quarantine::Q_BOX;
 
@@ -651,13 +667,13 @@ impl SurrogateKs {
 
     /// The code sample `i` is written to a file with: a lone sample's ([`Q_LONE`]) is the code it
     /// was loaded with; the provider-only codes `Q_DRAFT` (its tag carries it), `Q_REF_WAIT` (it
-    /// waits again at the reload) and `Q_STRAY` (set only on a `Q_NONE` sample) write as `Q_NONE`.
+    /// waits again at the reload), `Q_STRAY` and `Q_UNREP` (set only on a `Q_NONE` sample) write as `Q_NONE`.
     pub(super) fn persisted_code(&self, i: usize) -> u8 {
         let q = match self.quarantine.get(i).copied().unwrap_or(Q_NONE) {
             Q_LONE => self.lone_codes.get(&i).copied().unwrap_or(Q_NONE),
             q => q,
         };
-        if q == Q_DRAFT || q == Q_REF_WAIT || q == Q_LONE || q == Q_STRAY {
+        if q == Q_DRAFT || q == Q_REF_WAIT || q == Q_LONE || q == Q_STRAY || q == Q_UNREP {
             Q_NONE
         } else {
             q
@@ -1877,6 +1893,7 @@ impl SurrogateKs {
                     Q_REF_WAIT => "waiting for its box's isolated-atom reference",
                     Q_LONE => "lone atoms, held out for good",
                     Q_STRAY => "stray atoms, held out until a composition check measures them",
+                    Q_UNREP => "a many-body atom with a neighbour the chemical channels do not represent yet, held out of the channel fit",
                     _ => "held out of the fit",
                 }
             )),

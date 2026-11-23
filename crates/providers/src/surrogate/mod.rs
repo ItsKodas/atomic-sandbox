@@ -73,6 +73,16 @@
 //!    collection's surface-key check instead: any box, neutral, automatic multiplicity, the same
 //!    h, σ, tolerance, teacher and ionic tag; a charged or spin-forced scene is refused here, its
 //!    answers not kept (it keeps a per-scene model).
+//! 3b. **Unrepresented neighbour** (chemical channels Task 5; a channel collection only,
+//!    `represent` module doc): an atom with two or more neighbours within r_cut has a neighbour
+//!    species the frozen mix W does not represent (a flag stored with W: N_W met and ρ_t ≤ 0.01; a
+//!    species without a row is unrepresented) → teacher, unconditionally (draft mode too, as rule
+//!    2: its many-body energy has no channel); the sample is kept (thinned like rule 5's, never a
+//!    copy) and goes towards N_W, but stays out of the channel fit (`Q_UNREP`). A pair atom with an
+//!    unrepresented neighbour is judged as before (body 2). History code 25. "surrogate: atom 1 has
+//!    two or more neighbours and one is Cl, which the chemical channels do not represent yet (its
+//!    best many-body environment has 3 of the 12 samples W needs) — …". Never with the species
+//!    basis, which is bit for bit as before.
 //! 4. **Untrusted fit** (trust rule below) → teacher; the sample is kept so the fit can earn
 //!    trust. The note says which condition failed, e.g. "surrogate untrusted: n_samples 12 <
 //!    q_prime 16".
@@ -1399,6 +1409,7 @@ mod lone;
 mod policy;
 mod purge;
 mod quarantine;
+mod represent;
 mod shared;
 pub use shared::COLLECTION_CHECKPOINT_PREFIX;
 mod store;
@@ -1999,6 +2010,10 @@ pub struct SurrogateKs {
     /// M8a Task 5 — the user's stuck collection's repro is pinned to it).
     #[cfg(test)]
     body4_off: bool,
+    /// Tests only: a channel collection's W is never learnt by the provider (`represent`, "The
+    /// lifecycle"): a test's own mix stands.
+    #[cfg(test)]
+    pub(super) mix_learn_off: bool,
     /// Tests only: the body-4 degree every fit takes instead of the growth rule's
     /// ([`grown_body4_degree`](Self::grown_body4_degree)), in collection mode.
     #[cfg(test)]
@@ -2278,6 +2293,8 @@ impl SurrogateKs {
             attach_refit_off: false,
             #[cfg(test)]
             body4_off: false,
+            #[cfg(test)]
+            mix_learn_off: false,
             #[cfg(test)]
             body4_force: None,
             #[cfg(test)]
@@ -3058,7 +3075,7 @@ impl ForceProvider for SurrogateKs {
             self.cadence_steps += 1;
             c % k == 0 && !draft
         };
-        match self.gate(&z, &prov) {
+        match self.gate(&pos, &z, &prov) {
             Err(Gate { reason, untrusted: true, .. }) if draft => {
                 strict_gate = Some(reason.clone());
                 untrusted = Some(reason.text);
@@ -3930,7 +3947,7 @@ impl SurrogateKs {
                 return f;
             }
         }
-        let union = trust::key_column_counts(basis, store.samples.iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s)).union;
+        let union = trust::key_column_counts_c2(basis, store.samples.iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s)).union;
         let f = if union > 0 { union } else { basis.n_independent_columns() };
         self.fit_floor_cache.lock().unwrap().insert(basis.body4_degree, (key, f));
         f
@@ -4110,7 +4127,7 @@ impl Trainable for SurrogateKs {
                 self.ref_cache.insert(key.clone(), r.clone());
             }
         }
-        let sampler = sampler.with_references(std::mem::take(&mut self.ref_cache)).with_body4(self.default_basis(&[]).body4);
+        let sampler = sampler.with_references(std::mem::take(&mut self.ref_cache)).with_body4(self.default_basis(&[]).body4).with_channel_k(self.channel_k());
         self.pass_start = Some(self.samples());
         if let Some(sh) = self.shared.as_mut() {
             sh.pass_start = Some(sh.coll.samples.len());
@@ -4226,7 +4243,7 @@ impl Trainable for SurrogateKs {
                 self.ref_cache.insert(key.clone(), r.clone());
             }
         }
-        let sampler = sampler.with_references(std::mem::take(&mut self.ref_cache)).with_body4(self.default_basis(&[]).body4);
+        let sampler = sampler.with_references(std::mem::take(&mut self.ref_cache)).with_body4(self.default_basis(&[]).body4).with_channel_k(self.channel_k());
         self.pass_start = Some(info.pass_start.min(self.samples()));
         if let Some(sh) = self.shared.as_mut() {
             sh.pass_start = Some(info.pass_start);

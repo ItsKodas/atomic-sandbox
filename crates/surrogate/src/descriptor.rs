@@ -501,6 +501,12 @@ impl Basis {
         self.channels.as_ref()
     }
 
+    /// This basis on species instead of channels (every other setting kept): the species basis a
+    /// channel basis shadows (the per-key trust floors' second count, chemical-channels review C2).
+    pub fn without_channels(&self) -> Basis {
+        Basis { channels: None, ..self.clone() }
+    }
+
     /// Number of species S (body 2, the envelope, isolation; independent of the channels).
     pub fn n_species(&self) -> usize {
         self.species.len()

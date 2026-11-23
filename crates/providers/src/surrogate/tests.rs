@@ -8612,16 +8612,17 @@ fn fallback_steps_are_recorded_in_the_history_with_their_rule() {
         assert_eq!(*e, d, "atom {j}");
     }
     // every code is distinct and named
-    let rules = [TeachRule::Cell, TeachRule::NoModel, TeachRule::NewSpecies(1), TeachRule::OtherSettings, TeachRule::Untrusted(sim::activity::TrustKey::Samples), TeachRule::Class(sim::activity::EnvClass::Pair), TeachRule::Class(sim::activity::EnvClass::ManyBody), TeachRule::IsolatedAtom, TeachRule::Coordination, TeachRule::Spread, TeachRule::NoGrade, TeachRule::NewEnvironment, TeachRule::UnspannedAtom, TeachRule::Grade, TeachRule::ForceUncertainty, TeachRule::EnergyUncertainty, TeachRule::NonFiniteAnswer, TeachRule::NearQuarantine, TeachRule::Audit, TeachRule::RelaxVerification, TeachRule::Pass(sim::activity::PassJob::Scan), TeachRule::Segment, TeachRule::NearMisfit];
+    let rules = [TeachRule::Cell, TeachRule::NoModel, TeachRule::NewSpecies(1), TeachRule::OtherSettings, TeachRule::Untrusted(sim::activity::TrustKey::Samples), TeachRule::Class(sim::activity::EnvClass::Pair), TeachRule::Class(sim::activity::EnvClass::ManyBody), TeachRule::IsolatedAtom, TeachRule::Coordination, TeachRule::Spread, TeachRule::NoGrade, TeachRule::NewEnvironment, TeachRule::UnspannedAtom, TeachRule::Grade, TeachRule::ForceUncertainty, TeachRule::EnergyUncertainty, TeachRule::NonFiniteAnswer, TeachRule::NearQuarantine, TeachRule::Audit, TeachRule::RelaxVerification, TeachRule::Pass(sim::activity::PassJob::Scan), TeachRule::Segment, TeachRule::NearMisfit, TeachRule::UnrepresentedNeighbour(17)];
     let codes: std::collections::BTreeSet<u8> = rules.iter().map(|&r| history_rule_code(r)).collect();
     assert_eq!(codes.len(), rules.len(), "distinct codes");
     assert!(codes.iter().all(|&c| history_rule_name(c) != "?"));
     assert!(!codes.contains(&HISTORY_RULE_CLASS_AND_VARIANCE) && history_rule_name(HISTORY_RULE_CLASS_AND_VARIANCE) != "?", "code 21 is the provider's own, beside the rules'");
     // 22 is the capped segment's (M8a Task 10), 23 `NearMisfit`'s (spec 2026-11-13 §4.3), 24 the
-    // tail-aware inflations' (trust tightening Task 6: the provider's own, like 21); the next code
-    // is unnamed
+    // tail-aware inflations' (trust tightening Task 6: the provider's own, like 21), 25 rule 3b's
+    // (chemical channels Task 5); the next code is unnamed
     assert!(!codes.contains(&HISTORY_RULE_TAIL_INFLATION) && history_rule_name(HISTORY_RULE_TAIL_INFLATION) != "?");
-    assert_eq!(history_rule_name(25), "?");
+    assert_eq!(history_rule_name(25), "rule 3b (unrepresented neighbour)");
+    assert_eq!(history_rule_name(26), "?");
     // the sidecar keeps the kind
     let path = std::env::temp_dir().join(format!("fallback-history-{}.model", std::process::id()));
     s.save_sidecar(&path).unwrap();
@@ -11571,15 +11572,17 @@ fn a_collection_of_only_lone_atoms_attaches_with_no_model() {
     assert!(s.user_notes.iter().any(|n| n.contains("6 samples of lone atoms (no neighbour within 6 Bohr) held out of the fit")), "{:?}", s.user_notes);
 }
 
-/// Chemical-channels plan Task 3 (`shared` module doc, "The model basis"): the model basis picks
-/// the collection — the channel one is its own folder and starts empty, the species one keeps its
-/// samples —, a channel collection without a mix gathers samples and refuses the fit naming a
-/// species without a W row, a mix given to it is written to `channels.txt` and taken by the fit's
-/// basis (exactly its species set), a reattached provider reads it back, and a species the mix has
-/// no row for refuses the fit again.
+/// Chemical-channels plan Task 3 (`shared` module doc, "The model basis"), as Tasks 5–6 amend it
+/// (`represent` module doc): the model basis picks the collection — the channel one is its own
+/// folder and starts empty, the species one keeps its samples —, a channel collection without a
+/// mix fits a body-2 model (one all-zero channel: no species represented, a dimer collection meets
+/// no N_W), a mix given to it is written to `channels.txt` and taken by the fit's basis, a
+/// reattached provider reads it back, and a species the mix has no row for enters with a zero row
+/// (no refusal, no relearn): its many-body scenes go to the teacher (rule 3b) and their samples stay
+/// out of the channel fit.
 #[test]
 fn a_channel_collection_attaches_as_its_own_and_fits_only_with_its_mix() {
-    use surrogate::{BasisKind, FitError};
+    use surrogate::BasisKind;
     let dir = collection_root("channel-basis");
     let mut rng = StdRng::seed_from_u64(17);
     let key = {
@@ -11607,9 +11610,10 @@ fn a_channel_collection_attaches_as_its_own_and_fits_only_with_its_mix() {
         s.evaluate(&h2_at(1.1 + 1.2 * i as f64 / 39.0, &mut rng), &mut never()).unwrap();
     }
     assert_eq!(s.collection().unwrap().samples.len(), 40, "it gathers samples");
-    assert!(matches!(s.refit(), Err(FitError::Describe(surrogate::DescribeError::UnknownSpecies(1)))), "no W: no fit");
-    assert!(s.model().is_none());
-    // a W given at creation (Task 6 learns it): H alone, K_eff = S = 1, W = I
+    s.refit().expect("no W yet: a body-2 fit on one all-zero channel");
+    assert_eq!(s.basis().unwrap().channels(), Some(&surrogate::ChannelMix { k: 1, w: vec![0.0] }));
+    assert!(s.collection().unwrap().read_mix().unwrap().is_none(), "dimers meet no N_W: nothing learnt");
+    // a W given from outside (the provider learns its own: `represent`): H alone, K_eff = S = 1, W = I
     let mix = surrogate::channels::LearntMix {
         k: 1,
         k_requested: 3,
@@ -11622,6 +11626,10 @@ fn a_channel_collection_attaches_as_its_own_and_fits_only_with_its_mix() {
         weights: vec![1.0],
         rank: 1,
         low_order: None,
+        represented: vec![true],
+        n_w_met: vec![true],
+        many_body: vec![0],
+        history_from: 0,
     };
     let mut wrong_k = mix.clone();
     wrong_k.k_requested = 4;
@@ -11629,7 +11637,7 @@ fn a_channel_collection_attaches_as_its_own_and_fits_only_with_its_mix() {
     s.set_collection_mix(mix.clone()).unwrap();
     assert!(dir.join(&slug).join(surrogate::collection::CHANNELS_FILE).exists());
     assert_eq!(s.fit_basis(&[1]).channels(), Some(&surrogate::ChannelMix { k: 1, w: vec![1.0] }));
-    assert_eq!(s.fit_basis(&[1, 2]).channels(), None, "another species set: not the mix");
+    assert_eq!(s.fit_basis(&[1, 2]).channels(), Some(&surrogate::ChannelMix { k: 1, w: vec![1.0, 0.0] }), "a species without a row: an exact-zero row");
     s.refit().expect("the fit on the mix");
     assert_eq!(s.basis().unwrap().channels(), Some(&surrogate::ChannelMix { k: 1, w: vec![1.0] }));
     drop(s);
@@ -11637,22 +11645,35 @@ fn a_channel_collection_attaches_as_its_own_and_fits_only_with_its_mix() {
     let (mut again, _) = pair_student();
     again.set_collection_basis(ch3);
     again.attach_collection(&dir, &h2(1.4)).unwrap();
-    assert!(again.user_notes.iter().any(|n| n.contains("the frozen mix W of H (K = 1)")), "{:?}", again.user_notes);
+    assert!(again.user_notes.iter().any(|n| n.contains("the frozen mix W of H (K = 1; represented H)")), "{:?}", again.user_notes);
     assert_eq!(again.samples(), 40);
     again.set_collection_basis(BasisKind::Species);
     again.attach_collection(&dir, &h2(1.4)).unwrap();
     assert_eq!((again.collection().unwrap().basis, again.samples()), (BasisKind::Species, 5), "switched back: the species collection");
     drop(again);
-    // a species without a W row refuses the fit
+    // a species without a W row: a zero row, no refusal; its many-body scenes are rule 3b's and its
+    // samples stay out of the channel fit (`Q_UNREP`); far below N_W, so nothing is relearnt
     let (mut he, _) = pair_student();
     he.set_collection_basis(ch3);
     he.attach_collection(&dir, &h2(1.4)).unwrap();
+    assert!(he.model().is_some(), "the attach's fit on the mix");
     he.set_reference_solved(1, SpeciesMorse::atom(1), 41, Some(0.0));
     he.set_reference_solved(2, SpeciesMorse::atom(2), 41, Some(0.0));
     for i in 0..3 {
-        he.evaluate(&h2_he_at(1.3, 2.4 + 0.2 * i as f64, &mut rng), &mut never()).unwrap();
+        let r = he.evaluate(&h2_he_at(1.3, 2.4 + 0.2 * i as f64, &mut rng), &mut never()).unwrap();
+        assert_eq!(r.stats.source, Source::Fallback);
     }
-    assert!(matches!(he.refit(), Err(FitError::Describe(surrogate::DescribeError::UnknownSpecies(2)))), "He has no W row");
+    he.refit().expect("He enters with a zero row");
+    assert_eq!(he.basis().unwrap().channels(), Some(&surrogate::ChannelMix { k: 1, w: vec![1.0, 0.0] }));
+    assert!(he.samples() > 40 && he.quarantine[40..].iter().all(|&q| q == Q_UNREP), "kept, out of the channel fit: {:?}", &he.quarantine[40..]);
+    assert_eq!(he.report().unwrap().n_samples, 40);
+    let mix_now = he.collection().unwrap().read_mix().unwrap().unwrap();
+    assert_eq!((mix_now.species.clone(), mix_now.history_from), (vec![1], 0), "no relearn");
+    let prov = he.provenance_for(&h2_he_at(1.3, 2.6, &mut rng));
+    let sc = h2_he_at(1.3, 2.6, &mut rng);
+    let pos: Vec<[f64; 3]> = sc.nuclei.iter().map(|n| n.pos).collect();
+    let z: Vec<u8> = sc.nuclei.iter().map(|n| n.z).collect();
+    assert!(matches!(he.would_answer(&pos, &z, &prov), Err((TeachRule::UnrepresentedNeighbour(2), Some(_)))));
 }
 
 /// User-fix-4, the per-scene file: a model file whose fit used lone-atom samples (written before
@@ -11889,6 +11910,9 @@ mod refit_cost;
 mod refit_profile;
 /// The chemical-channels day-1 go / no-go gate on a collection copy (`#[ignore]`d measurement).
 mod channels_gate;
+/// Chemical channels Tasks 5–6: which species are represented, rule 3b, the exclusion, the lifecycle
+/// and the C2 floors (`represent` module doc).
+mod channels_life;
 /// The triple map's build cost on a collection copy (`#[ignore]`d measurement).
 mod triple_cost;
 mod refit_golden;

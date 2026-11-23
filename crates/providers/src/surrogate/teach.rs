@@ -443,8 +443,10 @@ impl SurrogateKs {
 
     /// The recovery's richer basis ([`richer_basis_floor`](Self::richer_basis_floor)): the store's
     /// species at [`RECOVERY_DEGREE_CAP`] with the standing basis's body-4 block, body-4 degree
-    /// (spec 2026-11-13 §4.1: D₄ = min(cap, the chosen D₄)) and reach; `None` when the standing
-    /// body-3 basis is at the recovery's degree already, or the recovery cannot take it.
+    /// (spec 2026-11-13 §4.1: D₄ = min(cap, the chosen D₄)) and reach, and a channel collection's mix
+    /// (the recovery's fit takes it too: `fit_basis`; its floors are C2's,
+    /// `trust::key_column_counts_c2`); `None` when the standing body-3 basis is at the recovery's
+    /// degree already, or the recovery cannot take it.
     pub(super) fn richer_basis(&self) -> Option<Basis> {
         let b = &self.model.as_ref()?.basis;
         if !b.body3 || b.degree_cap >= RECOVERY_DEGREE_CAP || self.degree_cap.is_some() {
@@ -458,7 +460,10 @@ impl SurrogateKs {
         rich.body4 = b.body4;
         rich.body4_degree = b.body4_degree;
         rich.r_cut = b.r_cut;
-        Some(rich)
+        Some(match self.collection_mix_for(&species) {
+            Some(mix) => rich.with_channels(mix),
+            None => rich,
+        })
     }
 
     /// SHOULD-T3: when the standing body-3 basis is below the recovery's degree and the recovery
@@ -491,6 +496,7 @@ impl SurrogateKs {
             }
         }
         (&rich.species, rich.n_max, rich.l_max, rich.degree_cap, rich.body3, rich.body4, rich.body4_degree, rich.r_cut.to_bits(), degree).hash(&mut h);
+        rich.channels().map(|m| (m.k, m.w.iter().map(|x| x.to_bits()).collect::<Vec<u64>>())).hash(&mut h);
         let key = h.finish();
         if let Some((k, words)) = self.richer_floor_cache.lock().unwrap().as_ref() {
             if *k == key {
@@ -500,7 +506,7 @@ impl SurrogateKs {
         let fitted = store.samples[..end].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s);
         #[cfg(test)]
         self.richer_floor_counts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let short: Vec<String> = super::trust::key_column_counts(&rich, fitted)
+        let short: Vec<String> = super::trust::key_column_counts_c2(&rich, fitted)
             .per_key
             .into_iter()
             .filter(|(_, (n, q))| n < q)

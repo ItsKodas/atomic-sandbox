@@ -574,6 +574,11 @@ pub enum TeachRule {
     NoModel,
     NewSpecies(u8),
     OtherSettings,
+    /// 3b (chemical channels): an atom with two or more neighbours has a neighbour of this species,
+    /// which the channel model's mix does not represent yet — its many-body environment has no
+    /// channel to live in (`providers::surrogate`, "Chemical channels: which species are
+    /// represented").
+    UnrepresentedNeighbour(u8),
     Untrusted(TrustKey),
     Class(EnvClass),
     IsolatedAtom,

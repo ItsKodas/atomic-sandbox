@@ -155,7 +155,7 @@ impl SurrogateKs {
     /// A cleared stray-atom scene (`stray_cleared`; spec §4.4) is judged as `evaluate` judges it: its stray atoms
     /// exempt from 5a–5e, rule 7 per bonded atom, 5d and the fences on the bonded part alone.
     pub fn would_answer(&self, pos: &[[f64; 3]], z: &[u8], prov: &Provenance) -> Verdict {
-        self.gate(z, prov).map_err(|g| (g.reason.rule, g.reason.atom))?;
+        self.gate(pos, z, prov).map_err(|g| (g.reason.rule, g.reason.atom))?;
         let model = self.model.as_ref().expect("the gate passed: a model exists");
         let pred = model.predict(pos, z, true).map_err(|e| match e {
             // unreachable past the gate (it refuses a species the basis lacks, rule 2), and
@@ -331,6 +331,8 @@ impl SurrogateKs {
                 Q_LONE => SampleState::Lone,
                 // stray atoms no composition check has measured yet: held out of the fit (`stray`)
                 Q_STRAY => SampleState::HeldOut,
+                // a many-body atom with a neighbour the chemical channels do not represent: out of the channel fit
+                Q_UNREP => SampleState::HeldOut,
                 // waiting for its box's reference (collection mode): not in the fit yet
                 Q_REF_WAIT => SampleState::Unfitted,
                 Q_NONE if i < *fit_n && fit_q.get(i).copied().unwrap_or(Q_NONE) == Q_NONE => SampleState::Fitted,
@@ -403,7 +405,7 @@ impl SurrogateKs {
             .iter()
             .map(|c| {
                 // rules 1–4 depend on the species and the settings only: one gate per pair
-                let gate = self.gate(&[c.z.0, c.z.1], prov).err().map(|g| g.reason.rule);
+                let gate = self.gate(&[], &[c.z.0, c.z.1], prov).err().map(|g| g.reason.rule);
                 let refused = c
                     .r
                     .iter()

@@ -74,15 +74,20 @@
 //!
 //! **`channels.txt`** holds the frozen mix W of a channel collection ([`channels_to_text`],
 //! [`channels_from_text`]; [`Collection::save_mix`], [`Collection::read_mix`]), versioned
-//! ([`CHANNELS_VERSION`]): the K asked for (the key's) and K_eff, the numerical rank, η, the S
-//! singular values, one `row` line **per species keyed by Z** (its energy weight a_t, its truncation
-//! residual ρ_t and its K weights W[t, ·]), Σ_W as one `sigma_w <Z> <c>` line per row (columns in
-//! the (sorted Z, channel) order of the rows), and the low-order fit's report (`low_order.<field>`
-//! lines; review M7 records Q′, λ and σ with W). Every f64 in Rust's shortest round-trip form, so
-//! the round trip is bit-exact (NaN, a species without a body-3 fibre's ρ, keeps no payload). The
-//! mix is used only for a fit over **exactly** its species ([`mix_for`]): a species set that
-//! differs — an element without a W row, or a row for an element the fit lacks — is refused
-//! (review I5: the provider relearns W instead; the "learn when ready" lifecycle is plan Task 6's).
+//! ([`CHANNELS_VERSION`] 2, chemical-channels Tasks 5–6): the K asked for (the key's) and K_eff, the
+//! numerical rank, η, the first audit-history generation measured under this W (`history_from`),
+//! the S singular values, one `row` line **per species keyed by Z** (its **represented** flag and
+//! whether N_W was met at learn time — flags, never inferred from W: spec "Physics review 2" item
+//! 2 —, its many-body sample count at learn time, its energy weight a_t, its truncation residual ρ_t
+//! and its K weights W[t, ·]; an unrepresented row must be exactly 0), Σ_W as one `sigma_w <Z> <c>`
+//! line per row (columns in the (sorted Z, channel) order of the rows; a diagnostic, never an error
+//! bar), and the low-order fit's report (`low_order.<field>` lines; review M7 records Q′, λ and σ
+//! with W). Every f64 in Rust's shortest round-trip form, so the round trip is bit-exact (NaN, a
+//! species without a body-3 fibre's ρ, keeps no payload). For a fit's species set ([`mix_for`]) an
+//! element without a W row enters with an exact-zero row (unrepresented: item 8, no relearn); a row
+//! for an element the fit lacks is refused (W must be relearnt). The provider's lifecycle — when W
+//! is learnt and relearnt — is `providers::surrogate`'s ("Chemical channels: which species are
+//! represented").
 //!
 //! # Record versions
 //!
@@ -315,7 +320,7 @@ fn key_difference(key: &SurfaceKey, basis: BasisKind, theirs: &(SurfaceKey, Basi
 /// A channel collection's mix file in its folder (module doc, "The model basis").
 pub const CHANNELS_FILE: &str = "channels.txt";
 /// The version of [`CHANNELS_FILE`]'s format this build writes and reads.
-pub const CHANNELS_VERSION: u32 = 1;
+pub const CHANNELS_VERSION: u32 = 2;
 /// The version of a sample record's extra-targets block (module doc, "`samples.bin` records",
 /// flag bit 2).
 pub const EXTRA_TARGETS_VERSION: u8 = 1;
@@ -350,12 +355,20 @@ pub fn channels_to_text(mix: &LearntMix) -> String {
     let (s, k) = (mix.species.len(), mix.k);
     let mut t = String::new();
     t.push_str("# Atomic Sandbox chemical-channel mix W of this collection: learnt only from its own DFT samples (CLAUDE.md rule 1's signed-off exception), frozen until relearnt\n");
-    t.push_str("# row <Z> weight <a_t> residual <rho_t> w <W[t,0..K]>; sigma_w <Z> <c> <Sigma_W row t*K+c over (sorted Z, channel)>\n");
+    t.push_str("# row <Z> represented <0|1> n_w <0|1> many_body <samples at learn time> weight <a_t> residual <rho_t> w <W[t,0..K]>; sigma_w <Z> <c> <Sigma_W row t*K+c over (sorted Z, channel)> (a diagnostic, never an error bar)\n");
     t.push_str(&format!("version {CHANNELS_VERSION}\n"));
-    t.push_str(&format!("k_requested {}\nk {k}\nrank {}\nnonlinearity {:?}\n", mix.k_requested, mix.rank, mix.nonlinearity));
+    t.push_str(&format!("k_requested {}\nk {k}\nrank {}\nnonlinearity {:?}\nhistory_from {}\n", mix.k_requested, mix.rank, mix.nonlinearity, mix.history_from));
     t.push_str(&format!("singular_values {}\n", join_f64(&mix.singular_values)));
     for (ti, z) in mix.species.iter().enumerate() {
-        t.push_str(&format!("row {z} weight {:?} residual {:?} w {}\n", mix.weights[ti], mix.truncation_residual[ti], join_f64(&mix.w[ti * k..(ti + 1) * k])));
+        t.push_str(&format!(
+            "row {z} represented {} n_w {} many_body {} weight {:?} residual {:?} w {}\n",
+            u8::from(mix.represented[ti]),
+            u8::from(mix.n_w_met[ti]),
+            mix.many_body[ti],
+            mix.weights[ti],
+            mix.truncation_residual[ti],
+            join_f64(&mix.w[ti * k..(ti + 1) * k])
+        ));
     }
     let sk = s * k;
     if mix.sigma_w.len() == sk * sk {
@@ -381,8 +394,8 @@ pub fn channels_to_text(mix: &LearntMix) -> String {
 /// the low-order report complete or absent.
 pub fn channels_from_text(text: &str) -> Result<LearntMix, String> {
     let mut version = None;
-    let (mut k_req, mut k, mut rank, mut eta, mut sv) = (None, None, None, None, None);
-    let mut rows: Vec<(u8, f64, f64, Vec<f64>)> = Vec::new();
+    let (mut k_req, mut k, mut rank, mut eta, mut sv, mut from) = (None, None, None, None, None, None);
+    let mut rows: Vec<Row> = Vec::new();
     let mut sigma: Vec<(u8, usize, Vec<f64>)> = Vec::new();
     let mut low: BTreeMap<String, String> = BTreeMap::new();
     let nums = |ws: &[&str], what: &str| -> Result<Vec<f64>, String> { ws.iter().map(|w| w.parse::<f64>().map_err(|e| format!("{what}: '{w}': {e}"))).collect() };
@@ -408,19 +421,27 @@ pub fn channels_from_text(text: &str) -> Result<LearntMix, String> {
             "k" => one(&mut k, head, rest)?,
             "rank" => one(&mut rank, head, rest)?,
             "nonlinearity" => one(&mut eta, head, rest)?,
+            "history_from" => one(&mut from, head, rest)?,
             "singular_values" => {
                 if sv.replace(nums(rest, head)?).is_some() {
                     return Err("field 'singular_values' appears twice".into());
                 }
             }
             "row" => match rest {
-                [z, "weight", a, "residual", rho, "w", ws @ ..] => {
+                [z, "represented", rep, "n_w", nw, "many_body", mb, "weight", a, "residual", rho, "w", ws @ ..] => {
                     let z = z.parse::<u8>().ok().filter(|&z| z >= 1).ok_or_else(|| format!("row '{line}': Z must be 1–255"))?;
+                    let flag = |v: &str, what: &str| match v {
+                        "0" => Ok(false),
+                        "1" => Ok(true),
+                        _ => Err(format!("row {z} {what}: '{v}' is not 0 or 1")),
+                    };
+                    let (represented, n_w) = (flag(rep, "represented")?, flag(nw, "n_w")?);
+                    let many_body = mb.parse::<usize>().map_err(|e| format!("row {z} many_body: {e}"))?;
                     let a = a.parse::<f64>().map_err(|e| format!("row {z} weight: {e}"))?;
                     let rho = rho.parse::<f64>().map_err(|e| format!("row {z} residual: {e}"))?;
-                    rows.push((z, a, rho, nums(ws, &format!("row {z} w"))?));
+                    rows.push(Row { z, represented, n_w, many_body, a, rho, w: nums(ws, &format!("row {z} w"))? });
                 }
-                _ => return Err(format!("line '{line}' is not 'row <Z> weight <a> residual <rho> w <K values>'")),
+                _ => return Err(format!("line '{line}' is not 'row <Z> represented <0|1> n_w <0|1> many_body <n> weight <a> residual <rho> w <K values>'")),
             },
             "sigma_w" => match rest {
                 [z, c, vs @ ..] => {
@@ -449,12 +470,13 @@ pub fn channels_from_text(text: &str) -> Result<LearntMix, String> {
     }
     let (k_requested, k, rank) = (int(k_req, "k_requested")?, int(k, "k")?, int(rank, "rank")?);
     let nonlinearity = need(eta, "nonlinearity")?.parse::<f64>().map_err(|e| format!("field 'nonlinearity': {e}"))?;
+    let history_from = need(from, "history_from")?.parse::<u64>().map_err(|e| format!("field 'history_from': {e}"))?;
     let singular_values = sv.ok_or("field 'singular_values' is missing")?;
     let s = rows.len();
     if s == 0 {
         return Err("no 'row' lines: a mix has at least one species".into());
     }
-    if rows.windows(2).any(|p| p[0].0 >= p[1].0) {
+    if rows.windows(2).any(|p| p[0].z >= p[1].z) {
         return Err("the rows must be in strictly ascending Z, each Z once".into());
     }
     if k == 0 || k > s || k > k_requested {
@@ -463,14 +485,21 @@ pub fn channels_from_text(text: &str) -> Result<LearntMix, String> {
     if singular_values.len() != s {
         return Err(format!("{} singular values for {s} species", singular_values.len()));
     }
-    let species: Vec<u8> = rows.iter().map(|r| r.0).collect();
+    let species: Vec<u8> = rows.iter().map(|r| r.z).collect();
     let mut w = Vec::with_capacity(s * k);
-    for (z, _, _, ws) in &rows {
+    for r in &rows {
+        let (z, ws) = (r.z, &r.w);
         if ws.len() != k {
             return Err(format!("row {z} has {} weights for K = {k}", ws.len()));
         }
         if let Some(v) = ws.iter().find(|v| !v.is_finite()) {
             return Err(format!("row {z} has a non-finite weight {v}"));
+        }
+        if !r.represented && ws.iter().any(|&v| v != 0.0) {
+            return Err(format!("row {z} is not represented and has a non-zero weight (an unrepresented row is exactly 0)"));
+        }
+        if r.represented && !r.n_w {
+            return Err(format!("row {z} is represented without N_W met"));
         }
         w.extend_from_slice(ws);
     }
@@ -527,8 +556,12 @@ pub fn channels_from_text(text: &str) -> Result<LearntMix, String> {
     Ok(LearntMix {
         k,
         k_requested,
-        weights: rows.iter().map(|r| r.1).collect(),
-        truncation_residual: rows.iter().map(|r| r.2).collect(),
+        weights: rows.iter().map(|r| r.a).collect(),
+        truncation_residual: rows.iter().map(|r| r.rho).collect(),
+        represented: rows.iter().map(|r| r.represented).collect(),
+        n_w_met: rows.iter().map(|r| r.n_w).collect(),
+        many_body: rows.iter().map(|r| r.many_body).collect(),
+        history_from,
         species,
         w,
         sigma_w,
@@ -539,26 +572,43 @@ pub fn channels_from_text(text: &str) -> Result<LearntMix, String> {
     })
 }
 
-/// The basis mix of `mix` for a fit over `species` (sorted, unique Z): `Ok` only when the species
-/// set is exactly the mix's rows (module doc, "The model basis"; review I5: a mismatched set is
-/// refused, never patched — an element without a W row stays out of the channel model until W is
-/// relearnt with it, and a row the fit lacks would leave W's columns no longer orthonormal over
-/// the fitted species).
+/// One `row` line of `channels.txt`.
+struct Row {
+    z: u8,
+    represented: bool,
+    n_w: bool,
+    many_body: usize,
+    a: f64,
+    rho: f64,
+    w: Vec<f64>,
+}
+
+/// The basis mix of `mix` for a fit over `species` (sorted, unique Z; module doc, "The model
+/// basis"). A species of the fit without a row in the mix **enters with an exact-zero row**
+/// (spec "Physics review 2" item 8: a new element is unrepresented and causes no relearn; its pair
+/// terms are body 2's, and the provider refuses its many-body neighbours by rule 3b and leaves such
+/// samples out of the channel fit). A row for a species the fit does not hold is refused: W's
+/// columns are orthonormal over the species it was learnt for, and a channel could be lost — W
+/// must be relearnt.
 pub fn mix_for(mix: &LearntMix, species: &[u8]) -> Result<ChannelMix, String> {
-    if mix.species != species {
-        let missing: Vec<u8> = species.iter().copied().filter(|z| !mix.species.contains(z)).collect();
-        let extra: Vec<u8> = mix.species.iter().copied().filter(|z| !species.contains(z)).collect();
+    let extra: Vec<u8> = mix.species.iter().copied().filter(|z| !species.contains(z)).collect();
+    if !extra.is_empty() {
         let names = |v: &[u8]| v.iter().map(|&z| element(z)).collect::<Vec<_>>().join(", ");
-        let mut why = Vec::new();
-        if !missing.is_empty() {
-            why.push(format!("no W row for {}", names(&missing)));
-        }
-        if !extra.is_empty() {
-            why.push(format!("W has rows for {} that the fit does not hold", names(&extra)));
-        }
-        return Err(format!("the channel mix was learnt for {} and the fit is over {} ({}): W must be relearnt", names(&mix.species), names(species), why.join("; ")));
+        return Err(format!(
+            "the channel mix was learnt for {} and the fit is over {} (W has rows for {} that the fit does not hold): W must be relearnt",
+            names(&mix.species),
+            names(species),
+            names(&extra)
+        ));
     }
-    Ok(ChannelMix { k: mix.k, w: mix.w.clone() })
+    let k = mix.k;
+    let mut w = vec![0.0; species.len() * k];
+    for (t, z) in species.iter().enumerate() {
+        if let Some(r) = mix.species.iter().position(|s| s == z) {
+            w[t * k..(t + 1) * k].copy_from_slice(&mix.w[r * k..(r + 1) * k]);
+        }
+    }
+    Ok(ChannelMix { k, w })
 }
 
 /// The refusal of a box-affected sample (by its code, or by its face density on import).
@@ -3124,11 +3174,11 @@ mod tests {
     // ---- the model basis (chemical-channels plan Task 3) ----
 
     /// A hand-built mix over H, O, S at K = 2 (requested 3): awkward values (−0.0, a subnormal, a
-    /// 17-digit weight), a NaN residual (a species without a body-3 fibre), the full Σ_W and the
-    /// low-order report with its pinned σ_E.
+    /// 17-digit weight), a NaN residual (a species without a body-3 fibre: S, unrepresented, its
+    /// row exactly 0), the full Σ_W and the low-order report with its pinned σ_E.
     fn mix() -> LearntMix {
         let (s, k) = (3usize, 2usize);
-        let w = vec![0.7071067811865476, -0.0, 0.5, 0.8660254037844386, -0.49999999999999994, 5e-324];
+        let w = vec![0.7071067811865476, -0.0, 0.5, 5e-324, 0.0, 0.0];
         let sigma_w = (0..s * k * s * k).map(|q| if q % (s * k + 1) == 0 { 1e-3 * (1 + q) as f64 } else { -1.25e-7 * q as f64 }).collect();
         let report = FitReport {
             rmse_energy_per_atom: 1.2e-4,
@@ -3161,6 +3211,10 @@ mod tests {
             weights: vec![1.5, 0.25, 1.0],
             rank: 2,
             low_order: Some(report),
+            represented: vec![true, true, false],
+            n_w_met: vec![true, true, false],
+            many_body: vec![812, 640, 3],
+            history_from: 17,
         }
     }
 
@@ -3168,21 +3222,24 @@ mod tests {
     fn same_mix(a: &LearntMix, b: &LearntMix) -> bool {
         let bits = |v: &[f64]| v.iter().map(|x| if x.is_nan() { u64::MAX } else { x.to_bits() }).collect::<Vec<_>>();
         let report = |r: &Option<FitReport>| r.as_ref().map(|r| (bits(&low_order_f64(r)), r.n_rows, r.n_samples, r.q_prime, r.hyper_iterations, r.converged));
-        (a.k, a.k_requested, &a.species, a.rank) == (b.k, b.k_requested, &b.species, b.rank)
+        (&a.represented, &a.n_w_met, &a.many_body, a.history_from) == (&b.represented, &b.n_w_met, &b.many_body, b.history_from)
+            && (a.k, a.k_requested, &a.species, a.rank) == (b.k, b.k_requested, &b.species, b.rank)
             && [(&a.w, &b.w), (&a.sigma_w, &b.sigma_w), (&a.singular_values, &b.singular_values), (&a.truncation_residual, &b.truncation_residual), (&a.weights, &b.weights)].iter().all(|(x, y)| bits(x) == bits(y))
             && a.nonlinearity.to_bits() == b.nonlinearity.to_bits()
             && report(&a.low_order) == report(&b.low_order)
     }
 
-    /// `channels.txt` reads back bit for bit (rows keyed by Z, Σ_W, the low-order report; without
-    /// the optional parts too), through a channel collection's save and read; its strictness.
+    /// `channels.txt` reads back bit for bit (rows keyed by Z with their represented flags, N_W
+    /// and many-body counts, the history generation, Σ_W, the low-order report; without the
+    /// optional parts too), through a channel collection's save and read; its strictness (spec
+    /// "Physics review 2" item 10, review T8).
     #[test]
     fn channels_txt_round_trips() {
         let m = mix();
         let text = channels_to_text(&m);
-        assert!(text.contains("\nrow 1 weight 1.5 residual 0.01 w 0.7071067811865476 -0.0\n"), "{text}");
-        assert!(text.contains("\nrow 16 weight 1.0 residual NaN w -0.49999999999999994 5e-324\n"), "{text}");
-        assert!(text.contains("\nversion 1\n") && text.contains("\nsigma_w 8 1 "), "{text}");
+        assert!(text.contains("\nrow 1 represented 1 n_w 1 many_body 812 weight 1.5 residual 0.01 w 0.7071067811865476 -0.0\n"), "{text}");
+        assert!(text.contains("\nrow 16 represented 0 n_w 0 many_body 3 weight 1.0 residual NaN w 0.0 0.0\n"), "{text}");
+        assert!(text.contains("\nversion 2\n") && text.contains("\nhistory_from 17\n") && text.contains("\nsigma_w 8 1 "), "{text}");
         assert!(same_mix(&channels_from_text(&text).unwrap(), &m));
         let mut bare = m.clone();
         bare.sigma_w.clear();
@@ -3206,12 +3263,16 @@ mod tests {
         assert_eq!(species.read_mix(), Ok(None));
 
         // refusals: another version, a row out of order, a short row, a missing field, Σ_W cut short
-        let swap = text.replace("row 1 weight", "row 99 weight");
+        let swap = text.replace("row 1 represented", "row 99 represented");
         let cases: Vec<(&str, String, &str)> = vec![
-            ("version", text.replace("version 1\n", "version 2\n"), "another build"),
+            ("version", text.replace("version 2\n", "version 1\n"), "another build"),
             ("order", swap, "ascending"),
             ("short row", text.replace("w 0.7071067811865476 -0.0\n", "w 0.7071067811865476\n"), "weights for K"),
             ("missing k", text.replace("\nk 2\n", "\n"), "'k' is missing"),
+            ("missing history", text.replace("\nhistory_from 17\n", "\n"), "'history_from' is missing"),
+            ("bad flag", text.replace("row 1 represented 1", "row 1 represented yes"), "not 0 or 1"),
+            ("unrepresented weight", text.replace("residual NaN w 0.0 0.0", "residual NaN w 0.0 0.5"), "exactly 0"),
+            ("represented without N_W", text.replace("represented 1 n_w 1 many_body 812", "represented 1 n_w 0 many_body 812"), "without N_W"),
             ("sigma rows", text.lines().filter(|l| !l.starts_with("sigma_w 16 1 ")).map(|l| format!("{l}\n")).collect(), "sigma_w rows"),
             ("unknown", format!("{text}colour blue\n"), "unknown field"),
             ("K above S", text.replace("\nk 2\n", "\nk 4\n"), "between 1"),
@@ -3277,18 +3338,23 @@ mod tests {
         }
     }
 
-    /// A mix is used only for a fit over exactly its species (review I5): an element without a W
-    /// row, or a row the fit does not hold, is refused with the reason; the same set gives W.
+    /// A mix for a fit's species set (review I5 as amended by "Physics review 2" item 8): the same
+    /// set gives W; an element without a W row enters with an exact-zero row (unrepresented, no
+    /// relearn); a row the fit does not hold is refused with the reason.
     #[test]
     fn a_mismatched_species_set_is_refused() {
         let m = mix();
         assert_eq!(mix_for(&m, &[1, 8, 16]), Ok(ChannelMix { k: 2, w: m.w.clone() }));
-        let e = mix_for(&m, &[1, 6, 8, 16]).unwrap_err();
-        assert!(e.contains("no W row for C") && e.contains("relearnt"), "{e}");
+        let with_c = mix_for(&m, &[1, 6, 8, 16]).unwrap();
+        assert_eq!(with_c.k, 2);
+        assert_eq!(with_c.w[..2], m.w[..2]);
+        assert_eq!(with_c.w[2..4].iter().map(|x| x.to_bits()).collect::<Vec<_>>(), vec![0u64; 2], "C: an exact +0.0 row");
+        assert_eq!(with_c.w[4..], m.w[2..]);
+        assert!(!m.represents(6) && m.represents(1) && !m.represents(16));
         let e = mix_for(&m, &[1, 8]).unwrap_err();
-        assert!(e.contains("rows for S that the fit does not hold"), "{e}");
+        assert!(e.contains("rows for S that the fit does not hold") && e.contains("relearnt"), "{e}");
         let e = mix_for(&m, &[1, 9, 16]).unwrap_err();
-        assert!(e.contains("no W row for F") && e.contains("rows for O"), "{e}");
+        assert!(e.contains("rows for O"), "{e}");
     }
 
     /// The reserved extra-targets block (flag bit 2): this build writes none, reads a sample that

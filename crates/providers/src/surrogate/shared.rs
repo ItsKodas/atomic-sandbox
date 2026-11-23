@@ -93,16 +93,17 @@
 //!
 //! **The mix.** An attached channel collection's frozen W is read from its `channels.txt` at
 //! attach (`SharedCollection::mix`) and a fit's basis takes it ([`SurrogateKs::collection_mix_for`],
-//! through `default_basis`) **only when the fit's species set is exactly the mix's rows**; any other
-//! set — an element without a W row, or no W at all — refuses the fit before anything changes
-//! (`channel_refusal`, as `FitError::Describe(UnknownSpecies(z))` naming the first species without a
-//! row: review I5, a missing row is never patched). **What Task 3 does not do:** learn W. A W is
-//! given to the collection from outside ([`SurrogateKs::set_collection_mix`]: written to
-//! `channels.txt`, the accumulator rebuilt at the next refit); the lifecycle of review I5 — learn W
-//! with `surrogate::channels::learn_mix` once the collection has enough samples (N_W), leave the
-//! samples of an element without a row out of the fit, relearn when that element's informative
-//! count doubles, reset class hysteresis on a relearn — is plan Task 6's. Until then a fresh channel
-//! collection gathers samples (it admits and stores them as any collection does) and forms no model.
+//! through `default_basis`): a species of the fit without a W row enters with an **exact-zero row**
+//! (unrepresented, no relearn: spec "Physics review 2" item 8), and before any W is learnt the mix
+//! is one all-zero channel (every species unrepresented, a body-2 model). A mix with a row for a
+//! species the fit no longer holds refuses the fit (`channel_refusal`, as
+//! `FitError::Describe(UnknownSpecies(z))`) until the lifecycle relearns W. **Chemical channels
+//! Tasks 5–6** (`represent` module doc): W is learnt by the provider itself — at the start of a refit,
+//! once a species meets N_W, again when a species first meets it or its many-body samples double —
+//! from the represented species only; rule 3b sends a many-body atom with an unrepresented
+//! neighbour to the teacher, such samples stay out of the channel fit (`Q_UNREP`), and a relearn
+//! clears the class memory and leaves the earlier W's audit points out of the evidence. A W can
+//! still be given from outside ([`SurrogateKs::set_collection_mix`]: tests and tools).
 //!
 //! **Not in collection mode:** a scene that cannot share the collection (charged, a forced
 //! multiplicity, another surface) is refused by rule 3 — the teacher answers, the sample is not
@@ -184,8 +185,13 @@ pub(super) struct SharedCollection {
     /// [`SurrogateKs::checkpoint_counts`]).
     pub(super) pass_start: Option<usize>,
     /// A channel collection's frozen mix (`channels.txt`, module doc "The model basis"); `None` for
-    /// a species collection or before W is given.
+    /// a species collection or before W is learnt.
     pub(super) mix: Option<LearntMix>,
+    /// The last refit's census of the low-order fit's samples (`represent` module doc): rule 3b's
+    /// N_W progress words. `None` for a species collection or before the first refit.
+    pub(super) census: Option<super::represent::Census>,
+    /// The census at which the last learn of W failed: not retried until it changes.
+    pub(super) learn_failed: Option<super::represent::Census>,
 }
 
 impl SharedCollection {
@@ -207,6 +213,8 @@ impl SharedCollection {
             write_noted: true,
             pass_start: self.pass_start,
             mix: self.mix.clone(),
+            census: self.census.clone(),
+            learn_failed: self.learn_failed.clone(),
         }
     }
 }
@@ -356,6 +364,8 @@ impl SurrogateKs {
             write_noted: false,
             pass_start: None,
             mix,
+            census: None,
+            learn_failed: None,
             coll: c,
         });
         // the fit's energies: each sample against its own box's references (module doc)
@@ -380,8 +390,17 @@ impl SurrogateKs {
         }
         if let Some(sh) = self.shared.as_ref().filter(|sh| sh.coll.basis != BasisKind::Species) {
             note.push_str(&match &sh.mix {
-                Some(m) => format!(" — model basis {}: the frozen mix W of {} (K = {})", sh.coll.basis.describe(), m.species.iter().map(|&z| symbol(z)).collect::<Vec<_>>().join(" "), m.k),
-                None => format!(" — model basis {}: no mix W learnt yet, so it gathers samples and forms no model until W is learnt", sh.coll.basis.describe()),
+                Some(m) => format!(
+                    " — model basis {}: the frozen mix W of {} (K = {}; {})",
+                    sh.coll.basis.describe(),
+                    m.species.iter().map(|&z| symbol(z)).collect::<Vec<_>>().join(" "),
+                    m.k,
+                    super::represent::represented_words(m)
+                ),
+                None => format!(
+                    " — model basis {}: no mix W learnt yet, so no species is represented — pair atoms are answered by the two-body terms, an atom with two or more neighbours by the teacher until a species has enough many-body samples for W",
+                    sh.coll.basis.describe()
+                ),
             });
         }
         self.user_notes.push(note);
@@ -442,39 +461,50 @@ impl SurrogateKs {
         self.collection_basis
     }
 
-    /// The attached channel collection's frozen mix for a fit over `species`, when it is exactly
-    /// the mix's species set (module doc, "The model basis"); `None` otherwise — a species
-    /// collection, none attached, no mix, or another species set ([`channel_refusal`](Self::channel_refusal)
-    /// refuses that fit).
+    /// The attached channel collection's mix for a fit over `species` (module doc, "The model
+    /// basis"): the frozen W with an exact-zero row for each species it has no row for
+    /// (`surrogate::collection::mix_for`: a new element is unrepresented, no relearn), or — before W
+    /// is learnt — one all-zero channel (every species unrepresented: a body-2 model, `represent`
+    /// module doc). `None` for a species collection, none attached, or a mix with a row the fit lacks
+    /// ([`channel_refusal`](Self::channel_refusal) refuses that fit).
     pub(super) fn collection_mix_for(&self, species: &[u8]) -> Option<ChannelMix> {
-        let mix = self.shared.as_ref().filter(|sh| sh.coll.basis != BasisKind::Species)?.mix.as_ref()?;
-        surrogate::collection::mix_for(mix, species).ok()
+        let sh = self.shared.as_ref().filter(|sh| sh.coll.basis != BasisKind::Species)?;
+        match sh.mix.as_ref() {
+            Some(mix) => surrogate::collection::mix_for(mix, species).ok(),
+            None => (!species.is_empty()).then(|| ChannelMix { k: 1, w: vec![0.0; species.len()] }),
+        }
     }
 
     /// Why a fit over `species` cannot form on the attached channel collection (module doc, "The
-    /// model basis"): no mix yet, or a species set other than the mix's rows — the first species
-    /// without a row (or, when every one has a row, the first row the fit lacks) as
-    /// `FitError::Describe(UnknownSpecies)`. `Ok` for a species collection or without one.
+    /// model basis"): the mix has a row for a species the fit does not hold (W must be relearnt; the
+    /// lifecycle relearns it once a species meets N_W) — that species as
+    /// `FitError::Describe(UnknownSpecies)`. `Ok` for a species collection, without one, before W
+    /// is learnt, and for any species set holding the mix's rows.
     pub(super) fn channel_refusal(&self, species: &[u8]) -> Result<(), FitError> {
         let Some(sh) = self.shared.as_ref().filter(|sh| sh.coll.basis != BasisKind::Species) else { return Ok(()) };
         let rows: &[u8] = sh.mix.as_ref().map_or(&[], |m| &m.species);
-        if rows == species {
-            return Ok(());
+        match rows.iter().find(|z| !species.contains(z)) {
+            Some(&z) => Err(FitError::Describe(DescribeError::UnknownSpecies(z))),
+            None => Ok(()),
         }
-        let z = species.iter().find(|z| !rows.contains(z)).or_else(|| rows.iter().find(|z| !species.contains(z))).copied().unwrap_or(0);
-        Err(FitError::Describe(DescribeError::UnknownSpecies(z)))
     }
 
-    /// Gives the attached channel collection its frozen mix W (module doc, "The model basis": Task 3
-    /// takes a W given from outside; learning it when the collection is ready is plan Task 6's):
-    /// written to `channels.txt` first (`Collection::save_mix`: refused for a species collection, a
-    /// read-only one, or another K than the key's), then used, the accumulator rebuilt at the next
-    /// refit (which is armed). `Err`, nothing changed, without an attached channel collection.
+    /// Gives the attached channel collection a mix W from outside (tests, tools; the provider learns
+    /// its own: `represent` module doc, "The lifecycle"): written to `channels.txt` first
+    /// (`Collection::save_mix`: refused for a species collection, a read-only one, or another K than
+    /// the key's), then used, the accumulator rebuilt at the next refit (which is armed), the class
+    /// memory cleared as on a relearn. `Err`, nothing changed, without an attached channel
+    /// collection.
     pub fn set_collection_mix(&mut self, mix: LearntMix) -> Result<(), String> {
         let sh = self.shared.as_mut().ok_or("no shared collection is attached")?;
         sh.coll.save_mix(&mix)?;
         sh.mix = Some(mix);
+        sh.learn_failed = None;
         self.species_dirty = true;
+        self.class_memory.clear();
+        self.fit_floor_cache.lock().unwrap().clear();
+        // another basis: a background refit begun on the old one is a conflict (`background`)
+        self.model_gen += 1;
         self.arm_refit();
         Ok(())
     }
@@ -645,7 +675,7 @@ impl SurrogateKs {
         } else if draft {
             Q_DRAFT
         } else {
-            self.quarantine.get(i).copied().filter(|&q| q != Q_REF_WAIT).unwrap_or(Q_NONE)
+            self.quarantine.get(i).copied().filter(|&q| q != Q_REF_WAIT && q != Q_UNREP).unwrap_or(Q_NONE)
         };
         let sh = self.shared.as_mut().expect("collection mode");
         let verdict = match sh.coll.admit(&s, prov, code) {
@@ -702,7 +732,8 @@ impl SurrogateKs {
             if matches!(self.quarantine.get(i), Some(&Q_LONE) | Some(&Q_STRAY)) {
                 continue;
             }
-            let code = self.quarantine.get(i).copied().filter(|&q| q != Q_REF_WAIT).unwrap_or(Q_NONE);
+            // `Q_UNREP` (chemical channels) is the provider's hold-out of a sample whose collection code is `Q_NONE`
+            let code = self.quarantine.get(i).copied().filter(|&q| q != Q_REF_WAIT && q != Q_UNREP).unwrap_or(Q_NONE);
             match *link {
                 // only a code a collection holds is written (`is_persisted_code`: 0–3, 7, 8); the provider's own and
                 // the draft code (its tag carries it) leave the collection's code standing — `set_status` refuses them,
@@ -740,7 +771,7 @@ impl SurrogateKs {
     /// leaves the collection at the old code, so a later Restore would otherwise "match" it and
     /// read as written).
     pub(super) fn write_status_now(&mut self, i: usize) -> Result<bool, String> {
-        let code = self.quarantine.get(i).copied().filter(|&q| q != Q_REF_WAIT).unwrap_or(Q_NONE);
+        let code = self.quarantine.get(i).copied().filter(|&q| q != Q_REF_WAIT && q != Q_UNREP).unwrap_or(Q_NONE);
         let Some(sh) = self.shared.as_mut() else { return Ok(false) };
         let Some(&Link::In(k)) = sh.link.get(i) else { return Ok(false) };
         if !surrogate::quarantine::is_persisted_code(code) {

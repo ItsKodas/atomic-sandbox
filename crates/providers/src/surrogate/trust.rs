@@ -335,6 +335,34 @@ pub(super) fn key_column_counts<'a>(basis: &surrogate::Basis, samples: impl Into
     ColumnCounts { per_key: per_key.into_iter().map(|(k, (bits, n))| (k, (n, count(&bits)))).collect(), union: count(&union) }
 }
 
+/// [`key_column_counts`] under review C2 (chemical channels; spec "Physics review 2" item 6): for
+/// a channel basis each key's q_k is the smaller of the channel columns its atoms touch and the
+/// columns they touch in the **shadow species basis** (`Basis::without_channels`: a species-basis
+/// atom touches only its own neighbours' species blocks, so that count is the species basis
+/// restricted to the key's neighbour set T), and the whole-model union likewise. A dense W makes a
+/// key's atoms touch its centre's whole channel block (H{H} 74 → 1 652 columns at S = 5, K = 4:
+/// the model would answer nothing); the bound keeps a key over |T| ≤ K species at exactly today's
+/// floor, n_max·|T| + P₃(|T|) + P₄(|T|), and never above it. n_k is the same in both bases (the
+/// keys are geometry and Z only). For the species basis this is [`key_column_counts`] bit for bit.
+/// The caller passes fitted samples only (C2: "counted over fitted samples").
+pub(super) fn key_column_counts_c2<'a>(basis: &surrogate::Basis, samples: impl IntoIterator<Item = &'a Sample>) -> ColumnCounts {
+    if basis.channels().is_none() {
+        return key_column_counts(basis, samples);
+    }
+    let samples: Vec<&Sample> = samples.into_iter().collect();
+    let ch = key_column_counts(basis, samples.iter().copied());
+    let sp = key_column_counts(&basis.without_channels(), samples.iter().copied());
+    let per_key = ch
+        .per_key
+        .into_iter()
+        .map(|(k, (n, q))| {
+            let q_sp = sp.per_key.get(&k).map_or(q, |&(_, q_sp)| q_sp);
+            (k, (n, q.min(q_sp)))
+        })
+        .collect();
+    ColumnCounts { per_key, union: ch.union.min(sp.union) }
+}
+
 /// The leave-one-out statistics a key no fitted atom holds is judged with (final review 5): its
 /// class's numbers with **n_k = 0** samples of its own — the sample floor refuses it before any
 /// leave-one-out number is read (`calibrate::verdict`), as `ClassKey::Samples`.
@@ -637,7 +665,7 @@ impl SurrogateKs {
     fn fit_column_union(&self) -> usize {
         let _prof = surrogate::prof::span("P3 fit_column_union (floor columns)");
         let (Some(model), Some(store)) = (self.model.as_ref(), self.store.as_ref()) else { return 0 };
-        key_column_counts(&model.basis, store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s)).union
+        key_column_counts_c2(&model.basis, store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s)).union
     }
 
     pub(super) fn sample_floor(&self, r: &FitReport) -> usize {
@@ -847,7 +875,7 @@ impl SurrogateKs {
     /// are committed. Nothing without a fit. Cost: one calibration pass over the ring.
     pub(super) fn rejudge_classes(&mut self) {
         let Some(mut j) = self.class_judge.take() else { return };
-        j.cal = super::calibrate::calibrate_with(&self.audit_history, &self.policy, j.aleatoric, &j.keys);
+        j.cal = super::calibrate::calibrate_from(&self.audit_history, &self.policy, j.aleatoric, &j.keys, self.history_floor());
         j.between_refits = true;
         let loo = self.judge_classes(&j);
         // a cached variance verdict was judged with the old factors: dropped when one moved (the
@@ -1052,8 +1080,8 @@ impl SurrogateKs {
         // touches is set by data the fit cannot reproduce, and leaving M out of q_k would lower the
         // floor it is held to (the union is `fit_column_union`'s, the sample floor)
         let _prof_kc = surrogate::prof::span("P4 class pass: key_column_counts (serial, x1-2)");
-        let counts = key_column_counts(&model.basis, fitted.iter().filter(|(i, _)| !self.in_misfit(*i)).map(|&(_, s)| s));
-        let all_fitted = self.misfit.as_ref().is_some_and(|m| !m.samples.is_empty()).then(|| key_column_counts(&model.basis, fitted.iter().map(|&(_, s)| s)));
+        let counts = key_column_counts_c2(&model.basis, fitted.iter().filter(|(i, _)| !self.in_misfit(*i)).map(|&(_, s)| s));
+        let all_fitted = self.misfit.as_ref().is_some_and(|m| !m.samples.is_empty()).then(|| key_column_counts_c2(&model.basis, fitted.iter().map(|&(_, s)| s)));
         let columns = all_fitted.as_ref().unwrap_or(&counts);
         drop(_prof_kc);
         let loos = surrogate::loo::leave_one_out_many(model, &fitted.iter().map(|&(_, s)| s).collect::<Vec<_>>());
@@ -1150,7 +1178,7 @@ impl SurrogateKs {
             let rms = if n > 0 { (ss / n as f64).sqrt() } else { report.sigma_f };
             report.sigma_f.min(rms)
         });
-        let cal = super::calibrate::calibrate_with(&self.audit_history, &self.policy, aleatoric, &keys);
+        let cal = super::calibrate::calibrate_from(&self.audit_history, &self.policy, aleatoric, &keys, self.history_floor());
         let stats_of = |a: LooSums| {
             let force_rms = if a.atoms > 0 { (a.force_ss / a.atoms as f64).sqrt() } else { 0.0 };
             // an undefined LOO (∞) makes the RMS ∞ — of a sample outside M through its max, of
@@ -1467,6 +1495,9 @@ impl SurrogateKs {
     /// recovery, the held-out guesses — each fit deferred (`fit_store_deferred`).
     fn refit_fits(&mut self) -> Result<FitReport, FitError> {
         let _prof = surrogate::prof::span("P1 refit_fits (fits, votes, release, recovery, held-out)");
+        // a channel collection's W: learnt or relearnt when due (`represent` module doc, "The
+        // lifecycle"); a no-op for the species basis
+        self.channel_lifecycle();
         let mut report = self.fit_store_deferred()?;
         self.recovery = None;
         // fence votes (`surrogate` module doc, "Fence voting"): a voted sample the new model cannot
@@ -2097,6 +2128,9 @@ impl SurrogateKs {
         }
         self.refit_stage(sim::RefitStage::Fit);
         self.exclude_box_samples();
+        // a channel collection: the samples with a many-body atom next to an unrepresented species
+        // leave the channel fit, and come back once represented (`represent` module doc, item 4)
+        self.mark_unrepresented();
         let store = self.store.as_ref().expect("checked");
         let provenance = store.provenance.clone();
         // M7: the labels of a pseudopotential surface carry the GPU path's scatter (policy.rs `PSEUDO_FORCE_NOISE`)

@@ -244,6 +244,7 @@ impl SurrogateKs {
         #[cfg(test)]
         {
             f.body4_off = self.body4_off;
+            f.mix_learn_off = self.mix_learn_off;
             f.body4_force = self.body4_force;
             f.eager_trust_passes = self.eager_trust_passes;
             f.skip_recovery = self.skip_recovery;
@@ -454,6 +455,21 @@ impl SurrogateKs {
             q.extend(self.quarantine.iter().skip(p).copied());
         }
         self.quarantine = q;
+        // a chemical-channel mix the copy learnt (`represent` module doc, "The lifecycle"): the copy
+        // wrote nothing, so `channels.txt` is written here; its census and failed learn too
+        if let (Some(live), Some(copy)) = (self.shared.as_mut(), f.shared.as_mut()) {
+            live.census = copy.census.take();
+            live.learn_failed = copy.learn_failed.take();
+            let learnt = |m: &Option<surrogate::channels::LearntMix>| m.as_ref().map(|m| (m.history_from, m.species.clone(), m.k, m.w.iter().map(|x| x.to_bits()).collect::<Vec<u64>>()));
+            if learnt(&copy.mix) != learnt(&live.mix) {
+                if let Some(m) = copy.mix.as_ref() {
+                    if let Err(e) = live.coll.save_mix(m) {
+                        self.user_notes.push(format!("chemical channels: the learnt W was not written to the collection ({e}): used for this session only"));
+                    }
+                }
+                live.mix = copy.mix.take();
+            }
+        }
         // the user's Forget / Restore while it ran, over the copy's codes (module doc, "The user's
         // codes"): the copy fitted with what it started from; the next refit takes the user's
         let user_moved = user.iter().any(|(&i, &c)| i < p && self.quarantine.get(i).copied().unwrap_or(Q_NONE) != c);

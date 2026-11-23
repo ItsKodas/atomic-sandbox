@@ -132,6 +132,7 @@ pub fn rule_label(rule: R, burst_t: Option<f64>) -> String {
         R::NoModel => "1 no model".into(),
         R::NewSpecies(z) => format!("2 new element {}", symbol(z)),
         R::OtherSettings => "3 other settings".into(),
+        R::UnrepresentedNeighbour(z) => format!("3b no channel for {}", symbol(z)),
         R::Untrusted(_) => "4 untrusted".into(),
         R::Class(_) => "4b class".into(),
         R::IsolatedAtom => "5a lone atom".into(),
@@ -198,6 +199,10 @@ pub fn rule_sentence(rule: R, atom: Option<usize>, cx: RowCtx) -> String {
             format!("the model has never seen {el} — answers like this one teach it; it can answer for {el} after a refit with {el}'s reference energy and enough {el} samples")
         }
         R::OtherSettings => "this scene's settings (grid, smearing, charge or spin) differ from the model's — the answer cannot be used for it".into(),
+        R::UnrepresentedNeighbour(z) => {
+            let el = symbol(z);
+            format!("{} has two or more neighbours and one is {el}, which the model's chemical channels don't cover yet — answers like this one teach it; the channels are relearnt once {el} has enough samples like this", a(atom))
+        }
         R::Untrusted(k) => format!("the model was not trusted then: {}", untrusted_title(k)),
         R::Class(EnvClass::Pair) => "the model hasn't learned two-atom arrangements well enough yet".into(),
         R::Class(EnvClass::ManyBody) => "the model hasn't learned three-or-more-atom arrangements well enough yet".into(),
