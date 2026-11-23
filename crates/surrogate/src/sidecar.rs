@@ -1265,6 +1265,8 @@ fn decode(bytes: &[u8]) -> Result<Sidecar, String> {
         body4,
         body4_degree,
         species,
+        // the sidecar does not carry a chemical-channel mix yet (chemical-channels plan, Task 3)
+        channels: None,
     };
     if body4 && body4_degree != basis.body4_cap() {
         return Err(format!("body4_cap {body4_degree} differs from this build's layout for the basis ({})", basis.body4_cap()));

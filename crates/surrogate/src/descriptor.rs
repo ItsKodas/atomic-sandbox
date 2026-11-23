@@ -209,6 +209,53 @@
 //! body-3 column is therefore its own class (`body3_columns_are_their_own_classes_lambda_zero_rank_test`
 //! pins it with a λ = 0 Gram on noise-free data).
 //!
+//! # Chemical channels for bodies 3 and 4 (chemical-channels spec 2026-11-22, Task 1)
+//!
+//! [`Basis::with_channels`] replaces the neighbour **species** index of the body-3 and body-4
+//! blocks by K learnt chemical channels. With W the S × K mix ([`ChannelMix`], `w[t·K + k]`, t the
+//! species index in the basis's sorted order — a learnt weight, never a tabulated property; CLAUDE.md
+//! rule 1's signed-off exception), the mixed atomic basis is
+//!
+//!   Ā_{(k,n),lm}(i) = Σ_t W[t,k] A_{(t,n),lm}(i) = Σ_{j ≠ i, r_ij < r_cut} W[s_j,k] φ_{n,lm}(r_j − r_i),
+//!
+//! linear in the neighbour density and computed in the same single pass (`add_neighbour` spreads
+//! each neighbour's φ into the K rows with weights W[s_j, ·]). Ā_l transforms by D^l like A_l (W is
+//! a constant mix of channels, not of m), so every contraction above stays invariant. Bodies 3 and
+//! 4 are the same contractions with Ā in place of A, items indexed (k, n, l) for k ∈ 0..K:
+//!
+//!   B^ch_{(k₁n₁),(k₂n₂),l} = Σ_m Ā_{(k₁n₁),lm} Ā_{(k₂n₂),lm} = Σ_{t₁t₂} W[t₁,k₁] W[t₂,k₂] B^sp_{(t₁n₁),(t₂n₂),l},
+//!   B^ch_{(k₁n₁l₁),(k₂n₂l₂),(k₃n₃l₃)} = Σ_{t₁t₂t₃} W[t₁,k₁] W[t₂,k₂] W[t₃,k₃] B^sp_{(t₁n₁l₁),(t₂n₂l₂),(t₃n₃l₃)},
+//!
+//! with B^sp the species features extended to every ordered channel pair / item triple by their
+//! symmetry (the physics review's I1 oracle, `random_mix_matches_the_contracted_species_basis`).
+//! The degree caps, parity and triangle rules involve n and l only, so the term list of a K-channel
+//! basis is exactly the species term list of a K-species basis: P₃(K), P₄(K), and
+//!
+//!   Q′ = n_max·S(S+1)/2 + S·(P₃(K) + P₄(K))
+//!
+//! (body 2 stays per species pair with its tie classes; per-centre blocks stay; body-3/4 columns
+//! remain one class each). `channel_columns_count` pins this against the review's counts script.
+//!
+//! **Gradients.** ∂Ā_{(k,n),lm}/∂r_j = W[s_j,k] ∇φ_{n,lm}(d_ij) for j ≠ i (the same per-neighbour
+//! ∇φ as the species basis), so the species formulas hold with the Kronecker δ_{s_j t} replaced by
+//! W[s_j, k]: ∂B^ch/∂r_j = Σ_m [W[s_j,k₁] ∇φ_{n₁,lm} Ā_{(k₂n₂),lm} + Ā_{(k₁n₁),lm} W[s_j,k₂] ∇φ_{n₂,lm}]
+//! for body 3, the product rule through the three factors for body 4, and ∂B_i/∂r_i = −Σ_j ∂B_i/∂r_j.
+//! In the code one weight table serves both bases: W, or the identity (δ_{tk}) without channels, and
+//! a zero weight skips its term — which for the species basis is exactly its old `t == s_j` test, so
+//! the species path is bit for bit what it was (a weight of 1.0 multiplies exactly).
+//!
+//! **No composition skip with channels.** An absent species leaves A_t = 0, but Ā_k = Σ_t W[t,k] A_t
+//! is non-zero as soon as any neighbour has W[s_j, k] ≠ 0, so the species basis's skip (terms whose
+//! channel species the scene lacks are exactly +0.0) does not hold and is off; a scene without
+//! species t gives the features of W with row t zeroed (`an_absent_species_is_a_zeroed_mix_row`).
+//! Likewise `touched_columns` (non-zero values) covers a centre's whole channel block for a dense W;
+//! the per-key floor of the physics review's C2 is the providers' job (Task 6).
+//!
+//! **K ≥ S.** At most S channels are independent (Ā spans the S species rows). A mix with K > S is
+//! replaced by W = I_S (K = S): exactly the species span (the span of every rank-S W) at the species
+//! cost, with no degenerate columns (review I2f, plan Review focus 3). K = S with a given W is kept.
+//! [`Basis::n_species`] stays S (body 2, the envelope, isolation); [`Basis::n_channels`] is K.
+//!
 //! # Neighbour search
 //!
 //! O(N²) with the r² < r_cut² test, no cell list: the surrogate targets N ≤ 200 atoms, where a
@@ -245,6 +292,20 @@ pub struct Basis {
     pub body4_degree: usize,
     /// Sorted, unique nuclear charges.
     pub species: Vec<u8>,
+    /// The chemical-channel mix of the body-3/4 blocks (module doc, "Chemical channels"); `None`
+    /// is the species basis. Set through [`Basis::with_channels`], which checks its shape.
+    pub(crate) channels: Option<ChannelMix>,
+}
+
+/// The learnt S × K chemical-channel mix of a basis's body-3/4 blocks (module doc, "Chemical
+/// channels"): `w[t * k + c]` = W[t, c], with t the species index in the basis's sorted species
+/// order and c ∈ 0..k the channel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChannelMix {
+    /// Number of channels K.
+    pub k: usize,
+    /// W, row-major S × K.
+    pub w: Vec<f64>,
 }
 
 /// The body-4 degree a basis starts at ([`Basis::body4_degree`]; module doc, "Body-4 features"):
@@ -272,7 +333,9 @@ pub const COLLECTION_R_CUT: f64 = 6.0;
 
 /// One body-4 feature: the Gaunt contraction Σ_{m₁m₂m₃} G^{l₁l₂l₃}_{m₁m₂m₃} A_{(t₁,n₁),l₁m₁}
 /// A_{(t₂,n₂),l₂m₂} A_{(t₃,n₃),l₃m₃} of three (channel, l) items in increasing order (module doc).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `t` is the neighbour species index of the species basis, the chemical channel k of a channel
+/// basis (module doc, "Chemical channels").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Body4Term {
     pub t: [usize; 3],
     pub n: [usize; 3],
@@ -374,8 +437,9 @@ pub(crate) fn body4_value(entries: &[Gaunt], a1: &[f64], a2: &[f64], a3: &[f64])
 }
 
 /// One body-3 feature: the contraction Σ_m A_{(t₁,n₁),lm} A_{(t₂,n₂),lm} of two channels with
-/// (t₁, n₁) ≤ (t₂, n₂) in channel order (module doc).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// (t₁, n₁) ≤ (t₂, n₂) in channel order (module doc). `t1`, `t2` are neighbour species indices of
+/// the species basis, chemical channels k of a channel basis (module doc, "Chemical channels").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Body3Term {
     pub t1: usize,
     pub n1: usize,
@@ -410,12 +474,70 @@ impl Basis {
             body4: false,
             body4_degree: BODY4_DEGREE_START,
             species,
+            channels: None,
         }
     }
 
-    /// Number of species channels S.
+    /// This basis with its body-3/4 blocks on the chemical channels of `mix` (module doc,
+    /// "Chemical channels"). A mix with K > S is replaced by W = I_S (K = S; review I2f).
+    ///
+    /// # Panics
+    /// If `mix.k` is 0, `mix.w.len()` is not S·K, or an entry of W is not finite.
+    pub fn with_channels(mut self, mix: ChannelMix) -> Basis {
+        let s = self.n_species();
+        assert!(mix.k >= 1, "with_channels: K = 0");
+        assert_eq!(mix.w.len(), s * mix.k, "with_channels: W is not S × K = {s} × {}", mix.k);
+        assert!(mix.w.iter().all(|v| v.is_finite()), "with_channels: W has a non-finite entry");
+        self.channels = Some(if mix.k > s {
+            ChannelMix { k: s, w: (0..s * s).map(|q| if q / s == q % s { 1.0 } else { 0.0 }).collect() }
+        } else {
+            mix
+        });
+        self
+    }
+
+    /// The chemical-channel mix of the body-3/4 blocks; `None` for the species basis.
+    pub fn channels(&self) -> Option<&ChannelMix> {
+        self.channels.as_ref()
+    }
+
+    /// Number of species S (body 2, the envelope, isolation; independent of the channels).
     pub fn n_species(&self) -> usize {
         self.species.len()
+    }
+
+    /// Number of neighbour channels of the body-3/4 blocks: K with channels (≤ S, module doc), S
+    /// without.
+    pub fn n_channels(&self) -> usize {
+        match &self.channels {
+            Some(mix) => mix.k,
+            None => self.n_species(),
+        }
+    }
+
+    /// The weight of neighbour species t in body-3/4 channel k, row-major S × [`Basis::n_channels`]:
+    /// W with channels, the identity δ_{tk} without (module doc, "Chemical channels": one table
+    /// for both bases).
+    ///
+    /// # Panics
+    /// If the mix does not match the species list (the species were edited after
+    /// [`Basis::with_channels`]).
+    pub fn channel_weights(&self) -> Vec<f64> {
+        let s = self.n_species();
+        match &self.channels {
+            Some(mix) => {
+                assert_eq!(mix.w.len(), s * mix.k, "the channel mix does not match the basis's {s} species");
+                mix.w.clone()
+            }
+            None => (0..s * s).map(|q| if q / s == q % s { 1.0 } else { 0.0 }).collect(),
+        }
+    }
+
+    /// Row of the body-3/4 atomic basis Ā (or A) of channel k, radial n: k·n_max + n — the
+    /// species basis's [`Basis::body2_index`] without channels.
+    #[inline]
+    pub fn channel_index(&self, k: usize, n: usize) -> usize {
+        k * self.n_max + n
     }
 
     /// Index of Z in the species list, if the basis knows it.
@@ -460,7 +582,8 @@ impl Basis {
         if !self.body3 {
             return 0;
         }
-        let s = self.n_species();
+        // S of the module doc's formula is the number of body-3 channels: K with a mix.
+        let s = self.n_channels();
         let n_max = self.n_max;
         // Σ_k N(k) c(k) over ordered (n₁, n₂), and the diagonal Σ_n c(2n).
         let mut ordered = 0;
@@ -479,7 +602,7 @@ impl Basis {
         if !self.body3 {
             return terms;
         }
-        let c = self.n_body2();
+        let c = self.n_channels() * self.n_max;
         for c1 in 0..c {
             let (t1, n1) = (c1 / self.n_max, c1 % self.n_max);
             for c2 in c1..c {
@@ -500,7 +623,8 @@ impl Basis {
     /// sum of their two coefficients; the fit solves for the sum and splits it equally (`fit`
     /// docs). The representative is the column with s ≤ t. Body-3 columns are all independent
     /// (the centre is the vertex of the angle, and unordered channel pairs are stored once) and
-    /// each forms its own class.
+    /// each forms its own class; so are body-4 columns, and so are both on chemical channels
+    /// (no centre ↔ neighbour tie exists for a channel, which is not a species).
     pub fn column_classes(&self) -> Vec<Vec<usize>> {
         let p = self.n_features();
         let p2 = self.n_body2();
@@ -537,7 +661,8 @@ impl Basis {
     }
 
     /// Number of independent coefficient columns Q′ (see [`Basis::column_classes`]):
-    /// n_max·S(S+1)/2 body-2 classes plus S·(P₃ + P₄) body-3 and body-4 columns.
+    /// n_max·S(S+1)/2 body-2 classes plus S·(P₃ + P₄) body-3 and body-4 columns, P₃ and P₄ at
+    /// [`Basis::n_channels`] (K with a mix; module doc, "Chemical channels").
     pub fn n_independent_columns(&self) -> usize {
         let s = self.n_species();
         self.n_max * s * (s + 1) / 2 + s * (self.n_body3() + self.n_body4())
@@ -565,7 +690,7 @@ impl Basis {
         let d = self.body4_cap();
         let l_top = self.l_max.min(2 * d);
         let mut items: Vec<(usize, usize, usize)> = Vec::new();
-        for t in 0..self.n_species() {
+        for t in 0..self.n_channels() {
             for n in 0..self.n_max.min(d + 1) {
                 for l in 0..=l_top {
                     items.push((t, n, l));
@@ -609,7 +734,9 @@ impl Basis {
     }
 
     /// Human-readable name of every feature, in index order (for debugging and the sidecar
-    /// header): `b2[Z=<neighbour Z>,n=<n>]`, then `b3[Z=<Z₁>,n=<n₁>;Z=<Z₂>,n=<n₂>;l=<l>]`.
+    /// header): `b2[Z=<neighbour Z>,n=<n>]`, then `b3[Z=<Z₁>,n=<n₁>;Z=<Z₂>,n=<n₂>;l=<l>]` and
+    /// `b4[Z=…,n=…,l=…;…;…]`. With chemical channels the body-3/4 items name the channel instead,
+    /// `b3[k=<k₁>,n=<n₁>;k=<k₂>,n=<n₂>;l=<l>]` and `b4[k=…,n=…,l=…;…;…]`.
     pub fn feature_names(&self) -> Vec<String> {
         let mut names = Vec::with_capacity(self.n_features());
         for &zt in &self.species {
@@ -617,16 +744,17 @@ impl Basis {
                 names.push(format!("b2[Z={zt},n={n}]"));
             }
         }
+        let label = |t: usize| match self.channels {
+            Some(_) => format!("k={t}"),
+            None => format!("Z={}", self.species[t]),
+        };
         for t in self.body3_terms() {
-            names.push(format!(
-                "b3[Z={},n={};Z={},n={};l={}]",
-                self.species[t.t1], t.n1, self.species[t.t2], t.n2, t.l
-            ));
+            names.push(format!("b3[{},n={};{},n={};l={}]", label(t.t1), t.n1, label(t.t2), t.n2, t.l));
         }
         for t in self.body4_terms() {
             names.push(format!(
-                "b4[Z={},n={},l={};Z={},n={},l={};Z={},n={},l={}]",
-                self.species[t.t[0]], t.n[0], t.l[0], self.species[t.t[1]], t.n[1], t.l[1], self.species[t.t[2]], t.n[2], t.l[2]
+                "b4[{},n={},l={};{},n={},l={};{},n={},l={}]",
+                label(t.t[0]), t.n[0], t.l[0], label(t.t[1]), t.n[1], t.l[1], label(t.t[2]), t.n[2], t.l[2]
             ));
         }
         debug_assert_eq!(names.len(), self.n_features());
@@ -687,7 +815,7 @@ impl AtomicBasisScratch {
         AtomicBasisScratch {
             n_max,
             nlm,
-            a: vec![0.0; basis.n_body2() * nlm],
+            a: vec![0.0; basis.n_channels() * n_max * nlm],
             dphi: vec![[0.0; 3]; n_atoms.saturating_sub(1) * n_max * nlm],
             neighbours: Vec::with_capacity(n_atoms),
             rn: vec![0.0; n_max],
@@ -705,7 +833,9 @@ impl AtomicBasisScratch {
     }
 
     /// Add neighbour `j` of species `t` at d = r_j − r_i (|d| = r < r_cut, u = d/r or 0): its
-    /// φ_{n,lm} into A_{(t,n),lm} and its ∇φ_{n,lm} into the next slot.
+    /// φ_{n,lm} into A_{(t,n),lm} — with chemical channels into every Ā_{(k,n),lm} with weight
+    /// W[t, k] (module doc, "Chemical channels"; a zero weight adds nothing) — and its ∇φ_{n,lm}
+    /// into the next slot (species-independent: the gradient passes apply W[t, k] themselves).
     #[inline]
     pub fn add_neighbour(&mut self, basis: &Basis, j: usize, t: usize, d: [f64; 3], r: f64, u: [f64; 3]) {
         let (n_max, nlm) = (self.n_max, self.nlm);
@@ -718,15 +848,39 @@ impl AtomicBasisScratch {
         let slot = self.neighbours.len();
         self.neighbours.push(j);
         let base = slot * n_max * nlm;
+        let Some(mix) = basis.channels() else {
+            for nn in 0..n_max {
+                let (rn, g) = (self.rn[nn], self.drn[nn]);
+                let a_row = &mut self.a[(t * n_max + nn) * nlm..(t * n_max + nn + 1) * nlm];
+                let d_row = &mut self.dphi[base + nn * nlm..base + (nn + 1) * nlm];
+                for lm in 0..nlm {
+                    let s = self.sh[lm];
+                    let ds = self.dsh[lm];
+                    a_row[lm] += rn * s;
+                    d_row[lm] = [g * s * u[0] + rn * ds[0], g * s * u[1] + rn * ds[1], g * s * u[2] + rn * ds[2]];
+                }
+            }
+            return;
+        };
+        let kk = mix.k;
+        let w_row = &mix.w[t * kk..(t + 1) * kk];
         for nn in 0..n_max {
             let (rn, g) = (self.rn[nn], self.drn[nn]);
-            let a_row = &mut self.a[(t * n_max + nn) * nlm..(t * n_max + nn + 1) * nlm];
             let d_row = &mut self.dphi[base + nn * nlm..base + (nn + 1) * nlm];
             for lm in 0..nlm {
                 let s = self.sh[lm];
                 let ds = self.dsh[lm];
-                a_row[lm] += rn * s;
                 d_row[lm] = [g * s * u[0] + rn * ds[0], g * s * u[1] + rn * ds[1], g * s * u[2] + rn * ds[2]];
+            }
+            for (k, &w) in w_row.iter().enumerate() {
+                if w == 0.0 {
+                    continue;
+                }
+                let row = k * n_max + nn;
+                let a_row = &mut self.a[row * nlm..(row + 1) * nlm];
+                for lm in 0..nlm {
+                    a_row[lm] += w * (rn * self.sh[lm]);
+                }
             }
         }
     }
@@ -770,7 +924,9 @@ pub fn describe(
 /// neighbour was added to it), so every product is ±0 and a sum that starts at +0.0 and adds only
 /// signed zeros stays +0.0; its gradient entries are +0.0 likewise, and subtracting +0.0 from the
 /// self entry leaves it unchanged. Bit for bit for finite positions
-/// (`the_composition_skip_changes_no_bit`); `false` is the unskipped loop, the test's oracle.
+/// (`the_composition_skip_changes_no_bit`); `false` is the unskipped loop, the test's oracle. With
+/// chemical channels the skip is off whatever `skip_absent` says: an absent species does not make a
+/// channel zero (module doc, "Chemical channels").
 fn describe_with(
     basis: &Basis,
     pos: &[[f64; 3]],
@@ -779,9 +935,16 @@ fn describe_with(
 ) -> Result<Vec<AtomDescriptor>, DescribeError> {
     assert_eq!(pos.len(), z.len(), "describe: pos and z lengths differ");
     let s = basis.species_indices(z)?;
-    let mut present = vec![!skip_absent; basis.n_species()];
-    for &si in &s {
-        present[si] = true;
+    let skip_absent = skip_absent && basis.channels().is_none();
+    // W[t, k] (the identity without channels): a zero weight is the species basis's `t ≠ s_j` skip
+    let kk = basis.n_channels();
+    let wt = basis.channel_weights();
+    // per body-3/4 channel: does the scene have it (always, with chemical channels: skip off)
+    let mut present = vec![!skip_absent; kk];
+    if skip_absent {
+        for &si in &s {
+            present[si] = true;
+        }
     }
     let p = basis.n_features();
     let p2 = basis.n_body2();
@@ -839,21 +1002,22 @@ fn describe_with(
         let Some(sc) = scratch.as_ref() else {
             continue;
         };
-        // Body-3 values: B = Σ_m A_{c₁,lm} A_{c₂,lm}.
+        // Body-3 values: B = Σ_m A_{c₁,lm} A_{c₂,lm} (Ā with chemical channels).
         for &q in &active3 {
             let t = &terms[q];
-            let (a1, a2) = (sc.a(basis.body2_index(t.t1, t.n1)), sc.a(basis.body2_index(t.t2, t.n2)));
+            let (a1, a2) = (sc.a(basis.channel_index(t.t1, t.n1)), sc.a(basis.channel_index(t.t2, t.n2)));
             let mut b = 0.0;
             for lm in AtomicBasisScratch::l_range(t.l) {
                 b += a1[lm] * a2[lm];
             }
             out[i].b[p2 + q] = b;
         }
-        // Body-3 gradients: the product rule through both factors, per neighbour slot; the self
-        // entry is minus the sum.
+        // Body-3 gradients: the product rule through both factors, per neighbour slot, each factor
+        // weighted by W[s_j, k] (δ without channels: weight 1.0 multiplies exactly); the self entry
+        // is minus the sum.
         let atom = &mut out[i];
         for (slot, &j) in sc.neighbours.iter().enumerate() {
-            let tj = s[j];
+            let w_j = &wt[s[j] * kk..(s[j] + 1) * kk];
             // grad[0] is the self entry; the neighbour entries follow in slot order.
             let (self_entry, rest) = atom.grad.split_at_mut(1);
             let gj = &mut rest[slot].1;
@@ -861,26 +1025,27 @@ fn describe_with(
             let self_g = &mut self_entry[0].1;
             for &q in &active3 {
                 let t = &terms[q];
-                if t.t1 != tj && t.t2 != tj {
+                let (w1, w2) = (w_j[t.t1], w_j[t.t2]);
+                if w1 == 0.0 && w2 == 0.0 {
                     continue;
                 }
                 let mut g = [0.0; 3];
                 let range = AtomicBasisScratch::l_range(t.l);
-                if t.t1 == tj {
-                    let a2 = sc.a(basis.body2_index(t.t2, t.n2));
+                if w1 != 0.0 {
+                    let a2 = sc.a(basis.channel_index(t.t2, t.n2));
                     let dp = sc.dphi(slot, t.n1);
                     for lm in range.clone() {
                         for a in 0..3 {
-                            g[a] += dp[lm][a] * a2[lm];
+                            g[a] += w1 * dp[lm][a] * a2[lm];
                         }
                     }
                 }
-                if t.t2 == tj {
-                    let a1 = sc.a(basis.body2_index(t.t1, t.n1));
+                if w2 != 0.0 {
+                    let a1 = sc.a(basis.channel_index(t.t1, t.n1));
                     let dp = sc.dphi(slot, t.n2);
                     for lm in range {
                         for a in 0..3 {
-                            g[a] += a1[lm] * dp[lm][a];
+                            g[a] += a1[lm] * (w2 * dp[lm][a]);
                         }
                     }
                 }
@@ -897,26 +1062,28 @@ fn describe_with(
             atom.b[p4 + q] = body4_value(entries, sc.a(c[0]), sc.a(c[1]), sc.a(c[2]));
         }
         for (slot, &j) in sc.neighbours.iter().enumerate() {
-            let tj = s[j];
+            let w_j = &wt[s[j] * kk..(s[j] + 1) * kk];
             let (self_entry, rest) = atom.grad.split_at_mut(1);
             let gj = &mut rest[slot].1;
             let self_g = &mut self_entry[0].1;
             for &q in &active4 {
                 let (t, entries) = &terms4[q];
-                if !t.t.contains(&tj) {
+                // the factor weights W[s_j, k_f] (δ without channels)
+                let wf = [w_j[t.t[0]], w_j[t.t[1]], w_j[t.t[2]]];
+                if wf.iter().all(|&w| w == 0.0) {
                     continue;
                 }
                 let c = t4_channels(basis, t);
                 let a = [sc.a(c[0]), sc.a(c[1]), sc.a(c[2])];
                 let mut g = [0.0; 3];
                 for f in 0..3 {
-                    if t.t[f] != tj {
+                    if wf[f] == 0.0 {
                         continue;
                     }
                     let dp = sc.dphi(slot, t.n[f]);
                     let (o1, o2) = ((f + 1) % 3, (f + 2) % 3);
                     for e in entries.iter() {
-                        let w = e.g * a[o1][e.lm[o1]] * a[o2][e.lm[o2]];
+                        let w = e.g * a[o1][e.lm[o1]] * a[o2][e.lm[o2]] * wf[f];
                         let d = dp[e.lm[f]];
                         g[0] += w * d[0];
                         g[1] += w * d[1];
@@ -939,7 +1106,10 @@ fn describe_with(
 /// sums) with no term, exactly 0.0, so this is the atom's environment's column support — the
 /// parameters its predictions can move with (M8a user-fix 3: a class key is held to the count
 /// of these, not to the whole basis's Q′). `class_of` is [`Basis::column_class_index`], computed
-/// once by a caller that walks many geometries. Same panics as [`describe_values`].
+/// once by a caller that walks many geometries. Same panics as [`describe_values`]. With chemical
+/// channels and a dense W every body-3/4 channel column of the centre is non-zero once the atom
+/// has a neighbour (module doc, "Chemical channels"), so this is then the centre's whole channel
+/// block; the per-key floor of physics review C2 is computed by the providers, not here.
 pub fn touched_columns(
     basis: &Basis,
     class_of: &[usize],
@@ -967,10 +1137,11 @@ pub fn touched_columns(
         .collect())
 }
 
-/// The three channels t·n_max + n of a body-4 term's factors.
+/// The three atomic-basis rows t·n_max + n of a body-4 term's factors (k·n_max + n with chemical
+/// channels: [`Basis::channel_index`]).
 #[inline]
 pub(crate) fn t4_channels(basis: &Basis, t: &Body4Term) -> [usize; 3] {
-    [basis.body2_index(t.t[0], t.n[0]), basis.body2_index(t.t[1], t.n[1]), basis.body2_index(t.t[2], t.n[2])]
+    [basis.channel_index(t.t[0], t.n[0]), basis.channel_index(t.t[1], t.n[1]), basis.channel_index(t.t[2], t.n[2])]
 }
 
 /// No atom of `pos` has a neighbour within `r_cut` (Bohr; strictly inside, where f_c > 0): every
@@ -1067,7 +1238,7 @@ pub fn describe_values(basis: &Basis, pos: &[[f64; 3]], z: &[u8]) -> Result<Vec<
             continue;
         };
         for (q, t) in terms.iter().enumerate() {
-            let (a1, a2) = (sc.a(basis.body2_index(t.t1, t.n1)), sc.a(basis.body2_index(t.t2, t.n2)));
+            let (a1, a2) = (sc.a(basis.channel_index(t.t1, t.n1)), sc.a(basis.channel_index(t.t2, t.n2)));
             let mut b = 0.0;
             for lm in AtomicBasisScratch::l_range(t.l) {
                 b += a1[lm] * a2[lm];
@@ -1711,6 +1882,452 @@ mod tests {
             }
             eprintln!("body-4 descriptor gradients vs central differences (D₄ = {degree}): worst {worst_g:.2e}");
         }
+    }
+
+    // ---- chemical channels (module doc, "Chemical channels"; chemical-channels plan Task 1) ----
+
+    /// The user's collection basis (n_max 8, l_max 3, degree_cap 6 = the recovery cap, body 4 at
+    /// D₄ = 3): the basis the review's counts are quoted at.
+    fn collection_basis(species: &[u8]) -> Basis {
+        let mut b = Basis::new(species);
+        b.degree_cap = 6;
+        b.body4 = true;
+        b.body4_degree = BODY4_DEGREE_CAP;
+        b
+    }
+
+    /// A random dense S × K mix with no zero entry and no symmetry: |W| ∈ [0.2, 1.3), random signs.
+    fn random_mix(rng: &mut rand::rngs::StdRng, s: usize, k: usize) -> ChannelMix {
+        use rand::Rng;
+        let w = (0..s * k).map(|_| rng.gen_range(0.2..1.3) * if rng.gen_bool(0.5) { 1.0 } else { -1.0 }).collect();
+        ChannelMix { k, w }
+    }
+
+    fn identity_mix(s: usize) -> ChannelMix {
+        ChannelMix { k: s, w: (0..s * s).map(|q| if q / s == q % s { 1.0 } else { 0.0 }).collect() }
+    }
+
+    /// A random cluster of `n` atoms inside a 3.2 Bohr cube (every pair within r_cut = 6), no two
+    /// closer than `min_d`, with every species of `sp` present.
+    fn random_cluster(rng: &mut rand::rngs::StdRng, sp: &[u8], n: usize, min_d: f64) -> (Vec<[f64; 3]>, Vec<u8>) {
+        use rand::Rng;
+        assert!(n >= sp.len());
+        let mut pos: Vec<[f64; 3]> = Vec::new();
+        while pos.len() < n {
+            let p: [f64; 3] = std::array::from_fn(|_| rng.gen_range(-1.6..1.6));
+            if pos.iter().all(|q| (0..3).map(|a| (p[a] - q[a]).powi(2)).sum::<f64>().sqrt() >= min_d) {
+                pos.push(p);
+            }
+        }
+        let mut z: Vec<u8> = sp.to_vec();
+        z.extend((sp.len()..n).map(|_| sp[rng.gen_range(0..sp.len())]));
+        // shuffle so the species order is not the atom order
+        for i in (1..n).rev() {
+            z.swap(i, rng.gen_range(0..=i));
+        }
+        (pos, z)
+    }
+
+    /// |a − b| against the scale `mag` (a sum's Σ|term|, or a block's largest entry): the relative
+    /// error of a computed sum, honest under cancellation.
+    fn rel(a: f64, b: f64, mag: f64) -> f64 {
+        if a == b {
+            0.0
+        } else {
+            (a - b).abs() / mag.max(a.abs()).max(b.abs())
+        }
+    }
+
+    /// Gate 1 (spec "Gates", the identity test): W = I with K = S gives the species basis's term
+    /// lists (the channel layout is the species layout with k = t: the reordering is the identity),
+    /// its feature values and every gradient entry to 1e-10 relative, and the same energy and forces
+    /// through random per-centre coefficients, on random 2–4-species clusters (with and without a
+    /// species absent from the scene).
+    #[test]
+    fn identity_channels_reproduce_the_species_basis() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xc4a1);
+        let pool = [1u8, 3, 8, 16];
+        let mut worst: f64 = 0.0;
+        let mut compared = 0usize;
+        for s in 2..=4 {
+            let species = &pool[..s];
+            let sp = collection_basis(species);
+            let ch = sp.clone().with_channels(identity_mix(s));
+            assert_eq!((ch.n_species(), ch.n_channels(), sp.n_channels()), (s, s, s));
+            assert_eq!(ch.body3_terms(), sp.body3_terms(), "the reordering is the identity");
+            assert_eq!(ch.body4_terms(), sp.body4_terms());
+            assert_eq!((ch.n_features(), ch.n_independent_columns()), (sp.n_features(), sp.n_independent_columns()));
+            assert_eq!(ch.column_classes(), sp.column_classes());
+            let (nsp, nch) = (sp.feature_names(), ch.feature_names());
+            let p2 = sp.n_body2();
+            assert_eq!(nsp[..p2], nch[..p2], "body 2 is unchanged");
+            // the body-3/4 names map species Z ↔ channel k = its index
+            for (a, b) in nsp[p2..].iter().zip(&nch[p2..]) {
+                let mut mapped = b.clone();
+                for (k, zt) in species.iter().enumerate().rev() {
+                    mapped = mapped.replace(&format!("k={k},"), &format!("Z={zt},"));
+                }
+                assert_eq!(&mapped, a);
+            }
+            for scene in 0..4 {
+                // scene 3 drops the last species from the scene (a composition the skip handles)
+                let present = if scene == 3 { &species[..s - 1] } else { species };
+                let n = rng.gen_range(s.max(4)..=7);
+                let (pos, z) = random_cluster(&mut rng, present, n, 0.5);
+                let a = describe(&sp, &pos, &z).unwrap();
+                let b = describe(&ch, &pos, &z).unwrap();
+                let coeffs: Vec<Vec<f64>> = (0..s).map(|_| (0..sp.n_features()).map(|_| rng.gen_range(-1.0..1.0)).collect()).collect();
+                let si = sp.species_indices(&z).unwrap();
+                let (mut e_a, mut e_b) = (0.0, 0.0);
+                let mut f_a = vec![[0.0; 3]; n];
+                let mut f_b = vec![[0.0; 3]; n];
+                for i in 0..n {
+                    let scale = a[i].b.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                    for k in 0..sp.n_features() {
+                        let e = rel(a[i].b[k], b[i].b[k], 1e-4 * scale);
+                        worst = worst.max(e);
+                        assert!(e <= 1e-10, "S {s} scene {scene} atom {i} feature {} : {} vs {}", nsp[k], a[i].b[k], b[i].b[k]);
+                        compared += 1;
+                    }
+                    assert_eq!(a[i].grad.len(), b[i].grad.len());
+                    let gscale = a[i].grad.iter().flat_map(|(_, g)| g.iter().flat_map(|v| v.iter())).fold(0.0f64, |m, v| m.max(v.abs()));
+                    for ((ja, ga), (jb, gb)) in a[i].grad.iter().zip(&b[i].grad) {
+                        assert_eq!(ja, jb);
+                        for k in 0..sp.n_features() {
+                            for x in 0..3 {
+                                let e = rel(ga[k][x], gb[k][x], 1e-4 * gscale);
+                                worst = worst.max(e);
+                                assert!(e <= 1e-10, "S {s} scene {scene} atom {i} wrt {ja} feature {}", nsp[k]);
+                            }
+                        }
+                        let c = &coeffs[si[i]];
+                        for x in 0..3 {
+                            f_a[*ja][x] -= (0..sp.n_features()).map(|k| c[k] * ga[k][x]).sum::<f64>();
+                            f_b[*jb][x] -= (0..sp.n_features()).map(|k| c[k] * gb[k][x]).sum::<f64>();
+                        }
+                    }
+                    e_a += (0..sp.n_features()).map(|k| coeffs[si[i]][k] * a[i].b[k]).sum::<f64>();
+                    e_b += (0..sp.n_features()).map(|k| coeffs[si[i]][k] * b[i].b[k]).sum::<f64>();
+                }
+                assert!(rel(e_a, e_b, 0.0) <= 1e-10, "energy {e_a} vs {e_b}");
+                let fmax = f_a.iter().flat_map(|v| v.iter()).fold(0.0f64, |m, v| m.max(v.abs()));
+                for j in 0..n {
+                    for x in 0..3 {
+                        assert!(rel(f_a[j][x], f_b[j][x], fmax) <= 1e-10, "force {j}.{x}");
+                    }
+                }
+                // describe_values is describe's values bit for bit with channels too
+                let v = describe_values(&ch, &pos, &z).unwrap();
+                assert!(v.iter().zip(&b).all(|(v, d)| v.iter().zip(&d.b).all(|(x, y)| x.to_bits() == y.to_bits())));
+            }
+        }
+        eprintln!("identity channels vs species basis: {compared} values, worst relative difference {worst:.2e}");
+    }
+
+    /// Review I1's algebraic oracle: for a random dense non-symmetric W (K ∈ {1, 2, S−1, S}) and a
+    /// permutation W at K = S, every channel body-3 feature is the species body-3 block contracted
+    /// with W ⊗ W, Σ_{t₁t₂} W[t₁,k₁] W[t₂,k₂] B^sp_{(t₁n₁),(t₂n₂),l} (B^sp extended to both orders
+    /// of the pair), every body-4 feature the contraction with W ⊗ W ⊗ W (B^sp extended to every
+    /// order of the triple), and every gradient entry the same contraction of the species
+    /// gradients — 1e-10 relative to the contraction's Σ|term|. Body 2 is the species body 2 bit for bit.
+    #[test]
+    fn random_mix_matches_the_contracted_species_basis() {
+        use rand::SeedableRng;
+        use std::collections::HashMap;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x0a1c);
+        let mut worst: f64 = 0.0;
+        let mut compared = 0usize;
+        for species in [&[1u8, 8, 16][..], &[1, 3, 8, 17]] {
+            let s = species.len();
+            let sp = collection_basis(species);
+            let nm = sp.n_max;
+            let p2 = sp.n_body2();
+            let (p3_sp, t3_sp, t4_sp) = (sp.n_body3(), sp.body3_terms(), sp.body4_terms());
+            let idx3: HashMap<Body3Term, usize> = t3_sp.iter().enumerate().map(|(q, t)| (*t, q)).collect();
+            let idx4: HashMap<Body4Term, usize> = t4_sp.iter().enumerate().map(|(q, t)| (*t, q)).collect();
+            // the species body-3 / body-4 feature index of any ordered pair / triple of items
+            let sp3 = |t1: usize, n1: usize, t2: usize, n2: usize, l: usize| {
+                let key = if t1 * nm + n1 <= t2 * nm + n2 { Body3Term { t1, n1, t2, n2, l } } else { Body3Term { t1: t2, n1: n2, t2: t1, n2: n1, l } };
+                p2 + idx3[&key]
+            };
+            let sp4 = |mut it: [(usize, usize, usize); 3]| {
+                it.sort_by_key(|&(t, n, l)| (t * nm + n, l));
+                p2 + p3_sp + idx4[&Body4Term { t: it.map(|x| x.0), n: it.map(|x| x.1), l: it.map(|x| x.2) }]
+            };
+            let (pos, z) = random_cluster(&mut rng, species, 7, 0.6);
+            let a = describe(&sp, &pos, &z).unwrap();
+            let mut mixes: Vec<ChannelMix> = [1, 2, s - 1, s].iter().map(|&k| random_mix(&mut rng, s, k)).collect();
+            // a permutation W at K = S (a cycle: not symmetric)
+            mixes.push(ChannelMix { k: s, w: (0..s * s).map(|q| if (q / s + 1) % s == q % s { 1.0 } else { 0.0 }).collect() });
+            for mix in mixes {
+                let k_ch = mix.k;
+                let w = mix.w.clone();
+                let ch = sp.clone().with_channels(mix);
+                assert_eq!((ch.n_channels(), ch.n_species()), (k_ch, s));
+                let b = describe(&ch, &pos, &z).unwrap();
+                let (p3, t3, t4) = (ch.n_body3(), ch.body3_terms(), ch.body4_terms());
+                assert_eq!(ch.n_features(), p2 + p3 + t4.len());
+                // the oracle of feature k of the channel basis as a list of (W product, species
+                // feature index): its value and gradients are Σ weight × species entry
+                let mut oracle: Vec<Vec<(f64, usize)>> = Vec::with_capacity(ch.n_features());
+                for k in 0..p2 {
+                    oracle.push(vec![(1.0, k)]);
+                }
+                for t in &t3 {
+                    let mut terms = Vec::new();
+                    for u1 in 0..s {
+                        for u2 in 0..s {
+                            terms.push((w[u1 * k_ch + t.t1] * w[u2 * k_ch + t.t2], sp3(u1, t.n1, u2, t.n2, t.l)));
+                        }
+                    }
+                    oracle.push(terms);
+                }
+                for t in &t4 {
+                    let mut terms = Vec::new();
+                    for u1 in 0..s {
+                        for u2 in 0..s {
+                            for u3 in 0..s {
+                                let wt = w[u1 * k_ch + t.t[0]] * w[u2 * k_ch + t.t[1]] * w[u3 * k_ch + t.t[2]];
+                                terms.push((wt, sp4([(u1, t.n[0], t.l[0]), (u2, t.n[1], t.l[1]), (u3, t.n[2], t.l[2])])));
+                            }
+                        }
+                    }
+                    oracle.push(terms);
+                }
+                for i in 0..pos.len() {
+                    assert_eq!(a[i].grad.len(), b[i].grad.len());
+                    for (k, terms) in oracle.iter().enumerate() {
+                        let expect: f64 = terms.iter().map(|&(c, q)| c * a[i].b[q]).sum();
+                        let mag: f64 = terms.iter().map(|&(c, q)| (c * a[i].b[q]).abs()).sum();
+                        let e = rel(b[i].b[k], expect, mag.max(1e-300));
+                        if k < p2 {
+                            assert_eq!(b[i].b[k].to_bits(), a[i].b[k].to_bits(), "body 2 is unchanged");
+                        }
+                        assert!(e <= 1e-10, "S {s} K {k_ch} atom {i} feature {k}: {} vs {expect}", b[i].b[k]);
+                        worst = worst.max(e);
+                        compared += 1;
+                        for ((ja, ga), (jb, gb)) in a[i].grad.iter().zip(&b[i].grad) {
+                            assert_eq!(ja, jb);
+                            for x in 0..3 {
+                                let expect: f64 = terms.iter().map(|&(c, q)| c * ga[q][x]).sum();
+                                let mag: f64 = terms.iter().map(|&(c, q)| (c * ga[q][x]).abs()).sum();
+                                let e = rel(gb[k][x], expect, mag.max(1e-300));
+                                assert!(e <= 1e-10, "S {s} K {k_ch} atom {i} feature {k} wrt {ja}.{x}: {} vs {expect}", gb[k][x]);
+                                worst = worst.max(e);
+                                compared += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("channel features vs the W-contracted species basis: {compared} values and gradient entries, worst {worst:.2e}");
+    }
+
+    /// Review I1, composition: a scene without species t gives exactly the features of W with row
+    /// t zeroed (an absent species adds no neighbour; a zero weight adds nothing) — and those are not
+    /// zero, so no composition skip may apply with channels.
+    #[test]
+    fn an_absent_species_is_a_zeroed_mix_row() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xab5e);
+        let species = [1u8, 8, 16];
+        let sp = collection_basis(&species);
+        let (pos, z) = random_cluster(&mut rng, &[1, 16], 6, 0.6); // no O (t = 1)
+        let mix = random_mix(&mut rng, 3, 2);
+        let mut zeroed = mix.clone();
+        zeroed.w[2..4].iter_mut().for_each(|v| *v = 0.0);
+        let a = describe(&sp.clone().with_channels(mix), &pos, &z).unwrap();
+        let b = describe(&sp.clone().with_channels(zeroed), &pos, &z).unwrap();
+        assert_eq!(a, b);
+        // every channel of the H/S scene is populated: no term may be skipped
+        let p2 = sp.n_body2();
+        assert!(a.iter().all(|d| d.b[p2..].iter().filter(|v| **v != 0.0).count() > (d.b.len() - p2) / 2));
+        // and skip on or off changes nothing with channels
+        let ch = sp.clone().with_channels(random_mix(&mut rng, 3, 3));
+        assert_eq!(describe_with(&ch, &pos, &z, true).unwrap(), describe_with(&ch, &pos, &z, false).unwrap());
+    }
+
+    /// Review I1: permuting the atoms permutes the channel descriptors (and relabels the gradient
+    /// partners) to 1e-12; relabelling the species — a bijection of Z that reorders the sorted
+    /// species list, with W's rows permuted along — leaves every body-3/4 feature and gradient bit
+    /// for bit unchanged and permutes the body-2 blocks exactly.
+    #[test]
+    fn channel_features_are_atom_permutation_invariant_and_species_relabel_equivariant() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x9e47);
+        let species = [1u8, 8, 16];
+        let sp = collection_basis(&species);
+        let (s, nm, p2) = (3, sp.n_max, sp.n_body2());
+        let mix = random_mix(&mut rng, s, 2);
+        let ch = sp.clone().with_channels(mix.clone());
+        let (pos, z) = random_cluster(&mut rng, &species, 7, 0.6);
+        let d = describe(&ch, &pos, &z).unwrap();
+        // atom permutation
+        let mut perm: Vec<usize> = (0..pos.len()).collect();
+        for i in (1..perm.len()).rev() {
+            perm.swap(i, rng.gen_range(0..=i));
+        }
+        let pp: Vec<[f64; 3]> = perm.iter().map(|&i| pos[i]).collect();
+        let pz: Vec<u8> = perm.iter().map(|&i| z[i]).collect();
+        let dp = describe(&ch, &pp, &pz).unwrap();
+        let mut worst: f64 = 0.0;
+        for (slot, &i) in perm.iter().enumerate() {
+            let scale = d[i].b.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            for k in 0..ch.n_features() {
+                let e = rel(dp[slot].b[k], d[i].b[k], 1e-4 * scale);
+                worst = worst.max(e);
+                assert!(e <= 1e-12, "atom {i} feature {k}");
+            }
+            let gscale = d[i].grad.iter().flat_map(|(_, g)| g.iter().flat_map(|v| v.iter())).fold(0.0f64, |m, v| m.max(v.abs()));
+            for (jp, gp) in &dp[slot].grad {
+                let (_, g) = d[i].grad.iter().find(|(j, _)| *j == perm[*jp]).expect("the same partner");
+                for k in 0..ch.n_features() {
+                    for x in 0..3 {
+                        assert!(rel(gp[k][x], g[k][x], 1e-4 * gscale) <= 1e-12, "atom {i} wrt {} feature {k}", perm[*jp]);
+                    }
+                }
+            }
+        }
+        // species relabel: Z 1 → 16, 8 → 1, 16 → 8; old index t goes to new index π(t)
+        let relabel = |zz: u8| match zz {
+            1 => 16,
+            8 => 1,
+            _ => 8,
+        };
+        let pi = |t: usize| ch.species_index(relabel(species[t])).unwrap();
+        let mut w2 = vec![0.0; mix.w.len()];
+        for t in 0..s {
+            for k in 0..mix.k {
+                w2[pi(t) * mix.k + k] = mix.w[t * mix.k + k];
+            }
+        }
+        let ch2 = sp.clone().with_channels(ChannelMix { k: mix.k, w: w2 });
+        let z2: Vec<u8> = z.iter().map(|&zz| relabel(zz)).collect();
+        let d2 = describe(&ch2, &pos, &z2).unwrap();
+        for i in 0..pos.len() {
+            for t in 0..s {
+                for n in 0..nm {
+                    assert_eq!(d2[i].b[pi(t) * nm + n].to_bits(), d[i].b[t * nm + n].to_bits(), "body-2 block permuted");
+                }
+            }
+            assert!(d2[i].b[p2..].iter().zip(&d[i].b[p2..]).all(|(x, y)| x.to_bits() == y.to_bits()), "atom {i}: body 3/4 unchanged");
+            for ((j2, g2), (j, g)) in d2[i].grad.iter().zip(&d[i].grad) {
+                assert_eq!(j2, j);
+                assert!(g2[p2..].iter().zip(&g[p2..]).all(|(x, y)| (0..3).all(|c| x[c].to_bits() == y[c].to_bits())));
+            }
+        }
+        eprintln!("channel descriptors under atom permutation: worst relative difference {worst:.2e}");
+    }
+
+    /// Plan Task 1 step 3 (review "Column counts", I1 "K < S"): Q′ = n_max·S(S+1)/2 + S·(P₃(K) +
+    /// P₄(K)) with K capped at S, for S = 1..5 and K = 1..6 at the collection basis; P₃(K), P₄(K)
+    /// are the species basis's blocks at K species. Pinned against the review's counts script
+    /// (`docs/superpowers/research/2026-11-22-chemical-channels-counts.py`, `qch(S, K, D=6, d4=3)`):
+    /// 8 340 at S = 5, K = 4 (the user's 5-element collection), 14 670 at S = 5, K ≥ 5 (the
+    /// species model), 4 140 at S = 5, K = 3.
+    #[test]
+    fn channel_columns_count() {
+        // qch(S, K, D=6, d4=3) of the counts script, S = 1..5 (rows) × K = 1..6 (columns)
+        let script: [[usize; 6]; 5] = [
+            [74, 74, 74, 74, 74, 74],
+            [156, 636, 636, 636, 636, 636],
+            [246, 966, 2460, 2460, 2460, 2460],
+            [344, 1304, 3296, 6656, 6656, 6656],
+            [450, 1650, 4140, 8340, 14670, 14670],
+        ];
+        let pool = [1u8, 3, 8, 16, 17];
+        for s in 1..=5 {
+            let sp = collection_basis(&pool[..s]);
+            for k in 1..=6 {
+                let ke = k.min(s);
+                let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64((s * 10 + k) as u64);
+                let ch = sp.clone().with_channels(random_mix(&mut rng, s, k));
+                let kb = collection_basis(&pool[..ke]); // the species basis at K species
+                let (p3, p4) = (kb.n_body3(), kb.n_body4());
+                let q = sp.n_max * s * (s + 1) / 2 + s * (p3 + p4);
+                assert_eq!((ch.n_species(), ch.n_channels()), (s, ke), "S {s} K {k}");
+                assert_eq!((ch.n_body3(), ch.n_body4()), (p3, p4), "S {s} K {k}");
+                assert_eq!(ch.body3_terms().len(), p3, "closed form vs enumeration");
+                assert_eq!(ch.n_independent_columns(), q, "S {s} K {k}");
+                assert_eq!(q, script[s - 1][k - 1], "the counts script, S {s} K {k}");
+                assert_eq!(ch.column_classes().len(), q);
+                assert_eq!(ch.feature_names().len(), ch.n_features());
+                assert_eq!(ch.n_features(), sp.n_body2() + p3 + p4);
+                let c = ch.channels().unwrap();
+                assert_eq!(c.w.len(), s * ke);
+                if k > s {
+                    // Review focus 3: capped at rank S — W = I, the species span, no degenerate column
+                    assert_eq!(c, &identity_mix(s), "S {s} K {k}");
+                    assert_eq!(q, sp.n_independent_columns(), "K ≥ S costs the species basis");
+                }
+            }
+        }
+        // the per-centre blocks the review quotes: P₃ + P₄ = 351 + 453 at K = 3, 616 + 1 028 at K = 4
+        let five = collection_basis(&pool);
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(1);
+        for (k, p3, p4) in [(3, 351, 453), (4, 616, 1028)] {
+            let ch = five.clone().with_channels(random_mix(&mut rng, 5, k));
+            assert_eq!((ch.n_body3(), ch.n_body4()), (p3, p4));
+        }
+        // the species basis is untouched: n_channels = S, Q′ as before
+        assert_eq!((five.n_channels(), five.n_independent_columns(), five.channels()), (5, 14670, None));
+        // names carry the channel
+        let ch = collection_basis(&[1, 8]).with_channels(ChannelMix { k: 1, w: vec![0.5, -1.0] });
+        let names = ch.feature_names();
+        assert_eq!(names[16], "b3[k=0,n=0;k=0,n=0;l=0]");
+        assert!(names.last().unwrap().starts_with("b4[k=0,"));
+    }
+
+    #[test]
+    #[should_panic(expected = "W is not S × K")]
+    fn with_channels_rejects_a_mix_of_the_wrong_shape() {
+        let _ = Basis::new(&[1, 8]).with_channels(ChannelMix { k: 2, w: vec![1.0; 3] });
+    }
+
+    /// Review I1, the finite-difference test at K < S: the analytic descriptor gradients of a channel
+    /// basis (S = 4, K = 2, random dense W fixed, the collection basis with body 4) against central
+    /// differences of `describe_values` (step 1e-5 Bohr), on a well-conditioned cluster (no two atoms
+    /// closer than 1 Bohr): 1e-6 relative to the atom's largest gradient entry, every feature, every
+    /// partner. Also ΣF = 0 per descriptor (translation invariance) to rounding.
+    #[test]
+    fn channel_descriptor_gradients_match_finite_differences() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xfd11);
+        let species = [1u8, 3, 8, 16];
+        let ch = collection_basis(&species).with_channels(random_mix(&mut rng, 4, 2));
+        let (pos, z) = random_cluster(&mut rng, &species, 6, 1.0);
+        let p = ch.n_features();
+        let desc = describe(&ch, &pos, &z).unwrap();
+        let h = 1e-5;
+        let mut worst: f64 = 0.0;
+        for (i, atom) in desc.iter().enumerate() {
+            let gmax = atom.grad.iter().flat_map(|(_, g)| g.iter().flat_map(|v| v.iter())).fold(0.0f64, |m, v| m.max(v.abs()));
+            assert!(gmax > 0.0);
+            for k in 0..p {
+                for x in 0..3 {
+                    let sum: f64 = atom.grad.iter().map(|(_, g)| g[k][x]).sum();
+                    assert!(sum.abs() <= 1e-12 * gmax, "atom {i} feature {k}: Σ_j ∂B/∂r_j = {sum}");
+                }
+            }
+            for (j, g) in &atom.grad {
+                for x in 0..3 {
+                    let mut pp = pos.clone();
+                    pp[*j][x] += h;
+                    let up = describe_values(&ch, &pp, &z).unwrap();
+                    pp[*j][x] -= 2.0 * h;
+                    let dn = describe_values(&ch, &pp, &z).unwrap();
+                    for k in 0..p {
+                        let fd = (up[i][k] - dn[i][k]) / (2.0 * h);
+                        let err = (fd - g[k][x]).abs() / gmax;
+                        worst = worst.max(err);
+                        assert!(err < 1e-6, "atom {i} wrt {j}.{x} feature {k}: fd {fd} vs {}", g[k][x]);
+                    }
+                }
+            }
+        }
+        eprintln!("channel descriptor gradients (S 4, K 2) vs central differences: worst {worst:.2e} of the largest entry");
     }
 
     #[test]

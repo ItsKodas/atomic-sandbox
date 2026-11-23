@@ -33,7 +33,7 @@ pub mod sidecar;
 pub mod threads;
 pub mod prof;
 
-pub use descriptor::{describe, describe_values, energy_row_atoms, energy_row_atoms_at, no_neighbours, touched_columns, AtomDescriptor, Basis, Body3Term, Body4Term, DescribeError, BODY4_DEGREE_CAP, BODY4_DEGREE_START, COLLECTION_R_CUT};
+pub use descriptor::{describe, describe_values, energy_row_atoms, energy_row_atoms_at, no_neighbours, touched_columns, AtomDescriptor, Basis, Body3Term, ChannelMix, Body4Term, DescribeError, BODY4_DEGREE_CAP, BODY4_DEGREE_START, COLLECTION_R_CUT};
 pub use envelope::Envelope;
 pub use fit::{
     fit, Accumulator, FitError, FitOptions, FitReport, RefitKind, Sample, SampleStore, SampleTag, SearchStart, StoreError, Sums,
