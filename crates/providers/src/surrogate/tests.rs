@@ -11803,6 +11803,8 @@ mod knowledge;
 mod triples;
 mod refit_cost;
 mod refit_profile;
+/// The chemical-channels day-1 go / no-go gate on a collection copy (`#[ignore]`d measurement).
+mod channels_gate;
 /// The triple map's build cost on a collection copy (`#[ignore]`d measurement).
 mod triple_cost;
 mod refit_golden;

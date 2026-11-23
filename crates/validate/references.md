@@ -6568,3 +6568,74 @@ A lost sample is one the pass gave up at its time limit (5× the median solve): 
 **Not fixed here** (pre-existing, measured on both sides): two scan points and the burst's start geometry (steps 43, 51, 59) end on the pass's time limit in both runs. Each is SCF step 1 of a discontinuous start whose first potential puts μ above zero (+0.09…+0.14 Ha: the fourth level unbound), so the 36 kT witness window (μ + 0.18 Ha) lies deep in the 17.7 Bohr box's continuum and the "no witness yet" doubling runs past 28 columns; the lowest-witness rule does not apply there (no tested level passes).
 
 **The dimer gate** solves on the GPU through the same code: its H₂ trace moved at the noise level in a few of its tight steps (the O and H acceptances unchanged in every run here); the pseudo suites re-check it.
+
+## Chemical channels: the day-1 gate (2026-11-24; plan `2026-11-22-chemical-channels.md` Task 2, spec "Gates" and review I7; `providers` `surrogate::tests::channels_gate`, `#[ignore]`d measurement; release, Ryzen 7 9800X3D, 12 fit threads, BelowNormal, alone) — **GO at K = 3 and K = 4 on this collection, with the caveat below**
+
+`COLLECTION_DIR=<copy> cargo test -p providers --release --lib channels_gate -- --ignored --nocapture --test-threads 1` (`GATE=tiny` runs the harness's self-checks, `GATE=dump` prints the groups).
+
+**Data.** A copy of the user's 5-element collection (surface lsda, h = σ = 0.15, tol 1e-6, GPU teacher, ionic `all`): 2 708 stored, 2 655 fitted after the provider's own hold-outs (47 quarantined, 5 superseded, 1 other), attached without a fit so the energies are the provider's per-box-rebased ones. Species H, Li, O, S, Cl; every sample has ≤ 3 atoms (H₂, H₂O, H₂S, HLi, HO, LiO, ClH).
+
+**Protocol.**
+- **Split by scene group, 80/20.** A group is a maximal run of consecutive stored samples with the same scene, formula, origin tag and box (one burst, one scan, one stretch of fallbacks), cut into blocks of ≤ 20 samples; 219 groups. Consecutive samples of one run are near-duplicates (MD steps a few mBohr apart), so a per-sample split would leave each held-out geometry's twin in training. Per formula the groups are shuffled (seed 2026) and taken while that brings the held-out count closer to 20 %. Train 2 096 samples, held out 559 (H 923, Li 106, O 207, S 60, Cl 3 atoms). Cl has 23 samples in three runs, so only 3 Cl atoms are held out: its row is reported, not judged.
+- **Models.**
+  - The species model on the collection's basis (n_max 8, l_max 3, degree cap 6, D₄ 3, reach 6 Bohr: Q′ 14 670, the spec's number), the fit the provider runs (`Accumulator::refit`, evidence-chosen λ, σ_E, σ_F with the pseudopotential σ_F floor 5e-5).
+  - Channel models at K = 3 and 4: W learnt on the **training samples only** (`channels::learn_mix`, the I2/I4 recipe, energy weighting on), then the same fit on `species_basis.with_channels(W)`.
+  - **The K = S control is the species model itself:** `learn_mix` returns W = I at K_eff = S, and the self-check below shows the K = S, W = I channel fit is the species fit bit for bit.
+- **Predictions from the design rows** (`loo::design_rows` · θ, the rows the fit uses), never through `model::energy_and_forces`, whose body-3/4 adjoint is not channel-aware until Task 4. σ_epi² = ‖L⁻¹φ‖² from the fit's posterior factor, without a Σ_W term (Task 5).
+- **Self-checks** (`GATE=tiny`, a small basis on 420 training samples; the full run repeats the last one):
+  - the row prediction equals the species model's hot path (|ΔE| 1.8e-14 Ha/atom, |ΔF| 9.4e-14 Ha/Bohr) and its `force_std_epistemic` (relative 8.5e-12);
+  - the channel basis at K = S, W = I fits to exactly the species model (Q′, λ, every prediction and σ_epi identical);
+  - every model's training RMSE from the rows equals its fit report's (to the printed digits).
+- **The trust bound** is the app's per-component bound min(max(2e-3, 0.1·|F|), 1e-2) Ha/Bohr (`FallbackPolicy::force_bound`, `force_residual`). "err/bound" is ‖ΔF‖/√3 over it.
+- **Calibration:** z = ‖ΔF‖ / √(Σ_a σ²_epi,a) per atom. z_tot adds the 3σ_F² noise. A calibrated Gaussian would give a median of 0.89 and a p90 of 1.44 (√(χ²₃/3)).
+
+**Results** (held out; force RMSE per component in Ha/Bohr, energy RMSE in Ha/atom; fit wall = accumulate + solve, the W learn separate):
+
+| model | Q′ | fit wall s (W learn s) | E RMSE | F RMSE | F RMSE by centre (atoms) | worst err/bound | > 1× | > 3× | z_epi med / p90 | z_tot med / p90 | λ | σ_F |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| species (= K = S control) | 14 670 | 1 129 (—) | 2.114e-4 | 1.881e-3 | H 1.88e-3 (923), Li 2.76e-4 (106), O 2.54e-3 (207), S 2.55e-5 (60), Cl 5.82e-5 (3) | 5.04 | 2.3 % | 0.4 % | 4.31 / 26.5 | 0.39 / 1.47 | 93.9 | 4.18e-4 |
+| channels K = 3 | 4 140 | 12 (32) | 1.931e-4 | 1.697e-3 | H 1.66e-3, Li 2.90e-4, O 2.40e-3, S 2.48e-5, Cl 5.49e-5 | 4.50 | 2.2 % | 0.3 % | 4.99 / 26.5 | 0.39 / 1.50 | 31.8 | 3.88e-4 |
+| channels K = 4 | 8 340 | 158 (32) | 2.060e-4 | 1.809e-3 | H 1.78e-3, Li 2.75e-4, O 2.53e-3, S 2.48e-5, Cl 5.30e-5 | 4.75 | 2.0 % | 0.5 % | 4.29 / 26.8 | 0.39 / 1.51 | 59.0 | 4.06e-4 |
+| K = 4, S at 20 % (39 of 195) | 8 340 | 128 (33) | 2.268e-4 | 1.989e-3 | H 2.01e-3, Li 2.75e-4, O 2.59e-3, **S 5.69e-5**, Cl 5.48e-5 | 5.30 | 2.3 % | 0.5 % | 4.39 / 25.4 | 0.37 / 1.49 | 50.5 | 4.11e-4 |
+| K = 4, S at 5 % (10 of 195) | 8 340 | 163 (81) | 2.167e-4 | 2.136e-3 | H 2.10e-3, Li 2.75e-4, O 2.60e-3, **S 2.74e-3**, Cl 5.43e-5 | 4.98 | 5.5 % | 1.1 % | 4.31 / 25.3 | 0.48 / 1.56 | 47.8 | 4.19e-4 |
+
+Every model's worst atom is the same O in H₂O (#2198, |F| 0.016 Ha/Bohr, error 0.009–0.011 per component against the 2e-3 floor).
+
+**The gate** (spec: force RMSE within 10 % of the species model's and a cold fit ≤ 25 % of its wall; I7 adds energy within 10 %):
+
+| | force RMSE ratio | energy RMSE ratio | fit wall ratio (with the W relearn) | verdict |
+|---|---|---|---|---|
+| K = 3 | 0.902 | 0.913 | 0.011 (0.039) | **GO** |
+| K = 4 | 0.962 | 0.974 | 0.140 (0.168) | **GO** |
+
+Choosing K by held-out RMSE (review I3) picks **K = 3** on this collection. The species fit took 1 129 s here, against the spec's 1 869 s, which included the provider's passes and every sample.
+
+**The learnt W and its diagnostics.**
+- Low-order fit: Q′ 735, λ 0.065, 32 s.
+- Singular values of the weighted unfolding: 189.5, 26.8, 7.77, 2.39, 0.095. The gap σ_K/σ_K+1 is 3.26 at K = 3 and 25.0 at K = 4.
+- **W is species-diagonal to within 0.008.** At K = 3 the channels are H, O and S, and the rows of Li and Cl are zero (truncation residual ρ = 1). At K = 4 the fourth channel is Li, and Cl's row stays zero (ρ = 1, its body-3 fibre is all in σ₅ = 0.095).
+- **η = 242 (K = 3) and 569 (K = 4)**; 1 636 and 6 030 for the thinned fits. η ≫ 1, so Σ_W is outside its first-order validity on this data (the `channels` module doc: Σ_W understates the spread there).
+
+**Caveat: what this gate does and does not show.**
+- Every sample has ≤ 3 atoms. The only many-body environments with two distinct neighbours are H₂O and H₂S.
+- Li and Cl occur only in diatomics. There, a neighbour's body-3/4 products are radial functions of the one distance, close to the body-2 span.
+- So the channel model wins here by **dropping** the species with no many-body information (Li, Cl at K = 3) and keeping one channel per remaining species. It does not show that several elements can **share** a channel.
+- The fit-cost result is general: Q′ 4 140 / 8 340 against 14 670. The accuracy result holds for this collection only. A many-element gate needs a collection with ≥ 3-species many-body environments.
+- A zero W row means a Cl (or, at K = 3, Li) neighbour adds nothing to any body-3/4 feature. A later HOCl-like sample would have no many-body description of its Cl neighbour until W is relearnt. That is the I5 lifecycle's job (relearn at N_W, and again on doubling) and C2's per-key floors.
+
+**Calibration.**
+- The channel models are **not** more overconfident than the species model. z_epi has median 4.3 / 5.0 / 4.3 for species / K = 3 / K = 4, with p90 ≈ 26.5 for each.
+- All of them are strongly overconfident on held-out groups when σ_epi stands alone. For H, Li and O the median z_epi is 3.5–6. With the noise term (z_tot) the median is 0.39 and the p90 is 1.5: the force noise σ_F carries the predictive σ, as in the app, where the class calibration then scales it.
+- Held-out force RMSE is ≈ 4.5× the training RMSE (1.8e-3 against 4.0e-4). The groups are genuinely out of sample.
+
+**Rare-element probe (I7f).** S is the rarest element with ≥ 20 training samples and ≥ 20 held-out atoms. Cl has only 3 held-out atoms.
+- At 20 %, S's held-out force RMSE goes from 2.48e-5 to 5.69e-5 (2.3×), with z_epi(S) median 0.65 and p90 0.89: σ covers the error.
+- At 5 % (10 samples) it goes to 2.74e-3 (110×), with z_epi(S) median 1.09 and p90 1.99. σ_epi roughly covers the error (p90 about 1.4× the calibrated 1.44), and the beyond-bound fraction rises from 2.0 % to 5.5 %.
+- Thinning S also moved the H-in-H₂O errors (H₂O force RMSE 3.34e-3 → 3.70e-3 at 20 %). The evidence-chosen λ, σ_E and σ_F are global and shift with the training set.
+- Not run here: Σ_W's widening of σ for the rare element (Task 5).
+
+**Not measured here** (I7 items that need the channel hot path, Task 4):
+- the trust outcome (key verdicts and `would_answer` at the `refit_golden` probes);
+- the count of admitted-but-wrong atoms;
+- per-key (EnvKey) results (per-formula results are in the harness output);
+- a relearn timed end to end through the provider. The pieces are the W learn (32 s) plus the fit (12 s / 158 s).

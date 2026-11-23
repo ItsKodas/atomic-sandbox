@@ -95,9 +95,9 @@ The spec's section "Physics review, 2026-11-22: binding changes" (C1, C2, I1–I
   - the evidence for each K.
 - Test `learn_mix_is_deterministic_and_rank_capped`.
 
-- [ ] **Step 1:** write the tests; implement `learn_mix`; the tests pass.
-- [ ] **Step 2:** run the harness on a copy of the user's 5-element collection (copy from `%LOCALAPPDATA%\atomic-sandbox\models\collections\<key>`, never in place).
-- [ ] **Step 3, the GATE:** GO if at K ≤ 4 the force RMSE is within 10 % of the species model's and the cold refit takes ≤ 25 % of its time. Write the numbers to `crates/validate/references.md` ("Chemical channels: the day-1 gate"). On NO-GO, stop and report to the controller.
+- [x] **Step 1:** write the tests; implement `learn_mix`; the tests pass. (Task 2a, 33f56405.)
+- [x] **Step 2:** run the harness on a copy of the user's 5-element collection (copy from `%LOCALAPPDATA%\atomic-sandbox\models\collections\<key>`, never in place). (2026-11-24: K = 3/4 plus the rare-element probe; K = 6 is capped to S = 5, which is the species control.)
+- [x] **Step 3, the GATE:** (2026-11-24: **GO** at K = 3 and K = 4. On this ≤ 3-atom collection W came out species-diagonal; see the references section's caveat.) GO if at K ≤ 4 the force RMSE is within 10 % of the species model's and the cold refit takes ≤ 25 % of its time. Write the numbers to `crates/validate/references.md` ("Chemical channels: the day-1 gate"). On NO-GO, stop and report to the controller.
 
 ### Task 3: fresh-collection format and switch (day 2)
 
