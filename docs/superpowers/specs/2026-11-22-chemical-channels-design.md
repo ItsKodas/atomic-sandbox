@@ -133,6 +133,38 @@ Full review: `docs/superpowers/research/2026-11-22-chemical-channels-physics-rev
   - the K = S control.
 - **Rules 5a/5b are unaffected:** `isolated_atom` and `coordination_ratio` read only the per-species body-2 features, which stay. No geometric replacement is needed. Keep `n_species()` = S and add a separate `n_channels()`.
 
+## Physics review 2, 2026-11-23: Task 5 replaced (binding; supersedes C1's gᵀΣ_W g)
+
+Full review: `docs/superpowers/research/2026-11-23-chemical-channels-task4-task5-review.md`. The day-1 gate measured η = 242–6 030 ≫ 1, and W came out species-diagonal with zero rows for Li and Cl. First-order Σ_W is therefore invalid, and the policy becomes **refuse rather than widen**:
+
+1. **Drop gᵀΣ_W g from the error bars.** Keep Σ_W, η and ρ_t in `channels.txt` as diagnostics only. Task 2a's exact off-span Σ_W formula is accepted.
+2. **A per-species "represented" flag**, stored by Z when W is learnt and never inferred from W's values. A species is represented when both hold:
+   - (N_W) some many-body key with it as a neighbour meets its floor n_k ≥ q_k in the low-order fit;
+   - ρ_t ≤ 0.01, the truncation residual (from the 10 % relative force bound: √ρ is the coefficients' relative error). A NaN fails.
+3. **W is learnt from represented species only.** Unrepresented rows are exact zeros. If K covers every represented species, W is the identity on them.
+4. **New rule 3b:** any scene with an atom that has ≥ 2 neighbours and an unrepresented species among them goes to DFT, and its sample is kept. A single unrepresented neighbour is judged as today: diatomics such as HCl, HLi and LiO are handled by body 2.
+5. **Such samples are left out of the channel fit entirely,** and still count for the low-order fit and N_W. This stops an unrepresentable effect (for example Cl in HOCl) being absorbed into a well-sampled key's coefficients.
+6. **Per-key floors keep C2's form,** q_k = min(the channel columns touched, the species columns restricted to the key's neighbours), counted over fitted samples only. An unseen key still needs Q′.
+7. **Novelty checks are unchanged.** Their blind spots are covered by 3b and the n_k = 0 floor, and both are pinned by tests.
+8. **When W is relearnt:**
+   - triggers: a species first reaching N_W, or a represented species' many-body sample count doubling;
+   - a new element enters with a zero row and causes no relearn;
+   - a relearn resets the class memory, and points recorded under the old W leave the evidence counts and λ.
+9. **Calibration is unchanged.** Assert the channel model's held-out z is within (1 + 1/√(2n)) of the species model's.
+10. **Tests:**
+    - HOCl, H₂O·HCl and LiOH are refused, and 5d and 5e alone would not have fired;
+    - HCl and HLi answers are bit-identical to before;
+    - excluded samples leave water's coefficients bit-identical;
+    - S at 5 % is unrepresented, then gets a row once it reaches N_W;
+    - the represented status is a flag, not read from W;
+    - an unseen combination of represented species is refused;
+    - the gate is rerun through the full decision list: the rare element's admitted-but-wrong atoms ≤ the species model's, and zero admitted atoms with an unrepresented many-body neighbour;
+    - `channels.txt` round-trips.
+
+    The two original Σ_W error-bar tests are dropped.
+
+**Task 4 landing note (A-I1):** a channel model must never be saved without its W. Task 3 stores W in the sidecar. Until both are on main, `encode` refuses a channels basis.
+
 ## Approaches considered
 
 1. **Neighbour channels with per-centre blocks and W from an SVD of a low-order fit (chosen).** It is supported by the literature, linear-algebra only, and keeps the exact posterior.
