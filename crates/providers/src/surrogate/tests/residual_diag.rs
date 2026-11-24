@@ -26,7 +26,7 @@ struct Meta {
 }
 
 fn collection_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("COLLECTION_DIR").expect("COLLECTION_DIR names a collection folder copy"))
+    collection_dir_copy()
 }
 
 fn open_at(dir: &std::path::Path) -> surrogate::Collection {

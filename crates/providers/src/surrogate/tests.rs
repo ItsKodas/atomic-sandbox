@@ -2829,7 +2829,7 @@ fn kappa_tail_of_a_collection_history() {
 #[test]
 #[ignore = "diagnosis: COLLECTION_DIR=<copy of a collection folder> cargo test -p providers --release lambda_before_after -- --ignored --nocapture"]
 fn lambda_before_after_on_a_collection() {
-    let dir = std::path::PathBuf::from(std::env::var("COLLECTION_DIR").expect("COLLECTION_DIR names a collection folder copy"));
+    let dir = collection_dir_copy();
     let key = surrogate::SurfaceKey::from_text(&std::fs::read_to_string(dir.join("key.txt")).unwrap()).unwrap();
     let (c, _) = surrogate::Collection::open(dir.parent().unwrap(), &key).unwrap();
     let mut s = SurrogateKs::new(Box::new(StubKsGpu), FallbackPolicy::default()).with_teacher_tol(1e-6);
@@ -9900,6 +9900,25 @@ impl std::ops::Deref for CollectionRoot {
 impl Drop for CollectionRoot {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `COLLECTION_DIR` for the `#[ignore]`d harnesses (a copy of a collection folder), with the copy's
+/// remembered fit choice (`fit_choice.txt`, the `fit_choice` module doc) removed, so a refit there
+/// runs the full trust recovery as the harness's numbers assume; `KEEP_FIT_CHOICE=1` keeps it (a
+/// run that tests the memory deliberately).
+fn collection_dir_copy() -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(std::env::var("COLLECTION_DIR").expect("COLLECTION_DIR names a collection folder copy"));
+    if std::env::var("KEEP_FIT_CHOICE").is_err() {
+        forget_fit_choice(&dir);
+    }
+    dir
+}
+
+/// Removes a collection folder's remembered fit choice (said once when there was one).
+fn forget_fit_choice(folder: &std::path::Path) {
+    if std::fs::remove_file(folder.join(surrogate::FIT_CHOICE_FILE)).is_ok() {
+        println!("{}: its {} removed (the full trust recovery runs)", folder.display(), surrogate::FIT_CHOICE_FILE);
     }
 }
 

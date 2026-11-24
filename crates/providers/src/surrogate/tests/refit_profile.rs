@@ -18,7 +18,7 @@ use std::time::Instant;
 use surrogate::Collection;
 
 pub(super) fn open_copy() -> Collection {
-    let dir = std::path::PathBuf::from(std::env::var("COLLECTION_DIR").expect("COLLECTION_DIR names a collection folder copy"));
+    let dir = collection_dir_copy();
     let key = surrogate::SurfaceKey::from_text(&std::fs::read_to_string(dir.join("key.txt")).unwrap()).unwrap();
     let (mut c, _) = surrogate::Collection::open(dir.parent().unwrap(), &key).unwrap();
     c.read_only = true;
@@ -235,6 +235,9 @@ fn refit_profile() {
                         std::fs::copy(e.path(), dst.join(&name)).unwrap();
                     }
                 }
+                // the first refit runs the full recovery (and records its choice) whatever the
+                // source folder remembered
+                forget_fit_choice(&dst);
                 let key = surrogate::SurfaceKey::from_text(&std::fs::read_to_string(dst.join("key.txt")).unwrap()).unwrap();
                 let open = || {
                     let (mut c, _) = surrogate::Collection::open(&root, &key).unwrap();

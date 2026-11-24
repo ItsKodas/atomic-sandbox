@@ -6,8 +6,10 @@
 //!
 //! A launch refit is a fit from the data: the provider starts with `degree_cap` unset, so a
 //! collection whose default-basis fit fails the training residuals pays that fit, then the
-//! recovery's step 1 (`recover_trust`: the cap-6 retry, a cold fit) every time — measured on the
-//! user's 5-element channel collection, 10.5 s of a 24.9 s launch refit. Within a session the cap
+//! recovery's step 1 (`recover_trust`: the cap-6 retry, a cold fit) every time. Remembering the
+//! cap skips the default-basis fit — 6.7 s of a 24.2 s launch refit on the user's 5-element
+//! channel collection (24.2 → 17.5 s); the cap-6 fit (the 10.5 s "recovery") is the fit that
+//! stands, so it still runs. Within a session the cap
 //! a recovery set already stands for the next refit (step 1b re-judges it when the capped fit
 //! fails); across launches it was forgotten.
 //!
@@ -26,8 +28,15 @@
 //! - the default basis (species, n_max, l_max, the default degree cap, body 3/4, reach) and, on a
 //!   channel collection, the mix the fit takes (K, W bit for bit, the represented flags): a new
 //!   species, a W relearn, another K or another reach is another key;
-//! - this build's version and the CPU's SIMD features (the dense kernels' results differ in the
-//!   last bits between instruction sets).
+//! - this build: its version and its identity — the running executable's length and
+//!   modification time, since builds from main share a version across many commits and a code
+//!   change could let the default basis pass (when either cannot be read nothing is remembered
+//!   or reused) — and the CPU's SIMD features (the dense kernels' results differ in the last
+//!   bits between instruction sets).
+//!
+//! **Display-only differences** of a launch that reuses the cap: its recovery note carries a
+//! "remembered" suffix; the refit picture shows no trust round (the recovery does not run); and
+//! the refit history (`refit_times.csv`) records it as a plain refit, not a recovery one.
 //!
 //! The store state counts as the same only when it is identical: the recovery's own rule is that
 //! a fit that stands is the cold search of its store state (`recover_trust`, "Warm-started
@@ -115,15 +124,42 @@ fn isa_tag() -> String {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: the build identity this thread's keys use instead of the executable's
+    /// (`Some(None)`: unreadable).
+    pub(super) static BUILD_IDENTITY: std::cell::RefCell<Option<Option<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// This build's identity (module doc, "What is remembered"): the running executable's length and
+/// modification time. The version alone is not one — builds from main share a version across many
+/// commits, and a code change that lets the default basis pass would still reuse the cap. `None`
+/// when either cannot be read: then nothing is remembered or reused.
+fn build_identity() -> Option<String> {
+    #[cfg(test)]
+    if let Some(id) = BUILD_IDENTITY.with(|b| b.borrow().clone()) {
+        return id;
+    }
+    static ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let meta = std::fs::metadata(std::env::current_exe().ok()?).ok()?;
+        let t = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some(format!("{} bytes, modified {}.{:09}", meta.len(), t.as_secs(), t.subsec_nanos()))
+    })
+    .clone()
+}
+
 impl SurrogateKs {
     /// The fingerprint of the refit's inputs (module doc, "What is remembered"); `None` without a
-    /// collection or a store.
+    /// collection, a store or a readable build identity.
     pub(super) fn fit_choice_key(&self) -> Option<u64> {
         let sh = self.shared.as_ref()?;
         let store = self.store.as_ref()?;
+        let build = build_identity()?;
         let mut h = Fnv::new();
         h.str("fit_choice key 1");
         h.str(env!("CARGO_PKG_VERSION"));
+        h.str(&build);
         h.str(&isa_tag());
         h.u64(store.samples.len() as u64);
         for (i, s) in store.samples.iter().enumerate() {

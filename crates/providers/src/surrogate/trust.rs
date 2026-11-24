@@ -1529,7 +1529,7 @@ impl SurrogateKs {
     /// trust recovery. With `choice_key` (the start met the remembered choice's conditions:
     /// `fit_choice` module doc) a recovery whose step 1 stands — after votes and a release that
     /// did nothing — is remembered with the collection.
-    fn fits_from_default(&mut self, choice_key: Option<u64>) -> Result<FitReport, FitError> {
+    pub(super) fn fits_from_default(&mut self, choice_key: Option<u64>) -> Result<FitReport, FitError> {
         // a W staged by the lifecycle is committed only once its first fit stands (review I1)
         let mut report = match self.fit_store_deferred() {
             Ok(r) => {

@@ -146,39 +146,89 @@ fn outcome(s: &mut SurrogateKs) -> Outcome {
     }
 }
 
-/// The full recovery of a launch, and the next launch of the same store state: the first runs the
-/// default-basis fit and step 1's cap retry ([4, 6]), which stands and is written to
-/// `fit_choice.txt`; the second reads it, makes one fit at the remembered cap ([6]) and stands where
-/// the first stood — the fit bit for bit (report, coefficients, posterior factor) and every verdict.
+/// Two paths on one store state, on twin collections written identically: a first launch of twin A
+/// runs the full recovery — the default-basis fit and step 1's cap retry ([4, 6]), which stands —
+/// and writes `fit_choice.txt`. Then twin A is launched again with the file present (remembered:
+/// one fit at the cap, [6]) and twin B, which has no file, is launched (the full recovery, [4, 6]).
+/// Both starts have the same key, and both stand on the same fit bit for bit (report,
+/// coefficients, posterior factor) with every verdict equal — and equal to the recording run's.
 #[test]
 fn a_launch_fits_the_remembered_cap_and_stands_where_the_full_recovery_does() {
-    let dir = collection_root("fit-choice-reuse");
-    write_collection(&dir, false);
-    let (full, choice) = {
-        let mut s = launch(&dir);
+    let (a, b) = (collection_root("fit-choice-reuse-a"), collection_root("fit-choice-reuse-b"));
+    write_collection(&a, false);
+    write_collection(&b, false);
+    let (recorded, choice) = {
+        let mut s = launch(&a);
         assert_eq!(s.fit_choice(), None, "nothing remembered yet");
         let key = s.fit_choice_entry().expect("a launch meets the conditions");
         s.refit().unwrap();
-        println!("full recovery: fits (cap) {:?}, note {:?}, trusted {} {:?}", caps(&s), s.recovery_note(), s.trusted(), s.untrusted_reason());
+        println!("recording run: fits (cap) {:?}, note {:?}, trusted {} {:?}", caps(&s), s.recovery_note(), s.trusted(), s.untrusted_reason());
         assert_eq!(caps(&s), vec![4, RECOVERY_DEGREE_CAP], "the premise: the default fit failed, step 1's retry stood");
         assert_eq!(s.recovery_note(), Some(cap_retry_note().as_str()));
         assert!(s.trusted(), "{:?}", s.untrusted_reason());
         let choice = FitChoice { key, degree_cap: RECOVERY_DEGREE_CAP };
         assert_eq!(s.fit_choice(), Some(choice), "remembered");
-        assert_eq!(choice_file(&dir), Some(fit_choice_to_text(&choice)), "and written with the collection");
+        assert_eq!(choice_file(&a), Some(fit_choice_to_text(&choice)), "and written with the collection");
         (outcome(&mut s), choice)
     };
+    // twin A, the file present: the remembered path
+    let remembered = {
+        let mut s = launch(&a);
+        assert_eq!(s.fit_choice(), Some(choice), "read back at attach");
+        assert_eq!(s.fit_choice_entry(), Some(choice.key), "the same store state, the same key");
+        s.refit().unwrap();
+        println!("remembered: fits (cap) {:?}, note {:?}", caps(&s), s.recovery_note());
+        assert_eq!(caps(&s), vec![RECOVERY_DEGREE_CAP], "one fit, at the remembered cap");
+        let note = s.recovery_note().unwrap();
+        assert!(note.starts_with(&cap_retry_note()) && note.contains("remembered"), "{note}");
+        assert_eq!(s.fit_choice(), Some(choice));
+        assert_eq!(choice_file(&a), Some(fit_choice_to_text(&choice)), "the file as it was");
+        outcome(&mut s)
+    };
+    // twin B, no file: the full recovery from the same store state
+    let full = {
+        let mut s = launch(&b);
+        assert_eq!((s.fit_choice(), choice_file(&b)), (None, None), "twin B remembers nothing");
+        assert_eq!(s.fit_choice_entry(), Some(choice.key), "twin B's start is the same store state");
+        s.refit().unwrap();
+        assert_eq!(caps(&s), vec![4, RECOVERY_DEGREE_CAP], "the full recovery");
+        outcome(&mut s)
+    };
+    assert_eq!(remembered, full, "the remembered path stands where the full recovery does, bit for bit");
+    assert_eq!(remembered, recorded, "and where the recording run stood");
+}
+
+/// The build is part of the key (module doc, "What is remembered"): a choice recorded under one
+/// build identity misses under another (a rebuild from main at the same version), and that launch
+/// runs the full recovery; an unreadable identity neither reuses nor records.
+#[test]
+fn another_build_identity_is_another_key() {
+    let dir = collection_root("fit-choice-build");
+    write_collection(&dir, false);
+    let with_build = |id: Option<&str>| super::super::fit_choice::BUILD_IDENTITY.with(|b| *b.borrow_mut() = Some(id.map(str::to_string)));
+    with_build(Some("build one"));
+    let choice = {
+        let mut s = launch(&dir);
+        s.refit().unwrap();
+        s.fit_choice().expect("the premise: step 1 stood and was remembered")
+    };
     let mut s = launch(&dir);
-    assert_eq!(s.fit_choice(), Some(choice), "read back at attach");
-    assert_eq!(s.fit_choice_entry(), Some(choice.key), "the same store state, the same key");
+    assert_eq!(s.fit_choice_entry(), Some(choice.key), "the same build: the same key");
+    with_build(Some("build two"));
+    let other = s.fit_choice_entry().unwrap();
+    assert_ne!(other, choice.key, "another build: another key");
     s.refit().unwrap();
-    println!("remembered: fits (cap) {:?}, note {:?}", caps(&s), s.recovery_note());
-    assert_eq!(caps(&s), vec![RECOVERY_DEGREE_CAP], "one fit, at the remembered cap");
-    let note = s.recovery_note().unwrap();
-    assert!(note.starts_with(&cap_retry_note()) && note.contains("remembered"), "{note}");
-    assert_eq!(outcome(&mut s), full, "the fit and the verdicts the full recovery reached");
-    assert_eq!(s.fit_choice(), Some(choice));
-    assert_eq!(choice_file(&dir), Some(fit_choice_to_text(&choice)), "the file as it was");
+    assert_eq!(caps(&s), vec![4, RECOVERY_DEGREE_CAP], "the full recovery under the other build");
+    assert_eq!(s.fit_choice(), Some(FitChoice { key: other, degree_cap: RECOVERY_DEGREE_CAP }), "its own choice recorded");
+    drop(s);
+    with_build(None);
+    let mut s = launch(&dir);
+    assert_eq!((s.fit_choice_key(), s.fit_choice_entry()), (None, None), "an unreadable build identity: no key");
+    let before = choice_file(&dir);
+    s.refit().unwrap();
+    assert_eq!(caps(&s), vec![4, RECOVERY_DEGREE_CAP], "no reuse");
+    assert_eq!(choice_file(&dir), before, "and nothing recorded");
+    super::super::fit_choice::BUILD_IDENTITY.with(|b| *b.borrow_mut() = None);
 }
 
 /// The same through a background refit (the app's launch fits on a copy of the provider): the
@@ -346,4 +396,90 @@ fn a_standing_cap_and_a_refit_without_recovery_leave_the_memory_alone() {
     s.refit().unwrap();
     assert_eq!(caps(&s), vec![4], "the default fit alone");
     assert_eq!(choice_file(&dir), before);
+}
+
+/// The entry's conditions (module doc, "How a refit uses it"): a pending fence vote and a
+/// box-affected sample waiting for its exclusion each refuse the entry (no key: neither reused
+/// nor recorded); a staged W (a relearn) refuses the reuse — the remembered fit is not tried even
+/// for a matching key, and the memory is left as it was.
+#[test]
+fn the_entry_refuses_a_pending_vote_a_pending_box_exclusion_and_reuse_under_a_staged_w() {
+    let dir = collection_root("fit-choice-entry");
+    write_collection(&dir, false);
+    let mut s = launch(&dir);
+    let k0 = s.fit_choice_entry().expect("a launch meets the conditions");
+    s.vote_pending.push((5, Vec::new()));
+    assert_eq!(s.fit_choice_entry(), None, "a pending vote");
+    s.vote_pending.clear();
+    assert_eq!(s.fit_choice_entry(), Some(k0));
+    s.face[7] = 1.0;
+    assert!(s.is_box(7), "the premise: sample 7 is box-affected at code 0");
+    assert_eq!(s.fit_choice_entry(), None, "a box-affected sample waiting for its exclusion");
+    s.face[7] = f64::NAN;
+    assert_eq!(s.fit_choice_entry(), Some(k0));
+    // a staged W: the key is computed (a recording may follow its first fit), the reuse is refused
+    let staged = surrogate::channels::LearntMix {
+        k: 1,
+        k_requested: 1,
+        species: vec![1],
+        w: vec![1.0],
+        sigma_w: Vec::new(),
+        singular_values: vec![1.0],
+        truncation_residual: vec![0.0],
+        nonlinearity: 0.0,
+        weights: vec![1.0],
+        rank: 1,
+        low_order: None,
+        represented: vec![true],
+        n_w_met: vec![true],
+        many_body: vec![0],
+        history_from: 0,
+    };
+    s.shared.as_mut().unwrap().pending_mix = Some((staged, "relearnt".into()));
+    let k = s.fit_choice_entry().expect("the key of the staged W's state");
+    let planted = FitChoice { key: k, degree_cap: RECOVERY_DEGREE_CAP };
+    s.shared.as_mut().unwrap().fit_choice = Some(planted);
+    assert!(s.remembered_fit(k).is_none(), "a staged W: the remembered fit is not tried");
+    assert!(s.fit_log.is_empty(), "no fit made");
+    assert_eq!(s.fit_choice(), Some(planted), "the memory as it was");
+}
+
+/// Recording needs a first fit whose votes and release did nothing (module doc, "remember"): on
+/// the step-1 fixture, a held sample the default fit reproduces is released (one more default fit)
+/// and step 1 then stands — nothing is recorded; a pending vote the default fit cannot reproduce is
+/// rejected (held) and step 1 then stands — nothing is recorded either. (A refit's own entry
+/// refuses a pending vote; the vote case drives the full path with a key directly.)
+#[test]
+fn a_release_or_a_rejected_vote_blocks_the_recording() {
+    // the release
+    let dir = collection_root("fit-choice-release");
+    write_collection(&dir, false);
+    let mut s = launch(&dir);
+    s.quarantine.resize(s.samples(), Q_NONE);
+    s.quarantine[0] = Q_HELD;
+    assert!(s.fit_choice_entry().is_some(), "a held sample is part of the key, not a refusal");
+    s.refit().unwrap();
+    println!("release: fits (cap) {:?}, note {:?}, held {}", caps(&s), s.recovery_note(), s.quarantined());
+    assert_eq!(caps(&s), vec![4, 4, RECOVERY_DEGREE_CAP], "the premise: the default fit released the held sample (a second default fit), then step 1 stood");
+    assert!(!s.is_quarantined(0) && s.recovery_note() == Some(cap_retry_note().as_str()), "the premise: released, step 1 stood");
+    assert_eq!((s.fit_choice(), choice_file(&dir)), (None, None), "a release blocks the recording");
+    drop(s);
+    // the vote: a sample the default fit misses, found on a twin
+    let (dir, twin) = (collection_root("fit-choice-vote"), collection_root("fit-choice-vote-twin"));
+    write_collection(&dir, false);
+    write_collection(&twin, false);
+    let missed = {
+        let mut t = launch(&twin);
+        t.fit_store().unwrap();
+        assert!(t.recoverable_fail(), "the premise: the default fit fails");
+        t.misfit().unwrap().samples[0]
+    };
+    let mut s = launch(&dir);
+    let key = s.fit_choice_entry().unwrap();
+    s.vote_pending.push((missed, Vec::new()));
+    s.fits_from_default(Some(key)).unwrap();
+    println!("vote: fits (cap) {:?}, note {:?}, held {}", caps(&s), s.recovery_note(), s.quarantined());
+    assert!(s.is_quarantined(missed), "the premise: the vote was rejected");
+    assert_eq!((s.degree_cap, s.recovery_note()), (Some(RECOVERY_DEGREE_CAP), Some(cap_retry_note().as_str())), "the premise: step 1 then stood");
+    assert_eq!(s.fit_choice(), None, "a rejected vote blocks the recording");
 }
