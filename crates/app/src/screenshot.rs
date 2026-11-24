@@ -1013,6 +1013,7 @@ pub fn wait_for_first_solve(
 /// Blocks until the estimated solver's first sampling pass is running and has done a few jobs
 /// (the sampling state of the mockup).
 fn wait_for_sampling(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter, stage: Option<&str>) -> Result<(), String> {
+    let mut started = false;
     loop {
         let running = viewer.snapshot.as_ref().is_some_and(|s| {
             crate::sim::sampling_active(&s.dynamics)
@@ -1024,6 +1025,12 @@ fn wait_for_sampling(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter, 
         });
         if running {
             return Ok(());
+        }
+        // a slow first solve (a cold GPU, another job on it) turns the automatic pass into an
+        // offer: press its "Start anyway", as the user would
+        if let Some(plan) = viewer.snapshot.as_ref().and_then(|s| s.model.as_ref()).and_then(|m| m.pass_offer.as_ref()).map(|o| o.plan.clone()).filter(|_| !started) {
+            viewer.send(crate::worker::Command::Dyn(::sim::DynCommand::StartSampling(plan)));
+            started = true;
         }
         let ev = viewer
             .sim

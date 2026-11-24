@@ -74,75 +74,81 @@ pub fn pseudo_line(p: &sim::PseudoSummary) -> String {
 const CAVEAT: &str = "In a molecule the electrons are shared: the cloud in the 3D view is the real picture. The simulation treats the nucleus as a point of charge +Z.";
 
 /// Draws the card for `nucleus` (index `i` in the scene) with its top-right corner at
-/// `top_right` (the 3D view's corner); returns the card's rect. Call once per frame while a
-/// nucleus is selected.
-pub fn show(ctx: &egui::Context, top_right: Pos2, nucleus: &SceneNucleus, i: usize, pseudo: Option<&sim::PseudoSummary>) -> egui::Rect {
+/// `top_right` (its place on the 3D view's right edge, `ui::zones`), at most `max_h` tall (it
+/// scrolls when the view leaves less); returns the size the whole card wants, unscrolled. Call
+/// once per frame while a nucleus is selected.
+pub fn show(ctx: &egui::Context, top_right: Pos2, nucleus: &SceneNucleus, i: usize, pseudo: Option<&sim::PseudoSummary>, max_h: f32) -> Vec2 {
     let z = nucleus.z;
     let n_neutrons = mass_number(nucleus).map(|a| a.saturating_sub(z as u32));
     let shells = shells(z);
-    egui::Area::new(egui::Id::new("atom-card"))
+    // the card's frame (its 7-point margins and stroke) around the scrolled content
+    const FRAME_H: f32 = 16.0;
+    let mut content_h = 0.0f32;
+    let r = egui::Area::new(egui::Id::new("atom-card"))
         .pivot(Align2::RIGHT_TOP)
         .fixed_pos(top_right)
         .order(egui::Order::Middle)
         .fade_in(false)
         .show(ctx, |ui| {
             crate::ui::theme::card().show(ui, |ui| {
-                ui.set_width(220.0);
-                ui.horizontal(|ui| {
-                    ui.strong(title(nucleus));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        crate::ui::theme::info(ui, CAVEAT);
+                let out = egui::ScrollArea::vertical().max_height((max_h - FRAME_H).max(40.0)).auto_shrink([true, true]).show(ui, |ui| {
+                    ui.set_width(220.0);
+                    ui.horizontal(|ui| {
+                        ui.strong(title(nucleus));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            crate::ui::theme::info(ui, CAVEAT);
+                        });
                     });
-                });
-                ui.label(format!("nucleus #{i}: {}", composition(nucleus)));
-                ui.label(electrons_line(z));
-                // M7: under a pseudopotential only the valence electrons are solved
-                if let Some(p) = pseudo {
-                    ui.label(pseudo_line(p));
-                }
-                let (rect, _) =
-                    ui.allocate_exact_size(Vec2::new(220.0, 190.0), egui::Sense::hover());
-                let p = ui.painter_at(rect);
-                let c = rect.center();
-                // nucleus: a compact cluster of red (p) and green (n) dots on a small spiral
-                // interleave protons (red) and neutrons (green) outward along a sunflower spiral
-                let (mut p_left, mut n_left) = (z as usize, n_neutrons.unwrap_or(0) as usize);
-                let golden = 2.399_963_f32;
-                let mut k = 0usize;
-                while p_left + n_left > 0 {
-                    let proton = if p_left == 0 { false } else if n_left == 0 { true } else { k % 2 == 0 };
-                    if proton { p_left -= 1 } else { n_left -= 1 }
-                    let r = 2.4 * (k as f32 + 0.5).sqrt();
-                    let ang = k as f32 * golden;
-                    let q = c + Vec2::new(ang.cos(), ang.sin()) * r;
-                    let colour = if proton { Color32::from_rgb(232, 86, 86) } else { Color32::from_rgb(96, 190, 110) };
-                    p.circle_filled(q, 3.2, colour);
-                    k += 1;
-                }
-                // shells: rings with electron dots
-                let max_r = 86.0;
-                let n_shells = shells.len().max(1) as f32;
-                for (s, &count) in shells.iter().enumerate() {
-                    let r = 22.0 + (s as f32 + 1.0) * (max_r - 22.0) / n_shells;
-                    p.circle_stroke(c, r, Stroke::new(1.0, Color32::from_white_alpha(70)));
-                    for e in 0..count {
-                        let ang = std::f32::consts::TAU * e as f32 / count as f32 - std::f32::consts::FRAC_PI_2;
-                        let q = c + Vec2::new(ang.cos(), ang.sin()) * r;
-                        p.circle_filled(q, 2.6, Color32::from_rgb(120, 180, 255));
+                    ui.label(format!("nucleus #{i}: {}", composition(nucleus)));
+                    ui.label(electrons_line(z));
+                    // M7: under a pseudopotential only the valence electrons are solved
+                    if let Some(p) = pseudo {
+                        ui.label(pseudo_line(p));
                     }
-                }
-                p.text(
-                    Pos2::new(rect.left() + 4.0, rect.bottom() - 4.0),
-                    Align2::LEFT_BOTTOM,
-                    "schematic — not to scale",
-                    FontId::proportional(10.0),
-                    Color32::from_white_alpha(140),
-                );
-                ui.small(CAVEAT);
+                    let (rect, _) =
+                        ui.allocate_exact_size(Vec2::new(220.0, 190.0), egui::Sense::hover());
+                    let p = ui.painter_at(rect);
+                    let c = rect.center();
+                    // nucleus: a compact cluster of red (p) and green (n) dots on a small spiral
+                    // interleave protons (red) and neutrons (green) outward along a sunflower spiral
+                    let (mut p_left, mut n_left) = (z as usize, n_neutrons.unwrap_or(0) as usize);
+                    let golden = 2.399_963_f32;
+                    let mut k = 0usize;
+                    while p_left + n_left > 0 {
+                        let proton = if p_left == 0 { false } else if n_left == 0 { true } else { k % 2 == 0 };
+                        if proton { p_left -= 1 } else { n_left -= 1 }
+                        let r = 2.4 * (k as f32 + 0.5).sqrt();
+                        let ang = k as f32 * golden;
+                        let q = c + Vec2::new(ang.cos(), ang.sin()) * r;
+                        let colour = if proton { Color32::from_rgb(232, 86, 86) } else { Color32::from_rgb(96, 190, 110) };
+                        p.circle_filled(q, 3.2, colour);
+                        k += 1;
+                    }
+                    // shells: rings with electron dots
+                    let max_r = 86.0;
+                    let n_shells = shells.len().max(1) as f32;
+                    for (s, &count) in shells.iter().enumerate() {
+                        let r = 22.0 + (s as f32 + 1.0) * (max_r - 22.0) / n_shells;
+                        p.circle_stroke(c, r, Stroke::new(1.0, Color32::from_white_alpha(70)));
+                        for e in 0..count {
+                            let ang = std::f32::consts::TAU * e as f32 / count as f32 - std::f32::consts::FRAC_PI_2;
+                            let q = c + Vec2::new(ang.cos(), ang.sin()) * r;
+                            p.circle_filled(q, 2.6, Color32::from_rgb(120, 180, 255));
+                        }
+                    }
+                    p.text(
+                        Pos2::new(rect.left() + 4.0, rect.bottom() - 4.0),
+                        Align2::LEFT_BOTTOM,
+                        "schematic — not to scale",
+                        FontId::proportional(10.0),
+                        Color32::from_white_alpha(140),
+                    );
+                    ui.small(CAVEAT);
+                });
+                content_h = out.content_size.y;
             });
-        })
-        .response
-        .rect
+        });
+    Vec2::new(r.response.rect.width(), content_h + FRAME_H)
 }
 
 #[cfg(test)]
