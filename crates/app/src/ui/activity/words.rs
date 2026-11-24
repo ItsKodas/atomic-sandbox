@@ -17,54 +17,99 @@ pub fn thousands(n: u64) -> String {
     out
 }
 
-/// A refit's time left (`sim::refit_eta`), worded as the estimate it is: "about 2:20 left (from
-/// your last 3 refits)" — the source only with `source` —, "estimating…" without a history,
-/// "finishing…" in its last second or past the estimate (never a negative time). The minutes and
-/// seconds round up, so the countdown never shows 0:00 while it runs.
-pub fn refit_eta_words(v: &sim::RefitView, source: bool) -> String {
-    match v.eta {
-        sim::RefitEta::Estimating => "estimating…".into(),
-        sim::RefitEta::Finishing => "finishing…".into(),
-        sim::RefitEta::Left { remaining_s, .. } => {
-            let s = remaining_s.max(0.0).ceil() as u64;
-            let from = match v.estimate.map_or(0, |e| e.from) {
-                _ if !source => String::new(),
-                0 => String::new(),
-                1 => " (from your last refit)".into(),
-                k => format!(" (from your last {k} refits)"),
-            };
-            format!("about {}:{:02} left{from}", s / 60, s % 60)
+/// The running refit's stage in plain words (the refit picture, `sim::refit_live`): "gathering
+/// samples", "solving the model", "checking each sample", the passes without a counter ("active
+/// set", "null space", "training residuals", "counting environments"), "starting" before the first;
+/// a stage of the mix W's learn (a channel collection) is "learning the mix W · gathering" /
+/// "· solving".
+pub fn refit_stage_name(l: &sim::RefitLive) -> String {
+    use sim::{LiveStage as S, OtherPass as O};
+    let name = match l.stage {
+        S::Starting => "starting",
+        S::Gather if l.mix => "learning the mix W · gathering",
+        S::Solve if l.mix => "learning the mix W · solving",
+        S::Gather => "gathering samples",
+        S::Solve => "solving the model",
+        S::Check => "checking each sample",
+        S::Other(O::Counts) => "counting environments",
+        S::Other(O::Residuals) => "training residuals",
+        S::Other(O::NullSpace) => "null space",
+        S::Other(O::ActiveSet) => "active set",
+    };
+    name.into()
+}
+
+/// The running stage's counter: "1,200 of 2,655 samples", "round 3 · 12 decompositions of
+/// 4,140 × 4,140 · 0.64 s each" ("first decomposition" before one finished: no time per one yet),
+/// "1,240 of 2,655 · 3 beyond their bound"; empty for a pass without a counter.
+pub fn refit_counter_words(l: &sim::RefitLive) -> String {
+    use sim::LiveStage as S;
+    match l.stage {
+        S::Gather => format!("{} of {} samples", thousands(l.done as u64), thousands(l.total as u64)),
+        S::Solve => {
+            let q = thousands(l.q as u64);
+            match l.decompositions {
+                0 => format!("round {} · first decomposition of {q} × {q}", l.round.max(1)),
+                k => {
+                    let each = if l.decomposition_s >= 1.0 { format!("{:.1} s", l.decomposition_s) } else { format!("{:.2} s", l.decomposition_s) };
+                    format!("round {} · {k} decomposition{} of {q} × {q} · {each} each", l.round.max(1), if k == 1 { "" } else { "s" })
+                }
+            }
         }
+        S::Check => {
+            let beyond = match l.beyond {
+                0 => String::new(),
+                1 => " · 1 beyond its bound".into(),
+                b => format!(" · {} beyond their bound", thousands(b as u64)),
+            };
+            format!("{} of {}{beyond}", thousands(l.done as u64), thousands(l.total as u64))
+        }
+        S::Starting | S::Other(_) => String::new(),
     }
 }
 
-/// A refit's stages so far: "fit 4 of 12 · leave-one-out 1 of 5", the totals the history's
-/// (`sim::RefitEstimate`; dropped once the refit runs past them), "· trust recovery" once it entered
-/// it; "starting" before its first fit.
-pub fn refit_stage_words(v: &sim::RefitView) -> String {
-    let st = v.stages;
-    if st.fits == 0 && st.loo == 0 {
-        return "starting".into();
-    }
-    let of = |k: u32, total: Option<u32>| match total.filter(|&t| t >= k && t > 0) {
-        Some(t) => format!("{k} of {t}"),
-        None => k.to_string(),
-    };
-    let mut parts = Vec::new();
-    if st.fits > 0 {
-        parts.push(format!("fit {}", of(st.fits, v.estimate.map(|e| e.fits))));
-    }
-    if st.loo > 0 {
-        parts.push(format!("leave-one-out {}", of(st.loo, v.estimate.map(|e| e.loo))));
-    }
-    if st.recovery {
-        parts.push("trust recovery".into());
-    }
+/// The running stage's time left, from its own counter (`sim::RefitLive::stage_left_s`): "about
+/// 0:12 left in this stage", rounded up (never 0:00 while it runs); `None` for a stage without a
+/// total (the search, the passes) or before its rate is measured.
+pub fn refit_left_words(l: &sim::RefitLive) -> Option<String> {
+    let s = l.stage_left_s()?.max(0.0).ceil() as u64;
+    Some(if s == 0 { "finishing this stage".into() } else { format!("about {}:{:02} left in this stage", s / 60, s % 60) })
+}
+
+/// The trust recovery's part: "trust round 2 of up to 5 · 41 held out", "trust recovery · basis
+/// retry" before its quarantine rounds; `None` outside one.
+pub fn refit_trust_words(l: &sim::RefitLive) -> Option<String> {
+    let t = l.trust?;
+    Some(match t.round {
+        0 => "trust recovery · basis retry".into(),
+        r => format!("trust round {r} of up to {} · {} held out", t.max, thousands(t.held as u64)),
+    })
+}
+
+/// A running refit in one phrase (the headline, the Model banner, the job's detail): its stage and
+/// that stage's time left — "checking each sample · about 0:04 left in this stage", "solving the
+/// model", "trust round 2 of up to 5 · 41 held out · solving the model".
+pub fn refit_now_words(v: &sim::RefitView) -> String {
+    let l = &v.live;
+    let mut parts: Vec<String> = refit_trust_words(l).into_iter().collect();
+    parts.push(refit_stage_name(l));
+    parts.extend(refit_left_words(l));
     parts.join(" · ")
 }
 
-/// What a refit's estimate is, for its hover.
-pub const REFIT_ETA_TIP: &str = "The time left is an estimate: the mean wall of your last (up to 5) comparable refits — the same kind (with or without the trust recovery) and species count — scaled by the sample count (time ∝ samples unless your history clearly shows otherwise), refined by the fits and leave-one-out passes as they finish. The history is kept with the shared collection (refit_times.csv), or for this session with a model file";
+/// The job card's count line: the trust round, the stage's counter and its time left —
+/// "trust round 2 of up to 5 · 41 held out · 1,240 of 2,655 · about 0:04 left in this stage".
+pub fn refit_count_line(v: &sim::RefitView) -> String {
+    let l = &v.live;
+    let mut parts: Vec<String> = refit_trust_words(l).into_iter().collect();
+    let c = refit_counter_words(l);
+    parts.push(if c.is_empty() { refit_stage_name(l) } else { c });
+    parts.extend(refit_left_words(l));
+    parts.join(" · ")
+}
+
+/// What the refit's words are, for their hover.
+pub const REFIT_ETA_TIP: &str = "What the refit is doing now, counted by the refit itself: gathering the samples into the fit's statistics, learning the mix W (a channel collection, when it is due), solving the model (the hyperparameter search: each round decomposes the Q′ × Q′ matrix, and the search stops when its levels settle, so it has no fixed number of rounds), checking each sample (leave-one-out: each sample's error with the sample left out, against its bound), and the trust recovery's rounds. The time left is the running stage's only, from its own rate: a stage that has not started has no number";
 
 /// What a log row (or a stuck streak) knew about its answer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

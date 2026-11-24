@@ -141,15 +141,11 @@ pub fn headline(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Optio
         let eta = input.model().and_then(|m| m.pass_eta_s).map(|e| format!(" · {} left", clock(e))).unwrap_or_default();
         Some((format!("{} · {stage}{eta}{step}", sample_text(s.done, s.total)), frac))
     } else if let Some(r) = p.refit {
-        // a refit of milliseconds says nothing more; a longer one its time left (`sim::refit_eta`)
-        let t = r.elapsed_s;
-        let left = match r.eta {
-            _ if t < 0.3 => String::new(),
-            sim::RefitEta::Estimating => format!(" · {t:.1} s · estimating…"),
-            _ => format!(" · {}", super::words::refit_eta_words(&r, false)),
-        };
-        let bar = r.eta.fraction().map_or(BarMode::Sweep, |f| BarMode::Fraction(f as f32));
-        Some((format!("Refitting · {} samples{left}", super::words::thousands(r.samples as u64)), bar))
+        // a refit of milliseconds says nothing more; a longer one its stage and that stage's time
+        // left (the refit picture's counters, `sim::refit_live`), the bar the stage's share
+        let now = if r.elapsed_s < 0.3 { String::new() } else { format!(" · {}", super::words::refit_now_words(&r)) };
+        let bar = r.live.stage_fraction().map_or(BarMode::Sweep, |f| BarMode::Fraction(f as f32));
+        Some((format!("Refitting · {} samples{now}", super::words::thousands(r.samples as u64)), bar))
     } else if p.main.running {
         if snap.engine == Backend::Cpu && running_iteration(&p.main).is_none() {
             Some((format!("Solving (CPU reference) · {:.0} s", p.main.elapsed_s), BarMode::Sweep))

@@ -6748,3 +6748,18 @@ By key, identical in both models on the full split:
 - So `H{Li}` and `O{Li}` pass with 212 and 160 samples either way.
 - `H{Cl}` (20 samples) is trusted in the channel model and refused in the species one.
 - No answer changed, because the partner `Cl{H}` (q 74, H represented) still refuses the HCl scene. It is the C2 rule as specified (q_k = the columns the key's atoms touch), recorded here because it is the one place the two models' verdicts differ.
+
+## Where a channel refit's time goes (2026-11-25; the refit picture, plan `2026-11-25-refit-visualisation.md`; `providers` `surrogate::tests::refit_profile` run `channels`, `REFIT_PROFILE=channels`, `--features profile`, `#[ignore]`d; release, Ryzen 7 9800X3D, 12 fit threads, BelowNormal, alone)
+
+A read-only copy of the user's installed collection (H, Li, O, S, Cl; 2 708 stored, 2 655 fitted, 6 163 atoms), its basis set to channels K = 3, attached without its own refit, then `refit()` twice.
+
+| first refit: 79.9 s | s | |
+|---|---|---|
+| learning the mix W (`channel_lifecycle`) | 53.2 | its low-order fit's dense reference search: 221 `TwoNoise::solve` Choleskys, 53.1 s; its gathering under 0.6 s |
+| the fit's spectral searches (2: the fit and the recovery's degree-cap retry) | 16.7 | 12 spectra 9.2 s, 14 solves 5.3 s, 3 condition estimates 1.7 s; Q′ 4 140, 5 rounds |
+| the class leave-one-out (2 655 samples) | 4.2 | 43 cpu-s on 12 threads |
+| null space / active set | 1.4 / 0.9 | |
+| counting environments (body-4 degree floor 1.0, floor columns 0.9, class keys 0.5) | 2.4 | |
+| gathering (`add_many`, 3 calls) / training residuals (2) | 0.6 / 0.25 | |
+
+The recovery (the degree-cap 6 retry, which restored the training residuals) is 10.9 s of the total. A second refit with nothing new: 8.1 s — a warm solve 0.2 s and the standing fit's trust passes 7.3 s (leave-one-out 4.4 s, null space 1.4 s, active set 0.9 s, key counts 0.5 s). So the W learn's search, the fit's search and the leave-one-out are what the refit picture counts; gathering is a blink, as the spec expected.

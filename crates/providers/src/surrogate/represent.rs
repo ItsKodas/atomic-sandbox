@@ -236,6 +236,7 @@ impl SurrogateKs {
             return false;
         }
         let Some(store) = self.store.as_ref() else { return false };
+        let _prof = surrogate::prof::span("P3 mark_unrepresented");
         let r = self.channel_r_cut();
         let rc2 = r * r;
         let mut moves: Vec<(usize, u8)> = Vec::new();
@@ -277,6 +278,7 @@ impl SurrogateKs {
     /// or without such samples.
     pub(super) fn channel_census(&self) -> Option<Census> {
         self.channel_collection()?;
+        let _prof = surrogate::prof::span("P1 channel_census (low-order key counts)");
         let store = self.store.as_ref()?;
         let members = self.low_order_members();
         let mut species: Vec<u8> = members.iter().flat_map(|&i| store.samples[i].z.iter().copied()).collect();
@@ -353,7 +355,15 @@ impl SurrogateKs {
         setup.fit = FitOptions { sigma_f_min: force_noise_prior(&ionic), ..FitOptions::default() };
         setup.eligible = Some(census.n_w.clone());
         let _prof = surrogate::prof::span("P1 channel_lifecycle (learn W)");
-        match learn_mix(&samples, &setup, k) {
+        // the refit picture: the low-order fit's gathering and search are the mix's (display only)
+        if let Some(p) = &self.meter {
+            p.refit_mix(true);
+        }
+        let learnt = learn_mix(&samples, &setup, k);
+        if let Some(p) = &self.meter {
+            p.refit_mix(false);
+        }
+        match learnt {
             Ok(mut mix) => {
                 mix.many_body = census.many_body.clone();
                 let sh = self.shared.as_mut().expect("a channel collection");

@@ -473,7 +473,8 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
                 if rows.is_empty() && loading.is_none() {
                     theme::note(ui, "nothing running");
                 } else {
-                    jobs::show(ui, &rows, &st.activity.conv, &bars, acts);
+                    let refit = input.probe.as_ref().and_then(|p| p.refit.as_ref()).map(|v| (v, &input.refit_ratios[..]));
+                    jobs::show(ui, &rows, &st.activity.conv, &bars, refit, acts);
                 }
             })
             .response

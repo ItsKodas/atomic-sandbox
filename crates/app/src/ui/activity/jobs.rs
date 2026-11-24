@@ -212,18 +212,19 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
         v.push(JobRow {
             key: JobKey::Refit,
             title: "Refitting".into(),
-            detail: format!("{n} samples · {}{more}", super::words::refit_eta_words(&r, false)),
-            progress: r.eta.fraction().map_or(JobProgress::Indeterminate, |f| JobProgress::Estimate(f as f32)),
+            detail: format!("{n} samples · {}{more}", super::words::refit_now_words(&r)),
+            // the running stage's share (gathering, checking), else a sweep (the search has no total)
+            progress: r.live.stage_fraction().map_or(JobProgress::Indeterminate, |f| JobProgress::Estimate(f as f32)),
             elapsed_s: Some(r.elapsed_s),
             eta_s: None,
             control: None,
             no_control_why: Some("a refit takes milliseconds to minutes and runs off the step path; Forget and Restore meanwhile apply at once and are refitted right after it"),
             scf: None,
             keeps_block: false,
-            // "Refitting · 2,077 samples · about 2:20 left (from your last 3 refits)"
-            stage: Some(format!("{n} samples · {}{more}", super::words::refit_eta_words(&r, true))),
-            // "fit 4 of 12 · leave-one-out 1 of 5"
-            count: Some(super::words::refit_stage_words(&r)),
+            // "Refitting · 2,077 samples · checking each sample"
+            stage: Some(format!("{n} samples · {}{more}", super::words::refit_stage_name(&r.live))),
+            // "1,240 of 2,077 · 3 beyond their bound · about 0:04 left in this stage"
+            count: Some(super::words::refit_count_line(&r)),
             control2: None,
         });
     }
@@ -550,7 +551,7 @@ fn strip(ui: &mut Ui, bars: &[StripBar]) {
 /// The running job's card: "Sampling pass · bond scan" with its control, the bar, "sample 40 of 144"
 /// and "27 % · 53 min left", the solve's small line ("iteration 6 · 2.2 s each", "Δρ 6.8e-1 →
 /// 1e-6"), the convergence plot and (a pass) the iterations strip.
-pub fn card(ui: &mut Ui, r: &JobRow, tr: &Traces, bars: &[StripBar], acts: &mut Vec<Action>) {
+pub fn card(ui: &mut Ui, r: &JobRow, tr: &Traces, bars: &[StripBar], refit: Option<(&sim::RefitView, &[f32])>, acts: &mut Vec<Action>) {
     let c = colour_of(r.key);
     let resp = theme::panel_card(ui, theme::panel_card_frame(), |ui| {
         ui.set_width(ui.available_width());
@@ -601,6 +602,10 @@ pub fn card(ui: &mut Ui, r: &JobRow, tr: &Traces, bars: &[StripBar], acts: &mut 
         }
         if r.key == JobKey::Pass {
             strip(ui, bars);
+        }
+        // the refit's stages (the refit picture's compact strip)
+        if let Some((v, ratios)) = refit.filter(|_| r.key == JobKey::Refit) {
+            crate::ui::refit_picture::strip(ui, v, ratios);
         }
     });
     crate::ui::probe_rect("activity-job-card", resp.response.rect);
@@ -732,9 +737,9 @@ pub fn compact(ui: &mut Ui, r: &JobRow, acts: &mut Vec<Action>) {
 }
 
 /// The job list: the first job as the card ([`card`]), the others one line each ([`compact`]).
-pub fn show(ui: &mut Ui, rows: &[JobRow], tr: &Traces, bars: &[StripBar], acts: &mut Vec<Action>) {
+pub fn show(ui: &mut Ui, rows: &[JobRow], tr: &Traces, bars: &[StripBar], refit: Option<(&sim::RefitView, &[f32])>, acts: &mut Vec<Action>) {
     let Some((first, rest)) = rows.split_first() else { return };
-    card(ui, first, tr, bars, acts);
+    card(ui, first, tr, bars, refit, acts);
     for r in rest {
         compact(ui, r, acts);
     }

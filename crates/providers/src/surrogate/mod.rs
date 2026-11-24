@@ -2059,9 +2059,51 @@ pub struct SurrogateKs {
     /// A background refit's copy: the live provider's probe, for the stages only (the phase and
     /// the history are the live provider's).
     stage_probe: Option<Arc<sim::ActivityProbe>>,
+    /// The probe the running refit's picture counters go to (`sim::refit_live`; display only): set
+    /// by `refit` for its duration — the live provider's probe, or a background copy's
+    /// `stage_probe` — and `None` outside a refit (a view's fit or leave-one-out is not shown).
+    pub(super) meter: Option<Arc<sim::ActivityProbe>>,
+}
+
+/// The refit picture's meter (`surrogate::progress`): the fit's own counters onto the probe.
+/// Display only.
+pub(super) struct ProbeMeter(pub(super) Arc<sim::ActivityProbe>);
+
+impl surrogate::progress::Meter for ProbeMeter {
+    fn described(&self, n: usize, total: usize) {
+        self.0.refit_described(n, total);
+    }
+    fn search_round(&self, round: usize, q: usize) {
+        self.0.refit_search_round(round, q);
+    }
+    fn decomposition(&self, _kind: surrogate::progress::Decomposition, q: usize) {
+        self.0.refit_decomposition(q);
+    }
 }
 
 impl SurrogateKs {
+    /// The refit picture: a pass without a per-sample counter starts (a no-op outside a refit).
+    pub(super) fn meter_other(&self, pass: sim::OtherPass) {
+        if let Some(p) = &self.meter {
+            p.refit_other(pass);
+        }
+    }
+
+    /// [`surrogate::loo::leave_one_out_many`] over `samples` (the members `idx`, in store order),
+    /// each sample's leave-one-out ratio ([`quarantine::loo_ratio`]'s first number, the Worst-fitting
+    /// list's) published as it is ready while a refit runs (`meter`). The results are the plain
+    /// call's, bit for bit (the callback reads them).
+    pub(super) fn leave_one_out_metered(&self, model: &surrogate::Model, samples: &[&Sample]) -> Vec<Option<surrogate::loo::SampleLoo>> {
+        let Some(p) = self.meter.as_ref() else { return surrogate::loo::leave_one_out_many(model, samples) };
+        p.refit_check_begin(samples.len());
+        let policy = &self.policy;
+        surrogate::loo::leave_one_out_many_with(model, samples, &|k, l| {
+            let s = samples[k];
+            let (own, _, _) = quarantine::loo_ratio(policy, model.energy_per_atom, surrogate::energy_row_atoms(&model.basis, &s.pos), s, l.as_ref());
+            p.refit_checked(k, own);
+        })
+    }
+
     /// A stage of the running refit starts (`sim::refit_eta`, "The countdown"): counted, and
     /// published on the probe; a no-op outside a refit. Bookkeeping only.
     pub(super) fn refit_stage(&mut self, stage: sim::RefitStage) {
@@ -2311,6 +2353,7 @@ impl SurrogateKs {
             refit_cancel: None,
             refit_counts: None,
             stage_probe: None,
+            meter: None,
         }
     }
 
@@ -3966,6 +4009,7 @@ impl SurrogateKs {
     /// block (per scene) the start, which such a basis carries unused.
     pub(super) fn grown_body4_degree(&self, species: &[u8]) -> usize {
         let _prof = surrogate::prof::span("P3 grown_body4_degree");
+        self.meter_other(sim::OtherPass::Counts);
         let start = surrogate::BODY4_DEGREE_START;
         let basis = self.fit_basis(species);
         if !basis.body4 {

@@ -196,17 +196,30 @@ fn solve_small(mut m: Vec<f64>, mut v: Vec<f64>, n: usize) -> Option<Vec<f64>> {
 /// trust pass, O(P · m · Q′²): 4.6 ms per sample at Q′ 1 032 on one thread, `references.md`
 /// "Refit cost at scale").
 pub fn leave_one_out_many(model: &Model, samples: &[&Sample]) -> Vec<Option<SampleLoo>> {
+    leave_one_out_many_with(model, samples, &|_, _| {})
+}
+
+/// [`leave_one_out_many`], calling `each(k, &result)` on the worker thread as sample k's result is
+/// ready (the refit picture's per-sample counter, `crate::progress`; display only — it sees the
+/// results, it changes none).
+pub fn leave_one_out_many_with(model: &Model, samples: &[&Sample], each: &(dyn Fn(usize, &Option<SampleLoo>) + Sync)) -> Vec<Option<SampleLoo>> {
     let _prof = crate::prof::span("loo: leave_one_out_many");
+    let one = |k: usize, s: &Sample| {
+        let l = leave_one_out(model, s);
+        each(k, &l);
+        l
+    };
     let threads = crate::threads::worker_threads();
     if threads == 1 || samples.len() < 2 {
-        return samples.iter().map(|s| leave_one_out(model, s)).collect();
+        return samples.iter().enumerate().map(|(k, s)| one(k, s)).collect();
     }
     let per = samples.len().div_ceil(threads);
     std::thread::scope(|scope| {
-        let handles: Vec<_> = samples.chunks(per).map(|chunk| {
+        let handles: Vec<_> = samples.chunks(per).enumerate().map(|(c, chunk)| {
+                let one = &one;
                 scope.spawn(move || {
                     crate::threads::lower_priority();
-                    chunk.iter().map(|s| leave_one_out(model, s)).collect::<Vec<_>>()
+                    chunk.iter().enumerate().map(|(j, s)| one(c * per + j, s)).collect::<Vec<_>>()
                 })
             })
             .collect();
@@ -413,6 +426,21 @@ mod tests {
         }
         assert!(serial.iter().all(Option::is_some));
         assert!(leave_one_out_many(&model, &[]).is_empty());
+        // the refit picture's callback (`leave_one_out_many_with`): every sample once, by its index,
+        // with its own result, on 1 and 3 threads alike, and the results unchanged
+        for t in [1, 3] {
+            let seen = std::sync::Mutex::new(vec![0usize; samples.len()]);
+            let with = crate::threads::with_threads(t, || {
+                leave_one_out_many_with(&model, &refs, &|k, l| {
+                    assert_eq!(bits(l), bits(&serial[k]), "sample {k}'s own result");
+                    seen.lock().unwrap()[k] += 1;
+                })
+            });
+            assert!(seen.into_inner().unwrap().iter().all(|&n| n == 1), "{t} threads: each sample once");
+            for (a, b) in with.iter().zip(&serial) {
+                assert_eq!(bits(a), bits(b));
+            }
+        }
     }
 
     #[test]

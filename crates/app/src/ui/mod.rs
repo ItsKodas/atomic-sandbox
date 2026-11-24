@@ -29,6 +29,7 @@ mod dock;
 pub mod estimated_box;
 mod files;
 pub mod profile;
+pub mod refit_picture;
 mod icons;
 pub mod knowledge;
 pub mod logbook;
@@ -713,6 +714,9 @@ pub struct UiState {
     /// The 3D view's overlays in their zones (`zones`): the sizes each measured per form, and the
     /// layout drawn (the viewer's ghost tag takes its top-centre slot from it).
     pub zones: zones::Zones,
+    /// The refit picture's last frame, kept for its fade-out once the fit lands (display only;
+    /// `refit_picture`).
+    pub refit_picture: refit_picture::Fade,
     /// The dots' look (View ▸ Density): floating (a Metropolis walk, `dots_drift` grid cells per
     /// frame), glowing (soft additive sprites), the amount (× the default count), size and brightness.
     pub dots_float: bool,
@@ -1046,6 +1050,7 @@ impl UiState {
             background: None,
             label_opacity: 1.0,
             zones: Default::default(),
+            refit_picture: Default::default(),
             loading: None,
             timings: Default::default(),
             dots_float: true,
@@ -1356,6 +1361,10 @@ pub struct PanelInput<'a> {
     /// refit in flight, the background auditor. Read per frame, so a long solve that publishes no
     /// snapshot still moves on screen.
     pub probe: Option<sim::ProbeView>,
+    /// The running refit's per-sample leave-one-out ratios (`sim::ActivityProbe::refit_ratios`, in
+    /// its pass's order; NaN: not checked yet), read once per frame while a refit runs: the refit
+    /// picture's blocks. Empty otherwise.
+    pub refit_ratios: Vec<f32>,
 }
 
 impl PanelInput<'_> {

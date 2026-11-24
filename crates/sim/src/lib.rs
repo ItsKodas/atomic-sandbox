@@ -16,6 +16,7 @@ pub mod profiles;
 pub mod provider;
 pub mod references;
 pub mod refit_eta;
+pub mod refit_live;
 pub mod relax;
 pub mod sampling;
 pub mod scene;
@@ -23,6 +24,7 @@ pub mod test_providers;
 pub mod thermostat;
 
 pub use refit_eta::{RefitEstimate, RefitEta, RefitKind, RefitRecord, RefitStage, RefitStages};
+pub use refit_live::{LiveStage, OtherPass, RefitLive, TrustRound};
 pub use activity::{ActivityProbe, DisplayJob, DisplaySolve, ProbeView, RefitView, ScfEnd, ScfIteration, ScfLive, Slot, SolveCounts, TeachBuffer, TeachEvent, TrainingViews};
 pub use dynamics::{DynCommand, DynSnapshot, Dynamics, ReferenceProgress, SideDensity, Walls, HARRIS_SAME_GEOMETRY};
 pub use integrator::{Integrator, StepStats};

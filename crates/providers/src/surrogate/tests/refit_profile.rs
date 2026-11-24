@@ -197,6 +197,22 @@ fn refit_profile() {
                 s.rebuild_active_set();
                 dump("active set alone (rule 5e), default basis", t.elapsed().as_secs_f64(), &s);
             }
+            // a channel collection's first refit (the W learn, its fit and every trust pass) and a
+            // second refit with nothing new (refit visualisation, 2026-11-25: where the time goes);
+            // `CHANNELS_K` (default 3)
+            "channels" => {
+                let k: usize = std::env::var("CHANNELS_K").map_or(3, |v| v.parse().unwrap());
+                let mut c = open_copy();
+                c.basis = surrogate::BasisKind::Channels { k };
+                let mut s = provider();
+                s.attach_refit_off = true;
+                s.attach(c).unwrap();
+                surrogate::prof::reset();
+                let wall = refit_timed(&mut s);
+                dump(&format!("(c) channels K = {k}: first refit (learn W + fit + trust passes)"), wall, &s);
+                let wall = refit_timed(&mut s);
+                dump(&format!("(c2) channels K = {k}: second refit, nothing new"), wall, &s);
+            }
             other => panic!("unknown run {other}"),
         }
     }
