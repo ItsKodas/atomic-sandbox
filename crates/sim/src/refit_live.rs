@@ -137,6 +137,10 @@ pub struct RefitLive {
     pub decompositions: u32,
     /// The matrix's size Q′ (0 before a search).
     pub q: u32,
+    /// Decompositions of this Q′ × Q′ matrix finished in the whole refit (every search on it: the
+    /// fit's, a recovery's; another Q′ — the W learn's low-order matrix — counts afresh). Kept
+    /// through the stages after the search: the matrix's real state.
+    pub matrix_decompositions: u32,
     /// The mean seconds of one decomposition in this search (NaN before the first), and the
     /// seconds since the last one finished (or the search started).
     pub decomposition_s: f64,
@@ -192,6 +196,7 @@ pub struct RefitMeter {
     round: AtomicU32,
     decompositions: AtomicU32,
     q: AtomicU32,
+    matrix_decompositions: AtomicU32,
     /// When this search started, and its last decomposition finished (µs).
     search_us: AtomicU64,
     decomposition_us: AtomicU64,
@@ -211,7 +216,7 @@ impl RefitMeter {
     pub fn begin(&self, now_us: u64) {
         self.stage.store(LiveStage::Starting.code(), Relaxed);
         self.stage_us.store(now_us, Relaxed);
-        for a in [&self.done, &self.total, &self.round, &self.decompositions, &self.q, &self.beyond, &self.trust_round, &self.trust_max, &self.trust_held] {
+        for a in [&self.done, &self.total, &self.round, &self.decompositions, &self.q, &self.matrix_decompositions, &self.beyond, &self.trust_round, &self.trust_max, &self.trust_held] {
             a.store(0, Relaxed);
         }
         self.mix.store(false, Relaxed);
@@ -267,7 +272,10 @@ impl RefitMeter {
             self.decomposition_us.store(now_us, Relaxed);
         }
         self.round.store(round.min(u32::MAX as usize) as u32, Relaxed);
-        self.q.store(q.min(u32::MAX as usize) as u32, Relaxed);
+        // another matrix (the W learn's, then the fit's): its decompositions count afresh
+        if self.q.swap(q.min(u32::MAX as usize) as u32, Relaxed) != q.min(u32::MAX as usize) as u32 {
+            self.matrix_decompositions.store(0, Relaxed);
+        }
     }
 
     /// One decomposition finished.
@@ -277,6 +285,7 @@ impl RefitMeter {
             self.search_round(1, q, now_us);
         }
         self.decompositions.fetch_add(1, Relaxed);
+        self.matrix_decompositions.fetch_add(1, Relaxed);
         self.decomposition_us.store(now_us, Relaxed);
     }
 
@@ -345,6 +354,7 @@ impl RefitMeter {
             round: self.round.load(Relaxed),
             decompositions,
             q: self.q.load(Relaxed),
+            matrix_decompositions: self.matrix_decompositions.load(Relaxed),
             decomposition_s: if decompositions > 0 { last.saturating_sub(search) as f64 * 1e-6 / decompositions as f64 } else { f64::NAN },
             since_decomposition_s: now_us.saturating_sub(last) as f64 * 1e-6,
             beyond: self.beyond.load(Relaxed),
@@ -413,9 +423,18 @@ mod tests {
         assert!((v.decomposition_fill().unwrap() - 0.5).abs() < 1e-9, "1 s into a 2 s decomposition");
         assert_eq!(v.stage_left_s(), None, "the search has no total");
         assert_eq!(m.view(60 * S).decomposition_fill(), Some(DECOMPOSITION_FILL_MAX));
-        // a new search (round 1) starts its counts again
+        // a new search (round 1) starts its counts again; the matrix keeps its total, and another
+        // stage after the search keeps it too (the matrix panel's state)
         m.search_round(1, 4140, 7 * S);
-        assert_eq!(m.view(7 * S).decompositions, 0);
+        m.decomposition(4140, 8 * S);
+        let v = m.view(8 * S);
+        assert_eq!((v.decompositions, v.matrix_decompositions), (1, 3));
+        m.other(OtherPass::ActiveSet, 9 * S);
+        let v = m.view(9 * S);
+        assert_eq!((v.round, v.q, v.matrix_decompositions), (1, 4140, 3));
+        // another matrix counts afresh
+        m.search_round(1, 1230, 10 * S);
+        assert_eq!(m.view(10 * S).matrix_decompositions, 0);
     }
 
     #[test]

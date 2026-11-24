@@ -14857,6 +14857,8 @@ fn the_refit_picture_fills_the_view_only_while_there_is_no_model() {
         assert!(!pic.intersects(r), "the picture overlaps {slot:?} at {r:?}");
     }
     assert!(st.refit_picture.last.as_ref().is_some_and(|(_, r)| r.len() == ratios.len()), "the last frame kept for the fade");
+    // the status chip names the refit only: the picture carries the stage
+    assert_eq!(super::activity::headline::headline(&inp, inp.probe.as_ref()).unwrap().text, "Refitting · 2,655 samples");
     // a model stands: no picture
     let fitted = snapshot(&scene, Backend::Estimated, Some(model()));
     let mut st2 = UiState::new("h2", &scene);

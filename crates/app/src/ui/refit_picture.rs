@@ -254,8 +254,13 @@ fn draw(p: &Painter, rect: Rect, v: &RefitView, ratios: &[f32], time: f64) {
     parts.retain(|p| !p.is_empty());
     parts.extend(words::refit_left_words(l));
     let line = parts.join(" · ");
-    p.text(inner.left_top() + vec2(0.0, 22.0), Align2::LEFT_TOP, line, FontId::proportional(12.0), theme::ACCENT_INK);
-    let body = Rect::from_min_max(inner.left_top() + vec2(0.0, 46.0), inner.max);
+    // wrapped to the card (two rows at most, then cut): never past the picture's edge
+    let mut job = egui::text::LayoutJob::single_section(line, egui::TextFormat { font_id: FontId::proportional(12.0), color: theme::ACCENT_INK, ..Default::default() });
+    job.wrap = egui::text::TextWrapping { max_width: inner.width(), max_rows: 2, break_anywhere: false, overflow_character: Some('…') };
+    let g = p.layout_job(job);
+    let line_h = g.size().y;
+    p.galley(inner.left_top() + vec2(0.0, 22.0), g, theme::ACCENT_INK);
+    let body = Rect::from_min_max(inner.left_top() + vec2(0.0, 30.0 + line_h), inner.max);
     // the stage list on the left when there is room
     let list_w = if body.width() >= 520.0 { 200.0 } else { 0.0 };
     if list_w > 0.0 {
@@ -285,53 +290,69 @@ fn draw(p: &Painter, rect: Rect, v: &RefitView, ratios: &[f32], time: f64) {
     draw_blocks(p, grid, v, ratios);
 }
 
-/// The Q′ × Q′ matrix (module doc).
+/// The matrix panel's grid side g (g × g cells, one per decomposition): the smallest of 4, 6, 8,
+/// 12, 16, 24 holding `count` decompositions and the one under way, so the cells stay as large as
+/// the count allows; past 24² every cell stands for several.
+pub fn matrix_grid(count: u32) -> u32 {
+    [4, 6, 8, 12, 16, 24].into_iter().find(|g| g * g > count).unwrap_or(24)
+}
+
+/// What the matrix panel says under the square: the search while it runs ("round 3 · 12
+/// decompositions"), the matrix's total after it ("26 decompositions · solved in 0:17"), nothing
+/// before any search.
+pub fn matrix_words(l: &RefitLive) -> String {
+    let plural = |k: u32| if k == 1 { "1 decomposition".to_string() } else { format!("{k} decompositions") };
+    if l.q == 0 {
+        String::new()
+    } else if l.stage == LiveStage::Solve {
+        format!("round {} · {}", l.round.max(1), plural(l.matrix_decompositions))
+    } else {
+        let slot = if l.mix { sim::refit_live::MIX_SLOT } else { LiveStage::Solve.slot() };
+        let solved = l.spent_s[slot];
+        if solved > 0.0 {
+            format!("{} · solved in {}", plural(l.matrix_decompositions), mmss(solved))
+        } else {
+            plural(l.matrix_decompositions)
+        }
+    }
+}
+
+/// The Q′ × Q′ matrix (module doc): a cell per decomposition of this matrix in the refit
+/// ([`matrix_grid`]), filled as each lands; while solving, the next cell fills over the mean time
+/// of one (a pulse before the first is measured); after the search the cells stay, the real state.
 fn draw_matrix(p: &Painter, m: Rect, l: &RefitLive, time: f64) {
     let solving = l.stage == LiveStage::Solve;
-    let ink = if solving { theme::ACCENT } else { theme::INK_FAINT };
+    let ink = if solving { theme::ACCENT } else { theme::INK_DIM };
     let label = if l.q > 0 { format!("Q′ {} × {}", words::thousands(l.q as u64), words::thousands(l.q as u64)) } else { "the model's matrix".into() };
     p.text(m.left_top() - vec2(0.0, 3.0), Align2::LEFT_BOTTOM, label, FontId::proportional(10.5), theme::INK_DIM);
     p.rect_filled(m, 2.0, theme::PANEL_2);
-    if solving {
-        match l.decomposition_fill() {
-            // the current decomposition, over the mean time of one: a sweep down the matrix
-            Some(f) => {
-                let filled = Rect::from_min_max(m.min, pos2(m.right(), m.top() + m.height() * f as f32));
-                p.rect_filled(filled, 2.0, theme::ACCENT.gamma_multiply(0.45));
-            }
-            // the first: no measure yet, a pulse
-            None => {
-                let a = 0.2 + 0.2 * (time * 3.0).sin().abs() as f32;
-                p.rect_filled(m, 2.0, theme::ACCENT.gamma_multiply(a));
-            }
-        }
+    let done = l.matrix_decompositions;
+    let g = matrix_grid(done);
+    let per = done.div_ceil(g * g).max(1);
+    let shown = done.div_ceil(per);
+    let cell = m.width() / g as f32;
+    let at = |k: u32| Rect::from_min_size(m.min + vec2((k % g) as f32 * cell, (k / g) as f32 * cell), Vec2::splat(cell)).shrink(0.75);
+    let fill = if solving { theme::ACCENT.gamma_multiply(0.75) } else { theme::ACCENT.gamma_multiply(0.4) };
+    for k in 0..shown.min(g * g) {
+        p.rect_filled(at(k), 1.0, fill);
     }
-    // the grid lines of the matrix's blocks
-    for k in 1..8 {
-        let t = k as f32 / 8.0;
-        let s = Stroke::new(0.5, theme::LINE_SOFT);
-        p.line_segment([pos2(m.left() + m.width() * t, m.top()), pos2(m.left() + m.width() * t, m.bottom())], s);
-        p.line_segment([pos2(m.left(), m.top() + m.height() * t), pos2(m.right(), m.top() + m.height() * t)], s);
+    if solving && shown < g * g {
+        let next = at(shown);
+        match l.decomposition_fill() {
+            // the decomposition under way, over the mean time of one: its cell fills upward
+            Some(f) => p.rect_filled(Rect::from_min_max(pos2(next.left(), next.bottom() - next.height() * f as f32), next.max), 1.0, theme::ACCENT.gamma_multiply(0.45)),
+            // the first: no measure yet, a pulse
+            None => p.rect_filled(next, 1.0, theme::ACCENT.gamma_multiply(0.2 + 0.3 * (time * 3.0).sin().abs() as f32)),
+        };
     }
     p.rect_stroke(m, 2.0, Stroke::new(1.0, ink), egui::StrokeKind::Inside);
-    // a tick per decomposition finished in this search
-    let mut y = m.bottom() + 8.0;
-    if l.round > 0 {
-        let per_row = ((m.width() + 2.0) / 5.0).floor().max(1.0) as usize;
-        let shown = (l.decompositions as usize).min(per_row * 3);
-        for k in 0..shown {
-            let (row, col) = (k / per_row, k % per_row);
-            let c = pos2(m.left() + 2.0 + col as f32 * 5.0, y + 2.0 + row as f32 * 5.0);
-            p.rect_filled(Rect::from_center_size(c, Vec2::splat(3.0)), 0.5, ink);
-        }
-        y += 6.0 + 5.0 * shown.div_ceil(per_row) as f32;
-        let words = match l.decompositions {
-            0 => format!("round {}", l.round),
-            1 => format!("round {} · 1 decomposition", l.round),
-            k => format!("round {} · {k} decompositions", l.round),
-        };
-        p.text(pos2(m.left(), y), Align2::LEFT_TOP, words, FontId::proportional(10.5), theme::INK_DIM);
+    let mut words = matrix_words(l);
+    if per > 1 {
+        words.push_str(&format!(" · a cell per {per}"));
     }
+    // (the card's inset is 14 pt: the words may use 12 of it, never past the card)
+    let g = p.layout(words, FontId::proportional(10.5), theme::INK_DIM, m.width() + 12.0);
+    p.galley(pos2(m.left(), m.bottom() + 6.0), g, theme::INK_DIM);
 }
 
 /// The sample blocks (module doc).
@@ -361,48 +382,129 @@ fn draw_blocks(p: &Painter, grid: Rect, v: &RefitView, ratios: &[f32]) {
     }
 }
 
-/// The strip's running cell's counter, short enough for a narrow cell: "1,700/2,655", "r4 · 131"
-/// (search round 4, 131 decompositions), "r2/5 · 41 out" (a trust round, samples held out), the
-/// pass's name otherwise.
+/// A count in at most four characters: "950", "1.7k", "27k", "1.2M".
+pub fn compact_count(n: u32) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=9_949 => format!("{:.1}k", n as f64 / 1e3),
+        9_950..=999_499 => format!("{:.0}k", n as f64 / 1e3),
+        _ => format!("{:.1}M", n as f64 / 1e6),
+    }
+}
+
+/// The strip's running cell's counter, short enough for a narrow cell (the card's count line has
+/// the words): "1.7k/2.7k", "r4·131" (search round 4, 131 decompositions), "r2/5" (a trust
+/// round; its held-out count is in the count line), "basis" (the recovery's basis retry), a short
+/// name for a pass without a counter.
 pub fn short_counter(l: &RefitLive, trust_row: bool) -> String {
+    use sim::OtherPass as O;
     if trust_row {
         return match l.trust {
-            Some(t) if t.round > 0 => format!("r{}/{} · {} out", t.round, t.max, words::thousands(t.held as u64)),
-            Some(_) => "basis retry".into(),
+            Some(t) if t.round > 0 => format!("r{}/{}", t.round, t.max),
+            Some(_) => "basis".into(),
             None => String::new(),
         };
     }
     match l.stage {
-        LiveStage::Gather | LiveStage::Check => format!("{}/{}", words::thousands(l.done as u64), words::thousands(l.total as u64)),
-        LiveStage::Solve => format!("r{} · {}", l.round.max(1), l.decompositions),
+        LiveStage::Gather | LiveStage::Check => format!("{}/{}", compact_count(l.done), compact_count(l.total)),
+        LiveStage::Solve => format!("r{}·{}", l.round.max(1), compact_count(l.decompositions)),
         LiveStage::Starting => String::new(),
-        LiveStage::Other(_) => words::refit_stage_name(l),
+        LiveStage::Other(O::Counts) => "counts".into(),
+        LiveStage::Other(O::Residuals) => "resid.".into(),
+        LiveStage::Other(O::NullSpace) => "null sp.".into(),
+        LiveStage::Other(O::ActiveSet) => "active".into(),
     }
+}
+
+/// A strip row's height (a cell and the gap under it).
+pub const STRIP_ROW: f32 = 29.0;
+/// The gap right of a cell.
+const STRIP_GAP: f32 = 3.0;
+
+/// The strip's cells laid out in `width` (rects relative to the strip's top left): each cell as
+/// wide as its text needs (`needs`, the gap included), the row's spare width shared out evenly, a
+/// new row when the next cell does not fit — so no text is ever cut, at any dock width.
+pub fn strip_layout(needs: &[f32], width: f32) -> Vec<Rect> {
+    let mut rows: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut used = 0.0;
+    for (i, &n) in needs.iter().enumerate() {
+        if used + n > width && !rows.last().unwrap().is_empty() {
+            rows.push(Vec::new());
+            used = 0.0;
+        }
+        rows.last_mut().unwrap().push(i);
+        used += n;
+    }
+    let mut out = vec![Rect::NOTHING; needs.len()];
+    for (y, row) in rows.iter().enumerate() {
+        let spare = (width - row.iter().map(|&i| needs[i]).sum::<f32>()).max(0.0) / row.len().max(1) as f32;
+        let mut x = 0.0;
+        for &i in row {
+            let w = needs[i] + spare;
+            out[i] = Rect::from_min_size(pos2(x, y as f32 * STRIP_ROW), vec2(w, STRIP_ROW));
+            x += w;
+        }
+    }
+    out
+}
+
+/// The strip's label font, its counter font, and the text inset of a cell (left + right, points).
+pub const STRIP_LABEL: f32 = 10.5;
+pub const STRIP_COUNT: f32 = 9.5;
+pub const STRIP_INSET: f32 = 8.0;
+
+/// A strip cell: its label, its second line (the running cell's short counter, else its time spent
+/// or "—"), running now, its time slot.
+pub struct StripCell {
+    pub label: &'static str,
+    pub line: String,
+    pub on: bool,
+    pub spent: Option<f64>,
+}
+
+/// The strip's cells for a refit now (module doc; [`strip`] draws them).
+pub fn strip_cells(l: &RefitLive) -> Vec<StripCell> {
+    stage_rows(l)
+        .into_iter()
+        .map(|(short, _, slot, on, _)| {
+            let spent = slot.map(|s| l.spent_s[s]).filter(|&s| s > 0.0);
+            let count = if on { short_counter(l, short == "Trust") } else { String::new() };
+            let line = if on && !count.is_empty() { count } else { spent.map_or("—".to_string(), mmss) };
+            StripCell { label: short, line, on, spent }
+        })
+        .collect()
+}
+
+/// The width a strip cell needs for its text (`text_w`: a string's width in a font), the inset
+/// and the gap included.
+pub fn strip_need(c: &StripCell, text_w: &dyn Fn(&str, FontId) -> f32) -> f32 {
+    text_w(c.label, FontId::proportional(STRIP_LABEL)).max(text_w(&c.line, FontId::monospace(STRIP_COUNT))).ceil() + STRIP_INSET + STRIP_GAP
 }
 
 /// Activity's compact strip for a running refit (module doc): a cell per stage — its time spent,
 /// the running one lit with its short counter ([`short_counter`]; the card's count line has the
-/// words) — and the checked samples' ratios as a thin line.
+/// words), each as wide as its text and wrapping to a second row in a narrow dock
+/// ([`strip_layout`]) — and the checked samples' ratios as a thin line.
 pub fn strip(ui: &mut Ui, v: &RefitView, ratios: &[f32]) {
     let l = &v.live;
-    let rows: Vec<_> = stage_rows(l).into_iter().map(|(short, long, slot, on, _)| (short, long, slot, on, if on { short_counter(l, short == "Trust") } else { String::new() })).collect();
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
+    let cells = strip_cells(l);
+    let width = ui.available_width();
+    let needs: Vec<f32> = {
+        let p = ui.painter();
+        let text_w = |t: &str, f: FontId| p.layout_no_wrap(t.to_string(), f, theme::INK).size().x;
+        cells.iter().map(|c| strip_need(c, &text_w)).collect()
+    };
+    let lay = strip_layout(&needs, width);
+    let rows_h = lay.iter().map(|r| r.bottom()).fold(0.0, f32::max);
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, rows_h + 5.0), Sense::hover());
     super::probe_rect("refit-strip", rect);
     let p = ui.painter_at(rect);
-    let w = rect.width() / rows.len().max(1) as f32;
-    for (k, (short, _, slot, on, count)) in rows.iter().enumerate() {
-        let cellr = Rect::from_min_size(pos2(rect.left() + k as f32 * w, rect.top()), vec2(w - 3.0, 26.0));
-        let spent = slot.map(|s| l.spent_s[s]).filter(|&s| s > 0.0);
-        p.rect_filled(cellr, 3.0, if *on { theme::ACCENT_BG } else { theme::PANEL_2 });
-        let ink = if *on { theme::ACCENT_INK } else if spent.is_some() { theme::INK_DIM } else { theme::INK_FAINT };
-        p.text(cellr.left_top() + vec2(5.0, 2.0), Align2::LEFT_TOP, *short, FontId::proportional(10.5), ink);
-        let right = if *on && !count.is_empty() { count.clone() } else { spent.map_or("—".to_string(), mmss) };
-        let g = p.layout_job({
-            let mut job = egui::text::LayoutJob::single_section(right, egui::TextFormat { font_id: FontId::monospace(9.5), color: ink, ..Default::default() });
-            job.wrap = egui::text::TextWrapping { max_width: (w - 12.0).max(10.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
-            job
-        });
-        p.galley(cellr.left_top() + vec2(5.0, 14.0), g, ink);
+    for (c, r) in cells.iter().zip(&lay) {
+        let cellr = Rect::from_min_size(rect.left_top() + r.min.to_vec2(), vec2(r.width() - STRIP_GAP, r.height() - STRIP_GAP));
+        p.rect_filled(cellr, 3.0, if c.on { theme::ACCENT_BG } else { theme::PANEL_2 });
+        let ink = if c.on { theme::ACCENT_INK } else if c.spent.is_some() { theme::INK_DIM } else { theme::INK_FAINT };
+        p.text(cellr.left_top() + vec2(STRIP_INSET / 2.0, 2.0), Align2::LEFT_TOP, c.label, FontId::proportional(STRIP_LABEL), ink);
+        p.text(cellr.left_top() + vec2(STRIP_INSET / 2.0, 14.0), Align2::LEFT_TOP, &c.line, FontId::monospace(STRIP_COUNT), ink);
     }
     // the last check's ratios, a pixel column per block
     if !ratios.is_empty() {
@@ -436,23 +538,25 @@ pub fn demo(stage: &str) -> Option<(RefitView, Vec<f32>)> {
     match stage {
         "gather" => {
             live.stage = LiveStage::Gather;
-            (live.done, live.total, live.stage_s) = (1536, n, 0.3);
+            (live.done, live.total, live.stage_s, live.q) = (1536, n, 0.3, 0);
             spent[0] = 0.1;
         }
         "mix" => {
             live.stage = LiveStage::Solve;
             live.mix = true;
-            (live.round, live.decompositions, live.q, live.decomposition_s, live.since_decomposition_s, live.stage_s) = (4, 131, 1230, 0.24, 0.1, 31.0);
+            (live.round, live.decompositions, live.matrix_decompositions, live.q, live.decomposition_s, live.since_decomposition_s, live.stage_s) = (4, 131, 131, 1230, 0.24, 0.1, 31.0);
             spent[0] = 0.1;
             spent[MIX_SLOT] = 31.5;
         }
         "solve" => {
             live.stage = LiveStage::Solve;
-            (live.round, live.decompositions, live.decomposition_s, live.since_decomposition_s, live.stage_s) = (3, 5, 0.64, 0.4, 3.2);
+            (live.round, live.decompositions, live.matrix_decompositions, live.decomposition_s, live.since_decomposition_s, live.stage_s) = (3, 5, 5, 0.64, 0.4, 3.2);
             spent = [0.1, 0.6, 3.2, 0.0, 1.1, 53.2];
         }
         "check" | "trust" => {
             live.stage = LiveStage::Check;
+            // the measured refit's two searches on Q′ 4,140: 26 decompositions, the last search 5 rounds
+            (live.round, live.decompositions, live.matrix_decompositions, live.decomposition_s) = (5, 11, 26, 0.64);
             (live.done, live.total, live.stage_s) = (1700, n, 2.7);
             ratios = (0..n as usize).map(|k| if k < 1700 { ratio(k) } else { f32::NAN }).collect();
             live.beyond = ratios.iter().filter(|r| **r > 1.0).count() as u32;
@@ -560,9 +664,46 @@ mod tests {
         let rows = stage_rows(&demo("mix").unwrap().0.live);
         assert_eq!(rows[1].4, "solving · round 4 · 131 decompositions of 1,230 × 1,230 · 0.24 s each");
         // the strip's short counters
-        assert_eq!(short_counter(&demo("mix").unwrap().0.live, false), "r4 · 131");
-        assert_eq!(short_counter(&demo("check").unwrap().0.live, false), "1,700/2,655");
-        assert_eq!(short_counter(&demo("trust").unwrap().0.live, true), "r2/5 · 41 out");
+        assert_eq!(short_counter(&demo("mix").unwrap().0.live, false), "r4·131");
+        assert_eq!(short_counter(&demo("check").unwrap().0.live, false), "1.7k/2.7k");
+        assert_eq!(short_counter(&demo("trust").unwrap().0.live, true), "r2/5");
         assert_eq!(short_counter(&demo("check").unwrap().0.live, true), "");
+        assert_eq!([compact_count(950), compact_count(1700), compact_count(2655), compact_count(9949), compact_count(9950), compact_count(27_000), compact_count(1_234_567)], ["950", "1.7k", "2.7k", "9.9k", "10k", "27k", "1.2M"]);
+        // the matrix panel: its grid holds the count and the next, and says the real state
+        assert_eq!([matrix_grid(0), matrix_grid(15), matrix_grid(16), matrix_grid(26), matrix_grid(221), matrix_grid(900)], [4, 4, 6, 6, 16, 24]);
+        let solve = demo("solve").unwrap().0.live;
+        assert_eq!(matrix_words(&solve), "round 3 · 5 decompositions");
+        let check = demo("check").unwrap().0.live;
+        assert_eq!(matrix_words(&check), "26 decompositions · solved in 0:17");
+        assert_eq!(matrix_words(&demo("mix").unwrap().0.live), "round 4 · 131 decompositions");
+        assert_eq!(matrix_words(&RefitLive::default()), "");
+        // a row's spare width shared out; a cell that does not fit starts the next row
+        let lay = strip_layout(&[40.0, 60.0, 50.0], 120.0);
+        assert_eq!((lay[0].width(), lay[1].width(), lay[1].left(), lay[2].top(), lay[2].width()), (50.0, 70.0, 50.0, STRIP_ROW, 120.0));
+    }
+
+    /// The strip's text fits its cells, uncut, at the default dock width of the Activity card and
+    /// at narrow ones, for every stage (the coordinator's "Check 1,70…" and "Trust r2/5…"): one row
+    /// at the default width, two at most when narrow.
+    #[test]
+    fn the_strip_cells_fit_their_text() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let text_w = |t: &str, f: FontId| ctx.fonts_mut(|fonts| fonts.layout_no_wrap(t.to_string(), f, Color32::WHITE).size().x);
+        // the Activity card's strip in the default layout (1400 × 900) is 268 pt wide
+        for (width, rows_max) in [(268.0, 1), (200.0, 2), (150.0, 2)] {
+            for stage in ["gather", "mix", "solve", "check", "trust"] {
+                let cells = strip_cells(&demo(stage).unwrap().0.live);
+                let needs: Vec<f32> = cells.iter().map(|c| strip_need(c, &text_w)).collect();
+                let lay = strip_layout(&needs, width);
+                for (c, r) in cells.iter().zip(&lay) {
+                    let room = r.width() - STRIP_GAP - STRIP_INSET;
+                    let (lw, cw) = (text_w(c.label, FontId::proportional(STRIP_LABEL)), text_w(&c.line, FontId::monospace(STRIP_COUNT)));
+                    assert!(lw <= room && cw <= room && r.right() <= width + 0.01, "{stage} at {width} pt: {:?} {lw:.1} / {:?} {cw:.1} in {room:.1} ({r:?})", c.label, c.line);
+                }
+                let rows = (lay.iter().map(|r| r.bottom()).fold(0.0, f32::max) / STRIP_ROW).round() as usize;
+                assert!(rows <= rows_max, "{stage} at {width} pt: {rows} rows");
+            }
+        }
     }
 }

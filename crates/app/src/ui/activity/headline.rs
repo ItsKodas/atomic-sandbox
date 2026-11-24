@@ -143,7 +143,9 @@ pub fn headline(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Optio
     } else if let Some(r) = p.refit {
         // a refit of milliseconds says nothing more; a longer one its stage and that stage's time
         // left (the refit picture's counters, `sim::refit_live`), the bar the stage's share
-        let now = if r.elapsed_s < 0.3 { String::new() } else { format!(" · {}", super::words::refit_now_words(&r)) };
+        // while the refit picture fills the view (no model yet) the chip names the refit only: the
+        // picture carries the stage
+        let now = if r.elapsed_s < 0.3 || crate::ui::refit_picture::in_view(input) { String::new() } else { format!(" · {}", super::words::refit_now_words(&r)) };
         let bar = r.live.stage_fraction().map_or(BarMode::Sweep, |f| BarMode::Fraction(f as f32));
         Some((format!("Refitting · {} samples{now}", super::words::thousands(r.samples as u64)), bar))
     } else if p.main.running {
