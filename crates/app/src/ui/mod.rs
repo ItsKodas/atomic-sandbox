@@ -799,7 +799,7 @@ pub struct UiState {
     /// `machine.settings`.
     pub refit_cadence: crate::worker::RefitCadence,
     /// Model tab ▸ Model basis (`Action::ModelBasis`, `Command::SetModelBasis`; chemical-channels plan
-    /// Task 3): per session, Species by default until the channel basis is gated (plan Task 7).
+    /// Task 3): per session, `sim::ModelBasis::default()` — Channels at K = 3 since plan Task 7.
     pub model_basis: sim::ModelBasis,
     /// The toolbar's ⚠ Model only (user request 2026-11-12; `Action::ModelOnly`): on, it holds the
     /// draft mode and audit cadence it replaced (draft on, audits 0 while it lasts), restored

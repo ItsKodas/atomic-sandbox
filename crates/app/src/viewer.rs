@@ -738,7 +738,9 @@ impl Viewer {
             if let Some(d) = &self.collections_dir {
                 teach.push(Command::Collections(Some(d.clone())));
             }
-            // Model tab ▸ Model basis, before the attach so the first one is that basis's collection
+            // Model tab ▸ Model basis, before the attach so the first one is that basis's collection;
+            // a new worker starts at `sim::ModelBasis::default()` (Channels K = 3 since plan Task 7),
+            // so sending only the other choice (Species) carries either one over
             if self.ui.model_basis != sim::ModelBasis::default() {
                 teach.push(Command::SetModelBasis(self.ui.model_basis));
             }

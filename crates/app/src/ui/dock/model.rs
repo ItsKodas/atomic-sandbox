@@ -1261,11 +1261,12 @@ fn refit_banner_row(ui: &mut Ui, m: &ModelStatus, sampling: bool, refit: Option<
 /// Model tab ▸ Model basis (chemical-channels plan Task 3): the basis of the shared collection,
 /// Species or K learnt chemical channels — each choice its own collection (`Action::ModelBasis`).
 /// Offered with the shared collection in use; not while a pass runs (the switch re-attaches).
+/// Channels is the default (plan Task 7) and listed first; Species stays a choice.
 fn model_basis_row(ui: &mut Ui, st: &UiState, sampling: bool, acts: &mut Vec<Action>) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("Model basis").size(11.5).color(theme::INK_DIM));
         let mut pick = st.model_basis;
-        let choices = [sim::ModelBasis::Species, sim::ModelBasis::Channels(sim::ModelBasis::CHANNELS_K)];
+        let choices = [sim::ModelBasis::Channels(sim::ModelBasis::CHANNELS_K), sim::ModelBasis::Species];
         let r = ui.add_enabled_ui(!sampling, |ui| {
             egui::ComboBox::from_id_salt("model-basis").selected_text(pick.label()).show_ui(ui, |ui| {
                 for c in choices {
@@ -1280,7 +1281,7 @@ fn model_basis_row(ui: &mut Ui, st: &UiState, sampling: bool, acts: &mut Vec<Act
     });
 }
 
-const MODEL_BASIS_TIP: &str = "how the model describes three- and four-atom environments. Species: one block per combination of neighbour elements (the cost grows quickly with each element). Channels: the neighbours are mixed into a few learnt chemical channels (learnt only from this collection's own DFT samples), so the cost grows gently with the elements. Each choice is its own shared collection, starting empty: switching never mixes or moves samples, and the other collection stays on disk. A channel collection forms a model once its channel mix is learnt";
+const MODEL_BASIS_TIP: &str = "how the model describes three- and four-atom environments. Species: one block per combination of neighbour elements (the cost grows quickly with each element). Channels: the neighbours are mixed into a few learnt chemical channels (learnt only from this collection's own DFT samples), so the cost grows gently with the elements (the default). Each choice is its own shared collection, starting empty: switching never mixes or moves samples, and the other collection stays on disk. Until an element has enough three- and four-atom samples to earn its own channel, an atom with two or more neighbours that include it goes to DFT (and its sample is kept)";
 
 /// Model tab ▸ Refit (user 2026-11-22): how soon an automatic refit may follow the last one
 /// (`worker::RefitCadence`, `Action::RefitCadence`); Refit now is never held.

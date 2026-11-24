@@ -1346,6 +1346,44 @@ review: 0 Critical, 0 Important, 8 Minor, all fixed. The app gate passes 795 tes
 - **The view's Solve Bonds** became two joined icon buttons (a new Bonds icon, the Orbitals icon): Solve bonds, and Solve orbitals (`Action::SolveOrbitals`: a display refresh on the background teacher, under Model only too), each ready / busy (spinner) / done-or-held, with an Orbitals progress card. Three layout slips on the way (a misplaced shadow, a swapped pair, the pair pulled out of the corner), caught by the user; the last fix was checked in a rendered frame before handing over.
 - **Still open:** the "Computing orbitals…" label under Model only can sit with no job running (no Harris job eligible); Solve orbitals is the way round it for now.
 
+### Chemical channels: refits that stay fast as elements are added (2026-11-22 to 2026-11-25, plan `2026-11-22-chemical-channels.md`, Tasks 0–7)
+
+- **Found by:** the user. Once sulfur and chlorine joined their collection, a cold refit took 1 869 s (Q′ 6 656 at 4 elements, 14 670 at 5), and the memory, Q′² × 8 B per copy, would run out at 7–8 elements. The user: "This model problem is now the most important thing".
+- **Design (Nov 22, 22:12–23:16):**
+  - a literature note on tensor-reduced ACE;
+  - rule 1's signed-off exception: each element's learnt channel weights, from our own DFT only;
+  - the spec and an 8-task plan with a day-1 go / no-go gate;
+  - a physics review that changed it: per-key trust floors (C2), the W recipe (I2), K chosen by held-out RMSE (I3), the new-element lifecycle (I5), and an extended gate (I7).
+- **Task 0 (Nov 23 00:29):** the old-collection migration and the legacy formats were deleted. No compatibility, by the user's ruling.
+- **Tasks 1–2 (Nov 23 23:17 to Nov 24 00:31):**
+  - the channel descriptors for bodies 3 and 4, and the W learn with its covariance;
+  - the day-1 gate on a copy of the user's 5-element collection: **GO at K = 3 and 4**.
+  - At K = 3 the force RMSE ratio was 0.902, the energy ratio 0.913, and the fit wall 12 s against 1 129 s (Q′ 4 140 against 14 670). Held-out RMSE chose K = 3.
+  - W came out species-diagonal, with zero rows for Li and Cl, which occur only in diatomics.
+- **Tasks 3–4 (Nov 24 01:56–02:09):**
+  - the channel-aware hot path and variance support;
+  - channel collections in their own `_ch<K>` folders, `channels.txt` and sidecar v11;
+  - the Model basis switch, still defaulting to Species.
+- **Physics review 2 replaced Task 5.** With η = 242–6 030 ≫ 1, the first-order W variance was invalid, so the design changed to **refuse rather than widen**:
+  - a per-species "represented" flag;
+  - rule 3b: an atom with ≥ 2 neighbours and an unrepresented one among them goes to DFT;
+  - unrepresented samples kept out of the channel fit.
+- **Tasks 5–6 landed together (Nov 24 04:19):** with the W lifecycle and the C2 floors. Review 3's fixes came at 04:43: a learnt W is committed only with its fit, and an unchanged relearn keeps its evidence.
+- **T7, the gate through the full decision list (passed Nov 25 00:35):** one real provider per model, `would_answer` on 559 held-out geometries.
+  - The species and K = 3 models answer the same 453 geometries, with 0 admitted-but-wrong atoms each.
+  - z ratio 1.002.
+  - The provider's whole learn-and-fit took **54–57 s against 3 334 s** for the species refit, which peaked at 36 GB private on the 32 GB machine.
+  - With S thinned to 5 %, S has no W row (K_eff = 2), and **rule 3b refused all 60 held-out H₂S scenes (180 atoms)**. With S at 20 %, 0 wrong atoms were admitted. The coordinator ruled the species S 20 % fit unnecessary: 0 cannot be beaten, and it would have taken ~50 min and paged the PC.
+- **A failure on the way:** the collection copy in the session scratchpad was deleted in the middle of the T7 run, after the species S 5 % model. The two thinned channel probes were rerun on a fresh copy. It reproduced the load line (2 708 stored, 2 655 fitted) and the split (2 096 / 559).
+- **Task 7 (Nov 25):**
+  - **Channels K = 3 became the default** for new collections (`sim::ModelBasis::default()`).
+  - Species stays a Model-tab choice. The user's species collections are untouched: not migrated, not deleted.
+- **What it does not show yet:**
+  - The test collection has no many-body environment with three distinct species. So it shows the channels **dropping** species that have no many-body data, not several elements **sharing** a channel.
+  - The HOCl-type case, where only 3b refuses, is pinned only by a synthetic test.
+  - Review items M7 (no cancel in the W learn), M8 (the C2 shadow count's cost per refit; not timed separately, it sits inside the 54–57 s) and M9 (a purged species' mix row) stay open.
+- **Gates (Task 7):** see the plan's Task 7 for the app, providers and validate surrogate runs.
+
 ### Process wins
 
 - An input-replay harness (M6 Task 8) that found a real app bug on its first scripts: a running relax

@@ -1653,7 +1653,8 @@ fn the_model_tab_says_where_the_model_learns() {
 
 /// Chemical-channels plan Task 3: Model tab ▸ Model basis is an action — the UiState choice and the
 /// worker's `SetModelBasis` (each basis its own collection) — with the script word
-/// `model-basis species|channels <K>`, read back; Species is the default; the row is drawn in the
+/// `model-basis species|channels <K>`, read back; Channels (K = 3) is the default (plan Task 7) and
+/// Species stays a choice; the row is drawn in the
 /// Model file fold with the shared collection in use, sending nothing by itself.
 #[test]
 fn the_model_basis_switch_sends_its_command_and_has_a_script_word() {
@@ -1674,7 +1675,14 @@ fn the_model_basis_switch_sends_its_command_and_has_a_script_word() {
     let snap = snapshot(&scene, Backend::Estimated, Some(m));
     let inp = input(&scene, Some(&snap), &cam);
     let mut st = UiState::new("h2", &scene);
-    assert_eq!(st.model_basis, sim::ModelBasis::Species, "the default until plan Task 7");
+    // Channels at K = 3 is the default since plan Task 7 (the gate through the decision list passed
+    // 2026-11-25, `validate/references.md` "T7: through the decision list"); Species stays a choice
+    assert_eq!(st.model_basis, sim::ModelBasis::Channels(sim::ModelBasis::CHANNELS_K), "the default since plan Task 7");
+    assert_eq!(sim::ModelBasis::default(), sim::ModelBasis::Channels(3));
+    let mut out = PanelOutput::default();
+    apply(&mut st, &inp, Action::ModelBasis(sim::ModelBasis::Species), &mut out);
+    assert_eq!(st.model_basis, sim::ModelBasis::Species);
+    assert!(matches!(out.commands.as_slice(), [Command::SetModelBasis(sim::ModelBasis::Species)]), "{:?}", out.commands);
     let mut out = PanelOutput::default();
     apply(&mut st, &inp, Action::ModelBasis(sim::ModelBasis::Channels(3)), &mut out);
     assert_eq!(st.model_basis, sim::ModelBasis::Channels(3));

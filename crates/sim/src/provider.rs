@@ -1759,11 +1759,20 @@ pub enum ModelSource {
 /// The model basis a shared collection is fitted with (plain data of `surrogate::BasisKind`;
 /// chemical-channels plan Task 3): bodies 3 and 4 per neighbour species, or on K learnt chemical
 /// channels. Each is its own collection ([`Trainable::set_model_basis`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ModelBasis {
-    #[default]
     Species,
     Channels(usize),
+}
+
+/// Channels at [`ModelBasis::CHANNELS_K`] for new collections (chemical-channels plan Task 7: the
+/// gate through the decision list passed 2026-11-25, `validate/references.md` "T7: through the
+/// decision list"). A species collection is not migrated or deleted; it is simply not the default
+/// any more and stays one Model-tab choice away.
+impl Default for ModelBasis {
+    fn default() -> Self {
+        ModelBasis::Channels(ModelBasis::CHANNELS_K)
+    }
 }
 
 impl ModelBasis {

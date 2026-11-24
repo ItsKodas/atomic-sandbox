@@ -164,6 +164,7 @@ The spec's section "Physics review, 2026-11-22: binding changes" (C1, C2, I1–I
 
 ### Task 7: preview, suites, merge (day 3)
 
+- [x] **Step 0 (2026-11-25, after the T7 PASS):** Channels K = 3 is the default for new collections. `sim::ModelBasis::default()` is `Channels(CHANNELS_K)`; the UI state, the worker and the viewer's re-send of a non-default choice all follow it. The Model tab lists Channels first and keeps Species. The UI test pins the new default and its reason. Replays, screenshots and `Scene::preset` paths run without a collections folder, so the default does not reach them. The provider's own `collection_basis` still starts at Species for the providers and validate tests. No old collection is migrated or deleted.
 - [ ] **Step 1:** preview build: a fresh channel collection, plus a copy of the user's real collection opened as a channel collection for the comparison.
 - [ ] **Step 2:** `validate --test surrogate` (the key trust tests; the stuck-escape failure is pre-existing); the full app and full providers runs.
 - [ ] **Step 3:** README, DEVLOG and dev-reference updated; merge; push.
