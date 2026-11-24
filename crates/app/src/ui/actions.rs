@@ -169,8 +169,8 @@ pub enum Action {
     RefitCadence(crate::worker::RefitCadence),
     /// Model tab ▸ Model basis (chemical-channels plan Task 3): the basis of the shared collection —
     /// Species, or K learnt chemical channels — each choice its own collection
-    /// (`Command::SetModelBasis`, `Trainable::set_model_basis`). Species stays the default until the
-    /// channel basis is gated (plan Task 7). Script word `model-basis species|channels <K>`.
+    /// (`Command::SetModelBasis`, `Trainable::set_model_basis`). Channels at K = 3 is the default
+    /// since the gate passed (plan Task 7). Script word `model-basis species|channels <K>`.
     ModelBasis(sim::ModelBasis),
     /// The forgotten list's "Purge forgotten (N)…" › **Purge** (after the inline confirmation):
     /// every forgotten sample deleted for good (`Command::PurgeForgotten`), with the count the user

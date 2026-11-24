@@ -804,7 +804,8 @@ impl Worker {
             // "Refits"): a large collection's took minutes on this thread
             t.set_fits_in_background(true);
             // the Model tab's basis picks which collection of the surface (`Command::SetModelBasis`)
-            // (a provider without bases — the tests' fakes — has only the species one)
+            // (a provider without bases — the tests' fakes — has only the species one; with the
+            // Channels default it refuses here, as its attach would have anyway)
             let species = self.model_basis == sim::ModelBasis::Species;
             let basis = t.set_model_basis(self.model_basis).or_else(|e| if species { Ok(()) } else { Err(e) });
             match basis.and_then(|()| t.attach_collection(&root, &scene)) {
