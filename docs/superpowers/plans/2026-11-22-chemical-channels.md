@@ -138,13 +138,19 @@ The spec's section "Physics review, 2026-11-22: binding changes" (C1, C2, I1–I
 
 **Physics review of Tasks 5–6 (2026-11-24, "land after fixes"; `scratchpad/task56-review.md` of the session):** fixed I1 (a learnt W is staged and committed only with its first successful fit; a background copy's W is taken only when its refit succeeded and its model is fitted on it; rule 3b refuses every many-body atom while the standing model's channels are not the committed mix's), I2 (a relearn that reproduces the same species, K, W bits and represented flags updates only the counts: no class-memory reset, no `history_from` move), M1 (the reader refuses a represented row with ρ > 0.01 or NaN), M2 (`set_collection_mix` sets `history_from`), M3 (attach moves `model_gen` past `history_from`), M4 (one reach for rule 3b, the exclusion and the census), M5 (relative QR pivot test), M6 (a failed learn is retried only when the N_W set changes or a count doubles). Left: M7 (no cancel token in `learn_mix`), M8 (the C2 shadow count describes every fitted sample in the species basis at each fit: measure in Task 7, or count structurally), M9 (a mix row for a purged species is refused rather than dropped; dropping it would let `with_channels` replace K > S by the identity silently, so it needs care).
 
-- [ ] **Blocker — review I3 / T7:** the gate rerun through the full decision list (below) must pass before the Channels default, any README or release mention of the channel basis, and the merge that closes this plan (Task 7).
-  - 2026-11-25, partly run (`providers` `surrogate::tests::channels_decisions`; `references.md` "T7: through the decision list"):
-    - On the day-1 split, the channel model (K = 3, W learnt through the provider with the N_W mask: 54–57 s end to end, against 3 334 s for the species refit) and the species model answer the same 453 of 559 geometries, with **0 admitted-but-wrong atoms each**. There are 0 admitted many-body atoms with an unrepresented neighbour, and the z ratio is 1.002.
-    - Nothing failed, but the test is not discriminating: the held-out set has no many-body atom with an unrepresented neighbour, so 3b is never exercised, and both models refuse every S atom.
-    - Still due before ticking: the S-thinned channel probes (`T7_MODELS=k3_t5,k3_t20,species_t20`). The collection copy was deleted mid-run; a rerun needs a copy that reproduces the day-1 data.
+- [x] **Blocker — review I3 / T7:** the gate rerun through the full decision list (below) must pass before the Channels default, any README or release mention of the channel basis, and the merge that closes this plan (Task 7).
+  - **PASS, 2026-11-25** (`providers` `surrogate::tests::channels_decisions`; `references.md` "T7: through the decision list").
+  - Full split: K = 3 and species answer the same 453 of 559 geometries, with 0 admitted-but-wrong atoms each.
+    - W is learnt through the provider with the N_W mask: 54–57 s end to end, against 3 334 s for the species refit.
+    - The z ratio is 1.002.
+  - S at 5 %:
+    - S fails N_W, so K_eff = 2.
+    - **Rule 3b refuses all 60 held-out H₂S scenes (180 atoms).** No admitted atom has an unrepresented neighbour.
+    - The channel model admits 0 wrong atoms, against the species model's 0.
+  - S at 20 %: the channel model admits 0 wrong atoms. Per the coordinator's ruling the species fit is not run (36 GB, ~50 min), since 0 cannot be beaten.
+  - Not shown: an unrepresented neighbour the envelope cannot also see (HOCl-type). That case is pinned only by the synthetic `channels_life` test.
 
-**Not done here:** the gate rerun through the full decision list (review T7: admitted-but-wrong ≤ the species model's, no admitted many-body atom with an unrepresented neighbour, z within 1 + 1/√(2n)) — see the Task 5–6 report. K is the collection key's; review I3's choice of K stays the gate's.
+**Not done here:** the gate rerun through the full decision list (review T7: admitted-but-wrong ≤ the species model's, no admitted many-body atom with an unrepresented neighbour, z within 1 + 1/√(2n)) — see the Task 5–6 report (run 2026-11-25: the blocker above). K is the collection key's; review I3's choice of K stays the gate's.
 
 ### Task 6: trust floors, new-species handling, sampling (day 2)
 

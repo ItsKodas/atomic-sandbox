@@ -6642,7 +6642,7 @@ Choosing K by held-out RMSE (review I3) picks **K = 3** on this collection. The 
 
 T7 below measures the admitted-but-wrong count, the per-key results, the trust outcome on the held-out geometries (not at the `refit_golden` probes) and the relearn through the provider.
 
-### T7: through the decision list (2026-11-25; plan Task 5–6 blocker, review I3/T7; `providers` `surrogate::tests::channels_decisions`, `#[ignore]`d measurement; release, 12 fit threads, BelowNormal) — **no admitted-but-wrong atom in either model; inconclusive on 3b; S-thinned channel probes not run**
+### T7: through the decision list (2026-11-25; plan Task 5–6 blocker, review I3/T7; `providers` `surrogate::tests::channels_decisions`, `#[ignore]`d measurement; release, 12 fit threads, BelowNormal) — **PASS: no admitted-but-wrong atom in any model; rule 3b exercised at S 5 % (60 H₂S scenes, 180 atoms refused, none admitted)**
 
 `COLLECTION_DIR=<copy> [T7_MODELS=k3,species,k3_t5,species_t5,k3_t20,species_t20] cargo test -p providers --release --lib channels_decisions -- --ignored --nocapture --test-threads 1`
 
@@ -6678,15 +6678,36 @@ T7 below measures the admitted-but-wrong count, the per-key results, the trust o
 | species | 3 334 s | 53 s | 14 670 | 453 (81.0 %) | 988 (76.1 %) | 0 | 0 | 453 / 0 | 0 | 0.886 / 0.672 |
 | channels K = 3 | **54–57 s** in two runs (137 s in a third, right after a species fit and beside another session's build), W learn included | 2–4 s | 4 140 | 453 (81.0 %) | 988 (76.1 %) | 0 | 0 | 453 / 0 | 0 (no held-out atom has one) | 0.888 / 0.700 |
 | species, S 5 % | 3 020 s | 23 s | 14 670 | 453 (81.0 %) | 988 (76.1 %) | 0 | 0 | 453 / 0 | 0 | 0.842 / 0.637 |
-| channels K = 3, S 5 % / S 20 %; species, S 20 % | not run: the collection copy was deleted from the session scratchpad mid-run (a cleanup outside this run), after `species_t5` | | | | | | | | | |
+| channels K = 3, S 5 % | 85 s (K_eff = 2: S fails N_W, 10 of 32) | 0.3 s | 1 230 | 224 (40.1 %) | 529 (40.7 %) | 0 | 0 | 224 / 0 | **0 (of 120 such atoms, all refused by 3b)** | 0.698 / 0.610 |
+| channels K = 3, S 20 % | 56 s (S represented: N_W 39 of 32) | 2 s | 4 140 | 451 (80.7 %) | 982 (75.6 %) | 0 | 0 | 451 / 0 | 0 (no held-out atom has one) | 0.851 / 0.665 |
+| species, S 20 % | not run, by the coordinator's ruling (below) | | | | | | | | | |
 
-Refusals (the first rule; samples): species and K = 3 alike: 4b many-body 60, 5c spread 23, 5e grade 20, 4b pair 3. Species at S 5 %: 5e unspanned 36, 5e grade 37, 5c 23, 4b many-body 7, 4b pair 3.
+The two S-thinned channel probes ran on a fresh copy of the same collection. The first copy was deleted from the session scratchpad mid-run, after `species_t5`. The fresh copy reproduces the load line "2708 stored, 2655 fitted, held by code {1: 47, 2: 5, 7: 1}" and the split "train 2096 / held out 559".
+
+**Ruling (coordinator, 2026-11-25): `species_t20` is not run.**
+- The channel model at S 20 % admits 0 wrong atoms, and the species model cannot admit fewer than 0.
+- So the criterion (channel ≤ species) is decided without the species fit. That fit costs ~50 min and the 36 GB peak below, and it pages the user's PC.
+- It is to be run only if a channel probe admits a wrong atom.
+
+Refusals (the first rule; samples):
+- species and K = 3 alike: 4b many-body 60, 5c spread 23, 5e grade 20, 4b pair 3;
+- species at S 5 %: 5e unspanned 36, 5e grade 37, 5c 23, 4b many-body 7, 4b pair 3;
+- K = 3 at S 5 %: **3b (unrepresented S) 60**, 4b pair 231, 5e grade 23, 5c 19, 5e unspanned 2;
+- K = 3 at S 20 %: 4b many-body 60, 5e grade 22, 5c 23, 4b pair 3.
+
+**K = 3 at S 5 % in detail** (the probe that exercises rule 3b):
+- The census finds S short of N_W: `H{H,S}`'s best key has 10 of 32 samples in the low-order fit. The learnt W is the identity on H and O (K_eff = 2), with zero rows for Li, S and Cl.
+- Every H₂S training sample is `Q_UNREP` (held by code 11: 10), out of the channel fit.
+- Rule 3b refuses all **60 held-out H₂S scenes (180 atoms)**. The 120 H atoms in them have an unrepresented S neighbour; 3b refuses every one of them, and none is admitted.
+- Separately, this fit took the recovery's degree cap 4 (Q′ 1 230). Its `pair H{H}` key is then refused by 4b (LOO force error 1.03× the bound), so the 228 H₂ held-out scenes go to the teacher. The answered fraction falls to 40 %, the conservative side.
 
 By element (atoms answered / held out; no model admitted a wrong atom):
 
 | | H | Li | O | S | Cl |
 |---|---|---|---|---|---|
-| every model | 718 / 923 | 106 / 106 | 164 / 207 | **0 / 60** | 0 / 3 |
+| species, K = 3, species S 5 % | 718 / 923 | 106 / 106 | 164 / 207 | **0 / 60** | 0 / 3 |
+| K = 3, S 5 % | 260 / 923 | 106 / 106 | 163 / 207 | **0 / 60** (3b) | 0 / 3 |
+| K = 3, S 20 % | 714 / 923 | 106 / 106 | 162 / 207 | **0 / 60** | 0 / 3 |
 
 By key, identical in both models on the full split:
 - answered: every `pair H{H}`, `H{Li}`, `Li{H}`, `Li{O}` and `O{Li}` atom; `pair H{O}`/`O{H}` 37 of 41 (5e); `many H{H,O}` 164 of 242 and `many O{H}` 82 of 121 (5c, 5e);
@@ -6702,12 +6723,19 @@ By key, identical in both models on the full split:
 - On the day-1 split, the channel model's admitted-but-wrong atoms are 0, against the species model's 0, overall and for every element (S, the probe element, and Cl, the rarest: no atom of either is admitted by either model).
 - There are 0 admitted atoms with an unrepresented many-body neighbour.
 - The z ratio is 1.002, within 1 ± 1/√(2n) = 1 ± 0.020.
-- So nothing fails. But the result is **not a discriminating test**:
-  - The held-out set holds **no** many-body atom with an unrepresented neighbour (Li and Cl occur only in diatomics). Rule 3b is never exercised.
-  - Both models refuse every S atom before any accuracy question arises.
-  - Both models answer exactly the same 453 geometries, all within the bound. On this collection the decision list's envelope and class rules (5c, 5e, 4b) decide, not the basis.
-- The probe that would exercise 3b and the new-element lifecycle is S at 5 % (S then fails N_W). It ran only for the species model, which refuses every S atom there too: 5e unspanned or grade, and the 10 of 74 sample floor. The channel side (`k3_t5`), and both sides at 20 %, did not run.
-- So the plan's T7 blocker is **left unticked**. A rerun of `T7_MODELS=k3_t5,k3_t20,species_t20` on a copy that reproduces the day-1 data needs one species fit (~50 min, the 36 GB peak below). The check that it does: "2708 stored, 2655 fitted, held by code {1: 47, 2: 5, 7: 1}" and "train 2096 / held out 559".
+- On the full split alone the result is not discriminating:
+  - The held-out set there holds no many-body atom with an unrepresented neighbour, because Li and Cl occur only in diatomics.
+  - Both models refuse every S atom.
+  - Both answer the same 453 geometries; the envelope and class rules (5c, 5e, 4b) decide, not the basis.
+- **The S-thinned probes:**
+  - At S 5 %, the channel model admits 0 wrong atoms, against the species model's 0.
+  - At S 20 %, the channel model admits 0, so it cannot exceed the species model, which is not run (ruling above).
+  - Rule 3b is **exercised** at S 5 %: 180 atoms in 60 scenes refused, and 0 admitted many-body atoms with an unrepresented neighbour.
+  - The species model at S 5 % refuses the same H₂S scenes by 5e and its 10 of 74 sample floor. So 3b is the channel model's guard where the species model's envelope and floors do the work.
+- **PASS** (T7 criteria: channel admitted-but-wrong ≤ species at every thinning; zero admitted many-body atoms with an unrepresented neighbour). The plan's T7 blocker is ticked.
+- **What it does not show:**
+  - No held-out geometry had an unrepresented neighbour the envelope could not also see (S at 5 % is unspanned for the species model as well).
+  - The HOCl-type case the spec designed 3b for, where 5d and 5e pass, is pinned only by the synthetic test `a_many_body_atom_with_an_unrepresented_neighbour_is_refused`.
 
 **Cost findings.**
 - **Refit wall:** the channel collection's whole first learn-and-fit takes 54–57 s through the provider, against the species collection's 3 334 s. That ratio is 0.016–0.017 with the W learn (0.041 at the slow 137 s), against the gate's ≤ 0.25. The species provider refit is ~3× the day-1 harness's bare fit (1 129 s): the trust passes (LOO, class LOO, the null space, the recovery) dominate at Q′ 14 670.
