@@ -990,11 +990,38 @@ fn frame_sized(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, size
         events,
         ..Default::default()
     };
-    let mut out = None;
-    let mut full = ctx.run_ui(raw, |root| out = Some(show(root, st, inp)));
+    // every pass's output, as the viewer takes them (a pass egui redoes — `request_discard`, e.g.
+    // a 3D-view overlay that changed size — keeps what the first one sent)
+    let mut out: Option<PanelOutput> = None;
+    let mut full = ctx.run_ui(raw, |root| {
+        let next = show(root, st, inp);
+        out = Some(match out.take() {
+            None => next,
+            Some(first) => merge_passes(first, next),
+        });
+    });
     // the window hands these to the painter; dropping them unapplied trips epaint's debug assertion
     full.textures_delta.clear();
     out.unwrap()
+}
+
+/// Two passes' outputs of one frame as one: the lists joined, the flags or'ed, the later pass's
+/// values where both set one.
+fn merge_passes(mut a: PanelOutput, b: PanelOutput) -> PanelOutput {
+    a.commands.extend(b.commands);
+    a.actions.extend(b.actions);
+    a.windows.extend(b.windows);
+    a.focus_selected |= b.focus_selected;
+    a.toggle_play |= b.toggle_play;
+    a.deselect |= b.deselect;
+    a.restart_for_update |= b.restart_for_update;
+    a.error = b.error.or(a.error);
+    a.view = b.view.or(a.view);
+    a.capture = b.capture.or(a.capture);
+    a.training = b.training.or(a.training);
+    a.switch_scene = b.switch_scene.or(a.switch_scene);
+    a.gpu_memory = b.gpu_memory.or(a.gpu_memory);
+    a
 }
 
 /// Every layout (wide and compact; each panel shown and every panel closed; every menu open; the
@@ -3036,11 +3063,30 @@ fn the_view_overlays_never_overlap_at_the_four_sizes() {
             for _ in 0..4 {
                 view = frame_sized(&ctx, &mut st, &inp, size, vec![]).view.expect("the 3D view");
             }
-            let rects: Vec<(&str, egui::Rect)> = IDS
-                .iter()
-                .filter(|id| ctx.memory(|m| m.areas().visible_last_frame(&egui::LayerId::new(egui::Order::Middle, egui::Id::new(**id))) || m.areas().visible_last_frame(&egui::LayerId::new(egui::Order::Foreground, egui::Id::new(**id)))))
-                .filter_map(|id| ctx.memory(|m| m.area_rect(egui::Id::new(*id))).map(|r| (*id, r)))
-                .collect();
+            let drawn = |ctx: &egui::Context| -> Vec<(&'static str, egui::Rect)> {
+                IDS.iter()
+                    .filter(|id| ctx.memory(|m| m.areas().visible_last_frame(&egui::LayerId::new(egui::Order::Middle, egui::Id::new(**id))) || m.areas().visible_last_frame(&egui::LayerId::new(egui::Order::Foreground, egui::Id::new(**id)))))
+                    .filter_map(|id| ctx.memory(|m| m.area_rect(egui::Id::new(*id))).map(|r| (*id, r)))
+                    .collect()
+            };
+            let rects = drawn(&ctx);
+            // settled: one more frame draws everything where it was
+            frame_sized(&ctx, &mut st, &inp, size, vec![]);
+            assert_eq!(drawn(&ctx), rects, "{name} {w}x{h}: the last two frames differ");
+            // review 2026-11-24: Pause ↔ Resume on the running pass moves no overlay
+            if training {
+                let mut paused = bonds_snapshot(&scene, Backend::Estimated, true);
+                paused.dynamics.sampling = snap.dynamics.sampling.clone().map(|p| sim::SamplingProgress { paused: true, ..p });
+                let mut pinp = input(&scene, Some(&paused), &cam);
+                pinp.density_label = inp.density_label.clone();
+                pinp.bonds_label = inp.bonds_label.clone();
+                for k in 0..4 {
+                    frame_sized(&ctx, &mut st, if k % 2 == 0 { &pinp } else { &inp }, size, vec![]);
+                    let now = drawn(&ctx);
+                    let moved: Vec<_> = now.iter().zip(&rects).filter(|(a, b)| a != b).collect();
+                    assert!(moved.is_empty(), "{name} {w}x{h}: paused {}: moved {moved:?}", k % 2 == 0);
+                }
+            }
             for (id, r) in &rects {
                 eprintln!("{name} {w}x{h} (view {:.0}x{:.0}): {id} {:.0}x{:.0}", view.width(), view.height(), r.width(), r.height());
             }
@@ -7671,8 +7717,14 @@ fn the_profile_keeps_the_layout() {
 /// One 1400 × 900 frame at input time `time` (s): the auto-hide timers run on egui's input time.
 fn frame_at(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, time: f64, events: Vec<egui::Event>) -> PanelOutput {
     let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), time: Some(time), events, ..Default::default() };
-    let mut out = None;
-    let mut full = ctx.run_ui(raw, |root| out = Some(show(root, st, inp)));
+    let mut out: Option<PanelOutput> = None;
+    let mut full = ctx.run_ui(raw, |root| {
+        let next = show(root, st, inp);
+        out = Some(match out.take() {
+            None => next,
+            Some(first) => merge_passes(first, next),
+        });
+    });
     full.textures_delta.clear();
     out.unwrap()
 }
@@ -9394,8 +9446,14 @@ mod triple_map {
         for _ in 0..3 {
             PROBES.with(|p| p.borrow_mut().clear());
             let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, TALL)), ..Default::default() };
-            let mut o = None;
-            let mut full = ctx.run_ui(raw, |root| o = Some(show(root, st, inp)));
+            let mut o: Option<PanelOutput> = None;
+            let mut full = ctx.run_ui(raw, |root| {
+                let next = show(root, st, inp);
+                o = Some(match o.take() {
+                    None => next,
+                    Some(first) => merge_passes(first, next),
+                });
+            });
             full.textures_delta.clear();
             out.clear();
             full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));

@@ -2748,13 +2748,20 @@ impl Viewer {
             let at = to_pos((vp.origin[0] + 0.5 * vp.size[0], vp.origin[1])) + egui::vec2(0.0, 58.0);
             // while a finished job's flash fades its outcome is named, in the solve log's word
             let last = self.ghost.flash(Instant::now()).map(|(f, _)| format!(" · last sample: {}", f.outcome.word())).unwrap_or_default();
-            let galley = painter.layout_no_wrap(format!("training is solving · {}{last}", crate::ghost::stage_line(g)), egui::FontId::proportional(11.5), egui::Color32::from_white_alpha(170));
+            let small = egui::FontId::proportional(11.5);
+            let galley = painter.layout_no_wrap(format!("training is solving · {}{last}", crate::ghost::stage_line(g)), small.clone(), egui::Color32::from_white_alpha(170));
             let main = painter.layout_no_wrap(crate::ghost::label(g), egui::FontId::proportional(14.5), egui::Color32::WHITE);
             let size = egui::vec2(galley.size().x.max(main.size().x), galley.size().y + main.size().y + 2.0);
             let mut rect = egui::Align2::CENTER_TOP.anchor_size(at, size).expand(6.0);
             if !lv.capture {
-                // its size for the next layout, and its place in this one (laid out once measured)
-                self.ui.zones.tag.set(Some(rect.size()));
+                // the zones lay it out at the width of its widest flash ("· last sample: not
+                // finite"), so a flash coming and going never moves it, or anything round it
+                let widest = crate::ghost::outcome_words()
+                    .into_iter()
+                    .map(|w| painter.layout_no_wrap(format!("training is solving · {} · last sample: {w}", crate::ghost::stage_line(g)), small.clone(), egui::Color32::WHITE).size().x)
+                    .fold(size.x, f32::max);
+                self.ui.zones.tag.set(Some(egui::vec2(widest, size.y) + egui::vec2(12.0, 12.0)));
+                // centred in its slot (this frame's layout: the tag's size is a frame late)
                 if let Some(p) = self.ui.zones.layout.get(ui::zones::Slot::CentreTag) {
                     rect = egui::Rect::from_min_size(egui::pos2(p.rect.center().x - rect.width() / 2.0, p.rect.top()), rect.size());
                 }

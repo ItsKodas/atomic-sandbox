@@ -34,8 +34,9 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
     // from what each overlay measured last frame
     let corner = corner(ctx, st, input);
     let label = layer_label(st, input, corner.as_ref());
+    remember_content(st, input, label.as_deref());
     let items = requests(st, input, corner.as_ref(), label.as_deref());
-    let lay = super::zones::layout(view, &items);
+    let lay = super::zones::layout_after(view, &items, Some(&st.zones.layout));
     st.zones.layout = lay.clone();
     let chip = status_chip(ctx, view, st, input, acts, &lay);
     st.zones.measured(Slot::Chip, lay.form(Slot::Chip), chip.size());
@@ -111,8 +112,34 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
             st.zones.measured(Slot::StaleLine, 0, r.size());
         }
     }
+    // an overlay that came up, changed form or grew this pass: redo the pass with its new size,
+    // so the frame shown never has it overlapping or off-centre (egui's second pass takes no input)
+    if st.zones.moved(&items, &lay) && !ctx.will_discard() {
+        ctx.request_discard("a 3D-view overlay changed size");
+    }
     // Q3 of Appendix B (draft mode's per-atom uncertainty tint) is the sphere colour itself:
     // `gfx::risk_tint` of `viewer::Viewer::atom_risk`.
+}
+
+/// Tells the zones what decides each overlay's form sizes now (`zones::Zones::content`) and which
+/// scene is up (`Zones::scene`: a new one forgets every size).
+fn remember_content(st: &mut UiState, input: &PanelInput<'_>, label: Option<&str>) {
+    use std::hash::{Hash, Hasher};
+    let key = |f: &dyn Fn(&mut std::collections::hash_map::DefaultHasher)| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        f(&mut h);
+        h.finish()
+    };
+    let scene = key(&|h| st.source.label().hash(h));
+    st.zones.scene(scene);
+    let notes = key(&|h| chip_notes(st, input).iter().for_each(|(_, n)| n.hash(h)));
+    let label_key = key(&|h| label.hash(h));
+    let legend = key(&|h| legend_of(st, input).map(|l| (l.text, l.warn)).hash(h));
+    let segment = key(&|h| st.segment_preview.as_ref().map(|s| s.scene.nuclei.len()).hash(h));
+    for (slot, k) in [(Slot::Chip, notes), (Slot::DensityLabel, label_key), (Slot::OrbitalLegend, legend), (Slot::Segment, segment)] {
+        let drawn = st.zones.layout.form(slot);
+        st.zones.content(slot, drawn, k);
+    }
 }
 
 /// The `Area` of an overlay at its place in the zones: pinned at its rect's corner by its zone's
@@ -142,7 +169,7 @@ fn requests(st: &UiState, input: &PanelInput<'_>, corner: Option<&Corner>, label
     }
     v.push(item(Slot::Capture, &[Vec2::ZERO]));
     if st.segment_preview.is_some() {
-        v.push(item(Slot::Segment, &[Vec2::ZERO, vec2(380.0, 40.0)]));
+        v.push(item(Slot::Segment, &[Vec2::ZERO, vec2(SEGMENT_ROW_W + CARD_FRAME_W, 40.0)]));
     }
     if input.model().and_then(|m| m.pass_offer.as_ref()).is_some() && !input.sampling() {
         v.push(item(Slot::Offer, &[Vec2::ZERO]));
@@ -174,10 +201,10 @@ fn requests(st: &UiState, input: &PanelInput<'_>, corner: Option<&Corner>, label
         v.push(item(Slot::KnowledgeLegend, &[Vec2::ZERO, vec2(f.x, f.y.min(84.0))]));
     }
     if input.snapshot.and_then(|s| s.dynamics.sampling.as_ref()).is_some() && input.sampling() {
-        v.push(item(Slot::Sampling, &[Vec2::ZERO, vec2(400.0, 40.0)]));
+        v.push(item(Slot::Sampling, &[Vec2::ZERO, vec2(SAMPLING_ROW_W + CARD_FRAME_W, 40.0)]));
     }
     if input.snapshot.and_then(|s| s.dynamics.relax.as_ref()).is_some_and(|r| r.converged.is_none()) {
-        v.push(item(Slot::Relax, &[Vec2::ZERO, vec2(330.0, 40.0)]));
+        v.push(item(Slot::Relax, &[Vec2::ZERO, vec2(RELAX_ROW_W + CARD_FRAME_W, 40.0)]));
     }
     if let Some(l) = label {
         let f = full(Slot::DensityLabel);
@@ -547,11 +574,13 @@ fn segment_card(ctx: &egui::Context, view: Rect, lay: &ViewLayout, st: &UiState,
         ui.add_space(4.0);
         theme::note(ui, SEGMENT_NOTE);
     };
-    let buttons = |ui: &mut Ui, acts: &mut Vec<Action>| {
+    let open = |ui: &mut Ui, acts: &mut Vec<Action>| {
         let open = egui::Button::new(RichText::new("Open the segment").strong().color(Color32::from_rgb(0x17, 0x11, 0x2a))).fill(theme::ACCENT);
         if super::probed("segment-open", ui.add(open)).on_hover_text("save this scene to a temp file and open the segment in the estimated solver, the Standard plan ready (press Start sampling to teach it); the chip by the scene chip brings you back").clicked() {
             acts.push(Action::OpenSegment);
         }
+    };
+    let cancel = |ui: &mut Ui, acts: &mut Vec<Action>| {
         if super::probed("segment-cancel", ui.button("Cancel")).on_hover_text("close the preview; nothing changes").clicked() {
             acts.push(Action::CancelSegment);
         }
@@ -560,20 +589,26 @@ fn segment_card(ctx: &egui::Context, view: Rect, lay: &ViewLayout, st: &UiState,
     let r = area("segment-card", Slot::Segment, lay).order(Order::Foreground).show(ctx, |ui| {
         theme::card().stroke(Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.6))).show(ui, |ui| {
             if compact {
-                ui.horizontal(|ui| {
-                    let title = ui.label(RichText::new("Train this segment").strong().size(14.0));
-                    let count = ui.label(RichText::new(format!("· {} atoms, {} trained", s.nuclei.len(), seg.n_interior())).color(theme::INK_DIM));
-                    title.union(count).on_hover_ui(|ui| {
+                ui.set_width(SEGMENT_ROW_W.min(view.width() - 40.0));
+                one_row(ui, |ui| {
+                    // right to left: Cancel at the end, Open before it
+                    cancel(ui, acts);
+                    open(ui, acts);
+                }, |ui| {
+                    let text = format!("Train this segment · {} atoms, {} trained", s.nuclei.len(), seg.n_interior());
+                    ui.add(egui::Label::new(RichText::new(text).strong()).truncate()).on_hover_ui(|ui| {
                         ui.set_max_width(400.0);
                         details(ui);
                     });
-                    buttons(ui, acts);
                 });
             } else {
                 ui.set_width(400.0f32.min(view.width() - 40.0));
                 ui.label(RichText::new("Train this segment").strong().size(14.0));
                 details(ui);
-                ui.horizontal(|ui| buttons(ui, acts));
+                ui.horizontal(|ui| {
+                    open(ui, acts);
+                    cancel(ui, acts);
+                });
             }
         });
     });
@@ -604,17 +639,21 @@ fn sampling_card(ctx: &egui::Context, view: Rect, lay: &ViewLayout, input: &Pane
     let r = area("sampling-card", Slot::Sampling, lay).show(ctx, |ui| {
         theme::card().show(ui, |ui| {
             if compact {
-                ui.horizontal(|ui| {
+                // one width whatever the stage, the counts or Pause ↔ Resume say (the text is cut
+                // with "…" past it): the zones never move for a digit
+                ui.set_width(SAMPLING_ROW_W.min(view.width() - 40.0));
+                one_row(ui, |ui| {
+                    if ui.button("Cancel").on_hover_text(CANCEL_PASS_TIP).clicked() {
+                        acts.push(Action::CancelSampling);
+                    }
+                    pause_button(ui, p.paused, "sampling-card", acts);
+                }, |ui| {
                     let stage = format!("{title} · {} {}/{}", crate::ui::activity::words::pass_stage(p), p.done, p.total);
-                    ui.label(RichText::new(stage).strong()).on_hover_ui(|ui| {
+                    ui.add(egui::Label::new(RichText::new(stage).strong()).truncate()).on_hover_ui(|ui| {
                         ui.set_max_width(420.0);
                         dock::progress(ui, p, input.model());
                         theme::note(ui, PASS_STAGES);
                     });
-                    pause_button(ui, p.paused, "sampling-card", acts);
-                    if ui.button("Cancel").on_hover_text(CANCEL_PASS_TIP).clicked() {
-                        acts.push(Action::CancelSampling);
-                    }
                 });
                 return;
             }
@@ -635,6 +674,28 @@ fn sampling_card(ctx: &egui::Context, view: Rect, lay: &ViewLayout, input: &Pane
     Some(r.response.rect)
 }
 
+/// The one-row cards' fixed widths (points, inside the frame; the frame adds 22): room for the
+/// common texts with their buttons ("Sampling pass · random nudges 8/60", Pause, Cancel — the
+/// width it measured, so the 560 × 360 view keeps it beside the corners); a longer one ("· paused ·
+/// teaching around #345 …") is cut with "…", its whole on hover. Fixed,
+/// so a digit, a stage word or Pause ↔ Resume never changes the card's size.
+const SAMPLING_ROW_W: f32 = 310.0;
+const RELAX_ROW_W: f32 = 280.0;
+const SEGMENT_ROW_W: f32 = 400.0;
+/// A card frame's horizontal margins and stroke (`theme::card`).
+const CARD_FRAME_W: f32 = 22.0;
+
+/// A one-row card's row: the buttons at its right end (`right`, added right to left), the text
+/// filling the rest from the left (`left`, cut to fit).
+fn one_row(ui: &mut Ui, right: impl FnOnce(&mut Ui), left: impl FnOnce(&mut Ui)) {
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            right(ui);
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), left);
+        });
+    });
+}
+
 /// The FIRE note under the relax card.
 const RELAX_NOTE: &str = "FIRE steps are not time: t and the step count stay put; the energy drained is booked as work done by tools.";
 
@@ -646,8 +707,13 @@ fn relax_card(ctx: &egui::Context, view: Rect, lay: &ViewLayout, input: &PanelIn
     let resp = area("relax-card", Slot::Relax, lay).show(ctx, |ui| {
         theme::card().show(ui, |ui| {
             if compact {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Relaxing (FIRE) · step {}", r.steps)).strong()).on_hover_ui(|ui| {
+                ui.set_width(RELAX_ROW_W.min(view.width() - 40.0));
+                one_row(ui, |ui| {
+                    if ui.button("Stop").on_hover_text(super::STOP_RELAX_TIP).clicked() {
+                        acts.push(Action::StopRelax);
+                    }
+                }, |ui| {
+                    ui.add(egui::Label::new(RichText::new(format!("Relaxing (FIRE) · step {}", r.steps)).strong()).truncate()).on_hover_ui(|ui| {
                         ui.set_max_width(460.0);
                         ui.label(super::RELAX_TIP);
                         for l in super::relax_lines(r) {
@@ -655,9 +721,6 @@ fn relax_card(ctx: &egui::Context, view: Rect, lay: &ViewLayout, input: &PanelIn
                         }
                         theme::note(ui, RELAX_NOTE);
                     });
-                    if ui.button("Stop").on_hover_text(super::STOP_RELAX_TIP).clicked() {
-                        acts.push(Action::StopRelax);
-                    }
                 });
                 return;
             }

@@ -1029,7 +1029,7 @@ fn wait_for_sampling(viewer: &mut Viewer, hl: &Headless, painter: &mut Painter, 
         // a slow first solve (a cold GPU, another job on it) turns the automatic pass into an
         // offer: press its "Start anyway", as the user would
         if let Some(plan) = viewer.snapshot.as_ref().and_then(|s| s.model.as_ref()).and_then(|m| m.pass_offer.as_ref()).map(|o| o.plan.clone()).filter(|_| !started) {
-            viewer.send(crate::worker::Command::Dyn(::sim::DynCommand::StartSampling(plan)));
+            viewer.apply(crate::ui::Action::StartOffered(plan));
             started = true;
         }
         let ev = viewer

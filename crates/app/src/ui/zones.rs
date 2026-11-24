@@ -34,8 +34,12 @@
 //! 4. once nothing overlaps, a bottom-centre card compacted in step 1 that moved up anyway gets its
 //!    full form back where the second row has room for it.
 //!
-//! The decision is a function of the sizes alone, so a zone's items move only when one appears,
-//! disappears or changes form (spec anti-goal: nothing jumps frame to frame).
+//! The decision is a function of the sizes and of last frame's decision: with the same overlays up,
+//! last frame's forms, row and tag band are kept while they still fit, and a lighter choice is
+//! taken only once it clears every gap by [`HYSTERESIS`] more ([`layout_after`]). So a size that
+//! wobbles at a threshold (a digit, a stage word, Pause ↔ Resume) flips nothing frame to frame
+//! (spec anti-goal); the one-row cards have fixed widths, and the ghost tag is measured at its
+//! widest flash, for the same reason.
 use egui::{pos2, Align2, Pos2, Rect, Vec2};
 use std::collections::HashMap;
 
@@ -202,11 +206,14 @@ pub struct ViewLayout {
     /// The top-left stack's width at most: up to the right column's items beside it (next frame's
     /// status chip and banner wrap inside it).
     pub top_left_room: f32,
+    /// Bottom-centre left the bottom row (step 2): kept, with the forms, for the next frame's
+    /// hysteresis ([`layout_after`]).
+    float: bool,
 }
 
 impl Default for ViewLayout {
     fn default() -> Self {
-        ViewLayout { view: Rect::NOTHING, placed: Vec::new(), crowded: false, top_left_room: 0.0 }
+        ViewLayout { view: Rect::NOTHING, placed: Vec::new(), crowded: false, top_left_room: 0.0, float: false }
     }
 }
 
@@ -242,6 +249,9 @@ impl ViewLayout {
 #[derive(Default)]
 pub struct Zones {
     sizes: HashMap<(Slot, usize), Vec2>,
+    /// What each overlay's sizes were measured for ([`Zones::content`]), and the scene's key.
+    keys: HashMap<Slot, u64>,
+    scene: u64,
     /// The layout drawn this frame (the viewer's ghost tag reads its slot).
     pub layout: ViewLayout,
     /// The ghost tag's size, set by the viewer as it draws it (after the chrome: a frame late).
@@ -254,15 +264,54 @@ impl Zones {
         self.sizes.insert((slot, form), size);
     }
 
-    /// The sizes of `slot`'s forms: as measured, else the guesses given (the full form's guess is
-    /// usually zero: it is measured on its first frame).
+    /// A new scene: every stored size is forgotten (each overlay is measured again on its next frame).
+    pub fn scene(&mut self, key: u64) {
+        if key != self.scene {
+            self.scene = key;
+            self.sizes.clear();
+            self.keys.clear();
+        }
+    }
+
+    /// `slot`'s content now (a hash of what decides its forms' sizes: its help lines, its label):
+    /// when it changed, the sizes of the forms not drawn last frame (`drawn`) are forgotten, so a
+    /// shrunk overlay is not kept compact with room to spare (its full form is tried again at the
+    /// drawn form's size and measured) — the drawn form is measured again as it draws.
+    pub fn content(&mut self, slot: Slot, drawn: usize, key: u64) {
+        if self.keys.insert(slot, key).is_some_and(|k| k != key) {
+            self.sizes.retain(|(s, f), _| *s != slot || *f == drawn);
+        }
+    }
+
+    /// The sizes of `slot`'s forms: as measured, else the guesses given. The full form, when not
+    /// measured, is guessed as the largest form that is (it holds at least as much) — else its
+    /// guess, usually zero: measured on its first frame.
     pub fn forms(&self, slot: Slot, guesses: &[Vec2]) -> Vec<Vec2> {
-        guesses.iter().enumerate().map(|(k, g)| self.sizes.get(&(slot, k)).copied().unwrap_or(*g)).collect()
+        let largest = (0..guesses.len()).filter_map(|k| self.size(slot, k)).reduce(|a, b| a.max(b));
+        guesses
+            .iter()
+            .enumerate()
+            .map(|(k, g)| self.size(slot, k).unwrap_or(if k == 0 { largest.unwrap_or(*g) } else { *g }))
+            .collect()
     }
 
     /// The last measured size of `slot` in `form`.
     pub fn size(&self, slot: Slot, form: usize) -> Option<Vec2> {
         self.sizes.get(&(slot, form)).copied()
+    }
+
+    /// Whether an overlay drawn this pass measured another size than the layout gave it (more than
+    /// a point): it appeared, changed form or its content grew — the pass is redone so the frame
+    /// shown is laid out with the new sizes (no overlap or off-centre draw for a frame). The tag,
+    /// measured by the viewer after the chrome, is left out.
+    pub fn moved(&self, items: &[Item], lay: &ViewLayout) -> bool {
+        items.iter().filter(|it| it.slot != Slot::CentreTag).any(|it| {
+            let form = lay.form(it.slot);
+            match (it.forms.get(form), self.size(it.slot, form)) {
+                (Some(used), Some(now)) => (*used - now).abs().max_elem() > 1.0,
+                _ => false,
+            }
+        })
     }
 }
 
@@ -270,35 +319,81 @@ fn takes_room(r: Rect) -> bool {
     r.width() > 0.5 && r.height() > 0.5
 }
 
-/// Two overlays closer than [`GAP`] (half a point of slack for rounding).
-fn near(a: Rect, b: Rect) -> bool {
-    let e = GAP / 2.0 - 0.5;
+/// Two overlays closer than `gap` ([`GAP`], or more deciding with a margin; half a point of
+/// slack for rounding).
+fn near(a: Rect, b: Rect, gap: f32) -> bool {
+    let e = gap / 2.0 - 0.5;
     a.expand(e).intersects(b.expand(e))
 }
 
-/// Lays the view's overlays out (see the module doc).
+/// How far (points) a layout must clear the gap before a decision made for a tighter fit is
+/// undone — the hysteresis that keeps a size wobbling at a threshold (a digit of "n/N", a
+/// stage word, Pause ↔ Resume) from flipping a form or a row each frame (spec anti-goal).
+pub const HYSTERESIS: f32 = 10.0;
+
+/// Lays the view's overlays out (see the module doc) with no history.
 pub fn layout(view: Rect, items: &[Item]) -> ViewLayout {
+    layout_after(view, items, None)
+}
+
+/// Lays the view's overlays out after `prev` (last frame's layout): with the same overlays up,
+/// last frame's forms and row are kept while they still fit, and given up for a lighter choice
+/// only once that clears every gap by [`HYSTERESIS`] more; the tag keeps its band likewise.
+pub fn layout_after(view: Rect, items: &[Item], prev: Option<&ViewLayout>) -> ViewLayout {
+    let prev = prev.filter(|p| {
+        let mut a: Vec<Slot> = p.placed.iter().map(|(s, _)| *s).collect();
+        let mut b: Vec<Slot> = items.iter().map(|i| i.slot).collect();
+        a.sort();
+        b.sort();
+        a == b
+    });
+    let band = prev.and_then(|p| p.get(Slot::CentreTag)).filter(|p| takes_room(p.rect)).map(|t| (t.rect.top() - (view.top() + INSET_TOP)).abs() < 0.5);
+    let (mut forms, mut float, mut crowded) = decide(view, items, GAP, band);
+    if let Some(p) = prev {
+        let kept: Vec<usize> = items.iter().map(|it| p.form(it.slot).min(it.forms.len() - 1)).collect();
+        if clashes_of(view, &place(view, items, &kept, p.float, GAP, band), GAP).is_empty() {
+            let (strict, strict_float, strict_crowded) = decide(view, items, GAP + HYSTERESIS, band);
+            let score = |f: &[usize], fl: bool| f.iter().sum::<usize>() + usize::from(fl);
+            if !strict_crowded && score(&strict, strict_float) < score(&kept, p.float) {
+                (forms, float, crowded) = (strict, strict_float, false);
+            } else {
+                (forms, float, crowded) = (kept, p.float, false);
+            }
+        }
+    }
+    let rects = place(view, items, &forms, float, GAP, band);
+    let placed: Vec<(Slot, Placed)> = items.iter().zip(&rects).zip(&forms).map(|((it, r), &form)| (it.slot, Placed { rect: *r, form })).collect();
+    // the top-left stack's room: up to the right column's items beside it
+    let tl_bottom = placed.iter().filter(|(s, p)| s.zone() == Zone::TopLeft && takes_room(p.rect)).map(|(_, p)| p.rect.bottom()).fold(view.top() + INSET_TOP, f32::max);
+    let right_left = placed
+        .iter()
+        .filter(|(s, p)| s.zone() == Zone::Right && takes_room(p.rect) && (p.rect.top() < tl_bottom + GAP || *s == Slot::Capture))
+        .map(|(_, p)| p.rect.left())
+        .fold(view.right() - INSET_TOP, f32::min);
+    let top_left_room = (right_left - GAP - (view.left() + INSET_TOP)).max(0.0);
+    ViewLayout { view, placed, crowded, top_left_room, float }
+}
+
+/// The forms and the row (steps 1–4 of the module doc) with every gap at least `gap`: the forms,
+/// whether bottom-centre left the bottom row, and whether it is still crowded.
+fn decide(view: Rect, items: &[Item], gap: f32, band: Option<bool>) -> (Vec<usize>, bool, bool) {
     let mut forms = vec![0usize; items.len()];
     let mut float = false;
     let mut crowded = false;
-    let mut rects;
     // the bottom-centre items compacted to fit the bottom row, in order (step 4 below)
     let mut row_compacted: Vec<usize> = Vec::new();
     // every step takes one form or the float, so this ends; the bound is a guard
     let mut steps = 0;
     loop {
-        rects = place(view, items, &forms, float);
-        let clashes = clashes_of(view, &rects);
+        let rects = place(view, items, &forms, float, gap, band);
+        let clashes = clashes_of(view, &rects, gap);
         if clashes.is_empty() {
             // 4. bottom-centre left the row anyway: its cards compacted for the row get their
             // full form back where the second row has room for it
             if float {
                 for &i in row_compacted.iter().rev() {
                     forms[i] -= 1;
-                    let r = place(view, items, &forms, float);
-                    if clashes_of(view, &r).is_empty() {
-                        rects = r;
-                    } else {
+                    if !clashes_of(view, &place(view, items, &forms, float, gap, band), gap).is_empty() {
                         forms[i] += 1;
                     }
                 }
@@ -359,27 +454,18 @@ pub fn layout(view: Rect, items: &[Item]) -> ViewLayout {
             break;
         }
     }
-    let placed: Vec<(Slot, Placed)> = items.iter().zip(&rects).zip(&forms).map(|((it, r), &form)| (it.slot, Placed { rect: *r, form })).collect();
-    // the top-left stack's room: up to the right column's items beside it
-    let tl_bottom = placed.iter().filter(|(s, p)| s.zone() == Zone::TopLeft && takes_room(p.rect)).map(|(_, p)| p.rect.bottom()).fold(view.top() + INSET_TOP, f32::max);
-    let right_left = placed
-        .iter()
-        .filter(|(s, p)| s.zone() == Zone::Right && takes_room(p.rect) && (p.rect.top() < tl_bottom + GAP || *s == Slot::Capture))
-        .map(|(_, p)| p.rect.left())
-        .fold(view.right() - INSET_TOP, f32::min);
-    let top_left_room = (right_left - GAP - (view.left() + INSET_TOP)).max(0.0);
-    ViewLayout { view, placed, crowded, top_left_room }
+    (forms, float, crowded)
 }
 
 /// The pairs of overlays closer than the gap, and (`None` as the second) those leaving the view.
-fn clashes_of(view: Rect, rects: &[Rect]) -> Vec<(usize, Option<usize>)> {
+fn clashes_of(view: Rect, rects: &[Rect], gap: f32) -> Vec<(usize, Option<usize>)> {
     let mut v = Vec::new();
     for (i, a) in rects.iter().enumerate().filter(|(_, r)| takes_room(**r)) {
         if !view.expand(0.5).contains_rect(*a) {
             v.push((i, None));
         }
         for (j, b) in rects.iter().enumerate().skip(i + 1).filter(|(_, r)| takes_room(**r)) {
-            if near(*a, *b) {
+            if near(*a, *b, gap) {
                 v.push((i, Some(j)));
             }
         }
@@ -389,7 +475,10 @@ fn clashes_of(view: Rect, rects: &[Rect]) -> Vec<(usize, Option<usize>)> {
 
 /// Every item's rect for these forms (a zero-size rect, at its stack's place, for an item that
 /// takes no room).
-fn place(view: Rect, items: &[Item], forms: &[usize], float: bool) -> Vec<Rect> {
+/// `gap` is [`GAP`] (or, deciding with a margin, more); `band` is the tag's place last frame
+/// ([`fit_down`]).
+fn place(view: Rect, items: &[Item], forms: &[usize], float: bool, gap: f32, band: Option<bool>) -> Vec<Rect> {
+    let near = |a: Rect, b: Rect| near(a, b, gap);
     let mut out = vec![Rect::NOTHING; items.len()];
     let mut done = vec![false; items.len()];
     let in_zone = |z: Zone| {
@@ -423,7 +512,7 @@ fn place(view: Rect, items: &[Item], forms: &[usize], float: bool) -> Vec<Rect> 
                     let me = out[i];
                     let hit = out.iter().zip(&done).filter(|(r, d)| **d && takes_room(**r)).map(|(r, _)| *r).find(|o| near(*o, me));
                     match hit {
-                        Some(o) if o.top() - GAP - s.y >= view.top() => out[i] = Rect::from_min_size(pos2(x, o.top() - GAP - s.y), s),
+                        Some(o) if o.top() - gap - s.y >= view.top() => out[i] = Rect::from_min_size(pos2(x, o.top() - gap - s.y), s),
                         _ => break,
                     }
                 }
@@ -444,7 +533,7 @@ fn place(view: Rect, items: &[Item], forms: &[usize], float: bool) -> Vec<Rect> 
         // (the capture buttons keep the corner: the chip's room always stops at them)
         if room(s) && items[i].slot != Slot::Capture {
             if let Some(b) = top_left.iter().filter(|r| near(**r, Rect::from_min_size(pos2(x1 - s.x, y), s))).map(|r| r.bottom()).reduce(f32::max) {
-                y = b + GAP;
+                y = b + gap;
             }
         }
         if let (Some(min_h), true) = (items[i].min_height, room(s)) {
@@ -452,7 +541,7 @@ fn place(view: Rect, items: &[Item], forms: &[usize], float: bool) -> Vec<Rect> 
                 .iter()
                 .zip(&done)
                 .filter(|(r, d)| **d && takes_room(**r) && r.bottom() > y && r.left() < x1 && r.right() > x1 - s.x)
-                .map(|(r, _)| r.top() - GAP)
+                .map(|(r, _)| r.top() - gap)
                 .fold(view.bottom() - INSET_TOP, f32::min);
             s.y = s.y.min(floor - y).max(min_h);
         }
@@ -467,7 +556,7 @@ fn place(view: Rect, items: &[Item], forms: &[usize], float: bool) -> Vec<Rect> 
     for i in in_zone(Zone::TopCentre) {
         let s = size(i);
         let obstacles: Vec<Rect> = out.iter().zip(&done).filter(|(r, d)| **d && takes_room(**r)).map(|(r, _)| *r).collect();
-        out[i] = if room(s) { fit_down(view, s, &obstacles) } else { Rect::from_min_size(pos2(view.center().x, view.top() + INSET_TOP), Vec2::ZERO) };
+        out[i] = if room(s) { fit_down(view, s, &obstacles, gap, band) } else { Rect::from_min_size(pos2(view.center().x, view.top() + INSET_TOP), Vec2::ZERO) };
         done[i] = true;
     }
     // bottom-centre, upward: in the bottom row, or (float) the lowest place that clears the rest
@@ -480,7 +569,7 @@ fn place(view: Rect, items: &[Item], forms: &[usize], float: bool) -> Vec<Rect> 
             continue;
         }
         let obstacles: Vec<Rect> = out.iter().zip(&done).filter(|(r, d)| **d && takes_room(**r)).map(|(r, _)| *r).collect();
-        out[i] = fit_up(view, s, start, &obstacles, float);
+        out[i] = fit_up(view, s, start, &obstacles, float, gap);
         start = out[i].top() - GAP;
         done[i] = true;
     }
@@ -490,14 +579,14 @@ fn place(view: Rect, items: &[Item], forms: &[usize], float: bool) -> Vec<Rect> 
 /// The left edge for a rect of `size` spanning `top..bottom`: centred on the view when that is
 /// clear, else as near the centre as the gap between the obstacles beside it allows; `None` when
 /// the gap is too narrow.
-fn row_x(view: Rect, size: Vec2, top: f32, bottom: f32, obstacles: &[Rect]) -> Option<f32> {
+fn row_x(view: Rect, size: Vec2, top: f32, bottom: f32, obstacles: &[Rect], gap: f32) -> Option<f32> {
     let (mut lo, mut hi) = (view.left() + INSET_TOP, view.right() - INSET_TOP);
     let cx = view.center().x;
-    for o in obstacles.iter().filter(|o| o.top() < bottom + GAP - 0.5 && o.bottom() > top - GAP + 0.5) {
+    for o in obstacles.iter().filter(|o| o.top() < bottom + gap - 0.5 && o.bottom() > top - gap + 0.5) {
         if o.center().x < cx {
-            lo = lo.max(o.right() + GAP);
+            lo = lo.max(o.right() + gap);
         } else {
-            hi = hi.min(o.left() - GAP);
+            hi = hi.min(o.left() - gap);
         }
     }
     (hi - lo >= size.x - 0.01).then(|| (cx - size.x / 2.0).clamp(lo, (hi - size.x).max(lo)))
@@ -505,17 +594,17 @@ fn row_x(view: Rect, size: Vec2, top: f32, bottom: f32, obstacles: &[Rect]) -> O
 
 /// A rect of `size` with its bottom at `start` (centred as its row allows), or, searching, at the
 /// lowest place at or above `start` that clears every obstacle.
-fn fit_up(view: Rect, size: Vec2, start: f32, obstacles: &[Rect], search: bool) -> Rect {
+fn fit_up(view: Rect, size: Vec2, start: f32, obstacles: &[Rect], search: bool, gap: f32) -> Rect {
     let mut ys = vec![start];
     if search {
-        ys.extend(obstacles.iter().map(|o| o.top() - GAP).filter(|&y| y < start));
+        ys.extend(obstacles.iter().map(|o| o.top() - gap).filter(|&y| y < start));
         ys.sort_by(|a, b| b.total_cmp(a));
     }
     for &y in &ys {
         if search && y - size.y < view.top() + INSET_TOP - 0.01 {
             break;
         }
-        if let Some(x) = row_x(view, size, y - size.y, y, obstacles) {
+        if let Some(x) = row_x(view, size, y - size.y, y, obstacles, gap) {
             return Rect::from_min_size(pos2(x, y - size.y), size);
         }
     }
@@ -523,17 +612,21 @@ fn fit_up(view: Rect, size: Vec2, start: f32, obstacles: &[Rect], search: bool) 
 }
 
 /// A rect of `size` at the top band's centre when clear there, else at the highest place under
-/// it that clears every obstacle.
-fn fit_down(view: Rect, size: Vec2, obstacles: &[Rect]) -> Rect {
+/// it that clears every obstacle. `band`: whether it was in the top band last frame — when it was
+/// not, the band must be clear by [`HYSTERESIS`] more before it moves back up.
+fn fit_down(view: Rect, size: Vec2, obstacles: &[Rect], gap: f32, band: Option<bool>) -> Rect {
     let start = view.top() + INSET_TOP;
     let mut ys = vec![start];
-    ys.extend(obstacles.iter().map(|o| o.bottom() + GAP).filter(|&y| y > start));
+    ys.extend(obstacles.iter().map(|o| o.bottom() + gap).filter(|&y| y > start));
     ys.sort_by(|a, b| a.total_cmp(b));
     for &y in &ys {
         if y + size.y > view.bottom() - INSET_BOTTOM + 0.01 {
             break;
         }
-        if let Some(x) = row_x(view, size, y, y + size.y, obstacles) {
+        let g = if y == start && band == Some(false) { gap + HYSTERESIS } else { gap };
+        if let Some(x) = row_x(view, size, y, y + size.y, obstacles, g) {
+            // (the margin decides; the place is the plain one)
+            let x = row_x(view, size, y, y + size.y, obstacles, gap).unwrap_or(x);
             return Rect::from_min_size(pos2(x, y), size);
         }
     }
@@ -570,7 +663,7 @@ mod tests {
             }
             CentreTag => Item::new(slot, f(&[(312.0, 52.0)])),
             Capture => Item::new(slot, f(&[(112.0, 40.0)])),
-            Segment => Item::new(slot, f(&[(400.0f32.min(w - 40.0) + 22.0, 430.0), (390.0, 40.0)])),
+            Segment => Item::new(slot, f(&[(400.0f32.min(w - 40.0) + 22.0, 430.0), (422.0, 40.0)])),
             Offer => Item::new(slot, f(&[(322.0, 112.0)])),
             TeachPrompt => Item::new(slot, f(&[(322.0, 64.0)])),
             AtomCard => Item::new(slot, f(&[(242.0, 342.0), (242.0, 96.0)])).shrinkable(96.0),
@@ -585,7 +678,7 @@ mod tests {
             }
             KnowledgeLegend => Item::new(slot, f(&[(272.0, 94.0), (272.0, 80.0)])),
             Sampling => Item::new(slot, f(&[(520.0f32.min(w - 40.0) + 22.0, 113.0), (332.0, 37.0)])),
-            Relax => Item::new(slot, f(&[(520.0f32.min(w - 40.0) + 22.0, 104.0), (330.0, 40.0)])),
+            Relax => Item::new(slot, f(&[(520.0f32.min(w - 40.0) + 22.0, 104.0), (302.0, 40.0)])),
             DensityLabel => {
                 let lw = 484.0f32.min((w - 560.0).max(260.0)) + 12.0;
                 Item::new(slot, f(&[(lw, 12.0 + 16.0 * lines(484.0, lw - 12.0).min(2.0)), (lw, 30.0)]))
@@ -612,18 +705,19 @@ mod tests {
     /// re-measured in the room the last layout left them, until it settles.
     fn settle(view: Rect, slots: &[Slot]) -> (Vec<Item>, ViewLayout) {
         let mut room = view.width() - 2.0 * INSET_TOP;
-        let mut last = None;
-        for _ in 0..6 {
+        let mut last: Option<(Vec<Item>, ViewLayout)> = None;
+        for _ in 0..8 {
             let it: Vec<Item> = slots.iter().map(|&s| item(s, view, room)).collect();
-            let l = layout(view, &it);
-            let settled = (l.top_left_room - room).abs() < 0.01;
+            let l = layout_after(view, &it, last.as_ref().map(|(_, l)| l));
+            // settled: the same room and the same layout two rounds running
+            let settled = (l.top_left_room - room).abs() < 0.01 && last.as_ref().is_some_and(|(_, p)| p.placed == l.placed);
             room = l.top_left_room;
             last = Some((it, l));
             if settled {
-                break;
+                return last.expect("laid out");
             }
         }
-        last.expect("laid out")
+        panic!("{slots:?} in {view:?} did not settle in 8 rounds: {:?}", last.map(|(_, l)| l.placed));
     }
 
     fn check(name: &str, view: Rect, slots: &[Slot]) -> ViewLayout {
@@ -781,5 +875,71 @@ mod tests {
         let switch = l.get(ViewSwitch).unwrap().rect;
         assert!((at.y - (switch.top() - GAP)).abs() < 0.01 && (at.x - switch.left()).abs() < 0.01, "{at:?} {switch:?}");
         assert_eq!(l.rects().count(), 1);
+    }
+
+    /// Frames of `sizes` (each a full request) laid out one after another, each after the last:
+    /// every frame's layout.
+    fn frames(v: Rect, sizes: &[Vec<Item>]) -> Vec<ViewLayout> {
+        let mut out: Vec<ViewLayout> = Vec::new();
+        for it in sizes {
+            let l = layout_after(v, it, out.last());
+            out.push(l);
+        }
+        out
+    }
+
+    /// Spec anti-goal (review 2026-11-24): a size wobbling a few points at the threshold — the
+    /// chip's text growing and shrinking by a digit beside the ghost tag — does not move the tag
+    /// between the top band and the row under the chip every frame: once moved down it comes back
+    /// up only when the band is clear by `HYSTERESIS` more.
+    #[test]
+    fn a_wobble_at_the_tags_cut_off_does_not_move_it() {
+        use Slot::*;
+        let v = view(1000.0, 700.0);
+        let req = |chip_w: f32| -> Vec<Item> {
+            vec![Item::new(Chip, vec![vec2(chip_w, 40.0)]), Item::new(Capture, vec![vec2(112.0, 40.0)]), Item::new(CentreTag, vec![vec2(312.0, 52.0)])]
+        };
+        let in_band = |l: &ViewLayout| (l.get(CentreTag).unwrap().rect.top() - (v.top() + INSET_TOP)).abs() < 0.5;
+        // the widest chip that leaves the tag in the band (no history)
+        let cut = (200..900).map(|w| w as f32).take_while(|&w| in_band(&layout(v, &req(w)))).last().expect("a cut-off");
+        // in the band, a wobble just inside keeps it there
+        let ls = frames(v, &[req(cut - 20.0), req(cut - 1.0), req(cut - 4.0), req(cut - 1.0)]);
+        assert!(ls.iter().all(in_band), "stays in the band");
+        // pushed down, a wobble back across the cut-off (within the margin) does not lift it
+        let ls = frames(v, &[req(cut + 2.0), req(cut - 2.0), req(cut + 2.0), req(cut - 2.0), req(cut + 1.0)]);
+        assert!(ls.iter().all(|l| !in_band(l)), "stays under the chip");
+        let tags: Vec<Rect> = ls.iter().map(|l| l.get(CentreTag).unwrap().rect).collect();
+        assert!(tags.windows(2).all(|w| w[0] == w[1]), "the tag never moves: {tags:?}");
+        // well clear of the margin it goes back up
+        let ls = frames(v, &[req(cut + 2.0), req(cut - HYSTERESIS - 10.0)]);
+        assert!(!in_band(&ls[0]) && in_band(&ls[1]), "back in the band once clear");
+    }
+
+    /// The same for a form and the row: a card whose size wobbles at the width where it stops
+    /// fitting the bottom row keeps its form and row until the change clears the margin.
+    #[test]
+    fn a_wobble_at_the_cards_cut_off_does_not_flip_its_form_or_row() {
+        use Slot::*;
+        let v = view(1100.0, 800.0);
+        let req = |card_w: f32| -> Vec<Item> {
+            vec![
+                Item::new(ViewSwitch, vec![vec2(336.0, 46.0)]),
+                Item::new(BondsPair, vec![vec2(104.0, 36.0)]),
+                Item::new(Sampling, vec![vec2(card_w, 113.0), vec2(352.0, 37.0)]),
+            ]
+        };
+        let full = |l: &ViewLayout| l.form(Sampling) == 0;
+        let cut = (300..1000).map(|w| w as f32).take_while(|&w| full(&layout(v, &req(w)))).last().expect("a cut-off");
+        // compacted at cut + 2, a wobble back to cut - 2 (inside the margin) keeps it compact
+        let ls = frames(v, &[req(cut + 2.0), req(cut - 2.0), req(cut + 2.0), req(cut - 3.0)]);
+        assert!(ls.iter().all(|l| !full(l)), "stays compact");
+        let cards: Vec<Rect> = ls.iter().map(|l| l.get(Sampling).unwrap().rect).collect();
+        assert!(cards.windows(2).all(|w| w[0] == w[1]), "the card never moves: {cards:?}");
+        // and full, a wobble just inside keeps it full
+        let ls = frames(v, &[req(cut - 30.0), req(cut), req(cut - 3.0), req(cut)]);
+        assert!(ls.iter().all(full), "stays full");
+        // a real change past the margin is followed
+        let ls = frames(v, &[req(cut + 2.0), req(cut - HYSTERESIS - 20.0)]);
+        assert!(!full(&ls[0]) && full(&ls[1]));
     }
 }
