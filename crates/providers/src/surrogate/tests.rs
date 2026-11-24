@@ -11911,6 +11911,8 @@ mod refit_cost;
 mod refit_profile;
 /// The chemical-channels day-1 go / no-go gate on a collection copy (`#[ignore]`d measurement).
 mod channels_gate;
+/// T7: the day-1 gate rerun through the full decision list in a real provider (`#[ignore]`d measurement).
+mod channels_decisions;
 /// Chemical channels Tasks 5–6: which species are represented, rule 3b, the exclusion, the lifecycle
 /// and the C2 floors (`represent` module doc).
 mod channels_life;
