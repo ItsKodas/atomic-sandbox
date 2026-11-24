@@ -71,6 +71,16 @@ pub fn label(g: &PassGhost) -> String {
 
 /// The first line of the label card: the pass stage in the Activity tab's words, with the scan
 /// point ("bond scan · point 9 of 12").
+/// Every word a finished job's flash can name (`GhostOutcome::word`): the view's tag reserves
+/// the widest, so it keeps one width as the flash comes and goes (view overlay zones: no zone
+/// moves per sample).
+pub fn outcome_words() -> Vec<&'static str> {
+    use sim::activity::ScfEnd as E;
+    let mut v = vec![GhostOutcome::Kept.word(), GhostOutcome::Failed(None).word(), GhostOutcome::Skipped.word()];
+    v.extend([E::Converged, E::Stalled, E::Cap, E::NonFinite, E::TimeLimit].map(|e| GhostOutcome::Failed(Some(e)).word()));
+    v
+}
+
 pub fn stage_line(g: &PassGhost) -> String {
     match g.job {
         GhostJob::Reference { .. } => "reference".into(),

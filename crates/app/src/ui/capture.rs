@@ -15,15 +15,18 @@ use std::time::Duration;
 /// How long the last note stays under the buttons.
 const NOTE_FOR: Duration = Duration::from_secs(8);
 
-/// Draws the buttons (top right of `view`) and returns the bottom of what they took, for the cards
-/// stacked under them (the atom card).
-pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, camera: &render::camera::OrbitCamera, acts: &mut Vec<Action>) -> f32 {
+/// Draws the buttons (the first of the right edge's zone, `super::zones`: the view's top-right
+/// corner) with their notes under them, and returns the rect the two took (the zone stacks the
+/// segment, the offers and the atom card under it). The settings popover opens under them, over
+/// the zone (a popover the user opened), down to the bottom-right stack.
+pub fn show(ctx: &egui::Context, view: Rect, lay: &super::zones::ViewLayout, st: &mut UiState, camera: &render::camera::OrbitCamera, acts: &mut Vec<Action>) -> Rect {
     let cv = st.capture_view.clone();
     let recording = cv.recording.is_some();
     let time = ctx.input(|i| i.time);
+    let corner = lay.get(super::zones::Slot::Capture).map_or(pos2(view.right() - 12.0, view.top() + 12.0), |p| p.rect.right_top());
     let area = egui::Area::new(Id::new("capture-buttons"))
         .pivot(Align2::RIGHT_TOP)
-        .fixed_pos(pos2(view.right() - 12.0, view.top() + 12.0))
+        .fixed_pos(corner)
         .order(Order::Middle)
         .fade_in(false)
         .show(ctx, |ui| {
@@ -82,7 +85,7 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, camera: &render::
         notes.push((text.clone(), if *err { RED } else { theme::INK_DIM }));
         ctx.request_repaint_after(Duration::from_millis(500));
     }
-    let mut bottom = rect.bottom();
+    let mut block = rect;
     if !notes.is_empty() {
         let r = egui::Area::new(Id::new("capture-notes"))
             .pivot(Align2::RIGHT_TOP)
@@ -99,14 +102,14 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, camera: &render::
                     }
                 });
             });
-        bottom = r.response.rect.bottom();
+        block = block.union(r.response.rect);
     }
     if st.capture.open {
-        let anchor = Rect::from_min_max(rect.min, pos2(rect.right(), bottom));
-        bottom = settings(ctx, view, anchor, st, &cv, camera).max(bottom);
+        let anchor = Rect::from_min_max(rect.min, pos2(rect.right(), block.bottom()));
+        settings(ctx, view, anchor, lay.bottom_right_top(), st, &cv, camera);
     }
     guide(ctx, view, st, &cv);
-    bottom
+    block
 }
 
 /// "4.1 s video", or "4.1 / 10.0 s video" with a set length.
@@ -161,12 +164,13 @@ fn guide(ctx: &egui::Context, view: Rect, st: &UiState, cv: &crate::capture::Vie
 const AMBER_GUIDE: egui::Color32 = egui::Color32::from_rgb(255, 184, 71);
 
 /// The quick settings popover under `anchor` (the buttons and their notes), until the settings
-/// button (or Esc over it) closes it. Returns its bottom.
-fn settings(ctx: &egui::Context, view: Rect, anchor: Rect, st: &mut UiState, cv: &crate::capture::View, window: &render::camera::OrbitCamera) -> f32 {
+/// button (or Esc over it) closes it; it scrolls above `floor` (the bottom-right stack's top).
+fn settings(ctx: &egui::Context, view: Rect, anchor: Rect, floor: f32, st: &mut UiState, cv: &crate::capture::View, window: &render::camera::OrbitCamera) {
     let recording = cv.recording.is_some();
     let ppp = ctx.pixels_per_point();
     let view_px = ((view.width() * ppp) as u32, (view.height() * ppp) as u32);
-    let max_h = (view.bottom() - anchor.bottom() - 24.0).max(160.0);
+    // the frame's margins (7 + 7) and the 6-point gap above the corner's stack
+    let max_h = (floor.min(view.bottom() - 10.0) - anchor.bottom() - 6.0 - 14.0 - super::zones::GAP).max(160.0);
     let r = egui::Area::new(Id::new("capture-settings"))
         .pivot(Align2::RIGHT_TOP)
         .fixed_pos(pos2(anchor.right(), anchor.bottom() + 6.0))
@@ -314,7 +318,6 @@ fn settings(ctx: &egui::Context, view: Rect, anchor: Rect, st: &mut UiState, cv:
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && r.response.contains_pointer() {
         st.capture.open = false;
     }
-    r.response.rect.bottom()
 }
 
 /// The capture camera: the view's, a fixed angle or an orbit — the azimuth on a dial seen from
