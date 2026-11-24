@@ -1199,13 +1199,14 @@ pub const SUSPECTS_NO_RANKING: &str = "no ranking yet: it is computed with the n
 /// no fit holds yet (`ModelStatus::user_changes_pending`) and when their refit starts
 /// (`ModelStatus::refit_due`, the worker's debounce) — "2 changes pending · refit in 8 s", "… ·
 /// refit starting", "… · the sampling pass's fit takes them" while a pass runs — or, while a refit
-/// runs, its time left (`refit`: the probe's, `sim::refit_eta`) and the ones queued after it:
-/// "refitting · about 2:20 left · 1 more pending after this one". A running refit with nothing
+/// runs, its stage and that stage's time left (`refit`: the probe's counters, `sim::refit_live`)
+/// and the ones queued after it: "refitting · checking each sample · about 0:04 left in this stage
+/// · 1 more pending after this one". A running refit with nothing
 /// queued has the banner from [`REFIT_BANNER_AFTER_S`] on (a refit of milliseconds does not
 /// flash one). `None` otherwise.
 pub fn refit_banner(m: &ModelStatus, sampling: bool, now: std::time::Instant, refit: Option<&sim::RefitView>) -> Option<String> {
     let n = m.user_changes_pending;
-    let left = refit.map(|r| format!(" · {}", crate::ui::activity::words::refit_eta_words(r, false))).unwrap_or_default();
+    let left = refit.map(|r| format!(" · {}", crate::ui::activity::words::refit_now_words(r))).unwrap_or_default();
     if n == 0 {
         let running = refit.filter(|r| r.elapsed_s >= REFIT_BANNER_AFTER_S).map(|_| format!("refitting{left}"));
         // new samples held by Model tab ▸ Refit (user 2026-11-22), with Refit now beside it

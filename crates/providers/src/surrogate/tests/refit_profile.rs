@@ -197,6 +197,72 @@ fn refit_profile() {
                 s.rebuild_active_set();
                 dump("active set alone (rule 5e), default basis", t.elapsed().as_secs_f64(), &s);
             }
+            // a channel collection's first refit (the W learn, its fit and every trust pass) and a
+            // second refit with nothing new (refit visualisation, 2026-11-25: where the time goes);
+            // `CHANNELS_K` (default 3)
+            "channels" => {
+                let k: usize = std::env::var("CHANNELS_K").map_or(3, |v| v.parse().unwrap());
+                let mut c = open_copy();
+                c.basis = surrogate::BasisKind::Channels { k };
+                let mut s = provider();
+                s.attach_refit_off = true;
+                s.attach(c).unwrap();
+                surrogate::prof::reset();
+                let wall = refit_timed(&mut s);
+                dump(&format!("(c) channels K = {k}: first refit (learn W + fit + trust passes)"), wall, &s);
+                let wall = refit_timed(&mut s);
+                dump(&format!("(c2) channels K = {k}: second refit, nothing new"), wall, &s);
+            }
+            // a launch on a channel collection whose channels.txt holds W (2026-11-25, the
+            // coordinator's question: does the launch refit relearn W?): a writable temporary copy
+            // of COLLECTION_DIR, a first provider learns W and writes it, then a fresh provider
+            // attaches the copy as a launch does and refits; the notes and the stage table say
+            // whether the W learn ran
+            "channels_launch" => {
+                let k: usize = std::env::var("CHANNELS_K").map_or(3, |v| v.parse().unwrap());
+                let src = std::path::PathBuf::from(std::env::var("COLLECTION_DIR").unwrap());
+                let root = std::env::temp_dir().join(format!("refit-launch-{}", std::process::id()));
+                let dst = root.join(src.file_name().unwrap());
+                let _ = std::fs::remove_dir_all(&root);
+                std::fs::create_dir_all(&dst).unwrap();
+                for e in std::fs::read_dir(&src).unwrap() {
+                    let e = e.unwrap();
+                    let name = e.file_name();
+                    if e.file_type().unwrap().is_file() && name != ".lock" {
+                        std::fs::copy(e.path(), dst.join(&name)).unwrap();
+                    }
+                }
+                let key = surrogate::SurfaceKey::from_text(&std::fs::read_to_string(dst.join("key.txt")).unwrap()).unwrap();
+                let open = || {
+                    let (mut c, _) = surrogate::Collection::open(&root, &key).unwrap();
+                    c.basis = surrogate::BasisKind::Channels { k };
+                    assert!(!c.read_only, "the temporary copy is writable");
+                    c
+                };
+                {
+                    let mut s = provider();
+                    s.attach_refit_off = true;
+                    s.attach(open()).unwrap();
+                    surrogate::prof::reset();
+                    let wall = refit_timed(&mut s);
+                    for n in s.user_notes.drain(..) {
+                        println!("  note: {n}");
+                    }
+                    dump(&format!("(l1) channels K = {k}: the first refit, W learnt and written"), wall, &s);
+                }
+                assert!(dst.join("channels.txt").exists(), "W written to the copy");
+                let mut s = provider();
+                s.attach_refit_off = true;
+                s.attach(open()).unwrap();
+                println!("  attached: W read from channels.txt: {}", s.shared.as_ref().unwrap().mix.is_some());
+                surrogate::prof::reset();
+                let wall = refit_timed(&mut s);
+                for n in s.user_notes.drain(..) {
+                    println!("  note: {n}");
+                }
+                dump(&format!("(l2) channels K = {k}: the launch refit (W on file)"), wall, &s);
+                let _ = std::fs::remove_dir_all(&root);
+            }
             other => panic!("unknown run {other}"),
         }
     }

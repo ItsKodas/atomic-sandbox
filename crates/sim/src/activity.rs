@@ -10,6 +10,7 @@
 //! Atomic units (Hartree, Bohr), kelvin, milliseconds. Nothing
 //! here decides anything: the providers fill these from decisions they already made.
 use crate::refit_eta::{self, RefitEstimate, RefitEta, RefitRecord, RefitStage, RefitStages};
+use crate::refit_live::{OtherPass, RefitLive, RefitMeter};
 use crate::AuditVerdict;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -159,6 +160,8 @@ pub struct ActivityProbe {
     /// Ended display eigensolves not yet taken by [`ActivityProbe::take_display_solves`]
     /// (oldest first, at most [`DISPLAY_SOLVES_KEPT`]).
     display_done: Mutex<VecDeque<DisplaySolve>>,
+    /// The running refit's stage counters (the refit picture, [`crate::refit_live`]).
+    refit_live: RefitMeter,
 }
 
 /// Ended display eigensolves the probe holds between two takes (the worker takes them at every
@@ -307,6 +310,8 @@ pub struct RefitView {
     pub estimate: Option<RefitEstimate>,
     /// The time left.
     pub eta: RefitEta,
+    /// What it is doing now, stage by stage (the refit picture, [`crate::refit_live`]).
+    pub live: RefitLive,
 }
 
 impl ActivityProbe {
@@ -329,6 +334,7 @@ impl ActivityProbe {
             display_job: AtomicU32::new(0),
             display_solves: AtomicU64::new(0),
             display_done: Mutex::new(VecDeque::new()),
+            refit_live: RefitMeter::default(),
         })
     }
 
@@ -418,8 +424,63 @@ impl ActivityProbe {
         self.refit_loo.store(0, Relaxed);
         self.refit_recovery.store(false, Relaxed);
         let now = self.now_us();
+        self.refit_live.begin(now);
         self.refit_stage_us.store(now, Relaxed);
         self.refit_started_us.store(now, Relaxed);
+    }
+
+    /// The refit picture's counters ([`crate::refit_live`]; display only): `n` more samples of a
+    /// gathering pass over `total` are in the fit's statistics.
+    pub fn refit_described(&self, n: usize, total: usize) {
+        self.refit_live.described(n, total, self.now_us());
+    }
+
+    /// Round `round` of the running refit's search on a `q` × `q` matrix starts.
+    pub fn refit_search_round(&self, round: usize, q: usize) {
+        self.refit_live.search_round(round, q, self.now_us());
+    }
+
+    /// One decomposition of the running refit's search finished.
+    pub fn refit_decomposition(&self, q: usize) {
+        self.refit_live.decomposition(q, self.now_us());
+    }
+
+    /// A leave-one-out pass over `total` samples starts.
+    pub fn refit_check_begin(&self, total: usize) {
+        self.refit_live.check_begin(total, self.now_us());
+    }
+
+    /// Sample `k` of the leave-one-out pass is checked, at `ratio` to its bound. Any thread.
+    pub fn refit_checked(&self, k: usize, ratio: f64) {
+        self.refit_live.checked(k, ratio);
+    }
+
+    /// A pass without a per-sample counter starts.
+    pub fn refit_other(&self, pass: OtherPass) {
+        self.refit_live.other(pass, self.now_us());
+    }
+
+    /// Learning the mix W starts (`true`) or ends.
+    pub fn refit_mix(&self, on: bool) {
+        self.refit_live.mix(on, self.now_us());
+    }
+
+    /// The trust recovery is in quarantine round `round` (0: its basis retries) of up to `max`,
+    /// holding `held` samples out.
+    pub fn refit_trust_round(&self, round: usize, max: usize, held: usize) {
+        self.refit_live.trust_round(round, max, held);
+    }
+
+    /// The running (or last) leave-one-out pass's ratios, in its order, into `out` (NaN: not
+    /// checked yet). Read once per frame.
+    pub fn refit_ratios(&self, out: &mut Vec<f32>) {
+        self.refit_live.ratios_into(out);
+    }
+
+    /// The running or last refit's stage counters (`view().refit` has them only while one runs:
+    /// the picture's fade-out, tests).
+    pub fn last_refit_live(&self) -> RefitLive {
+        self.refit_live.view(self.now_us())
     }
 
     /// A stage of the running refit starts (`crate::refit_eta`, "The countdown"); ignored when no
@@ -502,7 +563,16 @@ impl ActivityProbe {
                 at_s: self.refit_stage_us.load(Relaxed).saturating_sub(r) as f64 * 1e-6,
             };
             let estimate = refit_eta::estimate(&self.refit_history.lock().unwrap_or_else(|e| e.into_inner()), samples, species, stages.recovery);
-            RefitView { elapsed_s, samples, species, background: self.refit_background.load(Relaxed), stages, estimate, eta: refit_eta::eta(elapsed_s, estimate.as_ref(), &stages) }
+            RefitView {
+                elapsed_s,
+                samples,
+                species,
+                background: self.refit_background.load(Relaxed),
+                stages,
+                estimate,
+                eta: refit_eta::eta(elapsed_s, estimate.as_ref(), &stages),
+                live: self.refit_live.view(now),
+            }
         });
         ProbeView {
             main: slot(&self.main),
@@ -1158,6 +1228,40 @@ mod tests {
         assert!(matches!(v.eta, RefitEta::Left { remaining_s, .. } if remaining_s > 239.0 && remaining_s <= 240.0));
         p.set_refit_history(Vec::new());
         assert_eq!(p.view().refit.unwrap().eta, RefitEta::Estimating);
+    }
+
+    /// The refit picture's counters ride the refit view, and a new refit starts them at none.
+    #[test]
+    fn the_live_stage_counters_are_published_and_restarted() {
+        use crate::refit_live::LiveStage;
+        let p = ActivityProbe::new();
+        p.begin_refit(10, 2, true);
+        assert_eq!(p.view().refit.unwrap().live.stage, LiveStage::Starting);
+        p.refit_mix(true);
+        p.refit_described(4, 10);
+        let l = p.view().refit.unwrap().live;
+        assert_eq!((l.stage, l.done, l.total, l.mix), (LiveStage::Gather, 4, 10, true));
+        p.refit_mix(false);
+        p.refit_search_round(1, 300);
+        p.refit_decomposition(300);
+        let l = p.view().refit.unwrap().live;
+        assert_eq!((l.stage, l.round, l.decompositions, l.q, l.mix), (LiveStage::Solve, 1, 1, 300, false));
+        p.refit_check_begin(3);
+        p.refit_checked(1, 4.0);
+        p.refit_trust_round(2, 5, 7);
+        let l = p.view().refit.unwrap().live;
+        assert_eq!((l.stage, l.done, l.total, l.beyond), (LiveStage::Check, 1, 3, 1));
+        assert_eq!(l.trust.map(|t| (t.round, t.max, t.held)), Some((2, 5, 7)));
+        let mut r = Vec::new();
+        p.refit_ratios(&mut r);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[1], 4.0);
+        p.refit_other(OtherPass::ActiveSet);
+        assert_eq!(p.view().refit.unwrap().live.stage, LiveStage::Other(OtherPass::ActiveSet));
+        p.end_refit();
+        p.begin_refit(10, 2, true);
+        let l = p.view().refit.unwrap().live;
+        assert_eq!((l.stage, l.trust, l.done), (LiveStage::Starting, None, 0));
     }
 
     /// The display eigensolve: running while the guard lives, recorded once with its time when it

@@ -9,7 +9,9 @@
 //! - bottom-centre: the sampling and relax cards, the faded-density label, the toasts;
 //! - bottom-right: the estimated view's bonds / orbitals pair, the stale bonds' line over it and
 //!   the Orbitals card above;
-//! - the model offer stays centred over everything (a decision card, not in the zones).
+//! - the model offer stays centred over everything (a decision card, not in the zones);
+//! - the refit picture (`refit_picture`) while a refit runs with no model: in the room the zones
+//!   leave free, never over an overlay, never taking input.
 //!
 //! Each overlay reports the size it took per form (`UiState::zones`), the pass lays them out for
 //! the next frame, and each draws at its rect. The distance guides, drag spring and pin squares
@@ -78,6 +80,8 @@ pub fn show(ctx: &egui::Context, view: Rect, st: &mut UiState, input: &PanelInpu
         }
     }
     model_offer_card(ctx, view, st, input, acts);
+    // the refit picture while there is no model (not a zone: the room the zones leave free)
+    super::refit_picture::show(ctx, view, &lay, st, input);
     // bottom-centre: the cards, the density label, the toast
     if let Some(r) = sampling_card(ctx, view, &lay, input, acts) {
         st.zones.measured(Slot::Sampling, lay.form(Slot::Sampling), r.size());

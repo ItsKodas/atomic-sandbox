@@ -4268,6 +4268,52 @@ fn a_refit_reports_its_phase_on_the_probe() {
     assert_eq!((v.refit, v.refits), (None, 2), "the refit was bracketed and closed");
 }
 
+/// The refit picture (plan 2026-11-25): a refit with a probe publishes its stages — the search's
+/// rounds and decompositions on Q′, each sample's leave-one-out ratio (the Worst-fitting list's,
+/// f32) as it is checked — and fits the same model, bit for bit, as the same refits without a
+/// probe. Outside a refit nothing is published (a view's leave-one-out).
+#[test]
+#[cfg_attr(debug_assertions, ignore)]
+fn a_metered_refit_publishes_its_stages_and_fits_the_same_bits() {
+    let bits = |s: &SurrogateKs| {
+        let m = s.model.as_ref().unwrap();
+        let mut v: Vec<u64> = m.coeffs.iter().flatten().chain(&m.scale).map(|x| x.to_bits()).collect();
+        v.extend(m.sigma_inv_chol.iter().flatten().map(|x| x.to_bits()));
+        v.extend([m.lambda.to_bits(), m.sigma_e.to_bits(), m.sigma_f.to_bits()]);
+        v
+    };
+    let probe = sim::ActivityProbe::new();
+    let (dir, dir_plain) = (collection_root("refit-picture"), collection_root("refit-picture-plain"));
+    let (s, _) = pair_student();
+    let mut s = s.with_probe(probe.clone());
+    s.attach_collection(&dir, &h2(1.4)).unwrap();
+    teach_h2_then_h2_he(&mut s);
+    let (mut plain, _) = pair_student();
+    plain.attach_collection(&dir_plain, &h2(1.4)).unwrap();
+    teach_h2_then_h2_he(&mut plain);
+    assert_eq!(bits(&s), bits(&plain), "the H₂ fit");
+    s.refit().expect("the H₂ + He fit");
+    plain.refit().expect("the H₂ + He fit");
+    assert_eq!(bits(&s), bits(&plain), "the H₂ + He fit, bit for bit with and without the probe");
+    let live = probe.last_refit_live();
+    let q = s.report().unwrap().q_prime as u32;
+    assert!(live.round >= 1 && live.q == q, "the search on Q′ {q}: {live:?}");
+    assert!(live.spent_s[sim::LiveStage::Solve.slot()] > 0.0 && live.spent_s[sim::LiveStage::Check.slot()] > 0.0, "{live:?}");
+    assert!(!live.mix && live.trust.is_none(), "no W, no recovery: {live:?}");
+    // the last leave-one-out pass's ratios are the standing fit's, sample by sample
+    let mut published = Vec::new();
+    probe.refit_ratios(&mut published);
+    let rows: Vec<f32> = s.loo_ratios().unwrap().iter().map(|r| r.1 as f32).collect();
+    assert_eq!(published.len(), rows.len());
+    assert!(published.iter().zip(&rows).all(|(a, b)| a.to_bits() == b.to_bits()), "{published:?} vs {rows:?}");
+    assert_eq!(live.beyond as usize, rows.iter().filter(|r| r.is_nan() || **r > 1.0).count());
+    // the refit's last pass is the active set; outside a refit a leave-one-out pass publishes nothing
+    assert_eq!(live.stage, sim::LiveStage::Other(sim::OtherPass::ActiveSet));
+    s.loo_ratios = None;
+    let _ = s.loo_ratios();
+    assert_eq!(probe.last_refit_live().stage, sim::LiveStage::Other(sim::OtherPass::ActiveSet));
+}
+
 /// 2026-11-15, the refit time estimate (`sim::refit_eta`): a refit that ends with a fit leaves a
 /// record (its samples, species, stages, wall; a failed one none); a background refit publishes its
 /// stages on the probe while it runs and records them at its install; with a collection attached the

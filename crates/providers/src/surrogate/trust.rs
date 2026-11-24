@@ -664,6 +664,7 @@ impl SurrogateKs {
     /// `fit_columns`, computed alone for a deferred fit). 0 without a model or a store.
     fn fit_column_union(&self) -> usize {
         let _prof = surrogate::prof::span("P3 fit_column_union (floor columns)");
+        self.meter_other(sim::OtherPass::Counts);
         let (Some(model), Some(store)) = (self.model.as_ref(), self.store.as_ref()) else { return 0 };
         key_column_counts_c2(&model.basis, store.samples[..self.accumulated.min(store.len())].iter().enumerate().filter(|(i, _)| !self.excluded(*i)).map(|(_, s)| s)).union
     }
@@ -794,6 +795,7 @@ impl SurrogateKs {
     /// the residual rows fail on it.
     pub(super) fn compute_residuals(&self) -> Option<(TrainingResiduals, Misfit)> {
         let _prof = surrogate::prof::span("P3 compute_residuals (training residuals + M)");
+        self.meter_other(sim::OtherPass::Residuals);
         let (model, store) = (self.model.as_ref()?, self.store.as_ref()?);
         let (mut all, mut m) = (Running::ZERO, Misfit { samples: Vec::new(), atoms: Vec::new(), outside: Running::ZERO.worst, fitted: 0, worst: None });
         let mut outside = Running::ZERO;
@@ -1080,12 +1082,14 @@ impl SurrogateKs {
         // touches is set by data the fit cannot reproduce, and leaving M out of q_k would lower the
         // floor it is held to (the union is `fit_column_union`'s, the sample floor)
         let _prof_kc = surrogate::prof::span("P4 class pass: key_column_counts (serial, x1-2)");
+        self.meter_other(sim::OtherPass::Counts);
         let counts = key_column_counts_c2(&model.basis, fitted.iter().filter(|(i, _)| !self.in_misfit(*i)).map(|&(_, s)| s));
         let all_fitted = self.misfit.as_ref().is_some_and(|m| !m.samples.is_empty()).then(|| key_column_counts_c2(&model.basis, fitted.iter().map(|&(_, s)| s)));
         let columns = all_fitted.as_ref().unwrap_or(&counts);
         drop(_prof_kc);
-        let loos = surrogate::loo::leave_one_out_many(model, &fitted.iter().map(|&(_, s)| s).collect::<Vec<_>>());
+        let loos = self.leave_one_out_metered(model, &fitted.iter().map(|&(_, s)| s).collect::<Vec<_>>());
         let _prof_agg = surrogate::prof::span("P4 class pass: serial per-sample aggregation (energy_and_forces, env keys)");
+        self.meter_other(sim::OtherPass::Counts);
         // every fitted sample's leave-one-out ratios, M's included (the recovery ranks every
         // fitted sample, spec 2026-11-12 R1b; `fresh_loo_ratios` matches them to the fit's members)
         let mut sample_ratios: Vec<(usize, f64, f64, Channel)> = Vec::with_capacity(fitted.len());
@@ -1434,8 +1438,13 @@ impl SurrogateKs {
         });
         // the stages (`sim::refit_eta`): a background copy's are read at the install
         self.refit_counts = Some(sim::RefitStages::default());
+        // the refit picture's counters (`sim::refit_live`; display only): the fit's own through a
+        // meter on this thread, the provider's passes through `meter`
+        self.meter = self.probe.clone().or_else(|| self.stage_probe.clone());
+        let _metered = self.meter.clone().map(|p| surrogate::progress::install(Arc::new(super::ProbeMeter(p))));
         let (id_before, coeffs_before) = (self.fit_id, self.model.as_ref().map(coefficient_fingerprint));
         let r = self.refit_inner();
+        self.meter = None;
         // the fit id (spec 2026-11-18 §3): one new id per refit whose standing model holds new
         // coefficients solved from new teacher data — a member at or past the watermark
         // `fit_id_samples` (fix round 1, I1: a forget + restore, a recovery's holds and releases
@@ -1559,6 +1568,7 @@ impl SurrogateKs {
             return;
         }
         let _prof = surrogate::prof::span("P2 ensure_null_space (standing fit)");
+        self.meter_other(sim::OtherPass::NullSpace);
         if let (Some(acc), Some(model)) = (self.accumulator.as_ref(), self.model.as_ref()) {
             self.null_space = Some(NullSpace::of(acc, &model.scale));
         }
@@ -2220,6 +2230,7 @@ impl SurrogateKs {
         // the null space with the trust passes: now, or once for the fit that stands
         // (`ensure_null_space`; the accumulator and the model below are what it is built from)
         if trust_passes {
+            self.meter_other(sim::OtherPass::NullSpace);
             self.null_space = Some(NullSpace::of(&acc, &model.scale));
             self.null_space_pending = false;
         } else {

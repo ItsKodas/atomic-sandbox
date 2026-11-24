@@ -54,6 +54,9 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 ///
 /// `plan=quick|gentle|standard|hot` picks the sampling preset of the first pass.
 ///
+/// `refit=gather|mix|solve|check|trust` shows a made-up running refit at that stage (the refit
+/// picture: in the 3D view while no model stands, the stage strip in Activity's refit card).
+///
 /// `ghost=on|off` switches View ▸ Display aids ▸ show what training is solving (on by default: a
 /// `wait=sampling` shot then shows the geometry the pass is solving, not the scene);
 /// `wait=nudge|scan|burst` is `wait=sampling` until the pass is in that stage (and has finished a
@@ -120,6 +123,10 @@ pub struct ShotUi {
     /// shot of relaxed water).
     pub wait_relax: bool,
     pub training: bool,
+    /// `refit=gather|mix|solve|check|trust`: a made-up running refit at that stage in place of the
+    /// worker's (`ui::refit_picture::demo`: the refit picture in the view while no model stands —
+    /// a GPU or untrained scene — and the stage strip in Activity's refit card).
+    pub refit: Option<String>,
     /// `plan=quick|gentle|standard|hot`: the sampling preset of the first pass.
     pub plan: Option<usize>,
     pub names: Option<crate::names::NameStyle>,
@@ -374,6 +381,12 @@ impl ShotUi {
                     s.rotate = Some((a[0], a[1]));
                 }
                 "load" => s.load = Some(v.to_string()),
+                "refit" => {
+                    if crate::ui::refit_picture::demo(v).is_none() {
+                        return Err(format!("--ui: refit=gather|mix|solve|check|trust, got {v}"));
+                    }
+                    s.refit = Some(v.to_string());
+                }
                 "nuclei" => s.nucleus_scale = Some(v.parse().map_err(|_| format!("--ui: bad value in {kv}"))?),
                 "render" => {
                     s.render = Some(match v {
@@ -486,6 +499,10 @@ impl ShotUi {
     /// Puts the chrome into the requested state (before the frames are rendered).
     fn apply(&self, viewer: &mut Viewer) -> Result<(), String> {
         use crate::ui::{DockTab, ToolMode};
+        // `refit=<stage>`: a made-up running refit in place of the worker's (display only)
+        if let Some(k) = &self.refit {
+            viewer.demo_refit = crate::ui::refit_picture::demo(k);
+        }
         if let Some(p) = self.layout {
             viewer.ui.apply_layout(p);
         }

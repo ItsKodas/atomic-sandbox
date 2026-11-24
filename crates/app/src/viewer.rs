@@ -435,6 +435,9 @@ pub struct Viewer {
     pub label_side: std::cell::RefCell<std::collections::HashMap<(u8, usize, usize, usize), f32>>,
     /// `None` until [`Viewer::start`] (the window has no GPU context before `resumed`).
     pub sim: Option<SimWorker>,
+    /// A made-up running refit shown instead of the worker's (the hidden `--screenshot --ui
+    /// "refit=<stage>"` key, `ui::refit_picture::demo`; display only).
+    pub demo_refit: Option<(sim::RefitView, Vec<f32>)>,
     /// The backend `sim` runs.
     pub backend: Backend,
     /// The render context; the GPU backend runs on a clone of it (same device).
@@ -570,6 +573,7 @@ impl Viewer {
             label_smooth: Default::default(),
             label_side: Default::default(),
             sim: None,
+            demo_refit: None,
             backend: Backend::Cpu,
             gpu: None,
             ui,
@@ -1355,6 +1359,29 @@ impl Viewer {
         }
     }
 
+    /// The live solve state for the chrome (`ui::PanelInput::probe`): the worker's probe, its refit
+    /// replaced by the demo refit when one is set (`demo_refit`).
+    fn probe_view(&self) -> Option<sim::ProbeView> {
+        let p = self.sim.as_ref().map(|w| w.probe().view());
+        match &self.demo_refit {
+            Some((v, _)) => Some(sim::ProbeView { refit: Some(*v), ..p.unwrap_or_default() }),
+            None => p,
+        }
+    }
+
+    /// The running refit's per-sample leave-one-out ratios for the refit picture
+    /// (`ui::PanelInput::refit_ratios`): read once per frame, only while a refit runs.
+    fn refit_ratios(&self, probe: Option<&sim::ProbeView>) -> Vec<f32> {
+        if let Some((_, r)) = &self.demo_refit {
+            return r.clone();
+        }
+        let mut out = Vec::new();
+        if let (Some(w), true) = (self.sim.as_ref(), probe.is_some_and(|p| p.refit.is_some())) {
+            w.probe().refit_ratios(&mut out);
+        }
+        out
+    }
+
     /// One chrome action outside a frame — a replay script's `action` line, the 3D view's keys —
     /// through the same `ui::actions::apply` the widgets' clicks go through, then acted on as
     /// `run_ui` acts on a frame's output.
@@ -1378,7 +1405,8 @@ impl Viewer {
             bonds_label: None,
             stale_bonds_line: None,
             experience_bonds: Vec::new(),
-            probe: self.sim.as_ref().map(|w| w.probe().view()),
+            probe: self.probe_view(),
+            refit_ratios: Vec::new(),
         };
         ui::actions::apply(&mut self.ui, &input, a, &mut out);
         self.act_on(out);
@@ -2933,7 +2961,9 @@ impl Viewer {
             .unwrap_or_default();
         self.ui.edit_group = if self.ui.mode == ui::ToolMode::Edit { self.tool.set(self.scene.nuclei.len()) } else { Vec::new() };
         // the live solve state, read per frame: a long solve publishes no snapshot
-        let probe = self.sim.as_ref().map(|w| w.probe().view());
+        let probe = self.probe_view();
+        // the refit picture's per-sample ratios, once per frame while a refit runs
+        let refit_ratios = self.refit_ratios(probe.as_ref());
         let mut viewport = self.viewport;
         let screen_points = raw.screen_rect.map(|r| r.size());
         self.ui.capture_view = self.capture.view().clone();
@@ -2959,6 +2989,7 @@ impl Viewer {
                     stale_bonds_line: stale_bonds_line.clone(),
                     experience_bonds: experience_bonds.clone(),
                     probe,
+                    refit_ratios: refit_ratios.clone(),
                 },
             );
             if let Some(r) = out.view {
@@ -3013,6 +3044,7 @@ impl Viewer {
                 stale_bonds_line: stale_bonds_line.clone(),
                 experience_bonds: experience_bonds.clone(),
                 probe,
+                refit_ratios: refit_ratios.clone(),
             };
             let ui_state = &mut self.ui;
             let full = wctx.run_ui(wraw, |root| outs.push(ui::show_window(root, ui_state, &input, id)));

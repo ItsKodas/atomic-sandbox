@@ -787,6 +787,10 @@ impl SurrogateKs {
     pub(super) fn recover_trust(&mut self, report: FitReport) -> FitReport {
         let _prof = surrogate::prof::span("P2 recover_trust");
         self.refit_stage(sim::RefitStage::Recovery);
+        // the refit picture: the recovery's basis retries first (round 0), then its quarantine rounds
+        if let Some(p) = &self.meter {
+            p.refit_trust_round(0, QUARANTINE_ROUNDS, self.quarantined());
+        }
         let mut r = self.recovery_steps(report);
         // every exit confirms its fit cold or restores the entry state (a fit already cold): a
         // warm trial standing here is a bug (review M5) — loud in tests and debug builds, and in a
@@ -1002,7 +1006,10 @@ impl SurrogateKs {
         let mut report = report;
         let mut held = Held::NONE;
         let n_store = self.samples();
-        for _ in 0..QUARANTINE_ROUNDS {
+        for round in 0..QUARANTINE_ROUNDS {
+            if let Some(p) = &self.meter {
+                p.refit_trust_round(round + 1, QUARANTINE_ROUNDS, self.quarantined());
+            }
             // the rounds stop on a fit that passes — judged on its cold fit (review I1): a warm
             // trial that passes is searched again from the data, and one that fails cold goes on
             // as main's rounds would, ranking that cold fit's offenders. Should the fit in place
@@ -1372,7 +1379,7 @@ impl SurrogateKs {
             let (model, store) = (self.model.as_ref()?, self.store.as_ref()?);
             let members: Vec<usize> = self.fit_member_indices().collect();
             let samples: Vec<&Sample> = members.iter().map(|&i| &store.samples[i]).collect();
-            let loos = surrogate::loo::leave_one_out_many(model, &samples);
+            let loos = self.leave_one_out_metered(model, &samples);
             let (mut rows, mut tier, mut tier_channel) = (Vec::with_capacity(members.len()), Vec::with_capacity(members.len()), Vec::with_capacity(members.len()));
             for ((&i, s), l) in members.iter().zip(&samples).zip(&loos) {
                 let (own, t, ch) = loo_ratio(&self.policy, model.energy_per_atom, surrogate::energy_row_atoms(&model.basis, &s.pos), s, l.as_ref());
@@ -1439,6 +1446,7 @@ impl SurrogateKs {
     /// fit was built from (the accumulated prefix, none excluded), standardised as the model is.
     pub(super) fn rebuild_active_set(&mut self) {
         let _prof = surrogate::prof::span("P3 rebuild_active_set");
+        self.meter_other(sim::OtherPass::ActiveSet);
         self.ensure_desc_cache();
         let (Some(model), Some(basis)) = (self.model.as_ref(), self.desc_basis.as_ref()) else {
             self.active_set = None;

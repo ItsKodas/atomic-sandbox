@@ -1,6 +1,8 @@
 //! How long a refit will take (2026-11-15, the user's idea: "track how long each refit takes to give
-//! an actual estimate instead of just 'loading…'"). Bookkeeping for the Activity card and the
-//! Model tab's banner only: nothing here reaches a fit or a verdict.
+//! an actual estimate instead of just 'loading…'"). Bookkeeping only: nothing here reaches a fit or
+//! a verdict. Since 2026-11-25 the display words come from the running stage's own counters
+//! ([`crate::refit_live`], the refit picture: the spec has the estimate from the stage counters, not
+//! from the last refits' walls); the history is still recorded and computed here.
 //!
 //! # The history
 //!

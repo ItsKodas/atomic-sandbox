@@ -2405,6 +2405,7 @@ fn the_isotope_choice_round_trips_through_the_worker() {
         stale_bonds_line: None,
         experience_bonds: Vec::new(),
         probe: None,
+        refit_ratios: Vec::new(),
     };
     let mut out = crate::ui::PanelOutput::default();
     crate::ui::actions::apply(&mut st, &inp, crate::ui::Action::SetIsotope { index: 1, a: 2 }, &mut out);

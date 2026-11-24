@@ -831,9 +831,12 @@ impl Accumulator {
         if samples.is_empty() {
             return Ok(());
         }
+        // the refit picture's counter (`crate::progress`; display only)
+        let total = samples.len();
         if !self.basis.body4 {
             for s in samples {
                 self.add(s, basis, ref_energy, opts)?;
+                crate::progress::described(1, total);
             }
             return Ok(());
         }
@@ -868,7 +871,9 @@ impl Accumulator {
                     }
                 }
             }
+            let n = ok.len();
             self.apply_batch(ok, threads);
+            crate::progress::described(n, total);
             if let Some(e) = failed {
                 return Err(e);
             }
@@ -1859,6 +1864,7 @@ impl TwoNoise {
         let gamma_f = trace_product(&inv, &self.g_f, q) * i_f;
         let logdet = cholesky_logdet(&chol, q);
         let m_norm2 = m.iter().map(|v| v * v).sum();
+        crate::progress::decomposition(crate::progress::Decomposition::Solve, q);
         Ok(Solved {
             a,
             chol,
@@ -2011,6 +2017,7 @@ impl TwoNoise {
         let mut converged = false;
         for round in 0..OUTER_ROUNDS {
             iterations = round + 1;
+            crate::progress::search_round(round + 1, self.q);
             lambda = match opts.lambda {
                 Some(l) => l,
                 None => self.lambda_search(s_e2, s_f2)?,
@@ -2112,6 +2119,7 @@ impl TwoNoise {
             c[i + 1] = ss * x + cc * y;
         })
         .map_err(|_| FitError::Singular)?;
+        crate::progress::decomposition(crate::progress::Decomposition::Spectrum, q);
         Ok(Spectrum { rho, h: d, c, mu_floor: 4.0 * q.max(1) as f64 * f64::EPSILON * max_diag })
     }
 
@@ -2145,6 +2153,7 @@ impl TwoNoise {
         let tr_sigma = (0..q).map(|i| inv[i * q + i]).sum();
         let logdet = cholesky_logdet(&chol, q);
         let m_norm2 = m.iter().map(|v| v * v).sum();
+        crate::progress::decomposition(crate::progress::Decomposition::Solve, q);
         Ok((Solved { a, chol, m, rss_e, rss_f, gamma_e, gamma_f, logdet, m_norm2 }, LargeExtra { lambda_eff, tr_sigma, tr_sigma_ge, stalled: false }))
     }
 
@@ -2236,6 +2245,9 @@ impl TwoNoise {
             Ok((lambda, t, ev))
         };
         let mut rho = s_f2_0 / s_e2_0;
+        // the refit picture's counter (`crate::progress`): round 1 is this first profile and the
+        // loop's first solve
+        crate::progress::search_round(1, self.q);
         let (mut lambda, mut t, _) = profile(rho, s_f2_0)?;
         let levels = |rho: f64, t: f64| -> (f64, f64) {
             match (pin_e, pin_f) {
@@ -2250,6 +2262,9 @@ impl TwoNoise {
         let (mut alpha, mut prev_step) = (1.0f64, None);
         for round in 0..OUTER_ROUNDS {
             iterations = round + 1;
+            if round > 0 {
+                crate::progress::search_round(round + 1, self.q);
+            }
             let (s_e2, s_f2) = levels(rho, t);
             let (sol, _) = self.solve_large(lambda, s_e2, s_f2)?;
             let next_e = if pin_e { s_e2 } else { floored(sol.rss_e, self.n_e - sol.gamma_e, self.floor_e2) };
@@ -3512,6 +3527,62 @@ mod tests {
         b.n_max = 4;
         b.l_max = 2;
         b
+    }
+
+    /// The refit picture's counters (`crate::progress`): a metered spectral fit reports every
+    /// sample once, its rounds 1, 2, … as `RefitKind::Spectral` counts them, a spectrum and a solve
+    /// per round on Q′ (the last round's solve, and the final solve at the levels found), and a
+    /// dense search its rounds and Choleskys — and the fits are bit for bit those without a meter.
+    #[test]
+    fn a_metered_fit_counts_its_stages_and_computes_the_same_bits() {
+        use crate::progress::{install, Decomposition, Event, Recorder};
+        use std::sync::Arc;
+        let bits = |m: &Model| {
+            let mut v: Vec<u64> = m.coeffs.iter().flatten().chain(&m.scale).map(|x| x.to_bits()).collect();
+            v.extend(m.sigma_inv_chol.iter().flatten().map(|x| x.to_bits()));
+            v.extend([m.lambda.to_bits(), m.sigma_e.to_bits(), m.sigma_f.to_bits()]);
+            v
+        };
+        let mut rng = StdRng::seed_from_u64(77);
+        let basis = small_body4_basis();
+        let refs = [-0.478, -74.8];
+        let opts = FitOptions::default();
+        let samples = morse_bend_samples(&mut rng, 150);
+        let refs_of: Vec<&Sample> = samples.iter().collect();
+        let fit = || {
+            let mut acc = Accumulator::new(&basis);
+            acc.add_many(&refs_of, &basis, &refs, &opts).unwrap();
+            let (m, r) = acc.refit(&opts, &provenance(), &refs).unwrap();
+            let (d, dr) = acc.solve(&opts, &provenance(), &refs).unwrap();
+            (m, r, d, dr, acc.last_refit())
+        };
+        let (plain, _, plain_dense, _, _) = fit();
+        let rec = Arc::new(Recorder::default());
+        let (metered, metered_r, metered_dense, dense_r, kind) = {
+            let _g = install(rec.clone());
+            fit()
+        };
+        assert_eq!(bits(&plain), bits(&metered), "the spectral fit is bit for bit the same");
+        assert_eq!(bits(&plain_dense), bits(&metered_dense), "the dense fit is bit for bit the same");
+        let ev = rec.events();
+        let described: usize = ev.iter().filter_map(|e| match e { Event::Described { n, total } => { assert_eq!(*total, 150); Some(*n) } _ => None }).sum();
+        assert_eq!(described, 150, "every sample counted once");
+        let q = metered_r.q_prime;
+        let RefitKind::Spectral { rounds, .. } = kind else { panic!("expected a spectral search, got {kind:?}") };
+        // the spectral search's events come before the dense search's first round 1 after them
+        let dense_at = ev.iter().enumerate().filter(|(_, e)| matches!(e, Event::Round { round: 1, .. })).nth(1).map(|(i, _)| i).expect("the dense search starts");
+        let (spectral, dense) = ev.split_at(dense_at);
+        let rounds_seen: Vec<usize> = spectral.iter().filter_map(|e| match e { Event::Round { round, q: qq } => { assert_eq!(*qq, q); Some(*round) } _ => None }).collect();
+        assert_eq!(rounds_seen, (1..=rounds).collect::<Vec<_>>(), "rounds 1..={rounds}");
+        let count = |ev: &[Event], k: Decomposition| ev.iter().filter(|e| matches!(e, Event::Decomposition { kind, q: qq } if *kind == k && *qq == q)).count();
+        // a spectrum per round (the loop's last round ends without one), a solve per round and the final one
+        assert_eq!(count(spectral, Decomposition::Spectrum), rounds, "spectra");
+        assert_eq!(count(spectral, Decomposition::Solve), rounds + 1, "solves");
+        let dense_rounds = dense.iter().filter(|e| matches!(e, Event::Round { .. })).count();
+        // (a second search when s_F fell below its floor: rounds counted again from 1)
+        assert!(dense_rounds >= dense_r.hyper_iterations, "dense rounds {dense_rounds} vs {}", dense_r.hyper_iterations);
+        assert!(count(dense, Decomposition::Solve) > dense_rounds, "the dense search's Choleskys: several per round");
+        assert_eq!(count(dense, Decomposition::Spectrum), 0);
     }
 
     /// The large-basis path (module doc) on a body-4 basis: the spectral search lands on the
