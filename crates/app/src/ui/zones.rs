@@ -331,7 +331,8 @@ fn near(a: Rect, b: Rect, gap: f32) -> bool {
 /// stage word, Pause ↔ Resume) from flipping a form or a row each frame (spec anti-goal).
 pub const HYSTERESIS: f32 = 10.0;
 
-/// Lays the view's overlays out (see the module doc) with no history.
+/// Lays the view's overlays out (see the module doc) with no history (the tests' entry).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn layout(view: Rect, items: &[Item]) -> ViewLayout {
     layout_after(view, items, None)
 }

@@ -648,7 +648,9 @@ fn sampling_card(ctx: &egui::Context, view: Rect, lay: &ViewLayout, input: &Pane
                     }
                     pause_button(ui, p.paused, "sampling-card", acts);
                 }, |ui| {
-                    let stage = format!("{title} · {} {}/{}", crate::ui::activity::words::pass_stage(p), p.done, p.total);
+                    // the count first: a cut takes the stage word, never the count
+                    let paused = if p.paused { " · paused" } else { "" };
+                    let stage = format!("Sampling {}/{}{paused} · {}", p.done, p.total, crate::ui::activity::words::pass_stage(p));
                     ui.add(egui::Label::new(RichText::new(stage).strong()).truncate()).on_hover_ui(|ui| {
                         ui.set_max_width(420.0);
                         dock::progress(ui, p, input.model());
