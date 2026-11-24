@@ -44,6 +44,7 @@ pub mod theme;
 mod toolbar;
 pub mod version;
 mod workspace;
+pub mod zones;
 
 pub use actions::Action;
 /// The Orbitals panel module (its honesty texts and the Harris label are read by the viewer).
@@ -709,8 +710,9 @@ pub struct UiState {
     pub background: Option<[u8; 3]>,
     /// The labels in the 3D view (molecule names, bond lengths, angles): opacity 0–1.
     pub label_opacity: f32,
-    /// The status chip's rect last frame (points): the view's top-centre labels keep clear of it.
-    pub chip_rect: Option<egui::Rect>,
+    /// The 3D view's overlays in their zones (`zones`): the sizes each measured per form, and the
+    /// layout drawn (the viewer's ghost tag takes its top-centre slot from it).
+    pub zones: zones::Zones,
     /// The dots' look (View ▸ Density): floating (a Metropolis walk, `dots_drift` grid cells per
     /// frame), glowing (soft additive sprites), the amount (× the default count), size and brightness.
     pub dots_float: bool,
@@ -1043,7 +1045,7 @@ impl UiState {
             fov_deg: 50.0,
             background: None,
             label_opacity: 1.0,
-            chip_rect: None,
+            zones: Default::default(),
             loading: None,
             timings: Default::default(),
             dots_float: true,
@@ -1484,8 +1486,8 @@ pub fn show(root: &mut egui::Ui, st: &mut UiState, input: &PanelInput<'_>) -> Pa
         st.activity.triples_sent = want;
         out.commands.push(Command::SetTripleView(want));
     }
+    // the overlays of the 3D view, laid out in its zones (the knowledge legend among them)
     overlays::show(root.ctx(), view, st, input, &mut acts);
-    knowledge::legend(root.ctx(), view, st, input);
     search::show(root.ctx(), st, &mut acts);
     menus::help_window(root.ctx(), st);
     files::show(root.ctx(), st, input, &mut acts);

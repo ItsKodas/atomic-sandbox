@@ -2741,18 +2741,32 @@ impl Viewer {
             painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(bg));
             painter.galley(rect.min + egui::vec2(3.0, 3.0), galley, colour);
         };
+        if !lv.capture && self.ghost_now().is_none() {
+            self.ui.zones.tag.set(None);
+        }
         if let Some(g) = self.ghost_now() {
-            // the ghost's label, top centre of the view under the status chip; the scene's molecule labels and badge hide
+            // the ghost's label, in the view's top-centre zone slot (`ui::zones`: the top band when
+            // clear there, else under what is in the way); the scene's molecule labels and badge hide
             let at = to_pos((vp.origin[0] + 0.5 * vp.size[0], vp.origin[1])) + egui::vec2(0.0, 58.0);
             // while a finished job's flash fades its outcome is named, in the solve log's word
             let last = self.ghost.flash(Instant::now()).map(|(f, _)| format!(" · last sample: {}", f.outcome.word())).unwrap_or_default();
-            let galley = painter.layout_no_wrap(format!("training is solving · {}{last}", crate::ghost::stage_line(g)), egui::FontId::proportional(11.5), egui::Color32::from_white_alpha(170));
+            let small = egui::FontId::proportional(11.5);
+            let galley = painter.layout_no_wrap(format!("training is solving · {}{last}", crate::ghost::stage_line(g)), small.clone(), egui::Color32::from_white_alpha(170));
             let main = painter.layout_no_wrap(crate::ghost::label(g), egui::FontId::proportional(14.5), egui::Color32::WHITE);
             let size = egui::vec2(galley.size().x.max(main.size().x), galley.size().y + main.size().y + 2.0);
             let mut rect = egui::Align2::CENTER_TOP.anchor_size(at, size).expand(6.0);
-            // below the status chip when they would overlap (a narrow view)
-            if let Some(chip) = self.ui.chip_rect.filter(|c| !lv.capture && c.intersects(rect.expand(4.0))) {
-                rect = rect.translate(egui::vec2(0.0, chip.bottom() + 10.0 - rect.top()));
+            if !lv.capture {
+                // the zones lay it out at the width of its widest flash ("· last sample: not
+                // finite"), so a flash coming and going never moves it, or anything round it
+                let widest = crate::ghost::outcome_words()
+                    .into_iter()
+                    .map(|w| painter.layout_no_wrap(format!("training is solving · {} · last sample: {w}", crate::ghost::stage_line(g)), small.clone(), egui::Color32::WHITE).size().x)
+                    .fold(size.x, f32::max);
+                self.ui.zones.tag.set(Some(egui::vec2(widest, size.y) + egui::vec2(12.0, 12.0)));
+                // centred in its slot (this frame's layout: the tag's size is a frame late)
+                if let Some(p) = self.ui.zones.layout.get(ui::zones::Slot::CentreTag) {
+                    rect = egui::Rect::from_min_size(egui::pos2(p.rect.center().x - rect.width() / 2.0, p.rect.top()), rect.size());
+                }
             }
             painter.rect_filled(rect, 5.0, egui::Color32::from_black_alpha(175));
             let cx = rect.center().x;

@@ -1510,18 +1510,20 @@ fn histogram(
     resp
 }
 
-/// The overlay's legend card (bottom left of the 3D view, above the view switch), while the
-/// overlay is on.
-pub fn legend(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<'_>) {
+/// The overlay's legend card (bottom-left zone of the 3D view, above the view switch, its slider
+/// rows and the orbital legend: `super::zones`), while the overlay is on. Its note folds to one
+/// line past two (form 0) or always (form 1), with its ⓘ. Returns the card's rect.
+pub fn legend(ctx: &egui::Context, lay: &super::zones::ViewLayout, st: &UiState, input: &PanelInput<'_>) -> Option<Rect> {
+    use super::zones::Slot;
     if !st.show_knowledge {
-        return;
+        return None;
     }
-    // above the view switch, its slider rows, and the orbital legend when that is up
-    let lift = 70.0 + 40.0 * (u8::from(st.camera_view) + u8::from(st.volume_mode == super::VOLUME_DOTS)) as f32 + if st.show != super::ShowMode::Density { 64.0 } else { 0.0 };
     let map = map_of(st, input);
-    egui::Area::new(Id::new("knowledge-legend"))
-        .pivot(Align2::LEFT_BOTTOM)
-        .fixed_pos(pos2(view.left() + 14.0, view.bottom() - lift))
+    let rows = if lay.form(Slot::KnowledgeLegend) == 0 { 2 } else { 1 };
+    let (pivot, at) = lay.pin(Slot::KnowledgeLegend).unwrap_or((Align2::LEFT_BOTTOM, lay.view.left_bottom() + vec2(14.0, -14.0)));
+    let r = egui::Area::new(Id::new("knowledge-legend"))
+        .pivot(pivot)
+        .fixed_pos(at)
         .order(Order::Middle)
         .fade_in(false)
         .show(ctx, |ui| {
@@ -1552,7 +1554,8 @@ pub fn legend(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<
                 }
                 match map.as_deref() {
                     Some(m) => {
-                        theme::note(ui, format!("per atom: its least-known neighbour within {:.1} Bohr — that pair's verdict and how many distances like it were taught", m.r_cut));
+                        let note = format!("per atom: its least-known neighbour within {:.1} Bohr — that pair's verdict and how many distances like it were taught", m.r_cut);
+                        super::overlays::help_line(ui, &note, 11.0, theme::INK_DIM, rows);
                     }
                     None => {
                         ui.add(egui::Label::new(RichText::new("no knowledge map yet: the estimated solver builds it when its model is fitted").size(11.0).color(AMBER)).wrap());
@@ -1560,6 +1563,7 @@ pub fn legend(ctx: &egui::Context, view: Rect, st: &UiState, input: &PanelInput<
                 }
             });
         });
+    Some(r.response.rect)
 }
 
 /// The three-atom map of the tests (Task 6): r_cut 6, reach to 5 Bohr, spans H–H 2.6–3.2 and

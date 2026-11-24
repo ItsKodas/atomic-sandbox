@@ -990,11 +990,38 @@ fn frame_sized(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, size
         events,
         ..Default::default()
     };
-    let mut out = None;
-    let mut full = ctx.run_ui(raw, |root| out = Some(show(root, st, inp)));
+    // every pass's output, as the viewer takes them (a pass egui redoes — `request_discard`, e.g.
+    // a 3D-view overlay that changed size — keeps what the first one sent)
+    let mut out: Option<PanelOutput> = None;
+    let mut full = ctx.run_ui(raw, |root| {
+        let next = show(root, st, inp);
+        out = Some(match out.take() {
+            None => next,
+            Some(first) => merge_passes(first, next),
+        });
+    });
     // the window hands these to the painter; dropping them unapplied trips epaint's debug assertion
     full.textures_delta.clear();
     out.unwrap()
+}
+
+/// Two passes' outputs of one frame as one: the lists joined, the flags or'ed, the later pass's
+/// values where both set one.
+fn merge_passes(mut a: PanelOutput, b: PanelOutput) -> PanelOutput {
+    a.commands.extend(b.commands);
+    a.actions.extend(b.actions);
+    a.windows.extend(b.windows);
+    a.focus_selected |= b.focus_selected;
+    a.toggle_play |= b.toggle_play;
+    a.deselect |= b.deselect;
+    a.restart_for_update |= b.restart_for_update;
+    a.error = b.error.or(a.error);
+    a.view = b.view.or(a.view);
+    a.capture = b.capture.or(a.capture);
+    a.training = b.training.or(a.training);
+    a.switch_scene = b.switch_scene.or(a.switch_scene);
+    a.gpu_memory = b.gpu_memory.or(a.gpu_memory);
+    a
 }
 
 /// Every layout (wide and compact; each panel shown and every panel closed; every menu open; the
@@ -2954,7 +2981,10 @@ fn the_stale_line_is_experiences_when_it_draws() {
 /// User request 2026-11-13: with the bonds stale the 3D view says so in a small line just over the
 /// bottom-right "Solve Bonds", right-aligned with it, inside the view and narrower than the
 /// bottom-centre label's margin, at a wide and a compact width; the Selection panel keeps its note;
-/// a fresh graph has no line; the toasts sit above it.
+/// a fresh graph has no line. Since the view overlay zones (2026-11-24) the line is the second of
+/// the bottom-right stack — a zone gap (6 pt) over the pair, the Orbitals card above it — and the
+/// toasts moved to the bottom-centre stack (spec: toasts above the cards), so the pins below hold
+/// as before: the zones keep the line just over the pair and right-aligned with it.
 #[test]
 fn the_stale_bonds_line_sits_over_bonds_now() {
     let scene = Scene::preset("h2").unwrap();
@@ -2977,7 +3007,12 @@ fn the_stale_bonds_line_sits_over_bonds_now() {
         // right-aligned with its right half
         let (line, button) = (probed_rect("bonds-stale-line"), probed_rect("bonds-now").union(probed_rect("orbitals-now")));
         let view = view.expect("the 3D view");
-        assert!(line.bottom() <= button.top() + 0.5 && button.top() - line.bottom() < 12.0, "{w}: just over the button: {line:?} {button:?}");
+        // just over the pair; on a view too narrow for the line beside the view switch (the
+        // 760-pt window's view) it rises a zone gap past the switch instead of covering it
+        let switch = ctx.memory(|m| m.area_rect(egui::Id::new("view-switch"))).expect("the view switch");
+        let over_switch = (line.bottom() - (switch.top() - zones::GAP)).abs() < 0.5 && line.left() < switch.right();
+        assert!(line.bottom() <= button.top() + 0.5 && (button.top() - line.bottom() < 12.0 || over_switch), "{w}: just over the button: {line:?} {button:?} {switch:?}");
+        assert!(!line.intersects(switch), "{w}: clear of the view switch: {line:?} {switch:?}");
         assert!((line.right() - button.right()).abs() < 2.0, "{w}: right-aligned: {line:?} {button:?}");
         assert!(view.contains_rect(line), "{w}: inside the view {view:?}: {line:?}");
         assert!(line.width() <= overlays::STALE_LINE_WIDTH + 1.0 && line.height() < 50.0, "{w}: small: {line:?}");
@@ -2986,6 +3021,108 @@ fn the_stale_bonds_line_sits_over_bonds_now() {
         PROBES.with(|p| p.borrow_mut().clear());
         frame(&ctx, &mut st, &inp, w, vec![]);
         assert!(PROBES.with(|p| p.borrow().get("bonds-stale-line").is_none()), "{w}: fresh bonds: no line");
+    }
+}
+
+/// The 3D view's overlays drawn at once (spec 2026-11-22, view overlay zones): never two overlapping
+/// and every one inside the view, at the spec's four view sizes — a running pass (its card and the
+/// ghost-free chip, the density label, a toast, the knowledge legend, the Camera and Dots sliders,
+/// the bonds pair with its stale line) and the Orbitals case (the Orbitals card over the pair and
+/// its stale line, a selection's atom card). Prints each overlay's measured size: the pure layout
+/// tests' fixture (`zones::tests::item`) follows them.
+#[test]
+fn the_view_overlays_never_overlap_at_the_four_sizes() {
+    const IDS: [&str; 20] = [
+        "status-chip", "draft-banner", "capture-buttons", "capture-notes", "segment-card", "offer-card", "teach-prompt-card", "atom-card", "view-switch", "camera-sliders",
+        "dots-sliders", "orbital-legend", "knowledge-legend", "sampling-card", "relax-card", "density-label", "toast", "bonds-now", "bonds-stale-line", "orbitals-card",
+    ];
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let mut pass = bonds_snapshot(&scene, Backend::Estimated, true);
+    pass.dynamics.sampling = Some(sim::SamplingProgress { done: 41, total: 273, stage: "scans", last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false, target: None, paused: false });
+    let idle = bonds_snapshot(&scene, Backend::Estimated, true);
+    for (name, snap) in [("training", &pass), ("orbitals", &idle)] {
+        for (w, h) in [(1920.0f32, 1080.0f32), (1186.0, 1280.0), (900.0, 600.0), (560.0, 360.0)] {
+            let ctx = egui::Context::default();
+            apply_theme(&ctx);
+            let mut st = UiState::new("h2", &scene);
+            st.backend = Backend::Estimated;
+            st.apply_layout(super::LayoutPreset::Presenting);
+            let training = name == "training";
+            st.show_knowledge = training;
+            st.camera_view = training;
+            st.volume_mode = super::VOLUME_DOTS;
+            st.status = "paused: the model refits on the new samples — press Play to continue".into();
+            st.status_seq += 1;
+            let mut inp = input(&scene, Some(snap), &cam);
+            inp.density_label = Some("faded: the density is from the last DFT step at t = 12.50 fs, an earlier geometry".into());
+            inp.bonds_label = bonds_label(&snap.dynamics);
+            inp.selected = (!training).then_some(0);
+            // the window that leaves a view of (w, h) under the menus and the toolbar
+            let mut size = egui::vec2(w, h);
+            let mut view = egui::Rect::NOTHING;
+            for _ in 0..3 {
+                view = frame_sized(&ctx, &mut st, &inp, size, vec![]).view.expect("the 3D view");
+                size += egui::vec2(w, h) - view.size();
+            }
+            if !training {
+                st.orbitals_press = Some((std::time::Instant::now(), scene.nuclei.iter().map(|n| n.pos).collect()));
+            }
+            for _ in 0..4 {
+                view = frame_sized(&ctx, &mut st, &inp, size, vec![]).view.expect("the 3D view");
+            }
+            let drawn = |ctx: &egui::Context| -> Vec<(&'static str, egui::Rect)> {
+                IDS.iter()
+                    .filter(|id| ctx.memory(|m| m.areas().visible_last_frame(&egui::LayerId::new(egui::Order::Middle, egui::Id::new(**id))) || m.areas().visible_last_frame(&egui::LayerId::new(egui::Order::Foreground, egui::Id::new(**id)))))
+                    .filter_map(|id| ctx.memory(|m| m.area_rect(egui::Id::new(*id))).map(|r| (*id, r)))
+                    .collect()
+            };
+            let rects = drawn(&ctx);
+            // settled: one more frame draws everything where it was
+            frame_sized(&ctx, &mut st, &inp, size, vec![]);
+            assert_eq!(drawn(&ctx), rects, "{name} {w}x{h}: the last two frames differ");
+            // review 2026-11-24: Pause ↔ Resume on the running pass moves no overlay
+            if training {
+                let mut paused = bonds_snapshot(&scene, Backend::Estimated, true);
+                paused.dynamics.sampling = snap.dynamics.sampling.clone().map(|p| sim::SamplingProgress { paused: true, ..p });
+                let mut pinp = input(&scene, Some(&paused), &cam);
+                pinp.density_label = inp.density_label.clone();
+                pinp.bonds_label = inp.bonds_label.clone();
+                for k in 0..4 {
+                    frame_sized(&ctx, &mut st, if k % 2 == 0 { &pinp } else { &inp }, size, vec![]);
+                    let now = drawn(&ctx);
+                    let moved: Vec<_> = now.iter().zip(&rects).filter(|(a, b)| a != b).collect();
+                    assert!(moved.is_empty(), "{name} {w}x{h}: paused {}: moved {moved:?}", k % 2 == 0);
+                }
+            }
+            for (id, r) in &rects {
+                eprintln!("{name} {w}x{h} (view {:.0}x{:.0}): {id} {:.0}x{:.0}", view.width(), view.height(), r.width(), r.height());
+            }
+            let expect: &[&str] = if training {
+                &["status-chip", "capture-buttons", "view-switch", "camera-sliders", "knowledge-legend", "sampling-card", "density-label", "toast", "bonds-now", "bonds-stale-line"]
+            } else {
+                &["status-chip", "capture-buttons", "view-switch", "atom-card", "density-label", "toast", "bonds-now", "bonds-stale-line", "orbitals-card"]
+            };
+            for id in expect {
+                // at the minimum view the sliders are in their popover (the switch's sliders button)
+                if *id == "camera-sliders" && w < 600.0 {
+                    assert!(PROBES.with(|p| p.borrow().get("view-sliders").is_some()), "{name} {w}x{h}: the sliders button");
+                    continue;
+                }
+                assert!(rects.iter().any(|(i, _)| i == id), "{name} {w}x{h}: {id} is drawn: {rects:?}");
+            }
+            for (k, (a, ra)) in rects.iter().enumerate() {
+                assert!(view.expand(0.5).contains_rect(*ra), "{name} {w}x{h}: {a} {ra:?} leaves the view {view:?}");
+                for (b, rb) in &rects[k + 1..] {
+                    assert!(
+                        !ra.shrink(0.5).intersects(rb.shrink(0.5)),
+                        "{name} {w}x{h}: {a} {ra:?} overlaps {b} {rb:?}; the layout: {:?} (crowded {})",
+                        st.zones.layout.rects().map(|(s, r)| (s, r, st.zones.layout.form(s))).collect::<Vec<_>>(),
+                        st.zones.layout.crowded
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -7588,8 +7725,14 @@ fn the_profile_keeps_the_layout() {
 /// One 1400 × 900 frame at input time `time` (s): the auto-hide timers run on egui's input time.
 fn frame_at(ctx: &egui::Context, st: &mut UiState, inp: &PanelInput<'_>, time: f64, events: Vec<egui::Event>) -> PanelOutput {
     let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0))), time: Some(time), events, ..Default::default() };
-    let mut out = None;
-    let mut full = ctx.run_ui(raw, |root| out = Some(show(root, st, inp)));
+    let mut out: Option<PanelOutput> = None;
+    let mut full = ctx.run_ui(raw, |root| {
+        let next = show(root, st, inp);
+        out = Some(match out.take() {
+            None => next,
+            Some(first) => merge_passes(first, next),
+        });
+    });
     full.textures_delta.clear();
     out.unwrap()
 }
@@ -9311,8 +9454,14 @@ mod triple_map {
         for _ in 0..3 {
             PROBES.with(|p| p.borrow_mut().clear());
             let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, TALL)), ..Default::default() };
-            let mut o = None;
-            let mut full = ctx.run_ui(raw, |root| o = Some(show(root, st, inp)));
+            let mut o: Option<PanelOutput> = None;
+            let mut full = ctx.run_ui(raw, |root| {
+                let next = show(root, st, inp);
+                o = Some(match o.take() {
+                    None => next,
+                    Some(first) => merge_passes(first, next),
+                });
+            });
             full.textures_delta.clear();
             out.clear();
             full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
