@@ -18,11 +18,12 @@
 //! | `history.bin` | the audit history ([`AuditHistory::encode`]); one written by a newer build (`crate::history::written_by_newer_build`) is never overwritten: the open starts an empty history and says so, and [`Collection::save_history`] leaves the file as it is (trust-tightening plan, Review Focus 1); one that is damaged is replaced at the next save |
 //! | `README.txt` | what it knows, for people: species, pairs, counts, scenes ([`Collection::write_readme`]) |
 //! | `refit_times.csv` | the provider's refit history, for the time estimate only ([`Collection::save_refit_times`]; its format is `sim::refit_eta`'s — the collection stores the text) |
+//! | `fit_choice.txt` | the degree cap the provider's trust recovery last kept, with the provider's fingerprint of the store state it was kept for ("The remembered fit choice" below; [`fit_choice_to_text`]); absent until a recovery's cap retry stands |
 //! | `.lock` | the owning process id while a writer has it open |
 //! | `samples.bin.dropped-<n>` | the bytes a damaged tail held, set aside when it was cut (never deleted) |
 //! | `samples.bin.bak` | the samples file as it was before the last purge ([`Collection::purge`]; replaced by the next purge) |
 //!
-//! `references.txt`, `history.bin` and `refit_times.csv` are rewritten whole through a temporary file renamed into
+//! `references.txt`, `history.bin`, `refit_times.csv` and `fit_choice.txt` are rewritten whole through a temporary file renamed into
 //! place; `samples.bin` is only ever appended to (or cut back to its last whole record after a
 //! crash, below) — except by the user's **purge** of forgotten samples (below), which rewrites it.
 //!
@@ -88,6 +89,17 @@
 //! for an element the fit lacks is refused (W must be relearnt). The provider's lifecycle — when W
 //! is learnt and relearnt — is `providers::surrogate`'s ("Chemical channels: which species are
 //! represented").
+//!
+//! # The remembered fit choice (2026-11-25)
+//!
+//! **`fit_choice.txt`** ([`FitChoice`], [`fit_choice_to_text`], [`fit_choice_from_text`];
+//! [`Collection::save_fit_choice`], [`Collection::read_fit_choice`]) is three lines —
+//! `fit_choice <version>` ([`FIT_CHOICE_VERSION`] 1), `key <16 hex digits>`, `degree_cap <n>`: the
+//! degree cap the provider's trust recovery kept at a refit, and the provider's fingerprint of the
+//! store state it kept it for (`providers::surrogate`'s `fit_choice` module doc says what the
+//! fingerprint covers and how the next refit uses it). A hint, never data: a missing, damaged or
+//! other-version file is no memory (the provider runs its full recovery), and the file is replaced
+//! whole. A new file, so no existing format moved: a build before it ignores the file.
 //!
 //! # Record versions
 //!
@@ -696,6 +708,51 @@ pub const WHOLE_FILE: usize = usize::MAX;
 
 /// The refit history's file in a collection's folder (module doc).
 pub const REFIT_TIMES_FILE: &str = "refit_times.csv";
+
+/// The remembered fit choice's file in a collection's folder (module doc, "The remembered fit
+/// choice").
+pub const FIT_CHOICE_FILE: &str = "fit_choice.txt";
+/// The version of [`FIT_CHOICE_FILE`]'s format this build writes and reads (a file of another
+/// version is no memory: the full trust recovery runs, and the next choice overwrites it).
+pub const FIT_CHOICE_VERSION: u32 = 1;
+
+/// A fit choice the provider's trust recovery settled on, remembered with the collection (module
+/// doc, "The remembered fit choice"): the degree cap the recovery's first step kept, for the
+/// store state `key` names (the provider's fingerprint of everything that decides that step; the
+/// collection stores it and never reads it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FitChoice {
+    /// The provider's fingerprint of the fit's inputs at the refit's start.
+    pub key: u64,
+    /// The body-3 degree cap the recovery kept.
+    pub degree_cap: usize,
+}
+
+/// [`FIT_CHOICE_FILE`]'s text for `c`.
+pub fn fit_choice_to_text(c: &FitChoice) -> String {
+    format!("fit_choice {FIT_CHOICE_VERSION}\nkey {:016x}\ndegree_cap {}\n", c.key, c.degree_cap)
+}
+
+/// Reads [`fit_choice_to_text`]'s form: exactly its three lines, this version only.
+pub fn fit_choice_from_text(text: &str) -> Result<FitChoice, String> {
+    let mut lines = text.lines().map(|l| l.trim_end_matches('\r'));
+    let mut field = |name: &str| -> Result<String, String> {
+        let l = lines.next().ok_or_else(|| format!("{FIT_CHOICE_FILE}: no '{name}' line"))?;
+        l.strip_prefix(name).and_then(|v| v.strip_prefix(' ')).map(str::to_string).ok_or_else(|| format!("{FIT_CHOICE_FILE}: '{l}' is not a '{name}' line"))
+    };
+    let version = field("fit_choice")?;
+    if version != FIT_CHOICE_VERSION.to_string() {
+        return Err(format!("{FIT_CHOICE_FILE} version {version} was written by another build (this build reads version {FIT_CHOICE_VERSION})"));
+    }
+    let key = field("key")?;
+    let key = u64::from_str_radix(&key, 16).map_err(|e| format!("{FIT_CHOICE_FILE}: key '{key}': {e}"))?;
+    let cap = field("degree_cap")?;
+    let degree_cap = cap.parse::<usize>().map_err(|e| format!("{FIT_CHOICE_FILE}: degree_cap '{cap}': {e}"))?;
+    if let Some(extra) = lines.find(|l| !l.is_empty()) {
+        return Err(format!("{FIT_CHOICE_FILE}: unexpected line '{extra}'"));
+    }
+    Ok(FitChoice { key, degree_cap })
+}
 
 const REC_HEADER: u8 = 0;
 const REC_SAMPLE: u8 = 1;
@@ -2060,6 +2117,39 @@ impl Collection {
         write_atomic(&path, text.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
     }
 
+    /// The remembered fit choice (`fit_choice.txt`; module doc, "The remembered fit choice"):
+    /// `Ok(None)` without the file (or for a detached view), `Err` when it cannot be read or was
+    /// written by another build — the caller then holds no memory.
+    pub fn read_fit_choice(&self) -> Result<Option<FitChoice>, String> {
+        if self.folder.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        match std::fs::read_to_string(self.folder.join(FIT_CHOICE_FILE)) {
+            Ok(text) => fit_choice_from_text(&text).map(Some),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{}: {e}", self.folder.join(FIT_CHOICE_FILE).display())),
+        }
+    }
+
+    /// Writes `c` to `fit_choice.txt` (module doc), replacing any earlier one; refused when
+    /// read-only.
+    pub fn save_fit_choice(&self, c: &FitChoice) -> Result<(), String> {
+        self.writable()?;
+        let path = self.folder.join(FIT_CHOICE_FILE);
+        write_atomic(&path, fit_choice_to_text(c).as_bytes()).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Removes `fit_choice.txt` (a remembered choice whose fit no longer passed); `Ok` when there
+    /// is none; refused when read-only.
+    pub fn clear_fit_choice(&self) -> Result<(), String> {
+        self.writable()?;
+        let path = self.folder.join(FIT_CHOICE_FILE);
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(format!("{}: {e}", path.display())),
+            _ => Ok(()),
+        }
+    }
+
     /// Writes [`history`](Self::history) to `history.bin` — except over a newer build's
     /// `history.bin` (module doc), which it leaves as it is: `Ok` without writing (the open said so
     /// in its report).
@@ -2423,6 +2513,45 @@ mod tests {
         drop((c, other));
         let (c, _) = Collection::open(&dir, &key).unwrap();
         assert_eq!(c.read_refit_times().as_deref(), Some("c\n"));
+    }
+
+    /// The remembered fit choice (module doc, "The remembered fit choice"): none at first, replaced
+    /// whole, read back after a reopen, refused by a read-only handle; a file of another version, a
+    /// damaged one or one with a stray line is an error (no memory), never a guess.
+    #[test]
+    fn the_fit_choice_round_trips_and_a_foreign_one_is_no_memory() {
+        let dir = root("fit_choice");
+        let key = prov().surface_key();
+        let (c, _) = Collection::open(&dir, &key).unwrap();
+        assert_eq!(c.read_fit_choice(), Ok(None));
+        let a = FitChoice { key: 0x0123_4567_89ab_cdef, degree_cap: 6 };
+        let b = FitChoice { key: u64::MAX, degree_cap: 6 };
+        c.save_fit_choice(&a).unwrap();
+        assert_eq!(fit_choice_to_text(&a), "fit_choice 1\nkey 0123456789abcdef\ndegree_cap 6\n");
+        c.save_fit_choice(&b).unwrap();
+        assert_eq!(c.read_fit_choice(), Ok(Some(b)));
+        let (other, _) = Collection::open(&dir, &key).unwrap();
+        assert!(other.read_only);
+        assert_eq!(other.read_fit_choice(), Ok(Some(b)));
+        assert!(other.save_fit_choice(&a).is_err());
+        drop((c, other));
+        let (c, _) = Collection::open(&dir, &key).unwrap();
+        assert_eq!(c.read_fit_choice(), Ok(Some(b)));
+        c.clear_fit_choice().unwrap();
+        assert_eq!(c.read_fit_choice(), Ok(None));
+        c.clear_fit_choice().unwrap();
+        assert_eq!(fit_choice_from_text("fit_choice 1\r\nkey 0123456789abcdef\r\ndegree_cap 6\r\n"), Ok(a), "CRLF reads");
+        for bad in [
+            "fit_choice 2\nkey 0123456789abcdef\ndegree_cap 6\n",
+            "fit_choice 1\nkey 01234567zz\ndegree_cap 6\n",
+            "fit_choice 1\nkey 0123456789abcdef\n",
+            "fit_choice 1\nkey 0123456789abcdef\ndegree_cap 6\nextra 1\n",
+            "",
+        ] {
+            assert!(fit_choice_from_text(bad).is_err(), "{bad:?}");
+        }
+        std::fs::write(dir.join(key.slug()).join(FIT_CHOICE_FILE), "fit_choice 2\nkey 0\ndegree_cap 6\n").unwrap();
+        assert!(c.read_fit_choice().is_err(), "another build's file is no memory");
     }
 
     /// `set_status` writes only a code a collection holds (`is_persisted_code`: 0–3, 7, 8) — the draft code 4, the

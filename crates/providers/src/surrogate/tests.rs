@@ -11984,6 +11984,9 @@ mod recovery_loo;
 /// (`recovery_warm.rs`).
 mod recovery_warm;
 
+/// 2026-11-25: the trust recovery's cap retry remembered with the collection (`fit_choice.rs`).
+mod fit_choice;
+
 /// Spec 2026-11-12 R2: forget and restore one sample, the Model tab's worst-fitting list (`forget.rs`).
 mod forget;
 

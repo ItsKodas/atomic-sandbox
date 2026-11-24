@@ -28,6 +28,12 @@ pub const QUARANTINE_FRACTION: f64 = 0.1;
 /// The body-3 degree cap the first recovery step retries with (the bent-molecule setting).
 pub const RECOVERY_DEGREE_CAP: usize = 6;
 
+/// The recovery note of step 1's cap retry when it stands (`recover_trust`); the remembered fit
+/// choice (`fit_choice` module doc) reads it to know that step 1 is what stood.
+pub(super) fn cap_retry_note() -> String {
+    format!("refit with degree_cap {RECOVERY_DEGREE_CAP} (the bent-molecule setting) restored the training residuals")
+}
+
 /// Fence voting (Task 9 fix round 1, I3): this many mutually consistent fresh teacher answers
 /// inside a quarantine fence that all disagree with the model keep one of them for the fit…
 pub const FENCE_VOTES: usize = 3;
@@ -826,7 +832,7 @@ impl SurrogateKs {
                 // would pay a confirmation on top
                 match self.fit_store_deferred() {
                     Ok(r) if self.recovered() => {
-                        self.recovery = Some(format!("refit with degree_cap {RECOVERY_DEGREE_CAP} (the bent-molecule setting) restored the training residuals"));
+                        self.recovery = Some(cap_retry_note());
                         return r;
                     }
                     _ => self.restore_state(saved),
@@ -911,7 +917,7 @@ impl SurrogateKs {
 
     /// The trust recovery's verdict on a fit (steps 1, 1b, 3 and the rankings' fallback): the
     /// training residuals and the noise pass, and the trust rule's counts hold.
-    fn recovered(&self) -> bool {
+    pub(super) fn recovered(&self) -> bool {
         !self.recoverable_fail() && !self.trust_needs_samples()
     }
 

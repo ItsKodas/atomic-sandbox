@@ -41,7 +41,7 @@ pub use fit::{
     fit, Accumulator, FitError, FitOptions, FitReport, RefitKind, Sample, SampleStore, SampleTag, SearchStart, StoreError, Sums,
 };
 pub use model::{energy_and_forces, Model, Prediction, Provenance, SupportCache, SurfaceKey};
-pub use collection::{BasisKind, Collection, CollectionReference, REFIT_TIMES_FILE, CollectionSample, ImportReport, OpenReport, PurgeOutcome, ReferenceOutcome};
+pub use collection::{BasisKind, Collection, CollectionReference, FitChoice, FIT_CHOICE_FILE, REFIT_TIMES_FILE, CollectionSample, ImportReport, OpenReport, PurgeOutcome, ReferenceOutcome};
 pub use grade::ActiveSet;
 pub use history::{AuditHistory, AuditPoint, EnvKey, PointFlags, HISTORY_CAP};
 pub use novelty::NullSpace;

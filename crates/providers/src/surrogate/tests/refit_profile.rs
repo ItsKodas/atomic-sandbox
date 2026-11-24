@@ -217,7 +217,10 @@ fn refit_profile() {
             // coordinator's question: does the launch refit relearn W?): a writable temporary copy
             // of COLLECTION_DIR, a first provider learns W and writes it, then a fresh provider
             // attaches the copy as a launch does and refits; the notes and the stage table say
-            // whether the W learn ran
+            // whether the W learn ran. Since 2026-11-25 the first refit also remembers the trust
+            // recovery's cap (`fit_choice.txt`), which the launch fits first; it prints whether the
+            // launch stands where the first refit stood, bit for bit. `CHANNELS_LAUNCH_FORGET=1`
+            // removes the file before the launch (the full recovery from the default basis)
             "channels_launch" => {
                 let k: usize = std::env::var("CHANNELS_K").map_or(3, |v| v.parse().unwrap());
                 let src = std::path::PathBuf::from(std::env::var("COLLECTION_DIR").unwrap());
@@ -239,7 +242,16 @@ fn refit_profile() {
                     assert!(!c.read_only, "the temporary copy is writable");
                     c
                 };
-                {
+                // what a launch refit leaves standing (the remembered fit choice, 2026-11-25: the
+                // launch that reuses the cap must stand where the one that found it stands)
+                let standing = |s: &mut SurrogateKs| {
+                    let m = s.model.as_ref().unwrap();
+                    let coeffs: Vec<u64> = m.coeffs.iter().flatten().map(|x| x.to_bits()).collect();
+                    let codes: Vec<u8> = (0..s.samples()).map(|i| s.quarantine.get(i).copied().unwrap_or(Q_NONE)).collect();
+                    let loo: Vec<(usize, u64)> = s.loo_ratios().unwrap_or(&[]).iter().map(|&(i, r)| (i, r.to_bits())).collect();
+                    (s.report().cloned(), coeffs, codes, s.degree_cap, s.trusted(), s.trust_checks(), s.untrusted_reason(), s.training_residuals(), s.misfit().cloned(), loo)
+                };
+                let first = {
                     let mut s = provider();
                     s.attach_refit_off = true;
                     s.attach(open()).unwrap();
@@ -249,18 +261,30 @@ fn refit_profile() {
                         println!("  note: {n}");
                     }
                     dump(&format!("(l1) channels K = {k}: the first refit, W learnt and written"), wall, &s);
-                }
+                    println!("  remembered fit choice after it: {:?}", s.shared.as_ref().unwrap().fit_choice);
+                    standing(&mut s)
+                };
                 assert!(dst.join("channels.txt").exists(), "W written to the copy");
+                println!("  fit_choice.txt: {:?}", std::fs::read_to_string(dst.join(surrogate::FIT_CHOICE_FILE)).ok());
+                // `CHANNELS_LAUNCH_FORGET`: the launch without the remembered choice (the full
+                // recovery from the default basis, as before 2026-11-25) — the "before" time
+                if std::env::var("CHANNELS_LAUNCH_FORGET").is_ok() {
+                    let _ = std::fs::remove_file(dst.join(surrogate::FIT_CHOICE_FILE));
+                    println!("  CHANNELS_LAUNCH_FORGET: fit_choice.txt removed before the launch");
+                }
                 let mut s = provider();
                 s.attach_refit_off = true;
                 s.attach(open()).unwrap();
                 println!("  attached: W read from channels.txt: {}", s.shared.as_ref().unwrap().mix.is_some());
+                println!("  attached: fit choice read: {:?}, this start's key {:?}", s.shared.as_ref().unwrap().fit_choice, s.fit_choice_entry());
                 surrogate::prof::reset();
                 let wall = refit_timed(&mut s);
                 for n in s.user_notes.drain(..) {
                     println!("  note: {n}");
                 }
                 dump(&format!("(l2) channels K = {k}: the launch refit (W on file)"), wall, &s);
+                let second = standing(&mut s);
+                println!("  the launch refit stands where the first refit stood, bit for bit: {}", first == second);
                 let _ = std::fs::remove_dir_all(&root);
             }
             other => panic!("unknown run {other}"),
