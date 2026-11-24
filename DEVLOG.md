@@ -1389,7 +1389,10 @@ review: 0 Critical, 0 Important, 8 Minor, all fixed. The app gate passes 795 tes
   - The test collection has no many-body environment with three distinct species. So it shows the channels **dropping** species that have no many-body data, not several elements **sharing** a channel.
   - The HOCl-type case, where only 3b refuses, is pinned only by a synthetic test.
   - Review items M7 (no cancel in the W learn), M8 (the C2 shadow count's cost per refit; not timed separately, it sits inside the 54–57 s) and M9 (a purged species' mix row) stay open.
-- **Gates (Task 7):** see the plan's Task 7 for the app, providers and validate surrogate runs.
+- **Gates (Task 7, with the default flipped and main's view overlay zones merged in):**
+  - app 858 passed, 0 failed (with the replays; 859 with `surface_reconfigure`);
+  - providers 642 passed, 1 failed: the known environmental `ks::tests::the_level_gated_stall_stop_on_the_measured_cases`;
+  - validate surrogate 10 passed, 1 failed, 5 ignored: the pre-existing `the_stuck_escape_repro_is_answered_honestly`, with the same rms 0.411 as on main.
 
 ### Process wins
 

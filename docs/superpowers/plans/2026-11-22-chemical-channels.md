@@ -166,5 +166,10 @@ The spec's section "Physics review, 2026-11-22: binding changes" (C1, C2, I1–I
 
 - [x] **Step 0 (2026-11-25, after the T7 PASS):** Channels K = 3 is the default for new collections. `sim::ModelBasis::default()` is `Channels(CHANNELS_K)`; the UI state, the worker and the viewer's re-send of a non-default choice all follow it. The Model tab lists Channels first and keeps Species. The UI test pins the new default and its reason. Replays, screenshots and `Scene::preset` paths run without a collections folder, so the default does not reach them. The provider's own `collection_basis` still starts at Species for the providers and validate tests. No old collection is migrated or deleted.
 - [ ] **Step 1:** preview build: a fresh channel collection, plus a copy of the user's real collection opened as a channel collection for the comparison.
-- [ ] **Step 2:** `validate --test surrogate` (the key trust tests; the stuck-escape failure is pre-existing); the full app and full providers runs.
-- [ ] **Step 3:** README, DEVLOG and dev-reference updated; merge; push.
+- [x] **Step 2:** `validate --test surrogate` (the key trust tests; the stuck-escape failure is pre-existing); the full app and full providers runs.
+  - Runs of 2026-11-25, with the Channels default and main's view overlay zones merged in, at BelowNormal and `-j 4`, one heavy job at a time:
+    - `-p app`: 858 passed, 0 failed, 4 ignored, plus `surface_reconfigure` 1 passed. 17.5 min. The run before the merge, on the flip alone, gave 847 / 0.
+    - `-p providers`: 642 passed, 1 failed, 34 ignored, in 10.6 min. The failure is the known environmental `ks::tests::the_level_gated_stall_stop_on_the_measured_cases`.
+    - `validate --test surrogate`: 10 passed, 1 failed, 5 ignored, in 27 min. The failure is the pre-existing `the_stuck_escape_repro_is_answered_honestly`: refused steps at rms 0.411 of the bound, as on main.
+  - Review M8 (the C2 shadow count's cost per refit) is not measured separately. No existing log times it; it is inside T7's 54–57 s end-to-end channel refit.
+- [ ] **Step 3:** README, DEVLOG and dev-reference updated (done 2026-11-25, with the default flip); merge; push. Merge and push are the coordinator's.
