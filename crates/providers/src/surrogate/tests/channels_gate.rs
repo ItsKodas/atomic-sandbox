@@ -42,18 +42,21 @@ use surrogate::loo::{design_rows, forward_many};
 use surrogate::{Basis, ChannelMix, Model, Provenance};
 
 /// The provider's fitted set and what a fit of it needs.
-struct Data {
-    samples: Vec<Sample>,
+pub(super) struct Data {
+    pub(super) samples: Vec<Sample>,
     /// (scene, formula, origin tag, box) per sample, in collection order.
-    meta: Vec<(String, String, String, usize)>,
-    species: Vec<u8>,
-    refs: Vec<f64>,
+    pub(super) meta: Vec<(String, String, String, usize)>,
+    /// Per sample, its index in the collection (= the attached store's): T7 (`channels_decisions`)
+    /// drops the held-out samples from the collection by it.
+    pub(super) store_idx: Vec<usize>,
+    pub(super) species: Vec<u8>,
+    pub(super) refs: Vec<f64>,
     opts: FitOptions,
     prov: Provenance,
     r_cut: f64,
 }
 
-fn load() -> Data {
+pub(super) fn load() -> Data {
     let mut s = provider();
     s.attach_refit_off = true;
     s.attach(open_copy()).unwrap();
@@ -69,6 +72,7 @@ fn load() -> Data {
     let opts = FitOptions { sigma_f_min: crate::surrogate::policy::force_noise_prior(&prov.ionic), ..FitOptions::default() };
     let mut samples = Vec::new();
     let mut meta = Vec::new();
+    let mut store_idx = Vec::new();
     let mut held = BTreeMap::<u8, usize>::new();
     for i in 0..store.len() {
         if s.excluded(i) {
@@ -77,6 +81,7 @@ fn load() -> Data {
         }
         let cs = &coll.samples[i];
         samples.push(store.samples[i].clone());
+        store_idx.push(i);
         meta.push((cs.scene.clone(), crate::surrogate::shared::formula(&cs.sample.z), format!("{:?}", cs.sample.tag), cs.grid_n));
     }
     println!(
@@ -86,11 +91,11 @@ fn load() -> Data {
         basis.r_cut,
         opts.sigma_f_min
     );
-    Data { samples, meta, species, refs, opts, prov, r_cut: basis.r_cut }
+    Data { samples, meta, store_idx, species, refs, opts, prov, r_cut: basis.r_cut }
 }
 
 /// The groups (module doc, step 1): group id per sample.
-fn groups(d: &Data, block: usize) -> Vec<usize> {
+pub(super) fn groups(d: &Data, block: usize) -> Vec<usize> {
     let mut g = Vec::with_capacity(d.samples.len());
     let mut id = 0;
     let mut run_len = 0;
@@ -109,7 +114,7 @@ fn groups(d: &Data, block: usize) -> Vec<usize> {
 }
 
 /// The 80/20 split by group, stratified by formula (module doc, step 1): `true` = held out.
-fn split(d: &Data, g: &[usize], seed: u64) -> Vec<bool> {
+pub(super) fn split(d: &Data, g: &[usize], seed: u64) -> Vec<bool> {
     let mut by_formula: BTreeMap<&str, BTreeMap<usize, usize>> = BTreeMap::new();
     for (i, m) in d.meta.iter().enumerate() {
         *by_formula.entry(&m.1).or_default().entry(g[i]).or_default() += 1;
@@ -283,7 +288,7 @@ fn quantile(v: &[f64], p: f64) -> f64 {
     s[lo] + (s[hi] - s[lo]) * (x - lo as f64)
 }
 
-fn symbol(z: u8) -> &'static str {
+pub(super) fn symbol(z: u8) -> &'static str {
     match z {
         1 => "H",
         3 => "Li",
