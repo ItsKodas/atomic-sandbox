@@ -19,7 +19,7 @@ use super::*;
 use surrogate::Collection;
 
 fn open_copy() -> Collection {
-    let dir = std::path::PathBuf::from(std::env::var("COLLECTION_DIR").expect("COLLECTION_DIR names a collection folder copy"));
+    let dir = collection_dir_copy();
     let key = surrogate::SurfaceKey::from_text(&std::fs::read_to_string(dir.join("key.txt")).unwrap()).unwrap();
     let (mut c, _) = surrogate::Collection::open(dir.parent().unwrap(), &key).unwrap();
     c.read_only = true;

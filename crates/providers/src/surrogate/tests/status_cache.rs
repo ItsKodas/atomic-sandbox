@@ -151,7 +151,7 @@ fn status_cost_on_a_collection() {
     // the pseudopotential gate's disk cache (the app's `cache\pseudo`, or a copy): without it the
     // first `All`-policy provenance generates the H pseudopotential on the CPU (tens of minutes)
     crate::pseudo::set_disk_cache(std::env::var_os("PSEUDO_DIR").map(std::path::PathBuf::from));
-    let dir = std::path::PathBuf::from(std::env::var("COLLECTION_DIR").expect("COLLECTION_DIR"));
+    let dir = collection_dir_copy();
     let key = surrogate::SurfaceKey::from_text(&std::fs::read_to_string(dir.join("key.txt")).unwrap()).unwrap();
     let (mut c, _) = surrogate::Collection::open(dir.parent().unwrap(), &key).unwrap();
     c.read_only = true;

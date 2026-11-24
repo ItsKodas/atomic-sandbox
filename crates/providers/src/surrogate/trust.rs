@@ -1507,6 +1507,29 @@ impl SurrogateKs {
         // a channel collection's W: learnt or relearnt when due (`represent` module doc, "The
         // lifecycle"); a no-op for the species basis
         self.channel_lifecycle();
+        // the remembered fit choice (`fit_choice` module doc): this start's key when its
+        // conditions hold, and the remembered cap's fit standing in for step 1 when it matches
+        let choice_key = self.fit_choice_entry();
+        let mut report = match choice_key.and_then(|key| self.remembered_fit(key)) {
+            Some(r) => r,
+            None => self.fits_from_default(choice_key)?,
+        };
+        // the held-out draft guesses strict mode's domain now reaches: judged, promoted, refitted
+        if self.judge_held_out() > 0 {
+            report = self.fit_store_deferred()?;
+            if self.recoverable_fail() && !self.recovery_skipped() {
+                report = self.recover_trust(report);
+            }
+        }
+        Ok(report)
+    }
+
+    /// [`refit_fits`](Self::refit_fits) up to its held-out guesses on the full path: the fit (on
+    /// the standing cap, the default basis at a launch), the fence votes, the release and the
+    /// trust recovery. With `choice_key` (the start met the remembered choice's conditions:
+    /// `fit_choice` module doc) a recovery whose step 1 stands — after votes and a release that
+    /// did nothing — is remembered with the collection.
+    pub(super) fn fits_from_default(&mut self, choice_key: Option<u64>) -> Result<FitReport, FitError> {
         // a W staged by the lifecycle is committed only once its first fit stands (review I1)
         let mut report = match self.fit_store_deferred() {
             Ok(r) => {
@@ -1538,12 +1561,8 @@ impl SurrogateKs {
         }
         if self.recoverable_fail() && !self.recovery_skipped() {
             report = self.recover_trust(report);
-        }
-        // the held-out draft guesses strict mode's domain now reaches: judged, promoted, refitted
-        if self.judge_held_out() > 0 {
-            report = self.fit_store_deferred()?;
-            if self.recoverable_fail() && !self.recovery_skipped() {
-                report = self.recover_trust(report);
+            if let Some(key) = choice_key.filter(|_| rejected == 0 && released == 0) {
+                self.note_fit_choice(key);
             }
         }
         Ok(report)
@@ -1552,11 +1571,11 @@ impl SurrogateKs {
     /// Tests only: the refit runs no trust recovery (`skip_recovery`), so the misfit set is tested
     /// on the fit as it comes.
     #[cfg(test)]
-    fn recovery_skipped(&self) -> bool {
+    pub(super) fn recovery_skipped(&self) -> bool {
         self.skip_recovery
     }
     #[cfg(not(test))]
-    fn recovery_skipped(&self) -> bool {
+    pub(super) fn recovery_skipped(&self) -> bool {
         false
     }
 

@@ -2662,8 +2662,9 @@ fn trust_tightening_go_no_go_report() {
     let copy = copy_root.join(SLUG);
     let _ = std::fs::remove_dir_all(&copy);
     std::fs::create_dir_all(&copy).unwrap();
+    // (and not the remembered fit choice: the copy's refits run the full trust recovery)
     for (name, ..) in &before {
-        if name != ".lock" {
+        if name != ".lock" && name != surrogate::FIT_CHOICE_FILE {
             std::fs::copy(source.join(name), copy.join(name)).unwrap();
         }
     }

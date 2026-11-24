@@ -2829,7 +2829,7 @@ fn kappa_tail_of_a_collection_history() {
 #[test]
 #[ignore = "diagnosis: COLLECTION_DIR=<copy of a collection folder> cargo test -p providers --release lambda_before_after -- --ignored --nocapture"]
 fn lambda_before_after_on_a_collection() {
-    let dir = std::path::PathBuf::from(std::env::var("COLLECTION_DIR").expect("COLLECTION_DIR names a collection folder copy"));
+    let dir = collection_dir_copy();
     let key = surrogate::SurfaceKey::from_text(&std::fs::read_to_string(dir.join("key.txt")).unwrap()).unwrap();
     let (c, _) = surrogate::Collection::open(dir.parent().unwrap(), &key).unwrap();
     let mut s = SurrogateKs::new(Box::new(StubKsGpu), FallbackPolicy::default()).with_teacher_tol(1e-6);
@@ -9903,6 +9903,25 @@ impl Drop for CollectionRoot {
     }
 }
 
+/// `COLLECTION_DIR` for the `#[ignore]`d harnesses (a copy of a collection folder), with the copy's
+/// remembered fit choice (`fit_choice.txt`, the `fit_choice` module doc) removed, so a refit there
+/// runs the full trust recovery as the harness's numbers assume; `KEEP_FIT_CHOICE=1` keeps it (a
+/// run that tests the memory deliberately).
+fn collection_dir_copy() -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(std::env::var("COLLECTION_DIR").expect("COLLECTION_DIR names a collection folder copy"));
+    if std::env::var("KEEP_FIT_CHOICE").is_err() {
+        forget_fit_choice(&dir);
+    }
+    dir
+}
+
+/// Removes a collection folder's remembered fit choice (said once when there was one).
+fn forget_fit_choice(folder: &std::path::Path) {
+    if std::fs::remove_file(folder.join(surrogate::FIT_CHOICE_FILE)).is_ok() {
+        println!("{}: its {} removed (the full trust recovery runs)", folder.display(), surrogate::FIT_CHOICE_FILE);
+    }
+}
+
 fn collection_root(name: &str) -> CollectionRoot {
     let dir = std::env::temp_dir().join(format!("as-shared-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -11983,6 +12002,9 @@ mod recovery_loo;
 /// Spec 2026-11-17 (option B): warm-started recovery trials, every standing fit a cold search
 /// (`recovery_warm.rs`).
 mod recovery_warm;
+
+/// 2026-11-25: the trust recovery's cap retry remembered with the collection (`fit_choice.rs`).
+mod fit_choice;
 
 /// Spec 2026-11-12 R2: forget and restore one sample, the Model tab's worst-fitting list (`forget.rs`).
 mod forget;

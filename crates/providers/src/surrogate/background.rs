@@ -467,6 +467,12 @@ impl SurrogateKs {
         if let (Some(live), Some(copy)) = (self.shared.as_mut(), f.shared.as_mut()) {
             live.census = copy.census.take();
             live.learn_failed = copy.learn_failed.take();
+            // a fit choice the copy's recovery kept (`fit_choice` module doc): the copy wrote
+            // nothing, so the flush below writes it — as a synchronous refit's own flush would
+            if copy.fit_choice_unsaved {
+                live.fit_choice = copy.fit_choice;
+                live.fit_choice_unsaved = true;
+            }
             let learnt = |m: &Option<surrogate::channels::LearntMix>| {
                 m.as_ref().map(|m| (m.history_from, m.species.clone(), m.k, m.w.iter().map(|x| x.to_bits()).collect::<Vec<u64>>(), m.represented.clone(), m.n_w_met.clone(), m.many_body.clone()))
             };

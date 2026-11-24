@@ -196,6 +196,13 @@ pub(super) struct SharedCollection {
     /// 5–6, I1): the fit takes it, rule 3b and the evidence floor keep reading `mix` until the fit
     /// succeeds (`represent`, "The lifecycle"). `None` outside a refit.
     pub(super) pending_mix: Option<(LearntMix, String)>,
+    /// The fit choice the trust recovery settled on, remembered with the collection
+    /// (`fit_choice.txt`; the `fit_choice` module doc): read at attach, replaced when a refit's
+    /// recovery keeps its cap retry. `None` without one (or an unreadable file: no memory).
+    pub(super) fit_choice: Option<surrogate::FitChoice>,
+    /// [`fit_choice`](Self::fit_choice) is newer than the file (the live provider writes it at
+    /// its next flush; a background refit's copy hands it to the install).
+    pub(super) fit_choice_unsaved: bool,
 }
 
 impl SharedCollection {
@@ -220,6 +227,8 @@ impl SharedCollection {
             census: self.census.clone(),
             pending_mix: self.pending_mix.clone(),
             learn_failed: self.learn_failed.clone(),
+            fit_choice: self.fit_choice,
+            fit_choice_unsaved: false,
         }
     }
 }
@@ -356,6 +365,9 @@ impl SurrogateKs {
             }
             p.set_refit_history(history);
         }
+        // the remembered fit choice (`fit_choice` module doc): a hint — a file this build cannot
+        // read is no memory, and the full trust recovery runs
+        let fit_choice = c.read_fit_choice().ok().flatten();
         let held_out = c.quarantine.iter().filter(|&&q| q != Q_NONE).count();
         let read_only = c.read_only;
         let stamp = history_stamp(&c.history);
@@ -375,6 +387,8 @@ impl SurrogateKs {
             census: None,
             pending_mix: None,
             learn_failed: None,
+            fit_choice,
+            fit_choice_unsaved: false,
             coll: c,
         });
         // the fit's energies: each sample against its own box's references (module doc)
@@ -830,6 +844,19 @@ impl SurrogateKs {
         }
         if let Err(e) = sh.coll.write_readme() {
             failed.get_or_insert(e);
+        }
+        // the fit choice a refit's recovery kept, or dropped (`fit_choice` module doc)
+        if sh.fit_choice_unsaved {
+            let written = match sh.fit_choice {
+                Some(c) => sh.coll.save_fit_choice(&c),
+                None => sh.coll.clear_fit_choice(),
+            };
+            match written {
+                Ok(()) => sh.fit_choice_unsaved = false,
+                Err(e) => {
+                    failed.get_or_insert(e);
+                }
+            }
         }
         if let Some(e) = failed {
             self.note_write_failure(&e);

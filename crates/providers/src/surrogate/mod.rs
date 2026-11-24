@@ -994,7 +994,12 @@
 //!    case (`references.md` "M8a stuck collection"): one stretched-H₂ label under cap 6 drove the
 //!    energy noise to 2e-2 Ha/atom and spread its misfit over the H₂ samples (379 named as
 //!    offenders, re-measured 2026-11-12; 380 when first recorded), so step 2 named
-//!    no offender within its cap and the cap could never be undone — untrusted at every refit. A quarantined sample stays in the store (and in
+//!    no offender within its cap and the cap could never be undone — untrusted at every refit.
+//!    **Across launches** (2026-11-25, the `fit_choice` module doc): a cap step 1 kept is
+//!    remembered with a collection (`fit_choice.txt`) for exactly the store state it was kept
+//!    for; a launch refit of that state fits at the cap first, keeps it only on step 1's own
+//!    check, and otherwise runs this recovery from the default basis — the fit that stands is
+//!    the one this recovery reaches, only the default-basis fit before it is skipped. A quarantined sample stays in the store (and in
 //!    the sidecar, `sample_quarantine`); it is excluded from the fit, the envelope and the
 //!    residuals; a geometry within [`QUARANTINE_FRACTION`] · `max_descriptor_distance` training
 //!    spreads of one falls back ("near a quarantined geometry") — whichever rule fired first — and that
@@ -1402,6 +1407,7 @@ use surrogate::sidecar::TeacherSolves;
 mod audit;
 mod background;
 pub mod calibrate;
+mod fit_choice;
 mod inspect;
 mod knowledge;
 mod ledger;
