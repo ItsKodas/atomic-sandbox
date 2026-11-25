@@ -1411,6 +1411,40 @@ review: 0 Critical, 0 Important, 8 Minor, all fixed. The app gate passes 795 tes
 - **Display-only differences** of a launch that reuses the cap: the refit history (`refit_times.csv`) records it as a plain refit, not a recovery one; the refit picture shows no trust round (the recovery does not run); the recovery note ends with a "remembered" suffix. The fit and every verdict are the full recovery's.
 - **Review fixes (coordinator, same day):** the key now includes the build's identity (the running executable's length and modification time), since builds from main share a version across commits and a code change could let the default basis pass; an unreadable identity means no memory. The `#[ignore]`d harnesses that attach a `COLLECTION_DIR` copy remove the copy's `fit_choice.txt` first (`KEEP_FIT_CHOICE=1` keeps it). The reuse test now compares twin collections, one launched with the file and one without; new tests cover another build identity, the entry's refusals (pending vote, pending box exclusion, reuse under a staged W) and a release or a rejected vote blocking the recording.
 
+### Skip the current solve (2026-11-25, spec `2026-11-25-skip-solve-design.md`, 3 tasks)
+
+- **Asked for by:** the user: a human watching the Activity tab's live iteration log can often see a solve that won't converge before the stall stop, the iteration cap or the pass's time limit does.
+- **Change:** a **Skip** button on the Activity tab's live-solve row, for sampling passes, play and training.
+  - **In a pass:** a skipped sample is given up like a time-out, without doubling the time limit. A skipped reference or shell check is re-queued like a Pause.
+  - **In play or training:** the default (A) pauses the run and drops the step; Play retries it cold. The setting `skip_then` (B) retries cold at once.
+  - **Refreshes are not skippable:** bond and density refreshes and the relax's final verification disable the button.
+  - **The skip is visible:** an amber line on the Activity tab and a toast say what was skipped.
+- **Plumbing:** `sim::SkipRequest` is shared by the worker, `Dynamics` and the sampler (through `Trainable::set_skip_request`, no downcast).
+  - A cold retry goes through a new `ForceProvider::restart_cold()`. Its default is `reset()`; the KS adapters override it to keep the branch-jump guard, so a cold retry that lands on another branch is still caught.
+- **Review findings fixed:**
+  - `reset()` dropped that guard;
+  - a false "nothing to skip" during a refresh;
+  - a stale request surviving a provider install;
+  - the worker busy-looped after a Pause skip of a stale re-evaluation (the final Fable review; now `stale_eval_held`);
+  - the Activity tab said "nothing running" right after a skip.
+- **Gates (merged main `4016f5f7`, alongside the refit-picture merge below):**
+  - sim 206 passed;
+  - providers 659 passed, 1 failed: the known environmental `ks::tests::the_level_gated_stall_stop_on_the_measured_cases`;
+  - validate dynamics 7 passed;
+  - validate surrogate 10 passed, 1 failed, 5 ignored: the known `the_stuck_escape_repro_is_answered_honestly`, at the same rms 0.411 as on main.
+  - **App: 869 passed, 9 failed.** All 9 were GPU worker tests that timed out while the user trained in two previews and another agent's run held the GPU ("no snapshot within 120 s", a 97³ solve over 60 s, a 1.8 s Pause). Rerun one at a time on an idle GPU on the merged tree: **10 of 10 passed** (the filter also caught a harris namesake).
+
+### The refit picture after a pass and on Refit now (2026-11-25, spec `2026-11-25-refit-picture-more-design.md`)
+
+- **Asked for by:** the user: the big refit after each training pass, and the one "Refit now" starts, are the long ones they wait on, but the full refit picture only showed while no model stood.
+- **Change (display only):** every refit carries its cause, `sim::RefitCause { First, AfterPass, Requested, Background }`, published on the live refit view.
+  - The picture fills the 3D view for `First`, `AfterPass` and `Requested`.
+  - Background refits during play keep Activity's strip only.
+  - A refit merging several requests takes the most visible cause.
+  - No fit, trust, sample or timing change.
+- **Review:** approved with no Critical or Important findings. Parked minors are in the ledger (a stale headline comment, documenting the cause ranking, a fake-only pass-end worker test).
+- **Gates:** the app and validate runs above compiled the merged tree. `worker::tests::forget_and_restore_a_sample_refit_the_model`, which had timed out on a shared GPU during the branch, passed. Rerun on the merged tree `4d09a46a`: sim 207 passed; providers 660 passed, 1 failed: the known environmental `ks::tests::the_level_gated_stall_stop_on_the_measured_cases`.
+
 ### Process wins
 
 - An input-replay harness (M6 Task 8) that found a real app bug on its first scripts: a running relax
