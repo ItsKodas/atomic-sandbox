@@ -13,6 +13,10 @@
 //! last drawing). The window is [`ui`].
 pub mod chem;
 pub mod embed;
+// unused outside its tests until the shape lookup (builder database plan, Tasks 3–4) wires it in;
+// remove the allow then
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod records;
 pub mod ui;
 
 use crate::scene::{Scene, SceneNucleus};
