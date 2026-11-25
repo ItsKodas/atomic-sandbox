@@ -13,6 +13,10 @@
 //! last drawing). The window is [`ui`].
 pub mod chem;
 pub mod embed;
+// unused outside its tests until the shape lookup (builder database plan, Task 3) wires it in;
+// remove the allow then
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod iso;
 // unused outside its tests until the shape lookup (builder database plan, Tasks 3–4) wires it in;
 // remove the allow then
 #[cfg_attr(not(test), allow(dead_code))]
