@@ -15373,3 +15373,206 @@ mod activity_trust_tightening {
         assert_eq!(sim::TeachEvent::new(sim::activity::TeachOrigin::Fallback, R::ForceUncertainty, sim::activity::TeachOutcome::Kept).history_code, None, "defaulted in new");
     }
 }
+
+/// Skip the current solve (skip-solve plan Task 3, spec 2026-11-25): the Activity card's Skip and
+/// its ▾ setting, where it is disabled and why, its script words, the toast and the solve log.
+mod activity_skip {
+    use super::*;
+    use activity::jobs::{rows, JobKey, SkipControl, SKIP_CPU, SKIP_REFERENCE, SKIP_REFRESH, SKIP_RELAX, SKIP_THEN_TIP, SKIP_TIP};
+    use sim::SkipThen;
+
+    fn solving() -> sim::ProbeView {
+        sim::ProbeView { main: sim::activity::SlotView { running: true, scf_step: 7, elapsed_s: 2.0, solves: 3, ..Default::default() }, ..Default::default() }
+    }
+
+    fn pass(scene: &Scene, stage: &'static str) -> Snapshot {
+        let mut snap = snapshot(scene, Backend::Estimated, Some(model()));
+        snap.dynamics.sampling = Some(sim::SamplingProgress { done: 39, total: 144, stage, last_energy: -1.1, cancelled: false, skipped: 0, failed: 0, finished: false, target: None, paused: false });
+        snap
+    }
+
+    /// The row `key`'s Skip (the row must exist).
+    fn skip_of(inp: &PanelInput<'_>, key: JobKey) -> Option<SkipControl> {
+        rows(inp, inp.probe.as_ref()).into_iter().find(|r| r.key == key).unwrap_or_else(|| panic!("no {key:?} row")).skip
+    }
+
+    /// Spec §1, §5: Skip sits on the pass row and on the "DFT fallback" / "Solving" row; enabled
+    /// on the GPU, disabled with its reason for a CPU solve, a reference solve or shell check, a
+    /// relax, and a bond/density refresh; the orbital display row has none.
+    #[test]
+    fn the_skip_button_is_on_both_live_rows_and_disabled_with_reasons() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        // a GPU pass sample, a GPU fallback while playing, a paused Step / edit re-solve (busy)
+        let scans = pass(&scene, "scans");
+        let inp = PanelInput { probe: Some(solving()), ..input(&scene, Some(&scans), &cam) };
+        assert_eq!(skip_of(&inp, JobKey::Pass), Some(SkipControl::Enabled));
+        let est = snapshot(&scene, Backend::Estimated, Some(model()));
+        let playing = PanelInput { playing: true, busy: true, probe: Some(solving()), ..input(&scene, Some(&est), &cam) };
+        let r = rows(&playing, playing.probe.as_ref());
+        let live = r.iter().find(|r| r.key == JobKey::LiveSolve).unwrap();
+        assert_eq!((live.title.as_str(), live.skip), ("DFT fallback", Some(SkipControl::Enabled)));
+        let stepping = PanelInput { playing: false, busy: true, probe: Some(solving()), ..input(&scene, Some(&est), &cam) };
+        assert_eq!(skip_of(&stepping, JobKey::LiveSolve), Some(SkipControl::Enabled));
+        let gpu = snapshot(&scene, Backend::Gpu, None);
+        let solving_gpu = PanelInput { playing: true, busy: true, probe: Some(solving()), ..input(&scene, Some(&gpu), &cam) };
+        let r = rows(&solving_gpu, solving_gpu.probe.as_ref());
+        let live = r.iter().find(|r| r.key == JobKey::LiveSolve).unwrap();
+        assert_eq!((live.title.as_str(), live.skip), ("Solving", Some(SkipControl::Enabled)));
+        // a CPU solve: the pass's teacher and the CPU backend
+        let mut cpu_pass = pass(&scene, "scans");
+        cpu_pass.engine = Backend::Cpu;
+        let inp = PanelInput { probe: Some(solving()), ..input(&scene, Some(&cpu_pass), &cam) };
+        assert_eq!(skip_of(&inp, JobKey::Pass), Some(SkipControl::Disabled(SKIP_CPU)));
+        let cpu = snapshot(&scene, Backend::Cpu, None);
+        let inp = PanelInput { playing: true, busy: true, probe: Some(solving()), ..input(&scene, Some(&cpu), &cam) };
+        assert_eq!(skip_of(&inp, JobKey::LiveSolve), Some(SkipControl::Disabled(SKIP_CPU)));
+        assert_eq!(SKIP_CPU, "a CPU solve can't be stopped mid-solve");
+        // a reference solve and a shell check
+        let refs = pass(&scene, "references");
+        let inp = PanelInput { probe: Some(solving()), ..input(&scene, Some(&refs), &cam) };
+        assert_eq!(skip_of(&inp, JobKey::Pass), Some(SkipControl::Disabled(SKIP_REFERENCE)));
+        let mut shell = pass(&scene, "scans");
+        shell.dynamics.ghost = Some(sim::PassGhost { stage: "scans", job: sim::GhostJob::ShellCheck { i: 0, j: 1, r: 9.0 }, atoms: Vec::new(), base: Vec::new(), trail: Vec::new(), finished: None });
+        let inp = PanelInput { probe: Some(solving()), ..input(&scene, Some(&shell), &cam) };
+        assert_eq!(skip_of(&inp, JobKey::Pass), Some(SkipControl::Disabled(SKIP_REFERENCE)));
+        assert_eq!(SKIP_REFERENCE, "the fit and the shell fence rest on this solve");
+        // a relax: its FIRE steps and its final teacher verification
+        let mut relax = snapshot(&scene, Backend::Estimated, Some(model()));
+        relax.dynamics.relax = Some(relax_progress(None));
+        let inp = PanelInput { busy: true, probe: Some(solving()), ..input(&scene, Some(&relax), &cam) };
+        assert_eq!(skip_of(&inp, JobKey::LiveSolve), Some(SkipControl::Disabled(SKIP_RELAX)));
+        assert_eq!(SKIP_RELAX, "a relax: use Stop relax");
+        // a bond/density refresh: a solve while the worker is idle (paused, nothing to step)
+        let inp = PanelInput { playing: false, busy: false, probe: Some(solving()), ..input(&scene, Some(&est), &cam) };
+        assert_eq!(skip_of(&inp, JobKey::LiveSolve), Some(SkipControl::Disabled(SKIP_REFRESH)));
+        // the orbital display solve: no Skip
+        let harris = sim::ProbeView { display: Some((0.3, sim::DisplayJob::Harris)), ..Default::default() };
+        let inp = PanelInput { probe: Some(harris), ..input(&scene, Some(&est), &cam) };
+        assert_eq!(skip_of(&inp, JobKey::Orbitals), None);
+
+        // drawn on the card with its ▾, the reasons on hover
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        alone(&mut st, DockTab::Activity);
+        let inp = PanelInput { playing: true, busy: true, probe: Some(solving()), ..input(&scene, Some(&est), &cam) };
+        frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        let (skip, then, pause) = (probed_rect("activity-skip"), probed_rect("activity-skip-then"), probed_rect("job-control-pause"));
+        assert!((skip.center().y - pause.center().y).abs() < 2.0 && (then.center().y - skip.center().y).abs() < 2.0, "{skip:?} {then:?} {pause:?}");
+        assert!(skip.right() <= pause.left() && then.right() <= pause.left(), "left of the row's Pause: {skip:?} {then:?} {pause:?}");
+        assert!(hover_text(&ctx, &mut st, &inp, "activity-skip").contains(SKIP_TIP));
+        assert!(hover_text(&ctx, &mut st, &inp, "activity-skip-then").contains(SKIP_THEN_TIP));
+        let inp = PanelInput { playing: true, busy: true, probe: Some(solving()), ..input(&scene, Some(&cpu), &cam) };
+        assert!(hover_text(&ctx, &mut st, &inp, "activity-skip").contains(SKIP_CPU));
+        // a disabled Skip sends nothing
+        assert!(click_widget(&ctx, &mut st, &inp, "activity-skip").iter().all(|o| o.actions.is_empty() && o.commands.is_empty()));
+    }
+
+    /// Spec §4: the ▾ writes `UiState::skip_then` (a display setting: no command), and the Skip
+    /// action carries the choice, so `--record` writes exactly what happened; the words round-trip.
+    #[test]
+    fn a_skip_is_recorded_with_its_choice() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let est = snapshot(&scene, Backend::Estimated, Some(model()));
+        let inp = PanelInput { playing: true, busy: true, probe: Some(solving()), ..input(&scene, Some(&est), &cam) };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        alone(&mut st, DockTab::Activity);
+        assert_eq!(st.skip_then, SkipThen::Pause, "the default");
+        click_widget(&ctx, &mut st, &inp, "activity-skip-then");
+        let outs = click_widget(&ctx, &mut st, &inp, "activity-skip-then-retry");
+        assert_eq!(st.skip_then, SkipThen::Retry);
+        assert!(outs.iter().all(|o| o.commands.is_empty() && o.actions.is_empty()), "a display setting: nothing sent or recorded");
+        egui::Popup::close_all(&ctx);
+        let outs = click_widget(&ctx, &mut st, &inp, "activity-skip");
+        let acts: Vec<Action> = outs.iter().flat_map(|o| o.actions.clone()).collect();
+        assert_eq!(acts, vec![Action::SkipSolve { then: SkipThen::Retry }]);
+        assert!(matches!(dyn_commands(&outs).as_slice(), [DynCommand::SkipSolve(SkipThen::Retry)]));
+        // the recorder's line, and back
+        let path = std::env::temp_dir().join(format!("skip-{}.replay", std::process::id()));
+        let mut r = crate::replay::Recorder::with_clock(&path, (1400, 900), Box::new(|| std::time::Duration::ZERO)).unwrap();
+        r.action(&acts[0]);
+        drop(r);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.lines().any(|l| l == "action skip retry"), "{text}");
+        for (then, words) in [(SkipThen::Pause, "skip pause"), (SkipThen::Retry, "skip retry")] {
+            let a = Action::SkipSolve { then };
+            assert_eq!(a.describe().as_deref(), Some(words));
+            assert_eq!(Action::parse(&words.split_whitespace().collect::<Vec<_>>()).unwrap(), a);
+        }
+        assert!(Action::parse(&["skip"]).is_err() && Action::parse(&["skip", "later"]).is_err());
+    }
+
+    /// The toast: a new skip (the count moved, even with the same sentence) shows the bare sentence;
+    /// a snapshot without a new one shows nothing.
+    #[test]
+    fn a_new_skip_is_toasted_once() {
+        use activity::jobs::new_skip;
+        let mut a = sim::DynSnapshot::default();
+        assert_eq!(new_skip(None, &a), None);
+        a.skips_taken = 1;
+        a.last_skip = Some("you skipped the solve at step 4 — nothing was kept; Play retries it from a cold start".into());
+        assert_eq!(new_skip(None, &a), a.last_skip.as_deref());
+        let prev = sim::DynSnapshot::default();
+        assert_eq!(new_skip(Some(&prev), &a), a.last_skip.as_deref());
+        assert_eq!(new_skip(Some(&a), &a), None, "the same skip again");
+        let mut again = a.clone();
+        again.skips_taken = 2;
+        assert_eq!(new_skip(Some(&a), &again), a.last_skip.as_deref(), "the same sentence, a new skip");
+    }
+
+    /// Spec §6 and Task 2 review m1: a skipped solve is under the log's "failed" chip, with the word
+    /// "skipped" once in its row (the solve cell) and once in its hover — not "failed (skipped by
+    /// you after …) — skipped".
+    #[test]
+    fn a_skipped_solve_is_a_failure_that_says_skipped_once() {
+        use activity::log::{detail_text, in_view, is_failure, solve_cell, solve_hover, LogView};
+        use sim::activity::{PassJob, TeachOrigin as O, TeachOutcome as K, TeachRule as R};
+        let mut e = activity_tab::event(O::Pass, R::Pass(PassJob::Scan), K::Failed, None);
+        (e.scf_end, e.scf_steps, e.solve_ms) = (Some(sim::ScfEnd::Skipped), None, 1234.0);
+        e.detail = "sampling: a scans geometry failed (skipped by you after 1.2 s) — skipped".into();
+        assert!(is_failure(&e) && in_view(LogView::Failed, &e));
+        assert_eq!(solve_cell(&e), "1234 ms · skipped");
+        assert_eq!(detail_text(&e), "sampling: a scans geometry was given up (skipped by you after 1.2 s)");
+        assert!(solve_hover(&e).is_some_and(|h| h.starts_with("skipped by you")), "{:?}", solve_hover(&e));
+        let row = format!("{} {} {}", activity::words::outcome_label(e.outcome), solve_cell(&e), detail_text(&e));
+        assert_eq!(row.matches("skipped").count(), 2, "{row}");
+        // a skipped fallback: its why and the skip sentence, unchanged
+        let mut f = activity_tab::event(O::Fallback, R::ForceUncertainty, K::Failed, Some(4));
+        f.scf_end = Some(sim::ScfEnd::Skipped);
+        f.detail = "the model is unsure here — you skipped the solve at step 4 — nothing was kept; Play retries it from a cold start".into();
+        assert_eq!(detail_text(&f), f.detail);
+        assert!(is_failure(&f) && in_view(LogView::Failed, &f));
+    }
+}
+
+/// The profile's `skip_then` (skip-solve plan Task 3).
+mod profile_skip {
+    use super::*;
+    use sim::SkipThen;
+
+    #[test]
+    fn skip_then_round_trips() {
+        let scene = Scene::preset("h2").unwrap();
+        let mut st = UiState::new("h2", &scene);
+        assert_eq!(st.skip_then, SkipThen::Pause);
+        assert!(profile::capture(&st).contains("\nskip_then = pause\n"));
+        assert!(profile::defaults(&st).contains("\nskip_then = pause\n"));
+        st.skip_then = SkipThen::Retry;
+        let text = profile::capture(&st);
+        assert!(text.contains("\nskip_then = retry\n"), "{text}");
+        let mut back = UiState::new("h2", &scene);
+        profile::apply(&mut back, &text);
+        assert_eq!(back.skip_then, SkipThen::Retry);
+        // an unreadable value, or a profile without the key, leaves it as it is
+        profile::apply(&mut back, "skip_then = later\n");
+        assert_eq!(back.skip_then, SkipThen::Retry);
+        let defaults = profile::defaults(&back);
+        profile::apply(&mut back, &defaults);
+        assert_eq!(back.skip_then, SkipThen::Pause, "Reset puts back the default");
+    }
+}

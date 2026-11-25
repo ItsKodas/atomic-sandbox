@@ -23,7 +23,7 @@ pub fn counters(ui: &mut Ui, st: &ActivityState, m: Option<&crate::sim::ModelSta
             tips.push(format!("samples in the model: {} held{fitted} (the store; the Model tab shows the same number)", m.samples));
             let earlier = if c.unrecorded_before { " (earlier solves unrecorded)" } else { "" };
             tips.push(format!(
-                "teacher solves for this model: {total}{earlier} — pass {} · fallback {} · audit {} · relax checks {} — kept {}, not kept {} (references, similar answers, box-affected, failed, discarded audits, …). Completed or failed teaching solves; a cancelled solve is not counted. A stray-atom composition check is one row and 1 + n_stray audit solves (the molecule alone, each stray atom alone)",
+                "teacher solves for this model: {total}{earlier} — pass {} · fallback {} · audit {} · relax checks {} — kept {}, not kept {} (references, similar answers, box-affected, failed — solves you skipped among them —, discarded audits, …). Completed or failed teaching solves; a cancelled solve is not counted. A stray-atom composition check is one row and 1 + n_stray audit solves (the molecule alone, each stray atom alone)",
                 c.pass,
                 c.fallback,
                 c.audit,
@@ -98,10 +98,22 @@ pub enum LogView {
 }
 
 /// A solve that failed: the teacher's error, a refused store, or an SCF that did not converge
-/// (stalled, the cap, a non-finite Δρ, the pass's time limit).
+/// (stalled, the cap, a non-finite Δρ, the pass's time limit) or that the user skipped.
 pub fn is_failure(e: &sim::TeachEvent) -> bool {
     matches!(e.outcome, TeachOutcome::Failed | TeachOutcome::StoreRefused)
-        || matches!(e.scf_end, Some(sim::ScfEnd::Stalled | sim::ScfEnd::Cap | sim::ScfEnd::NonFinite | sim::ScfEnd::TimeLimit))
+        || matches!(e.scf_end, Some(sim::ScfEnd::Stalled | sim::ScfEnd::Cap | sim::ScfEnd::NonFinite | sim::ScfEnd::TimeLimit | sim::ScfEnd::Skipped))
+}
+
+/// The provider's own text as a row's hover shows it. A skipped sample's reads "… failed (skipped
+/// by you after 1.2 s) — skipped" (the sampler's failure note around the skip's error): the row
+/// already says "failed" in its outcome and "skipped" in its solve cell, so the hover says it once
+/// — "… was given up (skipped by you after 1.2 s)" (Task 2 review m1).
+pub fn detail_text(e: &sim::TeachEvent) -> String {
+    if e.scf_end != Some(sim::ScfEnd::Skipped) || !e.detail.contains("failed (skipped by you") {
+        return e.detail.clone();
+    }
+    let d = e.detail.replacen("failed (skipped by you", "was given up (skipped by you", 1);
+    d.strip_suffix(" — skipped").map_or(d.clone(), str::to_string)
 }
 
 /// A row that may fold into a run of identical ones: kept answers, references and held-out
@@ -186,7 +198,7 @@ fn solve_cell_time(e: &sim::TeachEvent) -> String {
     match (e.scf_steps.filter(|&n| n > 0), e.scf_end) {
         (Some(n), None | Some(sim::ScfEnd::Converged)) => format!("{t} · {n} it"),
         (Some(n), Some(end)) => format!("{t} · {n} {}", end.word()),
-        (None, Some(sim::ScfEnd::TimeLimit)) => format!("{t} · {}", sim::ScfEnd::TimeLimit.word()),
+        (None, Some(end @ (sim::ScfEnd::TimeLimit | sim::ScfEnd::Skipped))) => format!("{t} · {}", end.word()),
         (None, _) => t,
     }
 }
@@ -196,13 +208,16 @@ pub fn solve_hover(e: &sim::TeachEvent) -> Option<String> {
     if e.scf_end == Some(sim::ScfEnd::TimeLimit) {
         return Some("given up at the sampling pass's per-sample time limit (several times the pass's median solve): not kept, like a stalled solve".into());
     }
+    if e.scf_end == Some(sim::ScfEnd::Skipped) {
+        return Some("skipped by you (the Activity card's Skip): given up at once and nothing from it kept — counted as a failed solve".into());
+    }
     let n = e.scf_steps?;
     let why = match e.scf_end {
         Some(sim::ScfEnd::Converged) => " — converged",
         Some(sim::ScfEnd::Stalled) => " — stalled: the best Δρ did not halve within the stall window, so the solve stopped before the cap",
         Some(sim::ScfEnd::Cap) => " — stopped at the iteration cap without converging",
         Some(sim::ScfEnd::NonFinite) => " — stopped: Δρ was not finite",
-        // (a skip's own wording is the skip-solve plan's Task 3)
+        // (both answered above)
         Some(sim::ScfEnd::TimeLimit | sim::ScfEnd::Skipped) | None => "",
     };
     let ts = e.ts.and_then(ts_text).map_or(String::new(), |t| format!("; {t} (the electronic entropy term of F at T_el: partly occupied levels)"));
@@ -351,7 +366,7 @@ pub fn show_log(ui: &mut Ui, st: &mut ActivityState, estimated: bool) {
             (LogView::All, "all", "every row the filters below admit"),
             (LogView::Fallback, "fallback", "steps the model did not answer"),
             (LogView::Audit, "audit", "routine checks of the model against DFT"),
-            (LogView::Failed, "failed", "solves that failed or did not converge (stalled, the cap, the pass's time limit)"),
+            (LogView::Failed, "failed", "solves that failed or did not converge (stalled, the cap, the pass's time limit), and the ones you skipped"),
         ] {
             if crate::ui::probed(&format!("log-chip-{label}"), ui.add(theme::choice_button(st.log_view == v, label))).on_hover_text(tip).clicked() {
                 st.log_view = v;
@@ -605,7 +620,7 @@ fn row(ui: &mut Ui, id: egui::Id, rect: Rect, r: &LogRow, widths: &[f32; 7], mon
     col(ui, 1, &step, mono, theme::INK_DIM, step_hover);
     col(ui, 2, origin, prop, origin_colour, None);
     let sentence = words::rule_sentence(e.rule, e.atom, cx);
-    let rule_hover = if e.detail.is_empty() { sentence } else { format!("{sentence}\n\n{}", e.detail) };
+    let rule_hover = if e.detail.is_empty() { sentence } else { format!("{sentence}\n\n{}", detail_text(e)) };
     col(ui, 3, &rule_cell(e), prop, theme::INK, Some(rule_hover));
     let mut outcome_hover = words::outcome_sentence(e.outcome);
     let says_box = matches!(e.outcome, TeachOutcome::KeptBoxAffected | TeachOutcome::BoxNotKept);
@@ -616,7 +631,7 @@ fn row(ui: &mut Ui, id: egui::Id, rect: Rect, r: &LogRow, widths: &[f32; 7], mon
     col(ui, 4, &words::outcome_label(e.outcome), prop, outcome_colour, Some(outcome_hover));
     col(ui, 5, &gap, mono, theme::INK, gap_hover);
     let solve_colour = match e.scf_end {
-        Some(sim::ScfEnd::Stalled | sim::ScfEnd::Cap | sim::ScfEnd::NonFinite | sim::ScfEnd::TimeLimit) => AMBER,
+        Some(sim::ScfEnd::Stalled | sim::ScfEnd::Cap | sim::ScfEnd::NonFinite | sim::ScfEnd::TimeLimit | sim::ScfEnd::Skipped) => AMBER,
         _ => theme::INK_DIM,
     };
     col(ui, 6, &solve_cell(e), mono, solve_colour, solve_hover(e));

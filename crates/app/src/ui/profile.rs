@@ -5,7 +5,8 @@
 //! V(0.50,[Activity*],[Readouts*])`, one line per detached window — its desktop rect in physical
 //! pixels, `max` when it is maximised, and its tree without the 3D view, spec D-12,
 //! `workspace::detached`), the view and density-look settings and which
-//! of the View panel's sections are open (`view_sections = what,looks`) and which of the Model
+//! of the View panel's sections are open (`view_sections = what,looks`), what the Activity card's
+//! ▾ beside Skip does after a skip during play (`skip_then = pause|retry`) and which of the Model
 //! panel's folds (`model_sections = teach,health`) and of the Activity panel's
 //! (`activity_sections = trust,training`) and of the Orbitals panel's (`orbital_sections = spin`) and the Knowledge panel's (`knowledge_sections = why,triples`) and the Readouts panel's (`readouts_sections = work,breakdown,compare`) and the Selection panel's (`selection_sections = details,molecules,charges`), the units, the Version
 //! panel's channel and Check automatically (`update_channel = Stable`, `update_auto_check = true`;
@@ -87,6 +88,8 @@ pub fn capture(st: &UiState) -> String {
     out += &format!("name_style = {:?}\n", st.name_style);
     out += &format!("energy_units = {:?}\n", st.energy_units);
     out += &format!("temp_units = {:?}\n", st.temp_units);
+    // the Activity card's ▾ beside Skip (skip-solve spec §4)
+    out += &format!("skip_then = {}\n", super::actions::skip_word(st.skip_then));
     out += &format!("layout = {}\n", layout::encode(&st.workspace.to_node()));
     out += &format!("hidden = {}\n", layout::encode_hidden(st.workspace.hidden()));
     for (rect, max, tree) in st.workspace.saved_windows() {
@@ -174,6 +177,10 @@ pub fn apply(st: &mut UiState, text: &str) {
     }
     if let Some(v) = kv.get("temp_units").and_then(|w| pick(&TEMP_UNITS, w)) {
         st.temp_units = v;
+    }
+    // (added 2026-11-25; absent or unreadable: unchanged)
+    if let Some(v) = kv.get("skip_then").and_then(|w| super::actions::parse_skip(w)) {
+        st.skip_then = v;
     }
     if let Some(v) = kv.get("update_channel").and_then(|w| pick(&UPDATE_CHANNELS, w)) {
         st.update.channel = v;

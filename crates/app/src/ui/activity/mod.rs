@@ -474,7 +474,7 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
                     theme::note(ui, "nothing running");
                 } else {
                     let refit = input.probe.as_ref().and_then(|p| p.refit.as_ref()).map(|v| (v, &input.refit_ratios[..]));
-                    jobs::show(ui, &rows, &st.activity.conv, &bars, refit, acts);
+                    jobs::show(ui, &rows, &st.activity.conv, &bars, refit, &mut st.skip_then, acts);
                 }
             })
             .response

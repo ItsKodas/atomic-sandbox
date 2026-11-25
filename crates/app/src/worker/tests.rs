@@ -4680,3 +4680,189 @@ fn the_solvers_get_the_budget_of_the_share() {
     let env = crate::quality::budget_from(Some(3.0), 8_400_000_000, 60);
     assert_eq!(solver_budget(env, 2), (1_500_000_000, "the teacher's half of the 3.0 GB budget: set by ATOMIC_SANDBOX_VRAM_GB".to_string()));
 }
+
+// ---- Skip the current solve (skip-solve plan Task 3) ----
+
+/// A slow analytic solve: marks the probe's main slot running for `solve` of wall time, polling
+/// `should_abort` every 2 ms as the GPU solver does between SCF steps; abandoned, it returns
+/// `Cancelled` — or, armed (`panic_on_abort`), panics once instead (a solver that dies while a
+/// Skip is pending, so the worker rebuilds the driver with the request still set).
+struct AbortableSlow {
+    morse: sim::MorseDimer,
+    probe: Arc<sim::ActivityProbe>,
+    solve: Duration,
+    panic_on_abort: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ForceProvider for AbortableSlow {
+    fn evaluate(&mut self, scene: &sim::Scene, abort: &mut dyn FnMut() -> bool) -> Result<sim::ForceResult, sim::ProviderError> {
+        let _busy = self.probe.busy(sim::Slot::Main);
+        let t0 = Instant::now();
+        while t0.elapsed() < self.solve {
+            if abort() {
+                if self.panic_on_abort.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    panic!("a test panic in the provider");
+                }
+                return Err(sim::ProviderError::Cancelled);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        self.morse.evaluate(scene, abort)
+    }
+
+    fn name(&self) -> &'static str {
+        "abortable slow morse"
+    }
+
+    fn reset(&mut self) {}
+}
+
+/// A worker on [`AbortableSlow`] (300 ms solves: a click lands inside one) and its panic switch.
+fn skip_worker() -> (SimWorker, Arc<std::sync::atomic::AtomicBool>) {
+    let probe = sim::ActivityProbe::new();
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (p, a) = (probe.clone(), armed.clone());
+    let w = SimWorker::spawn_test_with(
+        h2_33(),
+        probe,
+        Box::new(move || Box::new(AbortableSlow { morse: sim::MorseDimer::h2(), probe: p.clone(), solve: Duration::from_millis(300), panic_on_abort: a.clone() })),
+    );
+    (w, armed)
+}
+
+/// Waits until a solve is in flight (the probe's main slot running).
+fn in_a_solve(w: &SimWorker) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !w.probe().view().main.running {
+        assert!(Instant::now() < deadline, "no solve in flight within 20 s");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The Activity card's Skip as the window sends it: the action through `actions::apply`, then
+/// its commands through `SimWorker::send` (which sets the request before it queues the command).
+fn click_skip(w: &SimWorker, s: &Snapshot, then: sim::SkipThen) {
+    let cam = render::camera::OrbitCamera::new(glam::Vec3::ZERO, 14.0);
+    let mut st = crate::ui::UiState::new("h2", &s.scene);
+    let inp = crate::ui::PanelInput {
+        scene: &s.scene,
+        snapshot: Some(s),
+        busy: true,
+        playing: true,
+        last_error: None,
+        selected: None,
+        measured_fs_per_s: None,
+        camera: &cam,
+        density_label: None,
+        orbital_label: None,
+        orbital_waiting: false,
+        pseudo_generating: None,
+        draft_banner: None,
+        bonds_label: None,
+        stale_bonds_line: None,
+        experience_bonds: Vec::new(),
+        probe: None,
+        refit_ratios: Vec::new(),
+    };
+    let mut out = crate::ui::PanelOutput::default();
+    crate::ui::actions::apply(&mut st, &inp, crate::ui::Action::SkipSolve { then }, &mut out);
+    assert!(matches!(out.commands.as_slice(), [Command::Dyn(DynCommand::SkipSolve(t))] if *t == then), "{:?}", out.commands);
+    for c in out.commands {
+        w.send(c);
+    }
+}
+
+/// Spec §3 "Pause" (the default): a Skip while playing abandons the step's solve, pauses the run,
+/// and keeps nothing — the step is not taken, so the time is the last completed step's; the toast
+/// sentence names the skipped step. Play then solves that step again (cold) and the run goes on.
+#[test]
+fn skip_during_play_pauses_and_keeps_nothing() {
+    let (w, _) = skip_worker();
+    let s0 = idle(&w);
+    w.send(Command::Dyn(DynCommand::Play));
+    let before = snapshot_until(&w, "two steps taken", |s| s.dynamics.step >= 2 && !s.dynamics.paused);
+    in_a_solve(&w);
+    click_skip(&w, &s0, sim::SkipThen::Pause);
+    let s = snapshot_until(&w, "the skip", |s| s.dynamics.skips_taken > 0);
+    let d = &s.dynamics;
+    assert_eq!(d.skips_taken, 1);
+    assert!(d.paused, "a skip during play pauses (the default)");
+    let n = d.step;
+    let sentence = format!("you skipped the solve at step {} — nothing was kept; Play retries it from a cold start", n + 1);
+    assert_eq!(d.last_skip.as_deref(), Some(sentence.as_str()));
+    // the skipped step was not taken: the time is the last completed step's
+    let dt = before.dynamics.dt;
+    assert!((d.sim_time - before.dynamics.sim_time - (n - before.dynamics.step) as f64 * dt).abs() < 1e-6 * dt, "t {} after {} steps", d.sim_time, n);
+    // paused: nothing more is solved
+    let still = idle(&w);
+    assert_eq!((still.dynamics.step, still.dynamics.sim_time, still.dynamics.skips_taken), (n, d.sim_time, 1));
+    // Play retries it and the run goes on
+    w.send(Command::Dyn(DynCommand::Play));
+    let on = snapshot_until(&w, "the skipped step solved", |s| s.dynamics.step > n);
+    assert_eq!(on.dynamics.skips_taken, 1);
+    assert!(!on.dynamics.paused);
+}
+
+/// Spec §3 "Retry": a Skip with Retry cold drops the solve and solves the same step again at once,
+/// without pausing.
+#[test]
+fn skip_during_play_with_retry_keeps_playing() {
+    let (w, _) = skip_worker();
+    let s0 = idle(&w);
+    w.send(Command::Dyn(DynCommand::Play));
+    snapshot_until(&w, "a step taken", |s| s.dynamics.step >= 1 && !s.dynamics.paused);
+    in_a_solve(&w);
+    click_skip(&w, &s0, sim::SkipThen::Retry);
+    let s = snapshot_until(&w, "the skip", |s| s.dynamics.skips_taken > 0);
+    let n = s.dynamics.step;
+    assert!(!s.dynamics.paused, "Retry keeps playing");
+    assert_eq!(s.dynamics.last_skip.as_deref(), Some(format!("skipped at step {} — retrying cold", n + 1).as_str()));
+    let on = snapshot_until(&w, "the retried step solved", |s| s.dynamics.step > n);
+    assert!(!on.dynamics.paused);
+    assert_eq!(on.dynamics.skips_taken, 1);
+}
+
+/// The worker installs its one request on every driver it builds (here the rebuild after a solver
+/// panic): a request pending when the driver is rebuilt is dropped — a later Pause is an ordinary
+/// pause, never a skip — and a Skip on the rebuilt driver still works.
+#[test]
+fn skip_after_a_rebuild_still_works_and_a_stale_request_is_dropped() {
+    let (w, armed) = skip_worker();
+    let s0 = idle(&w);
+    w.send(Command::Dyn(DynCommand::Play));
+    snapshot_until(&w, "a step taken", |s| s.dynamics.step >= 1 && !s.dynamics.paused);
+    in_a_solve(&w);
+    // the Skip's abort makes the solver panic: the driver is rebuilt with the request still set
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    click_skip(&w, &s0, sim::SkipThen::Pause);
+    let deadline = Instant::now() + WAIT;
+    let mut recovered = false;
+    let r = loop {
+        assert!(Instant::now() < deadline, "no recovered snapshot within {WAIT:?}");
+        match w.recv_timeout(Duration::from_secs(1)) {
+            Some(Event::Error(e)) if e.starts_with("solver panicked: a test panic") => recovered = true,
+            Some(Event::Error(e)) => panic!("{e}"),
+            Some(Event::Snapshot(s)) if recovered => break *s,
+            _ => {}
+        }
+    };
+    assert!(r.dynamics.paused, "the rebuilt run is paused");
+    assert_eq!((r.dynamics.skips_taken, r.dynamics.last_skip.as_deref()), (0, None));
+    // a later Pause is a Pause
+    w.send(Command::Dyn(DynCommand::Play));
+    snapshot_until(&w, "playing again", |s| !s.dynamics.paused);
+    in_a_solve(&w);
+    w.send(Command::Dyn(DynCommand::Pause));
+    let p = idle(&w);
+    assert!(p.dynamics.paused);
+    assert_eq!((p.dynamics.skips_taken, p.dynamics.last_skip.as_deref()), (0, None), "the stale request turned the Pause into a skip");
+    assert!(!p.dynamics.notes.iter().any(|n| n.contains("skip")), "{:?}", p.dynamics.notes);
+    // and the rebuilt driver's Skip works
+    w.send(Command::Dyn(DynCommand::Play));
+    snapshot_until(&w, "playing again", |s| !s.dynamics.paused);
+    in_a_solve(&w);
+    click_skip(&w, &s0, sim::SkipThen::Pause);
+    let s = snapshot_until(&w, "the skip on the rebuilt driver", |s| s.dynamics.skips_taken > 0);
+    assert!(s.dynamics.paused && s.dynamics.skips_taken == 1);
+    assert!(s.dynamics.last_skip.as_deref().is_some_and(|l| l.starts_with("you skipped the solve at step")));
+}

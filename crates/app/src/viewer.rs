@@ -1810,6 +1810,11 @@ impl Viewer {
                 // scene left its checkpoint as an interrupted pass; a finished or cancelled one
                 // removed its files (no offer)
                 let pass_ended = self.snapshot.as_ref().is_some_and(|p| crate::sim::sampling_active(&p.dynamics)) && !crate::sim::sampling_active(&s.dynamics);
+                // a skip taken during play or training: its sentence as the status line and toast
+                // (skip-solve spec §3; once per skip, `jobs::new_skip`)
+                if let Some(t) = ui::activity::jobs::new_skip(self.snapshot.as_ref().map(|p| &p.dynamics), &s.dynamics) {
+                    self.ui.set_status(t.to_string());
+                }
                 self.snapshot = Some(*s);
                 if pass_ended {
                     self.refresh_resume_offer();
