@@ -634,6 +634,14 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         Trainable::take_teach_events(&mut *self.lock())
     }
 
+    fn set_skip_request(&mut self, r: crate::dynamics::SkipRequest) {
+        Trainable::set_skip_request(&mut *self.lock(), r)
+    }
+
+    fn cancelled_teacher_solve(&self) -> Option<(crate::activity::TeachOrigin, crate::activity::TeachRule, Option<usize>)> {
+        Trainable::cancelled_teacher_solve(&*self.lock())
+    }
+
     fn training_views(&mut self) -> Option<crate::activity::TrainingViews> {
         Trainable::training_views(&mut *self.lock())
     }

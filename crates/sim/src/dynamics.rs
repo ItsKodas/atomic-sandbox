@@ -207,8 +207,8 @@
 //! # What should abort a running step (R11)
 //! `should_abort` abandons the solve in flight (GPU: latency ≤ one SCF step), so the caller
 //! must raise it only for commands that make the running step pointless: **Pause, the
-//! discontinuous edits (Move, Add, Remove), ReplaceScene, a backend or grid change, and
-//! shutdown.** It must **never** fire for DragStart/DragMove/DragEnd, SetDragForce, SetSpeed, Pin, Rewind,
+//! discontinuous edits (Move, Add, Remove), ReplaceScene, a backend or grid change, a Skip
+//! (`SkipSolve`, below), and shutdown.** It must **never** fire for DragStart/DragMove/DragEnd, SetDragForce, SetSpeed, Pin, Rewind,
 //! SetThermostat, SetExternalField, SetDt, SetComCorrection or SetWalls: those only change the state the
 //! *next* step starts from, and a DragMove arrives every frame — aborting on it would cancel
 //! every DFT step in flight and freeze the run while the user drags. SetDragForce (the wheel
@@ -219,9 +219,33 @@
 //! `Err` from a step: the integrator left the scene as it was before the step; the driver
 //! pauses, drops the queued steps, sets `last_error`, and keeps the last good forces, energies,
 //! display and history. `ProviderError::Cancelled` is not an error: the tick ends, the run stays
-//! playing, a queued step stays queued. `last_error` (provider failures only) is cleared by
+//! playing, a queued step stays queued (unless it was a skip, below). `last_error` (provider failures only) is cleared by
 //! `Play`, `Step` and an accepted edit (the "try again" actions). A rejected command sets
 //! `last_rejection` instead, which the next accepted command clears.
+//!
+//! # Skipping a solve (skip-solve spec 2026-11-25)
+//! The Activity tab's Skip gives up the running solve. The worker sets the shared [`SkipRequest`]
+//! (installed by [`Dynamics::set_skip_request`], which also hands it to a trainable provider for
+//! its sampling pass) and then queues [`DynCommand::SkipSolve`], whose abort abandons the solve.
+//! Whoever handles the resulting `Cancelled` **takes** the request — once, so a second quick click
+//! finds nothing:
+//! - **A play or training step** (an MD step, or the stale re-evaluation after an edit): the step
+//!   is not taken (as at a Pause abandon), the provider is `reset` so the next solve is cold —
+//!   the half-converged state is never a warm start — and the skip is noted; when the provider
+//!   reports the abandoned evaluation as a teacher solve (`Trainable::cancelled_teacher_solve`,
+//!   the surrogate's fallback) it is also a failed teaching event with `ScfEnd::Skipped`, stamped
+//!   with the step it was for. Nothing from the solve is kept. Then, by the request's
+//!   [`SkipThen`]: **Pause** pauses the run and drops queued steps (note "you skipped the solve
+//!   at step N — nothing was kept; Play retries it from a cold start"; a skipped re-evaluation is
+//!   not retried by paused ticks until Play, Step or an edit); **Retry** plays on, and the next
+//!   tick solves the same positions cold ("skipped at step N — retrying cold").
+//! - **A relax step**: abandoned as at a Pause abandon (the relax goes on next tick); the
+//!   request is dropped with the note [`NOTHING_TO_SKIP`].
+//! - **A sampling pass's solve**: the provider's pass takes it (`providers::sampling`).
+//!
+//! `SkipSolve` itself, applied after the tick, clears a request nothing took — the solve had
+//! already ended (the click raced its convergence) — with the note `nothing to skip`, so a late
+//! skip never hits the next solve.
 //!
 //! # A failed GPU (the gpu-fault fix, 2026-11-21)
 //! When the provider reports that the device it solves on failed (`ForceProvider::device_failure`: an out-of-memory,
@@ -570,7 +594,7 @@ use crate::thermostat::Csvr;
 use health::{History, Point};
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -592,6 +616,8 @@ pub const F_DRAG_LO: f64 = 0.01;
 pub const F_DRAG_HI: f64 = 1.0;
 /// Notes kept for the snapshot (newest last).
 const NOTES_KEPT: usize = 8;
+/// The note of a skip that found no solve to skip (module doc, "Skipping a solve").
+pub const NOTHING_TO_SKIP: &str = "nothing to skip";
 /// How long a dropped driver waits for a reference job's side solver to stop and come back (`Drop for Dynamics`): a
 /// GPU solve stops at its next SCF step.
 const SIDE_SOLVER_DROP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -680,6 +706,62 @@ impl Walls {
             let du = if d <= a { self.k * d * d / (2.0 * a) } else { self.k * (d - 0.5 * a) };
             -du * x.signum()
         })
+    }
+}
+
+/// What a skip during play or training does next (module doc, "Skipping a solve"): pause the run
+/// (the default; Play retries the step cold) or retry the step cold at once. A sampling pass
+/// treats both alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipThen {
+    Pause,
+    Retry,
+}
+
+/// The user's Skip, shared between the app worker (which sets it before it queues
+/// [`DynCommand::SkipSolve`], whose abort abandons the running solve), the driver and the
+/// provider (`Trainable::set_skip_request`): whoever handles the abandoned solve's
+/// `ProviderError::Cancelled` takes it (module doc, "Skipping a solve"). One atomic: 0 none,
+/// 1 Pause, 2 Retry; a newer request replaces a pending one. Clones share it.
+#[derive(Clone, Debug, Default)]
+pub struct SkipRequest(Arc<AtomicU8>);
+
+impl SkipRequest {
+    const NONE: u8 = 0;
+
+    fn code(then: SkipThen) -> u8 {
+        match then {
+            SkipThen::Pause => 1,
+            SkipThen::Retry => 2,
+        }
+    }
+
+    fn decode(c: u8) -> Option<SkipThen> {
+        match c {
+            1 => Some(SkipThen::Pause),
+            2 => Some(SkipThen::Retry),
+            _ => None,
+        }
+    }
+
+    /// Asks for the running solve to be skipped, then `then`.
+    pub fn request(&self, then: SkipThen) {
+        self.0.store(Self::code(then), Ordering::SeqCst);
+    }
+
+    /// The pending request, cleared: only one taker gets it.
+    pub fn take(&self) -> Option<SkipThen> {
+        Self::decode(self.0.swap(Self::NONE, Ordering::SeqCst))
+    }
+
+    /// The pending request, left pending.
+    pub fn peek(&self) -> Option<SkipThen> {
+        Self::decode(self.0.load(Ordering::SeqCst))
+    }
+
+    /// Drops a pending request.
+    pub fn clear(&self) {
+        self.0.store(Self::NONE, Ordering::SeqCst);
     }
 }
 
@@ -797,6 +879,12 @@ pub enum DynCommand {
     /// Display only — accepted at any time, never an edit, never aborts a step; it takes effect
     /// from the next evaluation (a paused scene shows it after the next step).
     SetDisplayPartialCore(bool),
+    /// The user's Skip (module doc, "Skipping a solve"): the worker sets the shared
+    /// [`SkipRequest`] before it queues this, and its abort abandons the running solve, whose
+    /// handler takes the request. Applied between steps, it only mops up: a request still pending
+    /// (nothing took it — the solve had already ended) is cleared with the note `nothing to skip`,
+    /// so it never reaches the next solve. Never rejected.
+    SkipSolve(SkipThen),
 }
 
 /// At most this many positions per tick go to the viewer's motion blur ([`DynSnapshot::tick_path`]).
@@ -1217,6 +1305,9 @@ pub struct Dynamics {
     /// The provider's teaching events since the worker's last drain, stamped with their step
     /// (`crate::activity::TeachBuffer`, plan review M6).
     teach: crate::activity::TeachBuffer,
+    /// The user's Skip (module doc, "Skipping a solve"): the worker's shared one once installed
+    /// (`set_skip_request`), else a private one nothing sets.
+    skip: SkipRequest,
 }
 
 impl Dynamics {
@@ -1308,6 +1399,7 @@ impl Dynamics {
             share_tables: None,
             share_inputs: None,
             teach: Default::default(),
+            skip: SkipRequest::default(),
         };
         d.ref_solver = Self::reference_solver_of(d.provider.as_mut());
         d.provider.reset();
@@ -1577,6 +1669,13 @@ impl Dynamics {
                 self.display_partial_core = on;
                 self.provider.set_display_partial_core(on);
             }
+            // whoever handled the abandoned solve took the request; one still pending found no
+            // solve to skip (module doc, "Skipping a solve")
+            DynCommand::SkipSolve(_) => {
+                if self.skip.take().is_some() {
+                    self.note(NOTHING_TO_SKIP.into());
+                }
+            }
         }
     }
 
@@ -1609,6 +1708,17 @@ impl Dynamics {
     pub fn set_display_interrupt(&mut self, interrupt: DisplayInterrupt) {
         self.provider.set_display_interrupt(interrupt.clone());
         self.display_interrupt = Some(interrupt);
+    }
+
+    /// Installs the worker's shared skip request (module doc, "Skipping a solve") and hands it to
+    /// a trainable provider (`Trainable::set_skip_request`: its sampling pass takes skips of pass
+    /// solves). The driver never replaces its provider; a new provider comes with a new driver,
+    /// which the worker gives the same request.
+    pub fn set_skip_request(&mut self, r: SkipRequest) {
+        if let Some(t) = self.provider.as_trainable() {
+            t.set_skip_request(r.clone());
+        }
+        self.skip = r;
     }
 
     /// `orbital_display_now` with the display interrupt as its abort.
@@ -1776,9 +1886,20 @@ impl Dynamics {
             }
             // (a live evaluation between sample solves must not extrapolate the teacher's density
             // through the other's geometry, review m2: the provider that runs the pass sees to it)
+            let ts = Instant::now();
             match self.evaluate(should_abort) {
                 Ok(()) => evaluated = true,
-                Err(ProviderError::Cancelled) => return self.snapshot(),
+                Err(ProviderError::Cancelled) => {
+                    // the user's Skip (module doc, "Skipping a solve"): a relax's re-evaluation
+                    // has nothing to skip; a paused skip waits for Play, not the next paused tick
+                    if self.fire.is_some() {
+                        self.drop_skip();
+                    } else if let Some(then) = self.skip.take() {
+                        self.skip_taken(then, self.step, ts);
+                        self.stale_eval_failed = then == SkipThen::Pause;
+                    }
+                    return self.snapshot();
+                }
                 Err(e) => {
                     self.stale_eval_failed = true;
                     self.fail(e);
@@ -1838,7 +1959,13 @@ impl Dynamics {
                     }
                     self.record_step_cost(ts);
                 }
-                Err(ProviderError::Cancelled) => break,
+                Err(ProviderError::Cancelled) => {
+                    // the user's Skip of this step's solve (module doc, "Skipping a solve")
+                    if let Some(then) = self.skip.take() {
+                        self.skip_taken(then, self.step + 1, ts);
+                    }
+                    break;
+                }
                 Err(e) => {
                     self.fail(e);
                     break;
@@ -2414,7 +2541,11 @@ impl Dynamics {
                         break;
                     }
                 }
-                Err(ProviderError::Cancelled) => break,
+                Err(ProviderError::Cancelled) => {
+                    // abandoned like a Pause abandon's step; a relax has nothing to skip
+                    self.drop_skip();
+                    break;
+                }
                 Err(e) => {
                     failure = Some(e);
                     break;
@@ -3293,6 +3424,46 @@ impl Dynamics {
 
     fn reject(&mut self, msg: String) {
         self.last_rejection = Some(msg);
+    }
+
+    /// A play or training solve the user skipped (module doc, "Skipping a solve"), for `step`,
+    /// started at `started`: the step was not taken (the integrator's step is atomic), the
+    /// provider is reset so the next solve is cold, the skip is noted — and logged as a failed
+    /// teaching event `ScfEnd::Skipped` when the provider reports the abandoned evaluation as a
+    /// teacher solve (`Trainable::cancelled_teacher_solve`) — then the run pauses or plays on.
+    fn skip_taken(&mut self, then: SkipThen, step: u64, started: Instant) {
+        let teacher = self.provider.as_trainable().and_then(|t| t.cancelled_teacher_solve());
+        self.provider.reset();
+        let msg = match then {
+            SkipThen::Pause => format!("you skipped the solve at step {step} — nothing was kept; Play retries it from a cold start"),
+            SkipThen::Retry => format!("skipped at step {step} — retrying cold"),
+        };
+        if let Some((origin, rule, atom)) = teacher {
+            use crate::activity::{ScfEnd, TeachEvent, TeachOutcome};
+            let mut e = TeachEvent::new(origin, rule, TeachOutcome::Failed);
+            e.step = Some(step);
+            e.atom = atom;
+            e.detail = msg.clone();
+            e.n_atoms = self.scene.nuclei.len();
+            e.solve_ms = started.elapsed().as_secs_f64() * 1e3;
+            e.scf_end = Some(ScfEnd::Skipped);
+            self.teach.absorb(vec![e], step);
+        }
+        if then == SkipThen::Pause {
+            self.paused = true;
+            self.pending_steps = 0;
+        }
+        self.note(msg);
+        self.seq += 1;
+    }
+
+    /// A solve abandoned where a skip does not apply (a relax): a pending request is dropped with
+    /// the note [`NOTHING_TO_SKIP`], so it never reaches a later solve.
+    fn drop_skip(&mut self) {
+        if self.skip.take().is_some() {
+            self.note(NOTHING_TO_SKIP.into());
+            self.seq += 1;
+        }
     }
 
     fn note(&mut self, msg: String) {

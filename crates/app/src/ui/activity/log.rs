@@ -202,7 +202,8 @@ pub fn solve_hover(e: &sim::TeachEvent) -> Option<String> {
         Some(sim::ScfEnd::Stalled) => " — stalled: the best Δρ did not halve within the stall window, so the solve stopped before the cap",
         Some(sim::ScfEnd::Cap) => " — stopped at the iteration cap without converging",
         Some(sim::ScfEnd::NonFinite) => " — stopped: Δρ was not finite",
-        Some(sim::ScfEnd::TimeLimit) | None => "",
+        // (a skip's own wording is the skip-solve plan's Task 3)
+        Some(sim::ScfEnd::TimeLimit | sim::ScfEnd::Skipped) | None => "",
     };
     let ts = e.ts.and_then(ts_text).map_or(String::new(), |t| format!("; {t} (the electronic entropy term of F at T_el: partly occupied levels)"));
     Some(format!("{n} SCF iterations{why}{ts}"))

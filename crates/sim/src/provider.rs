@@ -1513,6 +1513,19 @@ pub trait Trainable {
     fn take_teach_events(&mut self) -> Vec<crate::activity::TeachEvent> {
         Vec::new()
     }
+    /// The user's Skip (`crate::dynamics::SkipRequest`, shared with the app worker): the driver
+    /// hands it on whenever it is installed (`Dynamics::set_skip_request`), so the provider's own
+    /// solves outside the stepping path — a sampling pass's — can take it. The default: ignored.
+    fn set_skip_request(&mut self, _r: crate::dynamics::SkipRequest) {}
+    /// Whether the latest `evaluate` was a teacher solve that `should_abort` abandoned, and if so
+    /// why the step went to the teacher: (origin, rule, the atom the rule names) — what its
+    /// `TeachEvent` would have carried. `None` when the latest evaluation was anything else (a
+    /// provider clears it at the start of every evaluation), and by default. `sim::Dynamics` reads
+    /// it after a skipped step (module doc, "Skipping a solve") to log the skip as a teaching
+    /// event; without it the skip is a note only.
+    fn cancelled_teacher_solve(&self) -> Option<(crate::activity::TeachOrigin, crate::activity::TeachRule, Option<usize>)> {
+        None
+    }
     /// The training views' data built from what the provider holds, without a teacher solve
     /// (`crate::activity::TrainingViews`); `None` without a fitted model.
     fn training_views(&mut self) -> Option<crate::activity::TrainingViews> {

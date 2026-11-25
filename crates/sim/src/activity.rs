@@ -761,7 +761,8 @@ impl TeachOutcome {
 /// How a teacher's SCF ended (the solve log's iteration cell): converged, the stall stop
 /// (`qm::scf` "The stall stop"), the iteration cap, a non-finite Δρ, or — a sampling pass's solve
 /// only — the pass's per-sample time limit (`providers::sampling`, "The time limit"; the solve was
-/// given up from outside, its iteration count unknown).
+/// given up from outside, its iteration count unknown), or the user's Skip (the Activity tab;
+/// `crate::dynamics::SkipRequest`: given up from outside too, never kept — "skipped by you").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScfEnd {
     Converged,
@@ -769,6 +770,7 @@ pub enum ScfEnd {
     Cap,
     NonFinite,
     TimeLimit,
+    Skipped,
 }
 
 impl ScfEnd {
@@ -779,6 +781,7 @@ impl ScfEnd {
             ScfEnd::Cap => "cap",
             ScfEnd::NonFinite => "not finite",
             ScfEnd::TimeLimit => "time limit",
+            ScfEnd::Skipped => "skipped",
         }
     }
 }
