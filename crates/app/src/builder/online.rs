@@ -548,12 +548,12 @@ impl Net {
 
 /// PubChem has no such thing: a 4xx other than a request timeout or a rate limit. Anything else is
 /// the network's or the service's failure.
-fn absent(e: NetError) -> bool {
+pub(super) fn absent(e: NetError) -> bool {
     matches!(e, NetError::Status(s) if (400..500).contains(&s) && s != 408 && s != 429)
 }
 
 /// A `…/cids/TXT` body: one CID a line (0, PubChem's "none", and repeats left out).
-fn parse_cids(body: &str) -> Result<Vec<u64>, NetError> {
+pub(super) fn parse_cids(body: &str) -> Result<Vec<u64>, NetError> {
     let mut v = Vec::new();
     for l in body.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let c: u64 = l.parse().map_err(|_| NetError::Malformed)?;
@@ -625,7 +625,7 @@ fn finish(net: &mut Net, mut r: Record, cid: u64, deadline: Instant) -> (Record,
 
 /// The 2D SDF's coordinates in `r`'s atom order, through the exact mapping of its graph onto
 /// `r`'s, laid out by the canvas rule; None when the graphs differ.
-fn layout_2d(r: &Record, (z, charge, bonds, p): (Vec<u8>, Vec<i8>, Vec<(usize, usize, u8)>, Vec<[f64; 3]>)) -> Option<Vec<[f32; 2]>> {
+pub(super) fn layout_2d(r: &Record, (z, charge, bonds, p): (Vec<u8>, Vec<i8>, Vec<(usize, usize, u8)>, Vec<[f64; 3]>)) -> Option<Vec<[f32; 2]>> {
     let d = Drawing { atoms: z.iter().zip(&charge).map(|(&z, &charge)| Atom { z, pos: [0.0; 2], charge }).collect(), bonds: bonds.iter().map(|&(a, b, order)| Bond { a, b, order }).collect() };
     let all: Vec<usize> = (0..d.atoms.len()).collect();
     let MapResult::Mapped(m) = iso::map_fragment(&d, &all, r) else { return None };
@@ -887,6 +887,8 @@ fn graph_key(d: &Drawing) -> GraphKey {
 /// answer for it, and when each was asked. [`Session::tick`] runs every frame the window shows.
 pub struct Session {
     clock: Arc<dyn Clock>,
+    /// The shipped list ([`Library::shipped`]; a test session's leaves ethane out, [`Session::with`]).
+    lib: &'static Library,
     lookups: Option<Lookups>,
     cache: Option<Cache>,
     /// The lookups and cache were given (tests): the real ones are never made.
@@ -909,20 +911,27 @@ pub struct Session {
 
 impl Default for Session {
     fn default() -> Session {
-        Session::new(Arc::new(SystemClock), None, None, false)
+        Session::new(Arc::new(SystemClock), None, None, false, Library::shipped())
     }
 }
 
 impl Session {
-    fn new(clock: Arc<dyn Clock>, lookups: Option<Lookups>, cache: Option<Cache>, given: bool) -> Session {
+    fn new(clock: Arc<dyn Clock>, lookups: Option<Lookups>, cache: Option<Cache>, given: bool, lib: &'static Library) -> Session {
         let changed_at = clock.now();
-        Session { clock, lookups, cache, given, graph: None, enabled: false, generation: 0, changed_at, version: 0, local: Vec::new(), results: HashMap::new(), requested: HashMap::new(), inbox: Vec::new(), search_inbox: Vec::new() }
+        Session { clock, lib, lookups, cache, given, graph: None, enabled: false, generation: 0, changed_at, version: 0, local: Vec::new(), results: HashMap::new(), requested: HashMap::new(), inbox: Vec::new(), search_inbox: Vec::new() }
     }
 
-    /// A session over the given lookups, cache and clock (tests).
+    /// A session over the given lookups, cache and clock (tests), whose shipped list is
+    /// [`Library::shipped`] without its C₂H₆ records: the online tests draw ethane as the molecule
+    /// only PubChem knows (canned answers), and the real list must ship it (the Methyl stamp on a
+    /// carbon, Task 6).
     #[cfg(test)]
     pub(crate) fn with(lookups: Lookups, cache: Cache, clock: Arc<dyn Clock>) -> Session {
-        Session::new(clock, Some(lookups), Some(cache), true)
+        static NO_ETHANE: std::sync::OnceLock<Library> = std::sync::OnceLock::new();
+        let lib = NO_ETHANE.get_or_init(|| {
+            Library::from_records(Library::shipped().records().iter().filter(|r| r.formula_key() != ("C2H6".to_string(), 0)).cloned().collect())
+        });
+        Session::new(clock, Some(lookups), Some(cache), true, lib)
     }
 
     /// The real lookups and cache, made once the process may use the network (never in a test
@@ -956,7 +965,7 @@ impl Session {
             self.requested.clear();
             self.version += 1;
             let none = HashMap::new();
-            let here = Layered { lib: Library::shipped(), cache: self.cache.as_ref(), results: &none };
+            let here = Layered { lib: self.lib, cache: self.cache.as_ref(), results: &none };
             self.local = iso::fragments(d).into_iter().filter(|f| f.len() >= 2).map(|f| (here.find(d, &f).is_found(), f)).map(|(k, f)| (f, k)).collect();
             if let Some(l) = &self.lookups {
                 l.supersede(self.generation);
@@ -1025,7 +1034,7 @@ impl Session {
 
     /// The record source for the drawing [`Session::tick`] last saw.
     pub fn layered(&self) -> Layered<'_> {
-        Layered { lib: Library::shipped(), cache: self.cache.as_ref(), results: &self.results }
+        Layered { lib: self.lib, cache: self.cache.as_ref(), results: &self.results }
     }
 
     /// The molecule cache the search box reads: the user's, once the process may use the network
@@ -1785,9 +1794,13 @@ pub(crate) mod tests {
         assert_eq!(canned.total(), 0);
         // and the real transport, which checks the switch before anything else
         assert_eq!(UreqTransport::new().get(&smiles_url("[CH3][CH3]"), TIMEOUT), Err(NetError::Offline));
-        // a builder as the app makes it, in a test build: no lookups made at all
+        // a builder as the app makes it, in a test build: no lookups made at all, for a molecule the
+        // shipped list has not (an ethyl radical: the real list ships ethane)
         let mut b = Builder::default();
         b.drawing = d.clone();
+        let h = b.drawing.atoms.iter().rposition(|a| a.z == 1).unwrap();
+        b.drawing.remove_atom(h);
+        assert!(Library::shipped().candidates(&iso::drawing_key(&b.drawing, &all(&b.drawing))).is_empty());
         assert_eq!(footer_label(b.shaped()), "shape: approximate (offline)");
         assert!(b.lookup.lookups.is_none() && b.lookup.cache.is_none());
     }

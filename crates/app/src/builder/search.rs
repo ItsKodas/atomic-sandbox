@@ -97,7 +97,7 @@ pub fn fold(q: &str) -> String {
     fold_marked(q, true)
 }
 
-/// [`fold`] with the superscripts as plain ASCII, no `^` (`SO₄²⁻` → `SO42-`): what a formula query
+/// [`fold`] with the superscripts as plain ASCII and no `^`, typed or not (`SO₄²⁻`, `SO4^2-` → `SO42-`): what a formula query
 /// sends to PubChem.
 pub fn plain(q: &str) -> String {
     fold_marked(q, false)
@@ -122,6 +122,8 @@ fn fold_marked(q: &str, caret: bool) -> String {
                 continue;
             }
             c if c.is_control() => continue,
+            // a typed caret is our notation, never sent (plain ASCII has none)
+            '^' if !caret => continue,
             c => (c, false),
         };
         if space && !out.is_empty() {
@@ -712,6 +714,7 @@ pub(crate) mod tests {
         assert_eq!(online_query("h2o"), Query::Formula("h2o".into()), "the user's case kept");
         assert_eq!(online_query("NH\u{2084}\u{207A}\u{0}"), Query::Formula("NH4+".into()), "a control character dropped");
         assert_eq!(online_query("ethyl  alcohol"), Query::Name("ethyl alcohol".into()));
+        assert_eq!(online_query("SO4^2-"), Query::Formula("SO42-".into()), "a typed caret is not sent");
         for q in ["H₂O", "h2o", "H2O", "OH2"] {
             assert_eq!(names(&local(q)), ["water"], "{q}");
         }

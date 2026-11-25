@@ -8,3 +8,6 @@ crates/app/src/update/fixtures/** -text
 
 # the release public key: minisign's two lines, LF on every checkout (the release job reads it with minisign -V -p)
 crates/app/release-key.pub text eol=lf
+
+# the builder's molecule data (embedded with include_bytes!, so its size and bytes are the same on every checkout)
+crates/app/data/*.txt text eol=lf
