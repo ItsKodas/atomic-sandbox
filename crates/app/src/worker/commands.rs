@@ -252,7 +252,8 @@ impl Command {
     }
 
     /// Commands the viewer mirrors (scene edits, and the play state: Play / Pause / Step and the
-    /// pausing model commands, StartSampling and EnsureModel). The
+    /// pausing model commands, StartSampling and EnsureModel). Not `SkipSolve`: it pauses only
+    /// when it finds a solve to skip, and the viewer takes that from the snapshot. The
     /// worker counts them in `Snapshot::edits`; the viewer adopts a snapshot's scene and play
     /// state only once every such command it sent is in it, so a snapshot taken before an edit
     /// never undoes the edit on screen.
@@ -298,7 +299,7 @@ impl Command {
     }
 
     /// Whether the driver ends up paused by it (Pause, Step, the scene replacements, and a
-    /// sampling pass starting).
+    /// sampling pass starting). Not `SkipSolve` (a skip with Pause pauses only when it took a solve).
     pub fn pauses(&self) -> bool {
         matches!(
             self,
@@ -369,6 +370,9 @@ impl Command {
                     | DynCommand::ForgetModel
                     | DynCommand::LoadModel(_)
                     | DynCommand::StopRelax
+                    // the Activity card's Skip (skip-solve spec): `SimWorker::send` set the
+                    // request first, so whoever handles the abandoned solve takes it
+                    | DynCommand::SkipSolve(_)
             ),
             // a policy change applies from the next evaluation on, the cloud, the training views
             // and the orbital view are display only: nothing to abandon

@@ -989,6 +989,13 @@ pub trait ForceProvider: Send {
     /// Forget warm state: the next evaluation is cold (grid change, added or removed nuclei, a
     /// replaced scene).
     fn reset(&mut self);
+    /// The user skipped the running solve (`sim::dynamics`, "Skipping a solve"): drop the warm
+    /// start and any parked solve so the next evaluation starts cold, keeping anything that checks
+    /// the result against the last completed step (e.g. a branch-jump guard). Not an edit: the
+    /// scene and the last completed step are unchanged. The default calls [`reset`](Self::reset).
+    fn restart_cold(&mut self) {
+        self.reset();
+    }
     /// A teleport of existing nuclei (R13): the next evaluation may warm-start from the old
     /// geometry's state but must not extrapolate through the jump. Default: [`reset`](Self::reset).
     fn discontinuity(&mut self) {
@@ -1512,6 +1519,19 @@ pub trait Trainable {
     /// Activity tab's solve log). A provider without a teacher has none.
     fn take_teach_events(&mut self) -> Vec<crate::activity::TeachEvent> {
         Vec::new()
+    }
+    /// The user's Skip (`crate::dynamics::SkipRequest`, shared with the app worker): the driver
+    /// hands it on whenever it is installed (`Dynamics::set_skip_request`), so the provider's own
+    /// solves outside the stepping path — a sampling pass's — can take it. The default: ignored.
+    fn set_skip_request(&mut self, _r: crate::dynamics::SkipRequest) {}
+    /// Whether the latest `evaluate` was a teacher solve that `should_abort` abandoned, and if so
+    /// why the step went to the teacher (`crate::activity::CancelledTeach`: origin, rule, the atom
+    /// the rule names and the rule's sentence) — what its `TeachEvent` would have carried. `None`
+    /// when the latest evaluation was anything else (a provider clears it at the start of every
+    /// evaluation), and by default. `sim::Dynamics` reads it after a skipped step (module doc,
+    /// "Skipping a solve") to log the skip as a teaching event; without it the skip is a note only.
+    fn cancelled_teacher_solve(&self) -> Option<crate::activity::CancelledTeach> {
+        None
     }
     /// The training views' data built from what the provider holds, without a teacher solve
     /// (`crate::activity::TrainingViews`); `None` without a fitted model.

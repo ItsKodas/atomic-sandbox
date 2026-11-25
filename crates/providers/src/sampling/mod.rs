@@ -114,6 +114,16 @@
 //! not iterations: the teacher's iteration count is not visible through `ForceProvider`, and what
 //! the user waits for is time.
 //!
+//! **The user's Skip** (the Activity tab, skip-solve spec 2026-11-25) gives up a timed solve the same
+//! way, before or after a limit stands: the worker sets the shared `sim::SkipRequest` (the pass gets
+//! it from the surrogate, `Sampler::with_skip_request`) and its abort abandons the solve; a
+//! `Cancelled` with the request pending takes it, and the sample is `failed` with `ScfEnd::Skipped`
+//! ("skipped by you after … s"), never kept, the next solve cold, a stretched scan's further-out
+//! points skipped and a burst step's burst restarted, as after a time-out. A skip says nothing about
+//! how fast the solves are, so it does **not** double the limit. A reference solve or a shell check
+//! is never skipped: a request that reaches one (a stale frame; the app disables the button there)
+//! is cleared with the note [`UNSKIPPABLE`], and the job stays queued and restarts, as after a Pause.
+//!
 //! **A failed scan point ends its scan's stretched tail** (the SCF stall stop, `qm::scf` "The stall
 //! stop"): when a scan point on the stretched side (r > r₀) fails to converge — the stall stop or
 //! the iteration cap, `SolverError::scf_end` — the queued points of that scan at larger r are not
@@ -128,9 +138,9 @@
 //! converged stretched point stay unseen, so the model falls back to the teacher there (the
 //! data-driven rules 5b–5e; skip rows never become samples). Points on the compressed side, and every
 //! other scan, are unaffected; a failure at r ≤ r₀ skips nothing (the scan runs from compressed to
-//! stretched, so nothing nearer r₀ is still queued there). Only the stall stop, the cap and the
-//! pass's time limit trigger it (`ScfEnd::Stalled | Cap | TimeLimit`): a non-finite Δρ, a
-//! numerical failure or "GPU busy" skip nothing.
+//! stretched, so nothing nearer r₀ is still queued there). Only the stall stop, the cap, the
+//! pass's time limit and the user's Skip trigger it (`ScfEnd::Stalled | Cap | TimeLimit |
+//! Skipped`): a non-finite Δρ, a numerical failure or "GPU busy" skip nothing.
 //!
 //! **Box-affected samples** (final review I1): every sample goes to the surrogate with its
 //! teacher's face density (`EvalStats::face_density`, `SurrogateKs::add_sample_answer`, with the solved multiplicity), so
@@ -198,7 +208,7 @@ use sim::integrator::Integrator;
 use sim::references::{AtomScan, ReferenceKey};
 use sim::sampling::{allowed_multiplicities, SamplingPlan, SamplingProgress, EMPTY_SCENE, MAX_JOBS};
 use sim::thermostat::{standard_normal, Csvr};
-use sim::{ForceProvider, ForceResult, ProviderError, ReferenceCache, Scene, CELL_MARGIN_H};
+use sim::{ForceProvider, ForceResult, ProviderError, ReferenceCache, Scene, SkipRequest, CELL_MARGIN_H};
 use crate::surrogate::{box_affected_face_density, lone_pass_refusal, no_neighbours, PassKeep, SurrogateKs, MIN_RESIDUAL_DOF};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -230,6 +240,9 @@ pub const TIME_LIMIT_FACTOR: f64 = 5.0;
 pub const TIME_LIMIT_FLOOR_S: f64 = 15.0;
 /// …and only once this many sample solves have succeeded (the first solves include the cold start).
 pub const TIME_LIMIT_MIN_SOLVES: usize = 3;
+/// The note when the user's Skip reaches a solve the pass never gives up (a reference solve or a shell
+/// check; module doc, "The time limit"): the request is cleared and the solve restarts.
+pub const UNSKIPPABLE: &str = "reference solves can't be skipped; it restarts";
 /// What a scan point skipped for [`SCAN_CUTOFF_FRACTION`] carries in its note (the skip's tally).
 const SCAN_LIMIT_MARK: &str = "of the model's cutoff";
 
@@ -513,6 +526,11 @@ pub struct Sampler {
     time_limit_floor_s: f64,
     /// Sample solves given up in a row: each doubles the limit (module doc, "The time limit").
     timeouts_in_a_row: usize,
+    /// The user's Skip (`sim::SkipRequest`, `with_skip_request`): a sample solve abandoned with it pending is given
+    /// up like a time-out (module doc, "The time limit").
+    skip: SkipRequest,
+    /// The last solve was given up by the user's Skip.
+    skipped: bool,
     /// Teacher answers refused since the last accepted one (module doc, "Refused answers").
     refused_in_a_row: usize,
     /// The last refusal's reason, for the pass's end.
@@ -711,6 +729,8 @@ impl Sampler {
             timed_out: None,
             time_limit_floor_s: TIME_LIMIT_FLOOR_S,
             timeouts_in_a_row: 0,
+            skip: SkipRequest::default(),
+            skipped: false,
             refused_in_a_row: 0,
             last_refusal: None,
         })
@@ -768,6 +788,8 @@ impl Sampler {
             timed_out: None,
             time_limit_floor_s: TIME_LIMIT_FLOOR_S,
             timeouts_in_a_row: 0,
+            skip: SkipRequest::default(),
+            skipped: false,
             refused_in_a_row: 0,
             last_refusal: None,
         }
@@ -1277,6 +1299,8 @@ impl Sampler {
                     let solve_ms = started.elapsed().as_secs_f64() * 1e3;
                     let again = if retry { " (retry, cold)" } else { "" };
                     if let Err(ProviderError::Cancelled) = outcome {
+                        // never skipped (module doc, "The time limit"): it restarts
+                        self.untimed_cancel();
                         self.queue.push_front(Job::Reference(scan));
                         return Err(ProviderError::Cancelled);
                     }
@@ -1465,7 +1489,7 @@ impl Sampler {
                             // a non-converged scan point ends its stretched tail (module doc)
                             // only the stall stop and the cap say something about the bond; a non-finite Δρ is a
                             // numerics fault and costs nothing further (review S5)
-                            if let (false, Some((end @ (ScfEnd::Stalled | ScfEnd::Cap | ScfEnd::TimeLimit), _))) = (solved, self.last_failure) {
+                            if let (false, Some((end @ (ScfEnd::Stalled | ScfEnd::Cap | ScfEnd::TimeLimit | ScfEnd::Skipped), _))) = (solved, self.last_failure) {
                                 self.skip_scan_tail(pair, k, end);
                             }
                             return Ok(Some(self.progress()));
@@ -1533,13 +1557,34 @@ impl Sampler {
         self
     }
 
+    /// The user's Skip (module doc, "The time limit"): the handle the worker shares with the driver
+    /// (`sim::Dynamics::set_skip_request`), which the surrogate hands to every pass it builds
+    /// (`Trainable::set_skip_request`). Without it a pass never sees a skip.
+    pub fn with_skip_request(mut self, r: SkipRequest) -> Sampler {
+        self.skip = r;
+        self
+    }
+
     /// How a failed solve ended, for its event: the SCF's own end and iterations, or the pass's
-    /// time limit (iterations unknown: the solve was given up from outside).
+    /// time limit or the user's Skip (iterations unknown: the solve was given up from outside).
     fn failure_log(&self, e: &ProviderError) -> (Option<ScfEnd>, Option<usize>) {
+        if self.skipped {
+            return (Some(ScfEnd::Skipped), None);
+        }
         match (self.timed_out, e.scf_end()) {
             (Some(_), _) => (Some(ScfEnd::TimeLimit), None),
             (None, Some((end, n))) => (Some(end), Some(n)),
             (None, None) => (None, None),
+        }
+    }
+
+    /// A solve the pass never gives up (a reference solve, a shell check: the fit and the shell
+    /// fence rest on it) was abandoned: a pending Skip (a stale frame — the app disables the button
+    /// there) is not taken, only cleared, so it never hits the next solve; the job stays queued and
+    /// restarts, as after a Pause (module doc, "The time limit").
+    fn untimed_cancel(&mut self) {
+        if self.skip.take().is_some() {
+            self.notes.push(format!("sampling: {UNSKIPPABLE}"));
         }
     }
 
@@ -1559,6 +1604,7 @@ impl Sampler {
         should_abort: &mut dyn FnMut() -> bool,
     ) -> Result<ForceResult, ProviderError> {
         self.timed_out = None;
+        self.skipped = false;
         let limit = if limited { self.time_limit_s() } else { None };
         let median = self.median_solve_s();
         let t: &mut dyn ForceProvider = match teacher {
@@ -1602,6 +1648,18 @@ impl Sampler {
                     started.elapsed().as_secs_f64(),
                     self.time_limit_floor_s
                 )));
+            }
+            // the user's Skip: given up like a time-out, but it says nothing about the solves' speed — the limit is not
+            // doubled (module doc, "The time limit")
+            Err(ProviderError::Cancelled) if limited && self.skip.take().is_some() => {
+                self.skipped = true;
+                // as after a time-out, the next solve is cold (the abandoned solve parked its half-converged state)
+                self.last_n = None;
+                return Err(ProviderError::Invalid(format!("skipped by you after {:.1} s", started.elapsed().as_secs_f64())));
+            }
+            Err(ProviderError::Cancelled) if !limited => {
+                self.untimed_cancel();
+                return Err(ProviderError::Cancelled);
             }
             Err(e) => {
                 // the session's GPU failure ends the pass at its next step (`SurrogateKs::pass_step`)
@@ -1669,7 +1727,13 @@ impl Sampler {
                 ev.detail = note.clone();
                 ev.n_atoms = scene.nuclei.len();
                 ev.solve_ms = started.elapsed().as_secs_f64() * 1e3;
-                self.last_failure = if self.timed_out.is_some() { Some((ScfEnd::TimeLimit, 0)) } else { e.scf_end() };
+                self.last_failure = if self.skipped {
+                    Some((ScfEnd::Skipped, 0))
+                } else if self.timed_out.is_some() {
+                    Some((ScfEnd::TimeLimit, 0))
+                } else {
+                    e.scf_end()
+                };
                 (ev.scf_end, ev.scf_steps) = self.failure_log(&e);
                 surrogate.push_event(ev);
                 self.notes.push(note);
@@ -1914,9 +1978,10 @@ impl Sampler {
         let r = scan.r.clone();
         let mut n = 0;
         for job in self.queue.iter_mut() {
-            // a time-out says nothing about the bond further out, only about time: the pair's
-            // shell check — never timed, the fence rests on it — stays queued (review SHOULD-2)
-            if end == ScfEnd::TimeLimit && matches!(job, Job::Shell(..)) {
+            // a time-out (or the user's Skip) says nothing about the bond further out, only about
+            // time: the pair's shell check — never timed, the fence rests on it — stays queued
+            // (review SHOULD-2)
+            if matches!(end, ScfEnd::TimeLimit | ScfEnd::Skipped) && matches!(job, Job::Shell(..)) {
                 continue;
             }
             if let Job::Scan(_, p, kk) | Job::Shell(_, p, kk) = *job {

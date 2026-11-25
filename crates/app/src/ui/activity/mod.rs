@@ -467,14 +467,23 @@ pub fn show(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Ve
         let id = ui.id().with("jobs-height");
         let keep = input.playing || !rows.is_empty();
         let reserved = if keep { ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0) } else { 0.0 };
+        // the last skip's sentence (skip-solve spec §3, final review I2) while it is still the
+        // status line: Play clears the status and any newer one replaces it, so it goes exactly
+        // when it stops being true. A Pause skip leaves nothing running: it stands in for that.
+        let skipped = input.snapshot.and_then(|s| s.dynamics.last_skip.as_deref()).filter(|t| st.status == *t);
         let used = ui
             .scope(|ui| {
                 ui.set_min_height(reserved);
                 if rows.is_empty() && loading.is_none() {
-                    theme::note(ui, "nothing running");
+                    if skipped.is_none() {
+                        theme::note(ui, "nothing running");
+                    }
                 } else {
                     let refit = input.probe.as_ref().and_then(|p| p.refit.as_ref()).map(|v| (v, &input.refit_ratios[..]));
-                    jobs::show(ui, &rows, &st.activity.conv, &bars, refit, acts);
+                    jobs::show(ui, &rows, &st.activity.conv, &bars, refit, &mut st.skip_then, acts);
+                }
+                if let Some(t) = skipped {
+                    super::probed("activity-last-skip", ui.add(egui::Label::new(egui::RichText::new(t).size(11.5).color(super::AMBER)).wrap()));
                 }
             })
             .response

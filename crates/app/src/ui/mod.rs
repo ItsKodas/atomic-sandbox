@@ -736,6 +736,10 @@ pub struct UiState {
     /// A Relax or Stop click the worker has not answered yet: the button shows the new state at
     /// once, with a spinner, until [`RelaxPending::settled`] (display only, never recorded).
     pub relax_pending: Option<RelaxPending>,
+    /// The Activity card's ▾ beside Skip (skip-solve spec §4): what a skip during play does next —
+    /// Pause (the default) or Retry cold. A display setting kept in the profile (`skip_then =
+    /// pause|retry`); the Skip action carries it (`Action::SkipSolve { then }`).
+    pub skip_then: sim::SkipThen,
     /// The bond reference's last progress report: (egui time it arrived, its elapsed s) — the
     /// smooth bar fills in from it.
     pub ref_seen: Option<(f64, f64)>,
@@ -1064,6 +1068,7 @@ impl UiState {
             bonds_refresh: None,
             orbitals_press: None,
             relax_pending: None,
+            skip_then: sim::SkipThen::Pause,
             ref_seen: None,
             trail_fs: crate::trails::LENGTH_DEFAULT_FS,
             trail_opacity: crate::trails::OPACITY_DEFAULT,

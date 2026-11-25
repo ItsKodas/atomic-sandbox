@@ -300,7 +300,10 @@ pub(super) fn state(input: &PanelInput<'_>) -> (bool, String) {
     } else if input.busy {
         (true, "solving…".into())
     } else if let Some(s) = snap {
-        if s.dynamics.forces_stale {
+        if s.dynamics.forces_stale && s.dynamics.last_error.is_none() && s.dynamics.stale_eval_held {
+            // a Pause skip of the re-solve (skip-solve final review I1): no error to point at
+            (false, "paused — not evaluated (skipped; Play solves it)".into())
+        } else if s.dynamics.forces_stale {
             (false, "paused — not evaluated (see the error)".into())
         } else if s.scene == *input.scene {
             (false, "paused — converged".into())

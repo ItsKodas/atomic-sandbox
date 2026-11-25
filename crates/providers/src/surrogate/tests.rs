@@ -14727,6 +14727,97 @@ fn a_box_affected_tick_is_taken_without_a_point() {
     assert_eq!((s.ticks_taken(), s.ticks_skipped(), s.audit_due), (0, 0, false));
 }
 
+/// The Morse teacher of the skip tests: it abandons a solve while `cancel` is set (as the GPU teacher does when the
+/// user's Skip raises the abort), fails one while `fail` is set, and counts its resets and cold restarts.
+struct SkipTeacher {
+    inner: MorseDimer,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+    resets: Arc<std::sync::atomic::AtomicUsize>,
+    colds: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SkipTeacher {
+    fn new() -> SkipTeacher {
+        SkipTeacher { inner: MorseDimer::h2(), cancel: Arc::default(), fail: Arc::default(), resets: Arc::default(), colds: Arc::default() }
+    }
+}
+
+impl ForceProvider for SkipTeacher {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.cancel.load(SeqCst) {
+            return Err(ProviderError::Cancelled);
+        }
+        if self.fail.load(SeqCst) {
+            return Err(ProviderError::Invalid("a scripted failure".into()));
+        }
+        self.inner.evaluate(scene, should_abort)
+    }
+    fn name(&self) -> &'static str {
+        "morse dimer"
+    }
+    fn reset(&mut self) {
+        self.resets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn restart_cold(&mut self) {
+        self.colds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Skip (ruling R2; `sim::dynamics`, "Skipping a solve"): a teacher solve that `should_abort` abandoned is reported with
+/// the rule that sent the step to the teacher — its origin, rule, atom and the rule's own sentence, so the skip's log row
+/// reads like the surrogate's other `Failed` rows — until the next evaluation, which clears it. A failure is not a cancel.
+#[test]
+fn a_cancelled_teacher_solve_is_reported_with_its_rule_until_the_next_evaluation() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let t = SkipTeacher::new();
+    let (cancel, fail) = (t.cancel.clone(), t.fail.clone());
+    let mut s = SurrogateKs::new(Box::new(t), FallbackPolicy::default());
+    let sc = h2(1.4);
+    assert!(Trainable::cancelled_teacher_solve(&s).is_none());
+    // a failed teacher solve: the row the skip's should read like
+    fail.store(true, SeqCst);
+    let e = s.evaluate(&sc, &mut never()).unwrap_err();
+    fail.store(false, SeqCst);
+    let ev = Trainable::take_teach_events(&mut s);
+    let failed = ev.iter().find(|e| e.outcome == TeachOutcome::Failed).expect("a Failed row").clone();
+    assert!(Trainable::cancelled_teacher_solve(&s).is_none(), "a failure is not a cancel");
+    // the same step abandoned
+    cancel.store(true, SeqCst);
+    assert!(matches!(s.evaluate(&sc, &mut never()), Err(ProviderError::Cancelled)));
+    cancel.store(false, SeqCst);
+    let c = Trainable::cancelled_teacher_solve(&s).expect("a cancelled teacher solve is reported");
+    println!("{c:?}");
+    assert_eq!((c.origin, c.rule, c.atom), (failed.origin, failed.rule, failed.atom));
+    assert_eq!(failed.detail, format!("{} — the teacher failed: {e}", c.why), "the rule's sentence leads both rows");
+    assert!(Trainable::take_teach_events(&mut s).is_empty(), "a cancel leaves no row of its own (the driver logs the skip)");
+    // the next evaluation clears it
+    s.evaluate(&sc, &mut never()).expect("solved");
+    assert!(Trainable::cancelled_teacher_solve(&s).is_none());
+}
+
+/// Skip (rulings R4/R5): `restart_cold` restarts the teacher cold (its own `restart_cold`, not an edit's `reset`) and
+/// keeps the surrogate's report of the last completed step, so the retried step is booked against it — no false "energy
+/// surface changed without a booked jump" — and a composition check in flight stays valid (not an edit: `scene_gen`).
+#[test]
+fn restart_cold_keeps_the_last_report_and_restarts_the_teacher_cold() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let t = SkipTeacher::new();
+    let (resets, colds) = (t.resets.clone(), t.colds.clone());
+    let mut s = SurrogateKs::new(Box::new(t), FallbackPolicy::default());
+    s.evaluate(&h2(1.4), &mut never()).expect("solved");
+    assert!(s.last.is_some());
+    let (r0, gen) = (resets.load(SeqCst), s.scene_gen);
+    s.restart_cold();
+    assert!(s.last.is_some(), "the last completed step's report is kept");
+    assert_eq!((resets.load(SeqCst), colds.load(SeqCst), s.scene_gen), (r0, 1, gen), "the teacher restarts cold; not an edit");
+    // an edit's reset forgets it
+    s.reset();
+    assert!(s.last.is_none());
+    assert_eq!((resets.load(SeqCst), s.scene_gen), (r0 + 1, gen + 1));
+}
+
 /// The gpu-fault fix (2026-11-21): failed-GPU teachers (a panic, `GpuFailed`, an empty answer) through the
 /// surrogate, the pass, the auditor and the driver (`gpu_fault.rs`).
 mod gpu_fault;

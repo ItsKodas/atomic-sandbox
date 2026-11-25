@@ -2340,6 +2340,243 @@ fn a_sample_solve_past_the_time_limit_is_given_up_like_a_stall() {
     assert_eq!((sampler.progress().done, sampler.progress().failed), (before, 0));
 }
 
+/// A teacher whose user skips the solves `skip_at` picks (the scene, and the 1-based count of two-nucleus solves so
+/// far), at most `left` times: mid-solve it makes the request and raises the worker's abort, as the app's Skip does
+/// (`sim::SkipRequest`, `DynCommand::SkipSolve`), then polls `should_abort` like the GPU teacher every SCF iteration.
+/// Everything else is solved as `PairMorse`. Counts its resets.
+struct Skipper {
+    inner: PairMorse,
+    skip_at: fn(&Scene, usize) -> bool,
+    left: usize,
+    calls: usize,
+    skips: usize,
+    resets: usize,
+    req: sim::SkipRequest,
+    abort: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Skipper {
+    fn new(skip_at: fn(&Scene, usize) -> bool, req: &sim::SkipRequest, abort: &Arc<std::sync::atomic::AtomicBool>) -> Skipper {
+        Skipper { inner: PairMorse::h2(), skip_at, left: 1, calls: 0, skips: 0, resets: 0, req: req.clone(), abort: abort.clone() }
+    }
+}
+
+impl ForceProvider for Skipper {
+    fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
+        if scene.nuclei.len() == 2 {
+            self.calls += 1;
+        }
+        if self.left > 0 && (self.skip_at)(scene, self.calls) {
+            self.left -= 1;
+            self.skips += 1;
+            self.req.request(sim::SkipThen::Pause);
+            self.abort.store(true, Ordering::SeqCst);
+            if should_abort() {
+                return Err(ProviderError::Cancelled);
+            }
+        }
+        self.inner.evaluate(scene, should_abort)
+    }
+    fn name(&self) -> &'static str {
+        "pair morse"
+    }
+    fn reset(&mut self) {
+        self.resets += 1;
+    }
+    fn discontinuity(&mut self) {}
+}
+
+/// Steps `sampler` to its end with the worker's abort as `should_abort`, lowered after every step (the worker lowers it
+/// once the Skip command is applied). Returns the cancelled steps, and the time limit just before and just after the
+/// step whose solve was skipped.
+fn run_skipping(sampler: &mut Sampler, teacher: &mut Skipper, s: &mut SurrogateKs) -> (usize, Option<(Option<f64>, Option<f64>)>) {
+    let abort = teacher.abort.clone();
+    let (mut cancels, mut around) = (0, None);
+    loop {
+        let (before, skips) = (sampler.time_limit_s(), teacher.skips);
+        let r = sampler.step(teacher, s, &mut || abort.load(Ordering::SeqCst));
+        abort.store(false, Ordering::SeqCst);
+        if teacher.skips > skips {
+            around = Some((before, sampler.time_limit_s()));
+        }
+        match r {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(ProviderError::Cancelled) => cancels += 1,
+            Err(e) => panic!("{e}"),
+        }
+        assert!(cancels < 5, "a cancelled job is retried, not looped on");
+    }
+    (cancels, around)
+}
+
+/// The user's Skip (spec 2026-11-25 §2; module doc, "The time limit"): a skipped sample solve is given up through the
+/// time limit's path — failed, `ScfEnd::Skipped`, never kept, the next solve cold — but a skip says nothing about the
+/// GPU's speed, so it does not double the limit (only time-outs do). It works before any limit stands, and for a
+/// hot-burst step (the burst restarts) and a teach-around solve alike.
+#[test]
+fn a_skipped_sample_is_given_up_like_a_time_out_without_doubling_the_limit() {
+    use sim::activity::{ScfEnd, TeachOutcome};
+    let scene = pair(1, 1, 1.4, cell(49));
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    let run = |plan: &SamplingPlan, skip_at: fn(&Scene, usize) -> bool| {
+        let req = sim::SkipRequest::default();
+        let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut teacher = Skipper::new(skip_at, &req, &abort);
+        let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        let mut sampler = Sampler::new(&scene, plan).unwrap().with_time_limit_floor(0.05).with_skip_request(req.clone());
+        let (cancels, around) = run_skipping(&mut sampler, &mut teacher, &mut s);
+        assert_eq!((cancels, teacher.skips), (0, 1), "the skip is taken, not a cancel");
+        assert_eq!(req.peek(), None, "the pass took the request");
+        let kept = s.store().map_or(0, |st| st.samples.len());
+        (sampler.progress(), sampler.take_notes(), Trainable::take_teach_events(&mut s), sampler.samples_added(), kept, around, sampler.timeouts_in_a_row, teacher.resets)
+    };
+    // point 9 (1.50 r₀) skipped: failed, never kept; the limit is what it was (a time-out would double it to 0.1)
+    let (p, notes, events, added, kept, around, timeouts, _) = run(&plan, |s, _| s.nuclei.len() == 2 && dist(s, 0, 1) > 1.45 * 1.4 && dist(s, 0, 1) < 1.55 * 1.4);
+    println!("skipped: {p:?} around {around:?}\n  {notes:?}");
+    assert_eq!(around, Some((Some(0.05), Some(0.05))), "the time limit is unchanged by a skip");
+    assert_eq!(timeouts, 0);
+    assert_eq!((p.done, p.total, p.failed, p.skipped, added, kept), (13, 13, 1, 3, 8, 8));
+    let failed: Vec<_> = events.iter().filter(|e| e.outcome == TeachOutcome::Failed).collect();
+    assert_eq!(failed.len(), 1);
+    assert_eq!((failed[0].scf_end, failed[0].scf_steps), (Some(ScfEnd::Skipped), None));
+    assert!(failed[0].detail.contains("(skipped by you after "), "{}", failed[0].detail);
+    assert!(notes.iter().any(|n| n.contains("failed (skipped by you after ")), "{notes:?}");
+    // a skip at r₀ (point 4): the solve after it is cold — the reference, the first scan point and point 5 reset the
+    // teacher (the abandoned solve parked its half-converged state as the warm start)
+    let (p, _, events, added, _, around, _, resets) = run(&plan, |s, _| s.nuclei.len() == 2 && (dist(s, 0, 1) / 1.4 - 1.0).abs() < 0.01);
+    assert_eq!((p.failed, p.skipped, added, resets), (1, 0, 11, 3), "{p:?}");
+    assert_eq!(around, Some((Some(0.05), Some(0.05))));
+    assert!(events.iter().any(|e| e.scf_end == Some(ScfEnd::Skipped)));
+    // before three solves no limit stands, and a skip is still a skip: the first scan point
+    let (p, _, _, added, _, around, _, _) = run(&plan, |s, n| s.nuclei.len() == 2 && n == 1);
+    assert_eq!((p.failed, p.skipped, added), (1, 0, 11), "{p:?}");
+    assert_eq!(around, Some((None, None)));
+    // a skipped hot-burst step restarts the burst from the last geometry it solved, as a failed one does
+    let burst = SamplingPlan { perturbations: 0, hot_burst_steps: 20, scan_points_per_pair: 0, seed: 7, ..SamplingPlan::default() };
+    let (p, notes, events, _, kept, _, _, _) = run(&burst, |s, n| s.nuclei.len() == 2 && n == 6);
+    assert_eq!((p.done, p.total, p.failed, p.skipped, kept), (21, 21, 1, 0, 19), "{p:?}");
+    assert!(notes.iter().any(|n| n.contains("the burst restarts from the last geometry it solved")), "{notes:?}");
+    assert!(events.iter().any(|e| e.outcome == TeachOutcome::Failed && e.scf_end == Some(ScfEnd::Skipped)));
+    // a teach-around solve
+    let req = sim::SkipRequest::default();
+    let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut teacher = Skipper::new(|s, _| s.nuclei.len() == 2, &req, &abort);
+    let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let mut sampler = Sampler::targeted(&scene, vec![TargetJob { scene: pair(1, 1, 1.5, cell(49)), blocker: 7, holdout: false }]).with_skip_request(req.clone());
+    assert_eq!(run_skipping(&mut sampler, &mut teacher, &mut s).0, 0);
+    assert_eq!(sampler.progress().failed, 1);
+    let ev = Trainable::take_teach_events(&mut s);
+    assert!(ev.iter().any(|e| e.outcome == TeachOutcome::Failed && e.scf_end == Some(ScfEnd::Skipped) && e.detail.contains("skipped by you")), "{ev:?}");
+}
+
+/// A skipped stretched scan point ends its scan's stretched tail as a stall does (module doc, "A failed scan point …"):
+/// the further-out points become skip rows. Like a time-out it says nothing about the bond further out, so the pair's
+/// shell check (never timed, never skippable) stays queued and is solved.
+#[test]
+fn a_skipped_stretched_scan_point_drops_the_further_points() {
+    use sim::activity::TeachOutcome;
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    let req = sim::SkipRequest::default();
+    let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut teacher = Skipper::new(|s, _| s.nuclei.len() == 2 && dist(s, 0, 1) > 1.45 * 1.4 && dist(s, 0, 1) < 1.55 * 1.4, &req, &abort);
+    let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let mut sampler = Sampler::new(&pair(1, 1, 1.4, cell(49)), &plan).unwrap().with_skip_request(req.clone());
+    run_skipping(&mut sampler, &mut teacher, &mut s);
+    let (p, notes, events) = (sampler.progress(), sampler.take_notes(), Trainable::take_teach_events(&mut s));
+    assert_eq!((p.failed, p.skipped, sampler.tail_skipped), (1, 3, 3), "{p:?}");
+    assert!(notes.iter().any(|n| n.contains("point 9 of 12 (r = 1.50 r₀) failed (skipped); further-out points skipped")), "{notes:?}");
+    let rows: Vec<_> = events.iter().filter(|e| e.outcome == TeachOutcome::NotSolved && e.detail.contains("failed (skipped); further-out points skipped")).collect();
+    assert_eq!(rows.len(), 3, "one skip row per further-out point: {events:?}");
+    // H–H at r₀ = 3 Bohr reaches past 5/6 r_cut: its shell check (1.7 r₀ = 5.1 Bohr) is still solved after a skip at 1.2 r₀
+    let req = sim::SkipRequest::default();
+    let mut teacher = Skipper::new(|s, _| s.nuclei.len() == 2 && (dist(s, 0, 1) / 3.0 - 1.2).abs() < 0.01, &req, &abort);
+    let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let mut sampler = Sampler::new(&pair(1, 1, 3.0, cell(49)), &plan).unwrap().with_skip_request(req.clone());
+    run_skipping(&mut sampler, &mut teacher, &mut s);
+    let checks = sampler.take_shell_checks();
+    assert_eq!(checks.len(), 1, "the shell check is kept and solved");
+    assert!((checks[0].r - 5.1).abs() < 1e-9, "{}", checks[0].r);
+    assert_eq!((teacher.skips, sampler.progress().failed), (1, 1));
+}
+
+/// Review focus 3: a skip that reaches a reference solve or a shell check (a stale frame: the button is disabled there)
+/// is not taken — the fit and the shell fence rest on those solves. The solve is abandoned like a Pause and the job
+/// stays queued, nothing is counted failed, the request is cleared (so it never hits the next solve), and a note says so.
+#[test]
+fn a_skip_during_a_reference_solve_requeues_it() {
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 12, ..SamplingPlan::default() };
+    let req = sim::SkipRequest::default();
+    let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut teacher = Skipper::new(|s, _| s.nuclei.len() == 1, &req, &abort);
+    let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let mut sampler = Sampler::new(&pair(1, 1, 1.4, cell(49)), &plan).unwrap().with_skip_request(req.clone());
+    let a = abort.clone();
+    let r = sampler.step(&mut teacher, &mut s, &mut || a.load(Ordering::SeqCst));
+    abort.store(false, Ordering::SeqCst);
+    assert!(matches!(r, Err(ProviderError::Cancelled)), "abandoned like a Pause: {r:?}");
+    assert_eq!(teacher.skips, 1);
+    assert!(matches!(sampler.queue.front(), Some(Job::Reference(_))), "the reference job is still queued");
+    let p = sampler.progress();
+    assert_eq!((p.done, p.failed), (0, 0), "nothing counted");
+    assert_eq!(req.peek(), None, "the request is cleared");
+    let notes = sampler.take_notes();
+    assert!(notes.iter().any(|n| n.contains("reference solves can't be skipped; it restarts")), "{notes:?}");
+    assert!(Trainable::take_teach_events(&mut s).is_empty(), "no Failed row");
+    // the next step solves it; the pass runs to its end without a failure
+    run_skipping(&mut sampler, &mut teacher, &mut s);
+    let p = sampler.progress();
+    assert_eq!((p.done, p.total, p.failed, sampler.samples_added()), (13, 13, 0, 12), "{p:?}");
+    // a shell check alike: H–H at r₀ = 3 Bohr, its shell check at 1.7 r₀ = 5.1 Bohr
+    let req = sim::SkipRequest::default();
+    let mut teacher = Skipper::new(|s, _| s.nuclei.len() == 2 && (dist(s, 0, 1) - 5.1).abs() < 1e-6, &req, &abort);
+    let mut s = SurrogateKs::new(Box::new(Shared(Shared::new(PairMorse::h2()).handle())), FallbackPolicy::default()).with_teacher_tol(1e-6);
+    let mut sampler = Sampler::new(&pair(1, 1, 3.0, cell(49)), &plan).unwrap().with_skip_request(req.clone());
+    let (cancels, _) = run_skipping(&mut sampler, &mut teacher, &mut s);
+    assert_eq!((teacher.skips, cancels, sampler.progress().failed), (1, 1, 0), "abandoned once, re-solved, nothing failed");
+    assert_eq!(sampler.take_shell_checks().len(), 1, "the shell check is solved after all");
+    assert!(sampler.take_notes().iter().any(|n| n.contains("reference solves can't be skipped; it restarts")));
+    assert_eq!(req.peek(), None);
+}
+
+/// Ruling R1: the request reaches every pass the surrogate builds through `Trainable::set_skip_request` (no downcast):
+/// a pass started after it is installed takes a skip of its own teacher's solve, and a handle installed while a pass
+/// runs (a new driver) reaches that pass. Without the handle the pass would see a plain cancel and solve the job again.
+#[test]
+fn a_skip_request_reaches_the_pass_through_the_surrogate() {
+    use sim::activity::{ScfEnd, TeachOutcome};
+    let scene = pair(1, 1, 1.4, cell(49));
+    let plan = SamplingPlan { perturbations: 0, hot_burst_steps: 0, scan_points_per_pair: 4, ..SamplingPlan::default() };
+    for installed_mid_pass in [false, true] {
+        let req = sim::SkipRequest::default();
+        let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // the user skips the third scan point
+        let teacher = Skipper::new(|s, n| s.nuclei.len() == 2 && n == 3, &req, &abort);
+        let mut s = SurrogateKs::new(Box::new(teacher), FallbackPolicy::default()).with_teacher_tol(1e-6);
+        Trainable::set_skip_request(&mut s, if installed_mid_pass { sim::SkipRequest::default() } else { req.clone() });
+        Trainable::start_pass(&mut s, &scene, &plan, &mut AtomReferences::default()).unwrap();
+        let mut cancels = 0;
+        for i in 0.. {
+            if installed_mid_pass && i == 2 {
+                Trainable::set_skip_request(&mut s, req.clone());
+            }
+            let a = abort.clone();
+            let r = Trainable::pass_step(&mut s, &mut || a.load(Ordering::SeqCst));
+            abort.store(false, Ordering::SeqCst);
+            match r {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(ProviderError::Cancelled) => cancels += 1,
+                Err(e) => panic!("{e}"),
+            }
+            assert!(i < 20);
+        }
+        let ev = Trainable::take_teach_events(&mut s);
+        let skipped = ev.iter().filter(|e| e.outcome == TeachOutcome::Failed && e.scf_end == Some(ScfEnd::Skipped)).count();
+        assert_eq!((skipped, cancels, req.peek()), (1, 0, None), "installed mid-pass {installed_mid_pass}: {ev:?}");
+    }
+}
+
 /// The geometries a teacher was asked about, as flat coordinate lists.
 fn seen_positions(t: &PairMorse) -> Vec<Vec<f64>> {
     t.seen.iter().map(|s| s.nuclei.iter().flat_map(|n| n.pos).collect()).collect()

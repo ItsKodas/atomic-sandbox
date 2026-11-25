@@ -3,7 +3,8 @@
 //! component the precision milestone's job queue and the user-data model manager add rows to
 //! (`JobKey`): nobody builds a second list. Drawn (2026-11-14) as the running job's card ([`card`]:
 //! the convergence plot from [`Traces`], the iterations strip from [`StripBar`]s) and the other
-//! jobs one line each ([`compact`]).
+//! jobs one line each ([`compact`]). The live solve's card also carries **Skip** with its ▾
+//! (skip-solve spec 2026-11-25; [`JobRow::skip`], [`skip_control`]).
 use super::headline::{iteration_text, sample_text, steps_text, sweep_edge, sweep_phase};
 
 use crate::ui::{theme, Action, PanelInput, AMBER, GREEN, RED};
@@ -72,6 +73,80 @@ pub struct JobRow {
     /// A second control, drawn left of `control`: a pass's Pause, or Resume while it is paused
     /// (user request 2026-11-16).
     pub control2: Option<(String, Action)>,
+    /// The live solve's Skip (skip-solve spec §1, §5), drawn left of the controls with its ▾: on
+    /// the "Sampling pass" row and the "DFT fallback" / "Solving" row only.
+    pub skip: Option<SkipControl>,
+}
+
+/// A live-solve row's Skip: enabled, or disabled with the reason on hover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipControl {
+    Enabled,
+    Disabled(&'static str),
+}
+
+/// The Skip button's hover (spec §1).
+pub const SKIP_TIP: &str = "give up on this solve now: nothing from it is kept";
+/// The ▾ beside it (spec §4).
+pub const SKIP_THEN_TIP: &str = "After a skip during play: Pause (default) / Retry cold";
+/// Disabled: the CPU teacher polls only before its solve, so it cannot stop mid-solve.
+pub const SKIP_CPU: &str = "a CPU solve can't be stopped mid-solve";
+/// Disabled: a pass's reference solve or shell check, which the time limit never cuts either.
+pub const SKIP_REFERENCE: &str = "the fit and the shell fence rest on this solve";
+/// Disabled: a relax's FIRE step or its final teacher verification.
+pub const SKIP_RELAX: &str = "a relax: use Stop relax";
+/// Disabled: a bond/density refresh ("Bonds now", the paused density re-solve), solved between
+/// steps for the graph — not a step (ruling R6; the driver answers a stray Skip with "nothing to skip").
+pub const SKIP_REFRESH: &str = "a bond/density refresh, not a step";
+/// The paused live row's "can't be cancelled" hover where Skip is not enabled (final review m2:
+/// it names Skip only where Skip works).
+pub const PAUSED_SOLVE_WHY: &str = "a paused step finishes; edits abandon it at the next SCF iteration (CPU: after the solve)";
+/// Disabled: a paused pass solves nothing.
+pub const SKIP_PASS_PAUSED: &str = "the pass is paused: no solve is running";
+/// Disabled: between two of the pass's solves (a click now would skip the next one unseen).
+pub const SKIP_NOT_YET: &str = "no solve is running yet";
+
+/// The pass row's Skip: disabled on the CPU teacher, while paused, for a reference solve or a
+/// shell check (`ghost`'s job, else the progress stage `references`), and between solves.
+fn pass_skip(cpu: bool, p: &sim::SamplingProgress, ghost: Option<&sim::PassGhost>, running: bool) -> SkipControl {
+    let reference = ghost.map_or(p.stage, |g| g.stage) == "references" || ghost.is_some_and(|g| matches!(g.job, sim::GhostJob::ShellCheck { .. }));
+    if cpu {
+        SkipControl::Disabled(SKIP_CPU)
+    } else if p.paused {
+        SkipControl::Disabled(SKIP_PASS_PAUSED)
+    } else if reference {
+        SkipControl::Disabled(SKIP_REFERENCE)
+    } else if !running {
+        SkipControl::Disabled(SKIP_NOT_YET)
+    } else {
+        SkipControl::Enabled
+    }
+}
+
+/// The live solve row's Skip: disabled on the CPU, during a relax (its last snapshot still relaxing
+/// covers the final verification too), and for a refresh — a solve while the worker says it is
+/// idle (`Event::Busy(false)`: not playing, no step queued, no stale forces; a step, an edit's
+/// re-solve and play are all `busy`).
+fn live_skip(cpu: bool, relaxing: bool, busy: bool, playing: bool) -> SkipControl {
+    if cpu {
+        SkipControl::Disabled(SKIP_CPU)
+    } else if relaxing {
+        SkipControl::Disabled(SKIP_RELAX)
+    } else if !busy && !playing {
+        SkipControl::Disabled(SKIP_REFRESH)
+    } else {
+        SkipControl::Enabled
+    }
+}
+
+/// The toast's sentence when `next` took a skip `prev` had not (`DynSnapshot::skips_taken`
+/// moved: the same sentence twice is still a new skip; a new worker's count starts again at 0
+/// with no sentence): `last_skip`, the bare sentence.
+pub fn new_skip<'a>(prev: Option<&sim::DynSnapshot>, next: &'a sim::DynSnapshot) -> Option<&'a str> {
+    if next.skips_taken == prev.map_or(0, |p| p.skips_taken) {
+        return None;
+    }
+    next.last_skip.as_deref()
 }
 
 /// The pass card's Pause hover.
@@ -120,6 +195,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
     let snap = input.snapshot;
     let d = snap.map(|s| &s.dynamics);
     let m = input.model();
+    let cpu = snap.is_some_and(|s| s.engine == crate::sim::Backend::Cpu);
     if let Some(p) = d.and_then(|d| d.sampling.as_ref()).filter(|_| input.sampling()) {
         // a solver with nothing to report yet reads 0: say nothing rather than "iteration 0"
         let running = probe.map(|p| p.main).filter(|s| !p.paused && s.running && (s.scf_step > 0 || s.live.is_some_and(|l| l.iteration > 0)));
@@ -144,11 +220,13 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             stage: Some(super::words::pass_stage_of(p, d.and_then(|d| d.ghost.as_ref()))),
             count: Some(count),
             control2: Some(pause_control(p.paused)),
+            skip: Some(pass_skip(cpu, p, d.and_then(|d| d.ghost.as_ref()), probe.is_some_and(|p| p.main.running))),
         });
     } else if let Some(pv) = probe.filter(|p| p.main.running) {
         let last = d.map(|d| d.eval.scf_steps as u32).filter(|&n| n > 0);
         let estimated = snap.is_some_and(|s| s.backend == crate::sim::Backend::Estimated);
-        let cpu = snap.is_some_and(|s| s.engine == crate::sim::Backend::Cpu);
+        // (no snapshot yet: the new solver's first solve, which cannot be abandoned — no Skip)
+        let skip = d.map(|d| live_skip(cpu, crate::ui::relaxing(d), input.busy, input.playing));
         v.push(JobRow {
             key: JobKey::LiveSolve,
             title: if estimated { "DFT fallback".into() } else { "Solving".into() },
@@ -161,12 +239,17 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             elapsed_s: Some(pv.main.elapsed_s),
             eta_s: None,
             control: input.playing.then(|| ("Pause".into(), Action::Pause)),
-            no_control_why: (!input.playing).then_some("a paused step finishes; edits abandon it at the next SCF iteration (CPU: after the solve)"),
+            no_control_why: (!input.playing).then_some(if skip == Some(SkipControl::Enabled) {
+                "a paused step finishes unless you Skip it; edits abandon it at the next SCF iteration (CPU: after the solve)"
+            } else {
+                PAUSED_SOLVE_WHY
+            }),
             scf: pv.main.live,
             keeps_block: !cpu,
             stage: None,
             count: None,
             control2: None,
+            skip,
         });
     }
     match probe.and_then(|p| p.display) {
@@ -184,6 +267,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             stage: None,
             count: None,
             control2: None,
+            skip: None,
         }),
         // an orbital display solve (live-orbitals spec §4.3): its own job, never a fallback, an
         // audit or a teacher solve
@@ -201,6 +285,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             stage: None,
             count: None,
             control2: None,
+            skip: None,
         }),
         None => {}
     }
@@ -226,6 +311,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             // "1,240 of 2,077 · 3 beyond their bound · about 0:04 left in this stage"
             count: Some(super::words::refit_count_line(&r)),
             control2: None,
+            skip: None,
         });
     }
     // the user's Forget / Restore waiting for their refit (no refit runs: else the row above says so)
@@ -245,6 +331,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             stage: None,
             count: None,
             control2: None,
+            skip: None,
         });
     }
     if m.is_some_and(|m| m.audit_in_flight) {
@@ -266,6 +353,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             stage: None,
             count: None,
             control2: None,
+            skip: None,
         });
     } else if let Some(p) = probe.filter(|p| p.side.running && d.and_then(|d| d.bond_reference).is_none()) {
         // the auditor's other jobs (spec A8): a density refresh or an isolated-atom density
@@ -283,6 +371,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             stage: None,
             count: None,
             control2: None,
+            skip: None,
         });
     }
     if let Some(r) = d.and_then(|d| d.bond_reference) {
@@ -300,6 +389,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             stage: None,
             count: None,
             control2: None,
+            skip: None,
         });
     }
     if let Some(r) = d.and_then(|d| d.relax.as_ref()).filter(|r| r.converged.is_none()) {
@@ -317,6 +407,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             stage: None,
             count: None,
             control2: None,
+            skip: None,
         });
     }
     if let Some(o) = m.and_then(|m| m.pass_offer.as_ref()).filter(|_| !input.sampling()) {
@@ -334,6 +425,7 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             stage: None,
             count: None,
             control2: None,
+            skip: None,
         });
     }
     v
@@ -551,7 +643,7 @@ fn strip(ui: &mut Ui, bars: &[StripBar]) {
 /// The running job's card: "Sampling pass · bond scan" with its control, the bar, "sample 40 of 144"
 /// and "27 % · 53 min left", the solve's small line ("iteration 6 · 2.2 s each", "Δρ 6.8e-1 →
 /// 1e-6"), the convergence plot and (a pass) the iterations strip.
-pub fn card(ui: &mut Ui, r: &JobRow, tr: &Traces, bars: &[StripBar], refit: Option<(&sim::RefitView, &[f32])>, acts: &mut Vec<Action>) {
+pub fn card(ui: &mut Ui, r: &JobRow, tr: &Traces, bars: &[StripBar], refit: Option<(&sim::RefitView, &[f32])>, skip_then: &mut sim::SkipThen, acts: &mut Vec<Action>) {
     let c = colour_of(r.key);
     let resp = theme::panel_card(ui, theme::panel_card_frame(), |ui| {
         ui.set_width(ui.available_width());
@@ -567,7 +659,7 @@ pub fn card(ui: &mut Ui, r: &JobRow, tr: &Traces, bars: &[StripBar], refit: Opti
                 ui.set_width(w);
                 crate::ui::probed("activity-job-title", ui.add(egui::Label::new(RichText::new(&title).strong().size(13.5)).wrap()));
             });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| control(ui, r, acts));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| control(ui, r, skip_then, acts));
         });
         bar(ui, r, c);
         // "sample 40 of 144" · "27 % · 53 min left"
@@ -616,7 +708,9 @@ fn control_width(ui: &Ui, r: &JobRow) -> f32 {
     let w = |text: &str, size: f32| ui.painter().layout_no_wrap(text.to_string(), egui::FontId::proportional(size), theme::INK).size().x;
     let gap = ui.spacing().item_spacing.x;
     let second = r.control2.as_ref().map_or(0.0, |(label, _)| w(label, 13.0) + 2.0 * ui.spacing().button_padding.x + gap);
+    let skip = if r.skip.is_some() { w("Skip", 13.0) + w("▾", 13.0) + 4.0 * ui.spacing().button_padding.x + 2.0 * gap } else { 0.0 };
     second
+        + skip
         + match (&r.control, r.no_control_why) {
             (Some((label, _)), _) => w(label, 13.0) + 2.0 * ui.spacing().button_padding.x + gap,
             (None, Some(_)) => w("can't be cancelled", 10.5) + gap,
@@ -625,8 +719,9 @@ fn control_width(ui: &Ui, r: &JobRow) -> f32 {
 }
 
 /// A row's control on the right ("Cancel", "Pause", …), or "can't be cancelled" with why; its
-/// second control left of it (a right-to-left layout: drawn after).
-fn control(ui: &mut Ui, r: &JobRow, acts: &mut Vec<Action>) {
+/// second control left of it (a right-to-left layout: drawn after); then the live solve's Skip
+/// with its ▾ ([`skip_control`]).
+fn control(ui: &mut Ui, r: &JobRow, skip_then: &mut sim::SkipThen, acts: &mut Vec<Action>) {
     let button = |ui: &mut Ui, label: &str, action: &Action, acts: &mut Vec<Action>| {
         let b = crate::ui::probed(&format!("job-control-{}", label.to_lowercase().replace(' ', "-")), ui.button(label));
         let b = match action {
@@ -647,6 +742,35 @@ fn control(ui: &mut Ui, r: &JobRow, acts: &mut Vec<Action>) {
     }
     if let Some((label, action)) = &r.control2 {
         button(ui, label, action, acts);
+    }
+    if let Some(s) = r.skip {
+        skip_control(ui, s, skip_then, acts);
+    }
+}
+
+/// The small Skip (probe `activity-skip`) with its ▾ on its right (`activity-skip-then`: "After a
+/// skip during play: Pause (default) / Retry cold", items `activity-skip-then-pause|retry`). The ▾
+/// writes `skip_then` (`UiState::skip_then`, a display setting: nothing sent or recorded); Skip
+/// sends `Action::SkipSolve` with it. Disabled, Skip says why on hover; the ▾ stays usable.
+fn skip_control(ui: &mut Ui, s: SkipControl, skip_then: &mut sim::SkipThen, acts: &mut Vec<Action>) {
+    // (right to left: the ▾ first, so it sits right of Skip)
+    let t = crate::ui::probed("activity-skip-then", ui.button(RichText::new("▾").size(13.0)));
+    egui::Popup::from_toggle_button_response(&t).id(egui::Id::new("activity-skip-then-popup")).show(|ui| {
+        ui.label(RichText::new("After a skip during play").size(12.0).strong());
+        for (v, label, id) in [(sim::SkipThen::Pause, "Pause (default)", "activity-skip-then-pause"), (sim::SkipThen::Retry, "Retry cold", "activity-skip-then-retry")] {
+            if crate::ui::probed(id, ui.radio(*skip_then == v, label)).clicked() {
+                *skip_then = v;
+            }
+        }
+    });
+    t.on_hover_text(SKIP_THEN_TIP);
+    let b = crate::ui::probed("activity-skip", ui.add_enabled(s == SkipControl::Enabled, egui::Button::new(RichText::new("Skip").size(13.0))));
+    let b = match s {
+        SkipControl::Enabled => b.on_hover_text(SKIP_TIP),
+        SkipControl::Disabled(why) => b.on_disabled_hover_text(format!("Skip is off here: {why}")),
+    };
+    if b.clicked() {
+        acts.push(Action::SkipSolve { then: *skip_then });
     }
 }
 
@@ -716,7 +840,7 @@ fn bar(ui: &mut Ui, r: &JobRow, c: Color32) {
 
 /// A queued or side job in one line: its light, title and detail (cut), the progress words and
 /// its control.
-pub fn compact(ui: &mut Ui, r: &JobRow, acts: &mut Vec<Action>) {
+pub fn compact(ui: &mut Ui, r: &JobRow, skip_then: &mut sim::SkipThen, acts: &mut Vec<Action>) {
     let c = colour_of(r.key);
     ui.horizontal(|ui| {
         theme::light(ui, c);
@@ -731,16 +855,17 @@ pub fn compact(ui: &mut Ui, r: &JobRow, acts: &mut Vec<Action>) {
         ui.painter().galley(egui::pos2(rect.left(), rect.center().y - g.size().y / 2.0), g, theme::INK);
         resp.on_hover_text(format!("{}\n{}", r.title, r.detail));
         if r.control.is_some() {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| control(ui, r, acts));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| control(ui, r, skip_then, acts));
         }
     });
 }
 
 /// The job list: the first job as the card ([`card`]), the others one line each ([`compact`]).
-pub fn show(ui: &mut Ui, rows: &[JobRow], tr: &Traces, bars: &[StripBar], refit: Option<(&sim::RefitView, &[f32])>, acts: &mut Vec<Action>) {
+/// (The rows with a Skip are always the first.)
+pub fn show(ui: &mut Ui, rows: &[JobRow], tr: &Traces, bars: &[StripBar], refit: Option<(&sim::RefitView, &[f32])>, skip_then: &mut sim::SkipThen, acts: &mut Vec<Action>) {
     let Some((first, rest)) = rows.split_first() else { return };
-    card(ui, first, tr, bars, refit, acts);
+    card(ui, first, tr, bars, refit, skip_then, acts);
     for r in rest {
-        compact(ui, r, acts);
+        compact(ui, r, skip_then, acts);
     }
 }

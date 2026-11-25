@@ -123,6 +123,10 @@ impl ForceProvider for Failing {
     fn reset(&mut self) {
         self.inner.reset();
     }
+
+    fn restart_cold(&mut self) {
+        self.inner.restart_cold();
+    }
 }
 
 /// What [`Faulty`] does once it faults — the ways a failed GPU teacher has been seen or can be made to answer
@@ -204,6 +208,10 @@ impl ForceProvider for Faulty {
 
     fn reset(&mut self) {
         self.inner.reset();
+    }
+
+    fn restart_cold(&mut self) {
+        self.inner.restart_cold();
     }
 
     fn scf_tol(&self) -> Option<f64> {
@@ -309,6 +317,10 @@ impl<P: ForceProvider> ForceProvider for Shared<P> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).reset()
     }
 
+    fn restart_cold(&mut self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).restart_cold()
+    }
+
     fn discontinuity(&mut self) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).discontinuity()
     }
@@ -394,6 +406,10 @@ impl<P: ForceProvider + Trainable> ForceProvider for SharedTrainable<P> {
 
     fn reset(&mut self) {
         self.lock().reset()
+    }
+
+    fn restart_cold(&mut self) {
+        self.lock().restart_cold()
     }
 
     fn discontinuity(&mut self) {
@@ -634,6 +650,14 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         Trainable::take_teach_events(&mut *self.lock())
     }
 
+    fn set_skip_request(&mut self, r: crate::dynamics::SkipRequest) {
+        Trainable::set_skip_request(&mut *self.lock(), r)
+    }
+
+    fn cancelled_teacher_solve(&self) -> Option<crate::activity::CancelledTeach> {
+        Trainable::cancelled_teacher_solve(&*self.lock())
+    }
+
     fn training_views(&mut self) -> Option<crate::activity::TrainingViews> {
         Trainable::training_views(&mut *self.lock())
     }
@@ -681,6 +705,10 @@ impl<P: ForceProvider + Trainable> ForceProvider for TeacherOf<P> {
 
     fn reset(&mut self) {
         self.with(|t| t.reset())
+    }
+
+    fn restart_cold(&mut self) {
+        self.with(|t| t.restart_cold())
     }
 
     fn discontinuity(&mut self) {

@@ -1386,12 +1386,12 @@
 //! accumulator from the whole collection-backed store, exactly as above.
 
 use crate::sampling::{atom_key, Sampler};
-use sim::activity::{SolveCounts, TeachEvent, TeachOrigin, TeachOutcome, TeachRule};
+use sim::activity::{CancelledTeach, SolveCounts, TeachEvent, TeachOrigin, TeachOutcome, TeachRule};
 use sim::references::{AtomReference, AtomReferences};
 use sim::sampling::{SamplingPlan, SamplingProgress};
 use sim::{
     ClassLoo, Display, EvalStats, Extrapolation, ForceProvider, ForceResult, OrbitalDisplay, OrbitalViewRequest, ProviderError, Scene,
-    ShareTables, SideDisplay, SideKind, Source, Trainable, TrainableStatus,
+    ShareTables, SideDisplay, SideKind, SkipRequest, Source, Trainable, TrainableStatus,
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1963,6 +1963,13 @@ pub struct SurrogateKs {
     /// final progress.
     pass: Option<Sampler>,
     last_pass: Option<SamplingProgress>,
+    /// The user's Skip (`Trainable::set_skip_request`, the worker's handle via `sim::Dynamics`): handed to every pass
+    /// this surrogate builds (`begin_pass`), so a pass's sample solve can be skipped (`crate::sampling`, "The time
+    /// limit"). Until one is installed, a handle nobody sets.
+    skip: SkipRequest,
+    /// The latest evaluation was a teacher solve that `should_abort` abandoned, and why it went to the teacher
+    /// (`Trainable::cancelled_teacher_solve`): cleared at the start of every evaluation, set by `teach`.
+    cancelled_teach: Option<CancelledTeach>,
     /// Isolated-atom references solved by the passes or carried by a loaded model, keyed by the
     /// atom's solve settings (`crate::sampling`, "References"): a later pass at the same settings
     /// skips the scan. Survives a forget.
@@ -2313,6 +2320,8 @@ impl SurrogateKs {
             display_interrupt: None,
             share_tables: None,
             pass: None,
+            skip: SkipRequest::default(),
+            cancelled_teach: None,
             last_pass: None,
             ref_cache: AtomReferences::default(),
             user_notes: Vec::new(),
@@ -2664,7 +2673,11 @@ impl SurrogateKs {
             Ok(r) => r,
             Err(e) => {
                 self.note_teacher_error(&e);
-                if !matches!(e, ProviderError::Cancelled) {
+                if matches!(e, ProviderError::Cancelled) {
+                    // no event: the step is retried — or, the user's Skip, the driver logs it from this
+                    // (`Trainable::cancelled_teacher_solve`), led by the rule's sentence as the row below is
+                    self.cancelled_teach = Some(CancelledTeach { origin: origin_of(h.audit, h.reason.rule), rule: h.reason.rule, atom: h.reason.atom, why: h.reason.text.clone() });
+                } else {
                     let mut ev = TeachEvent::new(origin_of(h.audit, h.reason.rule), h.reason.rule, TeachOutcome::Failed);
                     ev.atom = h.reason.atom;
                     ev.detail = format!("{} — the teacher failed: {e}", h.reason.text);
@@ -3027,6 +3040,8 @@ impl ForceProvider for SurrogateKs {
     fn evaluate(&mut self, scene: &Scene, should_abort: &mut dyn FnMut() -> bool) -> Result<ForceResult, ProviderError> {
         // set again only by a teacher answer (`teach`)
         self.last_fallback = false;
+        // set again only by a teacher solve abandoned in this evaluation (`teach`)
+        self.cancelled_teach = None;
         // a note of a step that failed is not carried to the next (review M5)
         self.step_notes.clear();
         // a failed GPU (module doc, "A failed GPU"): no answer at all — neither the teacher's nor the model's
@@ -3587,6 +3602,14 @@ impl ForceProvider for SurrogateKs {
         self.scene_gen += 1;
     }
 
+    /// The user's Skip (`sim::dynamics`, "Skipping a solve"): the teacher restarts cold (its own `restart_cold`: its
+    /// branch-jump guard is kept). Not an edit, so nothing else is forgotten: the last completed step's report (`last`),
+    /// the pending surface bookkeeping and a composition check in flight stay — the retried step is booked against them
+    /// like any other step, with no "energy surface changed without a booked jump" (ruling R5).
+    fn restart_cold(&mut self) {
+        self.teacher.restart_cold();
+    }
+
     fn discontinuity(&mut self) {
         self.scene_gen += 1;
         self.teacher.discontinuity();
@@ -3727,7 +3750,8 @@ impl SurrogateKs {
         // future entry that forgets to still cannot leave one behind its new pass
         debug_assert!(self.pass_tail.is_none(), "a pass entry left the previous pass's tail waiting");
         self.drop_pass_tail(NEW_PASS_FIRST);
-        self.pass = Some(sampler);
+        // the user's Skip reaches the pass's solves (ruling R1: through the trait, no downcast)
+        self.pass = Some(sampler.with_skip_request(self.skip.clone()));
         self.harris_queued = None;
     }
 
@@ -4237,6 +4261,18 @@ impl Trainable for SurrogateKs {
 
     fn start_teach(&mut self, scene: &Scene) -> Result<(), String> {
         SurrogateKs::start_teach(self, scene)
+    }
+
+    /// Kept for every pass this surrogate builds (`begin_pass`), and handed to a pass already running (a new driver).
+    fn set_skip_request(&mut self, r: SkipRequest) {
+        if let Some(sampler) = self.pass.take() {
+            self.pass = Some(sampler.with_skip_request(r.clone()));
+        }
+        self.skip = r;
+    }
+
+    fn cancelled_teacher_solve(&self) -> Option<CancelledTeach> {
+        self.cancelled_teach.clone()
     }
 
     fn cancel_pass(&mut self) {

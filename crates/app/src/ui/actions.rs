@@ -225,6 +225,12 @@ pub enum Action {
     SolveOrbitals,
     /// End the relax now: `DynCommand::StopRelax`.
     StopRelax,
+    /// The Activity card's Skip (skip-solve spec 2026-11-25): give up on the running solve now,
+    /// nothing from it kept — `DynCommand::SkipSolve`, sent through `SimWorker::send`, which sets
+    /// the worker's request first. `then` is what a skip during play does next, from the card's ▾
+    /// (`UiState::skip_then`, a display setting): carried by the action so `--record` writes what
+    /// happened (script words `skip pause` / `skip retry`). A pass treats both alike.
+    SkipSolve { then: sim::SkipThen },
     /// View ▸ Density ▸ smooth motion: draw the nuclei between the last two snapshots (display
     /// only; every replay script turns it off first so what it checks is the snapshot's).
     SmoothMotion(bool),
@@ -845,6 +851,8 @@ fn apply_action(st: &mut UiState, input: &PanelInput<'_>, a: Action, out: &mut P
             out.commands.push(dyn_(DynCommand::StopRelax));
             st.relax_pending = Some(super::RelaxPending::new(true, input.relaxing(), Instant::now()));
         }
+        // (the toast comes with the snapshot that took it: `jobs::new_skip`)
+        Action::SkipSolve { then } => out.commands.push(dyn_(DynCommand::SkipSolve(then))),
         Action::CompareReference { method, relax } => compare_reference(st, input, method, relax, out),
         Action::CancelCompare => st.compare.cancel(),
         Action::SetupPyscf => st.compare.setup_pressed(),
@@ -1280,6 +1288,7 @@ impl Action {
             RefreshBonds => "refresh-bonds".into(),
             SolveOrbitals => "solve-orbitals".into(),
             StopRelax => "stop-relax".into(),
+            SkipSolve { then } => format!("skip {}", skip_word(*then)),
             SmoothMotion(b) => format!("smooth-motion {b}"),
             Show(m) => format!("show {}", m.word()),
             PickOrbital { spin, track } => format!("orbital {} {track}", spin_word(*spin)),
@@ -1363,6 +1372,10 @@ impl Action {
                 [i] => RewindTo(num(head, i)?),
                 _ => return Err(format!("action rewind takes 0 or 1 arguments (the snapshot, 0 = the newest), got {}", args.len())),
             },
+            "skip" => {
+                want(1)?;
+                SkipSolve { then: parse_skip(args[0]).ok_or_else(|| format!("action skip: pause or retry, got '{}'", args[0]))? }
+            }
             "speed" => {
                 want(1)?;
                 SetSpeed(num(head, args[0])?)
@@ -1632,6 +1645,23 @@ pub fn backend_word(b: Backend) -> &'static str {
         Backend::Gpu => "gpu",
         Backend::Cpu => "cpu",
         Backend::Estimated => "estimated",
+    }
+}
+
+/// What a skip during play does next, as the script and the profile (`skip_then`) word it.
+pub fn skip_word(t: sim::SkipThen) -> &'static str {
+    match t {
+        sim::SkipThen::Pause => "pause",
+        sim::SkipThen::Retry => "retry",
+    }
+}
+
+/// The inverse of [`skip_word`].
+pub fn parse_skip(w: &str) -> Option<sim::SkipThen> {
+    match w {
+        "pause" => Some(sim::SkipThen::Pause),
+        "retry" => Some(sim::SkipThen::Retry),
+        _ => None,
     }
 }
 

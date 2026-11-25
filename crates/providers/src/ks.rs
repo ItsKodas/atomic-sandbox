@@ -913,6 +913,16 @@ impl ForceProvider for CpuKs {
         self.unocc.dropped();
     }
 
+    /// The user's Skip (ruling R4): the warm state goes, so the next solve is cold; the `branch_jump` guard keeps the
+    /// last completed step (the geometry is still that step's, so a cold retry that lands on another SCF state is
+    /// caught), and the orbital tracker is kept (the scene is unchanged). A CPU solve is never cut short (module doc),
+    /// so a skip reaches it only before it starts.
+    fn restart_cold(&mut self) {
+        self.warm = None;
+        self.density_current = false;
+        self.rho = None;
+    }
+
     /// Keeps the warm `KsState` (CPU has no extrapolation history to drop); its density is the
     /// old geometry's, so `sample_density` says `None` until the next evaluation.
     fn discontinuity(&mut self) {
@@ -1720,6 +1730,16 @@ impl ForceProvider for GpuKs {
         // a reset is a new scene: the next Harris solve starts cold too (Task 4 review M4)
         self.harris.clear();
         self.orb.rebuilt();
+    }
+
+    /// The user's Skip (ruling R4): the next solve is cold and does not extrapolate (`warm = false` discards the
+    /// abandoned solve's parked state), but the `branch_jump` guard keeps the last completed step (the geometry is still
+    /// that step's, so a cold retry that lands on another SCF state is caught). The orbital view and the Harris display
+    /// state are kept: the scene is unchanged.
+    fn restart_cold(&mut self) {
+        self.cold = true;
+        self.density_current = false;
+        self.drop_extrapolation();
     }
 
     /// Keeps the warm (or parked) state and drops only the extrapolation history ρ_{t−1}
@@ -2558,6 +2578,65 @@ pub(crate) mod tests {
         let after_err = g.evaluate(&h2(25, 1.42), &mut never()).expect("GPU after reset + error");
         println!("GPU 25³ R 1.42 after reset + coincident-nuclei error: {} steps (cold {})", after_err.stats.scf_steps, cold.stats.scf_steps);
         assert!(after_err.stats.scf_steps >= cold.stats.scf_steps);
+    }
+
+    /// Skip (ruling R4; `ForceProvider::restart_cold`): the next CPU solve is cold — bitwise a fresh provider's — but the
+    /// `branch_jump` guard keeps the last completed step, so the cold retry is judged against it and one that lands on
+    /// another SCF state (here, deliberately, the triplet at the same positions) is flagged. An edit's `reset` would let
+    /// it through unjudged.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn restart_cold_solves_cold_and_keeps_the_branch_jump_guard() {
+        let sc = h2(25, 1.4);
+        let cold = CpuKs::new(1e-6).evaluate(&sc, &mut never()).expect("CPU cold");
+        let mut c = CpuKs::new(1e-6);
+        c.evaluate(&sc, &mut never()).expect("CPU first");
+        let warm = c.evaluate(&sc, &mut never()).expect("CPU warm repeat");
+        assert!(warm.stats.scf_steps < cold.stats.scf_steps, "test assumption: the warm start saves steps ({} vs {})", warm.stats.scf_steps, cold.stats.scf_steps);
+        assert!(warm.stats.spin_change.is_some(), "test assumption: the guard judges a repeat (N↑ = N↓: the spin measure)");
+        c.restart_cold();
+        let again = c.evaluate(&sc, &mut never()).expect("CPU after restart_cold");
+        println!("CPU 25³: cold {} steps, warm {} steps, after restart_cold {} steps", cold.stats.scf_steps, warm.stats.scf_steps, again.stats.scf_steps);
+        assert_eq!((again.energy.to_bits(), again.stats.scf_steps), (cold.energy.to_bits(), cold.stats.scf_steps), "the solve after restart_cold is the cold one");
+        assert!(again.stats.spin_change.is_some(), "still judged against the last completed step");
+        assert!(again.stats.branch_jump.is_none(), "the same state: no jump");
+        // a cold retry that lands on another SCF state
+        let mut triplet = sc.clone();
+        triplet.multiplicity = Some(3);
+        c.restart_cold();
+        let jumped = c.evaluate(&triplet, &mut never()).expect("CPU triplet");
+        println!("CPU 25³ triplet after restart_cold: E {:.6} vs {:.6}, branch_jump {:?}", jumped.energy, again.energy, jumped.stats.branch_jump);
+        assert!(jumped.stats.branch_jump.is_some(), "the guard still fires after restart_cold");
+        // the control: after an edit's reset the same jump is not judged
+        c.evaluate(&sc, &mut never()).expect("CPU singlet");
+        c.reset();
+        let unjudged = c.evaluate(&triplet, &mut never()).expect("CPU triplet after reset");
+        assert!(unjudged.stats.branch_jump.is_none());
+    }
+
+    /// The GPU half of [`restart_cold_solves_cold_and_keeps_the_branch_jump_guard`] (one tiny 25³ H₂ solve set): the
+    /// parked or warm state is not used (bitwise the cold solve) and the guard still judges against the last step.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore)]
+    fn gpu_restart_cold_solves_cold_and_keeps_the_branch_jump_guard() {
+        let Some(ctx) = gpu() else { return };
+        let _lock = GPU.lock().unwrap_or_else(|e| e.into_inner());
+        let sc = h2(25, 1.4);
+        let cold = GpuKs::new(ctx.clone(), 1e-6).evaluate(&sc, &mut never()).expect("GPU cold");
+        let mut g = GpuKs::new(ctx, 1e-6);
+        g.evaluate(&sc, &mut never()).expect("GPU first");
+        let warm = g.evaluate(&sc, &mut never()).expect("GPU warm repeat");
+        g.restart_cold();
+        let again = g.evaluate(&sc, &mut never()).expect("GPU after restart_cold");
+        println!("GPU 25³: cold {} steps, warm {} steps, after restart_cold {} steps; spin change {:?}", cold.stats.scf_steps, warm.stats.scf_steps, again.stats.scf_steps, again.stats.spin_change);
+        assert!(warm.stats.scf_steps < cold.stats.scf_steps, "test assumption: the warm start saves steps");
+        assert_eq!(again.energy.to_bits(), cold.energy.to_bits(), "a cold GPU solve is bit-reproducible: this is it");
+        assert!(again.stats.spin_change.is_some(), "still judged against the last completed step");
+        let mut triplet = sc.clone();
+        triplet.multiplicity = Some(3);
+        g.restart_cold();
+        let jumped = g.evaluate(&triplet, &mut never()).expect("GPU triplet");
+        assert!(jumped.stats.branch_jump.is_some(), "the guard still fires after restart_cold");
     }
 
     /// The M = 33 points s_k = k/32 of the chord a → b (spec §3.1).

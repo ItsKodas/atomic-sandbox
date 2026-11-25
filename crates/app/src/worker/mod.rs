@@ -212,7 +212,17 @@
 //! ([`Command::aborts`]): Pause, the scene edits (teleport, add, remove, a replaced scene,
 //! charge / multiplicity / grid / σ — those become `ReplaceScene`), the model commands that end or
 //! replace what a sampling solve is for (StartSampling, CancelSampling, PauseSampling, ForgetModel,
-//! LoadModel, EnsureModel; not SaveModel, a file write) and Shutdown. A Pause during a pass abandons the
+//! LoadModel, EnsureModel; not SaveModel, a file write), the Activity card's **Skip**
+//! (`DynCommand::SkipSolve`, skip-solve spec 2026-11-25) and Shutdown. A Skip names what follows a
+//! skip during play (Pause or Retry cold); [`SimWorker::send`] sets the worker's one
+//! `sim::SkipRequest` before it queues the command, so whoever handles the abandoned solve's
+//! `Cancelled` finds it and takes it — the driver (a skipped step: nothing kept, then pause or a
+//! cold retry; `sim::dynamics` "Skipping a solve") or the provider's sampling pass (a skipped
+//! sample, given up like a time-out). The command itself, applied after the tick, only clears a
+//! request nothing took ("nothing to skip"). The request is installed on every driver the worker
+//! builds — the first and the rebuild after a panic (`Worker::recover`) — and installing clears a
+//! stale one, so a request pending when the old driver died never turns a later Pause into a
+//! skip; a backend switch is a new worker with a request of its own. A Pause during a pass abandons the
 //! sampling solve in flight; the job stays queued and the pass resumes on the next tick. The pass
 //! card's Pause (`PauseSampling`) abandons it the same way and then holds the pass: nothing more is
 //! solved until `ContinueSampling` (the card's Resume), the worker is idle meanwhile ([`has_work`]),
@@ -465,6 +475,10 @@ pub struct SimWorker {
     /// Commands sent and not yet taken by the worker (`Inbox::take`): half of the display
     /// interrupt (module doc, "The display interrupt").
     pending: Arc<AtomicUsize>,
+    /// The worker's one Skip request (module doc, "What aborts a running step"): set by
+    /// [`SimWorker::send`] before it queues `DynCommand::SkipSolve`, shared with every driver the
+    /// worker builds.
+    skip: sim::SkipRequest,
 }
 
 impl SimWorker {
@@ -512,7 +526,8 @@ impl SimWorker {
         let (etx, erx) = channel::<Event>();
         let probe = sim::ActivityProbe::new();
         let pending = Arc::new(AtomicUsize::new(0));
-        let (p, q) = (probe.clone(), pending.clone());
+        let skip = sim::SkipRequest::default();
+        let (p, q, k) = (probe.clone(), pending.clone(), skip.clone());
         let exit = WorkerExit::default();
         let guard = ExitGuard(exit.clone());
         let handle = std::thread::Builder::new()
@@ -520,7 +535,7 @@ impl SimWorker {
             .spawn(move || {
                 let _guard = guard;
                 waited(&after, OLD_WORKER_WAIT, &etx);
-                worker(initial, settings, crx, etx, backend, gpu, autosave, None, p, q)
+                worker(initial, settings, crx, etx, backend, gpu, autosave, None, p, q, k)
             })
             .expect("spawn sim thread");
         SimWorker {
@@ -530,6 +545,7 @@ impl SimWorker {
             exit,
             probe,
             pending,
+            skip,
         }
     }
 
@@ -564,7 +580,8 @@ impl SimWorker {
         let (ctx, crx) = channel::<Command>();
         let (etx, erx) = channel::<Event>();
         let pending = Arc::new(AtomicUsize::new(0));
-        let (p, q) = (probe.clone(), pending.clone());
+        let skip = sim::SkipRequest::default();
+        let (p, q, k) = (probe.clone(), pending.clone(), skip.clone());
         let exit = WorkerExit::default();
         let guard = ExitGuard(exit.clone());
         let handle = std::thread::Builder::new()
@@ -572,7 +589,7 @@ impl SimWorker {
             .spawn(move || {
                 let _guard = guard;
                 waited(&after, wait, &etx);
-                worker(initial, Vec::new(), crx, etx, Backend::Cpu, None, autosave, Some(make), p, q)
+                worker(initial, Vec::new(), crx, etx, Backend::Cpu, None, autosave, Some(make), p, q, k)
             })
             .expect("spawn sim thread");
         SimWorker {
@@ -582,6 +599,7 @@ impl SimWorker {
             exit,
             probe,
             pending,
+            skip,
         }
     }
 
@@ -600,8 +618,13 @@ impl SimWorker {
     }
 
     /// Counted before it is sent (the display interrupt, module doc), so the worker never takes a
-    /// command the count does not hold yet.
+    /// command the count does not hold yet. A Skip sets the worker's request first, for the same
+    /// reason: the command's abort may abandon the solve the moment it is queued, and whoever
+    /// handles that `Cancelled` must find the request (module doc, "What aborts a running step").
     pub fn send(&self, cmd: Command) {
+        if let Command::Dyn(DynCommand::SkipSolve(then)) = &cmd {
+            self.skip.request(*then);
+        }
         self.pending.fetch_add(1, Ordering::SeqCst);
         if self.tx.send(cmd).is_err() {
             self.pending.fetch_sub(1, Ordering::SeqCst);
@@ -746,15 +769,16 @@ impl Inbox {
 /// scene"), queued steps, a stale-force evaluation, a relax running (its FIRE steps advance one tick at a
 /// time like play's; M6 Task 8, found by the `relax_h2` replay), or a sampling pass in progress
 /// that is not paused (a paused pass solves nothing: the worker sleeps until a command).
-/// A stale evaluation that failed is not retried until Play, Step or an edit (they clear
-/// `last_error`). A bond
+/// A stale evaluation the driver holds is not retried until Play, Step or an edit: one that failed
+/// (`last_error`), or one the user skipped with Pause (`stale_eval_held` without an error — final
+/// review I1: counted as work it made the worker spin, publishing every round). A bond
 /// reference solving off the stepping path is **not** work (M6 Task 3 fix round 2): it is
 /// background, reported by `DynSnapshot::bond_reference`, never busy, and `--screenshot` does
 /// not wait for it; an otherwise idle worker polls it (`polls_references_only`).
 fn has_work(s: &DynSnapshot) -> bool {
     (!s.paused && !s.scene.nuclei.is_empty())
         || s.pending_steps > 0
-        || (s.forces_stale && s.last_error.is_none())
+        || (s.forces_stale && s.last_error.is_none() && !s.stale_eval_held)
         || s.relax.as_ref().is_some_and(|r| r.converged.is_none())
         || (sampling_active(s) && !pass_paused(s))
 }
@@ -881,6 +905,9 @@ struct Worker {
     /// it and `SimWorker::pending` (module doc, "The display interrupt").
     batch: Arc<AtomicUsize>,
     interrupt: sim::DisplayInterrupt,
+    /// `SimWorker::skip`: installed on every driver this worker builds (the first, and the rebuild
+    /// after a panic — `recover`), which clears a request left pending by the old one.
+    skip: sim::SkipRequest,
     /// The `orbitals_seq` of the side payload an interrupted refresh was last re-requested for
     /// ([`orbital_retry_due`]).
     orbital_retried: Option<u64>,
@@ -1002,6 +1029,7 @@ fn worker(
     provider: Option<MakeProvider>,
     probe: Arc<sim::ActivityProbe>,
     pending: Arc<AtomicUsize>,
+    skip: sim::SkipRequest,
 ) {
     let gpu_readback = gpu.clone();
     let probe_make = probe;
@@ -1055,6 +1083,9 @@ fn worker(
     let dy = match catch_unwind(AssertUnwindSafe(|| {
         let mut d = Dynamics::new(scene, make(), DEFAULT_DT_FS, SEED);
         d.set_display_interrupt(interrupt.clone());
+        // the worker's one Skip request, on every driver it builds (and through it on the
+        // provider and its sampling passes); installing clears a stale one
+        d.set_skip_request(skip.clone());
         d
     })) {
         Ok(d) => d,
@@ -1122,6 +1153,7 @@ fn worker(
         activity: ActivityWork::starting_at(run_start),
         batch,
         interrupt,
+        skip,
         orbital_retried: None,
         side_pending: false,
         idle_polling: false,
@@ -1522,9 +1554,13 @@ impl Worker {
         let dt = if last.dt > 0.0 { last.dt_fs() } else { DEFAULT_DT_FS };
         let make = &self.make;
         let interrupt = self.interrupt.clone();
+        let skip = self.skip.clone();
         match catch_unwind(AssertUnwindSafe(|| {
             let mut d = Dynamics::new(last.scene.clone(), make(), dt, SEED);
             d.set_display_interrupt(interrupt.clone());
+            // (clears a request the dead driver left pending: it must not turn a later Pause
+            // into a skip)
+            d.set_skip_request(skip.clone());
             d.apply(DynCommand::SetSpeed(last.speed));
             d.apply(DynCommand::SetComCorrection(last.com_correction));
             d.apply(DynCommand::SetThermostat(last.thermostat));

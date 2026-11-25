@@ -761,7 +761,8 @@ impl TeachOutcome {
 /// How a teacher's SCF ended (the solve log's iteration cell): converged, the stall stop
 /// (`qm::scf` "The stall stop"), the iteration cap, a non-finite Δρ, or — a sampling pass's solve
 /// only — the pass's per-sample time limit (`providers::sampling`, "The time limit"; the solve was
-/// given up from outside, its iteration count unknown).
+/// given up from outside, its iteration count unknown), or the user's Skip (the Activity tab;
+/// `crate::dynamics::SkipRequest`: given up from outside too, never kept — "skipped by you").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScfEnd {
     Converged,
@@ -769,6 +770,7 @@ pub enum ScfEnd {
     Cap,
     NonFinite,
     TimeLimit,
+    Skipped,
 }
 
 impl ScfEnd {
@@ -779,8 +781,20 @@ impl ScfEnd {
             ScfEnd::Cap => "cap",
             ScfEnd::NonFinite => "not finite",
             ScfEnd::TimeLimit => "time limit",
+            ScfEnd::Skipped => "skipped",
         }
     }
+}
+
+/// A teacher solve that `should_abort` abandoned (`crate::Trainable::cancelled_teacher_solve`): what its
+/// [`TeachEvent`] would have carried — who asked, the rule that sent the step to the teacher, the atom the rule names,
+/// and the rule's own sentence (`why`), which leads the skip's log row as it leads the provider's other `Failed` rows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CancelledTeach {
+    pub origin: TeachOrigin,
+    pub rule: TeachRule,
+    pub atom: Option<usize>,
+    pub why: String,
 }
 
 /// One teaching solve (spec §4.3 A3). Energies in Hartree, the face density in e/Bohr³.
