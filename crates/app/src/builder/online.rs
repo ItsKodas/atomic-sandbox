@@ -486,16 +486,26 @@ fn read_entry(path: &std::path::Path, key: &(String, i32), cid: u64) -> Option<R
 
 /// The worker's requests: through the transport, at most one per [`MIN_INTERVAL`], each within its
 /// lookup's deadline, and none while the network is not allowed (for a transport that reaches it)
-/// or once the lookup being worked on is stale (review fix 1: a newer drawing generation exists, so
-/// the lookup stops between its requests and the queue behind it moves on).
+/// or once the job being worked on is stale (review fix 1: a newer drawing generation exists, so
+/// the lookup stops between its requests and the queue behind it moves on; Task 5 review fix 1: a
+/// search stops the same way once a newer search was asked or the window's online setting went
+/// off, [`Lookups::stop_searches`]).
 struct Net {
     t: Box<dyn Transport>,
     clock: Arc<dyn Clock>,
     last: Option<Instant>,
     /// The newest drawing generation the window has seen ([`Lookups::supersede`]).
     newest: Arc<AtomicU64>,
-    /// The generation of the lookup being worked on (`u64::MAX` for a search: never stale).
-    job: u64,
+    /// The newest search id handed out, or the mark [`Lookups::stop_searches`] set past it.
+    newest_search: Arc<AtomicU64>,
+    job: Working,
+}
+
+/// What the worker is on: a drawn fragment's lookup at a drawing generation, or a search by id.
+#[derive(Clone, Copy)]
+enum Working {
+    Lookup(u64),
+    Search(u64),
 }
 
 impl Net {
@@ -503,9 +513,13 @@ impl Net {
         !self.t.is_network() || network_allowed()
     }
 
-    /// The lookup being worked on is for an older drawing than the window's.
+    /// The job being worked on is superseded: a lookup for an older drawing than the window's, or
+    /// a search older than the newest one (or stopped).
     fn stale(&self) -> bool {
-        self.job < self.newest.load(Ordering::SeqCst)
+        match self.job {
+            Working::Lookup(generation) => generation < self.newest.load(Ordering::SeqCst),
+            Working::Search(id) => id < self.newest_search.load(Ordering::SeqCst),
+        }
     }
 
     fn get(&mut self, url: &str, deadline: Instant) -> Result<String, NetError> {
@@ -738,14 +752,13 @@ impl Lookups {
         let (hit_tx, hits) = mpsc::channel();
         let (latest, searches) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let network = t.is_network();
-        let newest_search = searches.clone();
-        let mut net = Net { t, clock, last: None, newest: latest.clone(), job: 0 };
+        let mut net = Net { t, clock, last: None, newest: latest.clone(), newest_search: searches.clone(), job: Working::Lookup(0) };
         // without a thread every request goes unanswered, and the session's timeout makes it offline
         let _ = std::thread::Builder::new().name("builder-lookups".into()).spawn(move || {
             for job in job_rx.iter() {
                 let sent = match job {
                     Job::Lookup { generation, drawing, frag } => {
-                        net.job = generation;
+                        net.job = Working::Lookup(generation);
                         if net.stale() {
                             continue;
                         }
@@ -757,10 +770,10 @@ impl Lookups {
                         answer_tx.send((generation, frag, answer)).is_ok()
                     }
                     Job::Search { id, query } => {
-                        if id < newest_search.load(Ordering::SeqCst) {
+                        net.job = Working::Search(id);
+                        if net.stale() {
                             continue;
                         }
-                        net.job = u64::MAX;
                         hit_tx.send((id, search(&mut net, &cache, &query))).is_ok()
                     }
                 };
@@ -789,7 +802,14 @@ impl Lookups {
         self.answers.try_iter().collect()
     }
 
-    /// Starts an online search; returns its id (later searches supersede it).
+    /// Stops every search asked so far: one running makes no further request (its answer, if
+    /// any, says offline), and one queued is skipped. The window's online setting going off.
+    pub fn stop_searches(&self) {
+        self.searches.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Starts an online search; returns its id (later searches supersede it: one still running
+    /// stops before its next request).
     pub fn search(&self, q: &Query) -> u64 {
         let id = self.searches.fetch_add(1, Ordering::SeqCst) + 1;
         let _ = self.jobs.send(Job::Search { id, query: q.clone() });
@@ -936,6 +956,10 @@ impl Session {
             self.local = iso::fragments(d).into_iter().filter(|f| f.len() >= 2).map(|f| (here.find(d, &f).is_found(), f)).map(|(k, f)| (f, k)).collect();
             if let Some(l) = &self.lookups {
                 l.supersede(self.generation);
+                // the setting off: no search may go on either (Task 5 review fix 1)
+                if !enabled {
+                    l.stop_searches();
+                }
             }
         }
         let mut answers = std::mem::take(&mut self.inbox);
@@ -1021,6 +1045,13 @@ impl Session {
             return None;
         }
         self.lookups.as_ref().map(|l| l.search(q))
+    }
+
+    /// Stops the searches asked so far ([`Lookups::stop_searches`]): the online setting went off.
+    pub fn stop_searches(&self) {
+        if let Some(l) = &self.lookups {
+            l.stop_searches();
+        }
     }
 
     /// The online searches answered since the last call (never blocks).
@@ -1755,6 +1786,38 @@ pub(crate) mod tests {
         b.drawing = d.clone();
         assert_eq!(footer_label(b.shaped()), "shape: approximate (offline)");
         assert!(b.lookup.lookups.is_none() && b.lookup.cache.is_none());
+    }
+
+    /// Task 5 review fix 1: the online setting going off supersedes a drawn fragment's lookup in
+    /// flight — it makes no further request — and stops the searches too.
+    #[test]
+    fn the_setting_off_stops_a_drawn_lookup_in_flight() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let urls = Arc::new(Mutex::new(Vec::new()));
+        let t = Recording { inner: Gate { inner: Canned::new(ethane_answers("CC")), open: gate.clone() }, urls: urls.clone() };
+        let clock = ManualClock::new();
+        let mut s = Session::with(Lookups::with_clock(Box::new(t), Cache::none(), ManualClock::new()), Cache::none(), clock.clone());
+        let d = ethane(false);
+        s.tick(&d, true);
+        clock.advance(DEBOUNCE);
+        s.tick(&d, true); // asked: the SMILES request is out, held at the gate
+        let t0 = Instant::now();
+        while urls.lock().unwrap().is_empty() {
+            assert!(t0.elapsed() < WAIT, "the worker never asked");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let l = s.lookups.as_ref().unwrap();
+        let before = l.searches.load(Ordering::SeqCst);
+        s.tick(&d, false);
+        assert!(s.lookups.as_ref().unwrap().searches.load(Ordering::SeqCst) > before, "the searches are stopped too");
+        assert_eq!(footer_label(&shape(&d, &s.layered())), "shape: approximate (offline)");
+        open_gate(&gate);
+        // a point behind it on the same worker: an empty search answers at once
+        let l = s.lookups.as_ref().unwrap();
+        l.search(&Query::Empty);
+        assert!(l.wait_search(WAIT).is_some());
+        assert_eq!(*urls.lock().unwrap(), [smiles_url("[CH3][CH3]")], "nothing after the setting went off");
+        assert!(l.wait(Duration::from_millis(50)).is_empty(), "and no answer for the superseded drawing");
     }
 
     /// R1: the online search, by name or CID, through canned answers; every URL it builds is ASCII

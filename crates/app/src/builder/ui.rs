@@ -180,7 +180,7 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, acts:
     } else if st.builder.lookup.busy() || st.builder.search_waiting() {
         // the lookups' answers and timeouts arrive without input: keep the frames coming
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
-    } else if st.builder.lookup.awaiting() {
+    } else if st.builder.lookup.awaiting() || st.builder.search_awaiting() {
         // a timed-out lookup's late answer relabels its fragment when it comes
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
     }
@@ -278,7 +278,10 @@ fn palette_column(ui: &mut Ui, st: &mut UiState) {
         }
     });
     ui.add_space(10.0);
-    ui.checkbox(&mut b.online, RichText::new(ONLINE_LABEL).size(12.5)).on_hover_text(ONLINE_TIP);
+    if ui.checkbox(&mut b.online, RichText::new(ONLINE_LABEL).size(12.5)).on_hover_text(ONLINE_TIP).changed() && !b.online {
+        // off: a search in flight stops now, not on the next frame (Task 5 review fix 1)
+        b.poll_search();
+    }
 }
 
 /// The search box (spec §8, `search.rs`) and its results: the local ones (the shipped list and the
@@ -287,7 +290,7 @@ fn palette_column(ui: &mut Ui, st: &mut UiState) {
 /// first local result, or asks PubChem when there is none.
 fn search_box(ui: &mut Ui, b: &mut Builder) {
     use super::search::{parse_query, Query};
-    let r = ui.add(egui::TextEdit::singleline(&mut b.search_query).hint_text(SEARCH_HINT).desired_width(ui.available_width()));
+    let r = ui.add(egui::TextEdit::singleline(&mut b.search_query).hint_text(SEARCH_HINT).char_limit(SEARCH_CHAR_LIMIT).desired_width(ui.available_width()));
     let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
     b.poll_search();
     if parse_query(&b.search_query) == Query::Empty {
@@ -314,15 +317,17 @@ fn search_box(ui: &mut Ui, b: &mut Builder) {
             return;
         }
         if let Some(hits) = b.online_hits() {
-            let seen: Vec<u64> = local.iter().filter_map(|h| h.cid()).collect();
-            let fresh: Vec<&super::search::Hit> = hits.iter().filter(|h| h.cid().is_none_or(|c| !seen.contains(&c))).collect();
-            if fresh.is_empty() {
+            let (rows, more) = super::search::online_rows(&local, hits);
+            if rows.is_empty() && more == 0 {
                 small(ui, if hits.is_empty() { "no results on PubChem" } else { "nothing more on PubChem" });
             }
-            for h in fresh {
+            for h in rows {
                 if result_row(ui, h).clicked() {
                     pick = h.record.clone();
                 }
+            }
+            if more > 0 {
+                small(ui, &format!("{more} more on PubChem: narrow the search"));
             }
         } else if b.search_waiting() {
             small(ui, "searching PubChem…");
@@ -1002,6 +1007,8 @@ pub const ONLINE_TIP: &str = "sends the molecule's name or structure string to N
 /// The search box's hint (spec §8) and its "nothing here" line.
 pub const SEARCH_HINT: &str = "molecule name, formula or CID";
 pub const NO_LOCAL: &str = "no match in the shipped list or the cache";
+/// The search box's length limit (characters): a few times what the online search sends.
+const SEARCH_CHAR_LIMIT: usize = 4 * super::search::MAX_NAME;
 
 /// The enlarge offer's margin, in words.
 const ENLARGE_MARGIN_TEXT: &str = "4 Bohr to spare from the farthest atom to the box";
@@ -1063,9 +1070,7 @@ mod tests {
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let canned = net::Canned::new(net::ethane_answers("CC"));
         let lookups = Lookups::with_clock(Box::new(net::Gate { inner: canned.clone(), open: gate.clone() }), Cache::none(), clock.clone());
-        let mut b = Builder::default();
-        b.lookup = Session::with(lookups, Cache::none(), clock.clone());
-        b.drawing = net::ethane(false);
+        let mut b = Builder { lookup: Session::with(lookups, Cache::none(), clock.clone()), drawing: net::ethane(false), ..Default::default() };
         let buttons = |s: &super::super::shape::Shaped| [handoff_button(false, "Insert into scene", true, looking_up(s)), handoff_button(true, "Replace scene", true, looking_up(s))];
         // waiting out the debounce, then asked and waiting for the answer
         for step in [Duration::ZERO, DEBOUNCE, TIMEOUT - Duration::from_millis(1)] {
@@ -1120,6 +1125,8 @@ mod tests {
         assert!(t.contains(SEARCH_HINT), "{t}");
         let at = |s: &str| t.to_lowercase().find(&s.to_lowercase()).unwrap_or_else(|| panic!("{s} missing: {t}"));
         assert!(at(SEARCH_HINT) < at("element") && at("element") < at(ONLINE_LABEL), "the box first, the setting last: {t}");
+        // the search tests' own list, whatever the shipped one holds (review M8)
+        st.builder.search.library = Some(super::super::search::tests::test_library());
         st.builder.search_query = "eth".into();
         let t = palette_texts(&mut st);
         assert!(t.contains("ethanol\nC₂H₆O · shipped"), "{t}");

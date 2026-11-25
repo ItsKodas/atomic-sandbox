@@ -6,8 +6,10 @@
 //! **The query** ([`parse_query`]) is compared after [`fold`]: Unicode subscripts read as digits
 //! (`H₂O` is `H2O`), superscript charges as `^` and the charge (`OH⁻` is `OH^-`), whitespace runs
 //! as one space. All digits is a CID (`000702` is 702); a formula written as chemists write it
-//! (`C2H5OH`, `NH4+`, `h2o` with its letters uppercased when that is the only reading) is a
-//! formula; anything else is a name.
+//! (`C2H5OH`, `NH4+`) is a formula, and so is an ASCII one in the wrong case whose letters split
+//! into the builder's element symbols (Z ≤ 18), a two-letter symbol tried before a one-letter one
+//! (`h2o` → `H2O`, `cl2` → `Cl2`, `nacl` → `NaCl`, `nh4+` → `NH4+`, `co` → `CO`); anything else is
+//! a name.
 //!
 //! **Local results** ([`search_local`]): the shipped list, then the molecule cache (a cached
 //! record the shipped list holds by CID is left out), ranked: the exact name (or the CID), a name
@@ -19,9 +21,12 @@
 //! **Online** (spec §7): "Search PubChem for '…'" is offered only with the builder's online setting
 //! on and PubChem reachable ([`super::online::Session::can_search`]: [`super::online::network_allowed`] for the
 //! app's transport, so never in a test build, a replay or a screenshot), and only the user's
-//! click (or Enter with no local result) asks it. A name or a formula goes to PubChem's name
-//! endpoint, a CID to its compound; the answer is listed below the local results (duplicates by
-//! CID left out), and a failure is one short line, never a toast. A name holding `/` is sent
+//! click (or Enter with no local result) asks it, and only while the local results are fewer than
+//! [`MAX_RESULTS`]. A name goes to PubChem's name endpoint as folded, a formula as the user typed
+//! it (trimmed: not the `^` notation, [`online_query`]), a CID to its compound; the answer is
+//! listed below the local results (duplicates by CID left out, the whole list at most
+//! [`MAX_RESULTS`], [`online_rows`]), and a failure is one short line, never a toast. The setting
+//! going off stops a search in flight before its next request ([`Builder::poll_search`]). A name holding `/` is sent
 //! percent-encoded (`%2F`) in the path segment, which PubChem often refuses: that is a 4xx, read as
 //! "no results on PubChem" (PUG REST's POST form would carry it, but the transport is GET-only).
 //!
@@ -31,6 +36,7 @@ use super::records::{hill, Library, Record, Source};
 use super::{Atom, Bond, Builder};
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
+use crate::ui::ptable::Z_ENABLED;
 use units::elements::{symbol, z_of_symbol};
 
 /// The most local results the box lists (spec §8).
@@ -192,17 +198,61 @@ fn charge(s: &str) -> Option<i32> {
     sign(last).map(|sg| sg * n)
 }
 
-/// [`formula`], else (an ASCII query with a count somewhere) the same with its letters uppercased,
-/// which is the only reading of `h2o` or `nh4+`: the formula's text (case corrected) and its reading.
+/// [`formula`], else (an ASCII query) the same with each run of letters split into element symbols
+/// whatever their case ([`symbols`]: `nacl` → `NaCl`, `h2o` → `H2O`): the formula's text (case
+/// corrected) and its reading.
 fn formula_any_case(s: &str) -> Option<(String, Formula)> {
     if let Some(f) = formula(s) {
         return Some((s.to_string(), f));
     }
-    if !s.is_ascii() || !s.bytes().any(|b| b.is_ascii_digit()) {
+    if !s.is_ascii() {
         return None;
     }
-    let up = s.to_ascii_uppercase();
-    formula(&up).map(|f| (up, f))
+    let b = s.as_bytes();
+    let mut fixed = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        let start = i;
+        if b[i].is_ascii_alphabetic() {
+            while i < b.len() && b[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            fixed += &symbols(&s[start..i])?;
+        } else {
+            fixed.push(b[i] as char);
+            i += 1;
+        }
+    }
+    formula(&fixed).map(|f| (fixed, f))
+}
+
+/// A run of ASCII letters split into element symbols of the builder's range (Z 1–[`Z_ENABLED`]: no
+/// record holds others), case-insensitively, a two-letter symbol tried before a one-letter one and
+/// the other tried when the rest does not split (`nacl` → `NaCl`, `cl` → `Cl`, `nh` → `NH`, not
+/// nihonium; `co` → `CO`, not cobalt); None when no split exists. Linear: a position that failed
+/// once is not tried again.
+fn symbols(run: &str) -> Option<String> {
+    fn go(run: &str, i: usize, failed: &mut [bool], out: &mut Vec<&'static str>) -> bool {
+        if i == run.len() {
+            return true;
+        }
+        if failed[i] {
+            return false;
+        }
+        for len in [2, 1] {
+            if let Some(z) = run.get(i..i + len).and_then(z_of_symbol).filter(|&z| z <= Z_ENABLED) {
+                out.push(symbol(z));
+                if go(run, i + len, failed, out) {
+                    return true;
+                }
+                out.pop();
+            }
+        }
+        failed[i] = true;
+        false
+    }
+    let mut out = Vec::new();
+    go(run, 0, &mut vec![false; run.len()], &mut out).then(|| out.concat())
 }
 
 /// What the box's text asks for (module doc). Never panics, whatever the text.
@@ -301,6 +351,26 @@ fn bounds(p: impl Iterator<Item = [f32; 2]>) -> Option<([f32; 2], [f32; 2])> {
     })
 }
 
+/// What the online search sends for the box's text: as [`parse_query`] reads it, except that a
+/// formula goes as the user typed it, trimmed (PubChem's synonyms are "H2O", not our `^` notation).
+pub fn online_query(q: &str) -> Query {
+    match parse_query(q) {
+        Query::Formula(_) => Query::Formula(q.trim().to_string()),
+        other => other,
+    }
+}
+
+/// The online answer's rows under the local ones (spec §8: the whole list at most
+/// [`MAX_RESULTS`]): the hits whose CID the local list does not hold, as many as fit, and how many
+/// more did not fit.
+pub fn online_rows<'a>(local: &[Hit], online: &'a [Hit]) -> (Vec<&'a Hit>, usize) {
+    let seen: Vec<u64> = local.iter().filter_map(Hit::cid).collect();
+    let fresh: Vec<&Hit> = online.iter().filter(|h| h.cid().is_none_or(|c| !seen.contains(&c))).collect();
+    let room = MAX_RESULTS.saturating_sub(local.len()).min(fresh.len());
+    let more = fresh.len() - room;
+    (fresh.into_iter().take(room).collect(), more)
+}
+
 /// The PubChem search asked for one query: its id, when, and how it went.
 pub(crate) struct Online {
     /// The query's [`fold`], lowercased: the box's text it belongs to.
@@ -308,6 +378,9 @@ pub(crate) struct Online {
     id: u64,
     asked: Instant,
     state: OnlineState,
+    /// No answer yet. After [`ONLINE_WAIT`] the box reads it as not answered, but the answer may
+    /// still come: the window repaints slowly for it until [`super::online::LATE_WAIT`].
+    unanswered: bool,
 }
 
 enum OnlineState {
@@ -321,6 +394,10 @@ enum OnlineState {
 pub(crate) struct SearchBox {
     local: Option<(String, Vec<Hit>)>,
     online: Option<Online>,
+    /// The list searched in place of the shipped one (tests, so that they keep to the records they
+    /// name whatever the shipped list holds).
+    #[cfg(test)]
+    pub(crate) library: Option<&'static Library>,
 }
 
 fn online_key(q: &str) -> String {
@@ -359,36 +436,46 @@ impl Builder {
         }
     }
 
+    /// The list the box searches: the shipped one (in a test that gives one, its own).
+    fn library(&self) -> &'static Library {
+        #[cfg(test)]
+        if let Some(l) = self.search.library {
+            return l;
+        }
+        Library::shipped()
+    }
+
     /// The local results for the box's text ([`search_local`] over the shipped list and the
     /// session's cache), remade when the text changes.
     pub fn search_hits(&mut self) -> &[Hit] {
         if self.search.local.as_ref().is_none_or(|(t, _)| *t != self.search_query) {
             let cache = self.lookup.local_cache();
-            let hits = search_local(&self.search_query, Library::shipped(), &cache);
+            let hits = search_local(&self.search_query, self.library(), &cache);
             self.search.local = Some((self.search_query.clone(), hits));
         }
         &self.search.local.as_ref().expect("just made").1
     }
 
-    /// Whether the box offers "Search PubChem for '…'" (module doc): a query to send, the online
-    /// setting on and PubChem reachable.
+    /// Whether the box offers "Search PubChem for '…'" (module doc): a query to send, fewer local
+    /// results than [`MAX_RESULTS`] (spec §7), the online setting on and PubChem reachable.
     pub fn can_search_online(&mut self) -> bool {
-        let sendable = match parse_query(&self.search_query) {
+        let sendable = match online_query(&self.search_query) {
             Query::Empty => false,
             Query::Cid(_) => true,
             Query::Name(s) | Query::Formula(s) => s.len() <= MAX_NAME,
         };
-        sendable && self.lookup.can_search(self.online)
+        sendable && self.search_hits().len() < MAX_RESULTS && self.lookup.can_search(self.online)
     }
 
-    /// Asks PubChem for the box's text (a later ask supersedes it).
+    /// Asks PubChem for the box's text (a later ask supersedes it: one still running stops before
+    /// its next request).
     pub fn search_online(&mut self) {
         if !self.can_search_online() {
             return;
         }
-        let q = parse_query(&self.search_query);
+        let q = online_query(&self.search_query);
         if let Some(id) = self.lookup.search(&q, self.online) {
-            self.search.online = Some(Online { query: online_key(&self.search_query), id, asked: self.lookup.now(), state: OnlineState::Waiting });
+            self.search.online = Some(Online { query: online_key(&self.search_query), id, asked: self.lookup.now(), state: OnlineState::Waiting, unanswered: true });
         }
     }
 
@@ -402,15 +489,27 @@ impl Builder {
         self.current_online().is_some_and(|o| matches!(o.state, OnlineState::Waiting))
     }
 
+    /// A search read as not answered may still answer: the window repaints slowly for it, up to
+    /// [`super::online::LATE_WAIT`] after it was asked.
+    pub fn search_awaiting(&self) -> bool {
+        self.current_online().is_some_and(|o| o.unanswered && !matches!(o.state, OnlineState::Waiting) && self.lookup.now().saturating_duration_since(o.asked) < super::online::LATE_WAIT)
+    }
+
     /// Takes the online answers in: the one for the box's search replaces its state (even after it
     /// read as not answered); others are stale and dropped. One waiting past [`ONLINE_WAIT`] reads
-    /// as a timeout.
+    /// as a timeout. The online setting off, or the box's text changed, drops the search and stops
+    /// it if still running: it makes no further request (Task 5 review fix 1).
     pub fn poll_search(&mut self) {
         let answers = self.lookup.poll_search();
         let now = self.lookup.now();
+        let key = online_key(&self.search_query);
+        if self.search.online.as_ref().is_some_and(|o| !self.online || o.query != key) && self.search.online.take().is_some_and(|o| o.unanswered) {
+            self.lookup.stop_searches();
+        }
         if let Some(o) = &mut self.search.online {
             for (id, a) in answers {
                 if id == o.id {
+                    o.unanswered = false;
                     o.state = match a {
                         Ok(v) => OnlineState::Done(v),
                         Err(e) => OnlineState::Failed(e),
@@ -450,12 +549,11 @@ impl Builder {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::super::online::tests::{Canned, ManualClock, Recording};
-    use super::super::online::{Lookups, PUG};
+pub(crate) mod tests {
+    use super::super::online::tests::{open_gate, Canned, Gate, ManualClock, Recording};
+    use super::super::online::{name_url, Lookups, Session, PUG};
     use super::*;
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
     const WAIT: Duration = Duration::from_secs(30);
 
@@ -463,10 +561,52 @@ mod tests {
         hits.iter().map(|h| h.name.as_str()).collect()
     }
 
-    fn local(q: &str) -> Vec<Hit> {
-        search_local(q, Library::shipped(), &Cache::none())
+    /// A record for the search only (its graph's elements and charge; no bonds or layout).
+    fn fake(name: &str, synonyms: &[&str], cid: u64, z: &[u8], charge: i8) -> Record {
+        let n = z.len();
+        let mut q = vec![0; n];
+        q[0] = charge;
+        Record {
+            name: name.into(),
+            synonyms: synonyms.iter().map(|s| s.to_string()).collect(),
+            source: Source::PubChem { cid },
+            z: z.to_vec(),
+            charge: q,
+            bonds: vec![],
+            xyz: vec![[0.0; 3]; n],
+            xy: vec![[0.0; 2]; n],
+            stereo_defined: false,
+        }
     }
 
+    /// The search tests' own list (review M8: independent of what the shipped list holds), with
+    /// isomers, prefixes and substrings to rank. No ethane in it (the online tests fetch it).
+    pub(crate) fn test_library() -> &'static Library {
+        static LIB: OnceLock<Library> = OnceLock::new();
+        LIB.get_or_init(|| {
+            let h = |n: usize| std::iter::repeat_n(1u8, n);
+            let z = |heavy: &[u8], hs: usize| heavy.iter().copied().chain(h(hs)).collect::<Vec<u8>>();
+            Library::from_records(vec![
+                fake("ethanol", &["ethyl alcohol"], 702, &z(&[6, 6, 8], 6), 0),
+                fake("dimethyl ether", &[], 8254, &z(&[6, 8, 6], 6), 0),
+                fake("ethanolamine", &[], 700, &z(&[6, 6, 7, 8], 7), 0),
+                fake("methanol", &[], 887, &z(&[6, 8], 4), 0),
+                fake("methane", &[], 297, &z(&[6], 4), 0),
+                fake("water", &["oxidane"], 962, &z(&[8], 2), 0),
+                fake("ammonium", &["azanium"], 223, &z(&[7], 4), 1),
+                fake("ammonia", &[], 222, &z(&[7], 3), 0),
+                fake("hydroxide", &[], 961, &z(&[8], 1), -1),
+                fake("sodium chloride", &[], 5234, &[11, 17], 0),
+                fake("chlorine", &[], 24526, &[17, 17], 0),
+            ])
+        })
+    }
+
+    fn local(q: &str) -> Vec<Hit> {
+        search_local(q, test_library(), &Cache::none())
+    }
+
+    /// A real record of the shipped list (its 2D layout and bonds: the stamping tests).
     fn seed(name: &str) -> &'static Record {
         Library::shipped().records().iter().find(|r| r.name == name).unwrap()
     }
@@ -474,34 +614,66 @@ mod tests {
     #[test]
     fn exact_names_rank_first() {
         let hits = local("ethanol");
-        assert_eq!(hits.first().map(|h| h.name.as_str()), Some("ethanol"), "{:?}", names(&hits));
-        assert_eq!((hits[0].formula.as_str(), hits[0].source), ("C2H6O", "shipped"));
-        assert_eq!(hits[0].record.as_ref(), Some(seed("ethanol")));
-        assert!(names(&local("eth")).contains(&"ethanol"), "{:?}", names(&local("eth")));
-        assert!(names(&local("Ethanol ")).first() == Some(&"ethanol"), "case and padding");
-        assert_eq!(names(&local("C2H6O")), vec!["ethanol"], "by formula");
-        assert_eq!(names(&local("C2H5OH")), vec!["ethanol"], "a formula as chemists write it");
-        // a synonym, a CID, a charged formula (and without its charge)
-        assert_eq!(names(&local("ethyl alcohol")), vec!["ethanol"]);
-        assert_eq!(names(&local("702")), vec!["ethanol"]);
-        assert_eq!(names(&local("NH4+")), vec!["ammonium"]);
-        assert_eq!(names(&local("OH⁻")), vec!["hydroxide"]);
-        assert_eq!(names(&local("NH4-")), Vec::<&str>::new(), "the wrong charge");
-        assert!(names(&local("NH4")).contains(&"ammonium"));
-        // a prefix of another name ranks below the exact one: "water" itself first
-        assert_eq!(names(&local("water"))[0], "water");
+        assert_eq!(names(&hits), ["ethanol", "ethanolamine", "methanol"], "exact, prefix, then containing");
+        assert_eq!((hits[0].formula.as_str(), hits[0].source, hits[0].cid()), ("C2H6O", "shipped", Some(702)));
+        assert_eq!(names(&local("Ethanol "))[0], "ethanol", "case and padding");
+        // prefixes (the shorter first), then names containing it (the shorter first)
+        assert_eq!(names(&local("eth")), ["ethanol", "ethanolamine", "methane", "methanol", "dimethyl ether"]);
+        assert_eq!(names(&local("methan")), ["methane", "methanol"]);
+        // by formula: both isomers, however written
+        for q in ["C2H6O", "C2H5OH", "CH3OCH3", "c2h6o"] {
+            assert_eq!(names(&local(q)), ["ethanol", "dimethyl ether"], "{q}");
+        }
+        // a synonym, a CID (leading zeros too), a charged formula (and without its charge)
+        assert_eq!(names(&local("ethyl alcohol")), ["ethanol"]);
+        assert_eq!(names(&local("azanium")), ["ammonium"]);
+        assert_eq!(names(&local("702")), ["ethanol"]);
+        assert_eq!(names(&local("000702")), ["ethanol"]);
+        for q in ["NH4+", "NH₄⁺", "NH4", "nh4+"] {
+            assert_eq!(names(&local(q)), ["ammonium"], "{q}");
+        }
+        assert!(local("NH4-").is_empty(), "the wrong charge");
+        assert_eq!(names(&local("NH3")), ["ammonia"]);
+        assert_eq!(names(&local("OH⁻")), ["hydroxide"]);
+        // review M4: lowercase formulas split into symbols, two letters tried first
+        assert_eq!(names(&local("nacl")), ["sodium chloride"]);
+        assert_eq!(names(&local("cl2")), ["chlorine"]);
         assert!(local("xyzzy").is_empty());
         assert!(local("").is_empty() && local("   ").is_empty());
-        assert!(local("e").len() <= MAX_RESULTS);
+        // at most MAX_RESULTS, the shorter names first
+        let many = Library::from_records((0..20).map(|i| fake(&format!("ethyl {}", "x".repeat(20 - i)), &[], 1000 + i as u64, &[6], 0)).collect());
+        let hits = search_local("ethyl", &many, &Cache::none());
+        assert_eq!(hits.len(), MAX_RESULTS);
+        assert_eq!(hits[0].name, "ethyl x");
+    }
+
+    /// Review M4: the case correction.
+    #[test]
+    fn lowercase_formulas_split_into_symbols() {
+        assert_eq!(parse_query("h2o"), Query::Formula("H2O".into()));
+        assert_eq!(parse_query("cl2"), Query::Formula("Cl2".into()));
+        assert_eq!(parse_query("nacl"), Query::Formula("NaCl".into()));
+        assert_eq!(parse_query("NACL"), Query::Formula("NaCl".into()), "no strict reading: N, A? — split again");
+        assert_eq!(parse_query("hcl"), Query::Formula("HCl".into()), "Hc is no symbol: H then Cl");
+        assert_eq!(parse_query("co"), Query::Formula("CO".into()), "the builder's elements only: C and O, not cobalt");
+        assert_eq!(parse_query("nh4+"), Query::Formula("NH4+".into()), "not nihonium");
+        assert_eq!(parse_query("ne"), Query::Name("ne".into()), "neon, one element: a name");
+        assert_eq!(parse_query("CO"), Query::Formula("CO".into()), "as written, carbon monoxide");
+        assert_eq!(parse_query("ethanol"), Query::Name("ethanol".into()));
+        assert_eq!(symbols("nacl").as_deref(), Some("NaCl"));
+        assert_eq!(symbols("xq"), None);
+        // linear however long: a run that never splits
+        assert_eq!(symbols(&"jq".repeat(400)), None);
     }
 
     /// Review focus 5.
     #[test]
     fn odd_queries_never_panic_or_send_malformed_urls() {
         let long = "ab".repeat(150);
-        let odd = ["", "   ", "000702", "H₂O", "h2o", "ethanol; DROP", long.as_str(), "a/b", "%2F", "ü", "\u{0}\t", "99999999999999999999999", "0", "H2Oü", "NH4ü", "C^", "H2O^+x", "Na+++++++++++", "C1000"];
+        let odd = ["", "   ", "000702", "H₂O", "h2o", "SO₄²⁻", "ethanol; DROP", long.as_str(), "a/b", "%2F", "ü", "\u{0}\t", "99999999999999999999999", "0", "H2Oü", "NH4ü", "C^", "H2O^+x", "Na+++++++++++", "C1000"];
         for q in odd {
             let _ = parse_query(q);
+            let _ = online_query(q);
             let _ = local(q);
         }
         assert_eq!(parse_query(""), Query::Empty);
@@ -512,19 +684,21 @@ mod tests {
         assert_eq!(parse_query("ethanol; DROP"), Query::Name("ethanol; DROP".into()));
         assert_eq!(parse_query("  ethyl   alcohol "), Query::Name("ethyl alcohol".into()));
         assert_eq!(parse_query("He"), Query::Name("He".into()), "one element alone reads as a name");
-        assert_eq!(parse_query("CO"), Query::Formula("CO".into()));
         assert_eq!(parse_query("SO₄²⁻"), Query::Formula("SO4^2-".into()), "a superscript charge stays a charge");
         assert_eq!(parse_query("H2Oü"), Query::Name("H2Oü".into()));
-        assert_eq!(names(&local("NH₄⁺")), vec!["ammonium"]);
+        // review M3: a formula goes online as typed (trimmed), never in the internal notation
+        assert_eq!(online_query(" SO₄²⁻ "), Query::Formula("SO₄²⁻".into()));
+        assert_eq!(online_query("h2o"), Query::Formula("h2o".into()));
+        assert_eq!(online_query("ethyl  alcohol"), Query::Name("ethyl alcohol".into()));
         for q in ["H₂O", "h2o", "H2O", "OH2"] {
-            assert_eq!(names(&local(q)), vec!["water"], "{q}");
+            assert_eq!(names(&local(q)), ["water"], "{q}");
         }
         // every URL the online search builds: ASCII, percent-encoded, under PubChem's root (a
         // recording transport over canned answers: never the network)
         let urls = Arc::new(Mutex::new(Vec::new()));
         let l = Lookups::with_clock(Box::new(Recording { inner: Canned::new(Default::default()), urls: urls.clone() }), Cache::none(), ManualClock::new());
         for q in odd {
-            let id = l.search(&parse_query(q));
+            let id = l.search(&online_query(q));
             let (got, hits) = l.wait_search(WAIT).expect("an answer");
             assert_eq!(got, id);
             assert_eq!(hits, Ok(vec![]), "{q:?}: canned 404s are no results, never an error");
@@ -541,10 +715,132 @@ mod tests {
             // one name or CID segment: an encoded '/' never splits the path
             let segs: Vec<&str> = path.split('?').next().unwrap().split('/').collect();
             assert!(segs.len() == 4 || segs.len() == 5, "{u}");
+            assert!(!u.contains("SO4%5E"), "no ^ notation sent for a superscript: {u}");
         }
         assert!(urls.iter().any(|u| u.contains("compound/cid/702/")), "{urls:?}");
-        assert!(urls.iter().any(|u| u.contains("compound/name/a%2Fb/cids/TXT")), "{urls:?}");
+        assert!(urls.contains(&name_url("a/b")) && name_url("a/b").contains("compound/name/a%2Fb/cids/TXT"), "{urls:?}");
+        assert!(urls.contains(&name_url("h2o")) && urls.contains(&name_url("H₂O")) && urls.contains(&name_url("SO₄²⁻")), "formulas as typed: {urls:?}");
         assert!(!urls.iter().any(|u| u.contains(&long)), "a name past MAX_NAME is not sent");
+    }
+
+    /// Review M2: the combined list is at most MAX_RESULTS; PubChem's rows fill what the local ones
+    /// leave, duplicates (by CID) left out, and the rest is counted.
+    #[test]
+    fn the_combined_list_is_capped() {
+        let lib = test_library().records();
+        let local: Vec<Hit> = lib[..6].iter().map(|r| Hit::of(r, "shipped")).collect();
+        let online: Vec<Hit> = std::iter::once(Hit::of(&lib[0], "PubChem")).chain((0..4).map(|i| Hit::of(&fake("x", &[], 90 + i, &[6], 0), "PubChem"))).collect();
+        let (rows, more) = online_rows(&local, &online);
+        assert_eq!((rows.iter().map(|h| h.cid()).collect::<Vec<_>>(), more), (vec![Some(90), Some(91)], 2));
+        let (rows, more) = online_rows(&local[..1], &online[..1]);
+        assert_eq!((rows.len(), more), (0, 0), "only a duplicate");
+        // with 8 local results there is nothing to ask PubChem for (spec §7)
+        let mut b = Builder { search_query: "ethyl".into(), ..Default::default() };
+        let many = Box::leak(Box::new(Library::from_records((0..9).map(|i| fake(&format!("ethyl {i}"), &[], 1000 + i, &[6], 0)).collect())));
+        b.search.library = Some(many);
+        let clock = ManualClock::new();
+        b.lookup = Session::with(Lookups::with_clock(Box::new(Canned::new(Default::default())), Cache::none(), clock.clone()), Cache::none(), clock);
+        assert!(!b.can_search_online());
+        b.search_query = "ethyl 1".into();
+        assert!(b.can_search_online());
+    }
+
+    /// A builder searching [`test_library`] through a session whose PubChem is `t`, the window's
+    /// clock apart from the worker's (the worker's request deadlines do not run out while the
+    /// test moves the window's clock).
+    fn builder_over(t: Box<dyn super::super::online::Transport>, query: &str) -> (Builder, Arc<ManualClock>) {
+        let clock = ManualClock::new();
+        let mut b = Builder { search_query: query.into(), ..Default::default() };
+        b.search.library = Some(test_library());
+        b.lookup = Session::with(Lookups::with_clock(t, Cache::none(), ManualClock::new()), Cache::none(), clock.clone());
+        (b, clock)
+    }
+
+    fn ethane_by_name() -> std::collections::HashMap<String, Result<String, NetError>> {
+        let mut answers = super::super::online::tests::ethane_answers("CC");
+        answers.insert(name_url("ethane"), Ok("6324\n".into()));
+        answers
+    }
+
+    /// Blocks until the transport saw `n` requests (the worker is then at the gate).
+    fn until(urls: &Arc<Mutex<Vec<String>>>, n: usize) {
+        let t0 = std::time::Instant::now();
+        while urls.lock().unwrap().len() < n {
+            assert!(t0.elapsed() < WAIT, "the worker never asked");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Review fix 1: the online setting going off stops a search in flight — no request after it —
+    /// and a newer search stops an older one the same way, so it does not wait behind it.
+    #[test]
+    fn turning_the_setting_off_stops_a_search_in_flight() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let urls = Arc::new(Mutex::new(Vec::new()));
+        let t = Recording { inner: Gate { inner: Canned::new(ethane_by_name()), open: gate.clone() }, urls: urls.clone() };
+        let (mut b, _) = builder_over(Box::new(t), "ethane");
+        b.search_online();
+        until(&urls, 1); // the name lookup is out, held at the gate
+        b.online = false;
+        b.poll_search();
+        assert!(!b.search_waiting() && b.online_hits().is_none());
+        open_gate(&gate);
+        // the stopped search's answer (offline: it stopped before its next request) is dropped
+        assert!(b.lookup.wait_search(WAIT));
+        assert_eq!(*urls.lock().unwrap(), [name_url("ethane")], "no request after the setting went off");
+        b.poll_search();
+        assert!(b.online_hits().is_none() && b.online_failed().is_none());
+        // on again: a search goes out in full
+        b.online = true;
+        b.search_online();
+        assert!(b.lookup.wait_search(WAIT));
+        b.poll_search();
+        assert_eq!(b.online_hits().map(|h| h.len()), Some(1));
+
+        // a newer search stops the one in flight before its next request
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let urls = Arc::new(Mutex::new(Vec::new()));
+        let t = Recording { inner: Gate { inner: Canned::new(ethane_by_name()), open: gate.clone() }, urls: urls.clone() };
+        let (mut b, _) = builder_over(Box::new(t), "ethane");
+        b.search_online();
+        until(&urls, 1);
+        b.search_query = "propane".into();
+        b.search_online();
+        open_gate(&gate);
+        until(&urls, 2);
+        assert!(b.lookup.wait_search(WAIT) && b.lookup.wait_search(WAIT), "both answer");
+        assert_eq!(*urls.lock().unwrap(), [name_url("ethane"), name_url("propane")], "ethane's 3D record was never asked");
+        b.poll_search();
+        assert_eq!(b.online_hits(), Some(&[][..]), "propane: no results");
+    }
+
+    /// Review M1: a search read as not answered after ONLINE_WAIT keeps the window repainting
+    /// slowly (as the drawn lookups' LATE_WAIT), so its late answer shows without input.
+    #[test]
+    fn a_late_search_answer_keeps_the_window_repainting() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (mut b, clock) = builder_over(Box::new(Gate { inner: Canned::new(ethane_by_name()), open: gate.clone() }), "ethane");
+        b.search_online();
+        assert!(b.search_waiting() && !b.search_awaiting());
+        clock.advance(ONLINE_WAIT);
+        b.poll_search();
+        assert_eq!(b.online_failed(), Some(NetError::Timeout));
+        assert!(!b.search_waiting() && b.search_awaiting(), "repaint, slowly, for the late answer");
+        open_gate(&gate);
+        assert!(b.lookup.wait_search(WAIT));
+        b.poll_search();
+        assert_eq!(b.online_hits().map(|h| h[0].name.as_str()), Some("Ethane"));
+        assert!(!b.search_awaiting());
+        // one that never answers: the repaint ends LATE_WAIT after the ask
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (mut b, clock) = builder_over(Box::new(Gate { inner: Canned::new(Default::default()), open: gate.clone() }), "propane");
+        b.search_online();
+        clock.advance(ONLINE_WAIT);
+        b.poll_search();
+        assert!(b.search_awaiting());
+        clock.advance(super::super::online::LATE_WAIT);
+        assert!(!b.search_awaiting());
+        open_gate(&gate);
     }
 
     #[test]
@@ -611,7 +907,6 @@ mod tests {
     #[test]
     fn the_online_search_runs_through_the_session() {
         use super::super::online::tests::{ethane_answers, temp_dir};
-        use super::super::online::{name_url, Session};
         let dir = temp_dir("search-session");
         let clock = ManualClock::new();
         let cache = Cache::open(dir.clone());
@@ -620,13 +915,14 @@ mod tests {
         let canned = Canned::new(answers);
         // a test build: no network, so the app's own session offers no online row
         let mut b = Builder { search_query: "ethane".into(), ..Default::default() };
+        b.search.library = Some(test_library());
         assert!(!b.can_search_online());
         b.lookup = Session::with(Lookups::with_clock(Box::new(canned.clone()), cache.clone(), clock.clone()), cache, clock.clone());
         assert!(b.can_search_online());
         b.online = false;
         assert!(!b.can_search_online(), "the setting off: no row");
         b.online = true;
-        assert_eq!(names(b.search_hits()), ["methane"], "not in the shipped list (methane contains it)");
+        assert_eq!(names(b.search_hits()), ["methane"], "not in the list (methane contains it)");
         b.search_online();
         assert!(b.search_waiting());
         assert!(b.lookup.wait_search(WAIT));
@@ -663,6 +959,7 @@ mod tests {
     #[test]
     fn search_and_stamp_first_stamps_the_top_local_hit() {
         let mut b = Builder::default();
+        b.search.library = Some(Box::leak(Box::new(Library::from_records(vec![seed("ethanol").clone(), seed("methane").clone()]))));
         assert_eq!(b.search_and_stamp_first("ethanol").as_deref(), Some("ethanol"));
         assert_eq!(b.search_query, "ethanol");
         assert_eq!(b.drawing.atoms.len(), 9);
