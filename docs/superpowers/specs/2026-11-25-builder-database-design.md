@@ -164,7 +164,7 @@ The shapes stay valid as starting guesses after later physics changes such as PB
 - **Layout (coordinator's call, from the builder check).**
   1. `embed::embed` lays out the **whole drawing once**, exactly as today.
   2. Every unmatched atom keeps the position that layout gives it.
-  3. Each matched fragment's atoms are replaced by its record shape, centred on the centroid the embedding gave that fragment.
+  3. Each matched fragment's atoms are replaced by its record shape, turned by the proper rotation (never a reflection, which would flip a stereo record's chirality) that best fits it, in the least-squares sense, to the embedding's positions for that fragment's atoms, then centred on the centroid the embedding gave that fragment. So each fragment keeps the orientation it was drawn in, and drawn arrangements between fragments (an H₂O···HF hydrogen bond) survive (user hand-test 2026-11-25; R16).
   4. Only matched fragments then move, pushed apart until every pair of atoms in different fragments is ≥ 3 Bohr, the same gap Insert already keeps from the scene's atoms.
 
   A drawing with no matched fragment therefore hands off bit for bit what it does today.

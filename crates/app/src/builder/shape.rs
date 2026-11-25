@@ -5,7 +5,9 @@
 //! **The layout (§6.1).** [`embed::embed`] lays out the whole drawing once, exactly as before the
 //! database existed. Each fragment of two or more atoms is then looked up through a
 //! [`RecordSource`]; a found fragment's atoms take its record's 3D shape (Å → Bohr) through the
-//! atom mapping, centred on the centroid the embedding gave that fragment. Only the matched
+//! atom mapping, turned by the proper rotation (never a reflection) that best fits it to the
+//! embedding's positions for that fragment ([`fit_rotation`]), then centred on the centroid the
+//! embedding gave that fragment — so each fragment keeps the orientation it was drawn in. Only the matched
 //! fragments then move, pushed apart along the line between fragment centroids until every pair of
 //! atoms in different fragments is at least [`FRAGMENT_GAP`] apart, and the whole is centred last as
 //! the embedding is. A matched fragment the push cannot clear within [`MAX_PUSH_PASSES`] (trapped
@@ -200,16 +202,178 @@ fn valid_mapping(d: &Drawing, frag: &[usize], r: &Record, m: &[usize]) -> bool {
     bonds_map && drawn == r.bonds.len()
 }
 
-/// The fragment's atoms at the record's shape (Bohr), its centroid where the embedding put the
-/// fragment's.
+/// The fragment's atoms at the record's shape (Bohr), turned by [`fit_rotation`] to best fit the
+/// embedding's positions for them, its centroid where the embedding put the fragment's.
 fn put_record(x: &mut [V3], frag: &[usize], r: &Record, m: &[usize]) {
-    let p: Vec<V3> = m.iter().map(|&k| r.xyz[k].map(units::angstrom_to_bohr)).collect();
+    let bohr = |k: usize| r.xyz[k].map(units::angstrom_to_bohr);
+    let p: Vec<V3> = m.iter().map(|&k| bohr(k)).collect();
     let (ce, cr) = (centroid(frag.iter().map(|&i| x[i])), centroid(p.iter().copied()));
-    for (&i, q) in frag.iter().zip(&p) {
+    let p: Vec<V3> = p.iter().map(|v| sub(*v, cr)).collect();
+    let q: Vec<V3> = frag.iter().map(|&i| sub(x[i], ce)).collect();
+    // the record's own axes, from its atoms in record order (independent of the drawing's order)
+    let all: Vec<V3> = (0..r.xyz.len()).map(bohr).collect();
+    let ca = centroid(all.iter().copied());
+    let axes = principal_axes(&all.iter().map(|v| sub(*v, ca)).collect::<Vec<_>>());
+    let rot = fit_rotation(&p, &q, &axes);
+    for (&i, v) in frag.iter().zip(&p) {
+        let t = apply(&rot, *v);
         for c in 0..3 {
-            x[i][c] = q[c] - cr[c] + ce[c];
+            x[i][c] = t[c] + ce[c];
         }
     }
+}
+
+type M3 = [[f64; 3]; 3];
+
+fn sub(a: V3, b: V3) -> V3 {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn dot(a: V3, b: V3) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross(a: V3, b: V3) -> V3 {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+
+fn apply(r: &M3, v: V3) -> V3 {
+    [dot(r[0], v), dot(r[1], v), dot(r[2], v)]
+}
+
+/// The weight of the tie-break term in [`fit_rotation`], relative to the record's Σ|p|² (Bohr²).
+const TIE_BREAK: f64 = 1e-9;
+
+/// The proper rotation `R` (det = +1, never a reflection: a reflection would flip a stereo record's
+/// chirality) that best fits `R p_i` onto `q_i` in the least-squares sense — Horn's quaternion form
+/// of the Kabsch fit: the unit quaternion is the top eigenvector of the symmetric 4×4 matrix built
+/// from S = Σ p_i q_iᵀ. `p` (the record, centred) and `q` (the embedding, centred) are paired by
+/// index.
+///
+/// **The tie-break (degenerate fits).** Where the drawing leaves part of the turn free, the free
+/// part is decided by a term of weight [`TIE_BREAK`] × Σ|p|² that turns the record's own principal
+/// axes `axes` (largest spread first, [`principal_axes`]) as near as allowed onto the scene's x, y
+/// and z — so a free turn lays the record flat in the drawing's plane. The term is fixed per record,
+/// so the answer is deterministic, and continuous wherever the fit is unique; its pull on a
+/// determined fit is of order 1e-9 rad.
+/// - a 2-atom or linear record: only the line's direction is fitted (onto the embedding's line,
+///   its sense from the atom mapping); the turn about it is the tie-break's, and moves no atom;
+/// - a flat (or near-flat) embedding, as a 2D drawing gives: S has rank 2, which still fixes a
+///   unique proper rotation (the third axis follows from the first two), so a tiny out-of-plane
+///   change in the embedding moves the answer by as little, without a flip between mirror frames;
+/// - a straight-line embedding of a bent record: the record's best-matching direction goes onto the
+///   line and the tie-break picks the turn about it.
+fn fit_rotation(p: &[V3], q: &[V3], axes: &[V3; 3]) -> M3 {
+    let mut s = [[0.0; 3]; 3];
+    for (a, b) in p.iter().zip(q) {
+        for i in 0..3 {
+            for j in 0..3 {
+                s[i][j] += a[i] * b[j];
+            }
+        }
+    }
+    let eps = TIE_BREAK * p.iter().map(|v| dot(*v, *v)).sum::<f64>();
+    for (k, w) in [3.0, 2.0, 1.0].into_iter().enumerate() {
+        // as if the record's axis k (weight w) were a point paired with the scene's axis k
+        for i in 0..3 {
+            s[i][k] += eps * w * axes[k][i];
+        }
+    }
+    let [[xx, xy, xz], [yx, yy, yz], [zx, zy, zz]] = s;
+    let n = [
+        [xx + yy + zz, yz - zy, zx - xz, xy - yx],
+        [yz - zy, xx - yy - zz, xy + yx, zx + xz],
+        [zx - xz, xy + yx, -xx + yy - zz, yz + zy],
+        [xy - yx, zx + xz, yz + zy, -xx - yy + zz],
+    ];
+    let (val, vec) = jacobi(n);
+    let mut top = 0;
+    for k in 1..4 {
+        if val[k] > val[top] {
+            top = k;
+        }
+    }
+    let qn = (0..4).map(|i| vec[i][top] * vec[i][top]).sum::<f64>().sqrt();
+    let [w, x, y, z] = [0, 1, 2, 3].map(|i| vec[i][top] / qn);
+    [
+        [w * w + x * x - y * y - z * z, 2.0 * (x * y - w * z), 2.0 * (x * z + w * y)],
+        [2.0 * (y * x + w * z), w * w - x * x + y * y - z * z, 2.0 * (y * z - w * x)],
+        [2.0 * (z * x - w * y), 2.0 * (z * y + w * x), w * w - x * x - y * y + z * z],
+    ]
+}
+
+/// The principal axes of the centred points `p` (eigenvectors of Σ p pᵀ), largest spread first, as
+/// a right-handed frame: each of the first two signed so the points' third moment along it is
+/// positive (or, when that vanishes, so the first point off its normal plane lies on its + side),
+/// the third their cross product. Deterministic for a given record.
+fn principal_axes(p: &[V3]) -> [V3; 3] {
+    let mut c = [[0.0; 3]; 3];
+    for v in p {
+        for i in 0..3 {
+            for j in 0..3 {
+                c[i][j] += v[i] * v[j];
+            }
+        }
+    }
+    let (val, vec) = jacobi(c);
+    let mut order = [0, 1, 2];
+    order.sort_by(|&a, &b| val[b].total_cmp(&val[a]));
+    let scale = p.iter().map(|v| dot(*v, *v)).sum::<f64>().sqrt().max(1e-300);
+    let mut ax = [[0.0; 3]; 2];
+    for (slot, &k) in order[..2].iter().enumerate() {
+        let a = [vec[0][k], vec[1][k], vec[2][k]];
+        let third: f64 = p.iter().map(|v| dot(*v, a).powi(3)).sum();
+        let sign = if third.abs() > 1e-9 * scale.powi(3) {
+            third.signum()
+        } else {
+            p.iter().map(|v| dot(*v, a)).find(|t| t.abs() > 1e-9 * scale).map_or(1.0, f64::signum)
+        };
+        ax[slot] = a.map(|c| c * sign);
+    }
+    [ax[0], ax[1], cross(ax[0], ax[1])]
+}
+
+/// The eigenvalues and eigenvectors (columns) of a small symmetric matrix, by cyclic Jacobi
+/// rotations.
+fn jacobi<const N: usize>(mut a: [[f64; N]; N]) -> ([f64; N], [[f64; N]; N]) {
+    let mut v = [[0.0; N]; N];
+    for (i, row) in v.iter_mut().enumerate() {
+        row[i] = 1.0;
+    }
+    for _ in 0..100 {
+        let off: f64 = (0..N).flat_map(|i| (i + 1..N).map(move |j| (i, j))).map(|(i, j)| a[i][j] * a[i][j]).sum();
+        let diag: f64 = (0..N).map(|i| a[i][i] * a[i][i]).sum();
+        if off == 0.0 || off <= 1e-32 * diag {
+            break;
+        }
+        for p in 0..N {
+            for q in p + 1..N {
+                if a[p][q] == 0.0 {
+                    continue;
+                }
+                let theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
+                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                let c = 1.0 / (t * t + 1.0).sqrt();
+                let s = t * c;
+                for k in 0..N {
+                    let (kp, kq) = (a[k][p], a[k][q]);
+                    a[k][p] = c * kp - s * kq;
+                    a[k][q] = s * kp + c * kq;
+                }
+                for k in 0..N {
+                    let (pk, qk) = (a[p][k], a[q][k]);
+                    a[p][k] = c * pk - s * qk;
+                    a[q][k] = s * pk + c * qk;
+                }
+                for row in v.iter_mut() {
+                    let (kp, kq) = (row[p], row[q]);
+                    row[p] = c * kp - s * kq;
+                    row[q] = s * kp + c * kq;
+                }
+            }
+        }
+    }
+    (std::array::from_fn(|i| a[i][i]), v)
 }
 
 fn centroid(v: impl Iterator<Item = V3>) -> V3 {
@@ -580,6 +744,217 @@ pub(crate) mod tests {
         // the record as it is still maps
         let right = By(|_: &Drawing, _: &[usize]| Lookup::Found(water.clone(), identity(3)));
         assert!(matches!(shape(&d, &right).sources[0].1, FragmentSource::PubChem { .. }));
+    }
+
+    /// The angle (degrees) at `c` between `a` and `b`.
+    fn angle_at(a: V3, c: V3, b: V3) -> f64 {
+        let (u, v) = ([a[0] - c[0], a[1] - c[1], a[2] - c[2]], [b[0] - c[0], b[1] - c[1], b[2] - c[2]]);
+        let dot = u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+        (dot / (dist(a, c) * dist(b, c))).clamp(-1.0, 1.0).acos().to_degrees()
+    }
+
+    /// `r` drawn at its canvas layout turned by `deg` (canvas coordinates) and shifted by `at`;
+    /// returns the drawn indices in record order.
+    fn draw_turned(d: &mut Drawing, r: &Record, at: [f32; 2], deg: f32, mirror: bool) -> Vec<usize> {
+        let (s, c) = deg.to_radians().sin_cos();
+        let mut t = r.clone();
+        for p in &mut t.xy {
+            let x = if mirror { -p[0] } else { p[0] };
+            *p = [c * x - s * p[1], s * x + c * p[1]];
+        }
+        draw_record(d, &t, at, &identity(t.z.len()))
+    }
+
+    /// The user's hand-test (2026-11-25): water drawn above HF, HF's H pointing at water's O and no
+    /// bond between them (the H₂O···HF hydrogen bond). Each fragment takes its record's shape, turned
+    /// to the drawing, so HF's H still points at the O — not left in PubChem's frame, where F came
+    /// out nearest the O.
+    #[test]
+    fn a_drawn_hydrogen_bond_keeps_its_orientation() {
+        let (w, hf) = (rec("water"), rec("hydrogen fluoride"));
+        let mut d = Drawing::default();
+        // water on top, its Hs pointing up (canvas y points down)
+        let o = d.add_atom(8, [0.0, 0.0]);
+        let h1 = d.add_atom(1, [-0.8, -0.6]);
+        let h2 = d.add_atom(1, [0.8, -0.6]);
+        d.bond(o, h1);
+        d.bond(o, h2);
+        // HF below, H up toward the O
+        let h = d.add_atom(1, [0.0, 1.6]);
+        let f = d.add_atom(9, [0.0, 2.6]);
+        d.bond(h, f);
+        let s = shape(&d, &LocalOnly(Library::shipped()));
+        assert!(matches!(s.sources[0].1, FragmentSource::PubChem { cid: 962, .. }), "{:?}", s.sources);
+        assert!(matches!(s.sources[1].1, FragmentSource::PubChem { cid: 14917, .. }), "{:?}", s.sources);
+        // the records' shapes: a rotation keeps every distance
+        assert_record_shape(&s.positions, &d, &[o, h1, h2], w);
+        assert_record_shape(&s.positions, &d, &[h, f], hf);
+        let x = &s.positions;
+        assert!(dist(x[h], x[o]) < dist(x[f], x[o]), "H···O {} vs F···O {}", dist(x[h], x[o]), dist(x[f], x[o]));
+        let a = angle_at(x[o], x[h], x[f]);
+        assert!(a > 150.0, "O···H–F {a}°");
+        // and the water's Hs still point away from the HF
+        for hw in [h1, h2] {
+            assert!(dist(x[hw], x[f]) > dist(x[o], x[f]), "water H {hw}");
+        }
+    }
+
+    /// A lone matched fragment turned on the canvas comes out turned the same way: the record's C–O
+    /// bond, seen from +z, points where the drawn one does (canvas y down, the scene's y up). Formic
+    /// acid is planar; it is drawn as its record's own shape seen from +z (the shipped canvas layout
+    /// draws the other O–H conformer, which the fit can only meet halfway).
+    #[test]
+    fn a_single_fragment_follows_the_drawing() {
+        let mut fa = rec("formic acid").clone();
+        fa.xy = fa.xyz.iter().map(|p| [(p[0] / 1.3) as f32, (-p[1] / 1.3) as f32]).collect();
+        let fa = &fa;
+        let c = fa.z.iter().position(|&z| z == 6).unwrap();
+        for o in (0..fa.z.len()).filter(|&k| fa.z[k] == 8) {
+            for deg in [0.0f32, 37.0, 90.0, 180.0, 270.0] {
+                let mut d = Drawing::default();
+                let idx = draw_turned(&mut d, fa, [0.0, 0.0], deg, false);
+                let s = shape(&d, &LocalOnly(Library::shipped()));
+                assert!(matches!(s.sources[0].1, FragmentSource::PubChem { .. }));
+                assert_record_shape(&s.positions, &d, &identity(fa.z.len()), fa);
+                let (pc, po) = (d.atoms[idx[c]].pos, d.atoms[idx[o]].pos);
+                let drawn = [(po[0] - pc[0]) as f64, -(po[1] - pc[1]) as f64];
+                let (xc, xo) = (s.positions[idx[c]], s.positions[idx[o]]);
+                let got = [xo[0] - xc[0], xo[1] - xc[1]];
+                let full = dist(xc, xo);
+                let in_plane = got[0].hypot(got[1]);
+                assert!(in_plane > 0.9 * full, "{deg}°: the planar molecule lies in the drawing's plane ({in_plane} of {full})");
+                let turn = (got[1].atan2(got[0]) - drawn[1].atan2(drawn[0])).to_degrees();
+                let turn = (turn + 540.0).rem_euclid(360.0) - 180.0;
+                assert!(turn.abs() < 15.0, "{deg}°, O {o}: C–O off the drawing by {turn}°");
+            }
+        }
+    }
+
+    /// The turn is a proper rotation, never a reflection: a stereo-defined record (L-alanine), drawn
+    /// as laid out and mirrored on the canvas, keeps its chirality — the signed volume of the
+    /// stereocentre's neighbours is the record's.
+    #[test]
+    fn the_fit_is_a_rotation_not_a_reflection() {
+        let ala = rec("L-alanine");
+        assert!(ala.stereo_defined);
+        let n = ala.z.iter().position(|&z| z == 7).unwrap();
+        let neighbours = |k: usize| -> Vec<usize> {
+            let mut v: Vec<usize> = ala.bonds.iter().filter_map(|&(a, b, _)| if a == k { Some(b) } else if b == k { Some(a) } else { None }).collect();
+            v.sort_unstable();
+            v
+        };
+        let ca = neighbours(n).into_iter().find(|&k| ala.z[k] == 6).unwrap();
+        let nb = neighbours(ca);
+        assert_eq!(nb.len(), 4);
+        let vol = |p: &[V3]| {
+            let (a, b, c, e) = (p[0], p[1], p[2], p[3]);
+            let (u, v, w) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]], [e[0] - a[0], e[1] - a[1], e[2] - a[2]]);
+            u[0] * (v[1] * w[2] - v[2] * w[1]) - u[1] * (v[0] * w[2] - v[2] * w[0]) + u[2] * (v[0] * w[1] - v[1] * w[0])
+        };
+        let want = vol(&nb.iter().map(|&k| ala.xyz[k].map(units::angstrom_to_bohr)).collect::<Vec<_>>());
+        assert!(want.abs() > 0.5, "{want}");
+        for mirror in [false, true] {
+            for deg in [0.0f32, 90.0, 200.0] {
+                let mut d = Drawing::default();
+                let idx = draw_turned(&mut d, ala, [0.0, 0.0], deg, mirror);
+                let s = shape(&d, &LocalOnly(Library::shipped()));
+                assert!(matches!(s.sources[0].1, FragmentSource::PubChem { .. }), "{:?}", s.sources);
+                assert_record_shape(&s.positions, &d, &identity(ala.z.len()), ala);
+                let got = vol(&nb.iter().map(|&k| s.positions[idx[k]]).collect::<Vec<_>>());
+                assert!((got - want).abs() < 1e-6, "mirror {mirror}, {deg}°: {got} vs {want}");
+            }
+        }
+    }
+
+    fn det(r: &M3) -> f64 {
+        dot(r[0], cross(r[1], r[2]))
+    }
+
+    fn turn(axis: V3, deg: f64) -> M3 {
+        let n = (dot(axis, axis)).sqrt();
+        let [x, y, z] = axis.map(|c| c / n);
+        let (s, c) = deg.to_radians().sin_cos();
+        let t = 1.0 - c;
+        [[c + x * x * t, x * y * t - z * s, x * z * t + y * s], [y * x * t + z * s, c + y * y * t, y * z * t - x * s], [z * x * t - y * s, z * y * t + x * s, c + z * z * t]]
+    }
+
+    fn centred(v: &[V3]) -> Vec<V3> {
+        let c = centroid(v.iter().copied());
+        v.iter().map(|p| sub(*p, c)).collect()
+    }
+
+    fn close(a: &M3, b: &M3, tol: f64) -> bool {
+        (0..3).all(|i| (0..3).all(|j| (a[i][j] - b[i][j]).abs() < tol))
+    }
+
+    /// A chiral, non-planar cloud with distinct spreads.
+    fn cloud() -> Vec<V3> {
+        centred(&[[0.0, 0.0, 0.0], [2.1, 0.3, -0.2], [-0.4, 1.7, 0.5], [0.6, -0.9, 1.4], [-1.8, -0.6, -0.9]])
+    }
+
+    /// The fit recovers a turn exactly; a mirror image still gets a proper rotation; and the result
+    /// is orthonormal.
+    #[test]
+    fn the_fit_recovers_a_turn_and_never_reflects() {
+        let p = cloud();
+        let axes = principal_axes(&p);
+        assert!((det(&[axes[0], axes[1], axes[2]]) - 1.0).abs() < 1e-12, "a right-handed frame");
+        for (axis, deg) in [([1.0, 2.0, 3.0], 73.0), ([0.0, 0.0, 1.0], 180.0), ([-1.0, 0.5, 0.2], 179.9), ([0.3, 0.1, -1.0], 0.0)] {
+            let r0 = turn(axis, deg);
+            let q: Vec<V3> = p.iter().map(|v| apply(&r0, *v)).collect();
+            let r = fit_rotation(&p, &q, &axes);
+            assert!(close(&r, &r0, 1e-7), "{axis:?} {deg}°: {r:?} vs {r0:?}");
+        }
+        // the mirror image (x → −x): the best proper rotation, not the reflection
+        let q: Vec<V3> = p.iter().map(|v| [-v[0], v[1], v[2]]).collect();
+        let r = fit_rotation(&p, &q, &axes);
+        assert!((det(&r) - 1.0).abs() < 1e-12, "{}", det(&r));
+        for i in 0..3 {
+            for j in 0..3 {
+                let rrt = dot(r[i], r[j]);
+                assert!((rrt - if i == j { 1.0 } else { 0.0 }).abs() < 1e-12);
+            }
+        }
+    }
+
+    /// The degenerate fits (module doc of [`fit_rotation`]): a 2-atom record goes onto the drawn
+    /// line, its sense kept; a flat embedding gives a proper rotation that does not flip when the
+    /// embedding's tiny out-of-plane offsets change sign; a straight-line embedding of a bent record
+    /// is decided the same way every time.
+    #[test]
+    fn degenerate_fits_are_proper_and_stable() {
+        // two atoms: record along z, drawn along (1, 1, 0)
+        let p = vec![[0.0, 0.0, -0.9], [0.0, 0.0, 0.9]];
+        let q = vec![[-0.5, -0.5, 0.0], [0.5, 0.5, 0.0]];
+        let axes = principal_axes(&p);
+        let r = fit_rotation(&p, &q, &axes);
+        assert!((det(&r) - 1.0).abs() < 1e-12);
+        let s = 0.9 / 2f64.sqrt();
+        for (a, want) in p.iter().zip([[-s, -s, 0.0], [s, s, 0.0]]) {
+            let got = apply(&r, *a);
+            assert!((0..3).all(|c| (got[c] - want[c]).abs() < 1e-6), "{got:?} vs {want:?}");
+        }
+        // reversed: the sense follows the mapping
+        let r = fit_rotation(&p, &[q[1], q[0]], &axes);
+        assert!(apply(&r, p[0])[0] > 0.6);
+        // a flat embedding of the chiral cloud, offsets ±1e-6 out of plane
+        let p = cloud();
+        let axes = principal_axes(&p);
+        let flat = |sign: f64| p.iter().enumerate().map(|(i, v)| [v[0], v[1], sign * 1e-6 * (i as f64 - 2.0)]).collect::<Vec<V3>>();
+        let (up, down) = (fit_rotation(&p, &flat(1.0), &axes), fit_rotation(&p, &flat(-1.0), &axes));
+        assert!((det(&up) - 1.0).abs() < 1e-12 && (det(&down) - 1.0).abs() < 1e-12);
+        assert!(close(&up, &down, 1e-4), "{up:?} vs {down:?}");
+        // and exactly flat, its mirror drawn in the plane: still proper
+        let mirrored: Vec<V3> = p.iter().map(|v| [-v[0], v[1], 0.0]).collect();
+        assert!((det(&fit_rotation(&p, &mirrored, &axes)) - 1.0).abs() < 1e-12);
+        // a bent record on a straight line: deterministic, proper, its best direction on the line
+        let line: Vec<V3> = centred(&(0..5).map(|i| [i as f64, 0.0, 0.0]).collect::<Vec<_>>());
+        let (a, b) = (fit_rotation(&p, &line, &axes), fit_rotation(&p, &line, &axes));
+        assert_eq!(a, b);
+        assert!((det(&a) - 1.0).abs() < 1e-12);
+        let w: V3 = p.iter().zip(&line).fold([0.0; 3], |acc, (v, l)| [acc[0] + l[0] * v[0], acc[1] + l[0] * v[1], acc[2] + l[0] * v[2]]);
+        let along = apply(&a, w);
+        assert!(along[0] > 0.999 * dot(w, w).sqrt(), "{along:?}");
     }
 
     /// R10 (a): a matched fragment that the push cannot clear of two lone atoms on either side of it
