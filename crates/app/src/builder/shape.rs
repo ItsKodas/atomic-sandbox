@@ -15,7 +15,7 @@
 //! embedding gives it.
 //!
 //! **Answers are checked** ([`valid_mapping`]): a source's mapping must keep every element and
-//! formal charge and take every drawn bond to a record bond, or the fragment is approximate.
+//! formal charge and take the drawn bonds onto exactly the record's bonds, or the fragment is approximate.
 //!
 //! **Rule 1 (spec §3).** A record only places nuclei here; nothing from it leaves the builder.
 use super::embed::{self, closest};
@@ -173,8 +173,8 @@ fn place_from(d: &Drawing, src: &dyn RecordSource, x0: Vec<V3>) -> (Vec<V3>, Vec
 }
 
 /// `m` is a one-to-one map of `frag` onto `r`'s atoms that keeps every element and formal charge
-/// and takes every drawn bond of the fragment to a record bond (orders may differ: the Kekulé
-/// case, [`iso`]); a drawn bond leaving the fragment fails it. A source's answer is checked here
+/// and takes every drawn bond of the fragment to a record bond, the record having no other
+/// (orders may differ: the Kekulé case, [`iso`]); a drawn bond leaving the fragment fails it. A source's answer is checked here
 /// whatever it claims, so a wrong one is never presented as the database's shape.
 fn valid_mapping(d: &Drawing, frag: &[usize], r: &Record, m: &[usize]) -> bool {
     let n = r.z.len();
@@ -187,11 +187,17 @@ fn valid_mapping(d: &Drawing, frag: &[usize], r: &Record, m: &[usize]) -> bool {
         return false;
     }
     let image = |a: usize| frag.iter().position(|&x| x == a).map(|i| m[i]);
-    d.bonds.iter().all(|b| match (image(b.a), image(b.b)) {
-        (Some(p), Some(q)) => r.bonds.iter().any(|&(u, v, _)| (u, v) == (p, q) || (u, v) == (q, p)),
+    let mut drawn = 0;
+    let bonds_map = d.bonds.iter().all(|b| match (image(b.a), image(b.b)) {
+        (Some(p), Some(q)) => {
+            drawn += 1;
+            r.bonds.iter().any(|&(u, v, _)| (u, v) == (p, q) || (u, v) == (q, p))
+        }
         (None, None) => true,
         _ => false,
-    })
+    });
+    // and the record has no bond the drawing lacks (the map is one-to-one, so equal counts suffice)
+    bonds_map && drawn == r.bonds.len()
 }
 
 /// The fragment's atoms at the record's shape (Bohr), its centroid where the embedding put the
@@ -566,6 +572,11 @@ pub(crate) mod tests {
         rewired.bonds = vec![(0, 1, 1), (1, 2, 1)];
         let wrong_bonds = By(|_: &Drawing, _: &[usize]| Lookup::Found(rewired.clone(), identity(3)));
         assert_eq!(shape(&d, &wrong_bonds).sources[0].1, FragmentSource::Approximate(Why::NotInDatabase));
+        // every drawn bond is there, but the "record" has one more (H–H): a ring the drawing lacks
+        let mut extra = water.clone();
+        extra.bonds.push((1, 2, 1));
+        let extra_bond = By(|_: &Drawing, _: &[usize]| Lookup::Found(extra.clone(), identity(3)));
+        assert_eq!(shape(&d, &extra_bond).sources[0].1, FragmentSource::Approximate(Why::NotInDatabase));
         // the record as it is still maps
         let right = By(|_: &Drawing, _: &[usize]| Lookup::Found(water.clone(), identity(3)));
         assert!(matches!(shape(&d, &right).sources[0].1, FragmentSource::PubChem { .. }));

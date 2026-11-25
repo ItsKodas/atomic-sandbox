@@ -180,6 +180,9 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, acts:
     } else if st.builder.lookup.busy() {
         // the lookups' answers and timeouts arrive without input: keep the frames coming
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    } else if st.builder.lookup.awaiting() {
+        // a timed-out lookup's late answer relabels its fragment when it comes
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
     }
 }
 

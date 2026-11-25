@@ -50,6 +50,10 @@ pub const DEBOUNCE: Duration = Duration::from_secs(1);
 pub const TIMEOUT: Duration = Duration::from_secs(5);
 /// The least time between two requests (PubChem's published limit is 5 a second).
 pub const MIN_INTERVAL: Duration = Duration::from_millis(200);
+/// How long after a lookup was asked the window still repaints for its late answer
+/// ([`Session::awaiting`]): several fragments' lookups queued one behind another, each within
+/// [`TIMEOUT`].
+pub const LATE_WAIT: Duration = Duration::from_secs(60);
 /// PubChem's PUG REST root: every request is under it.
 pub const PUG: &str = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/";
 /// The most CIDs one structure lookup tries.
@@ -263,6 +267,12 @@ pub fn stereo_url(cid: u64) -> String {
     format!("{PUG}compound/cid/{cid}/property/IsomericSMILES/TXT")
 }
 
+/// The same SMILES under PubChem's newer property name (2025), asked when [`stereo_url`] gives
+/// nothing: `…/compound/cid/<cid>/property/SMILES/TXT`.
+pub fn smiles_property_url(cid: u64) -> String {
+    format!("{PUG}compound/cid/{cid}/property/SMILES/TXT")
+}
+
 /// A name's CIDs: `…/compound/name/<name>/cids/TXT`.
 pub fn name_url(name: &str) -> String {
     format!("{PUG}compound/name/{}/cids/TXT", encode(name))
@@ -469,11 +479,17 @@ pub struct Hit {
 // ── the worker ──
 
 /// The worker's requests: through the transport, at most one per [`MIN_INTERVAL`], each within its
-/// lookup's deadline, and none while the network is not allowed (for a transport that reaches it).
+/// lookup's deadline, and none while the network is not allowed (for a transport that reaches it)
+/// or once the lookup being worked on is stale (review fix 1: a newer drawing generation exists, so
+/// the lookup stops between its requests and the queue behind it moves on).
 struct Net {
     t: Box<dyn Transport>,
     clock: Arc<dyn Clock>,
     last: Option<Instant>,
+    /// The newest drawing generation the window has seen ([`Lookups::supersede`]).
+    newest: Arc<AtomicU64>,
+    /// The generation of the lookup being worked on (`u64::MAX` for a search: never stale).
+    job: u64,
 }
 
 impl Net {
@@ -481,8 +497,13 @@ impl Net {
         !self.t.is_network() || network_allowed()
     }
 
+    /// The lookup being worked on is for an older drawing than the window's.
+    fn stale(&self) -> bool {
+        self.job < self.newest.load(Ordering::SeqCst)
+    }
+
     fn get(&mut self, url: &str, deadline: Instant) -> Result<String, NetError> {
-        if !self.reachable() {
+        if !self.reachable() || self.stale() {
             return Err(NetError::Offline);
         }
         if let Some(last) = self.last {
@@ -560,9 +581,20 @@ fn finish(net: &mut Net, mut r: Record, cid: u64, deadline: Instant) -> (Record,
         Err(e) if absent(e) => {}
         Err(_) => complete = false,
     }
-    match net.get(&stereo_url(cid), deadline) {
-        Ok(b) if !b.trim().is_empty() => r.stereo_defined = b.trim().contains(['@', '/', '\\']),
-        _ => complete = false,
+    // the isomeric SMILES, then (minor 1) PubChem's newer name for the same property
+    let stereo = [stereo_url(cid), smiles_property_url(cid)].into_iter().find_map(|url| match net.get(&url, deadline) {
+        Ok(b) if !b.trim().is_empty() => Some(b.trim().contains(['@', '/', '\\'])),
+        _ => None,
+    });
+    match stereo {
+        Some(s) => r.stereo_defined = s,
+        None => {
+            complete = false;
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::SeqCst) {
+                eprintln!("builder: PubChem gave no SMILES for CID {cid} (IsomericSMILES nor SMILES); its shape is taken as stereo-specific");
+            }
+        }
     }
     (r, complete)
 }
@@ -672,7 +704,9 @@ enum Job {
 type Answer = (u64, Vec<usize>, Lookup);
 
 /// The lookup thread (module doc): requests keyed by (drawing generation, fragment), answered in
-/// order; a request already older than the newest generation asked for is skipped unanswered.
+/// order. A lookup older than the newest generation (asked for, or announced by
+/// [`Lookups::supersede`]) is skipped unanswered, and one running when a newer generation comes
+/// stops before its next request, also unanswered.
 pub struct Lookups {
     jobs: mpsc::Sender<Job>,
     answers: mpsc::Receiver<Answer>,
@@ -693,23 +727,29 @@ impl Lookups {
         let (hit_tx, hits) = mpsc::channel();
         let (latest, searches) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
         let network = t.is_network();
-        let (newest, newest_search) = (latest.clone(), searches.clone());
-        let mut net = Net { t, clock, last: None };
+        let newest_search = searches.clone();
+        let mut net = Net { t, clock, last: None, newest: latest.clone(), job: 0 };
         // without a thread every request goes unanswered, and the session's timeout makes it offline
         let _ = std::thread::Builder::new().name("builder-lookups".into()).spawn(move || {
             for job in job_rx.iter() {
                 let sent = match job {
                     Job::Lookup { generation, drawing, frag } => {
-                        if generation < newest.load(Ordering::SeqCst) {
+                        net.job = generation;
+                        if net.stale() {
                             continue;
                         }
                         let answer = resolve(&mut net, &cache, &drawing, &frag);
+                        // a lookup that went stale while it ran stopped early: its answer is not one
+                        if net.stale() {
+                            continue;
+                        }
                         answer_tx.send((generation, frag, answer)).is_ok()
                     }
                     Job::Search { id, query } => {
                         if id < newest_search.load(Ordering::SeqCst) {
                             continue;
                         }
+                        net.job = u64::MAX;
                         hit_tx.send((id, search(&mut net, &cache, &query))).is_ok()
                     }
                 };
@@ -725,6 +765,12 @@ impl Lookups {
     pub fn request(&self, generation: u64, d: &Drawing, frag: &[usize]) {
         self.latest.fetch_max(generation, Ordering::SeqCst);
         let _ = self.jobs.send(Job::Lookup { generation, drawing: d.clone(), frag: frag.to_vec() });
+    }
+
+    /// The window's drawing is now at `generation`: lookups for older ones stop (between requests)
+    /// or are skipped, so the new drawing's do not wait behind them.
+    pub fn supersede(&self, generation: u64) {
+        self.latest.fetch_max(generation, Ordering::SeqCst);
     }
 
     /// The answers that arrived (never blocks).
@@ -855,10 +901,13 @@ impl Session {
     }
 
     /// Brings the answers up to date for drawing `d` with the online setting `enabled`: a new
-    /// generation when the graph (or the setting) changed, this generation's answers taken in (older
-    /// ones dropped), each unknown fragment asked for once the graph has been still for
-    /// [`DEBOUNCE`], and one unanswered after [`TIMEOUT`] marked offline. Without the setting or the
-    /// network every unknown fragment is offline at once, and nothing is asked.
+    /// generation when the graph (or the setting) changed (announced to the lookup thread, whose
+    /// older lookups then stop), this generation's answers taken in (older ones dropped), each
+    /// unknown fragment asked for once the graph has been still for [`DEBOUNCE`], and one
+    /// unanswered after [`TIMEOUT`] marked offline — Insert need not wait longer — until its answer
+    /// comes after all (it may have queued behind another fragment's lookup), which then relabels
+    /// it. Without the setting or the network every unknown fragment is offline at once, and
+    /// nothing is asked.
     pub fn tick(&mut self, d: &Drawing, enabled: bool) {
         self.ensure();
         let now = self.clock.now();
@@ -874,13 +923,17 @@ impl Session {
             let none = HashMap::new();
             let here = Layered { lib: Library::shipped(), cache: self.cache.as_ref(), results: &none };
             self.local = iso::fragments(d).into_iter().filter(|f| f.len() >= 2).map(|f| (here.find(d, &f).is_found(), f)).map(|(k, f)| (f, k)).collect();
+            if let Some(l) = &self.lookups {
+                l.supersede(self.generation);
+            }
         }
         let mut answers = std::mem::take(&mut self.inbox);
         if let Some(l) = &self.lookups {
             answers.extend(l.poll());
         }
         for (generation, frag, answer) in answers {
-            // an answer for an older drawing, or one that came after its timeout, is dropped
+            // an answer for an older drawing is dropped; one for this drawing is taken even after
+            // its timeout marked the fragment offline (review fix 1)
             if generation == self.generation && self.requested.remove(&frag).is_some() {
                 self.results.insert(frag, answer);
                 self.version += 1;
@@ -898,7 +951,7 @@ impl Session {
                 if now.saturating_duration_since(at) < TIMEOUT {
                     continue;
                 }
-                self.requested.remove(frag);
+                // still `requested`: a late answer relabels it
                 Lookup::Offline
             } else {
                 if due {
@@ -922,6 +975,13 @@ impl Session {
     /// A fragment is waiting for PubChem (or for the debounce): the window keeps repainting.
     pub fn busy(&self) -> bool {
         self.results.values().any(|r| *r == Lookup::Pending)
+    }
+
+    /// A timed-out fragment's answer may still come (it was queued behind another lookup): the
+    /// window keeps repainting, more slowly, for up to [`LATE_WAIT`] after it was asked.
+    pub fn awaiting(&self) -> bool {
+        let now = self.clock.now();
+        self.requested.values().any(|&at| now.saturating_duration_since(at) < LATE_WAIT)
     }
 
     /// The record source for the drawing [`Session::tick`] last saw.
@@ -1323,6 +1383,7 @@ pub(crate) mod tests {
         assert_eq!(smiles_url("[CH]#[N]"), "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/%5BCH%5D%23%5BN%5D/cids/TXT");
         assert_eq!(smiles_url("[NH4+]"), "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/%5BNH4%2B%5D/cids/TXT");
         assert_eq!(sdf_url(6324, "3d"), "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/6324/SDF?record_type=3d");
+        assert_eq!(smiles_property_url(6324), "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/6324/property/SMILES/TXT");
         assert_eq!(sdf_url(6324, "2d"), "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/6324/SDF?record_type=2d");
         assert_eq!(title_url(6324), "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/6324/property/Title/TXT");
         assert_eq!(stereo_url(6324), "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/6324/property/IsomericSMILES/TXT");
@@ -1460,7 +1521,8 @@ pub(crate) mod tests {
     fn a_late_answer_for_an_old_drawing_is_dropped() {
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let clock = ManualClock::new();
-        let l = Lookups::with_clock(Box::new(Gate { inner: Canned::new(ethane_answers("CC")), open: gate.clone() }), Cache::none(), clock.clone());
+        let canned = Canned::new(ethane_answers("CC"));
+        let l = Lookups::with_clock(Box::new(Gate { inner: canned.clone(), open: gate.clone() }), Cache::none(), clock.clone());
         let mut s = Session::with(l, Cache::none(), clock.clone());
         let d1 = ethane(false);
         s.tick(&d1, true);
@@ -1471,18 +1533,102 @@ pub(crate) mod tests {
         d2.cycle_order(0);
         s.tick(&d2, true);
         assert_eq!(s.generation(), 2);
-        open_gate(&gate);
-        assert!(s.wait_reply(WAIT), "generation 1's answer arrives");
+        // a generation-1 answer the worker sent just before the change: dropped on arrival
+        let plain = Lookups::with_clock(Box::new(Canned::new(ethane_answers("CC"))), Cache::none(), ManualClock::new());
+        plain.request(1, &d1, &all(&d1));
+        let early = plain.wait(WAIT);
+        assert!(matches!(early[0].2, Lookup::Found(..)));
+        s.inbox.extend(early);
         s.tick(&d2, true);
         let shaped = shape(&d2, &s.layered());
         assert_eq!(footer_label(&shaped), "looking up online…", "generation 2 is still waiting for its own");
         assert_eq!(shaped.positions, super::super::embed::embed(&d2), "placed as the embedding, not as ethane");
         assert!(s.layered().results.values().all(|r| *r == Lookup::Pending));
+        // the generation-1 lookup still running stops before its next request (review fix 1): it
+        // sends no answer, and generation 2's lookup, queued behind it, is answered next
+        open_gate(&gate);
+        clock.advance(DEBOUNCE);
+        s.tick(&d2, true);
+        assert!(s.wait_reply(WAIT));
+        assert!(s.inbox.iter().all(|a| a.0 == 2), "{:?}", s.inbox.iter().map(|a| a.0).collect::<Vec<_>>());
+        s.tick(&d2, true);
+        assert_eq!(footer_label(&shape(&d2, &s.layered())), "shape: approximate (not in the database) — Relax after recommended");
+        // (generation 1's lookup was at the gate with its first request, or skipped before it if the
+        // thread had not reached it yet: either way it went no further)
+        let urls = canned.log.lock().unwrap().clone();
+        assert!(!urls.contains(&sdf_url(6324, "3d")), "{urls:?}");
+        assert!(urls.iter().filter(|u| **u == smiles_url("[CH3][CH3]")).count() <= 1, "{urls:?}");
+        assert_eq!(urls.last(), Some(&smiles_url(&smiles(&d2, &all(&d2)))));
         // a moved atom is the same graph: no new generation
         let mut moved = d2.clone();
         moved.atoms[0].pos = [5.0, 5.0];
         s.tick(&moved, true);
         assert_eq!(s.generation(), 2);
+    }
+
+    /// Review fix 1: lookups queue one behind another, so a fragment can pass its 5 s while still
+    /// waiting its turn. It reads offline then (Insert need not wait longer), and its answer, when
+    /// it comes for the same drawing, relabels it.
+    #[test]
+    fn a_queued_fragment_past_its_timeout_is_relabelled() {
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        // the window's clock runs on; the worker's (its lookups' own deadlines) does not, as when
+        // a lookup sits queued while the one before it takes its time
+        let (clock, worker_clock) = (ManualClock::new(), ManualClock::new());
+        let l = Lookups::with_clock(Box::new(Gate { inner: Canned::new(ethane_answers("CC")), open: gate.clone() }), Cache::none(), worker_clock);
+        let mut s = Session::with(l, Cache::none(), clock.clone());
+        // two ethanes: two unknown fragments, two lookups
+        let mut d = ethane(false);
+        let second = ethane(true);
+        let n = d.atoms.len();
+        for a in &second.atoms {
+            let i = d.add_atom(a.z, [a.pos[0] + 6.0, a.pos[1]]);
+            d.atoms[i].charge = a.charge;
+        }
+        for b in &second.bonds {
+            d.bond(n + b.a, n + b.b);
+        }
+        assert_eq!(iso::fragments(&d).len(), 2);
+        s.tick(&d, true);
+        clock.advance(DEBOUNCE);
+        s.tick(&d, true);
+        assert_eq!(footer_label(&shape(&d, &s.layered())), "shape: 2 approximate · looking up online…");
+        clock.advance(TIMEOUT);
+        s.tick(&d, true);
+        assert_eq!(footer_label(&shape(&d, &s.layered())), "shape: 2 approximate");
+        assert!(!s.busy() && s.awaiting(), "Insert is free; the window still repaints for the answers");
+        open_gate(&gate);
+        while s.inbox.len() < 2 {
+            assert!(s.wait_reply(WAIT), "both answers come");
+        }
+        s.tick(&d, true);
+        assert_eq!(footer_label(&shape(&d, &s.layered())), "shape: 2 from PubChem");
+        assert!(!s.awaiting());
+        // an hour on, nothing asked is left to wait for
+        clock.advance(LATE_WAIT);
+        assert!(!s.awaiting());
+    }
+
+    /// Minor 1: without an answer for `IsomericSMILES`, PubChem's newer `SMILES` property gives the
+    /// stereo flag; with neither, the record is taken as stereo-specific and not cached.
+    #[test]
+    fn the_stereo_flag_falls_back_to_the_smiles_property() {
+        let d = ethane(false);
+        for (newer, stereo, kept) in [(Some("C[C@H]stand-in"), true, 1), (Some("CC"), false, 1), (None, true, 0)] {
+            let dir = temp_dir(&format!("stereo-fallback-{kept}-{stereo}"));
+            let mut answers = ethane_answers("unused");
+            answers.remove(&stereo_url(6324));
+            if let Some(v) = newer {
+                answers.insert(smiles_property_url(6324), Ok(format!("{v}\n")));
+            }
+            let l = Lookups::with_clock(Box::new(Canned::new(answers)), Cache::open(dir.clone()), ManualClock::new());
+            l.request(1, &d, &all(&d));
+            let got = l.wait(WAIT);
+            let Lookup::Found(r, _) = &got[0].2 else { panic!("{:?}", got[0].2) };
+            assert_eq!(r.stereo_defined, stereo, "{newer:?}");
+            assert_eq!(Cache::open(dir.clone()).find(&("C2H6".into(), 0)).len(), kept, "only a whole record is kept");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
