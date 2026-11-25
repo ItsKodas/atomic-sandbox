@@ -214,7 +214,7 @@ The 2D drawing carries no stereo, so the SMILES has none either.
   - A drawing change cancels the pending result: it is ignored on arrival.
   - Timeout: **5 s** per lookup. On timeout or a network error, the fragment falls back with `approximate (offline)`.
 - **When it runs:**
-  - **Search:** only on the user's search, when the shipped list and cache have fewer than the wanted matches.
+  - **Search:** only on the user's search. The "Search PubChem" row is offered unless the shipped list or cache has an exact name or CID match (Task 5 review, coordinator ruling R12). The combined list stays at 8 or fewer, and PubChem rows replace the lowest-ranked local rows.
   - **Drawn fragments:** on a drawn fragment that the shipped list and cache don't know, once the drawing has been unchanged for **1 s**, so Insert usually finds the answer ready.
   - **Insert during a lookup:** the button reads "Insert (looking up…)" and is disabled until the lookup ends or times out (≤ 5 s).
 - **Setting:** "Look up molecules online (PubChem)" in the builder's palette column, default **on**. Its tooltip says what is sent: the molecule's name or structure string, to NCBI's PubChem. Off means no network traffic at all. The setting is display-only (`UiState`, persisted like other display settings), not an `Action`.
