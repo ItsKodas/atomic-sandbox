@@ -273,9 +273,11 @@ impl SurrogateKs {
         // the copy's first stage is not reset by it
         fork.stage_probe = self.probe.clone();
         let species = self.store_species();
+        // a pass's end fit due: this refit is it (`complete_pass_tail` at the install)
+        let pass_fit = std::mem::take(&mut self.pass_fit_due) && self.pass_tail.is_some();
         let probe = self.probe.clone();
         if let Some(p) = &probe {
-            p.begin_refit(self.samples(), species, true);
+            p.begin_refit(self.samples(), species, true, self.refit_cause(pass_fit));
         }
         let handle = std::thread::Builder::new()
             .name("surrogate-refit".into())
@@ -288,10 +290,21 @@ impl SurrogateKs {
                 (Box::new(fork), r, t0.elapsed().as_secs_f64())
             })
             .expect("spawn the background refit");
-        // a pass's end fit due: this refit is it (`complete_pass_tail` at the install)
-        let pass_fit = std::mem::take(&mut self.pass_fit_due) && self.pass_tail.is_some();
         self.background = Some(BackgroundRefit { handle: Some(handle), snap, cancel, probe, user_codes: BTreeMap::new(), species, pass_fit });
         true
+    }
+
+    /// Why a refit starting now runs (`sim::RefitCause`, published on the probe; display only): the
+    /// first fit while no model stands, a pass's end fit (`pass_fit`), else a background refit —
+    /// the worker raises the one the user asked for (`ActivityProbe::ask_refit_cause`).
+    pub(super) fn refit_cause(&self, pass_fit: bool) -> sim::RefitCause {
+        if self.model.is_none() {
+            sim::RefitCause::First
+        } else if pass_fit {
+            sim::RefitCause::AfterPass
+        } else {
+            sim::RefitCause::Background
+        }
     }
 
     /// The live state a background refit starting now would start from (its [`Snapshot`]).

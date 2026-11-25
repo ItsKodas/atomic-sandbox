@@ -1715,6 +1715,10 @@ pub struct SurrogateKs {
     pass_fit_due: bool,
     /// That pass's tail, completed when its fit lands (`complete_pass_tail`).
     pass_tail: Option<PassTail>,
+    /// The next in-place [`refit`](SurrogateKs::refit) is a pass's end fit (`finish_pass` without
+    /// `fits_in_background`, `Trainable::refit` with a pass's tail waiting): taken by it, for the
+    /// cause it publishes (`refit_cause`; display only).
+    refit_after_pass: bool,
     /// An attach left its first fit to the worker (`fits_in_background`): until a model forms
     /// (or `forget` clears it), [`first_fit_ready`](SurrogateKs::first_fit_ready) may say so. Only
     /// an attach sets it — a no-model session's kept fallback samples still wait for a pass
@@ -2232,6 +2236,7 @@ impl SurrogateKs {
             fits_in_background: false,
             pass_fit_due: false,
             pass_tail: None,
+            refit_after_pass: false,
             first_fit_due: false,
             pending_jump: None,
             last: None,
@@ -3855,6 +3860,7 @@ impl SurrogateKs {
             self.pass_fit_due = true;
             self.arm_refit();
         } else {
+            self.refit_after_pass = true;
             let r = SurrogateKs::refit(self);
             self.complete_pass_tail(tail, PassFit::Fitted(r));
         }
@@ -4365,6 +4371,8 @@ impl Trainable for SurrogateKs {
     }
 
     fn refit(&mut self) -> Result<String, String> {
+        // a pass's tail waiting for this fit: it is the pass's end fit (the refit's cause)
+        self.refit_after_pass = self.pass_tail.is_some();
         let r = SurrogateKs::refit(self);
         // a pass's tail waiting for its fit (a caller that refits in place after all): this is it
         if let Some(tail) = self.pass_tail.take() {

@@ -8801,6 +8801,61 @@ fn pass_with_fit_waiting(s: &mut SurrogateKs, seed: u64) {
     assert!(s.pass_tail.is_some() && Trainable::first_fit_ready(s), "the pass's fit waits");
 }
 
+/// Spec 2026-11-25 (the refit picture after a pass and on Refit now): where a refit starts sets its
+/// cause on the probe — the first fit with no model is `First`; a pass's end fit is `AfterPass`, in
+/// the background (the app's worker) and in place; a refit nobody asked for (a sample kept during
+/// play) is `Background`; and the cause the worker asks for (Refit now) is taken by the refit it
+/// starts. Display only.
+#[test]
+fn each_refit_publishes_its_cause_where_it_starts() {
+    use sim::RefitCause;
+    let probe = sim::ActivityProbe::new();
+    // the first fit: no model stands
+    let (mut s, _h) = gap_blocked(2.0, 3.6);
+    let mut first = SurrogateKs::new(Box::new(Shared::new(MorseDimer::h2())), FallbackPolicy { audit_every: 0, ..FallbackPolicy::default() }).with_teacher_tol(1e-6).with_probe(probe.clone());
+    first.set_reference_energy(1, MorseDimer::h2().e_atom);
+    let mut rng = StdRng::seed_from_u64(4);
+    for i in 0..60 {
+        let sc = in_big_cell(dimer(1.1 + 0.9 * i as f64 / 59.0, unit_vector(&mut rng), [0.0; 3], 1, 1));
+        first.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    }
+    first.refit().unwrap();
+    assert_eq!(probe.last_refit_cause(), RefitCause::First);
+    // a pass's end fit in the background: AfterPass while it runs
+    s.probe = Some(probe.clone());
+    pass_with_fit_waiting(&mut s, 12);
+    assert!(s.begin_background_refit());
+    assert_eq!(probe.view().refit.map(|v| v.cause), Some(RefitCause::AfterPass));
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Installed(Ok(_))));
+    assert!(probe.view().refit.is_none());
+    // a sample kept during play, refitted in the background: Background
+    let sc = in_big_cell(dimer(1.7, [0.0, 1.0, 0.0], [0.0; 3], 1, 1));
+    s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    assert!(s.begin_background_refit());
+    assert_eq!(probe.view().refit.map(|v| v.cause), Some(RefitCause::Background));
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Installed(Ok(_))));
+    // the refit Refit now starts (the worker asks before it begins one): Requested
+    let sc = in_big_cell(dimer(1.8, [0.0, 0.0, 1.0], [0.0; 3], 1, 1));
+    s.add_sample(morse_sample(&MorseDimer::h2(), &sc), &sc).unwrap();
+    probe.ask_refit_cause(RefitCause::Requested);
+    assert!(Trainable::begin_refit_background(&mut s));
+    assert_eq!(probe.view().refit.map(|v| v.cause), Some(RefitCause::Requested));
+    assert!(matches!(s.finish_background_refit(), BackgroundPoll::Installed(Ok(_))));
+    // a pass's end fit in place (no `fits_in_background`): AfterPass; a plain refit after it: Background
+    Trainable::set_fits_in_background(&mut s, false);
+    let scene = in_big_cell(h2(1.6));
+    let prov = s.provenance_for(&scene);
+    let mut refs = sim::AtomReferences::default();
+    refs.seed_energy(crate::sampling::atom_key(&prov, 1), MorseDimer::h2().e_atom, None, prov.tol, &prov.teacher);
+    let refits = probe.view().refits;
+    Trainable::start_pass(&mut s, &scene, &SamplingPlan { perturbations: 4, hot_burst_steps: 0, scan_points_per_pair: 0, seed: 13, ..SamplingPlan::default() }, &mut refs).unwrap();
+    while Trainable::pass_step(&mut s, &mut never()).unwrap().is_some() {}
+    assert!(probe.view().refits > refits, "the pass fitted in place");
+    assert_eq!(probe.last_refit_cause(), RefitCause::AfterPass);
+    s.refit().unwrap();
+    assert_eq!(probe.last_refit_cause(), RefitCause::Background);
+}
+
 /// Quiet refits round 3 (review I1): a teach-around round whose fit still waits when a second
 /// round starts is completed as not landed **before** the new round touches the teaching state —
 /// its round is not counted (as a cancelled one), nothing is judged against the standing model (it

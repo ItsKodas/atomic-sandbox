@@ -13,7 +13,7 @@ use crate::refit_eta::{self, RefitEstimate, RefitEta, RefitRecord, RefitStage, R
 use crate::refit_live::{OtherPass, RefitLive, RefitMeter};
 use crate::AuditVerdict;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -139,6 +139,10 @@ pub struct ActivityProbe {
     /// The refit in flight's species count and where it runs (`begin_refit`).
     refit_species: AtomicU32,
     refit_background: AtomicBool,
+    /// The refit in flight's cause ([`RefitCause`], by rank), and the one a caller asked the next
+    /// refit to take at least (`ask_refit_cause`; taken by `begin_refit`).
+    refit_cause: AtomicU8,
+    refit_cause_asked: AtomicU8,
     /// The refit in flight's stages (`refit_stage`): fits and leave-one-out passes started, the
     /// trust recovery entered, and when the latest stage started (µs since `origin`).
     refit_fits: AtomicU32,
@@ -312,6 +316,62 @@ pub struct RefitView {
     pub eta: RefitEta,
     /// What it is doing now, stage by stage (the refit picture, [`crate::refit_live`]).
     pub live: RefitLive,
+    /// Why it runs: who started it ([`RefitCause`]; the refit picture's rule).
+    pub cause: RefitCause,
+}
+
+/// Why a refit runs — who started it (spec `2026-11-25-refit-picture-more-design.md`): set where
+/// the refit is started ([`ActivityProbe::begin_refit`], with the cause a caller asked for,
+/// [`ActivityProbe::ask_refit_cause`]) and published with its view ([`RefitView::cause`]). Display
+/// only: the view's full refit picture shows for every cause but [`Background`](Self::Background)
+/// (`app::ui::refit_picture::in_view`); nothing about the fit reads it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RefitCause {
+    /// No fitted model stands: the first fit.
+    First,
+    /// The refit a sampling ("training") pass starts when it ends.
+    AfterPass,
+    /// The refit the user asked for (Refit now).
+    Requested,
+    /// Every other refit: mid-pass, during play, a Forget / Restore's delayed refit.
+    #[default]
+    Background,
+}
+
+impl RefitCause {
+    /// How visible a cause is: a refit that merges several requests takes the most visible
+    /// ([`merge`](Self::merge)): First > Requested > AfterPass > Background.
+    fn rank(self) -> u8 {
+        match self {
+            RefitCause::Background => 0,
+            RefitCause::AfterPass => 1,
+            RefitCause::Requested => 2,
+            RefitCause::First => 3,
+        }
+    }
+
+    fn from_rank(r: u8) -> RefitCause {
+        match r {
+            1 => RefitCause::AfterPass,
+            2 => RefitCause::Requested,
+            3 => RefitCause::First,
+            _ => RefitCause::Background,
+        }
+    }
+
+    /// The more visible of the two (a refit that merges both requests).
+    pub fn merge(self, other: RefitCause) -> RefitCause {
+        if other.rank() > self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+
+    /// The view has the full refit picture for this cause (everything but a background refit).
+    pub fn shows_picture(self) -> bool {
+        self != RefitCause::Background
+    }
 }
 
 impl ActivityProbe {
@@ -324,6 +384,8 @@ impl ActivityProbe {
             refit_samples: AtomicU32::new(0),
             refit_species: AtomicU32::new(0),
             refit_background: AtomicBool::new(false),
+            refit_cause: AtomicU8::new(RefitCause::Background.rank()),
+            refit_cause_asked: AtomicU8::new(RefitCause::Background.rank()),
             refit_fits: AtomicU32::new(0),
             refit_loo: AtomicU32::new(0),
             refit_recovery: AtomicBool::new(false),
@@ -415,8 +477,13 @@ impl ActivityProbe {
     }
 
     /// A refit of `samples` samples of `species` species starts, on its own thread when
-    /// `background`; its stages start at none.
-    pub fn begin_refit(&self, samples: usize, species: usize, background: bool) {
+    /// `background`, for `cause` — or the cause a caller asked for ([`ask_refit_cause`], taken
+    /// here), whichever is more visible ([`RefitCause::merge`]); its stages start at none.
+    ///
+    /// [`ask_refit_cause`]: Self::ask_refit_cause
+    pub fn begin_refit(&self, samples: usize, species: usize, background: bool, cause: RefitCause) {
+        let asked = RefitCause::from_rank(self.refit_cause_asked.swap(RefitCause::Background.rank(), Relaxed));
+        self.refit_cause.store(cause.merge(asked).rank(), Relaxed);
         self.refit_samples.store(samples.min(u32::MAX as usize) as u32, Relaxed);
         self.refit_species.store(species.min(u32::MAX as usize) as u32, Relaxed);
         self.refit_background.store(background, Relaxed);
@@ -427,6 +494,14 @@ impl ActivityProbe {
         self.refit_live.begin(now);
         self.refit_stage_us.store(now, Relaxed);
         self.refit_started_us.store(now, Relaxed);
+    }
+
+    /// The next refit to begin ([`begin_refit`](Self::begin_refit)) takes at least `cause`: the
+    /// app's worker, before it starts the refit the user asked for (Refit now), which the provider
+    /// begins without knowing why. `Background` withdraws the request (no refit began after all).
+    /// Display only.
+    pub fn ask_refit_cause(&self, cause: RefitCause) {
+        self.refit_cause_asked.store(cause.rank(), Relaxed);
     }
 
     /// The refit picture's counters ([`crate::refit_live`]; display only): `n` more samples of a
@@ -475,6 +550,11 @@ impl ActivityProbe {
     /// checked yet). Read once per frame.
     pub fn refit_ratios(&self, out: &mut Vec<f32>) {
         self.refit_live.ratios_into(out);
+    }
+
+    /// The running or last refit's cause (`view().refit` has it only while one runs: tests).
+    pub fn last_refit_cause(&self) -> RefitCause {
+        RefitCause::from_rank(self.refit_cause.load(Relaxed))
     }
 
     /// The running or last refit's stage counters (`view().refit` has them only while one runs:
@@ -572,6 +652,7 @@ impl ActivityProbe {
                 estimate,
                 eta: refit_eta::eta(elapsed_s, estimate.as_ref(), &stages),
                 live: self.refit_live.view(now),
+                cause: RefitCause::from_rank(self.refit_cause.load(Relaxed)),
             }
         });
         ProbeView {
@@ -1205,12 +1286,50 @@ mod tests {
     fn the_refit_phase_is_reported_with_its_sample_count() {
         let p = ActivityProbe::new();
         assert_eq!((p.view().refit, p.view().refits), (None, 0));
-        p.begin_refit(250, 2, true);
+        p.begin_refit(250, 2, true, RefitCause::Background);
         let v = p.view().refit.unwrap();
         assert!(v.elapsed_s >= 0.0 && (v.samples, v.species, v.background) == (250, 2, true));
         assert_eq!(p.view().refits, 0, "counted when it ends");
         p.end_refit();
         assert_eq!((p.view().refit, p.view().refits), (None, 1));
+    }
+
+    /// Spec 2026-11-25 (the refit picture after a pass and on Refit now): the cause rides the
+    /// refit's view; a cause a caller asked for is taken by the next refit that begins — the more
+    /// visible of the two — and only by it; Background withdraws the request.
+    #[test]
+    fn the_refit_cause_is_published_and_an_asked_cause_is_taken_once() {
+        let p = ActivityProbe::new();
+        p.begin_refit(10, 1, true, RefitCause::AfterPass);
+        assert_eq!(p.view().refit.unwrap().cause, RefitCause::AfterPass);
+        p.end_refit();
+        assert_eq!(p.last_refit_cause(), RefitCause::AfterPass, "readable after it ends");
+        // Refit now: the worker asks, the provider begins a plain background refit
+        p.ask_refit_cause(RefitCause::Requested);
+        p.begin_refit(10, 1, true, RefitCause::Background);
+        assert_eq!(p.view().refit.unwrap().cause, RefitCause::Requested);
+        p.end_refit();
+        p.begin_refit(10, 1, true, RefitCause::Background);
+        assert_eq!(p.view().refit.unwrap().cause, RefitCause::Background, "taken once");
+        p.end_refit();
+        // a pass's end fit the user also asked for: the most visible
+        p.ask_refit_cause(RefitCause::Requested);
+        p.begin_refit(10, 1, true, RefitCause::AfterPass);
+        assert_eq!(p.view().refit.unwrap().cause, RefitCause::Requested);
+        p.end_refit();
+        p.ask_refit_cause(RefitCause::Requested);
+        p.begin_refit(10, 1, true, RefitCause::First);
+        assert_eq!(p.view().refit.unwrap().cause, RefitCause::First, "a first fit stays the first fit");
+        p.end_refit();
+        // withdrawn: no refit began after the ask
+        p.ask_refit_cause(RefitCause::Requested);
+        p.ask_refit_cause(RefitCause::Background);
+        p.begin_refit(10, 1, true, RefitCause::Background);
+        assert_eq!(p.view().refit.unwrap().cause, RefitCause::Background);
+        // the merge order and the picture's set
+        use RefitCause::*;
+        assert_eq!([Background.merge(AfterPass), AfterPass.merge(Requested), Requested.merge(AfterPass), Requested.merge(Background)], [AfterPass, Requested, Requested, Requested]);
+        assert_eq!([First, AfterPass, Requested, Background].map(RefitCause::shows_picture), [true, true, true, false]);
     }
 
     /// The stages are published while a refit runs (ignored outside one, restarted by the next),
@@ -1220,7 +1339,7 @@ mod tests {
         use crate::refit_eta::RefitKind;
         let p = ActivityProbe::new();
         p.refit_stage(RefitStage::Fit);
-        p.begin_refit(2000, 3, false);
+        p.begin_refit(2000, 3, false, RefitCause::Background);
         let v = p.view().refit.unwrap();
         assert_eq!((v.stages.fits, v.stages.loo, v.stages.recovery), (0, 0, false), "a stage outside a refit is not counted");
         assert_eq!((v.estimate, v.eta), (None, RefitEta::Estimating));
@@ -1234,7 +1353,7 @@ mod tests {
         let rec = RefitRecord { at_unix_s: 0, wall_s: 120.0, samples: 1000, species: 3, background: true, kind: RefitKind::Recovery, fits: 8, loo: 3 };
         assert_eq!(p.record_refit(rec), vec![rec]);
         assert_eq!(p.refit_history(), vec![rec]);
-        p.begin_refit(2000, 3, true);
+        p.begin_refit(2000, 3, true, RefitCause::Background);
         let v = p.view().refit.unwrap();
         assert_eq!((v.stages.fits, v.stages.loo, v.stages.recovery), (0, 0, false), "restarted");
         let e = v.estimate.unwrap();
@@ -1249,7 +1368,7 @@ mod tests {
     fn the_live_stage_counters_are_published_and_restarted() {
         use crate::refit_live::LiveStage;
         let p = ActivityProbe::new();
-        p.begin_refit(10, 2, true);
+        p.begin_refit(10, 2, true, RefitCause::Background);
         assert_eq!(p.view().refit.unwrap().live.stage, LiveStage::Starting);
         p.refit_mix(true);
         p.refit_described(4, 10);
@@ -1273,7 +1392,7 @@ mod tests {
         p.refit_other(OtherPass::ActiveSet);
         assert_eq!(p.view().refit.unwrap().live.stage, LiveStage::Other(OtherPass::ActiveSet));
         p.end_refit();
-        p.begin_refit(10, 2, true);
+        p.begin_refit(10, 2, true, RefitCause::Background);
         let l = p.view().refit.unwrap().live;
         assert_eq!((l.stage, l.trust, l.done), (LiveStage::Starting, None, 0));
     }
