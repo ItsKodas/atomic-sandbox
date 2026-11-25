@@ -26,7 +26,7 @@ pub mod thermostat;
 pub use refit_eta::{RefitEstimate, RefitEta, RefitKind, RefitRecord, RefitStage, RefitStages};
 pub use refit_live::{LiveStage, OtherPass, RefitLive, TrustRound};
 pub use activity::{ActivityProbe, DisplayJob, DisplaySolve, ProbeView, RefitView, ScfEnd, ScfIteration, ScfLive, Slot, SolveCounts, TeachBuffer, TeachEvent, TrainingViews};
-pub use dynamics::{DynCommand, DynSnapshot, Dynamics, ReferenceProgress, SideDensity, SkipRequest, SkipThen, Walls, HARRIS_SAME_GEOMETRY, NOTHING_TO_SKIP};
+pub use dynamics::{DynCommand, DynSnapshot, Dynamics, ReferenceProgress, SideDensity, SkipRequest, SkipThen, Walls, HARRIS_SAME_GEOMETRY, NOTHING_TO_SKIP, NOTHING_TO_SKIP_REFRESH};
 pub use integrator::{Integrator, StepStats};
 pub use knowledge::{atom_coverage, Confidence, ElementKnowledge, KnowledgeMap, PairKnowledge};
 pub use relax::{Fire, FireOutcome, FireParams, FireStep, RelaxProgress, F_TOL};

@@ -3399,29 +3399,52 @@ fn adding_or_removing_a_nucleus_drops_the_train_mask() {
 // ---- skipping the running solve (skip-solve plan Task 1; module doc, "Skipping a solve") ----
 
 /// What [`Skippable`] saw: every evaluation's positions and whether it started cold (no
-/// successful evaluation since construction or the last `reset`), the resets, and the skip
-/// handles the driver forwarded to it (`Trainable::set_skip_request`).
+/// successful evaluation since construction, the last `reset` or `restart_cold`), the resets and
+/// cold restarts apart, and the skip handles the driver forwarded to it
+/// (`Trainable::set_skip_request`).
 #[derive(Default)]
 struct SkipLog {
     evals: Vec<(Vec<[f64; 3]>, bool)>,
     resets: usize,
+    restart_colds: usize,
     handles: Vec<SkipRequest>,
 }
 
+/// The worker's abort for a Skip (review m2): raised with the request — the worker sets the
+/// request, then queues `SkipSolve`, whose pending count raises `should_abort` — and lowered only
+/// once that command is applied ([`apply_skip`]), so the rest of the tick runs with it up.
+#[derive(Clone, Default)]
+struct SkipAbort(Arc<std::sync::atomic::AtomicBool>);
+
+impl SkipAbort {
+    fn click(&self, req: &SkipRequest, then: SkipThen) {
+        req.request(then);
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    fn poll(&self) -> impl FnMut() -> bool + '_ {
+        move || self.0.load(Ordering::SeqCst)
+    }
+}
+
 /// A [`Harmonic`] whose evaluation number `skip_at` (0 = the constructor's) stands for the user
-/// clicking Skip mid-solve: it asks `trigger` for a skip (`then`, `requests` times — the worker
-/// sets the request before it queues the command, which raises `should_abort`), then polls
+/// clicking Skip mid-solve (`requests` clicks): it clicks through `abort`, then polls
 /// `should_abort` like an SCF loop until it fires and returns `Cancelled`. `trainable`: it is
 /// reached through `as_trainable` (the surrogate) and, when `teacher`, reports the cancelled
 /// solve as a teacher solve (`Trainable::cancelled_teacher_solve`); otherwise it stands for a
-/// Kohn-Sham provider (DFT mode).
+/// Kohn-Sham provider (DFT mode). `estimated`: its answers are on the model's surface
+/// (`Source::Surrogate`), except the first after a `reset` past construction, which is the
+/// teacher's with no jump booked — the surrogate after an edit (`last == None`).
 struct Skippable {
     inner: Harmonic,
     trigger: SkipRequest,
+    abort: SkipAbort,
     skip_at: Option<(usize, SkipThen)>,
     requests: usize,
     trainable: bool,
     teacher: bool,
+    estimated: bool,
+    edited: bool,
     calls: usize,
     warm: bool,
     cancelled_teacher: bool,
@@ -3429,15 +3452,18 @@ struct Skippable {
 }
 
 impl Skippable {
-    fn new(inner: Harmonic, trigger: &SkipRequest, skip_at: Option<(usize, SkipThen)>) -> (Skippable, Arc<std::sync::Mutex<SkipLog>>) {
+    fn new(inner: Harmonic, trigger: &SkipRequest, abort: &SkipAbort, skip_at: Option<(usize, SkipThen)>) -> (Skippable, Arc<std::sync::Mutex<SkipLog>>) {
         let log = Arc::new(std::sync::Mutex::new(SkipLog::default()));
         let p = Skippable {
             inner,
             trigger: trigger.clone(),
+            abort: abort.clone(),
             skip_at,
             requests: 1,
             trainable: true,
             teacher: true,
+            estimated: false,
+            edited: false,
             calls: 0,
             warm: false,
             cancelled_teacher: false,
@@ -3456,7 +3482,7 @@ impl ForceProvider for Skippable {
         if let Some((at, then)) = self.skip_at {
             if at == call {
                 for _ in 0..self.requests {
-                    self.trigger.request(then);
+                    self.abort.click(&self.trigger, then);
                 }
                 let t0 = std::time::Instant::now();
                 while !a() {
@@ -3467,8 +3493,16 @@ impl ForceProvider for Skippable {
                 return Err(ProviderError::Cancelled);
             }
         }
-        let r = self.inner.evaluate(scene, a);
+        let mut r = self.inner.evaluate(scene, a);
         self.warm = r.is_ok();
+        if let (true, Ok(r)) = (self.estimated, r.as_mut()) {
+            if std::mem::take(&mut self.edited) {
+                r.stats.source = Source::Fallback;
+                r.stats.teacher_gap = None;
+            } else {
+                r.stats.source = Source::Surrogate;
+            }
+        }
         r
     }
     fn name(&self) -> &'static str {
@@ -3476,7 +3510,12 @@ impl ForceProvider for Skippable {
     }
     fn reset(&mut self) {
         self.warm = false;
+        self.edited = self.calls > 0;
         self.log.lock().unwrap().resets += 1;
+    }
+    fn restart_cold(&mut self) {
+        self.warm = false;
+        self.log.lock().unwrap().restart_colds += 1;
     }
     fn as_trainable(&mut self) -> Option<&mut dyn crate::provider::Trainable> {
         if self.trainable { Some(self) } else { None }
@@ -3535,26 +3574,50 @@ impl crate::provider::Trainable for Skippable {
     }
 }
 
-/// A playing driver over [`Skippable`] with the shared request installed, and the abort the
-/// worker would raise: a pending skip (its `SkipSolve` command queued).
-fn skippable_driver(skip_at: Option<(usize, SkipThen)>, tune: impl FnOnce(&mut Skippable)) -> (Dynamics, SkipRequest, Arc<std::sync::Mutex<SkipLog>>, Scene) {
+/// A playing driver over [`Skippable`] with the shared request installed, the worker's abort,
+/// the provider's log and the starting scene.
+struct SkipRig {
+    d: Dynamics,
+    req: SkipRequest,
+    abort: SkipAbort,
+    log: Arc<std::sync::Mutex<SkipLog>>,
+    sc: Scene,
+}
+
+fn skip_rig(skip_at: Option<(usize, SkipThen)>, tune: impl FnOnce(&mut Skippable)) -> SkipRig {
     let (sc, h) = harmonic_three();
     let req = SkipRequest::default();
-    let (mut p, log) = Skippable::new(h, &req, skip_at);
+    let abort = SkipAbort::default();
+    let (mut p, log) = Skippable::new(h, &req, &abort, skip_at);
     tune(&mut p);
     let mut d = Dynamics::new(sc.clone(), Box::new(p), DT_FS, 1);
     d.set_skip_request(req.clone());
     d.apply(DynCommand::SetSpeed(10));
     d.apply(DynCommand::Play);
-    (d, req, log, sc)
+    SkipRig { d, req, abort, log, sc }
 }
 
-fn skip_pending(req: &SkipRequest) -> impl FnMut() -> bool + '_ {
-    move || req.peek().is_some()
-}
+impl SkipRig {
+    fn tick(&mut self, budget_ms: f64) -> DynSnapshot {
+        let abort = self.abort.clone();
+        let mut poll = abort.poll();
+        self.d.tick(budget_ms, &mut poll)
+    }
 
-fn skipped_events(d: &mut Dynamics) -> Vec<crate::activity::TeachEvent> {
-    d.take_teach_events().into_iter().filter(|e| e.scf_end == Some(crate::activity::ScfEnd::Skipped)).collect()
+    /// The worker applies the queued `SkipSolve` after the tick; its abort then comes down.
+    fn apply_skip(&mut self, then: SkipThen) {
+        self.d.apply(DynCommand::SkipSolve(then));
+        self.abort.0.store(false, Ordering::SeqCst);
+    }
+
+    fn resets(&self) -> (usize, usize) {
+        let l = self.log.lock().unwrap();
+        (l.resets, l.restart_colds)
+    }
+
+    fn skipped_events(&mut self) -> Vec<crate::activity::TeachEvent> {
+        self.d.take_teach_events().into_iter().filter(|e| e.scf_end == Some(crate::activity::ScfEnd::Skipped)).collect()
+    }
 }
 
 #[test]
@@ -3573,36 +3636,56 @@ fn skip_request_takes_peeks_and_clears() {
     assert_eq!(crate::activity::ScfEnd::Skipped.word(), "skipped");
 }
 
-/// Setting "Pause" (the default): the skipped step is not taken, the provider is reset, the skip
-/// is a failed teaching event `Skipped` at the step it was for, and the run pauses with the note.
+/// Review R7: a request pending when a driver installs it belongs to a command dropped with the
+/// old driver: it is cleared, and the next unrelated abort is not taken for a skip.
+#[test]
+fn installing_a_skip_request_clears_a_stale_one() {
+    let (sc, h) = harmonic_three();
+    let req = SkipRequest::default();
+    req.request(SkipThen::Pause);
+    let mut d = Dynamics::new(sc, Box::new(Failing::new(h, 3).with_kind(FailKind::Cancelled)), DT_FS, 1);
+    d.set_skip_request(req.clone());
+    assert_eq!(req.peek(), None, "cleared on install");
+    // a Pause's abort cancels step 2: an ordinary abandon, no skip
+    d.apply(DynCommand::SetSpeed(10));
+    d.apply(DynCommand::Play);
+    let s = d.tick(f64::INFINITY, &mut never());
+    assert_eq!((s.step, s.paused, s.skips_taken, s.last_skip.clone()), (1, false, 0, None));
+}
+
+/// Setting "Pause" (the default): the skipped step is not taken, the provider restarts cold (not
+/// an edit's reset), the skip is a failed teaching event `Skipped` at the step it was for, and the
+/// run pauses with the note; the snapshot carries the bare sentence for the toast.
 #[test]
 fn skip_with_pause_pauses_and_keeps_nothing() {
-    let (mut d, req, log, sc) = skippable_driver(Some((1, SkipThen::Pause)), |_| {});
-    let resets0 = log.lock().unwrap().resets;
-    let s = d.tick(f64::INFINITY, &mut skip_pending(&req));
+    let mut r = skip_rig(Some((1, SkipThen::Pause)), |_| {});
+    let (resets0, colds0) = r.resets();
+    let s = r.tick(f64::INFINITY);
     assert_eq!((s.steps_last_tick, s.step, s.sim_time), (0, 0, 0.0), "the skipped step is not taken");
-    assert!(s.scene == sc, "positions and velocities as before the step");
+    assert!(s.scene == r.sc, "positions and velocities as before the step");
     assert!(s.paused, "Pause after a skip");
     assert!(s.last_error.is_none(), "a skip is not an error: {:?}", s.last_error);
-    assert_eq!(log.lock().unwrap().resets, resets0 + 1, "the provider is reset: the next solve is cold");
-    assert_eq!(s.notes.last().map(String::as_str), Some("step 0: you skipped the solve at step 1 — nothing was kept; Play retries it from a cold start"));
-    assert_eq!(req.peek(), None, "the skip took the request");
-    let ev = skipped_events(&mut d);
+    assert_eq!(r.resets(), (resets0, colds0 + 1), "a cold restart, not an edit's reset");
+    let sentence = "you skipped the solve at step 1 — nothing was kept; Play retries it from a cold start";
+    assert_eq!(s.notes.last().cloned(), Some(format!("step 0: {sentence}")));
+    assert_eq!((s.last_skip.as_deref(), s.skips_taken), (Some(sentence), 1), "the bare sentence for the toast");
+    assert_eq!(r.req.peek(), None, "the skip took the request");
+    let ev = r.skipped_events();
     assert_eq!(ev.len(), 1, "{ev:?}");
     let e = &ev[0];
     assert_eq!((e.outcome, e.step, e.origin, e.rule, e.atom), (crate::activity::TeachOutcome::Failed, Some(1), crate::activity::TeachOrigin::Fallback, crate::activity::TeachRule::ForceUncertainty, Some(1)));
-    assert_eq!(e.detail, "you skipped the solve at step 1 — nothing was kept; Play retries it from a cold start");
+    assert_eq!(e.detail, sentence);
     // the queued command finds the request taken: nothing more happens
     let notes = s.notes_total;
-    d.apply(DynCommand::SkipSolve(SkipThen::Pause));
-    let a = d.snapshot();
+    r.apply_skip(SkipThen::Pause);
+    let a = r.d.snapshot();
     assert_eq!((a.notes_total, a.paused, a.last_rejection.clone()), (notes, true, None));
     // a paused tick does not solve; Play retries the step
-    let evals = log.lock().unwrap().evals.len();
-    d.tick(f64::INFINITY, &mut never());
-    assert_eq!(log.lock().unwrap().evals.len(), evals, "paused: nothing is solved");
-    d.apply(DynCommand::Play);
-    let p = d.tick(f64::INFINITY, &mut never());
+    let evals = r.log.lock().unwrap().evals.len();
+    r.tick(f64::INFINITY);
+    assert_eq!(r.log.lock().unwrap().evals.len(), evals, "paused: nothing is solved");
+    r.d.apply(DynCommand::Play);
+    let p = r.tick(f64::INFINITY);
     assert!(p.step >= 1 && !p.paused);
 }
 
@@ -3611,81 +3694,111 @@ fn skip_with_pause_pauses_and_keeps_nothing() {
 #[test]
 fn skip_with_retry_keeps_playing() {
     for teacher in [true, false] {
-        let (mut d, req, log, sc) = skippable_driver(Some((2, SkipThen::Retry)), |p| {
+        let mut r = skip_rig(Some((2, SkipThen::Retry)), |p| {
             p.trainable = teacher;
             p.teacher = teacher;
         });
-        let s = d.tick(f64::INFINITY, &mut skip_pending(&req));
+        let s = r.tick(f64::INFINITY);
         assert_eq!((s.steps_last_tick, s.step), (1, 1), "the tick ends at the skipped step");
         assert!(!s.paused, "Retry keeps playing");
         assert_eq!(s.notes.last().map(String::as_str), Some("step 1: skipped at step 2 — retrying cold"));
-        assert_eq!(req.peek(), None);
-        let ev = skipped_events(&mut d);
+        assert_eq!(s.last_skip.as_deref(), Some("skipped at step 2 — retrying cold"));
+        assert_eq!(r.req.peek(), None);
+        let ev = r.skipped_events();
         assert_eq!(ev.len(), usize::from(teacher), "teacher {teacher}: {ev:?}");
         if teacher {
             assert_eq!((ev[0].step, ev[0].detail.as_str()), (Some(2), "skipped at step 2 — retrying cold"));
         }
-        let n = log.lock().unwrap().evals.len();
-        let t = d.tick(f64::INFINITY, &mut never());
+        r.apply_skip(SkipThen::Retry);
+        let n = r.log.lock().unwrap().evals.len();
+        let t = r.tick(f64::INFINITY);
         assert!(!t.paused && t.step > 1, "the next tick plays on");
-        let l = log.lock().unwrap();
+        let l = r.log.lock().unwrap();
         assert!(l.evals[n].0 == l.evals[n - 1].0, "the next tick solves the skipped step's positions");
-        let mut reference = Dynamics::new(sc.clone(), Box::new(harmonic_three().1), DT_FS, 1);
-        let r = step_n(&mut reference, 1);
-        assert!(s.scene == r.scene, "teacher {teacher}: the step before the skip stands");
+        let mut reference = Dynamics::new(r.sc.clone(), Box::new(harmonic_three().1), DT_FS, 1);
+        let rs = step_n(&mut reference, 1);
+        assert!(s.scene == rs.scene, "teacher {teacher}: the step before the skip stands");
     }
 }
 
-/// Review focus 5: the retry is really cold — the provider was reset, and the re-solve is at
+/// Review focus 5: the retry is really cold — the provider restarted cold, and the re-solve is at
 /// bit-equal positions.
 #[test]
 fn retry_resolves_the_same_step_cold() {
-    let (mut d, req, log, _) = skippable_driver(Some((3, SkipThen::Retry)), |_| {});
-    d.tick(f64::INFINITY, &mut skip_pending(&req));
-    d.apply(DynCommand::SkipSolve(SkipThen::Retry));
-    d.tick(f64::INFINITY, &mut never());
-    let l = log.lock().unwrap();
+    let mut r = skip_rig(Some((3, SkipThen::Retry)), |_| {});
+    r.tick(f64::INFINITY);
+    r.apply_skip(SkipThen::Retry);
+    r.tick(f64::INFINITY);
+    let l = r.log.lock().unwrap();
     let cold: Vec<bool> = l.evals.iter().map(|e| e.1).collect();
     // 0: the constructor's (cold); 1, 2: warm steps; 3: the skipped one (warm); 4: its retry
     assert_eq!(&cold[..5], &[true, false, false, false, true], "{cold:?}");
     assert!(cold[5..].iter().all(|c| !c), "after the retry the solves are warm again: {cold:?}");
     assert!(l.evals[4].0 == l.evals[3].0, "the retry is at bit-equal positions");
+    assert_eq!(l.restart_colds, 1);
+}
+
+/// Review I1a: a skip is not an edit. Under an Estimated-like provider (answers on the model's
+/// surface; an edit's reset would make its next answer the teacher's with no booked jump), a skip
+/// and its cold retry leave no "energy surface changed" note, and E_conserved's history goes on
+/// exactly as for a run without the skip.
+#[test]
+fn a_skip_keeps_the_energy_history_like_an_ordinary_step() {
+    let mut r = skip_rig(Some((3, SkipThen::Retry)), |p| p.estimated = true);
+    r.tick(f64::INFINITY);
+    r.apply_skip(SkipThen::Retry);
+    let s = r.tick(f64::INFINITY);
+    assert_eq!(s.step, 12);
+    assert!(s.notes.iter().all(|n| !n.contains("energy surface changed")), "{:?}", s.notes);
+    assert_eq!(s.history.len(), 12, "the history was not restarted");
+    let (sc, h) = harmonic_three();
+    let (mut p, _) = Skippable::new(h, &SkipRequest::default(), &SkipAbort::default(), None);
+    p.estimated = true;
+    let mut reference = Dynamics::new(sc, Box::new(p), DT_FS, 1);
+    let rs = step_n(&mut reference, 12);
+    assert!(s.scene == rs.scene, "the same trajectory");
+    assert_eq!(s.energy_conserved, rs.energy_conserved);
+    assert!(s.history.iter().zip(rs.history.iter()).all(|(a, b)| a == b), "the same history, point for point");
 }
 
 /// Review focus 1 and 2: a skip that finds no solve running is dropped with a note and never
 /// reaches the next solve; two quick requests skip one solve once.
 #[test]
 fn a_late_skip_is_dropped_and_never_hits_the_next_solve() {
-    let (mut d, req, log, _) = skippable_driver(None, |_| {});
-    d.tick(f64::INFINITY, &mut never());
-    let s0 = d.snapshot();
-    // the solve converged just before the click: the request is set, no solve takes it
-    req.request(SkipThen::Pause);
-    d.apply(DynCommand::SkipSolve(SkipThen::Pause));
-    let a = d.snapshot();
-    assert_eq!(req.peek(), None, "the command clears an untaken request");
+    let mut r = skip_rig(None, |_| {});
+    r.tick(f64::INFINITY);
+    let s0 = r.d.snapshot();
+    // the solve converged just before the click: the tick that follows sees the abort raised and
+    // starts no step, then the command clears the untaken request
+    r.abort.click(&r.req, SkipThen::Pause);
+    let t0 = r.tick(f64::INFINITY);
+    assert_eq!(t0.step, s0.step, "the raised abort ends the tick before a step");
+    r.apply_skip(SkipThen::Pause);
+    let a = r.d.snapshot();
+    assert_eq!(r.req.peek(), None, "the command clears an untaken request");
     assert_eq!(a.notes.last().map(String::as_str), Some(format!("step {}: nothing to skip", s0.step).as_str()));
     assert!(!a.paused && a.last_rejection.is_none(), "nothing was skipped, so nothing pauses");
-    let resets = log.lock().unwrap().resets;
-    let t = d.tick(f64::INFINITY, &mut never());
+    assert_eq!((a.skips_taken, a.last_skip.clone()), (0, None));
+    let resets = r.resets();
+    let t = r.tick(f64::INFINITY);
     assert!(t.step > s0.step && !t.paused, "the next step completes normally");
-    assert_eq!(log.lock().unwrap().resets, resets, "and is not reset");
-    assert!(skipped_events(&mut d).is_empty());
+    assert_eq!(r.resets(), resets, "and starts warm");
+    assert!(r.skipped_events().is_empty());
     // the command with no request at all: no-op, no note
-    let notes = d.snapshot().notes_total;
-    d.apply(DynCommand::SkipSolve(SkipThen::Retry));
-    assert_eq!(d.snapshot().notes_total, notes);
+    let notes = r.d.snapshot().notes_total;
+    r.apply_skip(SkipThen::Retry);
+    assert_eq!(r.d.snapshot().notes_total, notes);
 
     // two clicks before one cancelled solve: skipped once, nothing left pending
-    let (mut d, req, _, _) = skippable_driver(Some((2, SkipThen::Retry)), |p| p.requests = 2);
-    let s = d.tick(f64::INFINITY, &mut skip_pending(&req));
+    let mut r = skip_rig(Some((2, SkipThen::Retry)), |p| p.requests = 2);
+    let s = r.tick(f64::INFINITY);
     let notes = s.notes_total;
-    d.apply(DynCommand::SkipSolve(SkipThen::Retry));
-    d.apply(DynCommand::SkipSolve(SkipThen::Retry));
-    assert_eq!(req.peek(), None);
-    assert_eq!(d.snapshot().notes_total, notes, "the second request finds the skip already taken");
-    assert_eq!(skipped_events(&mut d).len(), 1);
-    let t = d.tick(f64::INFINITY, &mut skip_pending(&req));
+    r.apply_skip(SkipThen::Retry);
+    r.apply_skip(SkipThen::Retry);
+    assert_eq!(r.req.peek(), None);
+    assert_eq!(r.d.snapshot().notes_total, notes, "the second request finds the skip already taken");
+    assert_eq!((r.d.snapshot().skips_taken, r.skipped_events().len()), (1, 1));
+    let t = r.tick(f64::INFINITY);
     assert!(t.step > s.step && !t.paused, "the next solve is not skipped");
 }
 
@@ -3693,49 +3806,95 @@ fn a_late_skip_is_dropped_and_never_hits_the_next_solve() {
 /// keeps its state and goes on) and dropped with `nothing to skip`.
 #[test]
 fn a_skip_during_relax_is_nothing_to_skip() {
-    let (mut d, req, log, _) = skippable_driver(Some((4, SkipThen::Pause)), |_| {});
-    d.apply(DynCommand::Pause);
-    d.apply(DynCommand::Relax);
+    let mut r = skip_rig(Some((4, SkipThen::Pause)), |_| {});
+    r.d.apply(DynCommand::Pause);
+    r.d.apply(DynCommand::Relax);
     // the constructor's solve is call 0: FIRE steps 1–3 land
     for _ in 0..3 {
-        d.tick(-1.0, &mut skip_pending(&req));
+        r.tick(-1.0);
     }
-    let before = d.snapshot();
-    assert_eq!(before.relax.as_ref().map(|r| (r.steps, r.converged)), Some((3, None)));
-    let resets = log.lock().unwrap().resets;
-    let s = d.tick(-1.0, &mut skip_pending(&req));
-    assert_eq!(req.peek(), None, "the request is cleared");
+    let before = r.d.snapshot();
+    assert_eq!(before.relax.as_ref().map(|x| (x.steps, x.converged)), Some((3, None)));
+    let resets = r.resets();
+    let s = r.tick(-1.0);
+    assert_eq!(r.req.peek(), None, "the request is cleared");
     assert!(s.scene == before.scene, "the abandoned FIRE step left the state as it was");
-    assert_eq!(s.relax.as_ref().map(|r| (r.steps, r.converged)), Some((3, None)), "the relax goes on");
+    assert_eq!(s.relax.as_ref().map(|x| (x.steps, x.converged)), Some((3, None)), "the relax goes on");
     assert_eq!(s.notes.last().map(String::as_str), Some("step 0: nothing to skip"));
-    assert_eq!(log.lock().unwrap().resets, resets, "no reset");
-    assert!(skipped_events(&mut d).is_empty());
+    assert_eq!(r.resets(), resets, "no reset, no cold restart");
+    assert!(r.skipped_events().is_empty());
     let notes = s.notes_total;
-    d.apply(DynCommand::SkipSolve(SkipThen::Pause));
-    assert_eq!(d.snapshot().notes_total, notes, "one note per skip");
-    let n = d.tick(-1.0, &mut skip_pending(&req));
-    assert_eq!(n.relax.as_ref().map(|r| r.steps), Some(4));
+    r.apply_skip(SkipThen::Pause);
+    assert_eq!(r.d.snapshot().notes_total, notes, "one note per skip");
+    let n = r.tick(-1.0);
+    assert_eq!(n.relax.as_ref().map(|x| x.steps), Some(4));
+}
+
+/// Review m4: the stale re-evaluation after an edit during a relax is the relax's: a skip there
+/// is dropped with `nothing to skip`, and the relax re-evaluates and goes on.
+#[test]
+fn a_skip_of_a_relax_re_evaluation_is_nothing_to_skip() {
+    let mut r = skip_rig(Some((3, SkipThen::Pause)), |_| {});
+    r.d.apply(DynCommand::Pause);
+    r.d.apply(DynCommand::Relax);
+    r.tick(-1.0);
+    r.tick(-1.0);
+    r.d.apply(DynCommand::MoveNucleusDiscontinuous { index: 0, pos: [0.1, 0.0, 0.0] });
+    assert_eq!(r.d.snapshot().last_rejection, None);
+    let resets = r.resets();
+    let s = r.tick(-1.0);
+    assert!(s.forces_stale && s.relax.as_ref().is_some_and(|x| x.converged.is_none()));
+    assert_eq!((r.req.peek(), s.notes.last().map(String::as_str)), (None, Some("step 0: nothing to skip")));
+    assert_eq!((r.resets(), s.skips_taken), (resets, 0));
+    r.apply_skip(SkipThen::Pause);
+    let t = r.tick(-1.0);
+    assert!(!t.forces_stale && t.relax.as_ref().is_some_and(|x| x.converged.is_none()), "re-evaluated; the relax goes on");
 }
 
 /// A skipped stale re-evaluation (after an edit) with "Pause" is not re-solved by the paused
 /// ticks that follow (they would undo the pause's point); Play re-solves it cold.
 #[test]
 fn a_skipped_re_evaluation_waits_for_play() {
-    let (mut d, req, log, _) = skippable_driver(Some((1, SkipThen::Pause)), |_| {});
-    d.apply(DynCommand::Pause);
-    d.apply(DynCommand::MoveNucleusDiscontinuous { index: 0, pos: [0.1, 0.0, 0.0] });
-    let s = d.tick(f64::INFINITY, &mut skip_pending(&req));
+    let mut r = skip_rig(Some((1, SkipThen::Pause)), |_| {});
+    r.d.apply(DynCommand::Pause);
+    r.d.apply(DynCommand::MoveNucleusDiscontinuous { index: 0, pos: [0.1, 0.0, 0.0] });
+    let s = r.tick(f64::INFINITY);
     assert!(s.paused && s.forces_stale);
     assert_eq!(s.notes.last().map(String::as_str), Some("step 0: you skipped the solve at step 0 — nothing was kept; Play retries it from a cold start"));
-    assert_eq!(skipped_events(&mut d).iter().map(|e| e.step).collect::<Vec<_>>(), vec![Some(0)]);
-    let n = log.lock().unwrap().evals.len();
-    assert!(d.tick(f64::INFINITY, &mut never()).forces_stale);
-    assert_eq!(log.lock().unwrap().evals.len(), n, "a paused tick does not re-solve it");
-    d.apply(DynCommand::Play);
-    let p = d.tick(f64::INFINITY, &mut never());
+    assert_eq!(r.skipped_events().iter().map(|e| e.step).collect::<Vec<_>>(), vec![Some(0)]);
+    r.apply_skip(SkipThen::Pause);
+    let n = r.log.lock().unwrap().evals.len();
+    assert!(r.tick(f64::INFINITY).forces_stale);
+    assert_eq!(r.log.lock().unwrap().evals.len(), n, "a paused tick does not re-solve it");
+    r.d.apply(DynCommand::Play);
+    let p = r.tick(f64::INFINITY);
     assert!(!p.forces_stale && !p.paused);
-    let l = log.lock().unwrap();
+    let l = r.log.lock().unwrap();
     assert!(l.evals[n].1 && l.evals[n].0 == l.evals[n - 1].0, "Play re-solves the same positions cold");
+}
+
+/// Review I2: a skip whose abort lands in a "Bonds now" refresh does not give it up: the request
+/// is dropped with a note that says why, nothing restarts cold, and the refresh runs again.
+#[test]
+fn a_skip_during_a_bond_refresh_is_nothing_to_skip() {
+    let mut r = skip_rig(Some((1, SkipThen::Pause)), |_| {});
+    r.d.apply(DynCommand::Pause);
+    r.d.apply(DynCommand::RefreshBonds);
+    let resets = r.resets();
+    let s = r.tick(f64::INFINITY);
+    assert_eq!(r.log.lock().unwrap().evals.len(), 2, "the refresh was the solve abandoned");
+    assert_eq!(r.req.peek(), None, "the request is cleared");
+    assert_eq!(s.notes.last().map(String::as_str), Some("step 0: nothing to skip — the running solve is a bond/density refresh"));
+    assert_eq!((r.resets(), s.skips_taken, s.last_skip.clone()), (resets, 0, None));
+    assert!(r.skipped_events().is_empty());
+    let notes = s.notes_total;
+    r.apply_skip(SkipThen::Pause);
+    assert_eq!(r.d.snapshot().notes_total, notes, "one note");
+    r.tick(f64::INFINITY);
+    let n = r.log.lock().unwrap().evals.len();
+    assert!(n > 2, "the refresh is solved again");
+    r.tick(f64::INFINITY);
+    assert_eq!(r.log.lock().unwrap().evals.len(), n, "and done");
 }
 
 /// Ruling R1: the driver hands its skip request to a trainable provider (the surrogate passes it
@@ -3743,19 +3902,19 @@ fn a_skipped_re_evaluation_waits_for_play() {
 /// the same request on.
 #[test]
 fn the_skip_request_reaches_a_trainable_provider_and_its_replacement() {
-    let (_d, req, log, sc) = skippable_driver(None, |_| {});
+    let r = skip_rig(None, |_| {});
     {
-        let l = log.lock().unwrap();
+        let l = r.log.lock().unwrap();
         assert_eq!(l.handles.len(), 1);
-        req.request(SkipThen::Retry);
+        r.req.request(SkipThen::Retry);
         assert_eq!(l.handles[0].peek(), Some(SkipThen::Retry), "the provider holds the shared request");
-        req.clear();
+        r.req.clear();
     }
-    let (p2, log2) = Skippable::new(harmonic_three().1, &req, None);
-    let mut d2 = Dynamics::new(sc, Box::new(p2), DT_FS, 1);
-    d2.set_skip_request(req.clone());
+    let (p2, log2) = Skippable::new(harmonic_three().1, &r.req, &r.abort, None);
+    let mut d2 = Dynamics::new(r.sc.clone(), Box::new(p2), DT_FS, 1);
+    d2.set_skip_request(r.req.clone());
     let l2 = log2.lock().unwrap();
     assert_eq!(l2.handles.len(), 1, "the replacement provider gets it too");
-    req.request(SkipThen::Pause);
+    r.req.request(SkipThen::Pause);
     assert_eq!(l2.handles[0].peek(), Some(SkipThen::Pause));
 }

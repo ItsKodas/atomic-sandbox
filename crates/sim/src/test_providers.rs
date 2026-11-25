@@ -123,6 +123,10 @@ impl ForceProvider for Failing {
     fn reset(&mut self) {
         self.inner.reset();
     }
+
+    fn restart_cold(&mut self) {
+        self.inner.restart_cold();
+    }
 }
 
 /// What [`Faulty`] does once it faults — the ways a failed GPU teacher has been seen or can be made to answer
@@ -309,6 +313,10 @@ impl<P: ForceProvider> ForceProvider for Shared<P> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).reset()
     }
 
+    fn restart_cold(&mut self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).restart_cold()
+    }
+
     fn discontinuity(&mut self) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).discontinuity()
     }
@@ -394,6 +402,10 @@ impl<P: ForceProvider + Trainable> ForceProvider for SharedTrainable<P> {
 
     fn reset(&mut self) {
         self.lock().reset()
+    }
+
+    fn restart_cold(&mut self) {
+        self.lock().restart_cold()
     }
 
     fn discontinuity(&mut self) {

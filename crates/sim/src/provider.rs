@@ -989,6 +989,13 @@ pub trait ForceProvider: Send {
     /// Forget warm state: the next evaluation is cold (grid change, added or removed nuclei, a
     /// replaced scene).
     fn reset(&mut self);
+    /// The user skipped the running solve (`sim::dynamics`, "Skipping a solve"): drop the warm
+    /// start and any parked solve so the next evaluation starts cold, keeping anything that checks
+    /// the result against the last completed step (e.g. a branch-jump guard). Not an edit: the
+    /// scene and the last completed step are unchanged. The default calls [`reset`](Self::reset).
+    fn restart_cold(&mut self) {
+        self.reset();
+    }
     /// A teleport of existing nuclei (R13): the next evaluation may warm-start from the old
     /// geometry's state but must not extrapolate through the jump. Default: [`reset`](Self::reset).
     fn discontinuity(&mut self) {
