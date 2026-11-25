@@ -887,8 +887,11 @@ fn graph_key(d: &Drawing) -> GraphKey {
 /// answer for it, and when each was asked. [`Session::tick`] runs every frame the window shows.
 pub struct Session {
     clock: Arc<dyn Clock>,
-    /// The shipped list ([`Library::shipped`]; a test session's leaves ethane out, [`Session::with`]).
-    lib: &'static Library,
+    /// The list looked in before the cache and PubChem in place of the shipped one (tests that
+    /// draw a molecule the shipped list holds as if only PubChem knew it), as the search box's
+    /// `library` is.
+    #[cfg(test)]
+    pub(crate) library: Option<&'static Library>,
     lookups: Option<Lookups>,
     cache: Option<Cache>,
     /// The lookups and cache were given (tests): the real ones are never made.
@@ -911,27 +914,46 @@ pub struct Session {
 
 impl Default for Session {
     fn default() -> Session {
-        Session::new(Arc::new(SystemClock), None, None, false, Library::shipped())
+        Session::new(Arc::new(SystemClock), None, None, false)
     }
 }
 
 impl Session {
-    fn new(clock: Arc<dyn Clock>, lookups: Option<Lookups>, cache: Option<Cache>, given: bool, lib: &'static Library) -> Session {
+    fn new(clock: Arc<dyn Clock>, lookups: Option<Lookups>, cache: Option<Cache>, given: bool) -> Session {
         let changed_at = clock.now();
-        Session { clock, lib, lookups, cache, given, graph: None, enabled: false, generation: 0, changed_at, version: 0, local: Vec::new(), results: HashMap::new(), requested: HashMap::new(), inbox: Vec::new(), search_inbox: Vec::new() }
+        Session {
+            clock,
+            #[cfg(test)]
+            library: None,
+            lookups,
+            cache,
+            given,
+            graph: None,
+            enabled: false,
+            generation: 0,
+            changed_at,
+            version: 0,
+            local: Vec::new(),
+            results: HashMap::new(),
+            requested: HashMap::new(),
+            inbox: Vec::new(),
+            search_inbox: Vec::new(),
+        }
     }
 
-    /// A session over the given lookups, cache and clock (tests), whose shipped list is
-    /// [`Library::shipped`] without its C₂H₆ records: the online tests draw ethane as the molecule
-    /// only PubChem knows (canned answers), and the real list must ship it (the Methyl stamp on a
-    /// carbon, Task 6).
+    /// A session over the given lookups, cache and clock (tests).
     #[cfg(test)]
     pub(crate) fn with(lookups: Lookups, cache: Cache, clock: Arc<dyn Clock>) -> Session {
-        static NO_ETHANE: std::sync::OnceLock<Library> = std::sync::OnceLock::new();
-        let lib = NO_ETHANE.get_or_init(|| {
-            Library::from_records(Library::shipped().records().iter().filter(|r| r.formula_key() != ("C2H6".to_string(), 0)).cloned().collect())
-        });
-        Session::new(clock, Some(lookups), Some(cache), true, lib)
+        Session::new(clock, Some(lookups), Some(cache), true)
+    }
+
+    /// The list looked in first: the shipped one (in a test that gives one, its own).
+    fn lib(&self) -> &'static Library {
+        #[cfg(test)]
+        if let Some(l) = self.library {
+            return l;
+        }
+        Library::shipped()
     }
 
     /// The real lookups and cache, made once the process may use the network (never in a test
@@ -965,7 +987,7 @@ impl Session {
             self.requested.clear();
             self.version += 1;
             let none = HashMap::new();
-            let here = Layered { lib: self.lib, cache: self.cache.as_ref(), results: &none };
+            let here = Layered { lib: self.lib(), cache: self.cache.as_ref(), results: &none };
             self.local = iso::fragments(d).into_iter().filter(|f| f.len() >= 2).map(|f| (here.find(d, &f).is_found(), f)).map(|(k, f)| (f, k)).collect();
             if let Some(l) = &self.lookups {
                 l.supersede(self.generation);
@@ -1034,7 +1056,7 @@ impl Session {
 
     /// The record source for the drawing [`Session::tick`] last saw.
     pub fn layered(&self) -> Layered<'_> {
-        Layered { lib: self.lib, cache: self.cache.as_ref(), results: &self.results }
+        Layered { lib: self.lib(), cache: self.cache.as_ref(), results: &self.results }
     }
 
     /// The molecule cache the search box reads: the user's, once the process may use the network
@@ -1118,6 +1140,7 @@ impl Lookup {
 pub(crate) mod tests {
     use super::super::chem;
     use super::super::shape::{footer_label, shape, tests::draw_record};
+    use super::super::search::tests::test_library;
     use super::super::Builder;
     use super::*;
     use std::sync::Condvar;
@@ -1297,6 +1320,15 @@ pub(crate) mod tests {
             (title_url(6324), Ok("Ethane\n".to_string())),
             (stereo_url(6324), Ok(format!("{stereo}\n"))),
         ])
+    }
+
+    /// [`Session::with`] looking in the search tests' own list ([`test_library`]: no ethane) in
+    /// place of the shipped one, which holds ethane: the online tests draw ethane as the molecule
+    /// only PubChem (their canned answers) knows.
+    pub(crate) fn ethane_session(lookups: Lookups, cache: Cache, clock: Arc<dyn Clock>) -> Session {
+        let mut s = Session::with(lookups, cache, clock);
+        s.library = Some(test_library());
+        s
     }
 
     /// Ethane drawn: C–C then Fill hydrogens, or (`h_first`) its hydrogens drawn before the carbons.
@@ -1543,7 +1575,7 @@ pub(crate) mod tests {
         let mut b = Builder::default();
         let clock = ManualClock::new();
         let cache = Cache::open(dir.clone());
-        b.lookup = Session::with(Lookups::with_clock(Box::new(Canned::new(ethane_answers("[C@H]stand-in"))), cache.clone(), clock.clone()), cache, clock.clone());
+        b.lookup = ethane_session(Lookups::with_clock(Box::new(Canned::new(ethane_answers("[C@H]stand-in"))), cache.clone(), clock.clone()), cache, clock.clone());
         b.drawing = ethane(false);
         b.shaped();
         clock.advance(DEBOUNCE);
@@ -1561,7 +1593,7 @@ pub(crate) mod tests {
         let clock = ManualClock::new();
         let cache = Cache::open(dir.clone());
         let canned = Canned::new(ethane_answers("CC"));
-        b.lookup = Session::with(Lookups::with_clock(Box::new(canned.clone()), cache.clone(), clock.clone()), cache, clock.clone());
+        b.lookup = ethane_session(Lookups::with_clock(Box::new(canned.clone()), cache.clone(), clock.clone()), cache, clock.clone());
         b.drawing = ethane(false);
         let drawn = b.drawing.clone();
         assert_eq!(footer_label(b.shaped()), "looking up online…");
@@ -1609,7 +1641,7 @@ pub(crate) mod tests {
         let mut timing_out = Canned::new(HashMap::new());
         timing_out.otherwise = Err(NetError::Timeout);
         let clock = ManualClock::new();
-        let mut s = Session::with(Lookups::with_clock(Box::new(timing_out), Cache::none(), clock.clone()), Cache::none(), clock.clone());
+        let mut s = ethane_session(Lookups::with_clock(Box::new(timing_out), Cache::none(), clock.clone()), Cache::none(), clock.clone());
         s.tick(&d, true);
         clock.advance(DEBOUNCE);
         s.tick(&d, true);
@@ -1627,7 +1659,7 @@ pub(crate) mod tests {
         let clock = ManualClock::new();
         let canned = Canned::new(ethane_answers("CC"));
         let l = Lookups::with_clock(Box::new(Gate { inner: canned.clone(), open: gate.clone() }), Cache::none(), clock.clone());
-        let mut s = Session::with(l, Cache::none(), clock.clone());
+        let mut s = ethane_session(l, Cache::none(), clock.clone());
         let d1 = ethane(false);
         s.tick(&d1, true);
         assert_eq!(s.generation(), 1);
@@ -1680,7 +1712,7 @@ pub(crate) mod tests {
         // a lookup sits queued while the one before it takes its time
         let (clock, worker_clock) = (ManualClock::new(), ManualClock::new());
         let l = Lookups::with_clock(Box::new(Gate { inner: Canned::new(ethane_answers("CC")), open: gate.clone() }), Cache::none(), worker_clock);
-        let mut s = Session::with(l, Cache::none(), clock.clone());
+        let mut s = ethane_session(l, Cache::none(), clock.clone());
         // two ethanes: two unknown fragments, two lookups
         let mut d = ethane(false);
         let second = ethane(true);
@@ -1769,7 +1801,7 @@ pub(crate) mod tests {
         // the setting off: nothing asked, even of a transport that could answer
         let canned = Canned::new(ethane_answers("CC"));
         let clock = ManualClock::new();
-        let mut s = Session::with(Lookups::with_clock(Box::new(canned.clone()), Cache::none(), clock.clone()), Cache::none(), clock.clone());
+        let mut s = ethane_session(Lookups::with_clock(Box::new(canned.clone()), Cache::none(), clock.clone()), Cache::none(), clock.clone());
         s.tick(&d, false);
         clock.advance(DEBOUNCE + TIMEOUT);
         s.tick(&d, false);
@@ -1777,7 +1809,7 @@ pub(crate) mod tests {
         assert!(!s.busy());
         // the network not allowed: offline at once, and the network is never called
         let called = Arc::new(AtomicBool::new(false));
-        let mut s = Session::with(Lookups::with_clock(Box::new(FailOnCall { called: called.clone() }), Cache::none(), clock.clone()), Cache::none(), clock.clone());
+        let mut s = ethane_session(Lookups::with_clock(Box::new(FailOnCall { called: called.clone() }), Cache::none(), clock.clone()), Cache::none(), clock.clone());
         s.tick(&d, true);
         assert_eq!(footer_label(&shape(&d, &s.layered())), "shape: approximate (offline)");
         clock.advance(DEBOUNCE);
@@ -1795,11 +1827,17 @@ pub(crate) mod tests {
         // and the real transport, which checks the switch before anything else
         assert_eq!(UreqTransport::new().get(&smiles_url("[CH3][CH3]"), TIMEOUT), Err(NetError::Offline));
         // a builder as the app makes it, in a test build: no lookups made at all, for a molecule the
-        // shipped list has not (an ethyl radical: the real list ships ethane)
+        // shipped list cannot hold (decane, 32 atoms: records have at most MAX_ATOMS; the real list
+        // ships ethane)
         let mut b = Builder::default();
-        b.drawing = d.clone();
-        let h = b.drawing.atoms.iter().rposition(|a| a.z == 1).unwrap();
-        b.drawing.remove_atom(h);
+        for i in 0..10 {
+            let c = b.drawing.add_atom(6, [i as f32, 0.0]);
+            if i > 0 {
+                b.drawing.bond(c - 1, c);
+            }
+        }
+        chem::fill_hydrogens(&mut b.drawing);
+        assert!(b.drawing.atoms.len() > MAX_ATOMS);
         assert!(Library::shipped().candidates(&iso::drawing_key(&b.drawing, &all(&b.drawing))).is_empty());
         assert_eq!(footer_label(b.shaped()), "shape: approximate (offline)");
         assert!(b.lookup.lookups.is_none() && b.lookup.cache.is_none());
@@ -1855,7 +1893,7 @@ pub(crate) mod tests {
         let urls = Arc::new(Mutex::new(Vec::new()));
         let t = Recording { inner: Gate { inner: Canned::new(ethane_answers("CC")), open: gate.clone() }, urls: urls.clone() };
         let clock = ManualClock::new();
-        let mut s = Session::with(Lookups::with_clock(Box::new(t), Cache::none(), ManualClock::new()), Cache::none(), clock.clone());
+        let mut s = ethane_session(Lookups::with_clock(Box::new(t), Cache::none(), ManualClock::new()), Cache::none(), clock.clone());
         let d = ethane(false);
         s.tick(&d, true);
         clock.advance(DEBOUNCE);

@@ -1058,7 +1058,7 @@ mod tests {
     /// the offline label.
     #[test]
     fn insert_waits_while_looking_up() {
-        use super::super::online::{tests as net, Cache, Lookups, Session, DEBOUNCE, TIMEOUT};
+        use super::super::online::{tests as net, Cache, Lookups, DEBOUNCE, TIMEOUT};
         use super::super::shape::{footer_label, looking_up};
         use std::sync::{Arc, Condvar, Mutex};
         use std::time::Duration;
@@ -1067,7 +1067,7 @@ mod tests {
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let canned = net::Canned::new(net::ethane_answers("CC"));
         let lookups = Lookups::with_clock(Box::new(net::Gate { inner: canned.clone(), open: gate.clone() }), Cache::none(), clock.clone());
-        let mut b = Builder { lookup: Session::with(lookups, Cache::none(), clock.clone()), drawing: net::ethane(false), ..Default::default() };
+        let mut b = Builder { lookup: net::ethane_session(lookups, Cache::none(), clock.clone()), drawing: net::ethane(false), ..Default::default() };
         let buttons = |s: &super::super::shape::Shaped| [handoff_button(false, "Insert into scene", true, looking_up(s)), handoff_button(true, "Replace scene", true, looking_up(s))];
         // waiting out the debounce, then asked and waiting for the answer
         for step in [Duration::ZERO, DEBOUNCE, TIMEOUT - Duration::from_millis(1)] {

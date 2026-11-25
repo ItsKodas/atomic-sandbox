@@ -158,8 +158,6 @@ imidazolium
 anilinium
 choline
 acetylcholine
-betaine
-carnitine
 
 # ── alkanes and cycloalkanes ──
 propane
@@ -1339,7 +1337,6 @@ thiazolidine
 # ── phosphorus compounds ──
 trimethylphosphine oxide
 hexamethylphosphoramide
-dimethylphosphine oxide
 diphenylphosphine oxide
 methylenediphosphonic acid
 etidronic acid
@@ -1355,7 +1352,7 @@ carbamoyl phosphate
 phosphocreatine
 phosphoserine
 O-phosphoethanolamine
-phosphocholine
+phosphocholine cation | 1014
 erythrose 4-phosphate
 ribose 5-phosphate
 glucose 6-phosphate
@@ -1488,7 +1485,7 @@ pentafluoropyridine
 pyridoxine
 pyridoxal
 pyridoxamine
-pyridostigmine
+pyridostigmine cation | 4991
 pyrazine
 2-methylpyrazine
 2,5-dimethylpyrazine
@@ -1674,6 +1671,8 @@ iminodiacetic acid
 nitrilotriacetic acid
 creatine
 creatinine
+betaine
+carnitine
 guanidinoacetic acid
 guanidine
 aminoguanidine
@@ -1782,6 +1781,7 @@ bisphenol S
 #   hydroxycarbamide — a CID again (CID 3657, first as "hydroxyurea")
 #   niacin — a CID again (CID 938, first as "nicotinic acid")
 # dropped on review:
+#   dimethylphosphine oxide — PubChem gives only CID 6327637, (CH3)2P+=O, a cation, not the neutral (CH3)2P(H)=O (Task 6 review I1)
 #   malonate — resolves to neutral malonic acid (CID 867); malonic acid is listed
 #   trans-decalin — resolves to the stereo-unspecified decalin (CID 7044), listed as decalin
 #   ethyl isocyanide — resolves to CID 4474585, CC[N+]#C, a cation, not ethyl isocyanide

@@ -442,12 +442,9 @@ pub fn canvas_layout(p: &[[f64; 3]], bonds: &[(usize, usize, u8)]) -> Vec<[f32; 
 
 #[cfg(test)]
 mod tests {
-    //! The seed `crates/app/data/molecules.txt` (Task 1; Task 6 replaces it) was made from PubChem's
-    //! 3D and 2D SDFs, fetched once by hand on 2026-11-25:
-    //! `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/<cid>/SDF?record_type=3d` and
-    //! `…?record_type=2d` for CIDs 962 (water), 297 (methane), 702 (ethanol), 241 (benzene),
-    //! 223 (ammonium) and 961 (hydroxide; PubChem has a 3D record for it). Each 2D graph matched its
-    //! 3D graph atom for atom; `xyz` is the 3D SDF's, `xy` is [`canvas_layout`] of the 2D SDF's.
+    //! `crates/app/data/molecules.txt` is made by [`super::generate`] from the name list
+    //! `crates/app/data/molecule-names.txt` and PubChem's 3D and 2D SDFs (Task 6): `xyz` is the 3D
+    //! SDF's, `xy` is [`canvas_layout`] of the 2D SDF's mapped atom for atom onto the 3D graph.
     use super::*;
 
     /// A water record built by hand, the base the refusals and the round trip mutate: CID 962's 3D
@@ -515,8 +512,9 @@ $$$$
 
     /// Task 6 (spec §5): the shipped list as a whole. Every record validates and has a unique CID;
     /// at least 1 000 come from PubChem; the stamps' molecules and the app's preset molecules are
-    /// there; each record's 2D layout draws its own graph (the drawing maps back onto the record,
-    /// within the step cap, and every drawn bond has a sane length); the embedded file is ≤ 3 MB.
+    /// there; each record's 2D layout draws its own graph (the drawing, its atoms in reverse order,
+    /// maps back onto the record within the step cap, and every drawn bond has a sane length); the
+    /// embedded file is ≤ 3 MB.
     #[test]
     fn the_shipped_list_is_complete_and_sound() {
         use super::super::shape::{self, RecordSource};
@@ -532,11 +530,13 @@ $$$$
                     panic!("CID {cid} twice: {first} and {}", r.name);
                 }
             }
+            // drawn in reverse atom order, so the search must find the mapping, not read it off
+            let n = r.z.len();
             let d = Drawing {
-                atoms: r.z.iter().zip(&r.charge).zip(&r.xy).map(|((&z, &charge), &pos)| Atom { z, pos, charge }).collect(),
-                bonds: r.bonds.iter().map(|&(a, b, order)| Bond { a, b, order }).collect(),
+                atoms: (0..n).rev().map(|i| Atom { z: r.z[i], pos: r.xy[i], charge: r.charge[i] }).collect(),
+                bonds: r.bonds.iter().map(|&(a, b, order)| Bond { a: n - 1 - a, b: n - 1 - b, order }).collect(),
             };
-            let all: Vec<usize> = (0..r.z.len()).collect();
+            let all: Vec<usize> = (0..n).collect();
             assert!(matches!(iso::map_fragment(&d, &all, r), iso::MapResult::Mapped(_)), "{}: its own drawing does not map onto it", r.name);
             for &(a, b, _) in &r.bonds {
                 let l = (r.xy[a][0] as f64 - r.xy[b][0] as f64).hypot(r.xy[a][1] as f64 - r.xy[b][1] as f64);
@@ -561,9 +561,11 @@ $$$$
                 assert!(found, "{s:?} (on a carbon: {on_carbon}), {}: not in the list", iso::drawing_key(&d, &all).0);
             }
         }
-        // every preset molecule within H–Ar, but those PubChem has no 3D record for: H₂ (CID 783)
-        // and LiH (CID 62714), the generator's report of 2026-11-25 (Task 7's LIRA rows are for
-        // such molecules)
+        // every preset molecule within H–Ar has a record of its formula and charge (the presets have
+        // no isomers, so that is the molecule), but those PubChem has no 3D record for: H₂ (CID 783)
+        // and LiH (CID 62714), the generator's report of 2026-11-25. Those two, H₂ the app's default
+        // molecule among them, have no shipped shape of any source today; Task 7's LIRA rows are to
+        // add them, and this exemption then becomes a check that they are there as `lira` rows.
         const NO_PUBCHEM_3D: [&str; 2] = ["h2", "lih"];
         for &name in crate::scene::Scene::PRESETS {
             let s = crate::scene::Scene::preset(name).unwrap();
@@ -571,7 +573,58 @@ $$$$
             if z.len() < 2 || z.iter().any(|&z| z > 18) || NO_PUBCHEM_3D.contains(&name) {
                 continue;
             }
-            assert!(!lib.candidates(&(hill(&z), s.charge)).is_empty(), "the preset {name} ({}) is missing", hill(&z));
+            assert!(!lib.candidates(&(hill(&z), s.charge)).is_empty(), "no record has the preset {name}'s formula {}", hill(&z));
+        }
+    }
+
+    /// R14 (Task 6 review): what a record's name says about its charge and electrons. No radical
+    /// (an even electron count); a charged record has an ion's name of its sign
+    /// ([`charge_fits_name`]); and every name in the list's ion section is charged with the sign its
+    /// name says. A title check cannot see a neutral name on a charged record (CID 6327637, the
+    /// cation PubChem gives for "dimethylphosphine oxide").
+    #[test]
+    fn every_charge_fits_its_name() {
+        let lib = Library::shipped();
+        for r in lib.records() {
+            charge_fits_name(&r.name, &r.z, &r.charge).unwrap_or_else(|e| panic!("{}: {e}", r.name));
+        }
+        let names = include_str!("../../data/molecule-names.txt");
+        let section = names.split("# ── ions").nth(1).expect("the ion section").split("\n# ──").next().unwrap();
+        let ions: Vec<&str> = section.lines().skip(1).map(|l| l.split('|').next().unwrap().trim()).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+        assert!(ions.len() >= 40, "{} ion names", ions.len());
+        for name in ions {
+            let r = lib.records().iter().find(|r| r.name == name).unwrap_or_else(|| panic!("{name} is not shipped"));
+            let q: i32 = r.charge.iter().map(|&c| c as i32).sum();
+            let want = if is_cation_name(name) { 1 } else { -1 };
+            assert_eq!(q.signum(), want, "{name}: net charge {q:+}");
+        }
+    }
+
+    /// A cation's name: `…ium`, the choline family (quaternary ammonium) or `… cation`.
+    pub(super) fn is_cation_name(name: &str) -> bool {
+        let n = name.to_lowercase();
+        n.ends_with("ium") || n.ends_with("choline") || n.ends_with(" cation")
+    }
+
+    /// An anion's name: `…ate`, `…ite`, `…ide` or `… anion`.
+    fn is_anion_name(name: &str) -> bool {
+        let n = name.to_lowercase();
+        ["ate", "ite", "ide", " anion"].iter().any(|s| n.ends_with(s))
+    }
+
+    /// R14's rule for one record: an even electron count (Σ Z minus the net charge; no radical),
+    /// and a net charge only under a name of its sign ([`is_cation_name`], [`is_anion_name`]). A
+    /// neutral record may have any name (esters end in -ate, amides in -ide).
+    pub(super) fn charge_fits_name(name: &str, z: &[u8], charge: &[i8]) -> Result<(), String> {
+        let q: i32 = charge.iter().map(|&c| c as i32).sum();
+        let electrons = z.iter().map(|&z| z as i32).sum::<i32>() - q;
+        if electrons % 2 != 0 {
+            return Err(format!("{electrons} electrons: a radical"));
+        }
+        match q.signum() {
+            1 if !is_cation_name(name) => Err(format!("net charge {q:+} under a name that is not a cation's")),
+            -1 if !is_anion_name(name) => Err(format!("net charge {q:+} under a name that is not an anion's")),
+            _ => Ok(()),
         }
     }
 
@@ -702,8 +755,8 @@ $$$$
         // the SDF's O sits below its Hs (smaller y, y up); on the canvas (y down) it stays below
         // them, so its y is the larger
         assert!(xy[0][1] > xy[1][1] && xy[0][1] > xy[2][1]);
-        // the stored f32 values, measured in f64 (an f32 sum over many records' bonds drifts past
-        // 1e-6); a record with no bonds is left unscaled by the rule
+        // the stored f32 values, measured in f64 (an f32 sum over one record's many bonds can drift
+        // past 1e-6); a record with no bonds is left unscaled by the rule
         let len64 = |a: [f32; 2], b: [f32; 2]| (a[0] as f64 - b[0] as f64).hypot(a[1] as f64 - b[1] as f64);
         for r in Library::shipped().records().iter().filter(|r| !r.bonds.is_empty()) {
             let mean = r.bonds.iter().map(|&(a, b, _)| len64(r.xy[a], r.xy[b])).sum::<f64>() / r.bonds.len() as f64;
@@ -723,7 +776,8 @@ $$$$
 /// stereo flag, by the online lookup's rule) and the synonyms, at most 5 requests a second. It
 /// skips, and reports, an entry whose name PubChem does not know, that has no 3D record, has Z > 18
 /// or more than [`MAX_ATOMS`] atoms, whose 2D graph does not map onto its 3D graph
-/// ([`super::iso::map_fragment`]), that fails [`Record::validate`], or that repeats an earlier CID
+/// ([`super::iso::map_fragment`]), that fails [`Record::validate`], whose charge or electron count
+/// does not fit its name (`tests::charge_fits_name`, R14), or that repeats an earlier CID
 /// or name. The records are written in the list's order, then the old file's `lira` rows as they
 /// were. It commits nothing; review its report. Answers are kept under `target/pubchem-generator/`
 /// (one file a URL, a 404 too), so a rerun after editing the list asks only for what is new.
@@ -810,7 +864,7 @@ mod generate {
     }
 
     /// One list entry made into a record, with PubChem's own title for the review; or why not.
-    fn entry(f: &mut Fetcher, name: &str, cid: Option<u64>, seen: &HashMap<u64, String>) -> Result<(Record, String), String> {
+    fn entry(f: &mut Fetcher, name: &str, cid: Option<u64>, seen: &HashMap<u64, String>, warnings: &mut Vec<String>) -> Result<(Record, String), String> {
         let net = |e: NetError| format!("network: {e:?}");
         let cid = match cid {
             Some(c) => c,
@@ -838,24 +892,50 @@ mod generate {
         }
         let xy = canvas_layout(&xyz, &bonds);
         let mut r = Record { name: name.into(), synonyms: Vec::new(), source: Source::PubChem { cid }, z, charge, bonds, xyz, xy, stereo_defined: true };
-        let two = f.get(&sdf_url(cid, "2d")).map_err(|e| format!("no 2D record (CID {cid}: {e:?})"))?;
+        let two = match f.get(&sdf_url(cid, "2d")) {
+            Ok(b) => b,
+            Err(e) if absent(e) => return Err(format!("no 2D record (CID {cid})")),
+            Err(e) => return Err(net(e)),
+        };
         let two = parse_sdf(&two).map_err(|e| format!("the 2D SDF does not read (CID {cid}: {e})"))?;
         r.xy = layout_2d(&r, two).ok_or_else(|| format!("the 2D graph does not map onto the 3D graph (CID {cid})"))?;
         // the online lookup's stereo rule: stereo marks in the isomeric SMILES
         let smiles = [stereo_url(cid), smiles_property_url(cid)].into_iter().find_map(|u| f.get(&u).ok().filter(|b| !b.trim().is_empty()));
         r.stereo_defined = smiles.ok_or_else(|| format!("no SMILES (CID {cid})"))?.trim().contains(['@', '/', '\\']);
         let mut title = String::new();
-        if let Ok(body) = f.get(&format!("{PUG}compound/cid/{cid}/synonyms/TXT")) {
-            title = body.lines().next().unwrap_or("").trim().to_string();
-            for s in body.lines().map(str::trim) {
-                let lower = s.to_lowercase();
-                if r.synonyms.len() < SYNONYMS && readable(s) && lower != name.to_lowercase() && !r.synonyms.iter().any(|t| t.to_lowercase() == lower) {
-                    r.synonyms.push(s.to_string());
+        match f.get(&format!("{PUG}compound/cid/{cid}/synonyms/TXT")) {
+            Ok(body) => {
+                title = body.lines().next().unwrap_or("").trim().to_string();
+                for s in body.lines().map(str::trim) {
+                    let lower = s.to_lowercase();
+                    if r.synonyms.len() < SYNONYMS && readable(s) && lower != name.to_lowercase() && !r.synonyms.iter().any(|t| t.to_lowercase() == lower) {
+                        r.synonyms.push(s.to_string());
+                    }
                 }
             }
+            // kept without synonyms, but said
+            Err(e) => warnings.push(format!("{name}: no synonyms (CID {cid}: {e:?})")),
         }
         r.validate().map_err(|e| format!("does not validate (CID {cid}: {e})"))?;
+        // R14: a title check cannot see a neutral name on a charged record
+        super::tests::charge_fits_name(name, &r.z, &r.charge).map_err(|e| format!("the charge does not fit the name (CID {cid}: {e})"))?;
         Ok((r, title))
+    }
+
+    /// The builder's network on while it lives, off again when dropped (a panic too).
+    struct NetworkOn;
+
+    impl NetworkOn {
+        fn new() -> NetworkOn {
+            set_network_allowed(true);
+            NetworkOn
+        }
+    }
+
+    impl Drop for NetworkOn {
+        fn drop(&mut self) {
+            set_network_allowed(false);
+        }
     }
 
     #[test]
@@ -865,7 +945,8 @@ mod generate {
         let names = std::fs::read_to_string(root.join("data/molecule-names.txt")).expect("data/molecule-names.txt");
         let dir = root.join("../../target/pubchem-generator");
         std::fs::create_dir_all(&dir).unwrap();
-        set_network_allowed(true);
+        let network = NetworkOn::new();
+        let mut warnings = Vec::new();
         let mut f = Fetcher { t: UreqTransport::new(), last: None, dir, sent: 0 };
         let (mut kept, mut skipped, mut review) = (Vec::new(), Vec::new(), String::new());
         let (mut seen, mut names_seen): (HashMap<u64, String>, HashSet<String>) = (HashMap::new(), HashSet::new());
@@ -881,7 +962,7 @@ mod generate {
                 skipped.push((name.to_string(), "the name again".to_string()));
                 continue;
             }
-            match entry(&mut f, name, cid, &seen) {
+            match entry(&mut f, name, cid, &seen, &mut warnings) {
                 Ok((r, title)) => {
                     let Source::PubChem { cid } = r.source else { unreachable!() };
                     let (formula, q) = r.formula_key();
@@ -896,7 +977,7 @@ mod generate {
                 eprintln!("... {} kept, {} skipped, {} requests sent", kept.len(), skipped.len(), f.sent);
             }
         }
-        set_network_allowed(false);
+        drop(network);
         let old = parse(std::str::from_utf8(DATA).unwrap()).expect("the current molecules.txt parses");
         let lira: Vec<Record> = old.into_iter().filter(|r| matches!(r.source, Source::Lira { .. })).collect();
         let n_lira = lira.len();
@@ -905,6 +986,10 @@ mod generate {
         assert_eq!(parse(&text).unwrap(), kept, "the written file reads back");
         std::fs::write(root.join("data/molecules.txt"), &text).unwrap();
         std::fs::write(root.join("../../target/pubchem-generator-review.tsv"), &review).unwrap();
+        println!("\n== warnings ({}) ==", warnings.len());
+        for w in &warnings {
+            println!("   {w}");
+        }
         println!("\n== skipped ({}) ==", skipped.len());
         let mut by_reason: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (name, why) in &skipped {
