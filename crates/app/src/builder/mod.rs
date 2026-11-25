@@ -13,14 +13,9 @@
 //! last drawing). The window is [`ui`].
 pub mod chem;
 pub mod embed;
-// unused outside its tests until the shape lookup (builder database plan, Task 3) wires it in;
-// remove the allow then
-#[cfg_attr(not(test), allow(dead_code))]
 pub mod iso;
-// unused outside its tests until the shape lookup (builder database plan, Tasks 3–4) wires it in;
-// remove the allow then
-#[cfg_attr(not(test), allow(dead_code))]
 pub mod records;
+pub mod shape;
 pub mod ui;
 
 use crate::scene::{Scene, SceneNucleus};
@@ -311,8 +306,9 @@ pub struct Builder {
     /// A hand-off pressed with warnings: (Replace?, the drawing then) — the same button again on the
     /// same drawing goes ahead (spec §4: radicals are legitimate).
     pub armed: Option<(bool, Drawing)>,
-    /// The embedding of the drawing as it was (spec §5), recomputed only when the drawing changes.
-    pub(crate) embedded: Option<(Drawing, Vec<[f64; 3]>)>,
+    /// The hand-off geometry of the drawing as it was ([`shape::shape`]: the embedding with the
+    /// database's shapes for the fragments it knows), recomputed only when the drawing changes.
+    pub(crate) shaped: Option<(Drawing, shape::Shaped)>,
 }
 
 impl Default for Builder {
@@ -334,7 +330,7 @@ impl Default for Builder {
             last_replace: None,
             enlarge: None,
             armed: None,
-            embedded: None,
+            shaped: None,
         }
     }
 }
@@ -442,12 +438,19 @@ impl Builder {
         self.gesture = ui::Gesture::None;
     }
 
-    /// The drawing in 3D (Bohr, centred), cached until the drawing changes.
-    pub fn embedding(&mut self) -> &[[f64; 3]] {
-        if self.embedded.as_ref().is_none_or(|(d, _)| *d != self.drawing) {
-            self.embedded = Some((self.drawing.clone(), embed::embed(&self.drawing)));
+    /// The drawing's hand-off geometry (Bohr, centred) from the shipped list, cached until the
+    /// drawing changes.
+    pub fn shaped(&mut self) -> &shape::Shaped {
+        self.shaped_from(&shape::LocalOnly(records::Library::shipped()))
+    }
+
+    /// [`Builder::shaped`] with the fragments looked up in `src`; the cache is keyed by the drawing
+    /// alone, so one builder keeps to one source.
+    pub(crate) fn shaped_from(&mut self, src: &dyn shape::RecordSource) -> &shape::Shaped {
+        if self.shaped.as_ref().is_none_or(|(d, _)| *d != self.drawing) {
+            self.shaped = Some((self.drawing.clone(), shape::shape(&self.drawing, src)));
         }
-        &self.embedded.as_ref().unwrap().1
+        &self.shaped.as_ref().unwrap().1
     }
 
     /// The one selected atom, when exactly one is.

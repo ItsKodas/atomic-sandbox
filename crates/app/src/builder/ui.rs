@@ -35,7 +35,7 @@ const ATOM_R: f32 = 13.0;
 /// The palette's elements (spec §4); "more…" opens the periodic table.
 const PALETTE: [u8; 8] = [1, 6, 7, 8, 9, 15, 16, 17];
 /// The rule-1 line (spec §3: the window states it).
-pub const RULE_1_LINE: &str = "bond lengths and valences here only place the atoms; the solver decides the real geometry and bonds";
+pub const RULE_1_LINE: &str = "bond lengths, valences and database shapes here only place the atoms; the solver decides the real geometry and bonds";
 
 /// What a press on the canvas started, while the button is held.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -683,6 +683,28 @@ fn footer_rows(ui: &mut Ui, st: &mut UiState) {
             }
         });
     });
+    // where the hand-off's shape comes from (spec §8): one line, each fragment's in the tooltip
+    if !b.drawing.atoms.is_empty() {
+        let s = b.shaped().clone();
+        let line = super::shape::footer_label(&s);
+        if !line.is_empty() {
+            let approximate = s.sources.iter().any(|(_, f)| matches!(f, super::shape::FragmentSource::Approximate(_)));
+            let r = ui.label(RichText::new(line).size(12.5).color(if approximate { theme::INK_DIM } else { theme::ACCENT_INK }));
+            if s.sources.len() > 1 {
+                let tip = s
+                    .sources
+                    .iter()
+                    .map(|(frag, f)| {
+                        let z: Vec<u8> = frag.iter().map(|&i| b.drawing.atoms[i].z).collect();
+                        let q: i32 = frag.iter().map(|&i| b.drawing.atoms[i].charge as i32).sum();
+                        format!("{}: {}", crate::names::formula(&z, Some(q)), super::shape::fragment_label(f))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                r.on_hover_text(tip);
+            }
+        }
+    }
     // the warnings (amber ones only once Fill hydrogens was used)
     let marks: Vec<_> = super::chem::warnings(&b.drawing).into_iter().filter(|m| b.filled || m.1 == super::chem::Warning::Over).collect();
     if !marks.is_empty() {
@@ -710,10 +732,28 @@ enum Fit {
     No { reach: f64, limit: f64 },
 }
 
+/// What a hand-off puts in (spec §6, §8): the shape Replace sends, Insert's copy of it beside the
+/// scene's atoms, and the reaches the fit check and the enlarge offer use — all from the shape the
+/// hand-off sends, the database's where it knows a fragment.
+struct HandoffGeometry {
+    new: Vec<[f64; 3]>,
+    beside: Vec<[f64; 3]>,
+    reach_replace: f64,
+    reach_insert: f64,
+}
+
+fn handoff_geometry(b: &mut Builder, src: &dyn super::shape::RecordSource, existing: &[[f64; 3]]) -> HandoffGeometry {
+    use super::{embed, max_abs};
+    let new = b.shaped_from(src).positions.clone();
+    let mut beside = new.clone();
+    embed::place_beside(existing, &mut beside);
+    HandoffGeometry { reach_replace: max_abs(&new), reach_insert: max_abs(&beside).max(max_abs(existing)), new, beside }
+}
+
 /// The hand-off row: the fit check and the enlarge offer, the warnings' confirm line, Relax
 /// after, Insert and Replace. Returns true when a hand-off was sent (the window closes).
 fn handoff_rows(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) -> bool {
-    use super::{embed, enlarge_n, fit_limit, max_abs};
+    use super::{enlarge_n, fit_limit};
     let walls_on = st.walls_on;
     let wall_now = st.wall_half_width;
     let (backend, gpu) = (st.backend, st.gpu_available);
@@ -724,12 +764,8 @@ fn handoff_rows(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
     }
     let scene = input.scene;
     let (n0, h0) = (scene.grid_n, scene.grid_h);
-    let new = b.embedding().to_vec();
     let existing: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
-    let mut beside = new.clone();
-    embed::place_beside(&existing, &mut beside);
-    let reach_replace = max_abs(&new);
-    let reach_insert = max_abs(&beside).max(max_abs(&existing));
+    let HandoffGeometry { new, beside, reach_replace, reach_insert } = handoff_geometry(b, &super::shape::LocalOnly(super::records::Library::shipped()), &existing);
     // the walls of a grid: today's on the grid now, else the default for that cell
     let walls_of = |n: usize, h: f64| -> Option<f64> {
         walls_on.then(|| if (n, h) == (n0, h0) { wall_now } else { crate::ui::default_wall_half_width(&crate::scene::Scene { grid_n: n, grid_h: h, ..scene.clone() }) })
@@ -844,6 +880,45 @@ const ENLARGE_MARGIN_TEXT: &str = "4 Bohr to spare from the farthest atom to the
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review focus 4: the fit check's reach is the shape the hand-off sends, not the embedding's.
+    #[test]
+    fn the_fit_check_uses_the_database_shape() {
+        use super::super::shape::{shape, tests::draw_record, Lookup, RecordSource};
+        use super::super::{embed, fit_limit, iso, max_abs, records::Library};
+        // a source answering ethanol's record stretched ×3
+        struct Stretched(super::super::records::Record);
+        impl RecordSource for Stretched {
+            fn find(&self, d: &super::super::Drawing, frag: &[usize]) -> Lookup {
+                match iso::map_fragment(d, frag, &self.0) {
+                    iso::MapResult::Mapped(m) => Lookup::Found(self.0.clone(), m),
+                    _ => Lookup::NotFound,
+                }
+            }
+        }
+        let mut eth = Library::shipped().records().iter().find(|r| r.name == "ethanol").unwrap().clone();
+        for p in &mut eth.xyz {
+            *p = p.map(|c| 3.0 * c);
+        }
+        let src = Stretched(eth.clone());
+        let mut b = Builder::default();
+        draw_record(&mut b.drawing, &eth, [0.0, 0.0], &(0..eth.z.len()).collect::<Vec<_>>());
+        let shaped = shape(&b.drawing, &src).positions;
+        let embedded = embed::embed(&b.drawing);
+        let existing = [[0.0, 0.0, 0.0], [1.4, 0.0, 0.0]];
+        let g = handoff_geometry(&mut b, &src, &existing);
+        assert_eq!(g.new, shaped, "Replace sends the database's shape");
+        assert_eq!(g.reach_replace, max_abs(&shaped));
+        assert!(max_abs(&embedded) * 2.0 < g.reach_replace, "the stretched shape reaches further: {} vs {}", g.reach_replace, max_abs(&embedded));
+        // Insert's copy is the same shape moved beside the scene's atoms
+        let mut beside = shaped.clone();
+        embed::place_beside(&existing, &mut beside);
+        assert_eq!(g.beside, beside);
+        assert_eq!(g.reach_insert, max_abs(&beside).max(max_abs(&existing)));
+        // so an 81³ × 0.15 box that holds the embedding does not hold it
+        let lim = fit_limit(81, 0.15, None);
+        assert!(max_abs(&embedded) <= lim && g.reach_replace > lim, "{} / {} / {lim}", max_abs(&embedded), g.reach_replace);
+    }
 
     /// The Atom tool as the user asked for it (2026-10-20): click places a lone atom and selects it,
     /// the next click elsewhere places one bonded to it, deselect, then a lone one again; clicking the

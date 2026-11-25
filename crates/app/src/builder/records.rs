@@ -82,6 +82,7 @@ impl Record {
     /// list as long as `z`; finite coordinates; bonds of order 1–3 between two distinct atoms in
     /// range, none twice, each within [`BOND_RANGE`] in 3D; and names and source fields the format
     /// can hold.
+    #[allow(dead_code)] // used outside tests by the online lookup's fetched records (builder database plan, Task 4)
     pub fn validate(&self) -> Result<(), String> {
         let n = self.z.len();
         if n == 0 {
@@ -163,6 +164,7 @@ fn dist(a: [f64; 3], b: [f64; 3]) -> f64 {
 }
 
 /// The data file's text for `records` (the module doc's format). Exact for records that validate.
+#[allow(dead_code)] // used outside tests by the online lookup's cache (builder database plan, Task 4)
 pub fn write(records: &[Record]) -> String {
     let mut s = format!("{FORMAT}\n# the builder's molecule shapes; crates/app/src/builder/records.rs documents the format\n");
     for r in records {
@@ -345,6 +347,7 @@ impl Library {
     }
 
     /// Every record, grouped by key.
+    #[allow(dead_code)] // used outside tests by name search (builder database plan, Task 5)
     pub fn records(&self) -> &[Record] {
         &self.records
     }
@@ -355,6 +358,7 @@ impl Library {
 /// from the `M  CHG` lines when there are any, which then supersede the atom block's charge codes
 /// (the V2000 rule), and otherwise from those codes. V3000, and aromatic (4) or query bond types,
 /// are refused.
+#[allow(dead_code)] // used outside tests by the online lookup (builder database plan, Task 4)
 pub fn parse_sdf(sdf: &str) -> Result<(Vec<u8>, Vec<i8>, Vec<(usize, usize, u8)>, Vec<[f64; 3]>), String> {
     let lines: Vec<&str> = sdf.lines().collect();
     let counts = lines.get(3).ok_or("SDF: no counts line")?;
@@ -428,6 +432,7 @@ fn col(line: &str, a: usize, b: usize) -> &str {
 /// entries): a 2D layout's x and y (Å, y up as in an SDF; z is ignored), centred on its centroid,
 /// y flipped (the canvas's y points down) and scaled so the mean bond is 1 canvas unit (unscaled
 /// with no bonds).
+#[allow(dead_code)] // used outside tests by the online lookup (builder database plan, Task 4)
 pub fn canvas_layout(p: &[[f64; 3]], bonds: &[(usize, usize, u8)]) -> Vec<[f32; 2]> {
     if p.is_empty() {
         return Vec::new();
