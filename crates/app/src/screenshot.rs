@@ -42,6 +42,8 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// sampling pass runs (instead of after the first solve), `drag=<i>` poses a Select-drag of nucleus
 /// i (its pull label by the `cursor`), `pull=<Ha/Bohr>` sets the drag pull (as the wheel would),
 /// `ptable=<query>` opens the periodic table with that search text (empty: none),
+/// `builder=<query>` opens the molecule builder with that search and stamps its first local result
+/// (the shipped list; a screenshot never reaches the network; no `;` in the query),
 /// `names=common|stoichiometric|hydride|formula` sets the molecule name style, `angles=on|off` the
 /// bond-angle overlay (on by default),
 /// `wait=bonds` shoots once the bond graph is in (the free-atom references solved: ≈ 70 s for
@@ -172,6 +174,9 @@ pub struct ShotUi {
     pub cell: Option<(f64, f64, f64)>,
     /// `rotate=<yaw>,<pitch>`: the 3D cloud's rotation (degrees).
     pub rotate: Option<(f32, f32)>,
+    /// `builder=<query>`: the molecule builder open with this in its search box, the first local
+    /// result (the shipped list: a screenshot never reaches the network) stamped onto the canvas.
+    pub builder: Option<String>,
 }
 
 /// A distance of a `--ui` key: finite and > 0 Bohr (NaN for a value that is not a number).
@@ -251,6 +256,7 @@ impl ShotUi {
                     other => return Err(format!("--ui: training=open, got {other}")),
                 },
                 "ptable" => s.ptable = Some(v.to_string()),
+                "builder" => s.builder = Some(v.trim().to_string()),
                 "names" => {
                     use crate::names::NameStyle::*;
                     s.names = Some(match v {
@@ -590,6 +596,16 @@ impl ShotUi {
         if let Some(q) = &self.ptable {
             viewer.ui.ptable_query = q.clone();
             crate::ui::open_ptable(&viewer.egui_ctx);
+        }
+        if let Some(q) = &self.builder {
+            // the local search only: `main` has forbidden the builder's network for a screenshot
+            let b = &mut viewer.ui.builder;
+            b.open = true;
+            match b.search_and_stamp_first(q) {
+                Some(name) => eprintln!("--ui builder: stamped {name} for {q:?}"),
+                None if q.is_empty() => {}
+                None => eprintln!("--ui builder: nothing in the shipped list matches {q:?}; the builder opens with the search"),
+            }
         }
         Ok(())
     }
@@ -1234,6 +1250,17 @@ mod tests {
         assert_eq!(ShotUi::parse("tab=graph").unwrap().layout, None);
         assert_eq!(ShotUi::parse("dock=open").unwrap().layout, None, "as before: only closed means anything");
         assert!(ShotUi::parse("layout=three").err().is_some_and(|e| e.contains("training")));
+    }
+
+    /// `builder=<query>` (builder database Task 5): the builder opened with that search, its first
+    /// local hit stamped.
+    #[test]
+    fn the_builder_key_parses() {
+        assert_eq!(ShotUi::parse("builder=ethanol").unwrap().builder.as_deref(), Some("ethanol"));
+        assert_eq!(ShotUi::parse("tab=graph; builder= ethyl alcohol ").unwrap().builder.as_deref(), Some("ethyl alcohol"));
+        assert_eq!(ShotUi::parse("builder=").unwrap().builder.as_deref(), Some(""), "the builder, empty");
+        assert_eq!(ShotUi::parse("tab=graph").unwrap().builder, None);
+        assert_eq!(ShotUi::parse("builder=H₂O").unwrap().builder.as_deref(), Some("H₂O"));
     }
 
     /// Spec U8 (Phase A's keys).

@@ -35,6 +35,7 @@
 //! builder.
 use super::iso::{self, MapResult};
 use super::records::{self, canvas_layout, hill, parse_sdf, Library, Record, Source, MAX_ATOMS};
+use super::search::{Hit, Query, MAX_NAME};
 use super::shape::{LocalOnly, Lookup, RecordSource};
 use super::{Atom, Bond, Drawing};
 use std::collections::HashMap;
@@ -383,6 +384,8 @@ pub struct Cache {
 struct CacheInner {
     dir: Option<PathBuf>,
     memo: Mutex<HashMap<(String, i32), Vec<Record>>>,
+    /// Every record ([`Cache::all`]), read once until the next store.
+    all: Mutex<Option<Vec<Record>>>,
 }
 
 impl Cache {
@@ -397,7 +400,7 @@ impl Cache {
     }
 
     fn with_dir(dir: Option<PathBuf>) -> Cache {
-        Cache { inner: Arc::new(CacheInner { dir, memo: Mutex::new(HashMap::new()) }) }
+        Cache { inner: Arc::new(CacheInner { dir, memo: Mutex::new(HashMap::new()), all: Mutex::new(None) }) }
     }
 
     /// `%LOCALAPPDATA%\atomic-sandbox\molecules`.
@@ -441,7 +444,33 @@ impl Cache {
         std::fs::write(&tmp, records::write(std::slice::from_ref(r)))?;
         std::fs::rename(&tmp, dir.join(&name))?;
         self.inner.memo.lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
+        *self.inner.all.lock().unwrap_or_else(|p| p.into_inner()) = None;
         Ok(())
+    }
+
+    /// Every cached record, by CID (the search box's names): each file named
+    /// `<formula>_<charge>_<cid>.txt` that holds what its name says, as [`Cache::find`] reads them.
+    pub fn all(&self) -> Vec<Record> {
+        let Some(dir) = &self.inner.dir else { return Vec::new() };
+        let mut all = self.inner.all.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(v) = all.as_ref() {
+            return v.clone();
+        }
+        let mut found: Vec<(u64, Record)> = Vec::new();
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let name = e.file_name();
+            let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".txt")) else { continue };
+            let mut parts = stem.rsplitn(3, '_');
+            let (Some(cid), Some(q), Some(formula)) = (parts.next(), parts.next(), parts.next()) else { continue };
+            let (Ok(cid), Ok(q)) = (cid.parse::<u64>(), q.parse::<i32>()) else { continue };
+            if let Some(r) = read_entry(&e.path(), &(formula.to_string(), q), cid) {
+                found.push((cid, r));
+            }
+        }
+        found.sort_by_key(|f| f.0);
+        let v: Vec<Record> = found.into_iter().map(|f| f.1).collect();
+        *all = Some(v.clone());
+        v
     }
 }
 
@@ -451,29 +480,6 @@ fn read_entry(path: &std::path::Path, key: &(String, i32), cid: u64) -> Option<R
     let mut v = records::parse(&text).ok()?;
     let r = v.pop().filter(|_| v.is_empty())?;
     (r.validate().is_ok() && r.formula_key() == *key && r.source == Source::PubChem { cid }).then_some(r)
-}
-
-// ── the search's query and results (R1: Task 5 may move them to `search.rs`) ──
-
-/// What a search box query asks for.
-#[allow(dead_code)] // the search's (builder database plan, Task 5)
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Query {
-    Empty,
-    Cid(u64),
-    Formula(String),
-    Name(String),
-}
-
-/// One search result.
-#[allow(dead_code)] // the search's (builder database plan, Task 5)
-#[derive(Clone, Debug, PartialEq)]
-pub struct Hit {
-    pub name: String,
-    pub formula: String,
-    /// "shipped", "cached" or "PubChem".
-    pub source: &'static str,
-    pub record: Option<Record>,
 }
 
 // ── the worker ──
@@ -656,11 +662,16 @@ fn resolve(net: &mut Net, cache: &Cache, d: &Drawing, frag: &[usize]) -> Lookup 
     Lookup::NotFound
 }
 
-/// An online search (R1, minimal): a name's or a CID's compounds, the first [`MAX_SEARCH`] with a
-/// 3D record, each kept in the cache. A formula is searched locally only (Task 5).
+/// An online search (`search.rs`): a name's or a CID's compounds, the first [`MAX_SEARCH`] with a
+/// 3D record, each kept in the cache. A formula is asked as a name (PubChem's synonyms hold the
+/// common ones: "H2O", "CO2"). A name longer than [`MAX_NAME`] is not sent (no results). A 4xx on
+/// the name (PubChem's "no such name", or its refusal of an encoded `/`) is no results, not an
+/// error.
 fn search(net: &mut Net, cache: &Cache, q: &Query) -> Result<Vec<Hit>, NetError> {
-    if matches!(q, Query::Empty | Query::Formula(_)) {
-        return Ok(Vec::new());
+    match q {
+        Query::Empty => return Ok(Vec::new()),
+        Query::Name(s) | Query::Formula(s) if s.len() > MAX_NAME => return Ok(Vec::new()),
+        _ => {}
     }
     if !net.reachable() {
         return Err(NetError::Offline);
@@ -668,12 +679,12 @@ fn search(net: &mut Net, cache: &Cache, q: &Query) -> Result<Vec<Hit>, NetError>
     let deadline = net.clock.now() + TIMEOUT;
     let cids = match q {
         Query::Cid(c) => vec![*c],
-        Query::Name(s) => match net.get(&name_url(s), deadline).and_then(|b| parse_cids(&b)) {
+        Query::Name(s) | Query::Formula(s) => match net.get(&name_url(s), deadline).and_then(|b| parse_cids(&b)) {
             Ok(c) => c,
             Err(e) if absent(e) => return Ok(Vec::new()),
             Err(e) => return Err(e),
         },
-        Query::Empty | Query::Formula(_) => unreachable!(),
+        Query::Empty => unreachable!(),
     };
     let mut hits = Vec::new();
     for cid in cids.into_iter().take(MAX_SEARCH) {
@@ -779,7 +790,6 @@ impl Lookups {
     }
 
     /// Starts an online search; returns its id (later searches supersede it).
-    #[allow(dead_code)] // the search's (builder database plan, Task 5)
     pub fn search(&self, q: &Query) -> u64 {
         let id = self.searches.fetch_add(1, Ordering::SeqCst) + 1;
         let _ = self.jobs.send(Job::Search { id, query: q.clone() });
@@ -787,7 +797,6 @@ impl Lookups {
     }
 
     /// The searches answered (never blocks): (id, hits or why none).
-    #[allow(dead_code)] // the search's (builder database plan, Task 5)
     pub fn poll_search(&self) -> Vec<(u64, Result<Vec<Hit>, NetError>)> {
         self.hits.try_iter().collect()
     }
@@ -870,6 +879,8 @@ pub struct Session {
     results: HashMap<Vec<usize>, Lookup>,
     requested: HashMap<Vec<usize>, Instant>,
     inbox: Vec<Answer>,
+    /// Search answers a test waited for, kept for the next [`Session::poll_search`].
+    search_inbox: Vec<(u64, Result<Vec<Hit>, NetError>)>,
 }
 
 impl Default for Session {
@@ -881,7 +892,7 @@ impl Default for Session {
 impl Session {
     fn new(clock: Arc<dyn Clock>, lookups: Option<Lookups>, cache: Option<Cache>, given: bool) -> Session {
         let changed_at = clock.now();
-        Session { clock, lookups, cache, given, graph: None, enabled: false, generation: 0, changed_at, version: 0, local: Vec::new(), results: HashMap::new(), requested: HashMap::new(), inbox: Vec::new() }
+        Session { clock, lookups, cache, given, graph: None, enabled: false, generation: 0, changed_at, version: 0, local: Vec::new(), results: HashMap::new(), requested: HashMap::new(), inbox: Vec::new(), search_inbox: Vec::new() }
     }
 
     /// A session over the given lookups, cache and clock (tests).
@@ -987,6 +998,55 @@ impl Session {
     /// The record source for the drawing [`Session::tick`] last saw.
     pub fn layered(&self) -> Layered<'_> {
         Layered { lib: Library::shipped(), cache: self.cache.as_ref(), results: &self.results }
+    }
+
+    /// The molecule cache the search box reads: the user's, once the process may use the network
+    /// (as for the drawn fragments: a test build, a replay or a screenshot sees the shipped list
+    /// alone), else none.
+    pub fn local_cache(&mut self) -> Cache {
+        self.ensure();
+        self.cache.clone().unwrap_or_else(Cache::none)
+    }
+
+    /// Whether the search box may offer "Search PubChem for '…'": the online setting on and PubChem
+    /// reachable (for the app's own transport, [`network_allowed`]; a test's canned one always).
+    pub fn can_search(&mut self, enabled: bool) -> bool {
+        self.ensure();
+        enabled && self.lookups.as_ref().is_some_and(Lookups::reachable)
+    }
+
+    /// Starts an online search ([`Lookups::search`]); None when [`Session::can_search`] is false.
+    pub fn search(&mut self, q: &Query, enabled: bool) -> Option<u64> {
+        if !self.can_search(enabled) {
+            return None;
+        }
+        self.lookups.as_ref().map(|l| l.search(q))
+    }
+
+    /// The online searches answered since the last call (never blocks).
+    pub fn poll_search(&mut self) -> Vec<(u64, Result<Vec<Hit>, NetError>)> {
+        let mut v = std::mem::take(&mut self.search_inbox);
+        if let Some(l) = &self.lookups {
+            v.extend(l.poll_search());
+        }
+        v
+    }
+
+    /// The window's clock (the search's wait).
+    pub fn now(&self) -> Instant {
+        self.clock.now()
+    }
+
+    /// Blocks up to `t` for the worker's next search answer, kept for the next poll (tests).
+    #[cfg(test)]
+    pub(crate) fn wait_search(&mut self, t: Duration) -> bool {
+        match self.lookups.as_ref().and_then(|l| l.wait_search(t)) {
+            Some(a) => {
+                self.search_inbox.push(a);
+                true
+            }
+            None => false,
+        }
     }
 
     #[cfg(test)]

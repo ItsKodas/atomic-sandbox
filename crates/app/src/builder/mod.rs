@@ -16,6 +16,7 @@ pub mod embed;
 pub mod iso;
 pub mod online;
 pub mod records;
+pub mod search;
 pub mod shape;
 pub mod ui;
 
@@ -316,6 +317,10 @@ pub struct Builder {
     /// database's shapes for the fragments it knows) and the lookup answers' version it was made
     /// with, recomputed only when either changes.
     pub(crate) shaped: Option<(Drawing, u64, shape::Shaped)>,
+    /// The search box's text (spec §8: a name, a formula or a PubChem CID).
+    pub search_query: String,
+    /// The search box's results for that text ([`search`]).
+    pub(crate) search: search::SearchBox,
 }
 
 impl Default for Builder {
@@ -340,6 +345,8 @@ impl Default for Builder {
             online: true,
             lookup: online::Session::default(),
             shaped: None,
+            search_query: String::new(),
+            search: Default::default(),
         }
     }
 }

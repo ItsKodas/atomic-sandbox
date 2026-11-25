@@ -345,7 +345,6 @@ impl Library {
     }
 
     /// Every record, grouped by key.
-    #[allow(dead_code)] // used outside tests by name search (builder database plan, Task 5)
     pub fn records(&self) -> &[Record] {
         &self.records
     }

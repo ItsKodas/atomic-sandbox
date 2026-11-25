@@ -177,7 +177,7 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, acts:
     if close {
         st.builder.open = false;
         st.builder.gesture = Gesture::None;
-    } else if st.builder.lookup.busy() {
+    } else if st.builder.lookup.busy() || st.builder.search_waiting() {
         // the lookups' answers and timeouts arrive without input: keep the frames coming
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     } else if st.builder.lookup.awaiting() {
@@ -195,6 +195,8 @@ fn child(ui: &mut Ui, rect: Rect, layout: egui::Layout, f: impl FnOnce(&mut Ui))
 
 fn palette_column(ui: &mut Ui, st: &mut UiState) {
     let b = &mut st.builder;
+    search_box(ui, b);
+    ui.add_space(10.0);
     theme::section(ui, "Element");
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = Vec2::splat(4.0);
@@ -277,6 +279,91 @@ fn palette_column(ui: &mut Ui, st: &mut UiState) {
     });
     ui.add_space(10.0);
     ui.checkbox(&mut b.online, RichText::new(ONLINE_LABEL).size(12.5)).on_hover_text(ONLINE_TIP);
+}
+
+/// The search box (spec §8, `search.rs`) and its results: the local ones (the shipped list and the
+/// cache), then — with the online setting on and PubChem reachable — "Search PubChem for '…'",
+/// whose answer is listed below it. A row stamps its molecule beside the drawing; Enter stamps the
+/// first local result, or asks PubChem when there is none.
+fn search_box(ui: &mut Ui, b: &mut Builder) {
+    use super::search::{parse_query, Query};
+    let r = ui.add(egui::TextEdit::singleline(&mut b.search_query).hint_text(SEARCH_HINT).desired_width(ui.available_width()));
+    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    b.poll_search();
+    if parse_query(&b.search_query) == Query::Empty {
+        return;
+    }
+    let local = b.search_hits().to_vec();
+    let online_row = b.can_search_online();
+    let mut pick = if enter { local.first().and_then(|h| h.record.clone()) } else { None };
+    let mut ask = enter && local.is_empty() && online_row && !b.search_waiting();
+    let small = |ui: &mut Ui, text: &str| {
+        ui.label(RichText::new(text).size(11.5).color(theme::INK_FAINT));
+    };
+    egui::ScrollArea::vertical().id_salt("builder-search-results").max_height(240.0).auto_shrink([false, true]).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 3.0;
+        for h in &local {
+            if result_row(ui, h).clicked() {
+                pick = h.record.clone();
+            }
+        }
+        if local.is_empty() {
+            small(ui, NO_LOCAL);
+        }
+        if !online_row {
+            return;
+        }
+        if let Some(hits) = b.online_hits() {
+            let seen: Vec<u64> = local.iter().filter_map(|h| h.cid()).collect();
+            let fresh: Vec<&super::search::Hit> = hits.iter().filter(|h| h.cid().is_none_or(|c| !seen.contains(&c))).collect();
+            if fresh.is_empty() {
+                small(ui, if hits.is_empty() { "no results on PubChem" } else { "nothing more on PubChem" });
+            }
+            for h in fresh {
+                if result_row(ui, h).clicked() {
+                    pick = h.record.clone();
+                }
+            }
+        } else if b.search_waiting() {
+            small(ui, "searching PubChem…");
+        } else {
+            if let Some(e) = b.online_failed() {
+                small(ui, &failed_line(e));
+            }
+            let text = format!("Search PubChem for '{}'", b.search_query.trim());
+            if ui.add(egui::Button::new(RichText::new(text).size(12.0)).wrap().min_size(Vec2::new(ui.available_width(), 0.0))).on_hover_text(ONLINE_TIP).clicked() {
+                ask = true;
+            }
+        }
+    });
+    if ask {
+        b.search_online();
+    }
+    if let Some(r) = pick {
+        b.stamp_record(&r);
+    }
+}
+
+/// One result row: the name, then the formula and where the record comes from.
+fn result_row(ui: &mut Ui, h: &super::search::Hit) -> egui::Response {
+    let formula = h.record.as_ref().map_or_else(|| h.formula.clone(), |r| crate::names::formula(&r.z, Some(r.charge.iter().map(|&q| q as i32).sum())));
+    let mut job = egui::text::LayoutJob::default();
+    job.append(&h.name, 0.0, egui::TextFormat { font_id: FontId::proportional(13.0), color: theme::INK, ..Default::default() });
+    job.append(&format!("\n{formula} · {}", h.source), 0.0, egui::TextFormat { font_id: FontId::proportional(11.0), color: theme::INK_FAINT, ..Default::default() });
+    let cid = h.cid().map_or(String::new(), |c| format!(" (PubChem CID {c})"));
+    let r = ui.add(egui::Button::new(job).wrap().right_text("").min_size(Vec2::new(ui.available_width(), 0.0)).fill(theme::PANEL_2));
+    r.on_hover_text(format!("{}{cid} — click to put it on the canvas beside the drawing (Ctrl-Z takes it back)", h.name))
+}
+
+/// The online search's failure, in one short line.
+fn failed_line(e: super::online::NetError) -> String {
+    use super::online::NetError;
+    match e {
+        NetError::Offline => "PubChem not reachable (offline)".into(),
+        NetError::Timeout => "PubChem did not answer in time".into(),
+        NetError::Status(s) => format!("PubChem answered {s}: try again later"),
+        NetError::Malformed => "PubChem's answer was not readable".into(),
+    }
 }
 
 /// Picking an element switches to the Atom tool (as the toolbar's chips switch to Place).
@@ -912,6 +999,10 @@ fn handoff_button(replace: bool, label: &'static str, fits: bool, looking: bool)
 pub const ONLINE_LABEL: &str = "Look up molecules online (PubChem)";
 pub const ONLINE_TIP: &str = "sends the molecule's name or structure string to NCBI's PubChem; off: no network";
 
+/// The search box's hint (spec §8) and its "nothing here" line.
+pub const SEARCH_HINT: &str = "molecule name, formula or CID";
+pub const NO_LOCAL: &str = "no match in the shipped list or the cache";
+
 /// The enlarge offer's margin, in words.
 const ENLARGE_MARGIN_TEXT: &str = "4 Bohr to spare from the farthest atom to the box";
 
@@ -993,6 +1084,68 @@ mod tests {
         // a shape that does not fit still disables them, with their usual text
         assert_eq!(handoff_button(false, "Insert into scene", false, false), (false, "Insert into scene"));
         net::open_gate(&gate);
+    }
+
+    /// Every text the palette column paints, after two frames in a 150 × 900 column.
+    fn palette_texts(st: &mut UiState) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    *out += t.galley.text();
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut out = String::new();
+        for _ in 0..2 {
+            out.clear();
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(150.0, 900.0))), ..Default::default() };
+            let full = ctx.run_ui(raw, |ui| palette_column(ui, st));
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        }
+        out
+    }
+
+    /// Spec §8: the search box tops the palette column with its hint; each result row shows the
+    /// name, the formula and the source; the PubChem row appears only with the setting on and
+    /// PubChem reachable (never in a test build's own session), above the online setting.
+    #[test]
+    fn the_search_box_lists_results_and_the_pubchem_row() {
+        use super::super::online::{tests as net, Cache, Lookups, Session};
+        let mut st = UiState::new("h2", &crate::scene::Scene::preset("h2").unwrap());
+        let t = palette_texts(&mut st);
+        assert!(t.contains(SEARCH_HINT), "{t}");
+        let at = |s: &str| t.to_lowercase().find(&s.to_lowercase()).unwrap_or_else(|| panic!("{s} missing: {t}"));
+        assert!(at(SEARCH_HINT) < at("element") && at("element") < at(ONLINE_LABEL), "the box first, the setting last: {t}");
+        st.builder.search_query = "eth".into();
+        let t = palette_texts(&mut st);
+        assert!(t.contains("ethanol\nC₂H₆O · shipped"), "{t}");
+        assert!(!t.contains("Search PubChem"), "no network in a test build: {t}");
+        st.builder.search_query = "xyzzy".into();
+        assert!(palette_texts(&mut st).contains(NO_LOCAL));
+        // a session whose PubChem (canned) is reachable: the row, unless the setting is off
+        let clock = net::ManualClock::new();
+        st.builder.lookup = Session::with(Lookups::with_clock(Box::new(net::Canned::new(Default::default())), Cache::none(), clock.clone()), Cache::none(), clock);
+        assert!(palette_texts(&mut st).contains("Search PubChem for 'xyzzy'"));
+        // asked: PubChem knows no such name (its 404) — one short line, the row gone
+        st.builder.search_online();
+        assert!(st.builder.lookup.wait_search(std::time::Duration::from_secs(30)));
+        let t = palette_texts(&mut st);
+        assert!(t.contains("no results on PubChem") && !t.contains("Search PubChem"), "{t}");
+        // a name it knows: its row, with the source
+        let mut answers = net::ethane_answers("CC");
+        answers.insert(super::super::online::name_url("ethane"), Ok("6324\n".into()));
+        let clock = net::ManualClock::new();
+        st.builder.lookup = Session::with(Lookups::with_clock(Box::new(net::Canned::new(answers)), Cache::none(), clock.clone()), Cache::none(), clock);
+        st.builder.search_query = "ethane".into();
+        st.builder.search_online();
+        assert!(st.builder.lookup.wait_search(std::time::Duration::from_secs(30)));
+        assert!(palette_texts(&mut st).contains("Ethane\nC₂H₆ · PubChem"));
+        st.builder.online = false;
+        assert!(!palette_texts(&mut st).contains("Search PubChem"));
     }
 
     /// The Atom tool as the user asked for it (2026-10-20): click places a lone atom and selects it,
