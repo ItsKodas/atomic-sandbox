@@ -556,6 +556,11 @@ fn main() {
     // started on the CPU without a chosen quality or scene file, the preset loads at Balanced
     // (49³). Switching the solver later keeps the grid (Scene ▸ Quality changes it).
     flags.cpu_default_quality(backend);
+    // replays and screenshots never touch the network (the builder's PubChem lookup: builder
+    // database spec §7), whatever the profile's online setting says
+    if replay_path.is_some() || shot.is_some() {
+        builder::online::set_network_allowed(false);
+    }
     if let Some(path) = replay_path {
         // headless; `--screenshot` then names the last frame's PNG
         for (given, flag) in [(sample, "--sample"), (play_ms.is_some(), "--play-ms"), (shot_ui_given, "--ui")] {

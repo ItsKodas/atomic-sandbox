@@ -14,6 +14,7 @@
 pub mod chem;
 pub mod embed;
 pub mod iso;
+pub mod online;
 pub mod records;
 pub mod shape;
 pub mod ui;
@@ -306,9 +307,15 @@ pub struct Builder {
     /// A hand-off pressed with warnings: (Replace?, the drawing then) — the same button again on the
     /// same drawing goes ahead (spec §4: radicals are legitimate).
     pub armed: Option<(bool, Drawing)>,
+    /// "Look up molecules online (PubChem)" (spec §7: on by default; display state kept in the
+    /// profile as `builder_online`, not an `Action`).
+    pub online: bool,
+    /// The online lookups of this window's drawings ([`online::Session`]).
+    pub(crate) lookup: online::Session,
     /// The hand-off geometry of the drawing as it was ([`shape::shape`]: the embedding with the
-    /// database's shapes for the fragments it knows), recomputed only when the drawing changes.
-    pub(crate) shaped: Option<(Drawing, shape::Shaped)>,
+    /// database's shapes for the fragments it knows) and the lookup answers' version it was made
+    /// with, recomputed only when either changes.
+    pub(crate) shaped: Option<(Drawing, u64, shape::Shaped)>,
 }
 
 impl Default for Builder {
@@ -330,6 +337,8 @@ impl Default for Builder {
             last_replace: None,
             enlarge: None,
             armed: None,
+            online: true,
+            lookup: online::Session::default(),
             shaped: None,
         }
     }
@@ -438,19 +447,28 @@ impl Builder {
         self.gesture = ui::Gesture::None;
     }
 
-    /// The drawing's hand-off geometry (Bohr, centred) from the shipped list, cached until the
-    /// drawing changes.
+    /// The drawing's hand-off geometry (Bohr, centred): the fragments looked up in the shipped
+    /// list, the molecule cache and PubChem ([`online::Session`], ticked here, so the window's every
+    /// frame brings its answers in). Cached until the drawing or the answers change.
     pub fn shaped(&mut self) -> &shape::Shaped {
-        self.shaped_from(&shape::LocalOnly(records::Library::shipped()))
+        self.lookup.tick(&self.drawing, self.online);
+        let version = self.lookup.version();
+        if self.shaped.as_ref().is_none_or(|(d, v, _)| *d != self.drawing || *v != version) {
+            let s = shape::shape(&self.drawing, &self.lookup.layered());
+            self.shaped = Some((self.drawing.clone(), version, s));
+        }
+        &self.shaped.as_ref().unwrap().2
     }
 
-    /// [`Builder::shaped`] with the fragments looked up in `src`; the cache is keyed by the drawing
-    /// alone, so one builder keeps to one source.
+    /// [`Builder::shaped`] with the fragments looked up in `src` instead (tests); cached by the
+    /// drawing alone, so one builder keeps to one source.
+    #[cfg(test)]
     pub(crate) fn shaped_from(&mut self, src: &dyn shape::RecordSource) -> &shape::Shaped {
-        if self.shaped.as_ref().is_none_or(|(d, _)| *d != self.drawing) {
-            self.shaped = Some((self.drawing.clone(), shape::shape(&self.drawing, src)));
+        const GIVEN: u64 = u64::MAX;
+        if self.shaped.as_ref().is_none_or(|(d, v, _)| *d != self.drawing || *v != GIVEN) {
+            self.shaped = Some((self.drawing.clone(), GIVEN, shape::shape(&self.drawing, src)));
         }
-        &self.shaped.as_ref().unwrap().1
+        &self.shaped.as_ref().unwrap().2
     }
 
     /// The one selected atom, when exactly one is.

@@ -3368,6 +3368,35 @@ fn the_gpu_memory_action_clamps_and_hands_the_share_to_the_viewer() {
     assert!(search::ENTRIES.iter().any(|e| e.anchor == "m-gpu-memory" && e.also.contains("gpu memory")), "a Ctrl K entry");
 }
 
+mod profile_online {
+    use super::*;
+
+    /// The builder's online setting (builder database spec §7) is display state kept in the
+    /// profile: on by default, off survives a save and a load, and a profile from before it (or
+    /// with a value that does not read) leaves it as it is.
+    #[test]
+    fn the_online_setting_round_trips_in_the_profile() {
+        let scene = Scene::preset("h2").unwrap();
+        let mut st = UiState::new("h2", &scene);
+        assert!(st.builder.online, "on by default");
+        assert!(profile::capture(&st).contains("\nbuilder_online = true\n"));
+        st.builder.online = false;
+        let text = profile::capture(&st);
+        assert!(text.contains("\nbuilder_online = false\n"), "{text}");
+        let mut back = UiState::new("h2", &scene);
+        profile::apply(&mut back, &text);
+        assert!(!back.builder.online);
+        assert_eq!(profile::capture(&back), text);
+        // Reset's defaults turn it back on; a profile without the key, or with a bad value, leaves it
+        let defaults = profile::defaults(&back);
+        profile::apply(&mut back, &defaults);
+        assert!(back.builder.online);
+        back.builder.online = false;
+        profile::apply(&mut back, "builder_online = maybe\nshow_bonds = true\n");
+        assert!(!back.builder.online);
+    }
+}
+
 /// The share is this computer's (user report 2026-11-21: it reset between runs): kept in
 /// `machine.settings`, never in a profile — a named profile's Load, Reset, or an older build's
 /// rewrite of `current.profile` leaves it alone. A share read there is clamped and left pending

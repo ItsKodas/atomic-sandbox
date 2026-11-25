@@ -8,8 +8,14 @@
 //! atom mapping, centred on the centroid the embedding gave that fragment. Only the matched
 //! fragments then move, pushed apart along the line between fragment centroids until every pair of
 //! atoms in different fragments is at least [`FRAGMENT_GAP`] apart, and the whole is centred last as
-//! the embedding is. Lone atoms and fragments not found keep the embedding's positions; a drawing
-//! with no matched fragment is handed off bit for bit as the embedding gives it.
+//! the embedding is. A matched fragment the push cannot clear within [`MAX_PUSH_PASSES`] (trapped
+//! between atoms that do not move) goes back to the embedding's positions, labelled approximate
+//! ([`Why::NoRoom`]), and the others are pushed again. Lone atoms and fragments not found keep the
+//! embedding's positions; a drawing with no matched fragment is handed off bit for bit as the
+//! embedding gives it.
+//!
+//! **Answers are checked** ([`valid_mapping`]): a source's mapping must keep every element and
+//! formal charge and take every drawn bond to a record bond, or the fragment is approximate.
 //!
 //! **Rule 1 (spec §3).** A record only places nuclei here; nothing from it leaves the builder.
 use super::embed::{self, closest};
@@ -27,19 +33,24 @@ pub const FRAGMENT_GAP: f64 = 3.0;
 /// line still converges in a few passes.
 const PUSH_SLACK: f64 = 0.05;
 
-/// The most passes over the fragment pairs the push takes.
-const MAX_PUSH_PASSES: usize = 1000;
+/// The most passes over the fragment pairs the push takes. A matched fragment still closer than
+/// [`FRAGMENT_GAP`] to another fragment after them goes back to the embedding ([`Why::NoRoom`]).
+pub const MAX_PUSH_PASSES: usize = 1000;
 
 /// Why a fragment's shape is the embedding's guess.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Why {
-    /// No record maps onto it (shipped list, cache and PubChem asked, or online off).
+    /// No record maps onto it (shipped list, cache and PubChem asked).
     NotInDatabase,
-    /// The online lookup failed (timeout or network error).
-    #[allow(dead_code)] // produced by the online lookup (builder database plan, Task 4)
+    /// PubChem was not asked or did not answer: the online setting is off, the process has no
+    /// network (`--replay`, `--screenshot`, tests), or the lookup timed out or failed.
     Offline,
-    /// The online lookup is in flight.
+    /// The online lookup is in flight (or waiting out [`super::online::DEBOUNCE`]).
     LookingUp,
+    /// A record maps onto it, but the push apart could not clear its shape of the other fragments'
+    /// atoms within [`MAX_PUSH_PASSES`] (it is trapped between atoms that do not move), so it keeps
+    /// the embedding's positions rather than overlap them.
+    NoRoom,
 }
 
 /// Where one fragment's hand-off shape comes from (the footer's label).
@@ -70,10 +81,8 @@ pub enum Lookup {
     Found(Record, Vec<usize>),
     NotFound,
     /// Being looked up online.
-    #[allow(dead_code)] // produced by the online lookup (builder database plan, Task 4)
     Pending,
-    /// The online lookup failed.
-    #[allow(dead_code)] // produced by the online lookup (builder database plan, Task 4)
+    /// The online lookup failed, or was not allowed.
     Offline,
 }
 
@@ -82,8 +91,8 @@ pub trait RecordSource {
     fn find(&self, d: &Drawing, frag: &[usize]) -> Lookup;
 }
 
-/// The shipped list only (Task 4 adds the cache and PubChem): the first candidate with the
-/// fragment's formula and charge that maps exactly.
+/// The shipped list only ([`super::online::Layered`] adds the cache and PubChem): the first
+/// candidate with the fragment's formula and charge that maps exactly.
 pub struct LocalOnly<'a>(pub &'a Library);
 
 impl RecordSource for LocalOnly<'_> {
@@ -108,7 +117,12 @@ pub fn shape(d: &Drawing, src: &dyn RecordSource) -> Shaped {
 
 /// [`shape`] before the final centring, and whether any fragment matched (only then is it centred).
 fn place(d: &Drawing, src: &dyn RecordSource) -> (Vec<V3>, Vec<(Vec<usize>, FragmentSource)>, bool) {
-    let mut x = embed::embed(d);
+    place_from(d, src, embed::embed(d))
+}
+
+/// [`place`] from the whole drawing's embedding `x0` (the tests give one by hand).
+fn place_from(d: &Drawing, src: &dyn RecordSource, x0: Vec<V3>) -> (Vec<V3>, Vec<(Vec<usize>, FragmentSource)>, bool) {
+    let mut x = x0.clone();
     let mut sources = Vec::new();
     let mut groups = Vec::new(); // (fragment, matched)
     for frag in iso::fragments(d) {
@@ -133,21 +147,51 @@ fn place(d: &Drawing, src: &dyn RecordSource) -> (Vec<V3>, Vec<(Vec<usize>, Frag
         sources.push((frag.clone(), source));
         groups.push((frag, matched));
     }
-    let matched = groups.iter().any(|g| g.1);
-    if matched {
+    // R10 (a): a matched group the push cannot clear goes back to the embedding (honest, never an
+    // overlap), and the rest are pushed again; each round unmatches at least one group, so this ends
+    while groups.iter().any(|g| g.1) {
         push_apart(&mut x, &groups);
+        let pts = |g: &[usize]| g.iter().map(|&i| x[i]).collect::<Vec<V3>>();
+        let stuck: Vec<usize> = (0..groups.len())
+            .filter(|&a| groups[a].1 && (0..groups.len()).any(|b| b != a && closest(&pts(&groups[a].0), &pts(&groups[b].0)) < FRAGMENT_GAP))
+            .collect();
+        if stuck.is_empty() {
+            break;
+        }
+        for a in stuck {
+            for &i in &groups[a].0 {
+                x[i] = x0[i];
+            }
+            groups[a].1 = false;
+            if let Some(s) = sources.iter_mut().find(|s| s.0 == groups[a].0) {
+                s.1 = FragmentSource::Approximate(Why::NoRoom);
+            }
+        }
     }
+    let matched = groups.iter().any(|g| g.1);
     (x, sources, matched)
 }
 
-/// `m` is a one-to-one map of `frag` onto `r`'s atoms that keeps every element.
+/// `m` is a one-to-one map of `frag` onto `r`'s atoms that keeps every element and formal charge
+/// and takes every drawn bond of the fragment to a record bond (orders may differ: the Kekulé
+/// case, [`iso`]); a drawn bond leaving the fragment fails it. A source's answer is checked here
+/// whatever it claims, so a wrong one is never presented as the database's shape.
 fn valid_mapping(d: &Drawing, frag: &[usize], r: &Record, m: &[usize]) -> bool {
     let n = r.z.len();
-    if m.len() != frag.len() || n != frag.len() || r.xyz.len() != n {
+    if m.len() != frag.len() || n != frag.len() || r.xyz.len() != n || r.charge.len() != n {
         return false;
     }
     let mut used = vec![false; n];
-    frag.iter().zip(m).all(|(&a, &k)| k < n && !std::mem::replace(&mut used[k], true) && r.z[k] == d.atoms[a].z)
+    let atoms_agree = frag.iter().zip(m).all(|(&a, &k)| k < n && !std::mem::replace(&mut used[k], true) && r.z[k] == d.atoms[a].z && r.charge[k] == d.atoms[a].charge);
+    if !atoms_agree {
+        return false;
+    }
+    let image = |a: usize| frag.iter().position(|&x| x == a).map(|i| m[i]);
+    d.bonds.iter().all(|b| match (image(b.a), image(b.b)) {
+        (Some(p), Some(q)) => r.bonds.iter().any(|&(u, v, _)| (u, v) == (p, q) || (u, v) == (q, p)),
+        (None, None) => true,
+        _ => false,
+    })
 }
 
 /// The fragment's atoms at the record's shape (Bohr), its centroid where the embedding put the
@@ -231,7 +275,13 @@ pub fn fragment_label(s: &FragmentSource) -> String {
         FragmentSource::Approximate(Why::NotInDatabase) => "shape: approximate (not in the database) — Relax after recommended".into(),
         FragmentSource::Approximate(Why::LookingUp) => "looking up online…".into(),
         FragmentSource::Approximate(Why::Offline) => "shape: approximate (offline)".into(),
+        FragmentSource::Approximate(Why::NoRoom) => "shape: approximate (no room for the database shape) — Relax after recommended".into(),
     }
+}
+
+/// A fragment of `s` is still being looked up online: Insert and Replace wait (spec §7).
+pub fn looking_up(s: &Shaped) -> bool {
+    s.sources.iter().any(|(_, f)| *f == FragmentSource::Approximate(Why::LookingUp))
 }
 
 /// The footer's shape line (spec §8): one fragment's label, or for several the summary
@@ -494,6 +544,71 @@ pub(crate) mod tests {
         for m in [vec![0, 1], vec![0, 1, 1]] {
             let bad = By(move |_: &Drawing, _: &[usize]| Lookup::Found(water.clone(), m.clone()));
             assert_eq!(shape(&d, &bad).sources[0].1, FragmentSource::Approximate(Why::NotInDatabase));
+        }
+    }
+
+    /// R10 (b): the elements alone do not make a mapping. A same-element record whose O carries a
+    /// charge the drawing's does not, or whose bonds join other atoms than the drawn ones, is
+    /// refused, whatever its source claims.
+    #[test]
+    fn a_wrong_charge_or_bond_record_is_refused() {
+        let water = rec("water");
+        let mut d = Drawing::default();
+        draw_record(&mut d, water, [0.0, 0.0], &identity(3));
+        let mut charged = water.clone();
+        charged.charge[0] = -1;
+        let wrong_charge = By(|_: &Drawing, _: &[usize]| Lookup::Found(charged.clone(), identity(3)));
+        let s = shape(&d, &wrong_charge);
+        assert_eq!(s.sources[0].1, FragmentSource::Approximate(Why::NotInDatabase));
+        assert_eq!(s.positions, embed::embed(&d));
+        // H–O–H drawn, the "record" bonded O–H and H–H: same elements, same bond count
+        let mut rewired = water.clone();
+        rewired.bonds = vec![(0, 1, 1), (1, 2, 1)];
+        let wrong_bonds = By(|_: &Drawing, _: &[usize]| Lookup::Found(rewired.clone(), identity(3)));
+        assert_eq!(shape(&d, &wrong_bonds).sources[0].1, FragmentSource::Approximate(Why::NotInDatabase));
+        // the record as it is still maps
+        let right = By(|_: &Drawing, _: &[usize]| Lookup::Found(water.clone(), identity(3)));
+        assert!(matches!(shape(&d, &right).sources[0].1, FragmentSource::PubChem { .. }));
+    }
+
+    /// R10 (a): a matched fragment that the push cannot clear of two lone atoms on either side of it
+    /// (exactly in line, so every push is along that line and the pushes undo each other) goes back
+    /// to the embedding's positions, labelled approximate — never handed off overlapping them.
+    #[test]
+    fn a_fragment_trapped_between_two_lone_atoms_falls_back() {
+        // Na · H–H · Na, the embedding given by hand: the Nas 5 Bohr apart, the H₂ between them
+        let mut d = Drawing::default();
+        let a = d.add_atom(11, [0.0, 0.0]);
+        let h1 = d.add_atom(1, [1.0, 0.0]);
+        let h2 = d.add_atom(1, [2.0, 0.0]);
+        let b = d.add_atom(11, [3.0, 0.0]);
+        d.bond(h1, h2);
+        let x0: Vec<V3> = vec![[-2.5, 0.0, 0.0], [-0.7, 0.0, 0.0], [0.7, 0.0, 0.0], [2.5, 0.0, 0.0]];
+        // a record of H₂ (0.74 Å) that every lookup returns
+        let h2rec = Record {
+            name: "hydrogen".into(),
+            synonyms: vec![],
+            source: Source::PubChem { cid: 783 },
+            z: vec![1, 1],
+            charge: vec![0, 0],
+            bonds: vec![(0, 1, 1)],
+            xyz: vec![[-0.37, 0.0, 0.0], [0.37, 0.0, 0.0]],
+            xy: vec![[-0.5, 0.0], [0.5, 0.0]],
+            stereo_defined: false,
+        };
+        let src = By(|d: &Drawing, f: &[usize]| found_or(d, f, &h2rec, Lookup::NotFound));
+        let (x, sources, matched) = place_from(&d, &src, x0.clone());
+        assert_eq!(sources, vec![(vec![h1, h2], FragmentSource::Approximate(Why::NoRoom))]);
+        assert!(!matched, "nothing is left matched: no centring");
+        assert_eq!(x.iter().map(|p| p.map(f64::to_bits)).collect::<Vec<_>>(), x0.iter().map(|p| p.map(f64::to_bits)).collect::<Vec<_>>(), "the embedding, bit for bit");
+        assert_eq!(fragment_label(&sources[0].1), "shape: approximate (no room for the database shape) — Relax after recommended");
+        // with room (the Nas 12 Bohr apart) the same fragment takes the record's shape
+        let roomy: Vec<V3> = vec![[-6.0, 0.0, 0.0], [-0.7, 0.0, 0.0], [0.7, 0.0, 0.0], [6.0, 0.0, 0.0]];
+        let (x, sources, matched) = place_from(&d, &src, roomy);
+        assert!(matched && matches!(sources[0].1, FragmentSource::PubChem { cid: 783, .. }));
+        assert!((dist(x[h1], x[h2]) - units::angstrom_to_bohr(0.74)).abs() < 1e-9);
+        for lone in [a, b] {
+            assert!(dist(x[lone], x[h1]).min(dist(x[lone], x[h2])) >= FRAGMENT_GAP);
         }
     }
 }

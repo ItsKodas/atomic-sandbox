@@ -177,6 +177,9 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, acts:
     if close {
         st.builder.open = false;
         st.builder.gesture = Gesture::None;
+    } else if st.builder.lookup.busy() {
+        // the lookups' answers and timeouts arrive without input: keep the frames coming
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 }
 
@@ -269,6 +272,8 @@ fn palette_column(ui: &mut Ui, st: &mut UiState) {
             b.redo();
         }
     });
+    ui.add_space(10.0);
+    ui.checkbox(&mut b.online, RichText::new(ONLINE_LABEL).size(12.5)).on_hover_text(ONLINE_TIP);
 }
 
 /// Picking an element switches to the Atom tool (as the toolbar's chips switch to Place).
@@ -742,9 +747,15 @@ struct HandoffGeometry {
     reach_insert: f64,
 }
 
+/// [`geometry_of`] the shape `src` gives (tests).
+#[cfg(test)]
 fn handoff_geometry(b: &mut Builder, src: &dyn super::shape::RecordSource, existing: &[[f64; 3]]) -> HandoffGeometry {
+    geometry_of(b.shaped_from(src).positions.clone(), existing)
+}
+
+/// The hand-off's geometry from the shape it sends, `new`.
+fn geometry_of(new: Vec<[f64; 3]>, existing: &[[f64; 3]]) -> HandoffGeometry {
     use super::{embed, max_abs};
-    let new = b.shaped_from(src).positions.clone();
     let mut beside = new.clone();
     embed::place_beside(existing, &mut beside);
     HandoffGeometry { reach_replace: max_abs(&new), reach_insert: max_abs(&beside).max(max_abs(existing)), new, beside }
@@ -765,7 +776,9 @@ fn handoff_rows(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
     let scene = input.scene;
     let (n0, h0) = (scene.grid_n, scene.grid_h);
     let existing: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
-    let HandoffGeometry { new, beside, reach_replace, reach_insert } = handoff_geometry(b, &super::shape::LocalOnly(super::records::Library::shipped()), &existing);
+    let shaped = b.shaped();
+    let looking = super::shape::looking_up(shaped);
+    let HandoffGeometry { new, beside, reach_replace, reach_insert } = geometry_of(shaped.positions.clone(), &existing);
     // the walls of a grid: today's on the grid now, else the default for that cell
     let walls_of = |n: usize, h: f64| -> Option<f64> {
         walls_on.then(|| if (n, h) == (n0, h0) { wall_now } else { crate::ui::default_wall_half_width(&crate::scene::Scene { grid_n: n, grid_h: h, ..scene.clone() }) })
@@ -846,9 +859,15 @@ fn handoff_rows(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
                 (true, fit_r, "Replace scene", "a new scene of these atoms (the grid, walls and ionic potential kept; time restarts)"),
                 (false, fit_i, "Insert into scene", "add these atoms beside the scene's (3 Bohr apart at least)"),
             ] {
-                let can = !matches!(fit, Fit::No { .. });
+                let (can, label) = handoff_button(replace, label, !matches!(fit, Fit::No { .. }), looking);
                 let r = ui.add_enabled(can, egui::Button::new(RichText::new(label).strong()).min_size(Vec2::new(130.0, 30.0)));
-                let r = if can { r.on_hover_text(tip) } else { r.on_disabled_hover_text("does not fit the box: enlarge it first") };
+                let r = if can {
+                    r.on_hover_text(tip)
+                } else if looking {
+                    r.on_disabled_hover_text("waiting for PubChem's shape (at most 5 s); the drawing stays editable")
+                } else {
+                    r.on_disabled_hover_text("does not fit the box: enlarge it first")
+                };
                 if r.clicked() {
                     if !marks.is_empty() && armed != Some(replace) {
                         b.armed = Some((replace, b.drawing.clone()));
@@ -873,6 +892,22 @@ fn handoff_rows(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
     });
     sent
 }
+
+/// Insert's or Replace's button (spec §7): pressable when the shape fits the box and no fragment is
+/// still being looked up online; while one is, it reads "Insert (looking up…)" / "Replace (looking
+/// up…)" until the answer comes or the lookup times out. `label` is the button's usual text.
+fn handoff_button(replace: bool, label: &'static str, fits: bool, looking: bool) -> (bool, &'static str) {
+    let text = match (looking, replace) {
+        (true, true) => "Replace (looking up…)",
+        (true, false) => "Insert (looking up…)",
+        (false, _) => label,
+    };
+    (fits && !looking, text)
+}
+
+/// The online setting's label and tooltip (spec §7).
+pub const ONLINE_LABEL: &str = "Look up molecules online (PubChem)";
+pub const ONLINE_TIP: &str = "sends the molecule's name or structure string to NCBI's PubChem; off: no network";
 
 /// The enlarge offer's margin, in words.
 const ENLARGE_MARGIN_TEXT: &str = "4 Bohr to spare from the farthest atom to the box";
@@ -918,6 +953,43 @@ mod tests {
         // so an 81³ × 0.15 box that holds the embedding does not hold it
         let lim = fit_limit(81, 0.15, None);
         assert!(max_abs(&embedded) <= lim && g.reach_replace > lim, "{} / {} / {lim}", max_abs(&embedded), g.reach_replace);
+    }
+
+    /// Spec §7: while a fragment is being looked up, Insert and Replace wait, saying so; the lookup
+    /// timing out (the clock moved by hand past [`super::super::online::TIMEOUT`]) enables them with
+    /// the offline label.
+    #[test]
+    fn insert_waits_while_looking_up() {
+        use super::super::online::{tests as net, Cache, Lookups, Session, DEBOUNCE, TIMEOUT};
+        use super::super::shape::{footer_label, looking_up};
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+        let clock = net::ManualClock::new();
+        // PubChem never answers: the gate stays shut until the end of the test
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let canned = net::Canned::new(net::ethane_answers("CC"));
+        let lookups = Lookups::with_clock(Box::new(net::Gate { inner: canned.clone(), open: gate.clone() }), Cache::none(), clock.clone());
+        let mut b = Builder::default();
+        b.lookup = Session::with(lookups, Cache::none(), clock.clone());
+        b.drawing = net::ethane(false);
+        let buttons = |s: &super::super::shape::Shaped| [handoff_button(false, "Insert into scene", true, looking_up(s)), handoff_button(true, "Replace scene", true, looking_up(s))];
+        // waiting out the debounce, then asked and waiting for the answer
+        for step in [Duration::ZERO, DEBOUNCE, TIMEOUT - Duration::from_millis(1)] {
+            clock.advance(step);
+            let s = b.shaped().clone();
+            assert_eq!(footer_label(&s), "looking up online…");
+            assert_eq!(buttons(&s), [(false, "Insert (looking up…)"), (false, "Replace (looking up…)")]);
+            assert!(b.lookup.busy(), "the window keeps repainting");
+        }
+        // five seconds after it was asked: offline, and the buttons are back
+        clock.advance(Duration::from_millis(1));
+        let s = b.shaped().clone();
+        assert_eq!(footer_label(&s), "shape: approximate (offline)");
+        assert_eq!(buttons(&s), [(true, "Insert into scene"), (true, "Replace scene")]);
+        assert!(!b.lookup.busy());
+        // a shape that does not fit still disables them, with their usual text
+        assert_eq!(handoff_button(false, "Insert into scene", false, false), (false, "Insert into scene"));
+        net::open_gate(&gate);
     }
 
     /// The Atom tool as the user asked for it (2026-10-20): click places a lone atom and selects it,
