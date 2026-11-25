@@ -577,54 +577,109 @@ $$$$
         }
     }
 
-    /// R14 (Task 6 review): what a record's name says about its charge and electrons. No radical
-    /// (an even electron count); a charged record has an ion's name of its sign
-    /// ([`charge_fits_name`]); and every name in the list's ion section is charged with the sign its
-    /// name says. A title check cannot see a neutral name on a charged record (CID 6327637, the
-    /// cation PubChem gives for "dimethylphosphine oxide").
+    /// R14 (Task 6 review and re-review): what a record's name says about its charge and electrons,
+    /// by [`charge_fits_name`] for every shipped record, with "in the ion section" read off the
+    /// name list ([`ion_section`]); and every name in the ion section is shipped. A title check
+    /// cannot see a neutral name on a charged record (CID 6327637, the cation PubChem gives for
+    /// "dimethylphosphine oxide").
     #[test]
     fn every_charge_fits_its_name() {
         let lib = Library::shipped();
-        for r in lib.records() {
-            charge_fits_name(&r.name, &r.z, &r.charge).unwrap_or_else(|e| panic!("{}: {e}", r.name));
-        }
-        let names = include_str!("../../data/molecule-names.txt");
-        let section = names.split("# ── ions").nth(1).expect("the ion section").split("\n# ──").next().unwrap();
-        let ions: Vec<&str> = section.lines().skip(1).map(|l| l.split('|').next().unwrap().trim()).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+        let ions = ion_section(include_str!("../../data/molecule-names.txt"));
         assert!(ions.len() >= 40, "{} ion names", ions.len());
-        for name in ions {
-            let r = lib.records().iter().find(|r| r.name == name).unwrap_or_else(|| panic!("{name} is not shipped"));
-            let q: i32 = r.charge.iter().map(|&c| c as i32).sum();
-            let want = if is_cation_name(name) { 1 } else { -1 };
-            assert_eq!(q.signum(), want, "{name}: net charge {q:+}");
+        for r in lib.records() {
+            charge_fits_name(&r.name, ions.contains(r.name.as_str()), &r.z, &r.charge).unwrap_or_else(|e| panic!("{}: {e}", r.name));
+        }
+        for name in &ions {
+            assert!(lib.records().iter().any(|r| r.name == *name), "{name} is in the ion section but not shipped");
         }
     }
 
-    /// A cation's name: `…ium`, the choline family (quaternary ammonium) or `… cation`.
-    pub(super) fn is_cation_name(name: &str) -> bool {
-        let n = name.to_lowercase();
-        n.ends_with("ium") || n.ends_with("choline") || n.ends_with(" cation")
+    /// The rule refuses what it is for: a charge under a neutral name outside the ion section
+    /// (whatever the name's ending), a neutral record or the wrong sign in the ion section, and a
+    /// radical.
+    #[test]
+    fn the_charge_rule_refuses_mismatches() {
+        // Σ Z = 11 (NH4): even at ±1; Σ Z = 10 (CH4): even when neutral
+        let (ion_z, closed_z) = ([7u8, 1, 1, 1, 1], [6u8, 1, 1, 1, 1]);
+        let (plus, minus, zero) = ([1i8, 0, 0, 0, 0], [-1i8, 0, 0, 0, 0], [0i8; 5]);
+        // outside the ion section a charge needs "… cation" / "… anion"; -ium/-ate/-ide endings do not do
+        assert!(charge_fits_name("phosphocholine", false, &ion_z, &plus).is_err());
+        assert!(charge_fits_name("methyl acetate", false, &ion_z, &minus).is_err());
+        assert!(charge_fits_name("dimethylphosphine oxide", false, &ion_z, &plus).is_err());
+        assert!(charge_fits_name("hydrogen peroxide", false, &ion_z, &minus).is_err());
+        assert!(charge_fits_name("anilinium", false, &ion_z, &plus).is_err(), "an -ium name outside the ion section");
+        assert_eq!(charge_fits_name("phosphocholine cation", false, &ion_z, &plus), Ok(()));
+        assert_eq!(charge_fits_name("benzoic acid anion", false, &ion_z, &minus), Ok(()));
+        assert!(charge_fits_name("phosphocholine cation", false, &ion_z, &minus).is_err(), "the wrong sign");
+        assert!(charge_fits_name("phosphocholine cation", false, &closed_z, &zero).is_err(), "a cation's name on a neutral record");
+        assert_eq!(charge_fits_name("methyl acetate", false, &closed_z, &zero), Ok(()));
+        // in the ion section: charged, with the sign the name says
+        assert_eq!(charge_fits_name("acetate", true, &ion_z, &minus), Ok(()));
+        assert_eq!(charge_fits_name("anilinium", true, &ion_z, &plus), Ok(()));
+        assert_eq!(charge_fits_name("choline", true, &ion_z, &plus), Ok(()));
+        assert!(charge_fits_name("acetate", true, &ion_z, &plus).is_err(), "the wrong sign");
+        assert!(charge_fits_name("anilinium", true, &ion_z, &minus).is_err(), "the wrong sign");
+        assert!(charge_fits_name("malonate", true, &closed_z, &zero).is_err(), "a neutral record in the ion section");
+        // a radical, anywhere: CH3 (9 electrons), CH4+ (9)
+        assert!(charge_fits_name("methyl", false, &[6, 1, 1, 1], &[0; 4]).is_err());
+        assert!(charge_fits_name("methanium", true, &closed_z, &plus).is_err());
+        // the ion section read off a list
+        let list = "# head\nwater\n# ── ions with a 3D record ──\nammonium | 223\nacetate\n\n# ── alkanes ──\nmethane\n";
+        assert_eq!(ion_section(list), HashSet::from(["ammonium", "acetate"]));
     }
 
-    /// An anion's name: `…ate`, `…ite`, `…ide` or `… anion`.
-    fn is_anion_name(name: &str) -> bool {
-        let n = name.to_lowercase();
-        ["ate", "ite", "ide", " anion"].iter().any(|s| n.ends_with(s))
+    /// The names under the name list's `# ── ions …` header, up to the next `# ──` header.
+    pub(super) fn ion_section(list: &str) -> HashSet<&str> {
+        let mut inside = false;
+        let mut out = HashSet::new();
+        for l in list.lines().map(str::trim) {
+            if l.starts_with("# ──") {
+                inside = is_ion_header(l);
+            } else if inside && !l.is_empty() && !l.starts_with('#') {
+                out.insert(l.split('|').next().unwrap().trim());
+            }
+        }
+        out
     }
 
-    /// R14's rule for one record: an even electron count (Σ Z minus the net charge; no radical),
-    /// and a net charge only under a name of its sign ([`is_cation_name`], [`is_anion_name`]). A
-    /// neutral record may have any name (esters end in -ate, amides in -ide).
-    pub(super) fn charge_fits_name(name: &str, z: &[u8], charge: &[i8]) -> Result<(), String> {
+    /// The name list's ion section header (`# ── ions with a 3D record ──`).
+    pub(super) fn is_ion_header(line: &str) -> bool {
+        line.starts_with("# ── ions")
+    }
+
+    /// R14's rule for one record (re-review): an even electron count (Σ Z minus the net charge; no
+    /// radical); a record in the list's ion section is charged, positive under `…ium`, the choline
+    /// family (quaternary ammonium) or `… cation`, negative otherwise; a record outside it is
+    /// neutral unless its name ends in `" cation"` (positive) or `" anion"` (negative). Name endings
+    /// alone decide nothing outside the ion section: hundreds of neutral names end in -ate, -ide or
+    /// -ium-free -choline.
+    pub(super) fn charge_fits_name(name: &str, in_ion_section: bool, z: &[u8], charge: &[i8]) -> Result<(), String> {
         let q: i32 = charge.iter().map(|&c| c as i32).sum();
         let electrons = z.iter().map(|&z| z as i32).sum::<i32>() - q;
         if electrons % 2 != 0 {
             return Err(format!("{electrons} electrons: a radical"));
         }
-        match q.signum() {
-            1 if !is_cation_name(name) => Err(format!("net charge {q:+} under a name that is not a cation's")),
-            -1 if !is_anion_name(name) => Err(format!("net charge {q:+} under a name that is not an anion's")),
-            _ => Ok(()),
+        let n = name.to_lowercase();
+        let want = if in_ion_section {
+            if n.ends_with("ium") || n.ends_with("choline") || n.ends_with(" cation") {
+                1
+            } else {
+                -1
+            }
+        } else if n.ends_with(" cation") {
+            1
+        } else if n.ends_with(" anion") {
+            -1
+        } else {
+            0
+        };
+        if q.signum() == want {
+            Ok(())
+        } else if in_ion_section {
+            Err(format!("net charge {q:+} in the ion section, where the name says {}", if want > 0 { "a cation" } else { "an anion" }))
+        } else {
+            Err(format!("net charge {q:+} outside the ion section under a name that says {}", ["an anion", "no charge", "a cation"][(want + 1) as usize]))
         }
     }
 
@@ -777,8 +832,8 @@ $$$$
 /// skips, and reports, an entry whose name PubChem does not know, that has no 3D record, has Z > 18
 /// or more than [`MAX_ATOMS`] atoms, whose 2D graph does not map onto its 3D graph
 /// ([`super::iso::map_fragment`]), that fails [`Record::validate`], whose charge or electron count
-/// does not fit its name (`tests::charge_fits_name`, R14), or that repeats an earlier CID
-/// or name. The records are written in the list's order, then the old file's `lira` rows as they
+/// does not fit its name and its section of the list (`tests::charge_fits_name`, R14), or that
+/// repeats an earlier CID or name. The records are written in the list's order, then the old file's `lira` rows as they
 /// were. It commits nothing; review its report. Answers are kept under `target/pubchem-generator/`
 /// (one file a URL, a 404 too), so a rerun after editing the list asks only for what is new.
 #[cfg(test)]
@@ -864,7 +919,7 @@ mod generate {
     }
 
     /// One list entry made into a record, with PubChem's own title for the review; or why not.
-    fn entry(f: &mut Fetcher, name: &str, cid: Option<u64>, seen: &HashMap<u64, String>, warnings: &mut Vec<String>) -> Result<(Record, String), String> {
+    fn entry(f: &mut Fetcher, name: &str, cid: Option<u64>, in_ion_section: bool, seen: &HashMap<u64, String>, warnings: &mut Vec<String>) -> Result<(Record, String), String> {
         let net = |e: NetError| format!("network: {e:?}");
         let cid = match cid {
             Some(c) => c,
@@ -918,7 +973,7 @@ mod generate {
         }
         r.validate().map_err(|e| format!("does not validate (CID {cid}: {e})"))?;
         // R14: a title check cannot see a neutral name on a charged record
-        super::tests::charge_fits_name(name, &r.z, &r.charge).map_err(|e| format!("the charge does not fit the name (CID {cid}: {e})"))?;
+        super::tests::charge_fits_name(name, in_ion_section, &r.z, &r.charge).map_err(|e| format!("the charge does not fit the name (CID {cid}: {e})"))?;
         Ok((r, title))
     }
 
@@ -950,7 +1005,12 @@ mod generate {
         let mut f = Fetcher { t: UreqTransport::new(), last: None, dir, sent: 0 };
         let (mut kept, mut skipped, mut review) = (Vec::new(), Vec::new(), String::new());
         let (mut seen, mut names_seen): (HashMap<u64, String>, HashSet<String>) = (HashMap::new(), HashSet::new());
+        // the name list's section: its ion section's names must be ions (R14)
+        let mut in_ion_section = false;
         for (no, line) in names.lines().enumerate().map(|(i, l)| (i + 1, l.trim())) {
+            if line.starts_with("# ──") {
+                in_ion_section = super::tests::is_ion_header(line);
+            }
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
@@ -962,7 +1022,7 @@ mod generate {
                 skipped.push((name.to_string(), "the name again".to_string()));
                 continue;
             }
-            match entry(&mut f, name, cid, &seen, &mut warnings) {
+            match entry(&mut f, name, cid, in_ion_section, &seen, &mut warnings) {
                 Ok((r, title)) => {
                     let Source::PubChem { cid } = r.source else { unreachable!() };
                     let (formula, q) = r.formula_key();
