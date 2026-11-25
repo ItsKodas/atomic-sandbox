@@ -303,31 +303,28 @@ fn search_box(ui: &mut Ui, b: &mut Builder) {
     let small = |ui: &mut Ui, text: &str| {
         ui.label(RichText::new(text).size(11.5).color(theme::INK_FAINT));
     };
+    // PubChem's answer, once it came: its new rows take the lowest-ranked local rows' places (8 in all)
+    let answered: Option<Vec<super::search::Hit>> = if online_row { b.online_hits().map(<[_]>::to_vec) } else { None };
+    let (shown, fresh) = match &answered {
+        Some(hits) => super::search::combined_rows(&local, hits),
+        None => (local.iter().collect(), Vec::new()),
+    };
     egui::ScrollArea::vertical().id_salt("builder-search-results").max_height(240.0).auto_shrink([false, true]).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 3.0;
-        for h in &local {
+        for h in shown.iter().chain(&fresh) {
             if result_row(ui, h).clicked() {
                 pick = h.record.clone();
             }
         }
-        if local.is_empty() {
+        if local.is_empty() && fresh.is_empty() {
             small(ui, NO_LOCAL);
         }
         if !online_row {
             return;
         }
-        if let Some(hits) = b.online_hits() {
-            let (rows, more) = super::search::online_rows(&local, hits);
-            if rows.is_empty() && more == 0 {
+        if let Some(hits) = &answered {
+            if fresh.is_empty() {
                 small(ui, if hits.is_empty() { "no results on PubChem" } else { "nothing more on PubChem" });
-            }
-            for h in rows {
-                if result_row(ui, h).clicked() {
-                    pick = h.record.clone();
-                }
-            }
-            if more > 0 {
-                small(ui, &format!("{more} more on PubChem: narrow the search"));
             }
         } else if b.search_waiting() {
             small(ui, "searching PubChem…");

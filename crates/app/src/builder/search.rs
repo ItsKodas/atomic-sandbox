@@ -21,11 +21,12 @@
 //! **Online** (spec §7): "Search PubChem for '…'" is offered only with the builder's online setting
 //! on and PubChem reachable ([`super::online::Session::can_search`]: [`super::online::network_allowed`] for the
 //! app's transport, so never in a test build, a replay or a screenshot), and only the user's
-//! click (or Enter with no local result) asks it, and only while the local results are fewer than
-//! [`MAX_RESULTS`]. A name goes to PubChem's name endpoint as folded, a formula as the user typed
-//! it (trimmed: not the `^` notation, [`online_query`]), a CID to its compound; the answer is
-//! listed below the local results (duplicates by CID left out, the whole list at most
-//! [`MAX_RESULTS`], [`online_rows`]), and a failure is one short line, never a toast. The setting
+//! click (or Enter with no local result) asks it, and only while no local result is an exact match
+//! ([`is_exact`]). A name goes to PubChem's name endpoint as folded, a formula in the user's case
+//! but plain ASCII (not the `^` notation, [`online_query`]), a CID to its compound; the answer is
+//! listed below the local results (duplicates by CID left out, in place of the lowest-ranked local
+//! rows: the whole list at most [`MAX_RESULTS`], [`combined_rows`]), and a failure is one short
+//! line, never a toast. The setting
 //! going off stops a search in flight before its next request ([`Builder::poll_search`]). A name holding `/` is sent
 //! percent-encoded (`%2F`) in the path segment, which PubChem often refuses: that is a 4xx, read as
 //! "no results on PubChem" (PUG REST's POST form would carry it, but the transport is GET-only).
@@ -93,6 +94,16 @@ impl Hit {
 /// and signs as `^` and their ASCII (`SO₄²⁻` → `SO4^2-`), U+2212 as `-`, control characters
 /// dropped, whitespace runs as one space, trimmed.
 pub fn fold(q: &str) -> String {
+    fold_marked(q, true)
+}
+
+/// [`fold`] with the superscripts as plain ASCII, no `^` (`SO₄²⁻` → `SO42-`): what a formula query
+/// sends to PubChem.
+pub fn plain(q: &str) -> String {
+    fold_marked(q, false)
+}
+
+fn fold_marked(q: &str, caret: bool) -> String {
     let mut out = String::with_capacity(q.len());
     let (mut sup, mut space) = (false, false);
     for c in q.chars() {
@@ -117,7 +128,7 @@ pub fn fold(q: &str) -> String {
             out.push(' ');
         }
         space = false;
-        if is_sup && !sup {
+        if caret && is_sup && !sup {
             out.push('^');
         }
         sup = is_sup;
@@ -352,23 +363,30 @@ fn bounds(p: impl Iterator<Item = [f32; 2]>) -> Option<([f32; 2], [f32; 2])> {
 }
 
 /// What the online search sends for the box's text: as [`parse_query`] reads it, except that a
-/// formula goes as the user typed it, trimmed (PubChem's synonyms are "H2O", not our `^` notation).
+/// formula goes as the user wrote it — its case kept, but in plain ASCII ([`plain`]: `H₂O` →
+/// `H2O`, `SO₄²⁻` → `SO42-`, never our `^` notation; PubChem's synonyms are written so).
 pub fn online_query(q: &str) -> Query {
     match parse_query(q) {
-        Query::Formula(_) => Query::Formula(q.trim().to_string()),
+        Query::Formula(_) => Query::Formula(plain(q)),
         other => other,
     }
 }
 
-/// The online answer's rows under the local ones (spec §8: the whole list at most
-/// [`MAX_RESULTS`]): the hits whose CID the local list does not hold, as many as fit, and how many
-/// more did not fit.
-pub fn online_rows<'a>(local: &[Hit], online: &'a [Hit]) -> (Vec<&'a Hit>, usize) {
+/// A local hit answers the query exactly (rank 0: its name, or its CID): then there is nothing to
+/// ask PubChem for.
+pub fn is_exact(q: &str, h: &Hit) -> bool {
+    let key = fold(q).to_lowercase();
+    !key.is_empty() && (h.name.to_lowercase() == key || matches!((parse_query(q), h.cid()), (Query::Cid(c), Some(d)) if c == d))
+}
+
+/// The list the box shows once PubChem answered (spec §8: at most [`MAX_RESULTS`] rows): PubChem's
+/// hits whose CID the local list does not hold, in place of the lowest-ranked local rows; the local
+/// rows kept, then PubChem's.
+pub fn combined_rows<'a>(local: &'a [Hit], online: &'a [Hit]) -> (Vec<&'a Hit>, Vec<&'a Hit>) {
     let seen: Vec<u64> = local.iter().filter_map(Hit::cid).collect();
-    let fresh: Vec<&Hit> = online.iter().filter(|h| h.cid().is_none_or(|c| !seen.contains(&c))).collect();
-    let room = MAX_RESULTS.saturating_sub(local.len()).min(fresh.len());
-    let more = fresh.len() - room;
-    (fresh.into_iter().take(room).collect(), more)
+    let fresh: Vec<&Hit> = online.iter().filter(|h| h.cid().is_none_or(|c| !seen.contains(&c))).take(MAX_RESULTS).collect();
+    let keep = MAX_RESULTS - fresh.len();
+    (local.iter().take(keep).collect(), fresh)
 }
 
 /// The PubChem search asked for one query: its id, when, and how it went.
@@ -456,15 +474,17 @@ impl Builder {
         &self.search.local.as_ref().expect("just made").1
     }
 
-    /// Whether the box offers "Search PubChem for '…'" (module doc): a query to send, fewer local
-    /// results than [`MAX_RESULTS`] (spec §7), the online setting on and PubChem reachable.
+    /// Whether the box offers "Search PubChem for '…'" (module doc): a query to send, no exact local
+    /// hit ([`is_exact`]: however many prefix or substring hits there are, the molecule asked for may
+    /// not be among them), the online setting on and PubChem reachable.
     pub fn can_search_online(&mut self) -> bool {
         let sendable = match online_query(&self.search_query) {
             Query::Empty => false,
             Query::Cid(_) => true,
             Query::Name(s) | Query::Formula(s) => s.len() <= MAX_NAME,
         };
-        sendable && self.search_hits().len() < MAX_RESULTS && self.lookup.can_search(self.online)
+        let q = self.search_query.clone();
+        sendable && !self.search_hits().iter().any(|h| is_exact(&q, h)) && self.lookup.can_search(self.online)
     }
 
     /// Asks PubChem for the box's text (a later ask supersedes it: one still running stops before
@@ -687,8 +707,10 @@ pub(crate) mod tests {
         assert_eq!(parse_query("SO₄²⁻"), Query::Formula("SO4^2-".into()), "a superscript charge stays a charge");
         assert_eq!(parse_query("H2Oü"), Query::Name("H2Oü".into()));
         // review M3: a formula goes online as typed (trimmed), never in the internal notation
-        assert_eq!(online_query(" SO₄²⁻ "), Query::Formula("SO₄²⁻".into()));
-        assert_eq!(online_query("h2o"), Query::Formula("h2o".into()));
+        assert_eq!(online_query(" SO₄²⁻ "), Query::Formula("SO42-".into()));
+        assert_eq!(online_query("H₂O"), Query::Formula("H2O".into()));
+        assert_eq!(online_query("h2o"), Query::Formula("h2o".into()), "the user's case kept");
+        assert_eq!(online_query("NH\u{2084}\u{207A}\u{0}"), Query::Formula("NH4+".into()), "a control character dropped");
         assert_eq!(online_query("ethyl  alcohol"), Query::Name("ethyl alcohol".into()));
         for q in ["H₂O", "h2o", "H2O", "OH2"] {
             assert_eq!(names(&local(q)), ["water"], "{q}");
@@ -719,7 +741,8 @@ pub(crate) mod tests {
         }
         assert!(urls.iter().any(|u| u.contains("compound/cid/702/")), "{urls:?}");
         assert!(urls.contains(&name_url("a/b")) && name_url("a/b").contains("compound/name/a%2Fb/cids/TXT"), "{urls:?}");
-        assert!(urls.contains(&name_url("h2o")) && urls.contains(&name_url("H₂O")) && urls.contains(&name_url("SO₄²⁻")), "formulas as typed: {urls:?}");
+        assert!(urls.contains(&name_url("h2o")) && urls.contains(&name_url("H2O")) && urls.contains(&name_url("SO42-")), "formulas in plain ASCII: {urls:?}");
+        assert!(!urls.iter().any(|u| u.contains("%E2%82")), "no Unicode subscript sent: {urls:?}");
         assert!(!urls.iter().any(|u| u.contains(&long)), "a name past MAX_NAME is not sent");
     }
 
@@ -730,19 +753,35 @@ pub(crate) mod tests {
         let lib = test_library().records();
         let local: Vec<Hit> = lib[..6].iter().map(|r| Hit::of(r, "shipped")).collect();
         let online: Vec<Hit> = std::iter::once(Hit::of(&lib[0], "PubChem")).chain((0..4).map(|i| Hit::of(&fake("x", &[], 90 + i, &[6], 0), "PubChem"))).collect();
-        let (rows, more) = online_rows(&local, &online);
-        assert_eq!((rows.iter().map(|h| h.cid()).collect::<Vec<_>>(), more), (vec![Some(90), Some(91)], 2));
-        let (rows, more) = online_rows(&local[..1], &online[..1]);
-        assert_eq!((rows.len(), more), (0, 0), "only a duplicate");
-        // with 8 local results there is nothing to ask PubChem for (spec §7)
-        let mut b = Builder { search_query: "ethyl".into(), ..Default::default() };
-        let many = Box::leak(Box::new(Library::from_records((0..9).map(|i| fake(&format!("ethyl {i}"), &[], 1000 + i, &[6], 0)).collect())));
-        b.search.library = Some(many);
+        // 6 local, 4 fresh from PubChem: the 2 lowest local rows give way
+        let (kept, rows) = combined_rows(&local, &online);
+        assert_eq!(rows.iter().map(|h| h.cid()).collect::<Vec<_>>(), [Some(90), Some(91), Some(92), Some(93)]);
+        assert_eq!(names(&kept.into_iter().cloned().collect::<Vec<_>>()), names(&local[..4]), "the best-ranked local rows stay");
+        let (kept, rows) = combined_rows(&local[..1], &online[..1]);
+        assert_eq!((kept.len(), rows.len()), (1, 0), "only a duplicate");
+        // fresh PubChem rows past MAX_RESULTS: the list is PubChem's alone, still at most 8
+        let flood: Vec<Hit> = (0..10).map(|i| Hit::of(&fake("y", &[], 200 + i, &[6], 0), "PubChem")).collect();
+        let (kept, rows) = combined_rows(&local, &flood);
+        assert_eq!((kept.len(), rows.len()), (0, MAX_RESULTS));
+    }
+
+    /// Fix round 2: a large list whose names all contain the query, none exactly, still offers
+    /// PubChem (the molecule asked for may not be among them); an exact local hit does not.
+    #[test]
+    fn a_crowded_query_without_an_exact_hit_still_offers_pubchem() {
+        let many = Box::leak(Box::new(Library::from_records((0..9).map(|i| fake(&format!("{i}-ethyl-x"), &[], 1000 + i, &[6], 0)).collect())));
         let clock = ManualClock::new();
+        let mut b = Builder { search_query: "ethyl".into(), ..Default::default() };
+        b.search.library = Some(many);
         b.lookup = Session::with(Lookups::with_clock(Box::new(Canned::new(Default::default())), Cache::none(), clock.clone()), Cache::none(), clock);
-        assert!(!b.can_search_online());
-        b.search_query = "ethyl 1".into();
-        assert!(b.can_search_online());
+        assert_eq!(b.search_hits().len(), MAX_RESULTS, "a full local list");
+        assert!(b.can_search_online(), "no exact hit: PubChem is offered");
+        b.search_query = "3-ethyl-x".into();
+        assert!(!b.can_search_online(), "an exact name: nothing to ask");
+        b.search_query = "1003".into();
+        assert!(!b.can_search_online(), "an exact CID: nothing to ask");
+        b.search_query = "1003 ".into();
+        assert!(!b.can_search_online(), "padding changes nothing");
     }
 
     /// A builder searching [`test_library`] through a session whose PubChem is `t`, the window's

@@ -530,6 +530,10 @@ impl Net {
             let wait = (last + MIN_INTERVAL).saturating_duration_since(self.clock.now());
             if !wait.is_zero() {
                 self.clock.sleep(wait);
+                // the network forbidden, or the job superseded, during the wait: nothing goes out
+                if !self.reachable() || self.stale() {
+                    return Err(NetError::Offline);
+                }
             }
         }
         let now = self.clock.now();
@@ -1786,6 +1790,48 @@ pub(crate) mod tests {
         b.drawing = d.clone();
         assert_eq!(footer_label(b.shaped()), "shape: approximate (offline)");
         assert!(b.lookup.lookups.is_none() && b.lookup.cache.is_none());
+    }
+
+    /// A clock whose rate-limit wait holds until the test opens its gate (real time otherwise).
+    struct SleepGate {
+        entered: Arc<AtomicBool>,
+        open: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Clock for SleepGate {
+        fn now(&self) -> Instant {
+            Instant::now()
+        }
+        fn sleep(&self, _: Duration) {
+            self.entered.store(true, Ordering::SeqCst);
+            let mut open = self.open.0.lock().unwrap();
+            while !*open {
+                open = self.open.1.wait(open).unwrap();
+            }
+        }
+    }
+
+    /// Task 5 fix round 2: a search stopped while the worker waits out MIN_INTERVAL before its next
+    /// request sends nothing after the wait.
+    #[test]
+    fn a_stop_during_the_rate_limit_wait_sends_nothing() {
+        let mut answers = ethane_answers("CC");
+        answers.insert(name_url("ethane"), Ok("6324\n".into()));
+        let urls = Arc::new(Mutex::new(Vec::new()));
+        let (entered, gate) = (Arc::new(AtomicBool::new(false)), Arc::new((Mutex::new(false), Condvar::new())));
+        let clock = Arc::new(SleepGate { entered: entered.clone(), open: gate.clone() });
+        let l = Lookups::with_clock(Box::new(Recording { inner: Canned::new(answers), urls: urls.clone() }), Cache::none(), clock);
+        let id = l.search(&Query::Name("ethane".into()));
+        // the name lookup answered; the 3D request waits out the rate limit
+        let t0 = Instant::now();
+        while !entered.load(Ordering::SeqCst) {
+            assert!(t0.elapsed() < WAIT, "the worker never waited");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        l.stop_searches();
+        open_gate(&gate);
+        assert_eq!(l.wait_search(WAIT), Some((id, Err(NetError::Offline))));
+        assert_eq!(*urls.lock().unwrap(), [name_url("ethane")], "nothing went out after the wait");
     }
 
     /// Task 5 review fix 1: the online setting going off supersedes a drawn fragment's lookup in
