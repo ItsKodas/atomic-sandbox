@@ -786,6 +786,17 @@ impl ScfEnd {
     }
 }
 
+/// A teacher solve that `should_abort` abandoned (`crate::Trainable::cancelled_teacher_solve`): what its
+/// [`TeachEvent`] would have carried — who asked, the rule that sent the step to the teacher, the atom the rule names,
+/// and the rule's own sentence (`why`), which leads the skip's log row as it leads the provider's other `Failed` rows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CancelledTeach {
+    pub origin: TeachOrigin,
+    pub rule: TeachRule,
+    pub atom: Option<usize>,
+    pub why: String,
+}
+
 /// One teaching solve (spec §4.3 A3). Energies in Hartree, the face density in e/Bohr³.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TeachEvent {

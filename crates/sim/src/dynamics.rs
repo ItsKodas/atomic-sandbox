@@ -237,7 +237,8 @@
 //!   sentence also on `DynSnapshot::last_skip`); when the provider
 //!   reports the abandoned evaluation as a teacher solve (`Trainable::cancelled_teacher_solve`,
 //!   the surrogate's fallback) it is also a failed teaching event with `ScfEnd::Skipped`, stamped
-//!   with the step it was for. Nothing from the solve is kept. Then, by the request's
+//!   with the step it was for, its detail led by the rule's sentence as the provider's other failed
+//!   rows are. Nothing from the solve is kept. Then, by the request's
 //!   [`SkipThen`]: **Pause** pauses the run and drops queued steps (note "you skipped the solve
 //!   at step N — nothing was kept; Play retries it from a cold start"; a skipped re-evaluation is
 //!   not retried by paused ticks until Play, Step or an edit); **Retry** plays on, and the next
@@ -3488,12 +3489,13 @@ impl Dynamics {
             SkipThen::Pause => format!("you skipped the solve at step {step} — nothing was kept; Play retries it from a cold start"),
             SkipThen::Retry => format!("skipped at step {step} — retrying cold"),
         };
-        if let Some((origin, rule, atom)) = teacher {
+        if let Some(c) = teacher {
             use crate::activity::{ScfEnd, TeachEvent, TeachOutcome};
-            let mut e = TeachEvent::new(origin, rule, TeachOutcome::Failed);
+            let mut e = TeachEvent::new(c.origin, c.rule, TeachOutcome::Failed);
             e.step = Some(step);
-            e.atom = atom;
-            e.detail = msg.clone();
+            e.atom = c.atom;
+            // the rule's sentence first, as in the provider's other `Failed` rows ("… — the teacher failed: …")
+            e.detail = if c.why.is_empty() { msg.clone() } else { format!("{} — {msg}", c.why) };
             e.n_atoms = self.scene.nuclei.len();
             e.solve_ms = started.elapsed().as_secs_f64() * 1e3;
             e.scf_end = Some(ScfEnd::Skipped);

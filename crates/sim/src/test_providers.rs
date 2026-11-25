@@ -210,6 +210,10 @@ impl ForceProvider for Faulty {
         self.inner.reset();
     }
 
+    fn restart_cold(&mut self) {
+        self.inner.restart_cold();
+    }
+
     fn scf_tol(&self) -> Option<f64> {
         self.inner.scf_tol()
     }
@@ -650,7 +654,7 @@ impl<P: ForceProvider + Trainable> Trainable for SharedTrainable<P> {
         Trainable::set_skip_request(&mut *self.lock(), r)
     }
 
-    fn cancelled_teacher_solve(&self) -> Option<(crate::activity::TeachOrigin, crate::activity::TeachRule, Option<usize>)> {
+    fn cancelled_teacher_solve(&self) -> Option<crate::activity::CancelledTeach> {
         Trainable::cancelled_teacher_solve(&*self.lock())
     }
 
@@ -701,6 +705,10 @@ impl<P: ForceProvider + Trainable> ForceProvider for TeacherOf<P> {
 
     fn reset(&mut self) {
         self.with(|t| t.reset())
+    }
+
+    fn restart_cold(&mut self) {
+        self.with(|t| t.restart_cold())
     }
 
     fn discontinuity(&mut self) {

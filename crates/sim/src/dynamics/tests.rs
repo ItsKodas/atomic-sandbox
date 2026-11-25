@@ -3427,6 +3427,9 @@ impl SkipAbort {
     }
 }
 
+/// The rule's sentence [`Skippable`] reports with a cancelled teacher solve: it leads the skip's log row.
+const SKIPPABLE_WHY: &str = "surrogate fallback (force uncertainty on atom 1)";
+
 /// A [`Harmonic`] whose evaluation number `skip_at` (0 = the constructor's) stands for the user
 /// clicking Skip mid-solve (`requests` clicks): it clicks through `abort`, then polls
 /// `should_abort` like an SCF loop until it fires and returns `Cancelled`. `trainable`: it is
@@ -3569,8 +3572,13 @@ impl crate::provider::Trainable for Skippable {
     fn set_skip_request(&mut self, r: SkipRequest) {
         self.log.lock().unwrap().handles.push(r);
     }
-    fn cancelled_teacher_solve(&self) -> Option<(crate::activity::TeachOrigin, crate::activity::TeachRule, Option<usize>)> {
-        self.cancelled_teacher.then_some((crate::activity::TeachOrigin::Fallback, crate::activity::TeachRule::ForceUncertainty, Some(1)))
+    fn cancelled_teacher_solve(&self) -> Option<crate::activity::CancelledTeach> {
+        self.cancelled_teacher.then(|| crate::activity::CancelledTeach {
+            origin: crate::activity::TeachOrigin::Fallback,
+            rule: crate::activity::TeachRule::ForceUncertainty,
+            atom: Some(1),
+            why: SKIPPABLE_WHY.into(),
+        })
     }
 }
 
@@ -3674,7 +3682,7 @@ fn skip_with_pause_pauses_and_keeps_nothing() {
     assert_eq!(ev.len(), 1, "{ev:?}");
     let e = &ev[0];
     assert_eq!((e.outcome, e.step, e.origin, e.rule, e.atom), (crate::activity::TeachOutcome::Failed, Some(1), crate::activity::TeachOrigin::Fallback, crate::activity::TeachRule::ForceUncertainty, Some(1)));
-    assert_eq!(e.detail, sentence);
+    assert_eq!(e.detail, format!("{SKIPPABLE_WHY} — {sentence}"), "the rule's sentence leads the row");
     // the queued command finds the request taken: nothing more happens
     let notes = s.notes_total;
     r.apply_skip(SkipThen::Pause);
@@ -3707,7 +3715,7 @@ fn skip_with_retry_keeps_playing() {
         let ev = r.skipped_events();
         assert_eq!(ev.len(), usize::from(teacher), "teacher {teacher}: {ev:?}");
         if teacher {
-            assert_eq!((ev[0].step, ev[0].detail.as_str()), (Some(2), "skipped at step 2 — retrying cold"));
+            assert_eq!((ev[0].step, ev[0].detail.clone()), (Some(2), format!("{SKIPPABLE_WHY} — skipped at step 2 — retrying cold")));
         }
         r.apply_skip(SkipThen::Retry);
         let n = r.log.lock().unwrap().evals.len();
