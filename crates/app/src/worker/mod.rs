@@ -769,15 +769,16 @@ impl Inbox {
 /// scene"), queued steps, a stale-force evaluation, a relax running (its FIRE steps advance one tick at a
 /// time like play's; M6 Task 8, found by the `relax_h2` replay), or a sampling pass in progress
 /// that is not paused (a paused pass solves nothing: the worker sleeps until a command).
-/// A stale evaluation that failed is not retried until Play, Step or an edit (they clear
-/// `last_error`). A bond
+/// A stale evaluation the driver holds is not retried until Play, Step or an edit: one that failed
+/// (`last_error`), or one the user skipped with Pause (`stale_eval_held` without an error — final
+/// review I1: counted as work it made the worker spin, publishing every round). A bond
 /// reference solving off the stepping path is **not** work (M6 Task 3 fix round 2): it is
 /// background, reported by `DynSnapshot::bond_reference`, never busy, and `--screenshot` does
 /// not wait for it; an otherwise idle worker polls it (`polls_references_only`).
 fn has_work(s: &DynSnapshot) -> bool {
     (!s.paused && !s.scene.nuclei.is_empty())
         || s.pending_steps > 0
-        || (s.forces_stale && s.last_error.is_none())
+        || (s.forces_stale && s.last_error.is_none() && !s.stale_eval_held)
         || s.relax.as_ref().is_some_and(|r| r.converged.is_none())
         || (sampling_active(s) && !pass_paused(s))
 }

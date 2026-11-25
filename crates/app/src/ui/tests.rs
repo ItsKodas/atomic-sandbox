@@ -15446,6 +15446,10 @@ mod activity_skip {
         // a bond/density refresh: a solve while the worker is idle (paused, nothing to step)
         let inp = PanelInput { playing: false, busy: false, probe: Some(solving()), ..input(&scene, Some(&est), &cam) };
         assert_eq!(skip_of(&inp, JobKey::LiveSolve), Some(SkipControl::Disabled(SKIP_REFRESH)));
+        // final review m2: the paused row's hover names Skip only where Skip works
+        let why = |inp: &PanelInput<'_>| rows(inp, inp.probe.as_ref()).into_iter().find(|r| r.key == JobKey::LiveSolve).unwrap().no_control_why;
+        assert_eq!(why(&inp), Some(activity::jobs::PAUSED_SOLVE_WHY));
+        assert!(why(&stepping).is_some_and(|w| w.contains("unless you Skip it")));
         // the orbital display solve: no Skip
         let harris = sim::ProbeView { display: Some((0.3, sim::DisplayJob::Harris)), ..Default::default() };
         let inp = PanelInput { probe: Some(harris), ..input(&scene, Some(&est), &cam) };
@@ -15505,6 +15509,36 @@ mod activity_skip {
             assert_eq!(Action::parse(&words.split_whitespace().collect::<Vec<_>>()).unwrap(), a);
         }
         assert!(Action::parse(&["skip"]).is_err() && Action::parse(&["skip", "later"]).is_err());
+    }
+
+    /// Final review I2 (spec §3: "the Activity row and a toast say …"): after a Pause skip nothing
+    /// runs, so the job list shows the skip's sentence instead of "nothing running" — while it is
+    /// still the status line (Play clears the status; a newer status replaces it).
+    #[test]
+    fn the_jobs_group_says_what_was_skipped_until_the_status_moves_on() {
+        let scene = Scene::preset("h2").unwrap();
+        let cam = camera();
+        let sentence = "you skipped the solve at step 4 — nothing was kept; Play retries it from a cold start";
+        let mut snap = snapshot(&scene, Backend::Gpu, None);
+        (snap.dynamics.last_skip, snap.dynamics.skips_taken, snap.dynamics.paused) = (Some(sentence.into()), 1, true);
+        let inp = PanelInput { probe: Some(sim::ProbeView::default()), ..input(&scene, Some(&snap), &cam) };
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+        let mut st = UiState::new("h2", &scene);
+        alone(&mut st, DockTab::Activity);
+        let shown = |ctx: &egui::Context, st: &mut UiState| {
+            PROBES.with(|p| p.borrow_mut().clear());
+            let texts: Vec<String> = frame_texts_sized(ctx, st, &inp, egui::vec2(1400.0, 900.0), vec![], 1.0).into_iter().map(|t| t.0).collect();
+            (PROBES.with(|p| p.borrow().contains_key("activity-last-skip")), texts.iter().any(|t| t.contains(sentence)), texts.iter().any(|t| t == "nothing running"))
+        };
+        st.set_status(sentence);
+        assert_eq!(shown(&ctx, &mut st), (true, true, false), "the sentence instead of nothing running");
+        // Play clears the status (the viewer), a newer status replaces it: the line goes
+        st.status.clear();
+        assert_eq!(shown(&ctx, &mut st).0, false);
+        st.set_status("something else");
+        let (line, _, nothing) = shown(&ctx, &mut st);
+        assert!(!line && nothing);
     }
 
     /// The toast: a new skip (the count moved, even with the same sentence) shows the bare sentence;

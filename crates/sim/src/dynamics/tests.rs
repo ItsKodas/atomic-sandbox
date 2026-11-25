@@ -3868,6 +3868,8 @@ fn a_skipped_re_evaluation_waits_for_play() {
     r.d.apply(DynCommand::MoveNucleusDiscontinuous { index: 0, pos: [0.1, 0.0, 0.0] });
     let s = r.tick(f64::INFINITY);
     assert!(s.paused && s.forces_stale);
+    // held without an error: the snapshot says so, so a worker does not count it as work
+    assert!(s.stale_eval_held && s.last_error.is_none());
     assert_eq!(s.notes.last().map(String::as_str), Some("step 0: you skipped the solve at step 0 — nothing was kept; Play retries it from a cold start"));
     assert_eq!(r.skipped_events().iter().map(|e| e.step).collect::<Vec<_>>(), vec![Some(0)]);
     r.apply_skip(SkipThen::Pause);
@@ -3876,7 +3878,7 @@ fn a_skipped_re_evaluation_waits_for_play() {
     assert_eq!(r.log.lock().unwrap().evals.len(), n, "a paused tick does not re-solve it");
     r.d.apply(DynCommand::Play);
     let p = r.tick(f64::INFINITY);
-    assert!(!p.forces_stale && !p.paused);
+    assert!(!p.forces_stale && !p.paused && !p.stale_eval_held);
     let l = r.log.lock().unwrap();
     assert!(l.evals[n].1 && l.evals[n].0 == l.evals[n - 1].0, "Play re-solves the same positions cold");
 }

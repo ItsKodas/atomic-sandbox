@@ -1601,14 +1601,17 @@ impl Viewer {
     }
 
     /// The loading ends with the first solve of the new scene (the snapshot has seen every edit and
-    /// its forces are fresh), or after two minutes.
+    /// its forces are fresh), when that solve is held instead (it failed, or was skipped with Pause:
+    /// `stale_eval_held` — nothing more is solved until Play; not timed), or after two minutes.
     fn finish_loading(&mut self) {
         let Some((t, _, key)) = self.ui.loading.clone() else { return };
-        let done = self.snapshot.as_ref().is_some_and(|s| s.edits == self.edits_sent && !s.dynamics.forces_stale);
+        let seen = self.snapshot.as_ref().filter(|s| s.edits == self.edits_sent);
+        let done = seen.is_some_and(|s| !s.dynamics.forces_stale);
+        let held = seen.is_some_and(|s| s.dynamics.forces_stale && s.dynamics.stale_eval_held);
         if done {
             self.ui.timings.record(&key, t.elapsed().as_secs_f64());
         }
-        if done || t.elapsed().as_secs() > 120 {
+        if done || held || t.elapsed().as_secs() > 120 {
             self.ui.loading = None;
         }
     }

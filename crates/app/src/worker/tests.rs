@@ -4822,6 +4822,40 @@ fn skip_during_play_with_retry_keeps_playing() {
     assert_eq!(on.dynamics.skips_taken, 1);
 }
 
+/// Final review I1: a Pause skip of a paused edit's re-solve holds the stale evaluation until Play
+/// without an error; the worker must then go idle (no work, no snapshot flood, `working` off) —
+/// it used to count the held evaluation as work and spin, publishing every round.
+#[test]
+fn skip_of_a_paused_re_solve_holds_it_and_the_worker_goes_idle() {
+    let (w, _) = skip_worker();
+    let s0 = idle(&w);
+    let moved = [s0.scene.nuclei[1].pos[0] + 0.1, s0.scene.nuclei[1].pos[1], s0.scene.nuclei[1].pos[2]];
+    w.send(Command::MoveNucleus { index: 1, pos: moved });
+    in_a_solve(&w);
+    click_skip(&w, &s0, sim::SkipThen::Pause);
+    snapshot_until(&w, "the skip", |s| s.dynamics.skips_taken > 0);
+    let s = idle(&w);
+    let d = &s.dynamics;
+    assert!(d.paused && d.forces_stale && d.stale_eval_held && d.last_error.is_none(), "held without an error");
+    // the worker blocks for a command: after the round that applies the SkipSolve, nothing more
+    let settle = Instant::now() + Duration::from_millis(400);
+    while let Some(left) = settle.checked_duration_since(Instant::now()) {
+        let _ = w.recv_timeout(left);
+    }
+    let quiet = Instant::now() + Duration::from_millis(600);
+    let mut extra = 0;
+    while let Some(left) = quiet.checked_duration_since(Instant::now()) {
+        if let Some(Event::Snapshot(_)) = w.recv_timeout(left) {
+            extra += 1;
+        }
+    }
+    assert_eq!(extra, 0, "the worker kept publishing while idle");
+    // Play re-solves it
+    w.send(Command::Dyn(DynCommand::Play));
+    let p = snapshot_until(&w, "the held evaluation solved", |s| !s.dynamics.forces_stale);
+    assert!(!p.dynamics.stale_eval_held);
+}
+
 /// The worker installs its one request on every driver it builds (here the rebuild after a solver
 /// panic): a request pending when the driver is rebuilt is dropped — a later Pause is an ordinary
 /// pause, never a skip — and a Skip on the rebuilt driver still works.

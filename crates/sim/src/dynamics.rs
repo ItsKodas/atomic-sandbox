@@ -241,7 +241,9 @@
 //!   rows are. Nothing from the solve is kept. Then, by the request's
 //!   [`SkipThen`]: **Pause** pauses the run and drops queued steps (note "you skipped the solve
 //!   at step N — nothing was kept; Play retries it from a cold start"; a skipped re-evaluation is
-//!   not retried by paused ticks until Play, Step or an edit); **Retry** plays on, and the next
+//!   not retried by paused ticks until Play, Step or an edit — held without an error, which the
+//!   snapshot reports as `DynSnapshot::stale_eval_held` so a caller does not count it as work);
+//!   **Retry** plays on, and the next
 //!   tick solves the same positions cold ("skipped at step N — retrying cold").
 //! - **A relax step**: abandoned as at a Pause abandon (the relax goes on next tick); the
 //!   request is dropped with the note [`NOTHING_TO_SKIP`].
@@ -1071,6 +1073,10 @@ pub struct DynSnapshot {
     /// Skips taken so far (monotone): a change means `last_skip` is a new one, even when its
     /// sentence repeats (the same step skipped twice).
     pub skips_taken: u64,
+    /// The stale evaluation is held until Play, Step or an edit: it failed (with `last_error`) or
+    /// the user skipped it with Pause (no error; module doc, "Skipping a solve"). Paused ticks do
+    /// not retry it, so a worker must not count it as work.
+    pub stale_eval_held: bool,
 }
 
 impl DynSnapshot {
@@ -1152,6 +1158,7 @@ impl Default for DynSnapshot {
             gpu_failed: false,
             last_skip: None,
             skips_taken: 0,
+            stale_eval_held: false,
         }
     }
 }
@@ -1203,7 +1210,8 @@ pub struct Dynamics {
     thermostats_created: u64,
     /// RAW provider forces at the current positions; `None` = stale (re-evaluate first).
     forces: Option<Vec<[f64; 3]>>,
-    /// A stale re-evaluation failed: paused ticks do not retry it until Play, Step or an edit.
+    /// A stale re-evaluation failed, or was skipped with Pause: paused ticks do not retry it until
+    /// Play, Step or an edit (`DynSnapshot::stale_eval_held`).
     stale_eval_failed: bool,
     /// The latest evaluation's energy, stats and display (kept through failures).
     energy_ks: f64,
@@ -2165,6 +2173,7 @@ impl Dynamics {
             gpu_failed: self.gpu_failed,
             last_skip: self.last_skip.clone(),
             skips_taken: self.skips_taken,
+            stale_eval_held: self.stale_eval_failed,
         }
     }
 

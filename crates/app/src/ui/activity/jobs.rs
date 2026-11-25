@@ -98,6 +98,9 @@ pub const SKIP_RELAX: &str = "a relax: use Stop relax";
 /// Disabled: a bond/density refresh ("Bonds now", the paused density re-solve), solved between
 /// steps for the graph — not a step (ruling R6; the driver answers a stray Skip with "nothing to skip").
 pub const SKIP_REFRESH: &str = "a bond/density refresh, not a step";
+/// The paused live row's "can't be cancelled" hover where Skip is not enabled (final review m2:
+/// it names Skip only where Skip works).
+pub const PAUSED_SOLVE_WHY: &str = "a paused step finishes; edits abandon it at the next SCF iteration (CPU: after the solve)";
 /// Disabled: a paused pass solves nothing.
 pub const SKIP_PASS_PAUSED: &str = "the pass is paused: no solve is running";
 /// Disabled: between two of the pass's solves (a click now would skip the next one unseen).
@@ -236,7 +239,11 @@ pub fn rows(input: &PanelInput<'_>, probe: Option<&sim::ProbeView>) -> Vec<JobRo
             elapsed_s: Some(pv.main.elapsed_s),
             eta_s: None,
             control: input.playing.then(|| ("Pause".into(), Action::Pause)),
-            no_control_why: (!input.playing).then_some("a paused step finishes unless you Skip it; edits abandon it at the next SCF iteration (CPU: after the solve)"),
+            no_control_why: (!input.playing).then_some(if skip == Some(SkipControl::Enabled) {
+                "a paused step finishes unless you Skip it; edits abandon it at the next SCF iteration (CPU: after the solve)"
+            } else {
+                PAUSED_SOLVE_WHY
+            }),
             scf: pv.main.live,
             keeps_block: !cpu,
             stage: None,
