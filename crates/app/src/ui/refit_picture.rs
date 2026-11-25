@@ -2,9 +2,13 @@
 //! `docs/superpowers/plans/2026-11-25-refit-visualisation.md`): what a refit is actually doing, from
 //! its own stage counters (`sim::refit_live`). Display only.
 //!
-//! - **The view** ([`show`]) has the full picture while nothing else needs it: a refit runs and no
-//!   model stands (the first fit at launch, any refit while there is no model; Play is refused then
-//!   anyway), and no decision card (the model offer) is up. It fades out when the fit lands. It is
+//! - **The view** ([`show`]) has the full picture for the refits the user waits on, while nothing
+//!   else needs it: a refit runs and either no model stands (the first fit at launch, any refit
+//!   while there is no model; Play is refused then anyway) or the refit is the one a training pass
+//!   starts at its end or the one **Refit now** starts (`sim::RefitCause`, set where the refit is
+//!   started — spec `docs/superpowers/specs/2026-11-25-refit-picture-more-design.md`); and no
+//!   decision card (the model offer) is up. A background refit during play (or the delayed one after
+//!   a Forget / Restore) keeps the view on the simulation. It fades out when the fit lands. It is
 //!   not one of the zones' overlays: it takes the room the zones leave free ([`free_rect`]), never
 //!   input (the camera still turns under it).
 //! - **Activity's refit card** ([`strip`]) has the compact strip of the same stages for every
@@ -40,9 +44,12 @@ pub struct Fade {
     pub last: Option<(RefitView, Vec<f32>)>,
 }
 
-/// Whether the view has the full picture now (module doc).
+/// Whether the view has the full picture now (module doc): a refit runs, and no fitted model
+/// stands or the refit is one the user waits on (`sim::RefitCause::shows_picture`: a pass's end
+/// fit, Refit now's).
 pub fn in_view(input: &PanelInput<'_>) -> bool {
-    input.probe.and_then(|p| p.refit).is_some() && !input.snapshot.and_then(|s| s.model.as_ref()).is_some_and(|m| m.fitted)
+    let Some(r) = input.probe.and_then(|p| p.refit) else { return false };
+    r.cause.shows_picture() || !input.snapshot.and_then(|s| s.model.as_ref()).is_some_and(|m| m.fitted)
 }
 
 /// The largest rect of `view` (less [`MARGIN`]) clear of every rect in `taken` (with [`GAP`]):
@@ -570,7 +577,7 @@ pub fn demo(stage: &str) -> Option<(RefitView, Vec<f32>)> {
     }
     live.spent_s = spent;
     let elapsed_s = spent.iter().sum::<f64>();
-    let v = RefitView { elapsed_s, samples: n, species: 5, background: true, stages: sim::RefitStages::default(), estimate: None, eta: sim::RefitEta::Estimating, live };
+    let v = RefitView { elapsed_s, samples: n, species: 5, background: true, stages: sim::RefitStages::default(), estimate: None, eta: sim::RefitEta::Estimating, live, cause: sim::RefitCause::Background };
     Some((v, ratios))
 }
 

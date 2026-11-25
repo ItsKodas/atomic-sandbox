@@ -1432,8 +1432,10 @@ impl SurrogateKs {
             }
         }
         let (samples, species, t0) = (self.samples(), self.store_species(), std::time::Instant::now());
+        let after_pass = std::mem::take(&mut self.refit_after_pass);
+        let cause = self.refit_cause(after_pass);
         let _phase = self.probe.clone().map(|p| {
-            p.begin_refit(samples, species, false);
+            p.begin_refit(samples, species, false, cause);
             RefitPhase(p)
         });
         // the stages (`sim::refit_eta`): a background copy's are read at the install

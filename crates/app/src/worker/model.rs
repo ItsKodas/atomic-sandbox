@@ -609,6 +609,9 @@ pub const FORGET_REFIT_DELAY: Duration = Duration::from_secs(10);
 pub(crate) struct UserRefit {
     /// When the refit may start; `None`: the user asked for none.
     due: Option<Instant>,
+    /// It was hurried by **Refit now** (not a Forget / Restore's delay running out): the refit
+    /// that starts for it is the user's (`sim::RefitCause::Requested`; display only).
+    hurried: bool,
 }
 
 /// What [`UserRefit::gate`] lets a refit do now.
@@ -697,11 +700,18 @@ impl UserRefit {
     /// A Forget / Restore (or a batch of them) was applied at `at`: the wait restarts.
     pub fn changed(&mut self, at: Instant) {
         self.due = Some(at + FORGET_REFIT_DELAY);
+        self.hurried = false;
     }
 
     /// **Refit now** at `at`: due at once (after a running refit lands, if one runs).
     pub fn refit_now(&mut self, at: Instant) {
         self.due = Some(at);
+        self.hurried = true;
+    }
+
+    /// Refit now asked for the refit that is due ([`refit_now`](Self::refit_now), no change since).
+    pub fn hurried(&self) -> bool {
+        self.hurried && self.due.is_some()
     }
 
     /// Whether a refit may start at `at` (none is running).
@@ -716,6 +726,7 @@ impl UserRefit {
     /// A refit started (it fits every change so far), or none is due any more.
     pub fn clear(&mut self) {
         self.due = None;
+        self.hurried = false;
     }
 
     /// When the refit is due (`None`: not asked for).
@@ -1080,11 +1091,19 @@ impl Worker {
             new_data,
             provider_due,
         };
-        match refit_start(&mut self.user_refit, at, inputs) {
+        // Refit now's refit (before `refit_start` clears the request): the probe's cause for the
+        // refit that begins — the provider does not know who asked (display only: the refit picture)
+        let requested = self.user_refit.hurried();
+        let start = refit_start(&mut self.user_refit, at, inputs);
+        if start == RefitStart::Background && requested {
+            self.probe.ask_refit_cause(sim::RefitCause::Requested);
+        }
+        match start {
             RefitStart::Wait => return landed,
             // off the step path; a provider that cannot runs it in the tick
             // (published at once: the banner and the busy state follow it)
             RefitStart::Background if s.begin_refit_background() => {
+                self.probe.ask_refit_cause(sim::RefitCause::Background);
                 self.refit_started = Some(at);
                 self.refit_started_gen = gen;
                 return true;
@@ -1092,6 +1111,7 @@ impl Worker {
             // a first fit, a pass's end fit or a retry never runs in the tick (minutes): this data
             // is not tried again
             RefitStart::Background if !fitted || retry || provider_due => {
+                self.probe.ask_refit_cause(sim::RefitCause::Background);
                 self.refit_done_gen = gen;
                 return landed;
             }
@@ -1100,6 +1120,8 @@ impl Worker {
         }
         let t = Instant::now();
         let fit = s.refit();
+        // (taken by the refit if it began one)
+        self.probe.ask_refit_cause(sim::RefitCause::Background);
         self.refit_done_gen = gen;
         self.log_refit(snap, fit, t.elapsed().as_secs_f64() * 1e3, "");
         true
@@ -1532,6 +1554,25 @@ mod debounce_tests {
         let at: Vec<f64> = f.started.iter().map(|(t, _)| secs(t0, *t)).collect();
         assert_eq!(at.len(), 2, "{at:?}");
         assert!((at[1] - 31.0).abs() < 0.05, "{at:?}");
+    }
+
+    /// Spec 2026-11-25 (the refit picture on Refit now): the request is the user's (`hurried`,
+    /// the refit's cause `Requested`) only after Refit now; a Forget / Restore's delay running out
+    /// is not, nor a change after Refit now (its wait restarts), and a start clears it.
+    #[test]
+    fn only_refit_now_hurries_the_refit() {
+        let t0 = Instant::now();
+        let mut u = UserRefit::default();
+        assert!(!u.hurried());
+        u.changed(t0);
+        assert!(!u.hurried() && matches!(u.gate(t0 + FORGET_REFIT_DELAY), RefitGate::Start), "the delay ran out: not hurried");
+        u.refit_now(t0);
+        assert!(u.hurried());
+        u.changed(t0 + Duration::from_secs(1));
+        assert!(!u.hurried(), "a change after Refit now waits its delay again");
+        u.refit_now(t0 + Duration::from_secs(2));
+        u.clear();
+        assert!(!u.hurried(), "started: cleared");
     }
 
     /// The rest of `refit_start`: while the user's refit waits, no refit starts (a fallback's

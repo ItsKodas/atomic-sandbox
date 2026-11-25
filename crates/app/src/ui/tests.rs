@@ -14727,7 +14727,7 @@ fn checked_rows_forget_and_restore_as_one_batch() {
 /// A running refit's view for the tests: `elapsed_s` seconds in, `samples` samples of 2 species,
 /// no stage reported yet ("starting").
 fn refit_view(elapsed_s: f64, samples: u32) -> sim::RefitView {
-    sim::RefitView { elapsed_s, samples, species: 2, background: true, stages: sim::RefitStages::default(), estimate: None, eta: sim::RefitEta::Estimating, live: sim::RefitLive::default() }
+    sim::RefitView { elapsed_s, samples, species: 2, background: true, stages: sim::RefitStages::default(), estimate: None, eta: sim::RefitEta::Estimating, live: sim::RefitLive::default(), cause: sim::RefitCause::Background }
 }
 
 /// A refit view `elapsed_s` seconds in with the stage counters `live`.
@@ -14881,6 +14881,48 @@ fn the_refit_picture_fills_the_view_only_while_there_is_no_model() {
     }
     assert!(!drawn(&ctx, &mut st, &ended, "refit-picture"));
     assert!(st.refit_picture.last.is_none());
+}
+
+/// Spec 2026-11-25 (the refit picture after a pass and on Refit now): with a fitted model the view
+/// has the full picture for the refit a training pass starts at its end (`AfterPass`) and the one
+/// Refit now starts (`Requested`), as for the first fit (`First`, no model); not for a background
+/// refit (`Background`: Activity's strip only); not while the model offer is up, whatever the cause.
+#[test]
+fn the_refit_picture_shows_for_a_pass_end_fit_and_refit_now() {
+    use sim::RefitCause::*;
+    let scene = Scene::preset("h2").unwrap();
+    let cam = camera();
+    let ctx = egui::Context::default();
+    apply_theme(&ctx);
+    let fitted = snapshot(&scene, Backend::Estimated, Some(ModelStatus { refit_running: true, ..model() }));
+    let no_model = snapshot(&scene, Backend::Estimated, Some(ModelStatus { fitted: false, ..model() }));
+    let (v, ratios) = super::refit_picture::demo("solve").unwrap();
+    for (cause, snap, shows) in [(First, &no_model, true), (AfterPass, &fitted, true), (Requested, &fitted, true), (Background, &fitted, false), (Background, &no_model, true)] {
+        let mut st = UiState::new("h2", &scene);
+        st.backend = Backend::Estimated;
+        let inp = PanelInput { busy: true, probe: Some(sim::ProbeView { refit: Some(sim::RefitView { cause, ..v }), ..Default::default() }), refit_ratios: ratios.clone(), ..input(&scene, Some(snap), &cam) };
+        assert_eq!(super::refit_picture::in_view(&inp), shows, "{cause:?}");
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        assert_eq!(drawn(&ctx, &mut st, &inp, "refit-picture"), shows, "{cause:?}, fitted {}", snap.model.as_ref().unwrap().fitted);
+        // Activity's strip for every refit
+        alone(&mut st, DockTab::Activity);
+        assert!(drawn(&ctx, &mut st, &inp, "refit-strip"), "{cause:?}");
+    }
+    // the model offer is up: no picture, whatever the cause
+    let mut st = UiState::new("h2", &scene);
+    (st.gpu_available, st.backend) = (true, Backend::Estimated);
+    st.model_file = Some(header_only_model("refit-offer.model", 81, 0.15, 0.15, 1e-5, 0, "null", "Kohn-Sham (CPU)", "cores/0123456789abcdef/fd5e-3/stop2x5e-8/pin1e-5"));
+    act(&mut st, &input(&scene, None, &cam), Action::LoadModel);
+    assert!(st.model_offer.is_some(), "the offer card is up");
+    for cause in [AfterPass, Requested] {
+        let inp = PanelInput { busy: true, probe: Some(sim::ProbeView { refit: Some(sim::RefitView { cause, ..v }), ..Default::default() }), ..input(&scene, Some(&fitted), &cam) };
+        for _ in 0..3 {
+            frame(&ctx, &mut st, &inp, 1400.0, vec![]);
+        }
+        assert!(!drawn(&ctx, &mut st, &inp, "refit-picture"), "{cause:?} under the model offer");
+    }
 }
 
 /// 2026-11-14, the batched forget: the pending-refit banner's words — "N changes pending · refit in

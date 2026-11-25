@@ -852,6 +852,9 @@ struct Worker {
     /// The refit the user's Forget / Restore asked for, debounced (`user_samples`, [`UserRefit`];
     /// 2026-11-14, the batched forget).
     user_refit: UserRefit,
+    /// The probe the viewer reads (`SimWorker::probe`): the worker asks the cause of the refit the
+    /// user asked for on it (`sim::ActivityProbe::ask_refit_cause`; display only).
+    probe: Arc<sim::ActivityProbe>,
     refits: u64,
     autoload_refused: Option<String>,
     /// This worker may write or remove the autosave (module doc, "Autosave").
@@ -1032,7 +1035,7 @@ fn worker(
     skip: sim::SkipRequest,
 ) {
     let gpu_readback = gpu.clone();
-    let probe_make = probe;
+    let probe_make = probe.clone();
     // the display interrupt (module doc): a command sent and not yet taken, or one of the batch
     // being applied not yet applied
     let batch = Arc::new(AtomicUsize::new(0));
@@ -1120,6 +1123,7 @@ fn worker(
         refit_landed: false,
         retick: false,
         user_refit: UserRefit::default(),
+        probe,
         samples_at_refit: 0,
         refits: 0,
         autoload_refused: None,

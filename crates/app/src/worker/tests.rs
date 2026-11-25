@@ -4206,6 +4206,8 @@ impl RefitState {
 struct RefitFake {
     inner: sim::MorseDimer,
     st: Arc<std::sync::Mutex<RefitState>>,
+    /// The worker's probe: a background refit's phase and cause, as the provider publishes them.
+    probe: Arc<sim::ActivityProbe>,
 }
 
 impl RefitFake {
@@ -4260,6 +4262,9 @@ impl Trainable for RefitFake {
         }
         let p = st.samples;
         st.started.push(("background", p));
+        // the provider's own cause (`SurrogateKs::refit_cause`); the worker raises Refit now's
+        let cause = if !st.fitted { sim::RefitCause::First } else if st.pass_fit { sim::RefitCause::AfterPass } else { sim::RefitCause::Background };
+        self.probe.begin_refit(p, 1, true, cause);
         (st.running, st.release, st.pass_fit) = (Some(p), false, false);
         true
     }
@@ -4270,6 +4275,7 @@ impl Trainable for RefitFake {
             return sim::RefitPoll::Running;
         }
         st.running = None;
+        self.probe.end_refit();
         match st.outcome.take().unwrap_or(Ok(())) {
             Ok(()) => {
                 st.fitted = true;
@@ -4341,7 +4347,9 @@ impl Trainable for RefitFake {
 fn refit_fake(st: RefitState) -> (SimWorker, Arc<std::sync::Mutex<RefitState>>) {
     let st = Arc::new(std::sync::Mutex::new(st));
     let s = st.clone();
-    let w = SimWorker::spawn_test(h2_33(), Box::new(move || Box::new(RefitFake { inner: sim::MorseDimer::h2(), st: s.clone() })));
+    let probe = sim::ActivityProbe::new();
+    let pr = probe.clone();
+    let w = SimWorker::spawn_test_with(h2_33(), probe, Box::new(move || Box::new(RefitFake { inner: sim::MorseDimer::h2(), st: s.clone(), probe: pr.clone() })));
     (w, st)
 }
 
@@ -4406,6 +4414,47 @@ fn refit_now_runs_in_model_only() {
     st.lock().unwrap().release = true;
     let s = snapshot_until(&w, "it landed", |s| !model(s).refit_running && model(s).refits == 1);
     assert!(!model(&s).pending_refit);
+}
+
+/// Spec 2026-11-25 (the refit picture on Refit now): the refit **Refit now** starts is published
+/// as the user's (`RefitCause::Requested`) on the probe the viewer reads — the provider begins it
+/// as a plain background refit; a pass's end fit is `AfterPass`; an automatic refit during play
+/// stays `Background` (only Activity's strip).
+#[test]
+fn the_refit_cause_follows_who_started_it() {
+    let (w, st) = refit_fake(RefitState { fitted: true, samples: 100, ..Default::default() });
+    idle(&w);
+    let probe = w.probe();
+    let cause = || probe.view().refit.map(|v| v.cause);
+    let land = |n: u64| {
+        st.lock().unwrap().release = true;
+        snapshot_until(&w, "it landed", |s| !model(s).refit_running && model(s).refits == n);
+    };
+    // Refit now: Requested
+    w.send(Command::SetModelOnly(true));
+    st.lock().unwrap().keep_one();
+    w.send(Command::RefitNow);
+    snapshot_until(&w, "the refit the user asked for", |s| model(s).refit_running);
+    assert_eq!(cause(), Some(sim::RefitCause::Requested));
+    land(1);
+    assert_eq!(cause(), None);
+    // a pass's end fit left to the worker: AfterPass
+    {
+        let mut s = st.lock().unwrap();
+        s.keep_one();
+        s.pass_fit = true;
+    }
+    w.send(Command::Dyn(DynCommand::SetSpeed(2)));
+    snapshot_until(&w, "the pass's end fit", |s| model(s).refit_running);
+    assert_eq!(cause(), Some(sim::RefitCause::AfterPass));
+    land(2);
+    // an automatic refit while playing: Background
+    w.send(Command::SetModelOnly(false));
+    st.lock().unwrap().keep_one();
+    w.send(Command::Dyn(DynCommand::Play));
+    snapshot_until(&w, "the automatic refit", |s| model(s).refit_running);
+    assert_eq!(cause(), Some(sim::RefitCause::Background));
+    assert_eq!(refits_started(&st).len(), 3, "{:?}", refits_started(&st));
 }
 
 /// The repeated 1629-sample refits (refit_times.csv, 2026-11-17: full trust recoveries on 1628,
