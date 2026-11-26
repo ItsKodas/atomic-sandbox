@@ -13,7 +13,8 @@
 //!   existing atom bonds to it, closing a ring); with nothing selected a click places a lone atom.
 //!   Click the selected atom again: it becomes the palette's element. Shift-click another atom: a
 //!   bond to it (a ring closure). Drag an atom: it moves (the selection with it);
-//! - right-click deselects; Esc deselects, and closes the window when nothing is selected;
+//! - right-click deselects; Esc deselects, and closes the window when nothing is selected (Esc in
+//!   the search box only leaves the box);
 //! - click a bond (Bond tool, or the Atom tool): its order cycles 1 → 2 → 3 → 1; Bond tool: drag
 //!   from atom to atom for a bond;
 //! - Charge tool: click an atom to cycle 0 → +1 → −1 → 0;
@@ -35,7 +36,7 @@ const ATOM_R: f32 = 13.0;
 /// The palette's elements (spec §4); "more…" opens the periodic table.
 const PALETTE: [u8; 8] = [1, 6, 7, 8, 9, 15, 16, 17];
 /// The rule-1 line (spec §3: the window states it).
-pub const RULE_1_LINE: &str = "bond lengths and valences here only place the atoms; the solver decides the real geometry and bonds";
+pub const RULE_1_LINE: &str = "bond lengths, valences and database shapes here only place the atoms; the solver decides the real geometry and bonds";
 
 /// What a press on the canvas started, while the button is held.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -177,6 +178,12 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, acts:
     if close {
         st.builder.open = false;
         st.builder.gesture = Gesture::None;
+    } else if st.builder.lookup.busy() || st.builder.search_waiting() {
+        // the lookups' answers and timeouts arrive without input: keep the frames coming
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    } else if st.builder.lookup.awaiting() || st.builder.search_awaiting() {
+        // a timed-out lookup's late answer relabels its fragment when it comes
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
     }
 }
 
@@ -189,6 +196,8 @@ fn child(ui: &mut Ui, rect: Rect, layout: egui::Layout, f: impl FnOnce(&mut Ui))
 
 fn palette_column(ui: &mut Ui, st: &mut UiState) {
     let b = &mut st.builder;
+    search_box(ui, b);
+    ui.add_space(10.0);
     theme::section(ui, "Element");
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = Vec2::splat(4.0);
@@ -269,6 +278,100 @@ fn palette_column(ui: &mut Ui, st: &mut UiState) {
             b.redo();
         }
     });
+    ui.add_space(10.0);
+    if ui.checkbox(&mut b.online, RichText::new(ONLINE_LABEL).size(12.5)).on_hover_text(ONLINE_TIP).changed() && !b.online {
+        // off: a search in flight stops now, not on the next frame (Task 5 review fix 1)
+        b.poll_search();
+    }
+}
+
+/// The search box (spec §8, `search.rs`) and its results: the local ones (the shipped list and the
+/// cache), then — with the online setting on and PubChem reachable — "Search PubChem for '…'",
+/// whose answer is listed below it. A row stamps its molecule beside the drawing; Enter stamps the
+/// first local result, or asks PubChem when there is none.
+fn search_box(ui: &mut Ui, b: &mut Builder) {
+    use super::search::{parse_query, Query};
+    let r = ui.add(egui::TextEdit::singleline(&mut b.search_query).hint_text(SEARCH_HINT).char_limit(SEARCH_CHAR_LIMIT).desired_width(ui.available_width()));
+    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    // Esc in the box only leaves the box (final review M1): egui drops the focus at the start of the
+    // frame, so the window's Esc (deselect, then close) would see no text field and take it too
+    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+    }
+    b.poll_search();
+    if parse_query(&b.search_query) == Query::Empty {
+        return;
+    }
+    let local = b.search_hits().to_vec();
+    let online_row = b.can_search_online();
+    let mut pick = if enter { local.first().and_then(|h| h.record.clone()) } else { None };
+    let mut ask = enter && local.is_empty() && online_row && !b.search_waiting();
+    let small = |ui: &mut Ui, text: &str| {
+        ui.label(RichText::new(text).size(11.5).color(theme::INK_FAINT));
+    };
+    // PubChem's answer, once it came: its new rows take the lowest-ranked local rows' places (8 in all)
+    let answered: Option<Vec<super::search::Hit>> = if online_row { b.online_hits().map(<[_]>::to_vec) } else { None };
+    let (shown, fresh) = match &answered {
+        Some(hits) => super::search::combined_rows(&local, hits),
+        None => (local.iter().collect(), Vec::new()),
+    };
+    egui::ScrollArea::vertical().id_salt("builder-search-results").max_height(240.0).auto_shrink([false, true]).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 3.0;
+        for h in shown.iter().chain(&fresh) {
+            if result_row(ui, h).clicked() {
+                pick = h.record.clone();
+            }
+        }
+        if local.is_empty() && fresh.is_empty() {
+            small(ui, NO_LOCAL);
+        }
+        if !online_row {
+            return;
+        }
+        if let Some(hits) = &answered {
+            if fresh.is_empty() {
+                small(ui, if hits.is_empty() { "no results on PubChem" } else { "nothing more on PubChem" });
+            }
+        } else if b.search_waiting() {
+            small(ui, "searching PubChem…");
+        } else {
+            if let Some(e) = b.online_failed() {
+                small(ui, &failed_line(e));
+            }
+            let text = format!("Search PubChem for '{}'", b.search_query.trim());
+            if ui.add(egui::Button::new(RichText::new(text).size(12.0)).wrap().min_size(Vec2::new(ui.available_width(), 0.0))).on_hover_text(ONLINE_TIP).clicked() {
+                ask = true;
+            }
+        }
+    });
+    if ask {
+        b.search_online();
+    }
+    if let Some(r) = pick {
+        b.stamp_record(&r);
+    }
+}
+
+/// One result row: the name, then the formula and where the record comes from.
+fn result_row(ui: &mut Ui, h: &super::search::Hit) -> egui::Response {
+    let formula = h.record.as_ref().map_or_else(|| h.formula.clone(), |r| crate::names::formula(&r.z, Some(r.charge.iter().map(|&q| q as i32).sum())));
+    let mut job = egui::text::LayoutJob::default();
+    job.append(&h.name, 0.0, egui::TextFormat { font_id: FontId::proportional(13.0), color: theme::INK, ..Default::default() });
+    job.append(&format!("\n{formula} · {}", h.source), 0.0, egui::TextFormat { font_id: FontId::proportional(11.0), color: theme::INK_FAINT, ..Default::default() });
+    let cid = h.cid().map_or(String::new(), |c| format!(" (PubChem CID {c})"));
+    let r = ui.add(egui::Button::new(job).wrap().right_text("").min_size(Vec2::new(ui.available_width(), 0.0)).fill(theme::PANEL_2));
+    r.on_hover_text(format!("{}{cid} — click to put it on the canvas beside the drawing (Ctrl-Z takes it back)", h.name))
+}
+
+/// The online search's failure, in one short line.
+fn failed_line(e: super::online::NetError) -> String {
+    use super::online::NetError;
+    match e {
+        NetError::Offline => "PubChem not reachable (offline)".into(),
+        NetError::Timeout => "PubChem did not answer in time".into(),
+        NetError::Status(s) => format!("PubChem answered {s}: try again later"),
+        NetError::Malformed => "PubChem's answer was not readable".into(),
+    }
 }
 
 /// Picking an element switches to the Atom tool (as the toolbar's chips switch to Place).
@@ -683,6 +786,33 @@ fn footer_rows(ui: &mut Ui, st: &mut UiState) {
             }
         });
     });
+    // where the hand-off's shape comes from (spec §8): one line, each fragment's in the tooltip
+    if !b.drawing.atoms.is_empty() {
+        let s = b.shaped().clone();
+        let line = super::shape::footer_label(&s);
+        if !line.is_empty() {
+            let approximate = s.sources.iter().any(|(_, f)| matches!(f, super::shape::FragmentSource::Approximate(_)));
+            let r = ui.label(RichText::new(line).size(12.5).color(if approximate { theme::INK_DIM } else { theme::ACCENT_INK }));
+            if s.sources.len() > 1 {
+                let tip = s
+                    .sources
+                    .iter()
+                    .map(|(frag, f)| {
+                        let z: Vec<u8> = frag.iter().map(|&i| b.drawing.atoms[i].z).collect();
+                        let q: i32 = frag.iter().map(|&i| b.drawing.atoms[i].charge as i32).sum();
+                        format!("{}: {}", crate::names::formula(&z, Some(q)), super::shape::fragment_label(f))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                r.on_hover_text(tip);
+            }
+        }
+        // the fallback's hint (spec §6.2): a drawing without its hydrogens is a radical
+        if let Some(hint) = b.fill_hint() {
+            ui.label(RichText::new(hint).size(11.5).color(theme::ACCENT_INK))
+                .on_hover_text("drawn atoms are real atoms: without its hydrogens the drawing is a radical, which no closed-shell record matches — Fill hydrogens adds them");
+        }
+    }
     // the warnings (amber ones only once Fill hydrogens was used)
     let marks: Vec<_> = super::chem::warnings(&b.drawing).into_iter().filter(|m| b.filled || m.1 == super::chem::Warning::Over).collect();
     if !marks.is_empty() {
@@ -710,10 +840,34 @@ enum Fit {
     No { reach: f64, limit: f64 },
 }
 
+/// What a hand-off puts in (spec §6, §8): the shape Replace sends, Insert's copy of it beside the
+/// scene's atoms, and the reaches the fit check and the enlarge offer use — all from the shape the
+/// hand-off sends, the database's where it knows a fragment.
+struct HandoffGeometry {
+    new: Vec<[f64; 3]>,
+    beside: Vec<[f64; 3]>,
+    reach_replace: f64,
+    reach_insert: f64,
+}
+
+/// [`geometry_of`] the shape `src` gives (tests).
+#[cfg(test)]
+fn handoff_geometry(b: &mut Builder, src: &dyn super::shape::RecordSource, existing: &[[f64; 3]]) -> HandoffGeometry {
+    geometry_of(b.shaped_from(src).positions.clone(), existing)
+}
+
+/// The hand-off's geometry from the shape it sends, `new`.
+fn geometry_of(new: Vec<[f64; 3]>, existing: &[[f64; 3]]) -> HandoffGeometry {
+    use super::{embed, max_abs};
+    let mut beside = new.clone();
+    embed::place_beside(existing, &mut beside);
+    HandoffGeometry { reach_replace: max_abs(&new), reach_insert: max_abs(&beside).max(max_abs(existing)), new, beside }
+}
+
 /// The hand-off row: the fit check and the enlarge offer, the warnings' confirm line, Relax
 /// after, Insert and Replace. Returns true when a hand-off was sent (the window closes).
 fn handoff_rows(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mut Vec<Action>) -> bool {
-    use super::{embed, enlarge_n, fit_limit, max_abs};
+    use super::{enlarge_n, fit_limit};
     let walls_on = st.walls_on;
     let wall_now = st.wall_half_width;
     let (backend, gpu) = (st.backend, st.gpu_available);
@@ -724,12 +878,10 @@ fn handoff_rows(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
     }
     let scene = input.scene;
     let (n0, h0) = (scene.grid_n, scene.grid_h);
-    let new = b.embedding().to_vec();
     let existing: Vec<[f64; 3]> = scene.nuclei.iter().map(|n| n.pos).collect();
-    let mut beside = new.clone();
-    embed::place_beside(&existing, &mut beside);
-    let reach_replace = max_abs(&new);
-    let reach_insert = max_abs(&beside).max(max_abs(&existing));
+    let shaped = b.shaped();
+    let looking = super::shape::looking_up(shaped);
+    let HandoffGeometry { new, beside, reach_replace, reach_insert } = geometry_of(shaped.positions.clone(), &existing);
     // the walls of a grid: today's on the grid now, else the default for that cell
     let walls_of = |n: usize, h: f64| -> Option<f64> {
         walls_on.then(|| if (n, h) == (n0, h0) { wall_now } else { crate::ui::default_wall_half_width(&crate::scene::Scene { grid_n: n, grid_h: h, ..scene.clone() }) })
@@ -810,9 +962,15 @@ fn handoff_rows(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
                 (true, fit_r, "Replace scene", "a new scene of these atoms (the grid, walls and ionic potential kept; time restarts)"),
                 (false, fit_i, "Insert into scene", "add these atoms beside the scene's (3 Bohr apart at least)"),
             ] {
-                let can = !matches!(fit, Fit::No { .. });
+                let (can, label) = handoff_button(replace, label, !matches!(fit, Fit::No { .. }), looking);
                 let r = ui.add_enabled(can, egui::Button::new(RichText::new(label).strong()).min_size(Vec2::new(130.0, 30.0)));
-                let r = if can { r.on_hover_text(tip) } else { r.on_disabled_hover_text("does not fit the box: enlarge it first") };
+                let r = if can {
+                    r.on_hover_text(tip)
+                } else if looking {
+                    r.on_disabled_hover_text("waiting for PubChem's shape (at most 5 s); the drawing stays editable")
+                } else {
+                    r.on_disabled_hover_text("does not fit the box: enlarge it first")
+                };
                 if r.clicked() {
                     if !marks.is_empty() && armed != Some(replace) {
                         b.armed = Some((replace, b.drawing.clone()));
@@ -838,12 +996,259 @@ fn handoff_rows(ui: &mut Ui, st: &mut UiState, input: &PanelInput<'_>, acts: &mu
     sent
 }
 
+/// Insert's or Replace's button (spec §7): pressable when the shape fits the box and no fragment is
+/// still being looked up online; while one is, it reads "Insert (looking up…)" / "Replace (looking
+/// up…)" until the answer comes or the lookup times out. `label` is the button's usual text.
+fn handoff_button(replace: bool, label: &'static str, fits: bool, looking: bool) -> (bool, &'static str) {
+    let text = match (looking, replace) {
+        (true, true) => "Replace (looking up…)",
+        (true, false) => "Insert (looking up…)",
+        (false, _) => label,
+    };
+    (fits && !looking, text)
+}
+
+/// The online setting's label and tooltip (spec §7).
+pub const ONLINE_LABEL: &str = "Look up molecules online (PubChem)";
+pub const ONLINE_TIP: &str = "sends the molecule's name or structure string to NCBI's PubChem; off: no network";
+
+/// The search box's hint (spec §8) and its "nothing here" line.
+pub const SEARCH_HINT: &str = "molecule name, formula or CID";
+pub const NO_LOCAL: &str = "no match in the shipped list or the cache";
+/// The search box's length limit (characters): a few times what the online search sends.
+const SEARCH_CHAR_LIMIT: usize = 4 * super::search::MAX_NAME;
+
 /// The enlarge offer's margin, in words.
 const ENLARGE_MARGIN_TEXT: &str = "4 Bohr to spare from the farthest atom to the box";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review focus 4: the fit check's reach is the shape the hand-off sends, not the embedding's.
+    #[test]
+    fn the_fit_check_uses_the_database_shape() {
+        use super::super::shape::{shape, tests::draw_record, Lookup, RecordSource};
+        use super::super::{embed, fit_limit, iso, max_abs, records::Library};
+        // a source answering ethanol's record stretched ×3
+        struct Stretched(super::super::records::Record);
+        impl RecordSource for Stretched {
+            fn find(&self, d: &super::super::Drawing, frag: &[usize]) -> Lookup {
+                match iso::map_fragment(d, frag, &self.0) {
+                    iso::MapResult::Mapped(m) => Lookup::Found(self.0.clone(), m),
+                    _ => Lookup::NotFound,
+                }
+            }
+        }
+        let mut eth = Library::shipped().records().iter().find(|r| r.name == "ethanol").unwrap().clone();
+        for p in &mut eth.xyz {
+            *p = p.map(|c| 3.0 * c);
+        }
+        let src = Stretched(eth.clone());
+        let mut b = Builder::default();
+        draw_record(&mut b.drawing, &eth, [0.0, 0.0], &(0..eth.z.len()).collect::<Vec<_>>());
+        let shaped = shape(&b.drawing, &src).positions;
+        let embedded = embed::embed(&b.drawing);
+        let existing = [[0.0, 0.0, 0.0], [1.4, 0.0, 0.0]];
+        let g = handoff_geometry(&mut b, &src, &existing);
+        assert_eq!(g.new, shaped, "Replace sends the database's shape");
+        assert_eq!(g.reach_replace, max_abs(&shaped));
+        assert!(max_abs(&embedded) * 2.0 < g.reach_replace, "the stretched shape reaches further: {} vs {}", g.reach_replace, max_abs(&embedded));
+        // Insert's copy is the same shape moved beside the scene's atoms
+        let mut beside = shaped.clone();
+        embed::place_beside(&existing, &mut beside);
+        assert_eq!(g.beside, beside);
+        assert_eq!(g.reach_insert, max_abs(&beside).max(max_abs(&existing)));
+        // so an 81³ × 0.15 box that holds the embedding does not hold it
+        let lim = fit_limit(81, 0.15, None);
+        assert!(max_abs(&embedded) <= lim && g.reach_replace > lim, "{} / {} / {lim}", max_abs(&embedded), g.reach_replace);
+    }
+
+    /// Spec §7: while a fragment is being looked up, Insert and Replace wait, saying so; the lookup
+    /// timing out (the clock moved by hand past [`super::super::online::TIMEOUT`]) enables them with
+    /// the offline label.
+    #[test]
+    fn insert_waits_while_looking_up() {
+        use super::super::online::{tests as net, Cache, Lookups, DEBOUNCE, TIMEOUT};
+        use super::super::shape::{footer_label, looking_up};
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+        let clock = net::ManualClock::new();
+        // PubChem never answers: the gate stays shut until the end of the test
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let canned = net::Canned::new(net::ethane_answers("CC"));
+        let lookups = Lookups::with_clock(Box::new(net::Gate { inner: canned.clone(), open: gate.clone() }), Cache::none(), clock.clone());
+        let mut b = Builder { lookup: net::ethane_session(lookups, Cache::none(), clock.clone()), drawing: net::ethane(false), ..Default::default() };
+        let buttons = |s: &super::super::shape::Shaped| [handoff_button(false, "Insert into scene", true, looking_up(s)), handoff_button(true, "Replace scene", true, looking_up(s))];
+        // waiting out the debounce, then asked and waiting for the answer
+        for step in [Duration::ZERO, DEBOUNCE, TIMEOUT - Duration::from_millis(1)] {
+            clock.advance(step);
+            let s = b.shaped().clone();
+            assert_eq!(footer_label(&s), "looking up online…");
+            assert_eq!(buttons(&s), [(false, "Insert (looking up…)"), (false, "Replace (looking up…)")]);
+            assert!(b.lookup.busy(), "the window keeps repainting");
+        }
+        // five seconds after it was asked: offline, and the buttons are back
+        clock.advance(Duration::from_millis(1));
+        let s = b.shaped().clone();
+        assert_eq!(footer_label(&s), "shape: approximate (offline)");
+        assert_eq!(buttons(&s), [(true, "Insert into scene"), (true, "Replace scene")]);
+        assert!(!b.lookup.busy());
+        // a shape that does not fit still disables them, with their usual text
+        assert_eq!(handoff_button(false, "Insert into scene", false, false), (false, "Insert into scene"));
+        net::open_gate(&gate);
+    }
+
+    /// Every text the palette column paints, after two frames in a 150 × 900 column.
+    fn palette_texts(st: &mut UiState) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    *out += t.galley.text();
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut out = String::new();
+        for _ in 0..2 {
+            out.clear();
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(150.0, 900.0))), ..Default::default() };
+            let full = ctx.run_ui(raw, |ui| palette_column(ui, st));
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        }
+        out
+    }
+
+    /// Spec §8: the search box tops the palette column with its hint; each result row shows the
+    /// name, the formula and the source; the PubChem row appears only with the setting on and
+    /// PubChem reachable (never in a test build's own session), above the online setting.
+    #[test]
+    fn the_search_box_lists_results_and_the_pubchem_row() {
+        use super::super::online::{tests as net, Cache, Lookups, Session};
+        let mut st = UiState::new("h2", &crate::scene::Scene::preset("h2").unwrap());
+        let t = palette_texts(&mut st);
+        assert!(t.contains(SEARCH_HINT), "{t}");
+        let at = |s: &str| t.to_lowercase().find(&s.to_lowercase()).unwrap_or_else(|| panic!("{s} missing: {t}"));
+        assert!(at(SEARCH_HINT) < at("element") && at("element") < at(ONLINE_LABEL), "the box first, the setting last: {t}");
+        // the search tests' own list, whatever the shipped one holds (review M8)
+        st.builder.search.library = Some(super::super::search::tests::test_library());
+        st.builder.search_query = "eth".into();
+        let t = palette_texts(&mut st);
+        assert!(t.contains("ethanol\nC₂H₆O · shipped"), "{t}");
+        assert!(!t.contains("Search PubChem"), "no network in a test build: {t}");
+        st.builder.search_query = "xyzzy".into();
+        assert!(palette_texts(&mut st).contains(NO_LOCAL));
+        // a session whose PubChem (canned) is reachable: the row, unless the setting is off
+        let clock = net::ManualClock::new();
+        st.builder.lookup = Session::with(Lookups::with_clock(Box::new(net::Canned::new(Default::default())), Cache::none(), clock.clone()), Cache::none(), clock);
+        assert!(palette_texts(&mut st).contains("Search PubChem for 'xyzzy'"));
+        // asked: PubChem knows no such name (its 404) — one short line, the row gone
+        st.builder.search_online();
+        assert!(st.builder.lookup.wait_search(std::time::Duration::from_secs(30)));
+        let t = palette_texts(&mut st);
+        assert!(t.contains("no results on PubChem") && !t.contains("Search PubChem"), "{t}");
+        // a name it knows: its row, with the source
+        let mut answers = net::ethane_answers("CC");
+        answers.insert(super::super::online::name_url("ethane"), Ok("6324\n".into()));
+        let clock = net::ManualClock::new();
+        st.builder.lookup = Session::with(Lookups::with_clock(Box::new(net::Canned::new(answers)), Cache::none(), clock.clone()), Cache::none(), clock);
+        st.builder.search_query = "ethane".into();
+        st.builder.search_online();
+        assert!(st.builder.lookup.wait_search(std::time::Duration::from_secs(30)));
+        assert!(palette_texts(&mut st).contains("Ethane\nC₂H₆ · PubChem"));
+        st.builder.online = false;
+        assert!(!palette_texts(&mut st).contains("Search PubChem"));
+    }
+
+    /// Every text the footer rows paint, after two frames in a 900 × 300 area.
+    fn footer_texts(st: &mut UiState) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    *out += t.galley.text();
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut out = String::new();
+        for _ in 0..2 {
+            out.clear();
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 300.0))), ..Default::default() };
+            let full = ctx.run_ui(raw, |ui| footer_rows(ui, st));
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        }
+        out
+    }
+
+    /// Final review I2 (spec §6.2): a drawing without its hydrogens is a radical and matches no
+    /// closed-shell record; the fallback label stays as the spec words it, and a second line says
+    /// Fill hydrogens would match the record the filled drawing maps to. Once filled, the database's
+    /// shape and no hint.
+    #[test]
+    fn the_fallback_suggests_fill_hydrogens() {
+        let mut st = UiState::new("h2", &crate::scene::Scene::preset("h2").unwrap());
+        // C–C–O, no hydrogens (a test build has no network: offline)
+        let d = &mut st.builder.drawing;
+        for (i, z) in [6u8, 6, 8].into_iter().enumerate() {
+            d.add_atom(z, [i as f32, 0.0]);
+        }
+        d.bond(0, 1);
+        d.bond(1, 2);
+        let t = footer_texts(&mut st);
+        assert!(t.contains("shape: approximate (offline)\n"), "{t}");
+        assert!(t.contains("Fill hydrogens would match ethanol\n"), "{t}");
+        st.builder.fill_hydrogens();
+        let t = footer_texts(&mut st);
+        assert!(t.contains("shape: PubChem \"ethanol\" (CID 702)") && !t.contains("would match"), "{t}");
+        // a drawing whose filled form is in no database either: no hint
+        let mut he = super::super::Drawing::default();
+        he.add_atom(2, [0.0, 0.0]);
+        he.add_atom(2, [1.0, 0.0]);
+        he.bond(0, 1);
+        st.builder.drawing = he;
+        let t = footer_texts(&mut st);
+        assert!(t.contains("shape: approximate (offline)") && !t.contains("would match"), "{t}");
+    }
+
+    /// One frame of the palette column with `events`; whether an Esc was still there for the
+    /// builder's own Esc (deselect, then close) after it.
+    fn palette_frame(ctx: &egui::Context, st: &mut UiState, events: Vec<egui::Event>) -> bool {
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(150.0, 900.0))), events, ..Default::default() };
+        let mut esc_left = false;
+        let _ = ctx.run_ui(raw, |ui| {
+            palette_column(ui, st);
+            esc_left = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        });
+        esc_left
+    }
+
+    /// Final review M1: Esc in the search box only leaves the box (egui drops the focus at the start
+    /// of the frame, so the window's Esc would otherwise see no text field and close the builder or
+    /// clear the selection); with the box not focused, Esc is the builder's.
+    #[test]
+    fn esc_in_the_search_box_stays_in_the_box() {
+        let mut st = UiState::new("h2", &crate::scene::Scene::preset("h2").unwrap());
+        let ctx = egui::Context::default();
+        let esc = egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        let press = |pressed: bool| egui::Event::PointerButton { pos: Pos2::new(40.0, 10.0), button: PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        palette_frame(&ctx, &mut st, vec![]);
+        assert!(palette_frame(&ctx, &mut st, vec![esc.clone()]), "the box not focused: the builder's Esc");
+        palette_frame(&ctx, &mut st, vec![]);
+        palette_frame(&ctx, &mut st, vec![egui::Event::PointerMoved(Pos2::new(40.0, 10.0)), press(true)]);
+        palette_frame(&ctx, &mut st, vec![press(false)]);
+        assert!(ctx.text_edit_focused(), "the click put the search box in focus");
+        assert!(!palette_frame(&ctx, &mut st, vec![esc.clone()]), "Esc in the box is the box's");
+        assert!(!ctx.text_edit_focused(), "and the box let go of the focus");
+        palette_frame(&ctx, &mut st, vec![]);
+        palette_frame(&ctx, &mut st, vec![]);
+        assert!(palette_frame(&ctx, &mut st, vec![esc]), "the next Esc is the builder's again");
+    }
 
     /// The Atom tool as the user asked for it (2026-10-20): click places a lone atom and selects it,
     /// the next click elsewhere places one bonded to it, deselect, then a lone one again; clicking the

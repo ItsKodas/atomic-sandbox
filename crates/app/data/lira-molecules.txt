@@ -1,0 +1,64 @@
+# The builder's LIRA-relaxed entries (spec docs/superpowers/specs/2026-11-25-builder-database-design.md §5.1):
+# molecules within H–Ar that PubChem has no 3D shape for. The generator
+#   LIRA_GENERATE=1 cargo test -p app --release --bin app -- worker::tests::generate_lira_shapes --ignored --nocapture
+# relaxes each one with the app's own Relax (GPU, LSDA, Accurate, ionic accepted, automatic multiplicity) and writes
+# it into molecules.txt as a `source lira` row; an entry PubChem does have a 3D shape for is skipped (PubChem's wins).
+#
+# One entry a line, five fields split by `|`:
+#   name | synonyms (comma-separated, may be empty) | atoms | bonds | multiplicity
+# atoms: element symbols in order (numbered from 0), a trailing + or - for a formal charge of ±1;
+# bonds: a-b single, a=b double, a#b triple;
+# multiplicity: `auto` (the app's automatic multiplicity: paired, one unpaired electron for an odd count).
+# The formal charges are the builder's (crates/app/src/builder/chem.rs): where a drawing with no valence
+# warning exists it is the one listed (BH4- on B, the dative N+–B- of ammonia borane, the bridging Cl+ of
+# Al2Cl6); a bridging H (B2H6, H3+) has no warning-free form and is drawn plain.
+#
+# The relaxed shapes are this solver's minima at those defaults, not experimental geometries: bonds to Na, Mg and Be come
+# out 2–10 % long against experiment (Al has no sourced gas-phase value to compare): Li, Be, Na, Mg and Al are
+# all-electron with smeared nuclei under `accepted` at h = σ = 0.15.
+# Measured and explained in crates/validate/references.md, "Builder LIRA shapes: all-electron light metals relax long".
+
+# H2 and LiH: the app's preset molecules (PubChem CIDs 783 and 62714 have no 3D record)
+hydrogen | dihydrogen, H2 | H H | 0-1 | auto
+lithium hydride | LiH | Li H | 0-1 | auto
+
+# lithium, beryllium, boron
+dilithium | lithium dimer, Li2 | Li Li | 0-1 | auto
+lithium fluoride | LiF | Li F | 0-1 | auto
+lithium chloride | LiCl | Li Cl | 0-1 | auto
+lithium hydroxide | LiOH | Li O H | 0-1 1-2 | auto
+beryllium hydride | BeH2 | Be H H | 0-1 0-2 | auto
+beryllium fluoride | BeF2 | Be F F | 0-1 0-2 | auto
+beryllium chloride | BeCl2 | Be Cl Cl | 0-1 0-2 | auto
+borane | borane monomer, BH3 | B H H H | 0-1 0-2 0-3 | auto
+borohydride | tetrahydroborate, BH4- | B- H H H H | 0-1 0-2 0-3 0-4 | auto
+diborane | B2H6 | B B H H H H H H | 0-2 0-3 1-4 1-5 0-6 1-6 0-7 1-7 | auto
+boron trifluoride | BF3 | B F F F | 0-1 0-2 0-3 | auto
+boron trichloride | BCl3 | B Cl Cl Cl | 0-1 0-2 0-3 | auto
+boric acid | orthoboric acid, B(OH)3 | B O O O H H H | 0-1 0-2 0-3 1-4 2-5 3-6 | auto
+ammonia borane | borazane, NH3BH3 | N+ B- H H H H H H | 0-1 0-2 0-3 0-4 1-5 1-6 1-7 | auto
+
+# sodium, magnesium, aluminium
+sodium hydride | NaH | Na H | 0-1 | auto
+disodium | sodium dimer, Na2 | Na Na | 0-1 | auto
+sodium fluoride | NaF | Na F | 0-1 | auto
+sodium chloride | NaCl | Na Cl | 0-1 | auto
+sodium hydroxide | NaOH | Na O H | 0-1 1-2 | auto
+magnesium hydride | MgH2 | Mg H H | 0-1 0-2 | auto
+magnesium fluoride | MgF2 | Mg F F | 0-1 0-2 | auto
+magnesium chloride | MgCl2 | Mg Cl Cl | 0-1 0-2 | auto
+magnesium oxide | MgO | Mg O | 0=1 | auto
+alane | aluminium hydride, AlH3 | Al H H H | 0-1 0-2 0-3 | auto
+tetrahydroaluminate | aluminium hydride anion, AlH4- | Al- H H H H | 0-1 0-2 0-3 0-4 | auto
+aluminium fluoride | aluminum fluoride, AlF3 | Al F F F | 0-1 0-2 0-3 | auto
+aluminium chloride | aluminum chloride, AlCl3 | Al Cl Cl Cl | 0-1 0-2 0-3 | auto
+aluminium chloride dimer | aluminum chloride dimer, Al2Cl6 | Al- Al- Cl+ Cl+ Cl Cl Cl Cl | 0-2 1-2 0-3 1-3 0-4 0-5 1-6 1-7 | auto
+
+# small radicals and ions the app uses
+trihydrogen cation | H3+ | H+ H H | 0-1 1-2 0-2 | auto
+hydroxyl radical | hydroxyl, OH | O H | 0-1 | auto
+methyl radical | methyl, CH3 | C H H H | 0-1 0-2 0-3 | auto
+amino radical | amidogen, NH2 | N H H | 0-1 0-2 | auto
+hydroperoxyl | hydroperoxy radical, HO2 | H O O | 0-1 1-2 | auto
+nitric oxide | nitrogen monoxide, NO | N O | 0=1 | auto
+nitrogen dioxide | NO2 | O N O | 0=1 1-2 | auto

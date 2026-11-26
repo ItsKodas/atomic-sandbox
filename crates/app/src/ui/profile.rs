@@ -10,7 +10,7 @@
 //! panel's folds (`model_sections = teach,health`) and of the Activity panel's
 //! (`activity_sections = trust,training`) and of the Orbitals panel's (`orbital_sections = spin`) and the Knowledge panel's (`knowledge_sections = why,triples`) and the Readouts panel's (`readouts_sections = work,breakdown,compare`) and the Selection panel's (`selection_sections = details,molecules,charges`), the units, the Version
 //! panel's channel and Check automatically (`update_channel = Stable`, `update_auto_check = true`;
-//! installer Task 4) — as a small text file of `key = value` lines. Display state only: nothing
+//! installer Task 4), the molecule builder's online lookup (`builder_online = true`) — as a small text file of `key = value` lines. Display state only: nothing
 //! here is an `Action` or reaches the worker.
 //!
 //! This computer's GPU memory share (Scene ▸ Quality ▸ GPU memory, design 2026-11-21) is kept
@@ -105,6 +105,8 @@ pub fn capture(st: &UiState) -> String {
     // the Version panel's display settings (installer Task 4)
     out += &format!("update_channel = {:?}\n", st.update.channel);
     out += &format!("update_auto_check = {}\n", st.update.auto_check);
+    // the molecule builder's "Look up molecules online (PubChem)" (builder database spec §7)
+    out += &format!("builder_online = {}\n", st.builder.online);
     out
 }
 
@@ -187,6 +189,10 @@ pub fn apply(st: &mut UiState, text: &str) {
     }
     if let Some(v) = kv.get("update_auto_check").and_then(|v| v.parse().ok()) {
         st.update.auto_check = v;
+    }
+    // absent (a profile from before it) or unreadable: unchanged, on by default
+    if let Some(v) = kv.get("builder_online").and_then(|v| v.parse().ok()) {
+        st.builder.online = v;
     }
     // (a `gpu_memory` line, written by 0.2.1-beta.1, is not applied here: the share is this
     // computer's, kept in `machine.settings` — `load_current` moves it there once)

@@ -1,0 +1,1853 @@
+# The builder's shipped molecule list: the names the generator turns into molecules.txt
+# (crates/app/src/builder/records.rs, mod generate; spec docs/superpowers/specs/2026-11-25-builder-database-design.md §5).
+# One molecule a line: a PubChem name, or "name | CID" where the name alone is ambiguous. The name
+# is the record's name in the builder. "#" starts a comment. Everything here is within H–Ar, with at
+# most 30 atoms including hydrogens, and has a PubChem 3D conformer (the generator skips and
+# reports anything else).
+
+# ── the builder's stamps: their molecules, alone and on a carbon ──
+methane
+water
+ammonia
+formic acid
+benzene
+ethane
+methanol
+methylamine
+acetic acid
+toluene
+
+# ── the app's presets and the README's molecules ──
+hydrogen sulfide
+hydrogen chloride
+phosphine
+silane
+carbon dioxide
+nitrogen
+oxygen
+ethanol
+
+# ── diatomics and common gases ──
+chlorine
+carbon monoxide
+hydrogen fluoride
+ozone
+sulfur dioxide
+sulfur trioxide
+hydrogen cyanide
+hydrogen peroxide
+hydrazine
+carbonyl sulfide
+carbon disulfide
+dichlorine monoxide
+nitrogen trifluoride
+nitrogen trichloride
+oxygen difluoride
+phosphorus trichloride
+phosphorus trifluoride
+phosphoryl chloride
+silicon tetrafluoride
+silicon tetrachloride
+trichlorosilane
+dichlorosilane
+disilane
+hydroxylamine
+cyanogen
+cyanogen chloride
+thionyl chloride
+sulfuryl chloride
+sulfuryl fluoride
+sulfur dichloride
+disulfur dichloride
+phosgene
+carbonyl fluoride
+thiophosgene
+nitrosyl chloride
+dinitrogen tetroxide
+hydrazoic acid
+cyanamide
+chloramine
+isocyanic acid
+cyanic acid
+hypochlorous acid
+nitric acid
+nitrous acid
+sulfuric acid
+sulfurous acid
+phosphoric acid
+phosphorous acid
+hypophosphorous acid
+pyrophosphoric acid
+carbonic acid
+silicic acid
+sulfamic acid
+diazene
+
+# ── hydrides and their simplest derivatives ──
+methylsilane
+trimethylsilane
+tetramethylsilane
+methylphosphine
+dimethylphosphine
+trimethylphosphine
+triethylphosphine
+methanethiol
+ethanethiol
+dimethyl sulfide
+diethyl sulfide
+dimethyl disulfide
+diethyl disulfide
+dimethyl trisulfide
+silanol
+trimethylsilanol
+chlorotrimethylsilane
+dichlorodimethylsilane
+trichloromethylsilane
+tetramethyl orthosilicate
+hexamethyldisiloxane
+hexamethyldisilazane
+hexamethylcyclotrisiloxane
+triethylsilane
+vinyltrimethylsilane
+allyltrimethylsilane
+methyltrimethoxysilane
+
+# ── ions with a 3D record ──
+ammonium | 223
+hydroxide | 961
+hydronium
+methylammonium
+dimethylammonium
+trimethylammonium
+tetramethylammonium
+guanidinium
+acetate
+formate
+bicarbonate
+carbonate
+nitrate
+nitrite
+sulfate
+hydrogen sulfate
+sulfite
+bisulfite
+hydrogen thiosulfate | 439208
+phosphate
+hydrogen phosphate
+dihydrogen phosphate
+hypochlorite
+cyanide
+thiocyanate
+azide
+oxalate
+methoxide
+ethoxide
+phenoxide
+hydrosulfide
+nitronium
+nitrosonium
+lactate
+pyruvate
+citrate
+succinate
+fumarate
+benzoate
+trifluoroacetate
+pyridinium
+imidazolium
+anilinium
+choline
+acetylcholine
+
+# ── alkanes and cycloalkanes ──
+propane
+butane
+isobutane
+pentane
+isopentane
+neopentane
+hexane
+2-methylpentane
+3-methylpentane
+2,2-dimethylbutane
+2,3-dimethylbutane
+heptane
+2-methylhexane
+3-methylhexane
+2,2-dimethylpentane
+2,3-dimethylpentane
+2,4-dimethylpentane
+3,3-dimethylpentane
+3-ethylpentane
+2,2,3-trimethylbutane
+octane
+2-methylheptane
+3-methylheptane
+4-methylheptane
+2,2-dimethylhexane
+2,3-dimethylhexane
+2,4-dimethylhexane
+2,5-dimethylhexane
+3,3-dimethylhexane
+3,4-dimethylhexane
+3-ethylhexane
+2,2,3-trimethylpentane
+2,2,4-trimethylpentane
+2,3,3-trimethylpentane
+2,3,4-trimethylpentane
+2,2,3,3-tetramethylbutane
+nonane
+cyclopropane
+cyclobutane
+cyclopentane
+cyclohexane
+cycloheptane
+cyclooctane
+methylcyclopropane
+methylcyclobutane
+methylcyclopentane
+methylcyclohexane
+1,1-dimethylcyclopropane
+1,1-dimethylcyclopentane
+1,1-dimethylcyclohexane
+cis-1,2-dimethylcyclohexane
+trans-1,2-dimethylcyclohexane
+spiropentane
+bicyclo[1.1.0]butane
+bicyclo[1.1.1]pentane
+bicyclo[2.2.1]heptane
+bicyclo[2.2.2]octane
+decalin
+cubane
+adamantane
+quadricyclane
+prismane
+twistane
+cyclononane
+
+# ── alkenes, dienes and polyenes ──
+ethylene
+propylene
+1-butene
+cis-2-butene
+trans-2-butene
+isobutylene
+1-pentene
+cis-2-pentene
+trans-2-pentene
+2-methyl-1-butene
+3-methyl-1-butene
+2-methyl-2-butene
+1-hexene
+cis-2-hexene
+trans-2-hexene
+cis-3-hexene
+trans-3-hexene
+2,3-dimethyl-2-butene
+1-heptene
+1-octene
+cyclopropene
+cyclobutene
+cyclopentene
+cyclohexene
+cycloheptene
+cis-cyclooctene
+1-methylcyclohexene
+methylenecyclopentane
+methylenecyclohexane
+1,2-butadiene
+1,3-butadiene
+isoprene
+trans-1,3-pentadiene
+1,4-pentadiene
+1,5-hexadiene
+2,4-hexadiene
+2,3-dimethyl-1,3-butadiene
+1,3-cyclopentadiene
+1,3-cyclohexadiene
+1,4-cyclohexadiene
+1,3,5-hexatriene
+1,3,5-cycloheptatriene
+cyclooctatetraene
+1,5-cyclooctadiene
+norbornene
+norbornadiene
+dicyclopentadiene
+fulvene
+6,6-dimethylfulvene
+limonene
+alpha-pinene
+beta-pinene
+camphene
+myrcene
+ocimene
+3-carene
+terpinolene
+alpha-terpinene
+gamma-terpinene
+
+# ── alkynes ──
+acetylene
+propyne
+1-butyne
+2-butyne
+1-pentyne
+2-pentyne
+3-methyl-1-butyne
+1-hexyne
+2-hexyne
+3-hexyne
+3,3-dimethyl-1-butyne
+1-heptyne
+1-octyne
+4-octyne
+1,3-butadiyne
+vinylacetylene
+propiolic acid
+methyl propiolate
+propiolaldehyde
+3-butyn-1-ol
+2-butyne-1,4-diol
+2-methyl-3-butyn-2-ol
+propargylamine
+propargyl chloride
+acetylenedicarboxylic acid
+dimethyl acetylenedicarboxylate
+phenylacetylene
+1-phenyl-1-propyne
+diphenylacetylene
+cyanoacetylene
+
+# ── alcohols ──
+1-propanol
+2-propanol
+1-butanol
+2-butanol
+isobutanol
+tert-butanol
+1-pentanol
+2-pentanol
+3-pentanol
+2-methyl-1-butanol
+3-methyl-1-butanol
+2-methyl-2-butanol
+3-methyl-2-butanol
+neopentyl alcohol
+1-hexanol
+2-hexanol
+3-hexanol
+1-heptanol
+1-octanol
+2-ethyl-1-hexanol
+cyclopropanol
+cyclobutanol
+cyclopentanol
+cyclohexanol
+1-methylcyclohexanol
+allyl alcohol
+crotyl alcohol
+prenol
+cis-3-hexen-1-ol
+1-octen-3-ol
+propargyl alcohol
+ethylene glycol
+propylene glycol
+1,3-propanediol
+1,3-butanediol
+1,4-butanediol
+2,3-butanediol
+1,6-hexanediol
+neopentyl glycol
+pinacol
+glycerol
+pentaerythritol
+erythritol
+xylitol
+sorbitol
+mannitol
+inositol
+benzyl alcohol
+2-phenylethanol
+1-phenylethanol
+cinnamyl alcohol
+2-methoxyethanol
+2-ethoxyethanol
+2-butoxyethanol
+1-methoxy-2-propanol
+diethylene glycol
+triethylene glycol
+2-phenoxyethanol
+2-chloroethanol
+2,2,2-trichloroethanol
+2-fluoroethanol
+2,2,2-trifluoroethanol
+hexafluoroisopropanol
+2-mercaptoethanol
+borneol
+geraniol
+nerol
+linalool
+alpha-terpineol
+terpinen-4-ol
+eucalyptol
+furfuryl alcohol
+tetrahydrofurfuryl alcohol
+glycidol
+5-hydroxymethylfurfural
+
+# ── phenols ──
+phenol
+o-cresol
+m-cresol
+p-cresol
+catechol
+resorcinol
+hydroquinone
+pyrogallol
+phloroglucinol
+2-chlorophenol
+3-chlorophenol
+4-chlorophenol
+2,4-dichlorophenol
+2,4,6-trichlorophenol
+pentachlorophenol
+2-fluorophenol
+4-fluorophenol
+pentafluorophenol
+2-nitrophenol
+3-nitrophenol
+4-nitrophenol
+2,4-dinitrophenol
+picric acid
+2-aminophenol
+3-aminophenol
+4-aminophenol
+guaiacol
+3-methoxyphenol
+4-methoxyphenol
+2,6-dimethylphenol
+4-ethylphenol
+4-tert-butylphenol
+2-phenylphenol
+thymol
+carvacrol
+eugenol
+isoeugenol
+4-vinylphenol
+4-methylcatechol
+tert-butylhydroquinone
+4-chloro-3-methylphenol
+chloroxylenol
+1-naphthol
+2-naphthol
+vanillyl alcohol
+tyrosol
+raspberry ketone
+zingerone
+umbelliferone
+sesamol
+
+# ── aldehydes ──
+formaldehyde
+acetaldehyde
+propanal
+butanal
+isobutyraldehyde
+pentanal
+isovaleraldehyde
+2-methylbutanal
+pivaldehyde
+hexanal
+heptanal
+octanal
+2-ethylhexanal
+acrolein
+crotonaldehyde
+methacrolein
+trans-2-hexenal
+cis-3-hexenal
+2,4-hexadienal
+3-methyl-2-butenal
+glyoxal
+methylglyoxal
+glycolaldehyde
+glyceraldehyde
+malondialdehyde
+glutaraldehyde
+chloral
+chloroacetaldehyde
+methional
+benzaldehyde
+4-methylbenzaldehyde
+4-chlorobenzaldehyde
+4-fluorobenzaldehyde
+4-nitrobenzaldehyde
+4-methoxybenzaldehyde
+salicylaldehyde
+4-hydroxybenzaldehyde
+vanillin
+ethyl vanillin
+4-dimethylaminobenzaldehyde
+piperonal
+phthalaldehyde
+terephthalaldehyde
+cinnamaldehyde
+phenylacetaldehyde
+cyclohexanecarboxaldehyde
+furfural
+5-methylfurfural
+thiophene-2-carboxaldehyde
+pyridine-2-carboxaldehyde
+pyridine-4-carboxaldehyde
+citral
+citronellal
+1-naphthaldehyde
+
+# ── ketones and quinones ──
+acetone
+butanone
+2-pentanone
+3-pentanone
+3-methyl-2-butanone
+2-hexanone
+3-hexanone
+4-methyl-2-pentanone
+3,3-dimethyl-2-butanone
+2-heptanone
+3-heptanone
+4-heptanone
+2,4-dimethyl-3-pentanone
+2-octanone
+cyclopropanone
+cyclobutanone
+cyclopentanone
+cyclohexanone
+cycloheptanone
+2-methylcyclohexanone
+2-cyclopenten-1-one
+2-cyclohexen-1-one
+isophorone
+mesityl oxide
+methyl vinyl ketone
+methyl cyclopropyl ketone
+diacetyl
+2,3-pentanedione
+acetylacetone
+2,5-hexanedione
+1,3-cyclohexanedione
+dimedone
+hydroxyacetone
+dihydroxyacetone
+acetoin
+diacetone alcohol
+chloroacetone
+1,1,1-trifluoroacetone
+hexafluoroacetone
+ketene
+dimethylketene
+diketene
+camphor
+menthone
+carvone
+pulegone
+verbenone
+fenchone
+thujone
+cis-jasmone
+tropone
+tropolone
+acetophenone
+propiophenone
+butyrophenone
+4-methylacetophenone
+4-chloroacetophenone
+4-nitroacetophenone
+4-aminoacetophenone
+4-methoxyacetophenone
+benzylacetone
+phenylacetone
+benzophenone
+benzil
+benzoin
+chalcone
+1-indanone
+2-indanone
+1,3-indandione
+1-tetralone
+fluorenone
+anthrone
+anthraquinone
+xanthone
+acridone
+1,4-benzoquinone
+1,2-benzoquinone
+duroquinone
+chloranil
+DDQ
+1,4-naphthoquinone
+1,2-naphthoquinone
+menadione
+juglone
+lawsone
+2-acetylfuran
+2-acetylthiophene
+2-acetylpyridine
+2-acetyl-1-pyrroline
+2-acetylthiazole
+squaric acid
+alloxan
+ninhydrin
+
+# ── carboxylic acids ──
+propionic acid
+butyric acid
+isobutyric acid
+valeric acid
+isovaleric acid
+2-methylbutanoic acid
+pivalic acid
+hexanoic acid
+octanoic acid
+valproic acid
+acrylic acid
+methacrylic acid
+crotonic acid
+tiglic acid
+angelic acid
+sorbic acid
+oxalic acid
+malonic acid
+succinic acid
+glutaric acid
+adipic acid
+pimelic acid
+maleic acid
+fumaric acid
+itaconic acid
+cis,cis-muconic acid
+glycolic acid
+lactic acid
+3-hydroxypropanoic acid
+3-hydroxybutyric acid
+4-hydroxybutyric acid
+malic acid
+L-tartaric acid
+citric acid
+isocitric acid
+cis-aconitic acid
+gluconic acid
+glucuronic acid
+ascorbic acid
+glyoxylic acid
+pyruvic acid
+acetoacetic acid
+levulinic acid
+alpha-ketoglutaric acid
+oxaloacetic acid
+chloroacetic acid
+dichloroacetic acid
+trichloroacetic acid
+fluoroacetic acid
+difluoroacetic acid
+trifluoroacetic acid
+2-chloropropanoic acid
+3-chloropropanoic acid
+cyanoacetic acid
+thioglycolic acid
+3-mercaptopropionic acid
+methoxyacetic acid
+phenoxyacetic acid
+benzoic acid
+phenylacetic acid
+3-phenylpropanoic acid
+2-phenylpropanoic acid
+cinnamic acid
+mandelic acid
+phthalic acid
+isophthalic acid
+terephthalic acid
+trimesic acid
+o-toluic acid
+m-toluic acid
+p-toluic acid
+2-chlorobenzoic acid
+4-chlorobenzoic acid
+4-fluorobenzoic acid
+3-nitrobenzoic acid
+4-nitrobenzoic acid
+anthranilic acid
+4-aminobenzoic acid
+salicylic acid
+4-hydroxybenzoic acid
+3,4-dihydroxybenzoic acid
+gallic acid
+4-methoxybenzoic acid
+vanillic acid
+5-aminosalicylic acid
+p-coumaric acid
+caffeic acid
+ferulic acid
+hippuric acid
+cyclopropanecarboxylic acid
+cyclohexanecarboxylic acid
+shikimic acid
+quinic acid
+2-furoic acid
+2,5-furandicarboxylic acid
+nicotinic acid
+isonicotinic acid
+picolinic acid
+orotic acid
+indole-3-acetic acid
+pyroglutamic acid
+uric acid
+barbituric acid
+oxamic acid
+carbamic acid
+methanesulfonic acid
+trifluoromethanesulfonic acid
+benzenesulfonic acid
+p-toluenesulfonic acid
+sulfanilic acid
+methylphosphonic acid
+aminomethylphosphonic acid
+glyphosate
+fosfomycin
+
+# ── esters, lactones and anhydrides ──
+methyl formate
+ethyl formate
+methyl acetate
+ethyl acetate
+propyl acetate
+isopropyl acetate
+butyl acetate
+isobutyl acetate
+tert-butyl acetate
+isoamyl acetate
+benzyl acetate
+phenyl acetate
+vinyl acetate
+allyl acetate
+triacetin
+methyl propionate
+ethyl propionate
+methyl butyrate
+ethyl butyrate
+methyl isobutyrate
+ethyl isobutyrate
+ethyl hexanoate
+methyl acrylate
+ethyl acrylate
+methyl methacrylate
+methyl lactate
+ethyl lactate
+methyl acetoacetate
+ethyl acetoacetate
+ethyl chloroacetate
+methyl trifluoroacetate
+ethyl cyanoacetate
+methyl 2-cyanoacrylate
+ethyl 2-cyanoacrylate
+dimethyl carbonate
+diethyl carbonate
+ethylene carbonate
+propylene carbonate
+dimethyl oxalate
+diethyl oxalate
+dimethyl malonate
+diethyl malonate
+dimethyl succinate
+diethyl succinate
+dimethyl maleate
+dimethyl fumarate
+methyl benzoate
+ethyl benzoate
+benzyl benzoate
+phenyl benzoate
+benzocaine
+methyl anthranilate
+methyl salicylate
+methylparaben
+propylparaben
+methyl cinnamate
+ethyl cinnamate
+dimethyl phthalate
+dimethyl terephthalate
+methyl nicotinate
+gamma-butyrolactone
+gamma-valerolactone
+delta-valerolactone
+epsilon-caprolactone
+beta-propiolactone
+gamma-decalactone
+delta-decalactone
+glucono-delta-lactone
+glycolide
+L-lactide
+coumarin
+dihydrocoumarin
+phthalide
+2-pyrone
+4-pyrone
+maltol
+ethyl maltol
+kojic acid
+furaneol
+acetic anhydride
+propionic anhydride
+succinic anhydride
+maleic anhydride
+phthalic anhydride
+trimethyl orthoformate
+triethyl orthoformate
+methyl nitrate
+ethyl nitrate
+methyl nitrite
+ethyl nitrite
+nitroglycerin
+isosorbide dinitrate
+dimethyl sulfate
+diethyl sulfate
+methyl methanesulfonate
+ethyl methanesulfonate
+busulfan
+trimethyl phosphate
+triethyl phosphate
+trimethyl phosphite
+triethyl phosphite
+
+# ── ethers, acetals and epoxides ──
+dimethyl ether
+diethyl ether
+methyl ethyl ether
+dipropyl ether
+diisopropyl ether
+dibutyl ether
+methyl tert-butyl ether
+ethyl tert-butyl ether
+methyl vinyl ether
+ethyl vinyl ether
+divinyl ether
+diallyl ether
+anisole
+phenetole
+diphenyl ether
+4-methylanisole
+4-nitroanisole
+anethole
+estragole
+safrole
+1,2-dimethoxybenzene
+1,3-dimethoxybenzene
+1,4-dimethoxybenzene
+1,3-benzodioxole
+1,4-benzodioxane
+dimethoxymethane
+1,1-dimethoxyethane
+2,2-dimethoxypropane
+1,2-dimethoxyethane
+diglyme
+ethylene oxide
+propylene oxide
+1,2-epoxybutane
+cyclohexene oxide
+styrene oxide
+epichlorohydrin
+oxetane
+tetrahydrofuran
+2-methyltetrahydrofuran
+tetrahydropyran
+1,4-dioxane
+1,3-dioxane
+1,3-dioxolane
+1,3,5-trioxane
+paraldehyde
+12-crown-4
+3,4-dihydro-2H-pyran
+2,3-dihydrofuran
+2,5-dihydrofuran
+furan
+2-methylfuran
+2,5-dimethylfuran
+benzofuran
+2,3-dihydrobenzofuran
+dibenzofuran
+xanthene
+chromane
+2H-chromene
+dibenzo-p-dioxin
+chloromethyl methyl ether
+bis(chloromethyl) ether
+enflurane
+isoflurane
+sevoflurane
+desflurane
+methoxyflurane
+di-tert-butyl peroxide
+tert-butyl hydroperoxide
+cumene hydroperoxide
+peracetic acid
+performic acid
+
+# ── amines, hydrazines, hydroxylamines, oximes, azo compounds ──
+dimethylamine
+trimethylamine
+ethylamine
+diethylamine
+triethylamine
+propylamine
+isopropylamine
+diisopropylamine
+N,N-diisopropylethylamine
+butylamine
+sec-butylamine
+isobutylamine
+tert-butylamine
+pentylamine
+hexylamine
+cyclopropylamine
+cyclopentylamine
+cyclohexylamine
+allylamine
+ethylenediamine
+N,N,N',N'-tetramethylethylenediamine
+1,2-diaminopropane
+1,3-diaminopropane
+putrescine
+cadaverine
+hexamethylenediamine
+diethylenetriamine
+spermidine
+ethanolamine
+N,N-dimethylethanolamine
+diethanolamine
+triethanolamine
+3-amino-1-propanol
+1-amino-2-propanol
+tromethamine
+cysteamine
+aniline
+N-methylaniline
+N,N-dimethylaniline
+o-toluidine
+m-toluidine
+p-toluidine
+2,6-dimethylaniline
+2-chloroaniline
+3-chloroaniline
+4-chloroaniline
+2-fluoroaniline
+4-fluoroaniline
+2-nitroaniline
+3-nitroaniline
+4-nitroaniline
+o-anisidine
+p-anisidine
+o-phenylenediamine
+m-phenylenediamine
+p-phenylenediamine
+2,4-diaminotoluene
+4-aminobiphenyl
+benzidine
+diphenylamine
+1-naphthylamine
+2-naphthylamine
+benzylamine
+phenethylamine
+1-phenylethylamine
+amphetamine
+tyramine
+dopamine
+norepinephrine
+epinephrine
+phenylephrine
+ephedrine
+pseudoephedrine
+tranylcypromine
+mexiletine
+pyrrolidine
+N-methylpyrrolidine
+piperidine
+N-methylpiperidine
+morpholine
+N-methylmorpholine
+thiomorpholine
+piperazine
+1-methylpiperazine
+azetidine
+aziridine
+azepane
+quinuclidine
+1,4-diazabicyclo[2.2.2]octane
+1,8-diazabicyclo[5.4.0]undec-7-ene
+tropane
+tropinone
+hexamethylenetetramine
+coniine
+nicotine
+nornicotine
+anabasine
+cotinine
+4-dimethylaminopyridine
+methylhydrazine
+1,1-dimethylhydrazine
+1,2-dimethylhydrazine
+phenylhydrazine
+N-methylhydroxylamine
+O-methylhydroxylamine
+acetone oxime
+acetaldehyde oxime
+butanone oxime
+cyclohexanone oxime
+dimethylglyoxime
+acetone hydrazone
+acetone azine
+N-nitrosodimethylamine
+azobenzene
+azoxybenzene
+azodicarbonamide
+azomethane
+diazomethane
+trimethylamine N-oxide
+pyridine N-oxide
+
+# ── amides, imides, ureas, carbamates ──
+formamide
+N-methylformamide
+N,N-dimethylformamide
+acetamide
+N-methylacetamide
+N,N-dimethylacetamide
+acetanilide
+phenacetin
+paracetamol
+propanamide
+butanamide
+acrylamide
+methacrylamide
+benzamide
+N,N-dimethylbenzamide
+salicylamide
+nicotinamide
+isonicotinamide
+pyrazinamide
+isoniazid
+glycinamide
+2-chloroacetamide
+trifluoroacetamide
+cyanoacetamide
+thioacetamide
+thioformamide
+malonamide
+oxamide
+2-pyrrolidone
+N-methyl-2-pyrrolidone
+N-vinyl-2-pyrrolidone
+2-piperidone
+caprolactam
+2-azetidinone
+2-oxazolidinone
+2-imidazolidinone
+1,3-dimethyl-2-imidazolidinone
+DMPU
+piracetam
+levetiracetam
+succinimide
+N-hydroxysuccinimide
+maleimide
+N-ethylmaleimide
+glutarimide
+phthalimide
+isatin
+oxindole
+saccharin
+acesulfame
+hydantoin
+5,5-dimethylhydantoin
+1,3-dichloro-5,5-dimethylhydantoin
+allantoin
+ethosuximide
+barbital
+phenobarbital
+primidone
+2,5-piperazinedione
+urea
+N-methylurea
+1,1-dimethylurea
+1,3-dimethylurea
+tetramethylurea
+phenylurea
+hydroxyurea
+biuret
+semicarbazide
+carbohydrazide
+thiosemicarbazide
+thiourea
+N-phenylthiourea
+ethylenethiourea
+methimazole
+propylthiouracil
+2-thiouracil
+rhodanine
+thiazolidine-2,4-dione
+2-mercaptobenzimidazole
+2-mercaptobenzothiazole
+methyl carbamate
+ethyl carbamate
+tert-butyl carbamate
+carbaryl
+methomyl
+guaifenesin
+chlorzoxazone
+benzisothiazolinone
+thiram
+
+# ── nitriles, isonitriles, isocyanates, cyanates, triazines ──
+acetonitrile
+propionitrile
+butyronitrile
+isobutyronitrile
+valeronitrile
+pivalonitrile
+acrylonitrile
+methacrylonitrile
+malononitrile
+succinonitrile
+adiponitrile
+fumaronitrile
+tetracyanoethylene
+benzonitrile
+4-methylbenzonitrile
+4-chlorobenzonitrile
+4-fluorobenzonitrile
+4-nitrobenzonitrile
+phthalonitrile
+terephthalonitrile
+benzyl cyanide
+mandelonitrile
+2-cyanopyridine
+3-cyanopyridine
+4-cyanopyridine
+glycolonitrile
+acetone cyanohydrin
+chloroacetonitrile
+trichloroacetonitrile
+trifluoroacetonitrile
+dimethylcyanamide
+dicyandiamide
+methyl isocyanide
+tert-butyl isocyanide
+methyl isocyanate
+ethyl isocyanate
+tert-butyl isocyanate
+phenyl isocyanate
+toluene 2,4-diisocyanate
+hexamethylene diisocyanate
+chlorosulfonyl isocyanate
+methyl isothiocyanate
+allyl isothiocyanate
+phenyl isothiocyanate
+sulforaphane
+methyl thiocyanate
+cyanuric acid
+cyanuric chloride
+melamine
+atrazine
+simazine
+
+# ── halogen compounds (F, Cl) ──
+chloromethane
+dichloromethane
+chloroform
+carbon tetrachloride
+fluoromethane
+difluoromethane
+fluoroform
+carbon tetrafluoride
+chlorodifluoromethane
+dichlorodifluoromethane
+trichlorofluoromethane
+chlorotrifluoromethane
+chloroethane
+1,1-dichloroethane
+1,2-dichloroethane
+1,1,1-trichloroethane
+1,1,2-trichloroethane
+1,1,2,2-tetrachloroethane
+hexachloroethane
+fluoroethane
+1,1-difluoroethane
+1,1,1-trifluoroethane
+1,1,1,2-tetrafluoroethane
+pentafluoroethane
+hexafluoroethane
+1,1,2-trichloro-1,2,2-trifluoroethane
+1-chloropropane
+2-chloropropane
+1,2-dichloropropane
+1,3-dichloropropane
+1,2,3-trichloropropane
+octafluoropropane
+1-chlorobutane
+2-chlorobutane
+tert-butyl chloride
+1-chloropentane
+perfluorobutane
+perfluorohexane
+octafluorocyclobutane
+perfluorocyclohexane
+chlorocyclohexane
+vinyl chloride
+vinylidene chloride
+cis-1,2-dichloroethylene
+trans-1,2-dichloroethylene
+trichloroethylene
+tetrachloroethylene
+vinyl fluoride
+vinylidene fluoride
+trifluoroethylene
+tetrafluoroethylene
+chlorotrifluoroethylene
+hexafluoropropylene
+3,3,3-trifluoropropene
+2,3,3,3-tetrafluoropropene
+allyl chloride
+chloroprene
+hexachlorocyclopentadiene
+chlorobenzene
+fluorobenzene
+1,2-dichlorobenzene
+1,3-dichlorobenzene
+1,4-dichlorobenzene
+1,2,4-trichlorobenzene
+hexachlorobenzene
+1,2-difluorobenzene
+1,3-difluorobenzene
+1,4-difluorobenzene
+hexafluorobenzene
+2-chlorotoluene
+4-chlorotoluene
+4-fluorotoluene
+benzyl chloride
+benzal chloride
+benzotrichloride
+benzotrifluoride
+1-chloronaphthalene
+4-chlorobiphenyl
+DDT
+lindane
+2,4-dichlorophenoxyacetic acid
+diuron
+chlorothalonil
+triclosan
+chloral hydrate
+chloropicrin
+acetyl chloride
+acetyl fluoride
+propionyl chloride
+acryloyl chloride
+chloroacetyl chloride
+trichloroacetyl chloride
+oxalyl chloride
+benzoyl chloride
+phthaloyl chloride
+methyl chloroformate
+ethyl chloroformate
+triphosgene
+methanesulfonyl chloride
+benzenesulfonyl chloride
+p-toluenesulfonyl chloride
+
+# ── sulfur compounds ──
+1-propanethiol
+2-propanethiol
+1-butanethiol
+tert-butyl mercaptan
+allyl mercaptan
+thiophenol
+benzyl mercaptan
+1,2-ethanedithiol
+dimercaprol
+dithiothreitol
+diallyl sulfide
+diallyl disulfide
+diphenyl sulfide
+thioanisole
+diphenyl sulfone
+diphenyl sulfoxide
+methyl phenyl sulfoxide
+methyl phenyl sulfone
+dimethyl sulfoxide
+dimethyl sulfone
+sulfolane
+3-sulfolene
+allicin
+alliin
+thiirane
+thietane
+tetrahydrothiophene
+tetrahydrothiopyran
+1,3-dithiane
+1,4-dithiane
+1,3,5-trithiane
+thiophene
+2-methylthiophene
+3-methylthiophene
+2,2'-bithiophene
+benzothiophene
+dibenzothiophene
+phenothiazine
+3,4-ethylenedioxythiophene
+tetrathiafulvalene
+thioacetic acid
+thiobenzoic acid
+S-methyl thioacetate
+thioformaldehyde
+thioacetone
+sulfamide
+methanesulfonamide
+benzenesulfonamide
+p-toluenesulfonamide
+sulfanilamide
+sulfacetamide
+sulfadiazine
+sulfamethoxazole
+dapsone
+acetazolamide
+hydrochlorothiazide
+zonisamide
+taurine
+hypotaurine
+lipoic acid
+2-aminothiazole
+2-methylthiazole
+4-methylthiazole
+thiazole
+isothiazole
+1,2,5-thiadiazole
+1,3,4-thiadiazole
+benzothiazole
+2-methylbenzothiazole
+2-aminobenzothiazole
+2,1,3-benzothiadiazole
+thiazolidine
+2-thiazoline
+
+# ── phosphorus compounds ──
+trimethylphosphine oxide
+hexamethylphosphoramide
+diphenylphosphine oxide
+methylenediphosphonic acid
+etidronic acid
+phosphoenolpyruvic acid
+2-phosphoglyceric acid
+3-phosphoglyceric acid
+1,3-bisphosphoglyceric acid
+glyceraldehyde 3-phosphate
+dihydroxyacetone phosphate
+glycerol 3-phosphate
+acetyl phosphate
+carbamoyl phosphate
+phosphocreatine
+phosphoserine
+O-phosphoethanolamine
+phosphocholine cation | 1014
+erythrose 4-phosphate
+ribose 5-phosphate
+glucose 6-phosphate
+glucose 1-phosphate
+fructose 6-phosphate
+6-phosphogluconic acid
+isopentenyl pyrophosphate
+pyridoxal phosphate
+methyl parathion
+dimethoate
+dichlorvos
+chlorpyrifos
+cyclophosphamide
+foscarnet
+
+# ── aromatic hydrocarbons and nitro compounds ──
+ethylbenzene
+o-xylene
+m-xylene
+p-xylene
+propylbenzene
+cumene
+4-ethyltoluene
+mesitylene
+1,2,3-trimethylbenzene
+1,2,4-trimethylbenzene
+butylbenzene
+tert-butylbenzene
+p-cymene
+1,4-diethylbenzene
+durene
+pentamethylbenzene
+hexamethylbenzene
+cyclopropylbenzene
+cyclohexylbenzene
+styrene
+alpha-methylstyrene
+trans-beta-methylstyrene
+1,4-divinylbenzene
+allylbenzene
+trans-stilbene
+cis-stilbene
+indene
+indane
+naphthalene
+1-methylnaphthalene
+2-methylnaphthalene
+1,2-dihydronaphthalene
+tetralin
+azulene
+biphenyl
+diphenylmethane
+bibenzyl
+acenaphthene
+acenaphthylene
+fluorene
+9,10-dihydroanthracene
+anthracene
+phenanthrene
+pyrene
+fluoranthene
+triphenylene
+chrysene
+tetracene
+benz[a]anthracene
+biphenylene
+pentalene
+heptalene
+benzocyclobutene
+cyclobutadiene
+benzvalene
+Dewar benzene
+nitrobenzene
+2-nitrotoluene
+3-nitrotoluene
+4-nitrotoluene
+1,2-dinitrobenzene
+1,3-dinitrobenzene
+1,4-dinitrobenzene
+2,4-dinitrotoluene
+2,6-dinitrotoluene
+2,4,6-trinitrotoluene
+1,3,5-trinitrobenzene
+1-chloro-2-nitrobenzene
+1-chloro-4-nitrobenzene
+1-chloro-2,4-dinitrobenzene
+1-fluoro-4-nitrobenzene
+1-fluoro-2,4-dinitrobenzene
+1-nitronaphthalene
+nitrosobenzene
+nitromethane
+nitroethane
+1-nitropropane
+2-nitropropane
+nitrocyclohexane
+nitroethylene
+dinitromethane
+tetranitromethane
+tris(hydroxymethyl)nitromethane
+nitroguanidine
+
+# ── heteroaromatics and other heterocycles ──
+pyridine
+2-methylpyridine
+3-methylpyridine
+4-methylpyridine
+2-ethylpyridine
+3-ethylpyridine
+4-ethylpyridine
+2,4-lutidine
+2,6-lutidine
+3,5-lutidine
+2,4,6-collidine
+2-vinylpyridine
+4-vinylpyridine
+2-phenylpyridine
+2,2'-bipyridine
+4,4'-bipyridine
+2-chloropyridine
+3-chloropyridine
+2-fluoropyridine
+pentafluoropyridine
+2-aminopyridine
+3-aminopyridine
+4-aminopyridine
+2-hydroxypyridine
+3-hydroxypyridine
+4-hydroxypyridine
+2-methoxypyridine
+pyridoxine
+pyridoxal
+pyridoxamine
+pyridostigmine cation | 4991
+pyrazine
+2-methylpyrazine
+2,5-dimethylpyrazine
+tetramethylpyrazine
+2-acetylpyrazine
+2-isobutyl-3-methoxypyrazine
+pyrimidine
+2-aminopyrimidine
+2,4-diaminopyrimidine
+5-fluorocytosine
+pyridazine
+maleic hydrazide
+1,3,5-triazine
+1,2,4-triazine
+1,2,4,5-tetrazine
+pyrrole
+1-methylpyrrole
+2,5-dimethylpyrrole
+porphobilinogen
+imidazole
+1-methylimidazole
+2-methylimidazole
+4-methylimidazole
+1,1'-carbonyldiimidazole
+metronidazole
+histamine
+carnosine
+ergothioneine
+2-imidazoline
+pyrazole
+1-methylpyrazole
+3-methylpyrazole
+3,5-dimethylpyrazole
+antipyrine
+1H-1,2,3-triazole
+1H-1,2,4-triazole
+3-amino-1,2,4-triazole
+benzotriazole
+tetrazole
+5-aminotetrazole
+pentylenetetrazol
+oxazole
+isoxazole
+muscimol
+ibotenic acid
+furazan
+1,3,4-oxadiazole
+2-oxazoline
+benzoxazole
+1,2-benzisoxazole
+benzofurazan
+benzimidazole
+2-methylbenzimidazole
+thiabendazole
+indazole
+indole
+1-methylindole
+3-methylindole
+5-methoxyindole
+indole-3-carboxaldehyde
+indoline
+isoindoline
+tryptamine
+serotonin
+N-acetylserotonin
+5-hydroxyindoleacetic acid
+quinoline
+isoquinoline
+2-methylquinoline
+8-hydroxyquinoline
+1,2,3,4-tetrahydroquinoline
+1,2,3,4-tetrahydroisoquinoline
+quinoxaline
+quinazoline
+4(3H)-quinazolinone
+cinnoline
+phthalazine
+1,10-phenanthroline
+phenanthridine
+acridine
+phenazine
+phenoxazine
+carbazole
+beta-carboline
+harmane
+purine
+2-aminopurine
+6-mercaptopurine
+6-benzylaminopurine
+pteridine
+pterin
+lumazine
+
+# ── nucleobases, nucleosides and their kin ──
+uracil
+thymine
+cytosine
+adenine
+guanine
+hypoxanthine
+xanthine
+5-methylcytosine
+5-fluorouracil
+6-methyluracil
+1-methylthymine
+1-methylcytosine
+9-methyladenine
+N6-methyladenine
+7-methylguanine
+O6-methylguanine
+8-oxoguanine
+2,6-diaminopurine
+dihydrouracil
+isocytosine
+caffeine
+theobromine
+theophylline
+paraxanthine
+allopurinol
+uridine
+cytidine
+pseudouridine
+2'-deoxyuridine
+2'-deoxycytidine
+cytarabine
+gemcitabine
+5-azacytidine
+decitabine
+ribavirin
+acyclovir
+
+# ── amino acids (neutral form) and their kin ──
+glycine
+L-alanine
+L-serine
+L-cysteine
+L-threonine
+L-valine
+L-leucine
+L-isoleucine
+L-methionine
+L-proline
+L-phenylalanine
+L-tyrosine
+L-tryptophan
+L-aspartic acid
+L-glutamic acid
+L-asparagine
+L-glutamine
+L-lysine
+L-arginine
+L-histidine
+L-ornithine
+L-citrulline
+L-homoserine
+L-homocysteine
+L-norvaline
+L-norleucine
+L-cystine
+L-4-hydroxyproline
+L-2-aminobutyric acid
+L-DOPA
+L-theanine
+L-5-hydroxytryptophan
+L-kynurenine
+L-penicillamine
+D-cycloserine
+D-alanine
+D-serine
+glycylglycine
+glycylglycylglycine
+glycyl-L-alanine
+L-alanylglycine
+L-alanyl-L-alanine
+beta-alanine
+sarcosine
+N,N-dimethylglycine
+2-aminoisobutyric acid
+gamma-aminobutyric acid
+6-aminocaproic acid
+5-aminolevulinic acid
+iminodiacetic acid
+nitrilotriacetic acid
+creatine
+creatinine
+betaine
+carnitine
+guanidinoacetic acid
+guanidine
+aminoguanidine
+agmatine
+metformin
+phenformin
+guanfacine
+clonidine
+N-acetylglycine
+N-acetyl-L-alanine
+N-acetyl-L-cysteine
+N-acetyl-L-aspartic acid
+N-acetyl-L-glutamic acid
+N-formyl-L-methionine
+gabapentin
+pregabalin
+baclofen
+vigabatrin
+tranexamic acid
+captopril
+acamprosate
+homotaurine
+kainic acid
+AMPA
+NMDA
+
+# ── sugars and their kin ──
+D-glucose
+alpha-D-glucopyranose
+beta-D-glucopyranose
+D-fructose
+D-galactose
+D-mannose
+D-allose
+D-ribose
+D-arabinose
+L-arabinose
+D-xylose
+D-lyxose
+2-deoxy-D-ribose
+2-deoxy-D-glucose
+D-erythrose
+D-threose
+D-glyceraldehyde
+L-glyceraldehyde
+D-ribulose
+D-xylulose
+L-sorbose
+D-tagatose
+D-psicose
+L-rhamnose
+L-fucose
+D-glucosamine
+D-galactosamine
+D-mannosamine
+N-acetyl-D-glucosamine
+N-acetyl-D-galactosamine
+D-galacturonic acid
+D-glucaric acid
+methyl alpha-D-glucopyranoside
+methyl beta-D-glucopyranoside
+levoglucosan
+cyrene
+
+# ── everyday molecules: food, medicine, materials ──
+creosol
+syringol
+1-octen-3-one
+trans-2-nonenal
+3-mercaptohexanol
+3-methyl-2-butene-1-thiol
+aspirin
+diclofenac
+diflunisal
+amantadine
+phenelzine
+carbidopa
+methyldopa
+carbamazepine
+lamotrigine
+amiloride
+isosorbide
+hydralazine
+minoxidil
+nitrofurantoin
+thioguanine
+thalidomide
+penicillamine
+tacrine
+cyclamic acid
+bisphenol S
+
+# ── tried and left out (the generator's report, 2026-11-25; kept here so the list is not regrown with them) ──
+# PubChem has no such name:
+#   amide — PubChem has no such name
+#   butylated hydroxytoluene — PubChem has no such name
+#   butylated hydroxyanisole — PubChem has no such name
+# a CID again:
+#   L-pyroglutamic acid — a CID again (CID 7405, first as "pyroglutamic acid")
+#   D-glucuronic acid — a CID again (CID 94715, first as "glucuronic acid")
+#   D-gluconic acid — a CID again (CID 10690, first as "gluconic acid")
+#   L-ascorbic acid — a CID again (CID 54670067, first as "ascorbic acid")
+#   D-sorbitol — a CID again (CID 5780, first as "sorbitol")
+#   D-mannitol — a CID again (CID 6251, first as "mannitol")
+#   skatole — a CID again (CID 6736, first as "3-methylindole")
+#   hydroxycarbamide — a CID again (CID 3657, first as "hydroxyurea")
+#   niacin — a CID again (CID 938, first as "nicotinic acid")
+# dropped on review:
+#   dimethylphosphine oxide — PubChem gives only CID 6327637, (CH3)2P+=O, a cation, not the neutral (CH3)2P(H)=O (Task 6 review I1)
+#   malonate — resolves to neutral malonic acid (CID 867); malonic acid is listed
+#   trans-decalin — resolves to the stereo-unspecified decalin (CID 7044), listed as decalin
+#   ethyl isocyanide — resolves to CID 4474585, CC[N+]#C, a cation, not ethyl isocyanide
+#   chiro-inositol — resolves to the stereo-unspecified inositol (CID 892), listed as inositol
+# more than 30 atoms:
+#   alpha-ionone — more than 30 atoms (CID 5282108, C13H20O, 34)
+#   beta-ionone — more than 30 atoms (CID 638014, C13H20O, 34)
+#   meprobamate — more than 30 atoms (CID 4064, C9H18N2O4, 33)
+#   disulfiram — more than 30 atoms (CID 3117, C10H20N2S4, 36)
+#   biotin — more than 30 atoms (CID 171548, C10H16N2O3S, 32)
+#   tributylphosphine — more than 30 atoms (CID 13831, C12H27P, 40)
+#   parathion — more than 30 atoms (CID 991, C10H14NO5PS, 32)
+#   malathion — more than 30 atoms (CID 4004, C10H19O6PS2, 38)
+#   diazinon — more than 30 atoms (CID 3017, C12H21N2O3PS, 40)
+#   o-terphenyl — more than 30 atoms (CID 6766, C18H14, 32)
+#   p-terphenyl — more than 30 atoms (CID 7115, C18H14, 32)
+#   [2.2]paracyclophane — more than 30 atoms (CID 74210, C16H16, 32)
+#   2'-deoxyadenosine — more than 30 atoms (CID 13730, C10H13N5O3, 31)
+#   adenosine — more than 30 atoms (CID 60961, C10H13N5O4, 32)
+#   guanosine — more than 30 atoms (CID 135398635, C10H13N5O5, 33)
+#   thymidine — more than 30 atoms (CID 5789, C10H14N2O5, 31)
+#   inosine — more than 30 atoms (CID 135398641, C10H12N4O5, 31)
+#   ganciclovir — more than 30 atoms (CID 135398740, C9H13N5O4, 31)
+#   menthol — more than 30 atoms (CID 1254, C10H20O, 31)
+#   nootkatone — more than 30 atoms (CID 1268142, C15H22O, 38)
+#   ibuprofen — more than 30 atoms (CID 3672, C13H18O2, 33)
+#   naproxen — more than 30 atoms (CID 156391, C14H14O3, 31)
+#   lidocaine — more than 30 atoms (CID 3676, C14H22N2O, 39)
+#   procaine — more than 30 atoms (CID 4914, C13H20N2O2, 37)
+#   memantine — more than 30 atoms (CID 4054, C12H21N, 34)
+#   salbutamol — more than 30 atoms (CID 2083, C13H21NO3, 38)
+#   atenolol — more than 30 atoms (CID 2249, C14H22N2O3, 41)
+#   metoprolol — more than 30 atoms (CID 4171, C15H25NO3, 44)
+#   oxcarbazepine — more than 30 atoms (CID 34312, C15H12N2O2, 31)
+#   tolbutamide — more than 30 atoms (CID 5505, C12H18N2O3S, 36)
+#   trimethoprim — more than 30 atoms (CID 5578, C14H18N4O3, 39)
+#   oseltamivir — more than 30 atoms (CID 65028, C16H28N2O4, 50)
+#   zidovudine — more than 30 atoms (CID 35370, C10H13N5O4, 32)
+#   melphalan — more than 30 atoms (CID 460612, C13H18Cl2N2O2, 37)
+#   physostigmine — more than 30 atoms (CID 5983, C15H21N3O2, 41)
+#   pilocarpine — more than 30 atoms (CID 5910, C11H16N2O2, 31)
+#   pantothenic acid — more than 30 atoms (CID 6613, C9H17NO5, 32)
+#   bisphenol A — more than 30 atoms (CID 6623, C15H16O2, 33)
+#   diethyltoluamide — more than 30 atoms (CID 4284, C12H17NO, 31)
+# no 3D record:
+#   hydrogen — no 3D record (CID 783)
+#   lithium hydride — no 3D record (CID 62714)
+#   fluorine — no 3D record (CID 24524)
+#   nitric oxide — no 3D record (CID 145068)
+#   nitrogen dioxide — no 3D record (CID 3032552)
+#   chlorine dioxide — no 3D record (CID 24870)
+#   chlorine trifluoride — no 3D record (CID 24637)
+#   phosphorus pentachloride — no 3D record (CID 24819)
+#   sulfur hexafluoride — no 3D record (CID 17358)
+#   chloric acid — no 3D record (CID 19654)
+#   perchloric acid — no 3D record (CID 24247)
+#   dimethylsilane — no 3D record (CID 6327141)
+#   trisilane — no 3D record (CID 6327667)
+#   ethylammonium — no 3D record (CID 193581)
+#   perchlorate — no 3D record (CID 123351)
+#   chlorate — no 3D record (CID 104770)
+#   chlorite — no 3D record (CID 197148)
+#   allene — no 3D record (CID 10037)
+#   hexachlorobutadiene — no 3D record (CID 6901)
+#   chloramine-T — no 3D record (CID 3641960)
+#   monosodium glutamate — no 3D record (CID 23689119)
+# the 2D graph does not map onto the 3D graph:
+#   nitrous oxide — the 2D graph does not map onto the 3D graph (CID 948)
+#   cyanate — the 2D graph does not map onto the 3D graph (CID 105034)

@@ -13,6 +13,13 @@
 //! last drawing). The window is [`ui`].
 pub mod chem;
 pub mod embed;
+pub mod iso;
+#[cfg(test)]
+pub mod lira;
+pub mod online;
+pub mod records;
+pub mod search;
+pub mod shape;
 pub mod ui;
 
 use crate::scene::{Scene, SceneNucleus};
@@ -303,8 +310,21 @@ pub struct Builder {
     /// A hand-off pressed with warnings: (Replace?, the drawing then) — the same button again on the
     /// same drawing goes ahead (spec §4: radicals are legitimate).
     pub armed: Option<(bool, Drawing)>,
-    /// The embedding of the drawing as it was (spec §5), recomputed only when the drawing changes.
-    pub(crate) embedded: Option<(Drawing, Vec<[f64; 3]>)>,
+    /// "Look up molecules online (PubChem)" (spec §7: on by default; display state kept in the
+    /// profile as `builder_online`, not an `Action`).
+    pub online: bool,
+    /// The online lookups of this window's drawings ([`online::Session`]).
+    pub(crate) lookup: online::Session,
+    /// The hand-off geometry of the drawing as it was ([`shape::shape`]: the embedding with the
+    /// database's shapes for the fragments it knows) and the lookup answers' version it was made
+    /// with, recomputed only when either changes.
+    pub(crate) shaped: Option<(Drawing, u64, shape::Shaped)>,
+    /// [`shape::fill_hint`] for that drawing and version, recomputed only when either changes.
+    fill_hint: Option<(Drawing, u64, Option<String>)>,
+    /// The search box's text (spec §8: a name, a formula or a PubChem CID).
+    pub search_query: String,
+    /// The search box's results for that text ([`search`]).
+    pub(crate) search: search::SearchBox,
 }
 
 impl Default for Builder {
@@ -326,7 +346,12 @@ impl Default for Builder {
             last_replace: None,
             enlarge: None,
             armed: None,
-            embedded: None,
+            online: true,
+            lookup: online::Session::default(),
+            shaped: None,
+            fill_hint: None,
+            search_query: String::new(),
+            search: Default::default(),
         }
     }
 }
@@ -434,12 +459,42 @@ impl Builder {
         self.gesture = ui::Gesture::None;
     }
 
-    /// The drawing in 3D (Bohr, centred), cached until the drawing changes.
-    pub fn embedding(&mut self) -> &[[f64; 3]] {
-        if self.embedded.as_ref().is_none_or(|(d, _)| *d != self.drawing) {
-            self.embedded = Some((self.drawing.clone(), embed::embed(&self.drawing)));
+    /// The drawing's hand-off geometry (Bohr, centred): the fragments looked up in the shipped
+    /// list, the molecule cache and PubChem ([`online::Session`], ticked here, so the window's every
+    /// frame brings its answers in). Cached until the drawing or the answers change.
+    pub fn shaped(&mut self) -> &shape::Shaped {
+        self.lookup.tick(&self.drawing, self.online);
+        let version = self.lookup.version();
+        if self.shaped.as_ref().is_none_or(|(d, v, _)| *d != self.drawing || *v != version) {
+            let s = shape::shape(&self.drawing, &self.lookup.layered());
+            self.shaped = Some((self.drawing.clone(), version, s));
         }
-        &self.embedded.as_ref().unwrap().1
+        &self.shaped.as_ref().unwrap().2
+    }
+
+    /// The line under the footer's fallback label (spec §6.2): "Fill hydrogens would match
+    /// <name>" when the hydrogen-filled drawing's fragments map onto a local record
+    /// ([`shape::fill_hint`]); cached with [`Builder::shaped`].
+    pub fn fill_hint(&mut self) -> Option<&str> {
+        self.shaped();
+        let version = self.lookup.version();
+        if self.fill_hint.as_ref().is_none_or(|(d, v, _)| *d != self.drawing || *v != version) {
+            let s = &self.shaped.as_ref().expect("just made").2;
+            let hint = shape::fill_hint(&self.drawing, s, &self.lookup.local_layers());
+            self.fill_hint = Some((self.drawing.clone(), version, hint));
+        }
+        self.fill_hint.as_ref().and_then(|h| h.2.as_deref())
+    }
+
+    /// [`Builder::shaped`] with the fragments looked up in `src` instead (tests); cached by the
+    /// drawing alone, so one builder keeps to one source.
+    #[cfg(test)]
+    pub(crate) fn shaped_from(&mut self, src: &dyn shape::RecordSource) -> &shape::Shaped {
+        const GIVEN: u64 = u64::MAX;
+        if self.shaped.as_ref().is_none_or(|(d, v, _)| *d != self.drawing || *v != GIVEN) {
+            self.shaped = Some((self.drawing.clone(), GIVEN, shape::shape(&self.drawing, src)));
+        }
+        &self.shaped.as_ref().unwrap().2
     }
 
     /// The one selected atom, when exactly one is.
