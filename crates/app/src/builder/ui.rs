@@ -398,7 +398,9 @@ fn canvas_area(ui: &mut Ui, rect: Rect, b: &mut Builder) {
     let pointer = ui.input(|i| i.pointer.latest_pos());
     let shift = ui.input(|i| i.modifiers.shift);
     let over = pointer.filter(|p| rect.contains(*p));
-    let hovered = if b.gesture == Gesture::None { over.and_then(|p| hit(b, &view, p, None)) } else { None };
+    // only while the canvas itself is under the pointer: not through the 2D | 3D toggle on top of
+    // it (review: Delete with the pointer on the toggle erased the atom beneath)
+    let hovered = if b.gesture == Gesture::None && resp.hovered() { over.and_then(|p| hit(b, &view, p, None)) } else { None };
 
     // ── zoom and pan ──
     if resp.hovered() {
@@ -834,7 +836,7 @@ fn view3d_area(ui: &mut Ui, rect: Rect, b: &mut Builder) {
     let scale = b.view3d.scale(&shaped.positions, rect);
     let pointer = ui.input(|i| i.pointer.latest_pos()).filter(|p| rect.contains(*p));
     let hovered = pointer.filter(|_| resp.hovered() && !resp.dragged()).and_then(|p| super::view3d::View3d::hit(&proj, &b.drawing.bonds, p));
-    paint3d(ui, rect, &b.drawing, &shaped, &proj, scale, hovered, pointer);
+    paint3d(ui, rect, &b.drawing, &b.selection, &shaped, &proj, scale, hovered, pointer);
     if resp.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
     } else if resp.hovered() && !b.drawing.atoms.is_empty() {
@@ -847,7 +849,7 @@ fn view3d_area(ui: &mut Ui, rect: Rect, b: &mut Builder) {
 /// charges as on the canvas; a dashed outline on a guessed (approximate) fragment's atoms; the
 /// hovered part's readout in a box by the pointer; the controls hint along the bottom.
 #[allow(clippy::too_many_arguments)]
-fn paint3d(ui: &Ui, rect: Rect, d: &super::Drawing, s: &super::shape::Shaped, proj: &[(Pos2, f64, f32)], scale: f64, hovered: Option<super::view3d::Part>, pointer: Option<Pos2>) {
+fn paint3d(ui: &Ui, rect: Rect, d: &super::Drawing, selection: &std::collections::BTreeSet<usize>, s: &super::shape::Shaped, proj: &[(Pos2, f64, f32)], scale: f64, hovered: Option<super::view3d::Part>, pointer: Option<Pos2>) {
     use super::view3d::{self as v3, Part};
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 8.0, theme::APP);
@@ -911,8 +913,11 @@ fn paint3d(ui: &Ui, rect: Rect, d: &super::Drawing, s: &super::shape::Shaped, pr
                     let ring: Vec<Pos2> = (0..=32).map(|k| c + Vec2::angled(k as f32 / 32.0 * std::f32::consts::TAU) * (r + 2.5)).collect();
                     p.extend(egui::Shape::dashed_line(&ring, Stroke::new(1.2, theme::INK_DIM.gamma_multiply(0.9)), 3.0, 3.0));
                 }
-                if hovered == Some(Part::Atom(i)) {
-                    p.circle_stroke(c, r + 3.0, Stroke::new(2.0, theme::ACCENT));
+                // the 2D selection shows here too (Esc, Delete in 2D and the groups act on it)
+                if selection.contains(&i) {
+                    p.circle_stroke(c, r + 3.5, Stroke::new(2.0, theme::ACCENT));
+                } else if hovered == Some(Part::Atom(i)) {
+                    p.circle_stroke(c, r + 3.0, Stroke::new(1.5, theme::INK_DIM));
                 }
                 if r >= 7.0 {
                     let fs = (0.95 * r).clamp(8.0, 18.0);
@@ -944,6 +949,9 @@ fn paint3d(ui: &Ui, rect: Rect, d: &super::Drawing, s: &super::shape::Shaped, pr
         if min.y + size.y > rect.bottom() - 4.0 {
             min.y = at.y - 16.0 - size.y;
         }
+        // flipped, it may now cross the other edge: keep it inside the view (its top-left first)
+        min.x = min.x.min(rect.right() - 4.0 - size.x).max(rect.left() + 4.0);
+        min.y = min.y.min(rect.bottom() - 4.0 - size.y).max(rect.top() + 4.0);
         let r = Rect::from_min_size(min, size);
         p.rect_filled(r, 6.0, theme::PANEL);
         p.rect_stroke(r, 6.0, Stroke::new(1.0, theme::LINE), egui::StrokeKind::Inside);
@@ -1768,5 +1776,40 @@ mod tests {
         let mut want = super::super::view3d::View3d::default();
         want.reset(&st.builder.shaped().positions.clone());
         assert!(st.builder.view3d.rot.angle_between(want.rot) < 1e-9);
+    }
+
+    /// Spec §5 (review): in 3D, Delete removes nothing (not the hovered atom, not the selection),
+    /// while Ctrl-Z still undoes, as the palette's Undo does.
+    #[test]
+    fn in_3d_delete_does_nothing_and_ctrl_z_undoes() {
+        let scene = roomy();
+        let cam = crate::ui::tests::camera();
+        let inp = crate::ui::tests::input(&scene, None, &cam);
+        let mut st = UiState::new("h2", &scene);
+        st.builder.open = true;
+        st.builder.drawing = water_drawing();
+        st.builder.checkpoint();
+        st.builder.drawing.add_atom(6, [6.0, 0.0]);
+        st.builder.selection = [0].into();
+        st.builder.view_3d = true;
+        let mut w = Win::new();
+        w.settle(&mut st, &inp);
+        let key = |key, modifiers| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+        // the pointer resting on an atom (the view's centre is the shape's centroid: find a ball)
+        let r = w.canvas();
+        let z: Vec<u8> = st.builder.drawing.atoms.iter().map(|a| a.z).collect();
+        let pos = st.builder.shaped().positions.clone();
+        let on_atom = st.builder.view3d.project(&pos, &z, r)[0].0;
+        w.frame(&mut st, &inp, vec![egui::Event::PointerMoved(on_atom)]);
+        for k in [egui::Key::Delete, egui::Key::Backspace] {
+            w.frame(&mut st, &inp, vec![key(k, egui::Modifiers::NONE)]);
+            w.frame(&mut st, &inp, vec![]);
+        }
+        assert_eq!(st.builder.drawing.atoms.len(), 4, "Delete removed nothing in 3D");
+        assert_eq!(st.builder.selection, [0].into());
+        w.frame(&mut st, &inp, vec![key(egui::Key::Z, egui::Modifiers::COMMAND)]);
+        w.frame(&mut st, &inp, vec![]);
+        assert_eq!(st.builder.drawing, water_drawing(), "Ctrl-Z undid the added atom");
+        assert_eq!(st.builder.view3d.shown, 3, "and the view shows the drawing as undone");
     }
 }

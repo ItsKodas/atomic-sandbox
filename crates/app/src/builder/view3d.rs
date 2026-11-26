@@ -211,25 +211,30 @@ pub(crate) fn bond_length_angstrom(pos: &[V3], bond: &Bond) -> f64 {
     }
 }
 
-/// The bond angles at `atom` (degrees): one per pair of its bonded neighbours `(j, k)`, j before k
-/// in the order of its bonds, at most [`MAX_ANGLES`]. A pair with a neighbour on the atom itself has
-/// no angle and is left out.
-pub(crate) fn angles_at(pos: &[V3], bonds: &[Bond], atom: usize) -> Vec<(usize, usize, f64)> {
+/// The bonded neighbours of `atom` that make an angle at it, in the order of its bonds, each once:
+/// a neighbour on the atom itself (Bohr distance under 1e-9) has no direction, so no angle.
+fn angle_neighbours(pos: &[V3], bonds: &[Bond], atom: usize) -> Vec<usize> {
     let Some(&c) = pos.get(atom) else { return Vec::new() };
     let c = DVec3::from(c);
     let mut nb: Vec<usize> = Vec::new();
     for j in bonds.iter().filter_map(|b| b.other(atom)) {
-        if j < pos.len() && j != atom && !nb.contains(&j) {
+        if j < pos.len() && j != atom && !nb.contains(&j) && (DVec3::from(pos[j]) - c).length() >= 1e-9 {
             nb.push(j);
         }
     }
+    nb
+}
+
+/// The bond angles at `atom` (degrees): one per pair of its bonded neighbours `(j, k)`, j before k
+/// in the order of its bonds, at most [`MAX_ANGLES`]. A neighbour on the atom itself has no angle
+/// and is left out ([`angle_neighbours`]).
+pub(crate) fn angles_at(pos: &[V3], bonds: &[Bond], atom: usize) -> Vec<(usize, usize, f64)> {
+    let nb = angle_neighbours(pos, bonds, atom);
     let mut out = Vec::new();
     for (x, &j) in nb.iter().enumerate() {
         for &k in &nb[x + 1..] {
+            let c = DVec3::from(pos[atom]);
             let (u, v) = (DVec3::from(pos[j]) - c, DVec3::from(pos[k]) - c);
-            if u.length() < 1e-9 || v.length() < 1e-9 {
-                continue;
-            }
             out.push((j, k, u.cross(v).length().atan2(u.dot(v)).to_degrees()));
             if out.len() == MAX_ANGLES {
                 return out;
@@ -239,12 +244,11 @@ pub(crate) fn angles_at(pos: &[V3], bonds: &[Bond], atom: usize) -> Vec<(usize, 
     out
 }
 
-/// How many angles `atom` has in all (the readout says how many it left out).
+/// How many angles `atom` has in all, by the same rule as [`angles_at`] before its cap (the
+/// readout says how many it left out).
 pub(crate) fn angle_count(pos: &[V3], bonds: &[Bond], atom: usize) -> usize {
-    let mut nb: Vec<usize> = bonds.iter().filter_map(|b| b.other(atom)).filter(|&j| j < pos.len() && j != atom).collect();
-    nb.sort_unstable();
-    nb.dedup();
-    nb.len() * nb.len().saturating_sub(1) / 2
+    let n = angle_neighbours(pos, bonds, atom).len();
+    n * n.saturating_sub(1) / 2
 }
 
 /// The hover readout of a bond: "C–O 1.208 Å, double".
@@ -442,5 +446,140 @@ mod tests {
         // three atoms at one point bonded to the middle one: the angle is undefined, so not listed
         let same = [[0.0; 3]; 3];
         assert!(angles_at(&same, &[Bond { a: 1, b: 0, order: 1 }, Bond { a: 1, b: 2, order: 1 }], 1).is_empty());
+    }
+
+    /// Water drawn from its shipped record, its hand-off shape, and the record's indices in the
+    /// drawing (identity here).
+    fn water() -> (Drawing, Shaped) {
+        let mut d = Drawing::default();
+        draw_record(&mut d, rec("water"), [0.0, 0.0], &[0, 1, 2]);
+        let s = shape(&d, &LocalOnly(Library::shipped()));
+        (d, s)
+    }
+
+    /// He–He: in no database, so the embedding's guess.
+    fn helium_pair() -> (Drawing, Shaped) {
+        let mut d = Drawing::default();
+        d.add_atom(2, [0.0, 0.0]);
+        d.add_atom(2, [1.0, 0.0]);
+        d.bond(0, 1);
+        let s = shape(&d, &LocalOnly(Library::shipped()));
+        (d, s)
+    }
+
+    /// Spec "Hover": the pointer on an atom's centre is that atom, on a bond's midpoint that bond,
+    /// on empty space nothing; inside a ball an atom wins over the bond under it, and of two balls
+    /// over one point the front-most (smaller depth) wins, whatever their order.
+    #[test]
+    fn hover_finds_the_atom_the_bond_or_nothing() {
+        let (d, s) = water();
+        let z: Vec<u8> = d.atoms.iter().map(|a| a.z).collect();
+        let mut v = View3d::default();
+        v.reset(&s.positions);
+        let p = v.project(&s.positions, &z, rect());
+        let hit = |at: Pos2| View3d::hit(&p, &d.bonds, at);
+        for i in 0..3 {
+            assert_eq!(hit(p[i].0), Some(Part::Atom(i)), "atom {i}");
+        }
+        for (k, b) in d.bonds.iter().enumerate() {
+            let mid = p[b.a].0 + (p[b.b].0 - p[b.a].0) * 0.5;
+            assert_eq!(hit(mid), Some(Part::Bond(k)), "bond {k} at {mid:?}: {p:?}");
+            // on the bond's line but inside the O ball: the atom
+            let o = if z[b.a] == 8 { b.a } else { b.b };
+            let h = b.other(o).unwrap();
+            let inside = p[o].0 + (p[h].0 - p[o].0).normalized() * (0.8 * p[o].2);
+            assert_eq!(hit(inside), Some(Part::Atom(o)), "bond {k}: the ball covers its end");
+        }
+        assert_eq!(hit(rect().left_top() + Vec2::splat(5.0)), None, "empty space");
+        // two balls over one point: the nearer one (depth −1 against +1), in either order
+        for (pos, front) in [([[0.0, 0.0, -1.0], [0.1, 0.0, 1.0]], 0), ([[0.1, 0.0, 1.0], [0.0, 0.0, -1.0]], 1)] {
+            let q = View3d::default().project(&pos, &[6, 6], rect());
+            assert!(q[front].1 < q[1 - front].1);
+            assert_eq!(View3d::hit(&q, &[], q[1 - front].0), Some(Part::Atom(front)), "{pos:?}");
+        }
+    }
+
+    /// The hover readouts: a bond's length in Å (the record's), an atom's element and bond angles.
+    #[test]
+    fn the_readouts_say_the_length_and_the_angles() {
+        let (d, s) = water();
+        let w = rec("water");
+        for (k, b) in d.bonds.iter().enumerate() {
+            let t = bond_readout(&d, &s.positions, k).unwrap();
+            let want = dist(w.xyz[b.a], w.xyz[b.b]);
+            assert!(t.ends_with(" Å") && t.contains(&format!("{want:.3}")) && (t.starts_with("O–H") || t.starts_with("H–O")), "{t} vs {want}");
+        }
+        assert_eq!(bond_readout(&d, &s.positions, 9), None);
+        let o = d.atoms.iter().position(|a| a.z == 8).unwrap();
+        let t = atom_readout(&d, &s.positions, o).unwrap();
+        assert!(t.starts_with("O (oxygen)") && t.contains("H–O–H") && t.contains('°') && !t.contains("more"), "{t}");
+        // a double bond says so; a seventh angle is counted, not listed
+        let mut c = Drawing::default();
+        c.add_atom(6, [0.0, 0.0]);
+        c.add_atom(8, [1.0, 0.0]);
+        c.bond(0, 1);
+        c.cycle_order(0);
+        assert!(bond_readout(&c, &[[0.0; 3], [2.3, 0.0, 0.0]], 0).unwrap().ends_with(", double"));
+        let mut sf = Drawing::default();
+        sf.add_atom(16, [0.0, 0.0]);
+        let mut pos = vec![[0.0; 3]];
+        for (k, a) in [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, -1.0]].into_iter().enumerate() {
+            sf.add_atom(9, [k as f32, 1.0]);
+            sf.bond(0, k + 1);
+            pos.push(a.map(|x| 3.0 * x));
+        }
+        let t = atom_readout(&sf, &pos, 0).unwrap();
+        assert_eq!(t.matches('°').count(), 6, "{t}");
+        assert!(t.ends_with("… 9 more"), "15 angles in all: {t}");
+        // a neighbour on the atom itself is no angle, nor counted (review: the same rule as angles_at)
+        pos[6] = [0.0; 3];
+        assert_eq!(angle_count(&pos, &sf.bonds, 0), 10);
+        assert!(atom_readout(&sf, &pos, 0).unwrap().ends_with("… 4 more"));
+    }
+
+    /// Spec §6: the guessed fragment's atoms are marked, a database shape's are not.
+    #[test]
+    fn approximate_atoms_are_the_guessed_fragments() {
+        let (d, s) = helium_pair();
+        assert!(matches!(s.sources[0].1, FragmentSource::Approximate(_)), "{:?}", s.sources);
+        assert_eq!(approximate_atoms(d.atoms.len(), &s), vec![true, true]);
+        let (d, s) = water();
+        assert_eq!(approximate_atoms(d.atoms.len(), &s), vec![false, false, false]);
+    }
+
+    /// Review focus: the rotation is kept while the molecule is the same one (a 2D atom move), and
+    /// reset for another (a bond or an element changed).
+    #[test]
+    fn the_view_follows_the_molecule_not_the_sketch() {
+        let (d, s) = water();
+        let mut v = View3d::default();
+        v.follow(&d, &s);
+        let mut fresh = View3d::default();
+        fresh.reset(&s.positions);
+        assert_eq!(v.rot, fresh.rot, "first sight: the reset view");
+        v.turn(Vec2::new(80.0, -30.0));
+        let turned = v.rot;
+        assert!(turned.angle_between(fresh.rot) > 0.5);
+        // an atom moved on the 2D canvas: the same molecule
+        let mut moved = d.clone();
+        moved.atoms[1].pos[0] += 0.7;
+        let s2 = shape(&moved, &LocalOnly(Library::shipped()));
+        v.follow(&moved, &s2);
+        assert_eq!(v.rot, turned, "kept");
+        // another element, or another bond: reset
+        for change in [0, 1] {
+            let mut other = d.clone();
+            if change == 0 {
+                other.set_z(0, 16);
+            } else {
+                other.remove_bond(0);
+            }
+            let s3 = shape(&other, &LocalOnly(Library::shipped()));
+            let mut v = v.clone();
+            v.follow(&other, &s3);
+            let mut want = View3d::default();
+            want.reset(&s3.positions);
+            assert_eq!(v.rot, want.rot, "change {change}: reset");
+        }
     }
 }
