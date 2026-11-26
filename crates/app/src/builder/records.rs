@@ -746,7 +746,7 @@ $$$$
             let shape::Lookup::Found(r, _) = shape::LocalOnly(lib).find(&d, &all) else { panic!("drawn {name} is not found") };
             assert_eq!((r.name.as_str(), matches!(r.source, Source::Lira { .. })), (name, true));
             let s = shape::shape(&d, &shape::LocalOnly(lib));
-            assert_eq!(s.sources, vec![(all.clone(), shape::FragmentSource::Lira)], "{name}");
+            assert_eq!(s.sources, vec![(all.clone(), shape::FragmentSource::Lira { functional: "LSDA".into(), quality: "Accurate".into() })], "{name}");
             assert_eq!(shape::footer_label(&s), "shape: relaxed with LIRA (LSDA, Accurate)", "{name}");
         }
     }

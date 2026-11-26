@@ -61,8 +61,9 @@ pub enum FragmentSource {
     /// A PubChem record's conformer; `stereo_note` when the record is one stereoisomer of a graph
     /// that has several, so the drawing did not decide it (§6.4).
     PubChem { name: String, cid: u64, stereo_note: bool },
-    /// One of our own LIRA-relaxed entries (§5.1).
-    Lira,
+    /// One of our own LIRA-relaxed entries (§5.1), with the functional and quality preset its
+    /// record says it was relaxed at.
+    Lira { functional: String, quality: String },
     /// The embedding's guess.
     Approximate(Why),
 }
@@ -137,7 +138,7 @@ fn place_from(d: &Drawing, src: &dyn RecordSource, x0: Vec<V3>) -> (Vec<V3>, Vec
                 put_record(&mut x, &frag, &r, &m);
                 let source = match r.source {
                     Source::PubChem { cid } => FragmentSource::PubChem { name: r.name.clone(), cid, stereo_note: r.stereo_defined },
-                    Source::Lira { .. } => FragmentSource::Lira,
+                    Source::Lira { ref functional, ref quality, .. } => FragmentSource::Lira { functional: functional.clone(), quality: quality.clone() },
                 };
                 (source, true)
             }
@@ -441,7 +442,8 @@ pub fn fragment_label(s: &FragmentSource) -> String {
             }
             t
         }
-        FragmentSource::Lira => "shape: relaxed with LIRA (LSDA, Accurate)".into(),
+        // today's rows: "shape: relaxed with LIRA (LSDA, Accurate)", the spec's string
+        FragmentSource::Lira { functional, quality } => format!("shape: relaxed with LIRA ({functional}, {quality})"),
         FragmentSource::Approximate(Why::NotInDatabase) => "shape: approximate (not in the database) — Relax after recommended".into(),
         FragmentSource::Approximate(Why::LookingUp) => "looking up online…".into(),
         FragmentSource::Approximate(Why::Offline) => "shape: approximate (offline)".into(),
@@ -498,7 +500,7 @@ pub fn footer_label(s: &Shaped) -> String {
         all => {
             let count = |f: &dyn Fn(&FragmentSource) -> bool| all.iter().filter(|(_, s)| f(s)).count();
             let k = count(&|s| matches!(s, FragmentSource::PubChem { .. }));
-            let j = count(&|s| matches!(s, FragmentSource::Lira));
+            let j = count(&|s| matches!(s, FragmentSource::Lira { .. }));
             let m = count(&|s| matches!(s, FragmentSource::Approximate(_)));
             let parts: Vec<String> = [(k, "from PubChem"), (j, "relaxed with LIRA"), (m, "approximate")].iter().filter(|p| p.0 > 0).map(|(n, w)| format!("{n} {w}")).collect();
             let mut t = format!("shape: {}", parts.join(", "));
@@ -731,6 +733,19 @@ pub(crate) mod tests {
         assert_eq!(footer_label(&shape(&d, &stereo_src)), "shape: PubChem \"ethanol\" (CID 702) · stereo as in the database (CID 702)");
         // nothing to label
         assert_eq!(footer_label(&shape(&Drawing::default(), &local)), "");
+    }
+
+    /// Coordinator M4: the LIRA label reads the record's own functional and quality (today's rows
+    /// are LSDA, Accurate: `labels_read_as_the_spec_says` and the `records` tests pin that string).
+    #[test]
+    fn the_lira_label_reads_the_records_provenance() {
+        let water = rec("water");
+        let mut lira = water.clone();
+        lira.source = Source::Lira { functional: "PBE".into(), quality: "Precise".into(), ionic: "accepted".into(), multiplicity: 1, max_force: 3e-4, commit: "test".into() };
+        let mut d = Drawing::default();
+        draw_record(&mut d, water, [0.0, 0.0], &identity(3));
+        let src = By(|d: &Drawing, f: &[usize]| found_or(d, f, &lira, Lookup::NotFound));
+        assert_eq!(footer_label(&shape(&d, &src)), "shape: relaxed with LIRA (PBE, Precise)");
     }
 
     /// Final review I2: the hint names what the hydrogen-filled drawing maps to, for each fragment
