@@ -1474,6 +1474,21 @@ Suites behind it:
 - **On `4dc34b73`:** app, as above.
 - **Not run for this release** (the user chose to release tonight): oracles, gpu_vs_cpu, pseudo, pseudo_gen, pseudo_oracles, charges, orbitals, harris and tools. The solver they test most (`qm`, `qm-gpu`) is unchanged since v0.3.0-beta.1.
 
+### A 3D view in the molecule builder, and v0.3.1 (2026-11-26 to 2026-11-27, spec `2026-11-26-builder-3d-view-design.md`, 1 task)
+
+- **Asked for by:** the user, who wanted to insert molecules the box can't hold, "maybe you want to look at the molecules structure". Of three options (enlarge anyway, insert regardless, a 3D view in the builder), the user chose the read-only 3D view.
+- **What landed** (merge `9d7bc232`): a **2D | 3D** toggle at the canvas's corner.
+  - It shows the exact positions Replace scene would place, as a ball-and-stick drawn with the egui painter (no wgpu pass, so no GPU memory), with bond orders as 1–3 sticks.
+  - Drag turns the view, the wheel zooms and double-click resets it to the principal axes.
+  - Hovering gives a bond's length in Å or an atom's angles.
+  - Approximate fragments get a dashed outline. A 2D selection shows as a ring.
+  - The view is read-only (Ctrl-Z/Y still work) and display-only: no `ui::Action`, not recorded, not in the profile. The screenshot key is `builder_view=3d`.
+- **Review** (Fable, task and final in one, since there is one task): ready with fixes. The Important finding was that the spec's hover test was missing. The minors were the selection hidden in 3D, an angle overcount for a coincident neighbour, the readout box not clamped, and Delete over the toggle erasing the atom drawn beneath it. One fix round, re-reviewed clean. Two parked: the ring and the toggle gate have no test.
+- **Gates on the merged tree `9d7bc232`:** `cargo test -p app --release` 960 passed and 9 failed, and on a serial rerun 1 passed and 8 failed.
+  - Every failure is a worker test waiting on a GPU solve ("no snapshot within 120 s", "the 97³ solve did not finish within 60 s", a replay "no solve within 600 s").
+  - During the run the user was playing a game holding about 76 % of the GPU's 3D engine, 28 % of its compute and 8.7 GB of VRAM. None of the failing tests touches the builder. All builder and UI tests passed (574 on the branch).
+- **v0.3.1** was released at the user's request with this gate result stated in the notes. The physics suites were not rerun; the solver, dynamics and model are unchanged since 0.3.0.
+
 ### Process wins
 
 - An input-replay harness (M6 Task 8) that found a real app bug on its first scripts: a running relax
