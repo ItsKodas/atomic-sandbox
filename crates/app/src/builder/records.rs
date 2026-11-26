@@ -692,11 +692,14 @@ $$$$
     /// generator's report, Task 7): PubChem has a 3D shape for it (spec §5.1: PubChem's wins), or its
     /// relax was deferred or left out.
     const LIRA_NOT_SHIPPED: &[(&str, &str)] = &[
-        ("boric acid", "left out 2026-11-26: the relax stopped after 2 FIRE steps (a failed evaluation), max |F| 8.8e-2"),
-        ("magnesium chloride", "left out 2026-11-26: the first evaluation failed (no SCF answer at the embedding)"),
-        ("aluminium fluoride", "left out 2026-11-26: the relax stopped after 8 FIRE steps (a failed evaluation), max |F| 2.8e-2"),
-        ("aluminium chloride", "left out 2026-11-26: the first evaluation failed (no SCF answer at the embedding)"),
-        ("aluminium chloride dimer", "deferred 2026-11-26: 137³ needs ≈ 8.3 GB of GPU memory, over the 4 GB cap of a shared GPU"),
+        // deferred: the solver's gap-witness levels the 4 GB cap allows (3–4 extra) were too few
+        // ("no gap witness within 4 extra levels … raise GPU memory"); rerun on a quiet GPU with a
+        // larger LIRA_VRAM_GB
+        ("boric acid", "deferred 2026-11-26: the 4 GB cap's gap-witness levels ran out after 2 FIRE steps"),
+        ("magnesium chloride", "deferred 2026-11-26: the 4 GB cap's gap-witness levels ran out at the first evaluation"),
+        ("aluminium fluoride", "deferred 2026-11-26: the 4 GB cap's gap-witness levels ran out after 8 FIRE steps"),
+        ("aluminium chloride", "deferred 2026-11-26: the 4 GB cap's gap-witness levels ran out at the first evaluation"),
+        ("aluminium chloride dimer", "deferred 2026-11-26: 137³ needs ≈ 8.3 GB of GPU memory, over the 4 GB cap"),
     ];
 
     /// Task 7 (spec §5.1, §9): the `lira` rows. Each is an entry of the LIRA list
