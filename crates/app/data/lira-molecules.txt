@@ -12,6 +12,10 @@
 # The formal charges are the builder's (crates/app/src/builder/chem.rs): where a drawing with no valence
 # warning exists it is the one listed (BH4- on B, the dative N+–B- of ammonia borane, the bridging Cl+ of
 # Al2Cl6); a bridging H (B2H6, H3+) has no warning-free form and is drawn plain.
+#
+# The relaxed shapes are this solver's minima at those defaults, not experimental geometries: bonds to Na, Mg, Al and Be
+# come out 2–10 % long (Li, Be, Na, Mg, Al are all-electron with smeared nuclei under `accepted` at h = σ = 0.15).
+# Measured and explained in crates/validate/references.md, "Builder LIRA shapes: all-electron light metals relax long".
 
 # H2 and LiH: the app's preset molecules (PubChem CIDs 783 and 62714 have no 3D record)
 hydrogen | dihydrogen, H2 | H H | 0-1 | auto

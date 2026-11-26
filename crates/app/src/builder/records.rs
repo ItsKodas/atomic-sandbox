@@ -693,8 +693,11 @@ $$$$
     /// relax was deferred or left out.
     const LIRA_NOT_SHIPPED: &[(&str, &str)] = &[
         // deferred: the solver's gap-witness levels the 4 GB cap allows (3–4 extra) were too few
-        // ("no gap witness within 4 extra levels … raise GPU memory"); rerun on a quiet GPU with a
-        // larger LIRA_VRAM_GB
+        // ("no gap witness within 4 extra levels … raise GPU memory", `providers::ks::WITNESS_BUDGET_HINT`),
+        // and Al₂Cl₆'s box is over the cap. On a quiet GPU, after committing (the generator refuses a dirty
+        // `crates/`), from the repo root:
+        //   LIRA_VRAM_GB=12 LIRA_ONLY="boric acid,magnesium chloride,aluminium fluoride,aluminium chloride,aluminium chloride dimer" cargo test -p app --release --bin app -- worker::tests::generate_lira_shapes --ignored --nocapture
+        // then delete each kept entry's line here
         ("boric acid", "deferred 2026-11-26: the 4 GB cap's gap-witness levels ran out after 2 FIRE steps"),
         ("magnesium chloride", "deferred 2026-11-26: the 4 GB cap's gap-witness levels ran out at the first evaluation"),
         ("aluminium fluoride", "deferred 2026-11-26: the 4 GB cap's gap-witness levels ran out after 8 FIRE steps"),
@@ -726,6 +729,10 @@ $$$$
             assert!(max_force.is_finite() && *max_force <= tol, "{}: max |F| {max_force} over the Relax tolerance {tol}", r.name);
             assert_eq!((functional.as_str(), quality.as_str(), ionic.as_str()), ("LSDA", "Accurate", sim::IonicPolicy::Accepted.word()), "{}", r.name);
             assert!(!commit.is_empty() && commit != "seed" && commit.len() >= 7 && commit.chars().all(|c| c.is_ascii_hexdigit()), "{}: commit {commit:?}", r.name);
+        }
+        for (name, why) in LIRA_NOT_SHIPPED {
+            assert!(!why.trim().is_empty(), "{name}: LIRA_NOT_SHIPPED gives no reason");
+            assert!(entries.iter().any(|e| e.name == *name), "{name}: in LIRA_NOT_SHIPPED but not in the LIRA list");
         }
         for e in &entries {
             let shipped = rows.iter().filter(|r| r.name == e.name).count();

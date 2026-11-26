@@ -4896,7 +4896,7 @@ fn generate_lira_shapes() {
             let why = s.dynamics.last_error.clone().unwrap_or_else(|| "no provider error".into());
             eprintln!("   last error: {why}");
             // the solver ran out of the levels the memory cap allows: a GPU-memory deferral, not a physics failure
-            let kind = if why.contains("GPU memory") { format!("deferred (needs > {cap_gb} GB VRAM, quiet GPU)") } else { "left out".into() };
+            let kind = if why.contains(providers::ks::WITNESS_BUDGET_HINT) { format!("deferred (needs > {cap_gb} GB VRAM, quiet GPU)") } else { "left out".into() };
             table.push(row(e, &m_s, &f_s, &steps, &t_s, format!("{kind}: not converged ({}; the provider: {why})", r.note.unwrap_or_default())));
             continue;
         }

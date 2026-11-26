@@ -134,7 +134,7 @@ A dev-only `#[ignore]`d harness. It does not ship and runs **on the GPU, so only
    - **Accurate** (h = σ = 0.15 Bohr);
    - `Accepted` ionic policy;
    - the entry's charge;
-   - automatic multiplicity, which keeps the lowest-energy converged multiplicity;
+   - automatic multiplicity: the lowest spin (electrons paired; one unpaired electron for an odd count), as `qm::System` chooses it — no multiplicity scan;
    - a box enlarged by the builder's own `enlarge_n` rule;
 3. stops at Relax's own convergence criterion.
 

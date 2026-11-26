@@ -6786,3 +6786,53 @@ The harness compares l2 with l1: the report, the coefficients, the codes, the ca
 Pinned on an analytic fixture (`tests/fit_choice.rs`: 300 H₂/H₃ answers on a pair surface plus a narrow three-body well the default basis cannot follow — the default fit fails, step 1's cap 6 stands, Q′ 74): the full recovery's fits are [4, 6], the next launch's [6], and the fit (report, coefficients, posterior factor) and every verdict are equal bit for bit, synchronous and through a background refit; a memory planted for a state where step 1 fails (an energy glitch) is tried, fails, and the refit then makes exactly the full recovery's fits after it and stands where that stands, the memory and the file dropped; a new sample, another policy, a reference, a code, the reach and a W (committed or staged) each change the key, and such a launch fits the default basis first.
 
 **The default-cap failure** was not investigated further: the default basis (degree cap 4) fails the training residuals that cap 6 then passes with nothing held, which is the documented purpose of step 1 ("bent molecules with wide bond excursions"), and nothing seen here points to a bug. Nothing in this change alters either fit or any check.
+
+## Builder LIRA shapes: all-electron light metals relax long (2026-11-26; builder database Task 7, spec `2026-11-25-builder-database-design.md` §5.1; `app` `worker::tests::generate_lira_shapes`, `#[ignore]`d dev tool, at e80acd70; release, RX 7900 XTX shared with a game, BelowNormal)
+
+The builder's `lira` rows in `crates/app/data/molecules.txt` are the app's own Relax minima at its defaults: GPU, LSDA,
+Accurate (h = σ = 0.15 Bohr), ionic `accepted`, automatic multiplicity, the builder's `enlarge_n` box, stopped at
+`sim::relax::F_TOL` = 1e-3 Ha/Bohr. Every one converged and keeps its drawn topology, but the bonds to Na, Mg, Al and
+Be come out long against experiment:
+
+| molecule | relaxed r (Å) | experiment r (Å) | relaxed − experiment |
+|---|---|---|---|
+| Na₂ | 3.367 | 3.079 (r_e) | **+9.4 %** |
+| NaH | 2.040 | 1.887 (r_e) | **+8.1 %** |
+| MgH₂ (Mg–H) | 1.878 | ≈ 1.70 (r₀, gas-phase IR) | **≈ +10 %** |
+| AlH₃ (Al–H) | 1.715–1.720 | ≈ 1.59 (r₀, gas-phase IR) | **≈ +8 %** |
+| BeH₂ (Be–H) | 1.401 | 1.326 (r₀, gas-phase IR) | **+5.6 %** |
+| NaF | 1.983 | 1.926 (r_e) | +3.0 % |
+| NaCl | 2.413 | 2.361 (r_e) | +2.2 % |
+| BeCl₂ (Be–Cl) | 1.839 | 1.791 (r₀) | +2.7 % |
+| LiH | 1.637 | 1.595 (r_e) | +2.6 % |
+| Li₂ | 2.736 | 2.673 (r_e) | +2.4 % |
+| LiF, LiCl | 1.575, 2.034 | 1.564, 2.021 (r_e) | +0.7 %, +0.7 % |
+| MgO | 1.735 | 1.749 (r_e) | −0.8 % |
+
+For contrast, rows with no Li/Be/Na/Mg/Al atom sit within about 1 % (BH₃ 1.196, BF₃ 1.315 vs 1.307, BCl₃ 1.745 vs
+1.742, NO 1.151 vs 1.151, NO₂ 1.195 Å / 134.2° vs 1.193 Å / 134.1°, CH₃ 1.087 vs 1.079).
+
+**Sources.** The experimental values are recalled, not re-fetched for this entry: the diatomics' r_e from Huber &
+Herzberg, *Constants of Diatomic Molecules* (1979; the NIST Chemistry WebBook's diatomic tables), and the polyatomics'
+r₀ from the gas-phase infrared work of Bernath and co-workers (BeH₂, MgH₂, BeCl₂) and Downs and co-workers (AlH₃),
+as collected in NIST CCCBDB's experimental geometries. Check a value against its source before citing it as a
+reference number. The relaxed values are the shipped rows (`molecules.txt`, recomputed from their Å coordinates).
+
+**The cause is the approximation, not LSDA.** `accepted` pseudises only what the recipe accepts (H, He, B, C, N, O, F,
+Ne, Si, P, S, Cl, Ar; "M7 generation records" above, its status paragraph): Li, Na and Mg are refused by the partition, Be and Al by T5.
+So every Li, Be, Na, Mg and Al atom in these scenes is **all-electron with a Gaussian-smeared nucleus** at h = σ = 0.15
+Bohr, a grid that cannot resolve a 1s core of Z = 11–13 (the energies show it: NaH −92.1 Ha, Na₂ −183.1 Ha). LSDA
+itself, at a point nucleus with a resolved core, usually binds slightly *short* for these molecules, so the sign here
+is the smearing's and the grid's. The bias is largest for bonds to H and the metal–metal bond and smaller for the
+ionic halides; Li, the lightest, is least affected. It is not separated further here (σ, h and a pseudopotential for
+these species would each move it; published pseudopotentials are a roadmap item).
+
+**What it means for the builder.** Like PubChem's MMFF shapes, a LIRA shape only places nuclei (rule 1). Because it
+is the app's own minimum at the defaults, a Relax after Insert at those defaults does not move it; at another quality
+or ionic policy the Relax moves it to that surface's minimum. The shapes are starting guesses for this solver, not
+experimental geometries.
+
+**Box.** Six of the kept rows ended with the "box too small" warning (face density 1.0–1.9e-5 e/Bohr³, just over the
+box rule's threshold): BeCl₂ 1.01e-5, BCl₃ 1.18e-5, AlH₃ 1.21e-5, AlH₄⁻ 1.23e-5, MgO 1.25e-5, NaCl 1.87e-5. Each was boxed by
+the builder's `enlarge_n` rule (4 Bohr past the farthest embedded nucleus), which is slightly tight for these diffuse
+densities. The shapes were kept as they are, as starting guesses.
