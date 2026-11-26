@@ -13,7 +13,8 @@
 //!   existing atom bonds to it, closing a ring); with nothing selected a click places a lone atom.
 //!   Click the selected atom again: it becomes the palette's element. Shift-click another atom: a
 //!   bond to it (a ring closure). Drag an atom: it moves (the selection with it);
-//! - right-click deselects; Esc deselects, and closes the window when nothing is selected;
+//! - right-click deselects; Esc deselects, and closes the window when nothing is selected (Esc in
+//!   the search box only leaves the box);
 //! - click a bond (Bond tool, or the Atom tool): its order cycles 1 → 2 → 3 → 1; Bond tool: drag
 //!   from atom to atom for a bond;
 //! - Charge tool: click an atom to cycle 0 → +1 → −1 → 0;
@@ -292,6 +293,11 @@ fn search_box(ui: &mut Ui, b: &mut Builder) {
     use super::search::{parse_query, Query};
     let r = ui.add(egui::TextEdit::singleline(&mut b.search_query).hint_text(SEARCH_HINT).char_limit(SEARCH_CHAR_LIMIT).desired_width(ui.available_width()));
     let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    // Esc in the box only leaves the box (final review M1): egui drops the focus at the start of the
+    // frame, so the window's Esc (deselect, then close) would see no text field and take it too
+    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+    }
     b.poll_search();
     if parse_query(&b.search_query) == Query::Empty {
         return;
@@ -1208,6 +1214,40 @@ mod tests {
         st.builder.drawing = he;
         let t = footer_texts(&mut st);
         assert!(t.contains("shape: approximate (offline)") && !t.contains("would match"), "{t}");
+    }
+
+    /// One frame of the palette column with `events`; whether an Esc was still there for the
+    /// builder's own Esc (deselect, then close) after it.
+    fn palette_frame(ctx: &egui::Context, st: &mut UiState, events: Vec<egui::Event>) -> bool {
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(150.0, 900.0))), events, ..Default::default() };
+        let mut esc_left = false;
+        let _ = ctx.run_ui(raw, |ui| {
+            palette_column(ui, st);
+            esc_left = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        });
+        esc_left
+    }
+
+    /// Final review M1: Esc in the search box only leaves the box (egui drops the focus at the start
+    /// of the frame, so the window's Esc would otherwise see no text field and close the builder or
+    /// clear the selection); with the box not focused, Esc is the builder's.
+    #[test]
+    fn esc_in_the_search_box_stays_in_the_box() {
+        let mut st = UiState::new("h2", &crate::scene::Scene::preset("h2").unwrap());
+        let ctx = egui::Context::default();
+        let esc = egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        let press = |pressed: bool| egui::Event::PointerButton { pos: Pos2::new(40.0, 10.0), button: PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        palette_frame(&ctx, &mut st, vec![]);
+        assert!(palette_frame(&ctx, &mut st, vec![esc.clone()]), "the box not focused: the builder's Esc");
+        palette_frame(&ctx, &mut st, vec![]);
+        palette_frame(&ctx, &mut st, vec![egui::Event::PointerMoved(Pos2::new(40.0, 10.0)), press(true)]);
+        palette_frame(&ctx, &mut st, vec![press(false)]);
+        assert!(ctx.text_edit_focused(), "the click put the search box in focus");
+        assert!(!palette_frame(&ctx, &mut st, vec![esc.clone()]), "Esc in the box is the box's");
+        assert!(!ctx.text_edit_focused(), "and the box let go of the focus");
+        palette_frame(&ctx, &mut st, vec![]);
+        palette_frame(&ctx, &mut st, vec![]);
+        assert!(palette_frame(&ctx, &mut st, vec![esc]), "the next Esc is the builder's again");
     }
 
     /// The Atom tool as the user asked for it (2026-10-20): click places a lone atom and selects it,
