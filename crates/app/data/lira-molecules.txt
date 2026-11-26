@@ -1,6 +1,6 @@
 # The builder's LIRA-relaxed entries (spec docs/superpowers/specs/2026-11-25-builder-database-design.md §5.1):
 # molecules within H–Ar that PubChem has no 3D shape for. The generator
-#   cargo test -p app --release --bin app -- worker::tests::generate_lira_shapes --ignored --nocapture
+#   LIRA_GENERATE=1 cargo test -p app --release --bin app -- worker::tests::generate_lira_shapes --ignored --nocapture
 # relaxes each one with the app's own Relax (GPU, LSDA, Accurate, ionic accepted, automatic multiplicity) and writes
 # it into molecules.txt as a `source lira` row; an entry PubChem does have a 3D shape for is skipped (PubChem's wins).
 #

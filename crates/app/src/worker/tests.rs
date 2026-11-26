@@ -4683,6 +4683,9 @@ fn the_solvers_get_the_budget_of_the_share() {
 
 // ---- the builder's LIRA-relaxed shapes (builder database, Task 7) ----
 
+/// The LIRA generator's switch (`builder::records::generator_armed`).
+pub(crate) const LIRA_GENERATE: &str = "LIRA_GENERATE";
+
 /// Dev tool (spec `docs/superpowers/specs/2026-11-25-builder-database-design.md` §5.1): relaxes each entry of
 /// `crates/app/data/lira-molecules.txt` with the app's own Relax and writes it into `crates/app/data/molecules.txt`
 /// as a `source lira` row, then prints the table (entry | multiplicity | max_force | steps | wall | outcome).
@@ -4703,13 +4706,18 @@ fn the_solvers_get_the_budget_of_the_share() {
 ///
 /// The `commit` is `git rev-parse --short=8 HEAD`; the run refuses a checkout whose `crates/` has uncommitted
 /// changes (other than `molecules.txt`, which it writes), so the commit is the code that ran. `LIRA_ONLY=a,b`: only
-/// those entries (names); `LIRA_DRY=1`: the checks, boxes and estimates without the GPU (no commit needed).
+/// those entries (names); `LIRA_DRY=1`: the checks, boxes and estimates without the GPU (no commit needed). It does
+/// nothing unless `LIRA_GENERATE=1` (`builder::records::generator_armed`: `--include-ignored` alone does not run it).
 #[test]
-#[ignore = "dev tool, GPU: cargo test -p app --release --bin app -- worker::tests::generate_lira_shapes --ignored --nocapture"]
+#[ignore = "dev tool, GPU: LIRA_GENERATE=1 cargo test -p app --release --bin app -- worker::tests::generate_lira_shapes --ignored --nocapture"]
 fn generate_lira_shapes() {
     use crate::builder::{self, chem, embed, lira, online, records, shape};
     use records::{Library, Record, Source};
     use shape::RecordSource as _;
+    if !records::generator_armed(LIRA_GENERATE) {
+        eprintln!("{LIRA_GENERATE}=1 is not set: the LIRA generator does nothing (it would use the network and the GPU and rewrite molecules.txt)");
+        return;
+    }
     let _gpu = gpu_lock();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());

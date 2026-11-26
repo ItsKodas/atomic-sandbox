@@ -696,7 +696,7 @@ $$$$
         // ("no gap witness within 4 extra levels … raise GPU memory", `providers::ks::WITNESS_BUDGET_HINT`),
         // and Al₂Cl₆'s box is over the cap. On a quiet GPU, after committing (the generator refuses a dirty
         // `crates/`), from the repo root:
-        //   LIRA_VRAM_GB=12 LIRA_ONLY="boric acid,magnesium chloride,aluminium fluoride,aluminium chloride,aluminium chloride dimer" cargo test -p app --release --bin app -- worker::tests::generate_lira_shapes --ignored --nocapture
+        //   LIRA_VRAM_GB=12 LIRA_ONLY="boric acid,magnesium chloride,aluminium fluoride,aluminium chloride,aluminium chloride dimer" LIRA_GENERATE=1 cargo test -p app --release --bin app -- worker::tests::generate_lira_shapes --ignored --nocapture
         // then delete each kept entry's line here
         ("boric acid", "deferred 2026-11-26: the 4 GB cap's gap-witness levels ran out after 2 FIRE steps"),
         ("magnesium chloride", "deferred 2026-11-26: the 4 GB cap's gap-witness levels ran out at the first evaluation"),
@@ -749,6 +749,20 @@ $$$$
             assert_eq!(s.sources, vec![(all.clone(), shape::FragmentSource::Lira { functional: "LSDA".into(), quality: "Accurate".into() })], "{name}");
             assert_eq!(shape::footer_label(&s), "shape: relaxed with LIRA (LSDA, Accurate)", "{name}");
         }
+    }
+
+    /// Coordinator M7: the generators run only when their switch is exactly `1`.
+    #[test]
+    fn the_generators_need_their_switch() {
+        let var = "ATOMIC_SANDBOX_TEST_GENERATOR_SWITCH";
+        std::env::remove_var(var);
+        assert!(!generator_armed(var), "unset");
+        for (v, armed) in [("1", true), (" 1 ", true), ("0", false), ("", false), ("yes", false)] {
+            std::env::set_var(var, v);
+            assert_eq!(generator_armed(var), armed, "{v:?}");
+        }
+        std::env::remove_var(var);
+        assert_eq!((PUBCHEM_GENERATE, crate::worker::tests::LIRA_GENERATE), ("PUBCHEM_GENERATE", "LIRA_GENERATE"));
     }
 
     #[test]
@@ -888,11 +902,24 @@ $$$$
     }
 }
 
+/// Whether a dev-only generator was asked for by its environment switch `var` set to `1`
+/// (coordinator M7): `cargo test -- --include-ignored` alone must never turn the builder's network
+/// on or rewrite `molecules.txt`, so each generator returns at once without it.
+#[cfg(test)]
+pub(crate) fn generator_armed(var: &str) -> bool {
+    std::env::var(var).is_ok_and(|v| v.trim() == "1")
+}
+
+/// The PubChem generator's switch ([`generator_armed`]).
+#[cfg(test)]
+pub(crate) const PUBCHEM_GENERATE: &str = "PUBCHEM_GENERATE";
+
 /// The shipped list's generator (spec §5; Task 6): `crates/app/data/molecule-names.txt` →
 /// `crates/app/data/molecules.txt`. A dev tool, never run by the suites, and the only code that
-/// turns the builder's network on:
+/// turns the builder's network on; it does nothing unless `PUBCHEM_GENERATE=1` (`--include-ignored`
+/// alone does not run it):
 ///
-/// `cargo test -p app --release --bin app -- builder::records::generate --ignored --nocapture`
+/// `PUBCHEM_GENERATE=1 cargo test -p app --release --bin app -- builder::records::generate --ignored --nocapture`
 ///
 /// For each line of the name list (`name`, or `name | CID` where a name is ambiguous) it resolves
 /// the CID (PubChem's first for the name), fetches the 3D and 2D SDFs, the isomeric SMILES (the
@@ -1062,8 +1089,12 @@ mod generate {
     }
 
     #[test]
-    #[ignore = "dev tool: cargo test -p app --release --bin app -- builder::records::generate --ignored --nocapture"]
+    #[ignore = "dev tool: PUBCHEM_GENERATE=1 cargo test -p app --release --bin app -- builder::records::generate --ignored --nocapture"]
     fn regenerate_the_shipped_list() {
+        if !generator_armed(PUBCHEM_GENERATE) {
+            eprintln!("{PUBCHEM_GENERATE}=1 is not set: the PubChem generator does nothing (it would turn the network on and rewrite molecules.txt)");
+            return;
+        }
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let names = std::fs::read_to_string(root.join("data/molecule-names.txt")).expect("data/molecule-names.txt");
         let dir = root.join("../../target/pubchem-generator");
