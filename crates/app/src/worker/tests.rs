@@ -4888,7 +4888,13 @@ fn generate_lira_shapes() {
             eprintln!("   warning: {w}");
         }
         if r.converged != Some(true) {
-            table.push(row(e, &m_s, &f_s, &steps, &t_s, format!("left out: not converged ({})", r.note.unwrap_or_default())));
+            // why it stopped: the driver's notes (a failed evaluation says what failed)
+            let notes = &s.dynamics.notes;
+            for n in &notes[notes.len().saturating_sub(6)..] {
+                eprintln!("   note: {n}");
+            }
+            let last = notes.iter().rev().find(|n| !n.starts_with("relax ")).cloned().unwrap_or_default();
+            table.push(row(e, &m_s, &f_s, &steps, &t_s, format!("left out: not converged ({}; last note: {last})", r.note.unwrap_or_default())));
             continue;
         }
         if !(max_force < tol) || !(r.max_force_augmented < tol) {
