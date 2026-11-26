@@ -1445,6 +1445,35 @@ review: 0 Critical, 0 Important, 8 Minor, all fixed. The app gate passes 795 tes
 - **Review:** approved with no Critical or Important findings. Parked minors are in the ledger (a stale headline comment, documenting the cause ranking, a fake-only pass-end worker test).
 - **Gates:** the app and validate runs above compiled the merged tree. `worker::tests::forget_and_restore_a_sample_refit_the_model`, which had timed out on a shared GPU during the branch, passed. Rerun on the merged tree `4d09a46a`: sim 207 passed; providers 660 passed, 1 failed: the known environmental `ks::tests::the_level_gated_stall_stop_on_the_measured_cases`.
 
+### The molecule builder's shape database (2026-11-25 to 2026-11-26, spec `2026-11-25-builder-database-design.md`, 8 tasks + 6b)
+
+- **Asked for by:** the user. Builder molecules should come out with their real 3D shape, not an approximate embedding, and be searchable by name.
+- **What landed** (merge `4dc34b73`):
+  - **The data:** a shipped database of 1 706 PubChem 3D records (MMFF94s, H–Ar, at most 30 atoms) and 32 shapes relaxed with LIRA itself (LSDA, Accurate) for molecules PubChem has no 3D record for (H₂, LiH, the radicals, H₃⁺ …).
+  - **Matching:** graph matching (`iso.rs`) of each drawn fragment to a record, checked atom by atom before it is placed. A rotation (Kabsch) fits the record onto the drawing.
+  - **Search and lookup:** a search box (name, formula, CID), and an opt-in online PubChem lookup with a cache, timeouts and no network in replay or screenshot.
+  - **Labels and hints:** an honest shape line in the footer (PubChem / LIRA / approximate), and a Fill-hydrogens hint for a bare skeleton.
+- **Deferred:** five LIRA entries (Al₂Cl₆, boric acid, MgCl₂, AlF₃, AlCl₃) needed more than the 4 GB GPU cap set while the user was gaming. They insert with the approximate shape until a quiet-GPU rerun (the command is in `LIRA_NOT_SHIPPED`).
+- **Physics honesty:** under `accepted`, Li, Be, Na, Mg and Al stay all-electron with smeared nuclei, and their bonds relax 2–10 % long.
+  - Examples: Na₂ +9.4 %, MgH₂ +10.3 %, BeH₂ +5.0 %.
+  - The values are cited against the NIST WebBook, CCCBDB and the spectroscopy papers in `references.md` "Builder LIRA shapes". AlH₃ has no sourced gas-phase value.
+- **Reviews:**
+  - Every task passed its review. Task 7 needed two fix rounds: the light-metal gap had been documented only in a git-ignored report, and its first experimental values were recalled rather than cited.
+  - The final review (Fable) found that a stereoisomer picked from the search could insert a different isomer's shape: 38 names in 28 same-graph groups, such as fumaric acid → maleic acid. It also found the spec's Fill-hydrogens hint missing, and that Esc in the search box closed the builder. All were fixed in one wave and re-reviewed clean.
+- **Gates on the merged tree `4dc34b73`:**
+  - `cargo test -p app --release`: 952 passed, 1 failed. The failure, `worker::tests::activity_overhead_is_reported`, timed out waiting 120 s for a pass with a 4-thread CPU job, OBS and two builds running beside it. It failed the same way in the skip-solve gate run and passed there on an idle rerun, so it is load-sensitive and unrelated to the builder. It failed again alone under the same load.
+  - `builder:: ui::` 557/557.
+- **Took:** about 30 hours of wall time across two days, mostly the GPU-bound LIRA generator (2 h 25 min) and the user's gaming limits.
+
+### v0.3.0 (stable, 2026-11-26)
+
+The first stable release since v0.2.2. It contains chemical channels (v0.3.0-beta.1), skip solve, the refit picture after a pass and on Refit now, remembered fit choices, the refit visualisation and the builder's shape database. The solver crates (`qm`, `qm-gpu`) are unchanged since v0.3.0-beta.1.
+
+Suites behind it:
+- **On `594c3395`/`4d09a46a`:** sim 207; providers 660 with 1 known environmental failure (`the_level_gated_stall_stop_on_the_measured_cases`); dynamics 7; surrogate 10 with 1 known failure (`the_stuck_escape_repro_is_answered_honestly`, failing since v0.2.1).
+- **On `4dc34b73`:** app, as above.
+- **Not rerun for this release** (the user chose to release tonight): oracles, gpu_vs_cpu, pseudo, charges, orbitals and harris. Their code is unchanged since they last passed.
+
 ### Process wins
 
 - An input-replay harness (M6 Task 8) that found a real app bug on its first scripts: a running relax
