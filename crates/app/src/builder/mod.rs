@@ -21,6 +21,7 @@ pub mod records;
 pub mod search;
 pub mod shape;
 pub mod ui;
+pub mod view3d;
 
 use crate::scene::{Scene, SceneNucleus};
 use crate::sim::Command;
@@ -325,6 +326,12 @@ pub struct Builder {
     pub search_query: String,
     /// The search box's results for that text ([`search`]).
     pub(crate) search: search::SearchBox,
+    /// The canvas's 2D | 3D toggle (3D view spec §1): 3D shows the hand-off's shape read-only
+    /// ([`view3d`]). Display state: not an `Action`, not recorded, not in the profile; kept while
+    /// the window is closed, so it reopens as it was left.
+    pub view_3d: bool,
+    /// The 3D view's rotation and zoom (reset whenever the shape is another molecule).
+    pub(crate) view3d: view3d::View3d,
 }
 
 impl Default for Builder {
@@ -352,6 +359,8 @@ impl Default for Builder {
             fill_hint: None,
             search_query: String::new(),
             search: Default::default(),
+            view_3d: false,
+            view3d: view3d::View3d::default(),
         }
     }
 }

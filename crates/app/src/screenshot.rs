@@ -44,6 +44,8 @@ const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// `ptable=<query>` opens the periodic table with that search text (empty: none),
 /// `builder=<query>` opens the molecule builder with that search and stamps its first local result
 /// (the shipped list; a screenshot never reaches the network; no `;` in the query),
+/// `builder_view=2d|3d` shows the builder's canvas as the 2D sketch or the read-only 3D view of
+/// the shape the hand-off would place (with `builder=`; display state, as the toggle),
 /// `names=common|stoichiometric|hydride|formula` sets the molecule name style, `angles=on|off` the
 /// bond-angle overlay (on by default),
 /// `wait=bonds` shoots once the bond graph is in (the free-atom references solved: ≈ 70 s for
@@ -177,6 +179,8 @@ pub struct ShotUi {
     /// `builder=<query>`: the molecule builder open with this in its search box, the first local
     /// result (the shipped list: a screenshot never reaches the network) stamped onto the canvas.
     pub builder: Option<String>,
+    /// `builder_view=2d|3d`: the builder's canvas in 2D or in its read-only 3D view (3D: true).
+    pub builder_view: Option<bool>,
 }
 
 /// A distance of a `--ui` key: finite and > 0 Bohr (NaN for a value that is not a number).
@@ -257,6 +261,13 @@ impl ShotUi {
                 },
                 "ptable" => s.ptable = Some(v.to_string()),
                 "builder" => s.builder = Some(v.trim().to_string()),
+                "builder_view" => {
+                    s.builder_view = Some(match v {
+                        "2d" => false,
+                        "3d" => true,
+                        other => return Err(format!("--ui: builder_view=2d|3d, got {other}")),
+                    })
+                }
                 "names" => {
                     use crate::names::NameStyle::*;
                     s.names = Some(match v {
@@ -606,6 +617,9 @@ impl ShotUi {
                 None if q.is_empty() => {}
                 None => eprintln!("--ui builder: nothing in the shipped list matches {q:?}; the builder opens with the search"),
             }
+        }
+        if let Some(three) = self.builder_view {
+            viewer.ui.builder.view_3d = three;
         }
         Ok(())
     }
@@ -1261,6 +1275,16 @@ mod tests {
         assert_eq!(ShotUi::parse("builder=").unwrap().builder.as_deref(), Some(""), "the builder, empty");
         assert_eq!(ShotUi::parse("tab=graph").unwrap().builder, None);
         assert_eq!(ShotUi::parse("builder=H₂O").unwrap().builder.as_deref(), Some("H₂O"));
+    }
+
+    /// `builder_view=2d|3d` (builder 3D view Task 1): the canvas's toggle for the shot.
+    #[test]
+    fn the_builder_view_key_parses() {
+        let s = ShotUi::parse("builder=caffeine;builder_view=3d").unwrap();
+        assert_eq!((s.builder.as_deref(), s.builder_view), (Some("caffeine"), Some(true)));
+        assert_eq!(ShotUi::parse("builder_view=2d").unwrap().builder_view, Some(false));
+        assert_eq!(ShotUi::parse("builder=water").unwrap().builder_view, None, "2D unless asked");
+        assert!(ShotUi::parse("builder_view=4d").err().is_some_and(|e| e.contains("builder_view=2d|3d")));
     }
 
     /// Spec U8 (Phase A's keys).
