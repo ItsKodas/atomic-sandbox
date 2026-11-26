@@ -131,11 +131,11 @@ fn the_watchable_speed_shows_a_vibration_in_about_half_a_second() {
 
 // ---- helpers ----
 
-fn camera() -> OrbitCamera {
+pub(crate) fn camera() -> OrbitCamera {
     OrbitCamera::new(glam::Vec3::ZERO, 14.0)
 }
 
-fn input<'a>(scene: &'a Scene, snapshot: Option<&'a Snapshot>, cam: &'a OrbitCamera) -> PanelInput<'a> {
+pub(crate) fn input<'a>(scene: &'a Scene, snapshot: Option<&'a Snapshot>, cam: &'a OrbitCamera) -> PanelInput<'a> {
     PanelInput {
         scene,
         snapshot,

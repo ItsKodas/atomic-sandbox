@@ -24,6 +24,12 @@
 //!   box-select, Shift adds;
 //! - wheel zooms about the cursor, middle- or right-drag pans, Ctrl-Z / Ctrl-Y (Ctrl-Shift-Z) undo /
 //!   redo.
+//!
+//! The canvas's **2D | 3D** toggle (top-right; spec `docs/superpowers/specs/2026-11-26-builder-3d-view-design.md`)
+//! swaps the canvas for a read-only ball-and-stick of the shape the hand-off would place
+//! ([`super::view3d`]): drag turns it, the wheel zooms, a double-click resets it, and hovering a
+//! bond or an atom reads out its length (Å) or bond angles. No tool acts there; the palette, the
+//! search and the footer stay live. Display state only (`Builder::view_3d`), never an `Action`.
 use super::{Builder, Tool};
 use crate::ui::{theme, Action, PanelInput, UiState};
 use egui::{Align2, Color32, FontId, Id, PointerButton, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
@@ -157,7 +163,13 @@ pub fn show(ctx: &egui::Context, st: &mut UiState, input: &PanelInput<'_>, acts:
                 });
             });
             child(ui, palette, egui::Layout::top_down(egui::Align::Min), |ui| palette_column(ui, st));
-            canvas_area(ui, canvas, &mut st.builder);
+            if st.builder.view_3d {
+                view3d_area(ui, canvas, &mut st.builder);
+            } else {
+                canvas_area(ui, canvas, &mut st.builder);
+            }
+            // after the canvas, so it sits on top of it (egui hit-tests the last widget first)
+            view_toggle(ui, canvas, &mut st.builder);
             child(ui, footer, egui::Layout::top_down(egui::Align::Min), |ui| {
                 footer_rows(ui, st);
                 ui.add_space(4.0);
@@ -756,6 +768,189 @@ fn controls(tool: Tool) -> Vec<&'static str> {
     v
 }
 
+/// The canvas's 2D | 3D toggle (3D view spec §1), at the canvas's top-right corner: display state
+/// on the builder, not an `Action`, not recorded, not in the profile.
+fn view_toggle(ui: &mut Ui, canvas: Rect, b: &mut Builder) {
+    let r = Rect::from_min_size(egui::pos2(canvas.right() - 94.0, canvas.top() + 8.0), Vec2::new(86.0, 24.0));
+    child(ui, r, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        for (three, name, tip) in [(false, "2D", TIP_2D), (true, "3D", TIP_3D)] {
+            let on = b.view_3d == three;
+            let btn = egui::Button::new(RichText::new(name).size(12.5).color(if on { Color32::WHITE } else { theme::INK_DIM }))
+                .min_size(Vec2::new(43.0, 24.0))
+                .fill(if on { theme::ACCENT_BG } else { theme::PANEL_2 })
+                .stroke(Stroke::new(1.0, if on { theme::ACCENT } else { theme::LINE }));
+            if ui.add(btn).on_hover_text(tip).clicked() && !on {
+                b.view_3d = three;
+                b.gesture = Gesture::None;
+            }
+        }
+    });
+}
+
+/// The toggle's tooltips.
+const TIP_2D: &str = "the sketch: draw and edit the structural formula";
+const TIP_3D: &str = "the shape Insert / Replace would place, as a ball-and-stick: drag to turn it, hover a bond or an atom for lengths and angles (read-only: switch back to 2D to edit)";
+/// The 3D view's one-line controls hint (spec §4), and its legend for a guessed shape (spec §6).
+pub const HINT_3D: &str = "drag: turn · wheel: zoom · double-click: reset the view · hover a bond: its length · hover an atom: its angles · read-only (2D to edit)";
+pub const APPROXIMATE_3D: &str = "dashed outline: an approximate shape (not from the database)";
+
+/// The 3D view in place of the canvas (3D view spec §2–§6): the shape [`Builder::shaped`] gives
+/// (what Replace scene would place), turned by a drag, zoomed by the wheel, reset by a
+/// double-click, with the hovered bond's length or atom's angles beside the pointer. Read-only: no
+/// tool acts here (Ctrl-Z / Ctrl-Y still undo and redo, as the palette's buttons do).
+fn view3d_area(ui: &mut Ui, rect: Rect, b: &mut Builder) {
+    let resp = ui.interact(rect, Id::new("builder-view3d"), Sense::click_and_drag());
+    // the keys first, so the shape below is the drawing's as this frame leaves it
+    if !ui.ctx().egui_wants_keyboard_input() {
+        let (redo, undo) = ui.input_mut(|i| {
+            let redo = i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z) || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Y);
+            (redo, i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z))
+        });
+        if redo {
+            b.redo();
+        }
+        if undo {
+            b.undo();
+        }
+    }
+    let shaped = b.shaped().clone();
+    b.view3d.follow(&b.drawing, &shaped);
+    if resp.double_clicked() {
+        b.view3d.reset(&shaped.positions);
+    } else if resp.dragged_by(PointerButton::Primary) {
+        b.view3d.turn(resp.drag_delta());
+    }
+    if resp.hovered() {
+        let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+        let f = (scroll / 300.0).exp() * pinch;
+        if (f - 1.0).abs() > 1e-4 {
+            b.view3d.zoom_by(f as f64);
+        }
+    }
+    let z: Vec<u8> = b.drawing.atoms.iter().map(|a| a.z).collect();
+    let proj = b.view3d.project(&shaped.positions, &z, rect);
+    b.view3d.shown = proj.len();
+    let scale = b.view3d.scale(&shaped.positions, rect);
+    let pointer = ui.input(|i| i.pointer.latest_pos()).filter(|p| rect.contains(*p));
+    let hovered = pointer.filter(|_| resp.hovered() && !resp.dragged()).and_then(|p| super::view3d::View3d::hit(&proj, &b.drawing.bonds, p));
+    paint3d(ui, rect, &b.drawing, &shaped, &proj, scale, hovered, pointer);
+    if resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+    } else if resp.hovered() && !b.drawing.atoms.is_empty() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+}
+
+/// Paints the 3D view: back to front ([`super::view3d::draw_order`]), farther parts dimmer;
+/// bonds as single, double or triple sticks between the balls' rims; element letters and formal
+/// charges as on the canvas; a dashed outline on a guessed (approximate) fragment's atoms; the
+/// hovered part's readout in a box by the pointer; the controls hint along the bottom.
+#[allow(clippy::too_many_arguments)]
+fn paint3d(ui: &Ui, rect: Rect, d: &super::Drawing, s: &super::shape::Shaped, proj: &[(Pos2, f64, f32)], scale: f64, hovered: Option<super::view3d::Part>, pointer: Option<Pos2>) {
+    use super::view3d::{self as v3, Part};
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 8.0, theme::APP);
+    p.rect_stroke(rect, 8.0, Stroke::new(1.0, theme::LINE), egui::StrokeKind::Inside);
+    let approx = v3::approximate_atoms(d.atoms.len(), s);
+    let mut hints = vec![HINT_3D];
+    if approx.iter().any(|&a| a) {
+        hints.push(APPROXIMATE_3D);
+    }
+    let mut y = rect.bottom() - 10.0;
+    for line in hints.iter().rev() {
+        p.text(egui::pos2(rect.left() + 12.0, y), Align2::LEFT_BOTTOM, *line, FontId::proportional(11.5), theme::INK_FAINT.gamma_multiply(0.75));
+        y -= 15.0;
+    }
+    if d.atoms.is_empty() || proj.len() != d.atoms.len() {
+        p.text(rect.center(), Align2::CENTER_CENTER, "nothing drawn yet: switch to 2D to draw, or pick a molecule from the search", FontId::proportional(15.0), theme::INK_FAINT);
+        return;
+    }
+    let (lo, hi) = proj.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), q| (lo.min(q.1), hi.max(q.1)));
+    // 0 at the front, 1 at the back
+    let far = |depth: f64| if hi - lo > 1e-9 { ((depth - lo) / (hi - lo)) as f32 } else { 0.0 };
+    for part in v3::draw_order(proj, &d.bonds) {
+        match part {
+            Part::Bond(k) => {
+                let bd = d.bonds[k];
+                let ((pa, da, ra), (pb, db, rb)) = (proj[bd.a], proj[bd.b]);
+                // the bond in 3D (points): from one ball's surface to the other's
+                let v = pb - pa;
+                let dz = ((db - da) * scale) as f32;
+                let len = (v.length_sq() + dz * dz).sqrt();
+                if !len.is_finite() || len <= ra + rb {
+                    continue;
+                }
+                let u = v / len;
+                let (s0, s1) = (pa + u * ra, pb - u * rb);
+                let t = far(0.5 * (da + db));
+                let w = (0.24 * ra.min(rb)).clamp(1.2, 5.0);
+                let colour = if hovered == Some(Part::Bond(k)) { theme::ACCENT } else { blend(theme::APP, theme::INK_DIM, 1.0 - 0.6 * t) };
+                let n = if v.length() > 1.0 { v.normalized().rot90() } else { Vec2::ZERO };
+                let (width, offsets): (f32, &[f32]) = match bd.order {
+                    2 => (0.7 * w, &[-1.1, 1.1]),
+                    3 => (0.6 * w, &[-1.9, 0.0, 1.9]),
+                    _ => (w, &[0.0]),
+                };
+                for &o in offsets {
+                    p.line_segment([s0 + n * o * w, s1 + n * o * w], Stroke::new(width, colour));
+                }
+            }
+            Part::Atom(i) => {
+                let (c, depth, r) = proj[i];
+                let t = far(depth);
+                let a = d.atoms[i];
+                let [cr, cg, cb] = render::elements::colour_srgb(a.z);
+                let col = Color32::from_rgb(cr, cg, cb);
+                let fill = blend(theme::APP, col, 0.92 - 0.5 * t);
+                p.circle_filled(c, r, fill);
+                p.circle_stroke(c, r, Stroke::new(1.0, blend(theme::APP, fill, 0.55)));
+                // a soft highlight up and to the left: a ball, not a disc
+                p.circle_filled(c + Vec2::new(-0.35 * r, -0.35 * r), 0.3 * r, Color32::from_white_alpha((60.0 * (1.0 - 0.6 * t)) as u8));
+                if approx[i] && r >= 3.0 {
+                    let ring: Vec<Pos2> = (0..=32).map(|k| c + Vec2::angled(k as f32 / 32.0 * std::f32::consts::TAU) * (r + 2.5)).collect();
+                    p.extend(egui::Shape::dashed_line(&ring, Stroke::new(1.2, theme::INK_DIM.gamma_multiply(0.9)), 3.0, 3.0));
+                }
+                if hovered == Some(Part::Atom(i)) {
+                    p.circle_stroke(c, r + 3.0, Stroke::new(2.0, theme::ACCENT));
+                }
+                if r >= 7.0 {
+                    let fs = (0.95 * r).clamp(8.0, 18.0);
+                    let light = 0.299 * fill.r() as f32 + 0.587 * fill.g() as f32 + 0.114 * fill.b() as f32 > 150.0;
+                    p.text(c, Align2::CENTER_CENTER, symbol(a.z), FontId::proportional(fs), if light { Color32::from_gray(25) } else { Color32::WHITE });
+                    if a.charge != 0 {
+                        let at = c + Vec2::new(r * 0.85, -r * 0.85);
+                        p.circle_filled(at, fs * 0.48, theme::PANEL);
+                        p.circle_stroke(at, fs * 0.48, Stroke::new(1.0, theme::INK_DIM));
+                        p.text(at, Align2::CENTER_CENTER, if a.charge > 0 { "+" } else { "−" }, FontId::proportional(fs * 0.8), theme::INK);
+                    }
+                }
+            }
+        }
+    }
+    // the readout (spec §4): a bond's length in Å, an atom's element and bond angles
+    let text = match hovered {
+        Some(Part::Bond(k)) => v3::bond_readout(d, &s.positions, k),
+        Some(Part::Atom(i)) => v3::atom_readout(d, &s.positions, i),
+        None => None,
+    };
+    if let (Some(text), Some(at)) = (text, pointer) {
+        let galley = p.layout_no_wrap(text, FontId::proportional(12.5), theme::INK);
+        let size = galley.size() + Vec2::splat(16.0);
+        let mut min = at + Vec2::new(16.0, 16.0);
+        if min.x + size.x > rect.right() - 4.0 {
+            min.x = at.x - 16.0 - size.x;
+        }
+        if min.y + size.y > rect.bottom() - 4.0 {
+            min.y = at.y - 16.0 - size.y;
+        }
+        let r = Rect::from_min_size(min, size);
+        p.rect_filled(r, 6.0, theme::PANEL);
+        p.rect_stroke(r, 6.0, Stroke::new(1.0, theme::LINE), egui::StrokeKind::Inside);
+        p.galley(min + Vec2::splat(8.0), galley, theme::INK);
+    }
+}
+
 /// `a` → `b` by `t` in sRGB (a display tint).
 fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
     let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
@@ -1339,5 +1534,239 @@ mod tests {
         j.drawing.add_atom(6, spot);
         click(&mut j, &view, at(2.0, 1.0), false, false);
         assert_eq!((j.drawing.atoms.len(), j.drawing.bonds.len(), j.selected_one()), (3, 2, Some(2)));
+    }
+
+    // ── the 3D view (builder 3D view spec §5, Task 1 step 4): real egui frames of the whole window ──
+
+    /// The builder window's frames (1400 × 900), 1/60 s apart.
+    struct Win {
+        ctx: egui::Context,
+        t: f64,
+    }
+
+    impl Win {
+        fn new() -> Win {
+            Win { ctx: egui::Context::default(), t: 0.0 }
+        }
+
+        /// One frame with `events`: the actions sent and every text painted, with its rect.
+        fn frame(&mut self, st: &mut UiState, inp: &PanelInput<'_>, events: Vec<egui::Event>) -> (Vec<Action>, Vec<(String, Rect)>) {
+            fn walk(s: &egui::epaint::Shape, out: &mut Vec<(String, Rect)>) {
+                match s {
+                    egui::epaint::Shape::Text(t) => out.push((t.galley.text().to_string(), t.visual_bounding_rect())),
+                    egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                    _ => {}
+                }
+            }
+            self.t += 1.0 / 60.0;
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))), events, time: Some(self.t), ..Default::default() };
+            let mut acts = Vec::new();
+            let full = self.ctx.run_ui(raw, |root| show(root.ctx(), st, inp, &mut acts));
+            let mut texts = Vec::new();
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut texts));
+            (acts, texts)
+        }
+
+        /// A few frames with no input (the modal lays itself out).
+        fn settle(&mut self, st: &mut UiState, inp: &PanelInput<'_>) -> Vec<(String, Rect)> {
+            let mut texts = Vec::new();
+            for _ in 0..4 {
+                texts = self.frame(st, inp, vec![]).1;
+            }
+            texts
+        }
+
+        /// A primary click at `p` (move, press, release, a quiet frame); the actions it sent.
+        fn click(&mut self, st: &mut UiState, inp: &PanelInput<'_>, p: Pos2) -> Vec<Action> {
+            let button = |pressed| egui::Event::PointerButton { pos: p, button: PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+            let mut acts = self.frame(st, inp, vec![egui::Event::PointerMoved(p)]).0;
+            acts.extend(self.frame(st, inp, vec![button(true)]).0);
+            acts.extend(self.frame(st, inp, vec![button(false)]).0);
+            acts.extend(self.frame(st, inp, vec![]).0);
+            acts
+        }
+
+        /// A primary drag from `a` to `b` in ten steps.
+        fn drag(&mut self, st: &mut UiState, inp: &PanelInput<'_>, a: Pos2, b: Pos2) {
+            let button = |pos, pressed| egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+            self.frame(st, inp, vec![egui::Event::PointerMoved(a)]);
+            self.frame(st, inp, vec![button(a, true)]);
+            for k in 1..=10 {
+                self.frame(st, inp, vec![egui::Event::PointerMoved(a + (b - a) * (k as f32 / 10.0))]);
+            }
+            self.frame(st, inp, vec![button(b, false)]);
+            self.frame(st, inp, vec![]);
+        }
+
+        /// The canvas's rect (the 2D canvas's or the 3D view's) as last laid out.
+        fn canvas(&self) -> Rect {
+            self.ctx.read_response(Id::new("builder-view3d")).or_else(|| self.ctx.read_response(Id::new("builder-canvas"))).expect("the canvas is laid out").rect
+        }
+    }
+
+    /// The centre of the painted text that is exactly `text`.
+    fn text_at(texts: &[(String, Rect)], text: &str) -> Pos2 {
+        texts.iter().find(|(t, _)| t == text).unwrap_or_else(|| panic!("no {text:?} in {:?}", texts.iter().map(|t| &t.0).collect::<Vec<_>>())).1.center()
+    }
+
+    /// A scene whose box holds the test molecules beside its H₂ (121³ × 0.25 Bohr).
+    fn roomy() -> crate::scene::Scene {
+        crate::scene::Scene { grid_n: 121, ..crate::scene::Scene::preset("h2").unwrap() }
+    }
+
+    fn water_drawing() -> super::super::Drawing {
+        let mut d = super::super::Drawing::default();
+        super::super::shape::tests::draw_record(&mut d, super::super::shape::tests::rec("water"), [0.0, 0.0], &[0, 1, 2]);
+        d
+    }
+
+    /// He–He: in no database, so its shape is the embedding's guess (and it is over He's valence:
+    /// the first press only arms the hand-off).
+    fn helium_pair() -> super::super::Drawing {
+        let mut d = super::super::Drawing::default();
+        d.add_atom(2, [0.0, 0.0]);
+        d.add_atom(2, [1.0, 0.0]);
+        d.bond(0, 1);
+        d
+    }
+
+    /// Spec §5: the toggle changes nothing handed off — Insert in 2D and in 3D (after turning the
+    /// view) sends the same `Handoff`, for a matched record and for an approximate fragment.
+    #[test]
+    fn the_3d_view_changes_nothing_handed_off() {
+        let scene = roomy();
+        let cam = crate::ui::tests::camera();
+        let inp = crate::ui::tests::input(&scene, None, &cam);
+        for (name, drawing) in [("water", water_drawing()), ("He–He", helium_pair())] {
+            let mut sent = Vec::new();
+            for three in [false, true] {
+                let mut st = UiState::new("h2", &scene);
+                st.builder.open = true;
+                st.builder.drawing = drawing.clone();
+                st.builder.view_3d = three;
+                let mut w = Win::new();
+                let mut texts = w.settle(&mut st, &inp);
+                if three {
+                    let before = st.builder.view3d.rot;
+                    let c = w.canvas().center();
+                    w.drag(&mut st, &inp, c, c + Vec2::new(120.0, 40.0));
+                    assert_ne!(st.builder.view3d.rot, before, "{name}: the drag turned the view");
+                    texts = w.settle(&mut st, &inp);
+                }
+                let shape_line = texts.iter().find(|t| t.0.starts_with("shape: ")).map(|t| t.0.clone()).unwrap_or_default();
+                assert_eq!(shape_line.contains("approximate"), name == "He–He", "{name}: {shape_line}");
+                let mut handoff = None;
+                for _ in 0..2 {
+                    let at = text_at(&texts, "Insert into scene");
+                    for a in w.click(&mut st, &inp, at) {
+                        if let Action::Builder(h) = a {
+                            handoff = Some(h);
+                        }
+                    }
+                    if handoff.is_some() {
+                        break;
+                    }
+                    texts = w.settle(&mut st, &inp);
+                }
+                let h = handoff.unwrap_or_else(|| panic!("{name}, 3D {three}: Insert sent nothing"));
+                assert!(!h.replace && h.nuclei.len() == drawing.atoms.len(), "{name}: {h:?}");
+                sent.push(h);
+            }
+            assert_eq!(sent[0], sent[1], "{name}: the same hand-off in 2D and 3D");
+        }
+    }
+
+    /// Spec §5: in 3D a click places nothing (the same click in 2D places an atom).
+    #[test]
+    fn a_click_in_3d_adds_no_atom() {
+        let scene = roomy();
+        let cam = crate::ui::tests::camera();
+        let inp = crate::ui::tests::input(&scene, None, &cam);
+        for three in [true, false] {
+            let mut st = UiState::new("h2", &scene);
+            st.builder.open = true;
+            st.builder.drawing = water_drawing();
+            st.builder.view_3d = three;
+            let mut w = Win::new();
+            w.settle(&mut st, &inp);
+            let r = w.canvas();
+            // on empty space and on the shape's centre
+            for p in [r.left_top() + Vec2::new(60.0, 80.0), r.center()] {
+                w.click(&mut st, &inp, p);
+                // apart in time: not a double-click
+                for _ in 0..40 {
+                    w.frame(&mut st, &inp, vec![]);
+                }
+            }
+            if three {
+                assert_eq!(st.builder.drawing, water_drawing(), "3D: the drawing is untouched");
+                assert!(!st.builder.can_undo(), "3D: no edit was made");
+            } else {
+                assert!(st.builder.drawing.atoms.len() > 3, "2D: the same clicks place atoms (the clicks land)");
+            }
+        }
+    }
+
+    /// Spec §5: a drag in 3D turns the view only: the drawing and the shape handed off are kept.
+    #[test]
+    fn a_drag_in_3d_turns_only_the_view() {
+        let scene = roomy();
+        let cam = crate::ui::tests::camera();
+        let inp = crate::ui::tests::input(&scene, None, &cam);
+        let mut st = UiState::new("h2", &scene);
+        st.builder.open = true;
+        st.builder.drawing = water_drawing();
+        st.builder.view_3d = true;
+        let mut w = Win::new();
+        w.settle(&mut st, &inp);
+        let (drawing, shaped, rot) = (st.builder.drawing.clone(), st.builder.shaped().positions.clone(), st.builder.view3d.rot);
+        let r = w.canvas();
+        // across an atom (the centre) and across empty space
+        w.drag(&mut st, &inp, r.center(), r.center() + Vec2::new(-90.0, 130.0));
+        w.drag(&mut st, &inp, r.left_top() + Vec2::new(60.0, 80.0), r.left_top() + Vec2::new(200.0, 90.0));
+        assert_eq!(st.builder.drawing, drawing);
+        assert_eq!(st.builder.shaped().positions, shaped);
+        assert!(st.builder.view3d.rot.angle_between(rot) > 0.5, "turned: {:?} → {:?}", rot, st.builder.view3d.rot);
+        assert!(st.builder.selection.is_empty() && !st.builder.can_undo());
+        // a double-click turns it back to the reset view
+        let mut reset = super::super::view3d::View3d::default();
+        reset.reset(&shaped);
+        let c = r.center();
+        let button = |pressed| egui::Event::PointerButton { pos: c, button: PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+        w.frame(&mut st, &inp, vec![egui::Event::PointerMoved(c)]);
+        w.frame(&mut st, &inp, vec![button(true)]);
+        w.frame(&mut st, &inp, vec![button(false)]);
+        w.frame(&mut st, &inp, vec![button(true)]);
+        w.frame(&mut st, &inp, vec![button(false)]);
+        w.frame(&mut st, &inp, vec![]);
+        assert!(st.builder.view3d.rot.angle_between(reset.rot) < 1e-9, "double-click resets");
+        assert_eq!(st.builder.drawing, drawing);
+    }
+
+    /// Spec §5: the search stays live in 3D, and a stamp shows its shape there.
+    #[test]
+    fn a_stamp_in_3d_shows_the_new_shape() {
+        let scene = roomy();
+        let cam = crate::ui::tests::camera();
+        let inp = crate::ui::tests::input(&scene, None, &cam);
+        let mut st = UiState::new("h2", &scene);
+        st.builder.open = true;
+        st.builder.view_3d = true;
+        let mut w = Win::new();
+        w.settle(&mut st, &inp);
+        assert_eq!(st.builder.view3d.shown, 0);
+        st.builder.search_query = "water".into();
+        let texts = w.settle(&mut st, &inp);
+        // the result row (its name, then the formula and source), not the search box's own text
+        let row = texts.iter().find(|t| t.0.starts_with("water\n")).unwrap_or_else(|| panic!("no water row: {:?}", texts.iter().map(|t| &t.0).collect::<Vec<_>>())).1.center();
+        w.click(&mut st, &inp, row);
+        w.settle(&mut st, &inp);
+        assert_eq!(st.builder.drawing.atoms.len(), 3, "the stamp went in");
+        assert!(st.builder.view_3d, "still in 3D");
+        assert_eq!(st.builder.view3d.shown, 3, "the view shows the stamped water");
+        // the view was reset for it: the principal-axes frame of its shape
+        let mut want = super::super::view3d::View3d::default();
+        want.reset(&st.builder.shaped().positions.clone());
+        assert!(st.builder.view3d.rot.angle_between(want.rot) < 1e-9);
     }
 }
