@@ -1472,7 +1472,7 @@ The first stable release since v0.2.2. It contains chemical channels (v0.3.0-bet
 Suites behind it:
 - **On `594c3395`/`4d09a46a`:** sim 207; providers 660 with 1 known environmental failure (`the_level_gated_stall_stop_on_the_measured_cases`); dynamics 7; surrogate 10 with 1 known failure (`the_stuck_escape_repro_is_answered_honestly`, failing since v0.2.1).
 - **On `4dc34b73`:** app, as above.
-- **Not rerun for this release** (the user chose to release tonight): oracles, gpu_vs_cpu, pseudo, charges, orbitals and harris. Their code is unchanged since they last passed.
+- **Not run for this release** (the user chose to release tonight): oracles, gpu_vs_cpu, pseudo, pseudo_gen, pseudo_oracles, charges, orbitals, harris and tools. The solver they test most (`qm`, `qm-gpu`) is unchanged since v0.3.0-beta.1.
 
 ### Process wins
 
