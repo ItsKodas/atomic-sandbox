@@ -68306,3 +68306,384 @@ bond 13 23 1
 bond 14 16 1
 bond 14 24 1
 end
+
+mol hydrogen
+syn dihydrogen
+syn H2
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00020407 commit=e80acd70
+stereo no
+atom H 0 0.31753 0.18333 -0.09691 0.5 0.000000000000000018296602
+atom H 0 -0.31753 -0.18333 0.09691 -0.5 -0.000000000000000018296602
+bond 0 1 1
+end
+
+mol lithium hydride
+syn LiH
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00098904 commit=e80acd70
+stereo no
+atom Li 0 0.82339 0.48495 -0.09834 0.5 -0.000000000000000004238025
+atom H 0 -0.56439 -0.36551 0.07919 -0.5 0.000000000000000004238025
+bond 0 1 1
+end
+
+mol dilithium
+syn lithium dimer
+syn Li2
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00089334 commit=e80acd70
+stereo no
+atom Li 0 1.18757 0.67384 -0.08531 0.5 0.0000000000000000063399428
+atom Li 0 -1.18758 -0.67384 0.08531 -0.5 -0.0000000000000000063399428
+bond 0 1 1
+end
+
+mol lithium fluoride
+syn LiF
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00082513 commit=e80acd70
+stereo no
+atom Li 0 0.65335 0.37768 -0.06703 0.5 -0.000000000000000008812353
+atom F 0 -0.70422 -0.40819 0.0724 -0.5 0.000000000000000008812353
+bond 0 1 1
+end
+
+mol lithium chloride
+syn LiCl
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00093331 commit=e80acd70
+stereo no
+atom Li 0 1.3204 0.80041 -0.11074 0.5 -0.000000000000000017060582
+atom Cl 0 -0.37676 -0.30753 0.05558 -0.5 0.000000000000000017060582
+bond 0 1 1
+end
+
+mol lithium hydroxide
+syn LiOH
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00089035 commit=e80acd70
+stereo no
+atom Li 0 0.84288 0.99639 -0.10276 1.0815629 -0.00042953758
+atom O 0 -0.28691 -0.12173 0.02711 -0.16312903 0.0011373868
+atom H 0 -0.97467 -0.79784 0.10746 -0.91843385 -0.0007078492
+bond 0 1 1
+bond 1 2 1
+end
+
+mol beryllium hydride
+syn BeH2
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00099859 commit=e80acd70
+stereo no
+atom Be 0 0.00015 0.00009 -0.01927 -0.0000016108567 -0.014230075
+atom H 0 -1.21171 -0.70332 -0.00233 -0.99977136 0.007115055
+atom H 0 1.21154 0.70322 0.02361 0.99977297 0.0071150204
+bond 0 1 1
+bond 0 2 1
+end
+
+mol beryllium fluoride
+syn BeF2
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00088091 commit=e80acd70
+stereo no
+atom Be 0 0.00008 0.00004 -0.01108 -0.0000030157303 -0.008936025
+atom F 0 -1.23927 -0.71895 -0.00291 0.99991167 0.004467992
+atom F 0 1.23916 0.71888 0.01916 -0.9999086 0.0044680326
+bond 0 1 1
+bond 0 2 1
+end
+
+mol beryllium chloride
+syn BeCl2
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00097165 commit=e80acd70
+stereo no
+atom Be 0 0.00001 -0.00001 0.00244 -0.0000055605315 -0.00096787675
+atom Cl 0 -1.39496 -1.19833 -0.01068 -0.9999962 0.0004839424
+atom Cl 0 1.39496 1.19831 0.0209 1.0000017 0.00048393433
+bond 0 1 1
+bond 0 2 1
+end
+
+mol borane
+syn borane monomer
+syn BH3
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00029425 commit=e80acd70
+stereo no
+atom B 0 0 -0.00019 0 -0.000013433341 -0.00023773807
+atom H 0 -1.03449 -0.59942 0.03691 -0.84064597 0.54169333
+atom H 0 0.002 1.19367 0.06129 -0.048766173 -0.9986837
+atom H 0 1.0325 -0.59596 -0.09821 0.8894256 0.45722806
+bond 0 1 1
+bond 0 2 1
+bond 0 3 1
+end
+
+mol borohydride
+syn tetrahydroborate
+syn BH4-
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00093563 commit=e80acd70
+stereo no
+atom B -1 -0.00001 -0.00008 0.00001 0.000013330438 -0.000004114886
+atom H 0 -0.86682 -0.5569 0.67743 -0.73348135 0.8270402
+atom H 0 -0.50832 0.92223 -0.64075 0.6374994 0.54996806
+atom H 0 0.49925 -0.81486 -0.77925 0.78400767 -0.4696987
+atom H 0 0.87582 0.44858 0.74266 -0.68803906 -0.9073055
+bond 0 1 1
+bond 0 2 1
+bond 0 3 1
+bond 0 4 1
+end
+
+mol diborane
+syn B2H6
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00089674 commit=e80acd70
+stereo no
+atom B 0 -0.73401 0.45154 -0.00216 0.8338976 0.0015421248
+atom B 0 0.73401 -0.45154 0.00216 -0.8338996 -0.0015427398
+atom H 0 -1.72594 -0.04262 -0.44191 1.3973867 0.8154472
+atom H 0 -0.74737 1.56272 0.43409 1.4117888 -0.8092303
+atom H 0 1.72593 0.04263 0.44191 -1.3973753 -0.81544936
+atom H 0 0.74738 -1.56272 -0.43408 -1.4117991 0.8092188
+atom H 0 0.21976 0.35294 -0.89891 0.0029748622 0.5648917
+atom H 0 -0.21977 -0.35295 0.8989 -0.0029737835 -0.5648774
+bond 0 2 1
+bond 0 3 1
+bond 1 4 1
+bond 1 5 1
+bond 0 6 1
+bond 1 6 1
+bond 0 7 1
+bond 1 7 1
+end
+
+mol boron trifluoride
+syn BF3
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00039146 commit=e80acd70
+stereo no
+atom B 0 0 -0.00038 0.00002 -0.0000034906022 -0.000089660054
+atom F 0 -1.13773 -0.65845 0.03317 -0.8594502 0.511362
+atom F 0 0.00147 1.31275 0.0551 -0.013208668 -0.99976
+atom F 0 1.13627 -0.65591 -0.08826 0.8726624 0.48848757
+bond 0 1 1
+bond 0 2 1
+bond 0 3 1
+end
+
+mol boron trichloride
+syn BCl3
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00099446 commit=e80acd70
+stereo no
+atom B 0 0.00018 -0.06355 0.00052 0.0000056138665 0.00020324698
+atom Cl 0 -1.51076 -0.93523 0.03638 -0.8626819 0.50638133
+atom Cl 0 0.0015 1.6789 0.06203 -0.007898151 -0.999309
+atom Cl 0 1.50977 -0.9329 -0.09687 0.8705744 0.49272442
+bond 0 1 1
+bond 0 2 1
+bond 0 3 1
+end
+
+mol ammonia borane
+syn borazane
+syn NH3BH3
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00091903 commit=e80acd70
+stereo no
+atom N 1 0.70727 0.40492 0.04508 -0.6464809 -0.0018980082
+atom B -1 -0.70699 -0.40424 -0.04586 0.6680506 -0.000597101
+atom H 0 0.61155 1.34803 -0.34787 -1.5313759 0.36550555
+atom H 0 1.44227 -0.08291 -0.47847 -0.4449757 0.6224083
+atom H 0 1.01925 0.4976 1.01855 -0.8508907 -0.99024796
+atom H 0 -0.48799 -1.38408 -0.72417 1.5408274 0.75741714
+atom H 0 -1.4857 0.36059 -0.57011 0.21059817 0.4508671
+atom H 0 -1.01291 -0.68136 1.09533 1.054247 -1.203455
+bond 0 1 1
+bond 0 2 1
+bond 0 3 1
+bond 0 4 1
+bond 1 5 1
+bond 1 6 1
+bond 1 7 1
+end
+
+mol sodium hydride
+syn NaH
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00069329 commit=e80acd70
+stereo no
+atom Na 0 0.87624 0.47876 -0.07982 0.5 -0.000000000000000013607282
+atom H 0 -0.89073 -0.52628 0.08849 -0.5 0.000000000000000013607282
+bond 0 1 1
+end
+
+mol disodium
+syn sodium dimer
+syn Na2
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00087213 commit=e80acd70
+stereo no
+atom Na 0 1.43439 0.87737 -0.07987 0.5 -0.000000000000000004122137
+atom Na 0 -1.43439 -0.87731 0.07989 -0.5 0.000000000000000004122137
+bond 0 1 1
+end
+
+mol sodium fluoride
+syn NaF
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.0009465 commit=e80acd70
+stereo no
+atom Na 0 0.87305 0.5558 -0.07944 0.5 -0.000000000000000017498706
+atom F 0 -0.81175 -0.47856 0.07089 -0.5 0.000000000000000017498706
+bond 0 1 1
+end
+
+mol sodium chloride
+syn NaCl
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00099841 commit=e80acd70
+stereo no
+atom Na 0 1.11637 0.63913 -0.07993 0.5 -0.000000000000000067128976
+atom Cl 0 -0.90587 -0.66605 0.09167 -0.5 0.000000000000000067128976
+bond 0 1 1
+end
+
+mol sodium hydroxide
+syn NaOH
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.0009884 commit=e80acd70
+stereo no
+atom Na 0 1.11123 1.11121 -0.07938 1.1159085 0.00067256205
+atom O 0 -0.43295 -0.16841 0.03608 -0.23182881 -0.002062268
+atom H 0 -1.17574 -0.79302 0.09329 -0.88407964 0.0013897062
+bond 0 1 1
+bond 1 2 1
+end
+
+mol magnesium hydride
+syn MgH2
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00087763 commit=e80acd70
+stereo no
+atom Mg 0 0.00004 0.00003 -0.00055 -0.000011548631 -0.008017038
+atom H 0 -1.4854 -1.14871 0.0048 0.9999335 0.0040084496
+atom H 0 1.48516 1.1484 0.03926 -0.9999219 0.004008589
+bond 0 1 1
+bond 0 2 1
+end
+
+mol magnesium fluoride
+syn MgF2
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00099115 commit=e80acd70
+stereo no
+atom Mg 0 0 0 -0.00006 -0.000002281991 -0.004025425
+atom F 0 -1.57443 -0.93126 -0.00013 -0.9999806 0.0020127192
+atom F 0 1.57433 0.93119 0.0221 0.9999829 0.0020127054
+bond 0 1 1
+bond 0 2 1
+end
+
+mol magnesium oxide
+syn MgO
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00088486 commit=e80acd70
+stereo no
+atom Mg 0 0.79026 0.47531 -0.07927 0.5 0.00000000000000003199347
+atom O 0 -0.69429 -0.40942 0.07519 -0.5 -0.00000000000000003199347
+bond 0 1 2
+end
+
+mol alane
+syn aluminium hydride
+syn AlH3
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00098312 commit=e80acd70
+stereo no
+atom Al 0 0 -0.00074 -0.00001 -0.00002400468 -0.0013061621
+atom H 0 -1.48756 -0.86341 0.04041 -0.85788375 0.5145527
+atom H 0 0.00166 1.71274 0.0672 -0.016564438 -0.99911296
+atom H 0 1.48593 -0.86054 -0.10754 0.87447214 0.4858664
+bond 0 1 1
+bond 0 2 1
+bond 0 3 1
+end
+
+mol tetrahydroaluminate
+syn aluminium hydride anion
+syn AlH4-
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00098365 commit=e80acd70
+stereo no
+atom Al -1 0.00006 -0.00032 0.00009 0.00012900375 0.00097555784
+atom H 0 -1.11297 -0.89425 0.99021 -0.59182215 0.42161694
+atom H 0 -0.87132 1.13875 -0.98017 0.84147817 0.8438645
+atom H 0 0.85963 -1.09594 -1.03876 0.58998686 -1.0659885
+atom H 0 1.12278 0.83456 1.02961 -0.83977187 -0.20046848
+bond 0 1 1
+bond 0 2 1
+bond 0 3 1
+bond 0 4 1
+end
+
+mol trihydrogen cation
+syn H3+
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=1 max_force=0.00089584 commit=e80acd70
+stereo no
+atom H 1 0.01054 0.00608 -0.52328 0.5371854 0.21157953
+atom H 0 -0.39773 -0.22963 0.2511 -0.08535893 -0.5710046
+atom H 0 0.38719 0.22354 0.27218 -0.45182642 0.35942513
+bond 0 1 1
+bond 1 2 1
+bond 0 2 1
+end
+
+mol hydroxyl radical
+syn hydroxyl
+syn OH
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=2 max_force=0.00073697 commit=e80acd70
+stereo no
+atom O 0 0.41825 0.24147 -0.08159 0.5 0.000000000000000027907757
+atom H 0 -0.43103 -0.24884 0.08407 -0.5 -0.000000000000000027907757
+bond 0 1 1
+end
+
+mol methyl radical
+syn methyl
+syn CH3
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=2 max_force=0.00075684 commit=e80acd70
+stereo no
+atom C 0 0 -0.00006 0 -0.0000024833964 -0.00009879194
+atom H 0 -0.93937 -0.54467 0.04637 -0.8522883 0.52312064
+atom H 0 0.00171 1.08544 0.04816 -0.026879411 -0.9995864
+atom H 0 0.93766 -0.54138 -0.09453 0.8791702 0.47656453
+bond 0 1 1
+bond 0 2 1
+bond 0 3 1
+end
+
+mol amino radical
+syn amidogen
+syn NH2
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=2 max_force=0.00076808 commit=e80acd70
+stereo no
+atom N 0 0.34467 -0.14933 -0.10901 -0.000009895523 -0.4153223
+atom H 0 -0.55165 -0.6487 0.06009 0.78224 0.2076572
+atom H 0 0.09836 0.84247 0.08329 -0.7822301 0.20766509
+bond 0 1 1
+bond 0 2 1
+end
+
+mol hydroperoxyl
+syn hydroperoxy radical
+syn HO2
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=2 max_force=0.0009914 commit=e80acd70
+stereo no
+atom H 0 0.45323 0.76827 -0.12022 -0.7291173 0.2432897
+atom O 0 -0.39324 0.26413 0.04612 -0.13945885 -0.38560402
+atom O 0 -0.04701 -1.00821 0.07079 0.8685761 0.14231433
+bond 0 1 1
+bond 1 2 1
+end
+
+mol nitric oxide
+syn nitrogen monoxide
+syn NO
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=2 max_force=0.00063361 commit=e80acd70
+stereo no
+atom N 0 0.49285 0.28451 -0.07823 0.5 0
+atom O 0 -0.49457 -0.2855 0.0785 -0.5 0
+bond 0 1 2
+end
+
+mol nitrogen dioxide
+syn NO2
+source lira functional=LSDA quality=Accurate ionic=accepted multiplicity=2 max_force=0.00096962 commit=e80acd70
+stereo no
+atom O 0 0.65845 0.8872 -0.1135 0.92117906 0.12973961
+atom N 0 -0.26751 0.14748 0.0374 -0.00014536035 -0.25954068
+atom O 0 -0.38628 -1.04026 0.07545 -0.9210337 0.12980105
+bond 0 1 2
+bond 1 2 1
+end

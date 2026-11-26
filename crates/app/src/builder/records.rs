@@ -562,18 +562,21 @@ $$$$
             }
         }
         // every preset molecule within H–Ar has a record of its formula and charge (the presets have
-        // no isomers, so that is the molecule), but those PubChem has no 3D record for: H₂ (CID 783)
-        // and LiH (CID 62714), the generator's report of 2026-11-25. Those two, H₂ the app's default
-        // molecule among them, have no shipped shape of any source today; Task 7's LIRA rows are to
-        // add them, and this exemption then becomes a check that they are there as `lira` rows.
+        // no isomers, so that is the molecule); those PubChem has no 3D record for, H₂ (CID 783) and
+        // LiH (CID 62714, the generator's report of 2026-11-25), H₂ the app's default molecule among
+        // them, have theirs as `lira` rows (Task 7, ruling R13)
         const NO_PUBCHEM_3D: [&str; 2] = ["h2", "lih"];
         for &name in crate::scene::Scene::PRESETS {
             let s = crate::scene::Scene::preset(name).unwrap();
             let z: Vec<u8> = s.nuclei.iter().map(|n| n.z).collect();
-            if z.len() < 2 || z.iter().any(|&z| z > 18) || NO_PUBCHEM_3D.contains(&name) {
+            if z.len() < 2 || z.iter().any(|&z| z > 18) {
                 continue;
             }
-            assert!(!lib.candidates(&(hill(&z), s.charge)).is_empty(), "no record has the preset {name}'s formula {}", hill(&z));
+            let found = lib.candidates(&(hill(&z), s.charge));
+            assert!(!found.is_empty(), "no record has the preset {name}'s formula {}", hill(&z));
+            if NO_PUBCHEM_3D.contains(&name) {
+                assert!(found.iter().any(|r| matches!(r.source, Source::Lira { .. })), "the preset {name} ({}) has no `lira` row", hill(&z));
+            }
         }
     }
 
@@ -587,7 +590,9 @@ $$$$
         let lib = Library::shipped();
         let ions = ion_section(include_str!("../../data/molecule-names.txt"));
         assert!(ions.len() >= 40, "{} ion names", ions.len());
-        for r in lib.records() {
+        // PubChem rows only (R15): the `lira` rows' radicals and ions are checked against the LIRA list
+        // (`lira_rows_are_relaxed_and_traceable`)
+        for r in lib.records().iter().filter(|r| matches!(r.source, Source::PubChem { .. })) {
             charge_fits_name(&r.name, ions.contains(r.name.as_str()), &r.z, &r.charge).unwrap_or_else(|e| panic!("{}: {e}", r.name));
         }
         for name in &ions {
@@ -680,6 +685,59 @@ $$$$
             Err(format!("net charge {q:+} in the ion section, where the name says {}", if want > 0 { "a cation" } else { "an anion" }))
         } else {
             Err(format!("net charge {q:+} outside the ion section under a name that says {}", ["an anion", "no charge", "a cation"][(want + 1) as usize]))
+        }
+    }
+
+    /// The entries of the LIRA list the shipped file has no `lira` row for, each with why (the
+    /// generator's report, Task 7): PubChem has a 3D shape for it (spec §5.1: PubChem's wins), or its
+    /// relax was deferred or left out.
+    const LIRA_NOT_SHIPPED: &[(&str, &str)] = &[
+        ("boric acid", "left out 2026-11-26: the relax stopped after 2 FIRE steps (a failed evaluation), max |F| 8.8e-2"),
+        ("magnesium chloride", "left out 2026-11-26: the first evaluation failed (no SCF answer at the embedding)"),
+        ("aluminium fluoride", "left out 2026-11-26: the relax stopped after 8 FIRE steps (a failed evaluation), max |F| 2.8e-2"),
+        ("aluminium chloride", "left out 2026-11-26: the first evaluation failed (no SCF answer at the embedding)"),
+        ("aluminium chloride dimer", "deferred 2026-11-26: 137³ needs ≈ 8.3 GB of GPU memory, over the 4 GB cap of a shared GPU"),
+    ];
+
+    /// Task 7 (spec §5.1, §9): the `lira` rows. Each is an entry of the LIRA list
+    /// (`crates/app/data/lira-molecules.txt`) with the entry's graph, net charge and multiplicity
+    /// (R15: the radicals' odd electron counts and the ions are the list's, not the name rule's); its
+    /// recorded max |F| is at most the app's Relax tolerance (`FireParams::for_dt(..).f_tol`); its
+    /// provenance is LSDA, Accurate, ionic `accepted` and a real commit (not the seed's). Every list
+    /// entry is shipped or in [`LIRA_NOT_SHIPPED`]. Drawing LiH, BH₄⁻ and H₃⁺ maps to their rows,
+    /// and the footer says so.
+    #[test]
+    fn lira_rows_are_relaxed_and_traceable() {
+        use super::super::{lira, shape};
+        use shape::RecordSource as _;
+        let lib = Library::shipped();
+        let tol = sim::relax::FireParams::for_dt(units::fs_to_au_time(crate::sim::DEFAULT_DT_FS)).f_tol;
+        let entries = lira::entries();
+        let rows: Vec<&Record> = lib.records().iter().filter(|r| matches!(r.source, Source::Lira { .. })).collect();
+        for r in &rows {
+            let Source::Lira { functional, quality, ionic, multiplicity, max_force, commit } = &r.source else { unreachable!() };
+            let e = entries.iter().find(|e| e.name == r.name).unwrap_or_else(|| panic!("{}: a `lira` row that is not in the LIRA list", r.name));
+            assert!(e.same_graph(r), "{}: not the list's graph", r.name);
+            assert_eq!(r.formula_key().1, e.net_charge(), "{}: the net charge", r.name);
+            assert_eq!(*multiplicity, e.expected_multiplicity(), "{}: the multiplicity", r.name);
+            assert!(max_force.is_finite() && *max_force <= tol, "{}: max |F| {max_force} over the Relax tolerance {tol}", r.name);
+            assert_eq!((functional.as_str(), quality.as_str(), ionic.as_str()), ("LSDA", "Accurate", sim::IonicPolicy::Accepted.word()), "{}", r.name);
+            assert!(!commit.is_empty() && commit != "seed" && commit.len() >= 7 && commit.chars().all(|c| c.is_ascii_hexdigit()), "{}: commit {commit:?}", r.name);
+        }
+        for e in &entries {
+            let shipped = rows.iter().filter(|r| r.name == e.name).count();
+            let excused = LIRA_NOT_SHIPPED.iter().any(|(n, _)| *n == e.name);
+            assert!(shipped + excused as usize == 1, "{}: {shipped} `lira` rows, {}in LIRA_NOT_SHIPPED", e.name, if excused { "" } else { "not " });
+        }
+        for name in ["lithium hydride", "borohydride", "trihydrogen cation"] {
+            let e = entries.iter().find(|e| e.name == name).unwrap();
+            let d = e.drawing();
+            let all: Vec<usize> = (0..d.atoms.len()).collect();
+            let shape::Lookup::Found(r, _) = shape::LocalOnly(lib).find(&d, &all) else { panic!("drawn {name} is not found") };
+            assert_eq!((r.name.as_str(), matches!(r.source, Source::Lira { .. })), (name, true));
+            let s = shape::shape(&d, &shape::LocalOnly(lib));
+            assert_eq!(s.sources, vec![(all.clone(), shape::FragmentSource::Lira)], "{name}");
+            assert_eq!(shape::footer_label(&s), "shape: relaxed with LIRA (LSDA, Accurate)", "{name}");
         }
     }
 
