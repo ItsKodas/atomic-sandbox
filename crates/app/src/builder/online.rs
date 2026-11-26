@@ -848,9 +848,11 @@ impl Lookups {
 
 // ── the record source ──
 
-/// The lookup order (spec §6.3): the shipped list, then the cache, then this generation's online
+/// The lookup order (spec §6.3): the records picked from the search box this session (the latest
+/// first, [`Session::prefer`]), the shipped list, then the cache, then this generation's online
 /// answers (pending, found, not found or offline); a fragment none of them knows is not found.
 pub struct Layered<'a> {
+    pub preferred: &'a [Record],
     pub lib: &'a Library,
     pub cache: Option<&'a Cache>,
     pub results: &'a HashMap<Vec<usize>, Lookup>,
@@ -858,11 +860,18 @@ pub struct Layered<'a> {
 
 impl RecordSource for Layered<'_> {
     fn find(&self, d: &Drawing, frag: &[usize]) -> Lookup {
+        // a pick decides between records of the same graph (final review I1: stereoisomers)
+        let key = iso::drawing_key(d, frag);
+        for r in self.preferred.iter().filter(|r| r.formula_key() == key) {
+            if let MapResult::Mapped(m) = iso::map_fragment(d, frag, r) {
+                return Lookup::Found(r.clone(), m);
+            }
+        }
         if let found @ Lookup::Found(..) = LocalOnly(self.lib).find(d, frag) {
             return found;
         }
         if let Some(cache) = self.cache {
-            for r in cache.find(&iso::drawing_key(d, frag)) {
+            for r in cache.find(&key) {
                 if let MapResult::Mapped(m) = iso::map_fragment(d, frag, &r) {
                     return Lookup::Found(r, m);
                 }
@@ -910,7 +919,12 @@ pub struct Session {
     inbox: Vec<Answer>,
     /// Search answers a test waited for, kept for the next [`Session::poll_search`].
     search_inbox: Vec<(u64, Result<Vec<Hit>, NetError>)>,
+    /// The records picked from the search box this session, the latest first ([`Session::prefer`]).
+    preferred: Vec<Record>,
 }
+
+/// The most picks a session remembers ([`Session::prefer`]).
+pub const MAX_PREFERRED: usize = 64;
 
 impl Default for Session {
     fn default() -> Session {
@@ -938,6 +952,7 @@ impl Session {
             requested: HashMap::new(),
             inbox: Vec::new(),
             search_inbox: Vec::new(),
+            preferred: Vec::new(),
         }
     }
 
@@ -987,7 +1002,7 @@ impl Session {
             self.requested.clear();
             self.version += 1;
             let none = HashMap::new();
-            let here = Layered { lib: self.lib(), cache: self.cache.as_ref(), results: &none };
+            let here = Layered { preferred: &self.preferred, lib: self.lib(), cache: self.cache.as_ref(), results: &none };
             self.local = iso::fragments(d).into_iter().filter(|f| f.len() >= 2).map(|f| (here.find(d, &f).is_found(), f)).map(|(k, f)| (f, k)).collect();
             if let Some(l) = &self.lookups {
                 l.supersede(self.generation);
@@ -1056,7 +1071,21 @@ impl Session {
 
     /// The record source for the drawing [`Session::tick`] last saw.
     pub fn layered(&self) -> Layered<'_> {
-        Layered { lib: self.lib(), cache: self.cache.as_ref(), results: &self.results }
+        Layered { preferred: &self.preferred, lib: self.lib(), cache: self.cache.as_ref(), results: &self.results }
+    }
+
+    /// Remembers a record picked from the search box for the rest of the session (final review I1):
+    /// a fragment it maps onto takes its shape before any other record's — the shipped list may
+    /// hold several records of one graph (stereoisomers: maleic and fumaric acid, L- and D-alanine),
+    /// of which a drawing alone gets the first. The latest pick comes first; at most
+    /// [`MAX_PREFERRED`] are kept. The next [`Session::tick`] starts a new generation, so a picked
+    /// record nothing else knows is not asked of PubChem.
+    pub fn prefer(&mut self, r: &Record) {
+        self.preferred.retain(|p| !(p.source == r.source && p.name == r.name));
+        self.preferred.insert(0, r.clone());
+        self.preferred.truncate(MAX_PREFERRED);
+        self.graph = None;
+        self.version += 1;
     }
 
     /// The molecule cache the search box reads: the user's, once the process may use the network

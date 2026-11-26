@@ -429,8 +429,10 @@ impl Builder {
     /// layout (canvas units, mean bond 1), moved right of the drawing's bounding box by
     /// [`STAMP_GAP`] and level with its middle — centred on the canvas origin when nothing is
     /// drawn — with its bonds (Kekulé orders) and formal charges. The stamped atoms become the
-    /// selection (to move them as one), and the view centres on the whole drawing. A record whose
-    /// lists disagree is ignored.
+    /// selection (to move them as one), and the view centres on the whole drawing. The record is
+    /// then preferred for its graph for the rest of the session ([`super::online::Session::prefer`],
+    /// spec §6.3), so a picked stereoisomer keeps its own shape on hand-off. A record whose lists
+    /// disagree is ignored.
     pub fn stamp_record(&mut self, r: &Record) {
         let n = r.z.len();
         if n == 0 || r.xy.len() != n || r.charge.len() != n || r.bonds.iter().any(|&(a, b, _)| a >= n || b >= n) {
@@ -450,6 +452,7 @@ impl Builder {
             self.drawing.bonds.push(Bond { a: base + a, b: base + b, order });
         }
         self.forget_indices();
+        self.lookup.prefer(r);
         self.selection = (base..base + n).collect();
         if let Some((lo, hi)) = bounds(self.drawing.atoms.iter().map(|a| a.pos)) {
             self.pan = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
@@ -1007,5 +1010,75 @@ pub(crate) mod tests {
         assert_eq!(b.drawing.atoms.len(), 9);
         assert_eq!(b.search_and_stamp_first("xyzzy"), None);
         assert_eq!(b.drawing.atoms.len(), 9);
+    }
+
+    fn cid_of(r: &Record) -> u64 {
+        match r.source {
+            Source::PubChem { cid } => cid,
+            Source::Lira { .. } => panic!("{}: not a PubChem record", r.name),
+        }
+    }
+
+    /// Final review I1: a record picked from the search gives its stamp its own shape on Insert,
+    /// even where an earlier row of the shipped list has the same graph (a stereoisomer); a
+    /// hand-drawn fragment with no pick keeps today's answer, the first row that maps.
+    #[test]
+    fn a_picked_stereoisomer_keeps_its_own_shape() {
+        use super::super::shape::{footer_label, shape, tests::draw_record, LocalOnly};
+        for (picked, first) in [("fumaric acid", "maleic acid"), ("trans-2-butene", "cis-2-butene")] {
+            let r = seed(picked);
+            let mut b = Builder::default();
+            b.stamp_record(r);
+            let label = footer_label(b.shaped());
+            assert!(label.starts_with(&format!("shape: PubChem \"{picked}\" (CID {})", cid_of(r))), "{picked}: {label}");
+            // the same graph drawn by hand, nothing picked: the list's first row, as before
+            let mut h = Builder::default();
+            draw_record(&mut h.drawing, r, [0.0, 0.0], &(0..r.z.len()).collect::<Vec<_>>());
+            let today = shape(&h.drawing, &LocalOnly(Library::shipped()));
+            assert_eq!(*h.shaped(), today, "{picked}: unchanged without a pick");
+            let label = footer_label(&today);
+            assert!(label.starts_with(&format!("shape: PubChem \"{first}\" (CID {})", cid_of(seed(first)))), "{picked} drawn: {label}");
+        }
+        // the latest pick comes first: fumaric acid, then maleic acid picked
+        let mut b = Builder::default();
+        b.stamp_record(seed("fumaric acid"));
+        b.stamp_record(seed("maleic acid"));
+        b.erase_selection();
+        assert!(footer_label(b.shaped()).starts_with("shape: PubChem \"maleic acid\""), "{}", footer_label(b.shaped()));
+    }
+
+    /// Final review I1, the data: the shipped list's groups of records with the same graph (the
+    /// first row of each answers a drawing; the others are stereoisomers, conformers or tautomers
+    /// the drawing cannot tell apart), pinned so the count is visible, and every record that is not
+    /// its group's first is still inserted as itself once picked from the search.
+    #[test]
+    fn same_graph_groups_of_the_shipped_list() {
+        use super::super::iso::{map_fragment, MapResult};
+        use super::super::shape::{footer_label, tests::draw_record};
+        let lib = Library::shipped();
+        let mut groups: Vec<(&Record, Vec<&Record>)> = Vec::new();
+        for r in lib.records() {
+            let mut d = super::super::Drawing::default();
+            draw_record(&mut d, r, [0.0, 0.0], &(0..r.z.len()).collect::<Vec<_>>());
+            let all: Vec<usize> = (0..r.z.len()).collect();
+            let first = lib.candidates(&r.formula_key()).iter().find(|c| matches!(map_fragment(&d, &all, c), MapResult::Mapped(_))).expect("a record maps onto its own drawing");
+            if std::ptr::eq(first, r) {
+                continue;
+            }
+            match groups.iter_mut().find(|g| std::ptr::eq(g.0, first)) {
+                Some(g) => g.1.push(r),
+                None => groups.push((first, vec![r])),
+            }
+        }
+        let listing: Vec<String> = groups.iter().map(|(f, rest)| format!("{} ← {}", f.name, rest.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(", "))).collect();
+        eprintln!("{} same-graph groups:\n{}", groups.len(), listing.join("\n"));
+        let shadowed: Vec<&Record> = groups.iter().flat_map(|g| g.1.iter().copied()).collect();
+        assert_eq!((groups.len(), shadowed.len()), (28, 38), "the same-graph groups changed:\n{}", listing.join("\n"));
+        for r in shadowed {
+            let mut b = Builder::default();
+            b.stamp_record(r);
+            let label = footer_label(b.shaped());
+            assert!(label.starts_with(&format!("shape: PubChem \"{}\" (CID {})", r.name, cid_of(r))), "{}: {label}", r.name);
+        }
     }
 }

@@ -189,6 +189,7 @@ Hydrogens are matched like any other atom. A drawing without hydrogens is a diff
 
 For each fragment:
 
+0. **The records picked from the search box this session**, the latest pick first (final review I1, 2026-11-26). The shipped list holds several records of one graph (stereoisomers such as maleic and fumaric acid or L- and D-alanine, conformers, tautomers), and a drawing alone gets the first that maps; a picked record that maps comes before them, so a stamped stereoisomer is inserted as itself. A hand-drawn fragment with no pick is looked up as before.
 1. **The shipped list.** Index it by formula and charge, then try isomorphism against each candidate.
 2. **The cache**, the same way.
 3. **PubChem, online only:**
@@ -205,7 +206,7 @@ The 2D drawing carries no stereo, so the SMILES has none either.
 
 - If PubChem returns a record with undefined stereo and a 3D conformer, its conformer stands.
 - If it returns only stereo-specific records, take the first CID that maps. The footer adds "stereo as in the database (CID n)".
-- The shipped list stores one record per name, and its stereo stands.
+- The shipped list stores one record per name, and its stereo stands. Where it holds several stereoisomers of one graph, a drawing gets the first; one picked from the search box is preferred for that graph for the rest of the session (§6.3, step 0).
 
 ## 7. Online lookup
 
@@ -232,7 +233,7 @@ The 2D drawing carries no stereo, so the SMILES has none either.
 - **Palette column:** a search box at the top (hint "molecule name, formula or CID").
   - **Results:** up to 8, shipped and cached first, then a "Search PubChem for '…'" row when online is on.
   - **Each row:** name, formula and source.
-  - **Picking a row:** stamps the molecule onto the canvas, as in Goal 2.
+  - **Picking a row:** stamps the molecule onto the canvas, as in Goal 2, and prefers its record for its graph for the rest of the session (§6.3, step 0).
   - **The online setting** goes below.
 - **Footer:** beside the live formula and name, one shape line per hand-off.
   - One fragment: the single label from §4 Goal 5.
