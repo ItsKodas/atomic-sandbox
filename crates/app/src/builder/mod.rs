@@ -319,6 +319,8 @@ pub struct Builder {
     /// database's shapes for the fragments it knows) and the lookup answers' version it was made
     /// with, recomputed only when either changes.
     pub(crate) shaped: Option<(Drawing, u64, shape::Shaped)>,
+    /// [`shape::fill_hint`] for that drawing and version, recomputed only when either changes.
+    fill_hint: Option<(Drawing, u64, Option<String>)>,
     /// The search box's text (spec §8: a name, a formula or a PubChem CID).
     pub search_query: String,
     /// The search box's results for that text ([`search`]).
@@ -347,6 +349,7 @@ impl Default for Builder {
             online: true,
             lookup: online::Session::default(),
             shaped: None,
+            fill_hint: None,
             search_query: String::new(),
             search: Default::default(),
         }
@@ -467,6 +470,20 @@ impl Builder {
             self.shaped = Some((self.drawing.clone(), version, s));
         }
         &self.shaped.as_ref().unwrap().2
+    }
+
+    /// The line under the footer's fallback label (spec §6.2): "Fill hydrogens would match
+    /// <name>" when the hydrogen-filled drawing's fragments map onto a local record
+    /// ([`shape::fill_hint`]); cached with [`Builder::shaped`].
+    pub fn fill_hint(&mut self) -> Option<&str> {
+        self.shaped();
+        let version = self.lookup.version();
+        if self.fill_hint.as_ref().is_none_or(|(d, v, _)| *d != self.drawing || *v != version) {
+            let s = &self.shaped.as_ref().expect("just made").2;
+            let hint = shape::fill_hint(&self.drawing, s, &self.lookup.local_layers());
+            self.fill_hint = Some((self.drawing.clone(), version, hint));
+        }
+        self.fill_hint.as_ref().and_then(|h| h.2.as_deref())
     }
 
     /// [`Builder::shaped`] with the fragments looked up in `src` instead (tests); cached by the

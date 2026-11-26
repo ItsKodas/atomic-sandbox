@@ -1074,6 +1074,13 @@ impl Session {
         Layered { preferred: &self.preferred, lib: self.lib(), cache: self.cache.as_ref(), results: &self.results }
     }
 
+    /// The local layers of [`Session::layered`] (the picks, the shipped list and the cache), without
+    /// the online answers: the Fill-hydrogens hint's source ([`super::shape::fill_hint`]).
+    pub fn local_layers(&self) -> Layered<'_> {
+        static NONE: std::sync::LazyLock<HashMap<Vec<usize>, Lookup>> = std::sync::LazyLock::new(HashMap::new);
+        Layered { preferred: &self.preferred, lib: self.lib(), cache: self.cache.as_ref(), results: &NONE }
+    }
+
     /// Remembers a record picked from the search box for the rest of the session (final review I1):
     /// a fragment it maps onto takes its shape before any other record's — the shipped list may
     /// hold several records of one graph (stereoisomers: maleic and fumaric acid, L- and D-alanine),

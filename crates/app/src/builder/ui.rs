@@ -801,6 +801,11 @@ fn footer_rows(ui: &mut Ui, st: &mut UiState) {
                 r.on_hover_text(tip);
             }
         }
+        // the fallback's hint (spec §6.2): a drawing without its hydrogens is a radical
+        if let Some(hint) = b.fill_hint() {
+            ui.label(RichText::new(hint).size(11.5).color(theme::ACCENT_INK))
+                .on_hover_text("drawn atoms are real atoms: without its hydrogens the drawing is a radical, which no closed-shell record matches — Fill hydrogens adds them");
+        }
     }
     // the warnings (amber ones only once Fill hydrogens was used)
     let marks: Vec<_> = super::chem::warnings(&b.drawing).into_iter().filter(|m| b.filled || m.1 == super::chem::Warning::Over).collect();
@@ -1150,6 +1155,59 @@ mod tests {
         assert!(palette_texts(&mut st).contains("Ethane\nC₂H₆ · PubChem"));
         st.builder.online = false;
         assert!(!palette_texts(&mut st).contains("Search PubChem"));
+    }
+
+    /// Every text the footer rows paint, after two frames in a 900 × 300 area.
+    fn footer_texts(st: &mut UiState) -> String {
+        fn walk(s: &egui::epaint::Shape, out: &mut String) {
+            match s {
+                egui::epaint::Shape::Text(t) => {
+                    *out += t.galley.text();
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut out = String::new();
+        for _ in 0..2 {
+            out.clear();
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 300.0))), ..Default::default() };
+            let full = ctx.run_ui(raw, |ui| footer_rows(ui, st));
+            full.shapes.iter().for_each(|c| walk(&c.shape, &mut out));
+        }
+        out
+    }
+
+    /// Final review I2 (spec §6.2): a drawing without its hydrogens is a radical and matches no
+    /// closed-shell record; the fallback label stays as the spec words it, and a second line says
+    /// Fill hydrogens would match the record the filled drawing maps to. Once filled, the database's
+    /// shape and no hint.
+    #[test]
+    fn the_fallback_suggests_fill_hydrogens() {
+        let mut st = UiState::new("h2", &crate::scene::Scene::preset("h2").unwrap());
+        // C–C–O, no hydrogens (a test build has no network: offline)
+        let d = &mut st.builder.drawing;
+        for (i, z) in [6u8, 6, 8].into_iter().enumerate() {
+            d.add_atom(z, [i as f32, 0.0]);
+        }
+        d.bond(0, 1);
+        d.bond(1, 2);
+        let t = footer_texts(&mut st);
+        assert!(t.contains("shape: approximate (offline)\n"), "{t}");
+        assert!(t.contains("Fill hydrogens would match ethanol\n"), "{t}");
+        st.builder.fill_hydrogens();
+        let t = footer_texts(&mut st);
+        assert!(t.contains("shape: PubChem \"ethanol\" (CID 702)") && !t.contains("would match"), "{t}");
+        // a drawing whose filled form is in no database either: no hint
+        let mut he = super::super::Drawing::default();
+        he.add_atom(2, [0.0, 0.0]);
+        he.add_atom(2, [1.0, 0.0]);
+        he.bond(0, 1);
+        st.builder.drawing = he;
+        let t = footer_texts(&mut st);
+        assert!(t.contains("shape: approximate (offline)") && !t.contains("would match"), "{t}");
     }
 
     /// The Atom tool as the user asked for it (2026-10-20): click places a lone atom and selects it,

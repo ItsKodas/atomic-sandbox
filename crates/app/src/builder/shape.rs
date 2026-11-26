@@ -449,6 +449,39 @@ pub fn fragment_label(s: &FragmentSource) -> String {
     }
 }
 
+/// The line under a fallback label (spec §6.2, final review I2): drawn atoms are real atoms, so a
+/// drawing without its hydrogens is a radical and matches no closed-shell record. For each fragment
+/// labelled "not in the database" or "offline", the drawing with hydrogens filled
+/// ([`chem::fill_hydrogens`](super::chem::fill_hydrogens), on a copy) is looked up in `local` (the
+/// session's picks, the shipped list and the cache: no network); "Fill hydrogens would match
+/// <name>" names the records found (several: comma-separated), None when there are none or Fill
+/// hydrogens would add no hydrogen to those fragments.
+pub fn fill_hint(d: &Drawing, s: &Shaped, local: &dyn RecordSource) -> Option<String> {
+    let unknown: Vec<&Vec<usize>> = s.sources.iter().filter(|(_, f)| matches!(f, FragmentSource::Approximate(Why::NotInDatabase | Why::Offline))).map(|(frag, _)| frag).collect();
+    if unknown.is_empty() {
+        return None;
+    }
+    let mut filled = d.clone();
+    if super::chem::fill_hydrogens(&mut filled) == 0 {
+        return None;
+    }
+    // Fill hydrogens only appends atoms, so each fragment's atoms keep their indices
+    let frags = iso::fragments(&filled);
+    let mut names: Vec<String> = Vec::new();
+    for f in unknown {
+        let Some(g) = frags.iter().find(|g| g.contains(&f[0])) else { continue };
+        if g.len() == f.len() {
+            continue;
+        }
+        if let Lookup::Found(r, m) = local.find(&filled, g) {
+            if valid_mapping(&filled, g, &r, &m) && !names.contains(&r.name) {
+                names.push(r.name);
+            }
+        }
+    }
+    (!names.is_empty()).then(|| format!("Fill hydrogens would match {}", names.join(", ")))
+}
+
 /// A fragment of `s` is still being looked up online: Insert and Replace wait (spec §7).
 pub fn looking_up(s: &Shaped) -> bool {
     s.sources.iter().any(|(_, f)| *f == FragmentSource::Approximate(Why::LookingUp))
@@ -698,6 +731,46 @@ pub(crate) mod tests {
         assert_eq!(footer_label(&shape(&d, &stereo_src)), "shape: PubChem \"ethanol\" (CID 702) · stereo as in the database (CID 702)");
         // nothing to label
         assert_eq!(footer_label(&shape(&Drawing::default(), &local)), "");
+    }
+
+    /// Final review I2: the hint names what the hydrogen-filled drawing maps to, for each fragment
+    /// not in the database or offline; none for a known, pending or hydrogen-complete fragment.
+    #[test]
+    fn the_fill_hint_names_the_filled_match() {
+        let local = LocalOnly(Library::shipped());
+        let heavy = |zs: &[u8], at: f32, d: &mut Drawing| {
+            let first = d.atoms.len();
+            for (i, &z) in zs.iter().enumerate() {
+                d.add_atom(z, [at + i as f32, 0.0]);
+                if i > 0 {
+                    d.bond(first + i - 1, first + i);
+                }
+            }
+        };
+        // C–C–O: not in the database (the shipped list alone), the filled drawing is ethanol
+        let mut d = Drawing::default();
+        heavy(&[6, 6, 8], 0.0, &mut d);
+        let s = shape(&d, &local);
+        assert_eq!(fragment_label(&s.sources[0].1), "shape: approximate (not in the database) — Relax after recommended");
+        assert_eq!(fill_hint(&d, &s, &local).as_deref(), Some("Fill hydrogens would match ethanol"));
+        // offline names it the same way; in flight, nothing yet
+        assert_eq!(fill_hint(&d, &shape(&d, &By(|_: &Drawing, _: &[usize]| Lookup::Offline)), &local).as_deref(), Some("Fill hydrogens would match ethanol"));
+        assert_eq!(fill_hint(&d, &shape(&d, &By(|_: &Drawing, _: &[usize]| Lookup::Pending)), &local), None);
+        // two bare fragments: both named; a known water beside them is not
+        heavy(&[8], 5.0, &mut d);
+        heavy(&[6, 8], 8.0, &mut d);
+        draw_record(&mut d, rec("water"), [12.0, 0.0], &identity(3));
+        let s = shape(&d, &local);
+        assert_eq!(fill_hint(&d, &s, &local).as_deref(), Some("Fill hydrogens would match ethanol, methanol"), "{:?}", s.sources);
+        // filled: in the database, no hint
+        let mut f = Drawing::default();
+        heavy(&[6, 6, 8], 0.0, &mut f);
+        super::super::chem::fill_hydrogens(&mut f);
+        assert_eq!(fill_hint(&f, &shape(&f, &local), &local), None);
+        // a fragment Fill hydrogens adds nothing to (He–He): no hint
+        let mut he = Drawing::default();
+        heavy(&[2, 2], 0.0, &mut he);
+        assert_eq!(fill_hint(&he, &shape(&he, &local), &local), None);
     }
 
     #[test]
