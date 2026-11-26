@@ -4888,13 +4888,14 @@ fn generate_lira_shapes() {
             eprintln!("   warning: {w}");
         }
         if r.converged != Some(true) {
-            // why it stopped: the driver's notes (a failed evaluation says what failed)
+            // why it stopped: the driver's notes and its last provider error (a failed evaluation's message)
             let notes = &s.dynamics.notes;
             for n in &notes[notes.len().saturating_sub(6)..] {
                 eprintln!("   note: {n}");
             }
-            let last = notes.iter().rev().find(|n| !n.starts_with("relax ")).cloned().unwrap_or_default();
-            table.push(row(e, &m_s, &f_s, &steps, &t_s, format!("left out: not converged ({}; last note: {last})", r.note.unwrap_or_default())));
+            let why = s.dynamics.last_error.clone().unwrap_or_else(|| "no provider error".into());
+            eprintln!("   last error: {why}");
+            table.push(row(e, &m_s, &f_s, &steps, &t_s, format!("left out: not converged ({}; the provider: {why})", r.note.unwrap_or_default())));
             continue;
         }
         if !(max_force < tol) || !(r.max_force_augmented < tol) {
