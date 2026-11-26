@@ -4680,3 +4680,286 @@ fn the_solvers_get_the_budget_of_the_share() {
     let env = crate::quality::budget_from(Some(3.0), 8_400_000_000, 60);
     assert_eq!(solver_budget(env, 2), (1_500_000_000, "the teacher's half of the 3.0 GB budget: set by ATOMIC_SANDBOX_VRAM_GB".to_string()));
 }
+
+// ---- the builder's LIRA-relaxed shapes (builder database, Task 7) ----
+
+/// Dev tool (spec `docs/superpowers/specs/2026-11-25-builder-database-design.md` §5.1): relaxes each entry of
+/// `crates/app/data/lira-molecules.txt` with the app's own Relax and writes it into `crates/app/data/molecules.txt`
+/// as a `source lira` row, then prints the table (entry | multiplicity | max_force | steps | wall | outcome).
+///
+/// For each entry: an entry the shipped list or PubChem (the online lookup's own client, `builder::online::Lookups`,
+/// asked with the drawing's SMILES) has a 3D shape for is skipped — PubChem's wins. Otherwise the scene is the
+/// builder's Replace (`builder::replace_scene`) of the drawing's embedding (`builder::embed::embed`) at the
+/// production defaults: GPU, Accurate (h = σ = 0.15 Bohr), ionic `accepted`, the entry's charge, automatic
+/// multiplicity, the box `builder::enlarge_n(max_abs, 0.15, 81)`. A scene whose GPU estimate
+/// (`providers::gpu_footprint_bytes`) is over `LIRA_VRAM_GB` (default 4) is deferred, not run. Relax runs until it
+/// ends; only `converged == Some(true)` with max|F| below `FireParams::for_dt(..).f_tol` (the Relax tolerance), the
+/// list's multiplicity, every bond of the graph still a bond (0.6–1.6 × the builder's covalent-radius sum) and no
+/// other pair closer than 0.8 × theirs, is kept; anything else, or the `LIRA_WALL_MIN` wall (default 30 min), is
+/// reported and left out — never shipped half-relaxed. `max_force` is the verified max|F| when the provider gives
+/// one (a surrogate's), else the solver's own max|F| at the result (the GPU backend's forces are the DFT forces).
+/// The file is rewritten after each kept entry (PubChem rows as they were, then the `lira` rows in list order), so
+/// an interrupted run keeps what it finished.
+///
+/// The `commit` is `git rev-parse --short=8 HEAD`; the run refuses a checkout whose `crates/` has uncommitted
+/// changes (other than `molecules.txt`, which it writes), so the commit is the code that ran. `LIRA_ONLY=a,b`: only
+/// those entries (names); `LIRA_DRY=1`: the checks, boxes and estimates without the GPU (no commit needed).
+#[test]
+#[ignore = "dev tool, GPU: cargo test -p app --release --bin app -- worker::tests::generate_lira_shapes --ignored --nocapture"]
+fn generate_lira_shapes() {
+    use crate::builder::{self, chem, embed, lira, online, records, shape};
+    use records::{Library, Record, Source};
+    use shape::RecordSource as _;
+    let _gpu = gpu_lock();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let dry = var("LIRA_DRY").is_some();
+    let only: Option<Vec<String>> = var("LIRA_ONLY").map(|v| v.split(',').map(|s| s.trim().to_string()).collect());
+    let wall = Duration::from_secs_f64(60.0 * var("LIRA_WALL_MIN").and_then(|v| v.parse::<f64>().ok()).unwrap_or(30.0));
+    let cap_gb = var("LIRA_VRAM_GB").and_then(|v| v.parse::<f64>().ok()).unwrap_or(4.0);
+    if std::env::var("ATOMIC_SANDBOX_VRAM_GB").is_err() {
+        // the solver's own budget (its refusal and witness cap) at the same cap
+        std::env::set_var("ATOMIC_SANDBOX_VRAM_GB", format!("{cap_gb}"));
+    }
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").args(args).current_dir(&root).output().expect("git runs");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let commit = git(&["rev-parse", "--short=8", "HEAD"]);
+    assert!(commit.len() >= 7 && commit.chars().all(|c| c.is_ascii_hexdigit()), "git rev-parse gave {commit:?}");
+    let dirty: Vec<String> = git(&["status", "--porcelain", "--", "../../crates"]).lines().filter(|l| !l.ends_with("crates/app/data/molecules.txt")).map(String::from).collect();
+    assert!(dry || dirty.is_empty(), "commit the generator's code first, so the rows' commit is the code that ran:\n{}", dirty.join("\n"));
+    let tol = sim::relax::FireParams::for_dt(units::fs_to_au_time(DEFAULT_DT_FS)).f_tol;
+    let all_entries = lira::entries();
+    let entries: Vec<lira::Entry> = match &only {
+        Some(names) => {
+            for n in names {
+                assert!(all_entries.iter().any(|e| &e.name == n), "LIRA_ONLY: {n:?} is not in the list");
+            }
+            all_entries.iter().filter(|e| names.contains(&e.name)).cloned().collect()
+        }
+        None => all_entries.clone(),
+    };
+    let lib = Library::shipped();
+    // the table's rows: (entry, multiplicity, max_force, steps, wall, outcome)
+    let mut table: Vec<[String; 6]> = Vec::new();
+    let row = |e: &lira::Entry, m: &str, f: &str, steps: &str, t: &str, outcome: String| [e.name.clone(), m.into(), f.into(), steps.into(), t.into(), outcome];
+
+    // 1. PubChem wins: the shipped list, then PubChem itself (the online lookup's resolve, by SMILES)
+    struct NetworkOn;
+    impl Drop for NetworkOn {
+        fn drop(&mut self) {
+            online::set_network_allowed(false);
+        }
+    }
+    online::set_network_allowed(true);
+    let network = NetworkOn;
+    let lookups = online::Lookups::new(Box::new(online::UreqTransport::new()), online::Cache::none());
+    // a positive control first: water, which PubChem has a 3D shape for (CID 962), is found online, so a
+    // "not found" below is PubChem's answer and not a check that cannot find anything
+    {
+        let mut d = builder::Drawing::default();
+        let o = d.add_atom(8, [0.0, 0.0]);
+        chem::fill_hydrogens(&mut d);
+        let all: Vec<usize> = (0..d.atoms.len()).collect();
+        lookups.request(1_000_000, &d, &all);
+        let got = lookups.wait(Duration::from_secs(60)).into_iter().next().map(|a| a.2);
+        assert!(matches!(&got, Some(shape::Lookup::Found(r, _)) if r.source == Source::PubChem { cid: 962 }), "the PubChem check found no 3D water (O {o}): {got:?}");
+    }
+    let mut to_run = Vec::new();
+    for (k, e) in entries.iter().enumerate() {
+        let d = e.drawing();
+        let all: Vec<usize> = (0..d.atoms.len()).collect();
+        if let shape::Lookup::Found(r, _) = shape::LocalOnly(lib).find(&d, &all) {
+            if let Source::PubChem { cid } = r.source {
+                table.push(row(e, "", "", "", "", format!("skipped: the shipped PubChem record \"{}\" (CID {cid})", r.name)));
+                continue;
+            }
+        }
+        let mut answer = None;
+        for attempt in 0..3u64 {
+            lookups.request(1_000_001 + 3 * k as u64 + attempt, &d, &all);
+            if let Some((_, _, l)) = lookups.wait(Duration::from_secs(60)).into_iter().next() {
+                if !matches!(l, shape::Lookup::Offline | shape::Lookup::Pending) {
+                    answer = Some(l);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        match answer {
+            Some(shape::Lookup::Found(r, _)) => {
+                let cid = match r.source {
+                    Source::PubChem { cid } => cid.to_string(),
+                    Source::Lira { .. } => "?".into(),
+                };
+                table.push(row(e, "", "", "", "", format!("skipped: PubChem has a 3D shape (CID {cid}, \"{}\")", r.name)));
+            }
+            Some(_) => to_run.push(e.clone()),
+            None => table.push(row(e, "", "", "", "", "not run: the PubChem check got no answer (offline?)".into())),
+        }
+    }
+    drop(network);
+    drop(lookups);
+
+    // 2. each remaining entry, one at a time
+    let ctx = if dry { None } else { Some(gpu_ctx().expect("a GPU adapter")) };
+    let mut now = crate::scene::h2_r16();
+    (now.grid_h, now.sigma, now.ionic) = (0.15, Some(0.15), sim::IonicPolicy::Accepted);
+    let radius = |i: usize, z: &[u8]| chem::covalent_radius_bohr(z[i]);
+    for e in &to_run {
+        let d = e.drawing();
+        let x = embed::embed(&d);
+        let n = builder::enlarge_n(builder::max_abs(&x), 0.15, 81);
+        let h = builder::Handoff {
+            replace: true,
+            nuclei: e.z.iter().copied().zip(x.iter().copied()).collect(),
+            charge: e.net_charge(),
+            relax: true,
+            grid: Some((n, 0.15)),
+            label: records::hill(&e.z),
+        };
+        let scene = builder::replace_scene(&now, &h);
+        assert_eq!((scene.grid_h, scene.sigma, scene.ionic, scene.multiplicity, scene.charge), (0.15, Some(0.15), sim::IonicPolicy::Accepted, None, e.net_charge()));
+        if let Err(why) = scene.validate() {
+            table.push(row(e, "", "", "", "", format!("not run: the scene does not validate ({why})")));
+            continue;
+        }
+        let need = providers::gpu_footprint_bytes(&scene.to_sim().expect("a scene of known elements"));
+        let gb = need as f64 / 1e9;
+        let embedded: Vec<String> = e.bonds.iter().map(|&(a, b, _)| {
+            let l = ((x[a][0] - x[b][0]).powi(2) + (x[a][1] - x[b][1]).powi(2) + (x[a][2] - x[b][2]).powi(2)).sqrt();
+            format!("{a}–{b} {l:.2}")
+        }).collect();
+        eprintln!("\n== {} ({}, charge {:+}): {n}³ × 0.15 Bohr, max |x| {:.2} Bohr, GPU estimate {gb:.2} GB; embedded bonds (Bohr) {}", e.name, records::hill(&e.z), e.net_charge(), builder::max_abs(&x), embedded.join(", "));
+        if gb > cap_gb {
+            table.push(row(e, "", "", "", "", format!("deferred (needs > {cap_gb} GB VRAM, quiet GPU): {n}³, ≈ {gb:.1} GB")));
+            continue;
+        }
+        let Some(ctx) = ctx.as_ref() else {
+            table.push(row(e, "", "", "", "", format!("dry run: {n}³, ≈ {gb:.2} GB")));
+            continue;
+        };
+        let t0 = Instant::now();
+        let w = SimWorker::spawn(scene, Backend::Gpu, Some(ctx.clone()));
+        let (mut sent, mut last, mut error, mut said) = (false, None::<Snapshot>, None::<String>, Instant::now());
+        while t0.elapsed() < wall {
+            match w.recv_timeout(Duration::from_secs(1)) {
+                Some(Event::Snapshot(s)) => {
+                    if !sent && !s.working {
+                        eprintln!("   first evaluation in {:.0} s ({} SCF steps, multiplicity {:?}); relaxing", t0.elapsed().as_secs_f64(), s.dynamics.eval.scf_steps, s.dynamics.eval.multiplicity);
+                        w.send(Command::Dyn(DynCommand::Relax));
+                        sent = true;
+                    }
+                    let ended = sent && s.dynamics.relax.as_ref().is_some_and(|r| r.converged.is_some());
+                    if let Some(r) = s.dynamics.relax.as_ref().filter(|_| said.elapsed() > Duration::from_secs(60)) {
+                        eprintln!("   {:.0} s: {} FIRE steps, max|F| {:.2e} Ha/Bohr", t0.elapsed().as_secs_f64(), r.steps, r.max_force);
+                        said = Instant::now();
+                    }
+                    last = Some(*s);
+                    if ended {
+                        break;
+                    }
+                }
+                Some(Event::Error(m)) => {
+                    error = Some(m);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let t_s = format!("{:.0} s", t0.elapsed().as_secs_f64());
+        drop(w);
+        if let Some(m) = error {
+            table.push(row(e, "", "", "", &t_s, format!("left out: worker error: {m}")));
+            continue;
+        }
+        if !last.as_ref().is_some_and(|s| s.dynamics.relax.as_ref().is_some_and(|r| r.converged.is_some())) {
+            let steps = last.as_ref().and_then(|s| s.dynamics.relax.as_ref()).map_or(String::new(), |r| r.steps.to_string());
+            table.push(row(e, "", "", &steps, &t_s, format!("left out: the {:.0}-minute wall", wall.as_secs_f64() / 60.0)));
+            continue;
+        }
+        let s = last.unwrap();
+        let r = s.dynamics.relax.clone().unwrap();
+        let max_force = r.verified_max_force.unwrap_or(r.max_force);
+        let mult = s.dynamics.eval.multiplicity;
+        let (m_s, f_s, steps) = (mult.map_or("?".into(), |m| m.to_string()), format!("{max_force:.2e}"), r.steps.to_string());
+        for w in &s.dynamics.eval.warnings {
+            eprintln!("   warning: {w}");
+        }
+        if r.converged != Some(true) {
+            table.push(row(e, &m_s, &f_s, &steps, &t_s, format!("left out: not converged ({})", r.note.unwrap_or_default())));
+            continue;
+        }
+        if !(max_force < tol) || !(r.max_force_augmented < tol) {
+            table.push(row(e, &m_s, &f_s, &steps, &t_s, format!("left out: max|F| {max_force:.2e} (augmented {:.2e}) not below {tol:.0e}", r.max_force_augmented)));
+            continue;
+        }
+        if mult != Some(e.expected_multiplicity() as u32) {
+            table.push(row(e, &m_s, &f_s, &steps, &t_s, format!("left out: multiplicity {mult:?}, the list says {}", e.expected_multiplicity())));
+            continue;
+        }
+        let pos: Vec<[f64; 3]> = s.dynamics.scene.nuclei.iter().map(|n| n.pos).collect();
+        assert_eq!(pos.len(), e.z.len());
+        let dist = |a: usize, b: usize| ((pos[a][0] - pos[b][0]).powi(2) + (pos[a][1] - pos[b][1]).powi(2) + (pos[a][2] - pos[b][2]).powi(2)).sqrt();
+        let mut odd = Vec::new();
+        for i in 0..pos.len() {
+            for j in i + 1..pos.len() {
+                let ratio = dist(i, j) / (radius(i, &e.z) + radius(j, &e.z));
+                let bonded = e.bonds.iter().any(|&(a, b, _)| (a, b) == (i, j) || (a, b) == (j, i));
+                if bonded && !(0.6..=1.6).contains(&ratio) {
+                    odd.push(format!("bond {i}–{j} at {:.3} Bohr ({ratio:.2} × the radius sum)", dist(i, j)));
+                } else if !bonded && ratio < 0.8 {
+                    odd.push(format!("non-bonded {i}–{j} at {:.3} Bohr ({ratio:.2} × the radius sum)", dist(i, j)));
+                }
+            }
+        }
+        let bonds: Vec<String> = e.bonds.iter().map(|&(a, b, _)| format!("{a}–{b} {:.3} Å", units::bohr_to_angstrom(dist(a, b)))).collect();
+        eprintln!("   relaxed: {}; E = {:.6} Ha", bonds.join(", "), r.energy);
+        if !odd.is_empty() {
+            table.push(row(e, &m_s, &f_s, &steps, &t_s, format!("left out: the shape is not the graph's ({})", odd.join("; "))));
+            continue;
+        }
+        let source = Source::Lira {
+            functional: "LSDA".into(),
+            quality: "Accurate".into(),
+            ionic: sim::IonicPolicy::Accepted.word().into(),
+            multiplicity: mult.unwrap() as u8,
+            max_force: (max_force * 1e8).ceil() / 1e8,
+            commit: commit.clone(),
+        };
+        let rec = e.record(&pos.iter().map(|p| p.map(units::bohr_to_angstrom)).collect::<Vec<_>>(), source);
+        if let Err(why) = rec.validate() {
+            table.push(row(e, &m_s, &f_s, &steps, &t_s, format!("left out: the record does not validate ({why})")));
+            continue;
+        }
+        // into the file at once: PubChem rows as they were, then the lira rows in list order
+        let path = root.join("data/molecules.txt");
+        let mut v = records::parse(&std::fs::read_to_string(&path).unwrap()).expect("molecules.txt parses");
+        v.retain(|x| !(x.name == rec.name && matches!(x.source, Source::Lira { .. })));
+        v.push(rec);
+        let order = |x: &Record| match x.source {
+            Source::PubChem { .. } => 0,
+            Source::Lira { .. } => 1 + all_entries.iter().position(|e| e.name == x.name).unwrap_or(usize::MAX - 1),
+        };
+        v.sort_by_key(order);
+        let text = records::write(&v);
+        assert_eq!(records::parse(&text).unwrap(), v, "the written file reads back");
+        std::fs::write(&path, &text).unwrap();
+        table.push(row(e, &m_s, &f_s, &steps, &t_s, "kept".into()));
+    }
+
+    println!("\n| entry | multiplicity | max_force | steps | wall | kept / skipped / deferred |\n|---|---|---|---|---|---|");
+    for r in &table {
+        println!("| {} |", r.join(" | "));
+    }
+    let count = |p: &str| table.iter().filter(|r| r[5].starts_with(p)).count();
+    println!(
+        "\n{} kept, {} skipped, {} deferred, {} left out, {} not run (commit {commit}, tolerance {tol:.0e} Ha/Bohr)",
+        count("kept"),
+        count("skipped"),
+        count("deferred"),
+        count("left out"),
+        count("not run") + count("dry run")
+    );
+}

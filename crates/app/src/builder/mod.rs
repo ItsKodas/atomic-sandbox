@@ -14,6 +14,8 @@
 pub mod chem;
 pub mod embed;
 pub mod iso;
+#[cfg(test)]
+pub mod lira;
 pub mod online;
 pub mod records;
 pub mod search;

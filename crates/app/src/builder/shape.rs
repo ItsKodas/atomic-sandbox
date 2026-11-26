@@ -306,7 +306,7 @@ fn fit_rotation(p: &[V3], q: &[V3], axes: &[V3; 3]) -> M3 {
 /// a right-handed frame: each of the first two signed so the points' third moment along it is
 /// positive (or, when that vanishes, so the first point off its normal plane lies on its + side),
 /// the third their cross product. Deterministic for a given record.
-fn principal_axes(p: &[V3]) -> [V3; 3] {
+pub(crate) fn principal_axes(p: &[V3]) -> [V3; 3] {
     let mut c = [[0.0; 3]; 3];
     for v in p {
         for i in 0..3 {
